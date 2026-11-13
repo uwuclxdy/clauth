@@ -10,6 +10,7 @@ fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: None,
         sub_type: Some("max".to_string()),
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }
@@ -21,6 +22,7 @@ fn third_party_snapshot(name: &str, base_url: &str, rank: RosterRank) -> Profile
         provider: "DeepSeek".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank,
     }
 }
@@ -212,8 +214,9 @@ fn third_party_headline_all_lapsed_bars_keep_the_plan_prefix() {
 /// The reader here is picking a delegate target, so a provider's refusal has to
 /// reach the headline WITH its figure: the number alone reads as spendable and
 /// sent one run into a `402`, while the refusal alone hides how short the
-/// account is. `funded_wallets` drops a zero wallet, so an exhausted account
-/// reaches the headline through the first-value arm rather than the wallet one.
+/// account is. `funded_wallets` drops a zero wallet, so no funded wallet exists
+/// and the any-wallet arm picks the spent `api balance` before the first-value
+/// arm gets a chance.
 #[test]
 fn third_party_headline_names_a_refusal_beside_its_figure() {
     let mut s = third_party_stats(
@@ -316,6 +319,22 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     // the roster is labelled a session-start snapshot with a live-refresh pointer.
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
     assert!(out.contains("call `profiles`"));
+    // the block says it is filtered, so a disabled row in `profiles` never
+    // reads as an account added since.
+    for auth in [
+        SessionAuth::Global,
+        SessionAuth::IsolatedRuntime("work".to_string()),
+        SessionAuth::IsolatedCustom,
+    ] {
+        let block = instructions_block(&profiles, &auth, crate::runtime::LinkProbe::NothingShared);
+        assert!(
+            block.contains(
+                "Profiles, most headroom first (session-start snapshot, disabled accounts left \
+out; call `profiles` for live usage and anything added since):\n"
+            ),
+            "the header names the omission in every tier: {block}",
+        );
+    }
 
     // the tool router survives, because it is the ONLY clauth text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
@@ -476,6 +495,82 @@ fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
     ];
     let out = roster_lines(&profiles, &SessionAuth::Global);
     assert_eq!(out, "- healthy, overdrawn [DeepSeek, api.deepseek.com]\n");
+}
+
+/// A disabled account the roster keeps says so inside its marker paren on every
+/// session tier, while its enabled bracket-mate keeps its plain spelling.
+#[test]
+fn a_kept_disabled_account_reads_disabled_inside_its_marker_on_every_tier() {
+    let roster = |off: ProfileSnapshot, on: ProfileSnapshot, auth: SessionAuth| {
+        let block = instructions_block(&[off, on], &auth, crate::runtime::LinkProbe::NothingShared);
+        let (_, roster) = block
+            .split_once("`profiles` for live usage and anything added since):\n")
+            .expect("the roster header");
+        roster.to_string()
+    };
+    let disabled = |mut p: ProfileSnapshot| {
+        p.disabled = true;
+        p
+    };
+
+    assert_eq!(
+        roster(
+            snapshot("off", true),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session), on [anthropic, max]\n",
+        "an enabled account's marker carries no flag",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("on".into()),
+        ),
+        "- off (global active; disabled), on (this session) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedCustom,
+        ),
+        "- off (global active; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (this session; disabled), on (global active) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::Global
+        ),
+        "- off (disabled), on (global active, this session) [anthropic, max]\n",
+        "a markerless disabled row still opens a paren for the flag",
+    );
 }
 
 #[test]
@@ -801,12 +896,14 @@ fn live_usage_prose_dates_an_all_lapsed_unknown() {
     assert_eq!(absent, "active profile `work`: 5h unknown, 7d unknown");
 }
 
-/// The denial is conditional on what the provider publishes. One that reports
-/// its own `5h`/`7d` bars HAS those limits, so a denial beside them contradicts
-/// the very figure it introduces; one answering with a wallet has none, and the
-/// reader needs telling before reading the amount as a window. A third-party
-/// account with no figure at all denies nothing: the provider's limits are
-/// exactly what clauth cannot answer for there.
+/// The denial is conditional on what the provider publishes AND on what the
+/// response carries. One that reports its own `5h`/`7d` bars HAS those limits,
+/// so a denial beside them contradicts the very figure it introduces; an
+/// account answering with a wallet has none, and the denial never rides an api
+/// balance; a no-windows account whose figure is a
+/// counter with no wallet still needs telling. A third-party account with no
+/// figure at all denies nothing: the provider's limits are exactly what clauth
+/// cannot answer for there.
 #[test]
 fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     assert_eq!(
@@ -822,8 +919,20 @@ fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         })),
-        "no 5h/7d limits; api balance: 31.45 CNY",
+        "api balance: 31.45 CNY",
+        "the denial never rides an api balance",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "credits: 42 units",
+            "provider_windows": false,
+            "has_wallet": false,
+        })),
+        "no 5h/7d limits; credits: 42 units",
+        "a counter keeps the denial",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({"kind": "third_party", "balance": null})),
@@ -845,6 +954,62 @@ fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
             "provider_windows": false,
         })),
         "no 5h/7d limits; pro: 5h 12.5%, 7d 48%",
+    );
+}
+
+/// The wallet's runway rides its burn rate, so a reader picking a delegate
+/// target reads how long the account lasts instead of dividing two figures:
+/// whole days from one day up, whole hours below it. 371.47 / 160.7 = 2.31
+/// days; 50 / 160.7 = 0.311 days = 7.47 h.
+#[test]
+fn windows_prose_names_the_wallet_runway_beside_its_burn() {
+    let wallet = |balance: f64, per_day: f64| {
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": format!("api balance: {balance:.2} CNY"),
+            "provider_windows": false,
+            "has_wallet": true,
+            "wallet_balance": balance,
+            "wallet_burn_per_day": per_day,
+            "wallet_burn_currency": "CNY",
+        }))
+    };
+    assert_eq!(
+        wallet(371.47, 160.7),
+        "api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)",
+    );
+    assert_eq!(
+        wallet(50.0, 160.7),
+        "api balance: 50.00 CNY · ~160.7 CNY/day (~7 h left)",
+    );
+}
+
+/// No runway without both figures: a zero burn never runs out, and a burn with
+/// no numeric balance has nothing to divide.
+#[test]
+fn windows_prose_names_no_runway_without_a_balance_and_a_burn() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "has_wallet": true,
+            "wallet_balance": 371.47,
+            "wallet_burn_per_day": 0.0,
+            "wallet_burn_currency": "CNY",
+        })),
+        "api balance: 371.47 CNY · ~0.0 CNY/day",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "has_wallet": true,
+            "wallet_burn_per_day": 160.7,
+            "wallet_burn_currency": "CNY",
+        })),
+        "api balance: 371.47 CNY · ~160.7 CNY/day",
     );
 }
 
@@ -887,9 +1052,21 @@ fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "stale": true,
         })),
-        "no 5h/7d limits; api balance: 31.45 CNY (stale)",
+        "api balance: 31.45 CNY (stale)",
+    );
+    // A counter's stale verdict rides AFTER the denial, which keeps its place.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "credits: 42 units",
+            "provider_windows": false,
+            "has_wallet": false,
+            "stale": true,
+        })),
+        "no 5h/7d limits; credits: 42 units (stale)",
     );
     // And on the arm that prints no denial, so the clause rides the FIGURE
     // rather than whatever text happens to precede it.
@@ -905,8 +1082,7 @@ fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
 }
 
 /// The wallet-burn rate rides the balance it qualifies, before the freshness
-/// clause — the shortfall-report shape: the figure and its pace, the caller
-/// judges the runway.
+/// clause — the shortfall-report shape: the figure and its pace.
 #[test]
 fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
     assert_eq!(
@@ -914,10 +1090,11 @@ fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
             "kind": "third_party",
             "balance": "api balance: 2.53 CNY",
             "provider_windows": false,
+            "has_wallet": true,
             "wallet_burn_per_day": 4.17,
             "wallet_burn_currency": "CNY",
         })),
-        "no 5h/7d limits; api balance: 2.53 CNY · ~4.2 CNY/day",
+        "api balance: 2.53 CNY · ~4.2 CNY/day",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
@@ -937,8 +1114,99 @@ fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
             "kind": "third_party",
             "balance": "api balance: 2.53 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         })),
-        "no 5h/7d limits; api balance: 2.53 CNY",
+        "api balance: 2.53 CNY",
+    );
+}
+
+/// The runway rounds to the nearest whole unit and keeps its unit above the
+/// day: 160.7 CNY/day makes 200 CNY last 1.24 days → one SINGULAR day, 12 CNY
+/// last 1.79 h → 2 h, and 1 CNY (0.15 h) rounds to no whole hour at all.
+/// A negative balance is no runway, not a negative one.
+#[test]
+fn windows_prose_rounds_the_runway_to_whole_days_and_hours() {
+    let wallet = |balance: f64, per_day: f64| {
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": format!("api balance: {balance:.2} CNY"),
+            "provider_windows": false,
+            "has_wallet": true,
+            "wallet_balance": balance,
+            "wallet_burn_per_day": per_day,
+            "wallet_burn_currency": "CNY",
+        }))
+    };
+    assert_eq!(
+        wallet(200.0, 160.7),
+        "api balance: 200.00 CNY · ~160.7 CNY/day (~1 day left)",
+    );
+    assert_eq!(
+        wallet(160.7, 160.7),
+        "api balance: 160.70 CNY · ~160.7 CNY/day (~1 day left)",
+    );
+    assert_eq!(
+        wallet(12.0, 160.7),
+        "api balance: 12.00 CNY · ~160.7 CNY/day (~2 h left)",
+    );
+    assert_eq!(
+        wallet(1.0, 160.7),
+        "api balance: 1.00 CNY · ~160.7 CNY/day (<1 h left)",
+    );
+    // Days round to nearest too: 250 / 160.7 = 1.56 days, which floors to 1
+    // and rounds to 2.
+    assert_eq!(
+        wallet(250.0, 160.7),
+        "api balance: 250.00 CNY · ~160.7 CNY/day (~2 days left)",
+    );
+    // A non-finite ratio is no runway either: 1e307 / 0.05 overflows to `inf`
+    // (the payload never carries one today, and the guard keeps `~inf days
+    // left` off a row if it ever does).
+    let overflow = wallet(1e307, 0.05);
+    assert!(
+        overflow.ends_with(" CNY/day"),
+        "a non-finite runway renders no clause: {overflow}",
+    );
+    // The guard reads the burn AS RENDERED (one decimal): 0.04/day prints
+    // `~0.0`, which reads as no burn, so no runway of decades rides it.
+    assert_eq!(
+        wallet(371.47, 0.04),
+        "api balance: 371.47 CNY · ~0.0 CNY/day",
+    );
+    assert_eq!(
+        wallet(-5.0, 160.7),
+        "api balance: -5.00 CNY · ~160.7 CNY/day",
+    );
+}
+
+/// The delegate receipt renders through the same prose, so the target clause
+/// names the target wallet's runway beside its burn — one spelling of one
+/// account's headroom, never a second render path.
+#[test]
+fn delegate_prose_names_the_wallet_runway_in_the_target_clause() {
+    let sync = serde_json::json!({
+        "profile": "vendor",
+        "is_error": false,
+        "result": "ok",
+        "total_cost_usd": 0.5,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "live_usage": {
+            "profile": "vendor",
+            "endpoint": "api.deepseek.com",
+            "kind": "third_party",
+            "balance": "api balance: 371.47 CNY",
+            "provider_windows": false,
+            "has_wallet": true,
+            "wallet_balance": 371.47,
+            "wallet_burn_per_day": 160.7,
+            "wallet_burn_currency": "CNY",
+        }
+    });
+    assert_eq!(
+        delegate_prose(&sync),
+        "delegate to `vendor` finished: ok (equivalent Anthropic API rate cost: $0.5), \
+         usage: input 10 tokens, output 5 tokens; target `vendor`: \
+         api balance: 371.47 CNY · ~160.7 CNY/day (~2 days left)"
     );
 }
 
@@ -965,8 +1233,9 @@ fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
             "kind": "third_party",
             "balance": "api balance: 31.45 CNY",
             "provider_windows": false,
+            "has_wallet": true,
         },
-        "has_live_session": true,
+        "live_sessions": 1,
         "throughput": [{
             "model": "deepseek-chat",
             "tok_s": 12.3,
@@ -980,8 +1249,8 @@ fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     assert_eq!(
         text,
         "- solo (global active) [anthropic]: usage unknown; tier unknown\n\
-         - vendor [DeepSeek, api.deepseek.com]: no 5h/7d limits; api balance: 31.45 CNY; \
-         live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
+         - vendor [DeepSeek, api.deepseek.com]: api balance: 31.45 CNY; \
+         1 live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
 }
 
@@ -994,6 +1263,7 @@ fn endpoint_snapshot(name: &str, base_url: &str) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }
@@ -1319,7 +1589,8 @@ fn profiles_prose_handles_empty_roster_and_error_envelope() {
 
 /// The same ruling on the folded live-usage clause: a delegate to an api-key
 /// account reports that account's own figures, denies the limits that account
-/// really lacks, and dates the figure off its own cache.
+/// really lacks (a wallet denies none — the denial never rides an api
+/// balance), and dates the figure off its own cache.
 #[test]
 fn live_usage_prose_answers_for_a_third_party_target() {
     assert_eq!(
@@ -1329,11 +1600,26 @@ fn live_usage_prose_answers_for_a_third_party_target() {
                 "kind": "third_party",
                 "balance": "api balance: 31.45 CNY",
                 "provider_windows": false,
+                "has_wallet": true,
                 "fetched_secs_ago": 30,
             }),
             "target",
         ),
-        "target `vendor`: no 5h/7d limits; api balance: 31.45 CNY (cached 30s ago)",
+        "target `vendor`: api balance: 31.45 CNY (cached 30s ago)",
+    );
+    assert_eq!(
+        live_usage_prose(
+            &serde_json::json!({
+                "profile": "cnt",
+                "kind": "third_party",
+                "balance": "credits: 42 units",
+                "provider_windows": false,
+                "has_wallet": false,
+                "fetched_secs_ago": 30,
+            }),
+            "target",
+        ),
+        "target `cnt`: no 5h/7d limits; credits: 42 units (cached 30s ago)",
     );
     assert_eq!(
         live_usage_prose(
@@ -1605,7 +1891,10 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
 /// was writing the record is gone, and the resume id is the only way back
 /// into the run's transcript. A RUNNING row carries none of this: its session
 /// is still held by the live run, and inviting a resume onto a session the
-/// run still holds is the collision the row deliberately does not offer.
+/// run still holds is the collision the row deliberately does not offer. An
+/// orphan whose recorded child still writes the transcript is no handle
+/// either (`resumable: false`): a resume would put a second writer on a live
+/// session.
 #[test]
 fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
     let listed = monitor_state_prose(&serde_json::json!({
@@ -1623,6 +1912,15 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
                 "state": "orphaned",
                 "since_secs": 4000,
                 "session_id": "6cc9c767-1cc3-4e77-a787-a7f8a6d41515",
+                "resumable": true,
+            },
+            {
+                "job_id": "d-e-0",
+                "profile": "five",
+                "state": "orphaned",
+                "since_secs": 10,
+                "session_id": "still-being-written",
+                "resumable": false,
             },
         ],
     }));
@@ -1632,9 +1930,10 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
             "delegates clauth holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-d-0` orphaned on `four`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1h 6m ago",
+            "  job `d-e-0` orphaned on `five`, last seen 10s ago",
         ]
         .join("\n"),
-        "only the orphaned row offers the handle, and the age phrase stays the row's tail"
+        "only a resumable orphaned row offers the handle, and the age phrase stays the row's tail"
     );
 }
 
@@ -2298,7 +2597,8 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
                     "endpoint": "api.deepseek.com",
                     "kind": "third_party",
                     "balance": "api balance: 31.45 USD",
-                    "provider_windows": false
+                    "provider_windows": false,
+                    "has_wallet": true
                 }
             },
         ],
@@ -2308,7 +2608,7 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
         delegate_fanout_prose(&fanout),
         "delegated to `solo` (job `d-7-0`), `vendor` (job `d-7-1`); \
          target `solo`: 5h 12% used, 7d 45.6% used; \
-         target `vendor`: no 5h/7d limits; api balance: 31.45 USD; \
+         target `vendor`: api balance: 31.45 USD; \
          since your last call: credentials file rewritten",
     );
 }
@@ -2337,7 +2637,8 @@ fn delegate_fanout_results_prose_names_each_row_and_digest_last() {
                     "endpoint": "api.deepseek.com",
                     "kind": "third_party",
                     "balance": "api balance: 31.45 USD",
-                    "provider_windows": false
+                    "provider_windows": false,
+                    "has_wallet": true
                 }
             },
         ],
@@ -2346,7 +2647,7 @@ fn delegate_fanout_results_prose_names_each_row_and_digest_last() {
     assert_eq!(
         delegate_fanout_results_prose(&payload),
         "delegate to `solo` finished: ok; target `solo`: 5h 12% used, 7d 45.6% used\n\
-         delegate to `vendor` finished: done; target `vendor`: no 5h/7d limits; api balance: 31.45 USD\n\
+         delegate to `vendor` finished: done; target `vendor`: api balance: 31.45 USD\n\
          since your last call: credentials file rewritten",
     );
 }
@@ -2678,6 +2979,154 @@ fn monitor_batch_prose_never_opens_with_a_blank_line() {
     assert_eq!(prose, "since your last call: credentials file rewritten");
 }
 
+/// A `result: "file"` reply names the result's first line beside the path, so
+/// the model can judge the answer without paying a Read for the body.
+#[test]
+fn result_file_prose_names_the_results_first_line() {
+    let e = serde_json::json!({
+        "result": "all done\nsecond line\n\nthird line",
+        "total_cost_usd": 0.5,
+        "live_usage": {"endpoint": "anthropic"},
+    });
+    assert_eq!(
+        result_file_prose("/tmp/r.txt", "abc123", &e),
+        "result written to /tmp/r.txt (sha256 abc123); first line: all done; (cost $0.5)",
+    );
+}
+
+/// The first line is the first NON-empty line of the delegate's RESULT text,
+/// trimmed, every control character escaped, cut at 200 characters with
+/// `format::truncate`'s three-dot `...` marker. A non-string result renders its
+/// literal and a missing one reads `unknown`, matching `envelope_prose`.
+#[test]
+fn result_first_line_trims_escapes_and_cuts() {
+    assert_eq!(
+        result_first_line(&serde_json::json!({
+            "result": "\n  \n  real answer  \nsecond line"
+        })),
+        "real answer",
+        "blank leading lines are skipped, the line is trimmed"
+    );
+    assert_eq!(
+        result_first_line(&serde_json::json!({"result": "a\u{1}b"})),
+        "a\\u{0001}b",
+        "a control byte escapes, never rides raw",
+    );
+    let long = "x".repeat(300);
+    let cut = result_first_line(&serde_json::json!({ "result": long }));
+    assert_eq!(cut.chars().count(), 200, "the cut lands at 200 characters");
+    assert!(cut.ends_with("..."), "a cut line ends in `...`: {cut}");
+    assert_eq!(
+        result_first_line(&serde_json::json!({"result": 42})),
+        "42",
+        "a numeric result renders its literal"
+    );
+    assert_eq!(
+        result_first_line(&serde_json::json!({})),
+        "unknown",
+        "a missing result reads unknown"
+    );
+}
+
+/// The bound is on the RENDERED line. `escape_unless` widens every control
+/// character to its eight-character `\u{....}` spelling, so a cut taken before
+/// the escape lets a line of control bytes through at eight times the budget.
+/// The cut lands after the escape, keeps `format::truncate`'s `...` marker,
+/// and never splits an escape sequence: 200 control characters escape to 1600
+/// characters and render as twenty-four whole escapes plus the marker, inside
+/// the 200-character bound.
+#[test]
+fn result_first_line_bounds_the_escaped_output() {
+    let line = "\u{1}".repeat(200);
+    let out = result_first_line(&serde_json::json!({ "result": line }));
+    assert!(
+        out.chars().count() <= 200,
+        "the escaped line stays inside the bound: {} chars",
+        out.chars().count()
+    );
+    let expected = format!("{}...", "\\u{0001}".repeat(24));
+    assert_eq!(out, expected, "whole escapes only, marker on the cut");
+}
+
+/// A literal backslash in the text is not an escape: the cut keeps the text
+/// before it instead of backing up to it and collapsing the line.
+#[test]
+fn result_first_line_keeps_text_before_a_literal_backslash() {
+    let line = format!("\\{}\u{1}", "x".repeat(198));
+    let out = result_first_line(&serde_json::json!({ "result": line }));
+    let expected = format!("\\{}...", "x".repeat(196));
+    assert_eq!(out, expected, "the cut keeps the line, marker at the bound");
+}
+
+/// A bidi override in a delegate's first line is escaped like a control
+/// character, so the reply cannot reorder the line it sits in.
+#[test]
+fn result_first_line_escapes_a_bidi_override() {
+    let out = result_first_line(&serde_json::json!({ "result": "ok\u{202e}evil" }));
+    assert_eq!(out, "ok\\u{202e}evil");
+}
+
+/// An escape that would straddle the bound is dropped whole: the line keeps
+/// its text up to the escape and never shows a dangling `\u` or `\`.
+#[test]
+fn result_first_line_drops_an_escape_straddling_the_bound() {
+    for lead in [195, 196] {
+        let line = format!("{}\u{1}", "x".repeat(lead));
+        let out = result_first_line(&serde_json::json!({ "result": line }));
+        assert_eq!(out, format!("{}...", "x".repeat(lead)), "lead {lead}");
+    }
+}
+
+/// A done batch row that carries a result file renders COMPACT: verdict, first
+/// line, then the path + sha256 the body lives under, plus the cost clause. A
+/// row without a result file (the write-failure fallback) keeps the inline
+/// envelope spelling unchanged.
+#[test]
+fn monitor_batch_prose_renders_a_compact_done_row() {
+    let compact = serde_json::json!({
+        "results": [{
+            "job_id": "d-1-0",
+            "status": "done",
+            "is_error": false,
+            "first_line": "all done",
+            "result_file": "/tmp/d-1-0.txt",
+            "sha256": "abc",
+            "total_cost_usd": 1.5,
+            "live_usage": {"endpoint": "anthropic"},
+        }],
+    });
+    assert_eq!(
+        monitor_batch_prose(&compact),
+        "job `d-1-0` finished: all done; \
+         result written to /tmp/d-1-0.txt (sha256 abc); (cost $1.5)",
+    );
+
+    let failed = serde_json::json!({
+        "results": [{
+            "job_id": "d-2-0",
+            "status": "done",
+            "is_error": true,
+            "first_line": "boom",
+            "result_file": "/tmp/d-2-0.txt",
+            "sha256": "abc",
+        }],
+    });
+    assert_eq!(
+        monitor_batch_prose(&failed),
+        "job `d-2-0` failed: boom; result written to /tmp/d-2-0.txt (sha256 abc)",
+        "the verdict word mirrors the envelope's error flag"
+    );
+
+    let inline = serde_json::json!({
+        "results": [{"job_id": "d-3-0", "status": "done", "is_error": false, "result": "ok"}],
+    });
+    assert_eq!(
+        monitor_batch_prose(&inline),
+        "job `d-3-0` finished: ok",
+        "a row without a result file keeps the inline spelling"
+    );
+}
+
 /// A cancelled run is not a timed-out one, and the verdict word is the first
 /// thing a reader takes off the line. The salvage clauses already render here,
 /// so a cancel carries its partial and its resume handle for free.
@@ -2738,6 +3187,7 @@ fn delegate_prose_shrinks_the_finished_envelope() {
             "kind": "third_party",
             "endpoint": "api.deepseek.com",
             "provider_windows": false,
+            "has_wallet": true,
             "balance": "api balance: 1044.41 CNY",
             "fetched_secs_ago": 35
         },
@@ -2759,7 +3209,7 @@ fn delegate_prose_shrinks_the_finished_envelope() {
         "delegate to `DS8` finished: <the delegate's answer> (equivalent Anthropic API rate \
          cost: $3.411), usage: input 83930 tokens, `cache_read_input_tokens` 3948672, \
          output 40681 tokens, `service_tier` standard, `speed` standard; resume with session id \
-         `d44b2c9c-...`; permission denials: Bash; target `DS8`: no 5h/7d limits; \
+         `d44b2c9c-...`; permission denials: Bash; target `DS8`: \
          api balance: 1044.41 CNY (cached 35s ago)"
     );
 }
@@ -2839,4 +3289,493 @@ fn envelope_prose_names_denials_and_marks_the_unreadable() {
     );
     let empty = serde_json::json!({"result": "ok", "permission_denials": []});
     assert!(!envelope_prose(&empty).contains("permission denials"));
+}
+
+// ── hook refusals vs permission denials ─────────────────────────────────────
+
+const SPLIT_SLUG: &str = "-w-split";
+
+/// Write a fixture transcript under the sandbox's `~/.claude/projects/` store,
+/// one JSON value per line. The lookup resolves it by the filename stem.
+fn write_transcript(home: &crate::testutil::HomeSandbox, session_id: &str, lines: &[Value]) {
+    let dir = home.home().join(".claude/projects").join(SPLIT_SLUG);
+    std::fs::create_dir_all(&dir).unwrap();
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(transcript_path(home, session_id), body).unwrap();
+}
+
+fn transcript_path(home: &crate::testutil::HomeSandbox, session_id: &str) -> std::path::PathBuf {
+    home.home()
+        .join(".claude/projects")
+        .join(SPLIT_SLUG)
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// A `tool_result` content as a string: the shape the child writes for a hook
+/// refusal.
+fn text(body: &str) -> Value {
+    Value::String(body.to_string())
+}
+
+/// One transcript `tool_result` line: the user message carrying the child's
+/// answer to a `tool_use` id. `content` is the block's own content value, so
+/// both a string and a `[{ "type": "text", … }]` array are expressible.
+fn tool_result_line(tool_use_id: &str, is_error: bool, content: Value) -> Value {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "is_error": is_error,
+                "content": content,
+            }]
+        }
+    })
+}
+
+fn denial_entry(tool_name: &str, tool_use_id: &str) -> Value {
+    serde_json::json!({
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "tool_input": {},
+    })
+}
+
+/// The `Edit` refusals a `PreToolUse` hook leaves behind are split out of the
+/// permission clause, and the split rides the envelope: the receipt still
+/// reads it after the transcript is gone.
+#[test]
+fn envelope_prose_splits_hook_refusals_from_permission_denials() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "split-session";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_hook_1",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+            tool_result_line(
+                "call_hook_2",
+                true,
+                text("PreToolUse:Edit hook error: refused once: clean-rust is not loaded"),
+            ),
+            // A deny-rule denial has no transcript row; these two rows pin what
+            // the match must not take: a non-error result, and an id no denial
+            // names.
+            tool_result_line(
+                "call_deny_1",
+                false,
+                text("PreToolUse:Grep hook error: a non-error result is not a refusal"),
+            ),
+            tool_result_line(
+                "call_other",
+                true,
+                text("PreToolUse:Bash hook error: an id no denial names"),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope[crate::mcp::render::HOOK_REFUSAL_IDS],
+        serde_json::json!(["call_hook_1", "call_hook_2"]),
+        "only the denial ids with an is_error `PreToolUse` row are stamped"
+    );
+    // The classification is stored, not re-read: the receipt still splits with
+    // no transcript left on disk.
+    std::fs::remove_file(transcript_path(&home, sid)).unwrap();
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `split-session`; hook refusals: Edit 2 times; \
+         permission denials: Grep"
+    );
+}
+
+/// No transcript for the session id: one permission clause.
+#[test]
+fn envelope_prose_keeps_one_permission_clause_without_a_transcript() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": "no-such-session",
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `no-such-session`; permission denials: Edit 2 \
+         times, Grep"
+    );
+}
+
+/// Every denial is a hook refusal: the permission clause drops rather than
+/// reading empty.
+#[test]
+fn envelope_prose_drops_the_permission_clause_when_only_hook_refusals_remain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "only-hooks";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_hook_1",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+            tool_result_line(
+                "call_hook_2",
+                true,
+                text(
+                    "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+                ),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Edit", "call_hook_2"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `only-hooks`; hook refusals: Edit 2 times"
+    );
+}
+
+/// The classifier reads the transcript; the envelope's own
+/// `permission_denials` array is left exactly as the child reported it.
+#[test]
+fn classify_leaves_the_permission_denials_field_untouched() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "untouched";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_hook_1",
+            true,
+            text("PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call."),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    let original = envelope["permission_denials"].clone();
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(envelope["permission_denials"], original);
+}
+
+/// The text must START with the hook's own prefix: a tool error that merely
+/// quotes a whole hook message mid-text stays a permission denial. The fixture
+/// carries the full refusal shape — prefix and ` hook error:` wording — so a
+/// matcher that looks anywhere in the text reds.
+#[test]
+fn classify_requires_the_pretooluse_prefix_at_the_start() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "prefix-not-at-start";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_quoted",
+            true,
+            text("Error: rg exited 2 matching PreToolUse:Edit hook error: x"),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Grep", "call_quoted")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `prefix-not-at-start`; permission denials: Grep"
+    );
+}
+
+/// The prefix alone is not the refusal shape: a `PreToolUse:` line without the
+/// child's `<tool> hook error:` wording stays a permission denial.
+#[test]
+fn classify_requires_the_hook_error_wording() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "not-a-hook-error";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_warning",
+            true,
+            text("PreToolUse:Edit hook warning: not a refusal"),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_warning")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `not-a-hook-error`; permission denials: Edit"
+    );
+}
+
+/// ` hook error:` must follow the `PreToolUse:<tool>` token directly: wording
+/// that slips further along the text, and a lead that names no tool, are both
+/// something other than the refusal.
+#[test]
+fn classify_requires_the_hook_error_wording_directly_after_the_tool() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "wording-not-direct";
+    write_transcript(
+        &home,
+        sid,
+        &[
+            tool_result_line(
+                "call_warning_then_error",
+                true,
+                text("PreToolUse:Edit hook warning: the hook error: x"),
+            ),
+            tool_result_line(
+                "call_no_tool",
+                true,
+                text("PreToolUse: hook error: no tool named"),
+            ),
+        ],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_warning_then_error"),
+            denial_entry("Edit", "call_no_tool"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `wording-not-direct`; permission denials: Edit 2 \
+         times"
+    );
+}
+
+/// The child writes a hook error's `tool_result` content as text blocks too, not
+/// only as a string; both shapes classify.
+#[test]
+fn classify_reads_a_tool_result_content_block_array() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "content-blocks";
+    write_transcript(
+        &home,
+        sid,
+        &[tool_result_line(
+            "call_hook_1",
+            true,
+            serde_json::json!([{
+                "type": "text",
+                "text": "PreToolUse:Edit hook error: rule pack `code`: read it, then retry this call.",
+            }]),
+        )],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert_eq!(
+        envelope[crate::mcp::render::HOOK_REFUSAL_IDS],
+        serde_json::json!(["call_hook_1"])
+    );
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `content-blocks`; hook refusals: Edit; permission \
+         denials: Grep"
+    );
+}
+
+/// Only a `tool_result` block answers a tool call: a text block carrying the
+/// same id, even beside a `tool_result` word, never classifies.
+#[test]
+fn classify_requires_the_tool_result_block_type() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "block-type";
+    write_transcript(
+        &home,
+        sid,
+        &[serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "tool_result PreToolUse: a note, not a block"},
+                    {
+                        "type": "text",
+                        "tool_use_id": "call_text",
+                        "is_error": true,
+                        "content": "PreToolUse:Edit hook error: not a tool_result block",
+                    },
+                ],
+            }
+        })],
+    );
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_text")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `block-type`; permission denials: Edit"
+    );
+}
+
+/// An undecodable transcript line ends the scan: nothing is stamped and the
+/// single clause stands, rather than an error reaching the receipt.
+#[test]
+fn classify_returns_on_an_undecodable_transcript_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "undecodable-line";
+    std::fs::create_dir_all(home.home().join(".claude/projects").join(SPLIT_SLUG)).unwrap();
+    // An invalid-UTF-8 line, then a row that would classify: a scan that
+    // continued past the error would stamp, and a scan that returns does not.
+    let mut bytes = b"\xff\xfe\n".to_vec();
+    bytes.extend_from_slice(
+        tool_result_line(
+            "call_hook_1",
+            true,
+            text("PreToolUse:Edit hook error: after the bad line"),
+        )
+        .to_string()
+        .as_bytes(),
+    );
+    bytes.push(b'\n');
+    std::fs::write(transcript_path(&home, sid), bytes).unwrap();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [
+            denial_entry("Edit", "call_hook_1"),
+            denial_entry("Grep", "call_deny_1"),
+        ],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `undecodable-line`; permission denials: Edit, Grep"
+    );
+}
+
+/// A read error that never clears ends the scan too: the classification returns
+/// instead of spinning on the same line.
+#[cfg(unix)]
+#[test]
+fn classify_returns_on_a_persistent_read_error() {
+    let home = crate::testutil::HomeSandbox::new();
+    let sid = "persistent-error";
+    let dir = home.home().join(".claude/projects").join(SPLIT_SLUG);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Opening a directory succeeds; reading it fails with `Is a directory`
+    // forever. `collect_jsonl` pushes the link because its name ends `.jsonl`.
+    let target = dir.join("a-directory");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, transcript_path(&home, sid)).unwrap();
+    let mut envelope = serde_json::json!({
+        "result": "ok",
+        "session_id": sid,
+        "permission_denials": [denial_entry("Edit", "call_hook_1")],
+    });
+    crate::mcp::classify_hook_refusals(&mut envelope);
+    assert!(envelope.get(crate::mcp::render::HOOK_REFUSAL_IDS).is_none());
+    assert_eq!(
+        envelope_prose(&envelope),
+        "finished: ok; resume with session id `persistent-error`; permission denials: Edit"
+    );
+}
+
+/// A reader whose `fill_buf` fails on every call gets one read attempt: the
+/// scan returns `None` on the first error, so the work it can do is bounded by
+/// the reader, not by the error clearing. The reader counts its calls and
+/// panics past the bound, so a `continue` on the error reds this test instead
+/// of spinning the suite forever.
+#[test]
+fn scan_returns_after_one_failed_read() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct AlwaysFailing {
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl std::io::Read for AlwaysFailing {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("persistent read error"))
+        }
+    }
+
+    impl std::io::BufRead for AlwaysFailing {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            let reads = self.reads.get() + 1;
+            self.reads.set(reads);
+            assert!(
+                reads <= 2,
+                "a read error must end the scan, not re-read the line"
+            );
+            Err(std::io::Error::other("persistent read error"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    let reads = Rc::new(Cell::new(0));
+    let reader = AlwaysFailing {
+        reads: Rc::clone(&reads),
+    };
+    assert_eq!(
+        crate::mcp::scan_hook_refusal_ids(reader, &["call_hook_1"]),
+        None,
+        "a read error ends the scan"
+    );
+    assert_eq!(reads.get(), 1, "one read attempt, then the scan returns");
 }

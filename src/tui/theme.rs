@@ -69,29 +69,43 @@ thread_local! {
     static GHOSTTY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Detect the tier from `$COLORTERM`:
-/// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
-pub(crate) fn detect() -> Tier {
-    match std::env::var("COLORTERM")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
-        "truecolor" | "24bit" => Tier::Full,
-        _ => Tier::Compatible,
-    }
+/// The environment the production detection reads.
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
-/// Detect the terminal family Claude Code draws its other working-line set for.
-pub(crate) fn detect_ghostty() -> bool {
-    std::env::var("TERM").is_ok_and(|term| term == "xterm-ghostty")
+/// The startup detection read through `env`, the only seam it has to the
+/// process environment: the tier comes from `$COLORTERM` (`truecolor` or
+/// `24bit` → [`Tier::Full`], anything else → [`Tier::Compatible`]), the
+/// ghostty flag from `TERM == "xterm-ghostty"`. `NO_COLOR` is the terminal
+/// library's to honour: crossterm's `Colored` display path drops colour while
+/// it is set. `TERM=dumb` is no tier: crossterm 0.29 (measured 2026-10-31)
+/// reads `TERM` only in `available_color_count`, which the TUI never calls,
+/// and in its windows ANSI probe once VT processing fails to enable. The tier
+/// ignores both.
+pub(crate) fn detect_with(env: impl Fn(&str) -> Option<String>) -> (Tier, bool) {
+    let tier = match env("COLORTERM").unwrap_or_default().to_lowercase().as_str() {
+        "truecolor" | "24bit" => Tier::Full,
+        _ => Tier::Compatible,
+    };
+    let ghostty = env("TERM").is_some_and(|term| term == "xterm-ghostty");
+    (tier, ghostty)
+}
+
+/// Detect the tier from the process environment (see [`detect_with`]).
+/// Test builds read the tier through the thread-local pin only, so the
+/// fallback's caller is `cfg(not(test))` and so is this.
+#[cfg(not(test))]
+pub(crate) fn detect() -> Tier {
+    detect_with(process_env).0
 }
 
 /// Seed the process tier and terminal family at startup.
 /// Precedence (highest first): explicit override → auto-detect.
 pub(crate) fn init(override_tier: Option<Tier>) {
-    set_tier(override_tier.unwrap_or_else(detect));
-    set_ghostty(detect_ghostty());
+    let (tier, ghostty) = detect_with(process_env);
+    set_tier(override_tier.unwrap_or(tier));
+    set_ghostty(ghostty);
 }
 
 /// Whether the terminal is the family Claude Code draws its other working-line
@@ -165,6 +179,13 @@ fn pick(full: Color, compatible: Color) -> Color {
 }
 
 // ── Surfaces ──────────────────────────────────────────────────────────────────
+//
+// The painted surface colours are the full tier's fills and, on the compatible
+// tier, the colour a surface's text rides when it sits on an inverse fill. A
+// surface fill paints only on the full tier; the selected-row tint (`bg_hover`)
+// and the toast glass (`bg_sunken` blended) paint on both. Otherwise the
+// compatible tier leaves a surface unpainted so the terminal's own background
+// shows through, and elevation falls to borders and colour alone.
 #[inline]
 pub(crate) fn bg() -> Color {
     pick(Color::Rgb(30, 30, 46), Color::Indexed(235))
@@ -172,6 +193,18 @@ pub(crate) fn bg() -> Color {
 #[inline]
 pub(crate) fn bg_sunken() -> Color {
     pick(Color::Rgb(17, 17, 27), Color::Indexed(233))
+}
+
+/// The base surface fill (`BG`), unpainted on the compatible tier.
+#[inline]
+pub(crate) fn surface_fill() -> Color {
+    pick(Color::Rgb(30, 30, 46), Color::Reset)
+}
+
+/// The sunken surface fill (`BG_SUNKEN`), unpainted on the compatible tier.
+#[inline]
+pub(crate) fn sunken_fill() -> Color {
+    pick(Color::Rgb(17, 17, 27), Color::Reset)
 }
 #[inline]
 pub(crate) fn bg_hover() -> Color {
@@ -208,11 +241,62 @@ pub(crate) fn text_faint_color() -> Color {
 pub(crate) fn accent_color() -> Color {
     pick(Color::Rgb(67, 171, 229), Color::Indexed(75))
 }
-/// Claude orange — the warm secondary; rule: once per screen max.
+/// Claude orange — the warm secondary, held only by a closed set of warm
+/// anchors; any other orange is a passing crest, never a held color.
 #[inline]
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
 }
+
+/// A provider the Overview's identity wave recognizes by type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrestProvider {
+    Anthropic,
+    DeepSeek,
+    Zai,
+    Alibaba,
+    OpenRouter,
+    MiniMax,
+    Codex,
+}
+
+impl CrestProvider {
+    /// Every variant, in declaration order. Test-only: the palette pins walk it
+    /// to prove each provider a variant can name has a reviewed crest.
+    #[cfg(test)]
+    pub(crate) const ALL: [CrestProvider; 7] = [
+        CrestProvider::Anthropic,
+        CrestProvider::DeepSeek,
+        CrestProvider::Zai,
+        CrestProvider::Alibaba,
+        CrestProvider::OpenRouter,
+        CrestProvider::MiniMax,
+        CrestProvider::Codex,
+    ];
+}
+
+/// The full-tier RGB of a provider's identity-wave crest. Each holds 4.5:1
+/// against `BG` and `BG_HOVER`; z.ai's sweeps dark, below `TEXT_DIM`.
+pub(crate) fn crest_rgb(provider: CrestProvider) -> (u8, u8, u8) {
+    match provider {
+        CrestProvider::Anthropic => (217, 119, 87), // 5.25:1 BG, 4.64:1 BG_HOVER
+        CrestProvider::DeepSeek => (0x67, 0x99, 0xFE), // 5.91:1 BG, 5.21:1 BG_HOVER
+        CrestProvider::Zai => (0x8A, 0x90, 0xA6),   // 5.17:1 BG, 4.56:1 BG_HOVER
+        CrestProvider::Alibaba => (0xFF, 0x6A, 0x00), // 5.71:1 BG, 5.04:1 BG_HOVER
+        CrestProvider::OpenRouter => (0xC8, 0xFF, 0x00), // 13.87:1 BG, 12.24:1 BG_HOVER
+        CrestProvider::MiniMax => (0xFF, 0x51, 0x51), // 5.11:1 BG, 4.51:1 BG_HOVER
+        CrestProvider::Codex => (205, 214, 244),    // 11.34:1 BG, 10.01:1 BG_HOVER
+    }
+}
+
+/// A provider's crest color. The wave's own tier check is the single gate that
+/// keeps the crest off the compatible tier, so this answers the full-tier RGB
+/// on every tier.
+pub(crate) fn crest_color(provider: CrestProvider) -> Color {
+    let (r, g, b) = crest_rgb(provider);
+    Color::Rgb(r, g, b)
+}
+
 /// Clawd's `clawd_background` cut-out colour: `rgb(0,0,0)` in the source's dark
 /// and light themes alike (its ansi themes use `ansi:black`). The compatible
 /// tier uses xterm-256 index 16 (the colour cube's black), never 16-colour
@@ -382,6 +466,31 @@ fn nearest_index(rgb: (u8, u8, u8)) -> u8 {
     best
 }
 
+// ── Marks (tier-independent) ──────────────────────────────────────────────────
+
+/// Selection caret, drawn only inside the focused pane.
+pub(crate) const CARET: &str = "❯";
+/// Filled status dot — active / online.
+pub(crate) const DOT_ON: &str = "●";
+/// Hollow status dot — inactive / disconnected.
+pub(crate) const DOT_OFF: &str = "○";
+/// Done / captured mark.
+pub(crate) const DONE: &str = "✓";
+/// Collapsed disclosure arrow.
+pub(crate) const DISCLOSURE_SHUT: &str = "▶";
+/// Expanded disclosure arrow.
+pub(crate) const DISCLOSURE_OPEN: &str = "▼";
+/// Heavy vertical: the toast's left bar and the scrollbar's thumb.
+pub(crate) const BAR: &str = "┃";
+/// Scrollbar track.
+pub(crate) const TRACK: &str = "┊";
+/// Static waiting mark — `queued` / `idle`.
+pub(crate) const WAITING: &str = "◌";
+/// Ticked checkbox of a multi-select row.
+pub(crate) const CHECKBOX_ON: &str = "[x]";
+/// Unticked checkbox of a multi-select row.
+pub(crate) const CHECKBOX_OFF: &str = "[ ]";
+
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
 
 /// Toggle switch in the **on** state.
@@ -456,7 +565,7 @@ pub(crate) fn dead_credential_glyph() -> &'static str {
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn base() -> Style {
-    Style::default().fg(text_color()).bg(bg())
+    Style::default().fg(text_color()).bg(surface_fill())
 }
 
 /// Plain body text — foreground only.

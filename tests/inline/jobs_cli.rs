@@ -333,6 +333,50 @@ fn an_isolated_runs_row_is_marked_isolated() {
     );
 }
 
+/// A finished attached run's settled liveness record reads done, and its
+/// row says no `monitor` call can collect it; a background run's done row can.
+#[test]
+fn a_finished_attached_runs_json_row_is_done_and_not_collectable() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-att-0.live.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-att-0",
+            "profile": "work",
+            "state": "done",
+            "started_at": NOW - 600_000,
+            "done_at": NOW - 120_000,
+            "outcome": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    seed_done("d-fin-0", NOW - 600_000, NOW - 120_000);
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows(NOW))).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+    assert_eq!(by_id("d-att-0")["state"], by_id("d-fin-0")["state"]);
+    assert_eq!(
+        by_id("d-att-0")["collectable"],
+        serde_json::json!(false),
+        "an attached run's result went back through its call"
+    );
+    assert_eq!(
+        by_id("d-fin-0")["collectable"],
+        serde_json::json!(true),
+        "control: a background run's done row is collectable"
+    );
+}
+
 /// The `--json` field set is FIXED: every key is present on every row, and a
 /// figure the record does not have is `null`.
 ///
@@ -589,5 +633,88 @@ fn the_table_names_each_row_and_quotes_a_tail_on_its_own_line() {
     assert!(
         table.contains("    \"building the crate\""),
         "the tail rides its own indented, quoted line:\n{table}"
+    );
+}
+
+/// A column sizes and pads by drawn cells: a profile cell of four wide glyphs
+/// (eight cells) lays the table out exactly as an eight-letter ASCII name does,
+/// so every column after it keeps its start.
+#[test]
+fn a_wide_script_profile_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let _home = HomeSandbox::new();
+    write_running(&RunningSpec {
+        profile: WIDE.to_string(),
+        ..spec("d-wide-0", NOW - 65_000)
+    })
+    .unwrap();
+    write_running(&spec("d-narrow-0", NOW - 65_000)).unwrap();
+
+    let mut rows = rows(NOW);
+    let wide = render_table(&rows);
+    for row in &mut rows {
+        if row.profile == WIDE {
+            row.profile = TWIN.to_string();
+        }
+    }
+    let twin = render_table(&rows);
+
+    assert!(
+        twin.contains(TWIN),
+        "the twin table renders the twin: {twin}"
+    );
+    assert_eq!(wide, twin.replace(TWIN, WIDE));
+}
+
+/// A stopped record reads its own word, dated by when it stopped, with no
+/// elapsed figure and no invented result text.
+#[test]
+fn a_stopped_record_reads_stopped() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-stop.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "work",
+            "state": "done",
+            "started_at": NOW - 65_000,
+            "done_at": NOW - 5_000,
+            "stopped": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let rows = rows(NOW);
+    assert_eq!(rows.len(), 1, "one record in the store");
+    assert_eq!(
+        rows[0].phase.label(),
+        "stopped",
+        "the row's state word is stopped"
+    );
+    assert_eq!(
+        row_json(&rows[0]),
+        serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "work",
+            "state": "stopped",
+            "collectable": false,
+            "session_id": null,
+            "isolated": false,
+            "age_secs": 5,
+            "elapsed_secs": null,
+            "last_output_secs_ago": null,
+            "idle_kill_in_secs": null,
+            "wall_kill_in_secs": null,
+            "tail": "",
+        })
+    );
+    assert_eq!(
+        render_table(&rows),
+        "STATE    JOB ID  PROFILE  AGE  ELAPSED  LAST OUTPUT  KILL IN\n\
+         stopped  d-stop  work      5s        -            -  -\n"
     );
 }

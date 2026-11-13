@@ -12,6 +12,232 @@ fn write_stats_cache(claude_dir: &std::path::Path, json: &str) {
     std::fs::write(claude_dir.join("stats-cache.json"), json).expect("write stats-cache");
 }
 
+fn stats_at(date: &str) -> String {
+    format!(
+        r#"{{"version":5,"lastComputedDate":"{date}","dailyActivity":[],"dailyModelTokens":[],"totalSessions":0,"totalMessages":0}}"#
+    )
+}
+
+/// The cutoff is the frozen file's, so moving `~/.claude/stats-cache.json` on
+/// never hands ledger days over to Claude Code's rows.
+#[test]
+fn the_tab_keeps_its_cutoff_after_the_global_stats_cache_moves() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+    let first = load_frozen_base(&claude_dir, &clauth_dir).expect("first load");
+    assert_eq!(first.last_computed_date.as_deref(), Some("2026-06-09"));
+
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    let second = load_frozen_base(&claude_dir, &clauth_dir).expect("second load");
+    assert_eq!(second.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// An unusable frozen file costs the freeze, never the tab.
+#[test]
+fn a_torn_frozen_base_falls_back_to_the_global_file() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    std::fs::write(clauth_dir.join("stats-base.json"), "{not json").expect("write torn");
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-11-04"));
+}
+
+/// With nothing to freeze, the load fails exactly as the global read does.
+#[test]
+fn no_stats_cache_anywhere_keeps_the_missing_error() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+
+    let frozen = load_frozen_base(&claude_dir, &clauth_dir).expect_err("nothing to read");
+    let plain = load_base(&claude_dir).expect_err("nothing to read");
+    assert_eq!(frozen.cause_line(), plain.cause_line());
+    assert!(!clauth_dir.join("stats-base.json").exists());
+}
+
+/// A freeze that cannot land costs the tab nothing: the global file answers.
+#[test]
+fn an_unwritable_frozen_base_still_loads_the_global_file() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::write(&clauth_dir, "a file where the dir belongs").expect("write");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// Torn bytes carry no date, so freezing them would pin the tab to the global
+/// file forever; the freeze waits for a dated body instead.
+#[test]
+fn a_torn_global_stats_cache_freezes_nothing() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, "{not json");
+
+    let _ = load_frozen_base(&claude_dir, &clauth_dir);
+    assert!(
+        !clauth_dir.join("stats-base.json").exists(),
+        "the torn global froze"
+    );
+
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("load");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+    assert_eq!(
+        std::fs::read_to_string(clauth_dir.join("stats-base.json")).expect("frozen base"),
+        stats_at("2026-06-09"),
+        "the good global froze"
+    );
+}
+
+/// Two publishers read the same absent frozen base; the one that freezes first
+/// while the other is between its checks keeps its bytes.
+#[test]
+fn a_freeze_that_loses_the_race_keeps_the_first_publishers_bytes() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    let first = stats_at("2026-06-09");
+    let frozen = clauth_dir.join("stats-base.json");
+    let frozen_for_hook = frozen.clone();
+    let first_for_hook = first.clone();
+    let _hook = StatsFreezeRereadHook::arm(move || {
+        // The other publisher freezes the base while this one reads the global.
+        std::fs::write(&frozen_for_hook, &first_for_hook).expect("the other publisher freezes");
+    });
+
+    freeze_stats_base(&claude_dir, &clauth_dir).expect("freeze");
+
+    assert_eq!(
+        std::fs::read_to_string(&frozen).expect("frozen base"),
+        first,
+        "the loser overwrote the first publisher's bytes"
+    );
+}
+
+/// A directory at the frozen name is no frozen file: the global stands in.
+#[cfg(unix)]
+#[test]
+fn a_directory_at_the_frozen_base_falls_back_to_the_global() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(clauth_dir.join("stats-base.json")).expect("mkdir frozen name");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let base = load_frozen_base(&claude_dir, &clauth_dir).expect("global stands in");
+    assert_eq!(base.last_computed_date.as_deref(), Some("2026-06-09"));
+}
+
+/// Opening a FIFO for reading blocks until a writer arrives, so a read at the
+/// frozen name would hang the tab's worker before its first paint.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_frozen_base_cannot_hang_the_loader() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    crate::testutil::mkfifo(&clauth_dir.join("stats-base.json"));
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (claude, clauth) = (claude_dir, clauth_dir);
+    std::thread::spawn(move || {
+        let loaded = load_frozen_base(&claude, &clauth);
+        let _ = done_tx.send(loaded.map(|stats| stats.last_computed_date));
+    });
+    let date = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the loader hung on a FIFO at the frozen base")
+        .expect("the global file stands in");
+    assert_eq!(date.as_deref(), Some("2026-06-09"));
+}
+
+/// The stand-in read takes the same regular-file guard: a FIFO at the global
+/// name is refused instead of opened.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_global_stats_cache_cannot_hang_the_loader() {
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    crate::testutil::mkfifo(&claude_dir.join("stats-cache.json"));
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let claude = claude_dir;
+    std::thread::spawn(move || {
+        let loaded = load_base(&claude);
+        let _ = done_tx.send(loaded.map(|stats| stats.last_computed_date));
+    });
+    let refused = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stand-in read hung on a FIFO at the global name");
+    assert!(refused.is_err(), "a FIFO carries no stats: {refused:?}");
+}
+
+/// The background worker reads the frozen base on every refresh, so a global
+/// file that moves after the freeze never moves the tab's cutoff.
+#[test]
+fn the_spawn_worker_keeps_the_frozen_cutoff_across_a_refresh() {
+    fn next_base(rx: &std::sync::mpsc::Receiver<TokensEvent>) -> String {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(TokensEvent::Base(stats)) => {
+                    return stats.last_computed_date.clone().expect("a cutoff");
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no Base event from the tokens worker: {e}"),
+            }
+        }
+    }
+
+    fn next_loaded(rx: &std::sync::mpsc::Receiver<TokensEvent>) {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(TokensEvent::Loaded(_)) => return,
+                Ok(TokensEvent::Failed(cause)) => {
+                    panic!("the tokens worker failed: {}", cause.cause_line())
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+            }
+        }
+    }
+
+    let home = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&home);
+    let clauth_dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    write_stats_cache(&claude_dir, &stats_at("2026-06-09"));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    spawn(tx, refresh_rx, claude_dir.clone(), Some(clauth_dir));
+    assert_eq!(next_base(&rx), "2026-06-09");
+
+    write_stats_cache(&claude_dir, &stats_at("2026-11-04"));
+    refresh_tx.send(()).expect("refresh the worker");
+    assert_eq!(next_base(&rx), "2026-06-09");
+    // Phase 2 (`persist_ledger`) ends with `Loaded`; let it finish before the
+    // sandbox's tempdir goes, or the ledger write recreates `.clauth` under it.
+    next_loaded(&rx);
+    drop(refresh_tx);
+}
+
 fn make_claude_dir(sandbox: &HomeSandbox) -> std::path::PathBuf {
     let dir = sandbox.home().join(".claude");
     std::fs::create_dir_all(&dir).expect("create .claude");
@@ -286,6 +512,242 @@ fn transcript_usage_without_a_model_keeps_unknown_bucket() {
     assert!(records[0].has_usage);
     assert_eq!(records[0].model, "unknown");
     assert_eq!((records[0].input, records[0].output), (3, 1));
+}
+
+/// A read error that never clears (a `.jsonl` that is really a directory) ends
+/// the parse instead of looping forever. The read runs on a thread behind a
+/// bounded wait, so the loop fails by assertion instead of hanging the suite;
+/// `std` cannot cancel that thread, so a red leaves it spinning until the test
+/// process exits.
+#[cfg(unix)]
+#[test]
+fn a_persistent_read_error_ends_parse_file() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let target = dir.join("not-a-file-dir");
+    std::fs::create_dir_all(&target).expect("create target directory");
+    let path = dir.join("dir.jsonl");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink transcript to a directory");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_path = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_file(&thread_path));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_file did not return within 10s: a persistent read error never ends the line loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a directory read yields no records, got {}",
+        recs.len()
+    );
+}
+
+/// One failed read is still skipped: a line that is not valid UTF-8 between two
+/// good lines drops only itself, so both good lines count.
+#[test]
+fn a_bad_utf8_line_between_two_good_lines_drops_only_itself() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let path = dir.join("mixed.jsonl");
+    let good_a = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let good_b = r#"{"timestamp":"2026-06-11T13:00:00+00:00","message":{"id":"b","usage":{"input_tokens":5,"output_tokens":2}}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(good_a.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&[0xff, 0xfe, b'x', b'\n']);
+    bytes.extend_from_slice(good_b.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).expect("write transcript");
+
+    let recs = parse_file(&path);
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(tokens, vec![(3, 1), (5, 2)]);
+}
+
+/// A `BufRead` whose reads follow a script: each read yields either one line
+/// or an error. Once the script runs out, the last step repeats, so a trailing
+/// `Fail` is a read error that never clears.
+enum ReadStep {
+    Line(&'static str),
+    Fail,
+}
+
+struct ScriptedReader {
+    steps: Vec<ReadStep>,
+    next: usize,
+    served: Vec<u8>,
+    consumed: usize,
+    reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScriptedReader {
+    fn new(steps: Vec<ReadStep>, reads: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            steps,
+            next: 0,
+            served: Vec::new(),
+            consumed: 0,
+            reads,
+        }
+    }
+}
+
+impl std::io::Read for ScriptedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = std::io::BufRead::fill_buf(self)?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        std::io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for ScriptedReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.consumed < self.served.len() {
+            return Ok(&self.served[self.consumed..]);
+        }
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let line = match &self.steps[self.next] {
+            ReadStep::Line(line) => Some(*line),
+            ReadStep::Fail => None,
+        };
+        if self.next + 1 < self.steps.len() {
+            self.next += 1;
+        }
+        match line {
+            Some(line) => {
+                // A newline-terminated read is what `read_until` needs to
+                // return the line before the next read's error arrives; a
+                // line without one reads as a partial line that the error
+                // discards, unlike any real transcript file.
+                self.served = format!("{line}\n").into_bytes();
+                self.consumed = 0;
+                Ok(&self.served)
+            }
+            None => Err(std::io::Error::other("scripted read failure")),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.consumed = (self.consumed + amt).min(self.served.len());
+    }
+}
+
+/// A reader that fails every read ends the parse after exactly three read
+/// attempts. The outcome alone (an empty list) cannot tell a capped loop from
+/// an early exit, so the read count is pinned too. The bounded wait turns a
+/// regression into a failed assertion instead of a hung suite.
+#[test]
+fn parse_lines_stops_after_three_consecutive_failed_reads() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(vec![ReadStep::Fail], std::sync::Arc::clone(&reads));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: a reader that fails every read never ends the loop"
+        );
+    };
+    assert!(
+        recs.is_empty(),
+        "a reader that never yields a line parses no records, got {}",
+        recs.len()
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the loop must stop after the third failed read in a row"
+    );
+}
+
+/// Two failed reads, then a good line, then failed reads that never clear: the
+/// good line still counts, and the second run of failures stops the loop after
+/// three. Pins the failure counter's reset on the good read (6 reads, not 4)
+/// and the skip of a failed read (the good line survives two failures).
+#[test]
+fn parse_lines_counts_a_good_line_between_failed_read_runs() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads after a good line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "the good line between two failed-read runs still counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        6,
+        "2 failed reads + 1 good read + 3 failed reads, then the loop stops"
+    );
+}
+
+/// A successful read resets the failure count even when its line records
+/// nothing: two failed reads, an unparseable line, two failed reads, a good
+/// line, then failed reads that never clear. The good line counts and the loop
+/// stops after 9 reads; a count reset only on a recorded line stops at the
+/// fourth read instead.
+#[test]
+fn parse_lines_resets_the_failure_count_on_an_unparseable_line() {
+    let good = r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"id":"a","usage":{"input_tokens":3,"output_tokens":1}}}"#;
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader = ScriptedReader::new(
+        vec![
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line("not json"),
+            ReadStep::Fail,
+            ReadStep::Fail,
+            ReadStep::Line(good),
+            ReadStep::Fail,
+        ],
+        std::sync::Arc::clone(&reads),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_lines(reader));
+    });
+    let Ok(recs) = rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!(
+            "parse_lines did not return within 10s: failed reads around an unparseable line never end the loop"
+        );
+    };
+    let tokens: Vec<(u64, u64)> = recs.iter().map(|r| (r.input, r.output)).collect();
+    assert_eq!(
+        tokens,
+        vec![(3, 1)],
+        "an unparseable line resets the failure count, so the later good line counts"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "2 failed + 1 unparseable + 2 failed + 1 good + 3 failed reads, then the loop stops"
+    );
 }
 
 // ── 1. base stats parsing ─────────────────────────────────────────────────────
@@ -2501,7 +2963,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
     assert_eq!(bytes_after_first, bytes_after_second);
 }
 
-/// The backfill's save is independent of `record`'s: on an idle cycle
+/// The backfill's save is independent of `record_covering`'s: on an idle cycle
 /// (watermark already at yesterday, nothing new to record) the done flag and
 /// filled hours must still persist — otherwise the pass re-sweeps the whole
 /// corpus every 90s until a day records.
@@ -2515,8 +2977,8 @@ fn backfill_persists_when_record_has_nothing_new() {
         let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
         iso.get(..10).map(str::to_owned).unwrap_or(iso)
     };
-    // A v1 ledger whose watermark is ALREADY at yesterday: record() has
-    // nothing to advance or write, so its own save never fires.
+    // A v1 ledger whose watermark is ALREADY at yesterday: record_covering()
+    // has nothing to advance or write, so its own save never fires.
     write_v1_ledger(
         &clauth_dir,
         &yesterday,
@@ -2549,8 +3011,8 @@ fn backfill_persists_when_record_has_nothing_new() {
     let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
     let base = TokenStats::default(); // nothing mergeable
     assert!(
-        !ledger.record(&base, &today),
-        "fixture: record() must have nothing to do"
+        !ledger.record_covering(&base, &today, true),
+        "fixture: record_covering() must have nothing to do"
     );
     persist_ledger(
         &claude_dir,
@@ -2558,6 +3020,7 @@ fn backfill_persists_when_record_has_nothing_new() {
         &clauth_dir,
         &base,
         &today,
+        true,
         |_, _| {},
     );
 
@@ -2625,6 +3088,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
         &clauth_dir,
         &TokenStats::default(),
         &today,
+        true,
         |_, _| {},
     );
 
@@ -3101,6 +3565,7 @@ fn lrec(input: u64, cache_read: u64) -> super::LineRec {
         shape: UsageShape::Healthy,
         fast: false,
         tool_calls: 0,
+        advisor: false,
     }
 }
 
@@ -3737,6 +4202,7 @@ fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
         &clauth_dir,
         &TokenStats::default(),
         "2026-06-20",
+        true,
         |_, _| {},
     );
 
@@ -3780,6 +4246,7 @@ fn persist_ledger_does_not_write_the_speed_ledger() {
         &clauth,
         &base,
         "2026-10-15",
+        true,
         |_, _| {},
     );
 
@@ -3793,4 +4260,1069 @@ fn persist_ledger_does_not_write_the_speed_ledger() {
             .is_empty(),
         "an empty speed ledger loads empty"
     );
+}
+
+// ── advisor iterations ───────────────────────────────────────────────────────
+
+/// A real-shaped `message` iteration: the entries whose sum is the line's
+/// top-level usage.
+fn message_iteration(input: u64, output: u64) -> String {
+    format!(
+        r#"{{"type":"message","input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}"#
+    )
+}
+
+/// A server-side advisor iteration on `model`, with the same extra keys a
+/// real transcript carries (ignored by the reader).
+fn advisor_iteration(model: &str, input: u64, output: u64) -> String {
+    format!(
+        r#"{{"type":"advisor_message","model":"{model}","input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}"#
+    )
+}
+
+/// One assistant line on `claude-sonnet-4-5` whose top-level usage is `top`
+/// (input, output) and whose `iterations[]` is `iterations`; `extra_usage`
+/// is spliced into the usage object (`,"speed":"fast"`).
+fn iterations_line(
+    timestamp: &str,
+    msg_id: &str,
+    uuid: &str,
+    top: (u64, u64),
+    iterations: &[String],
+    extra_usage: &str,
+) -> String {
+    format!(
+        r#"{{"timestamp":"{timestamp}","uuid":"{uuid}","sessionId":"s1","message":{{"id":"{msg_id}","role":"assistant","model":"claude-sonnet-4-5","content":[{{"type":"tool_use"}}],"usage":{{"input_tokens":{},"output_tokens":{},"cache_read_input_tokens":0,"cache_creation_input_tokens":0{extra_usage},"iterations":[{}]}}}}}}"#,
+        top.0,
+        top.1,
+        iterations.join(",")
+    )
+}
+
+/// A stats-cache whose cutoff is 2026-06-10, so every 2026-06-11 transcript
+/// line is post-cutoff.
+fn cutoff_stats_cache(claude_dir: &std::path::Path) {
+    write_stats_cache(
+        claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+}
+
+fn write_project_file(claude_dir: &std::path::Path, name: &str, lines: &[String]) -> PathBuf {
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    let path = project.join(name);
+    std::fs::write(&path, lines.join("\n")).expect("write transcript");
+    set_mtime(&path, SystemTime::now());
+    path
+}
+
+fn lifetime_row<'a>(stats: &'a TokenStats, model: &str) -> Option<&'a ModelTokens> {
+    stats.models.iter().find(|m| m.model == model)
+}
+
+#[test]
+fn an_advisor_iteration_counts_under_its_own_model() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("advisor.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (30, 7),
+            &[
+                message_iteration(10, 3),
+                advisor_iteration("claude-opus-5-5", 301_544, 5_477),
+                message_iteration(20, 4),
+            ],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 2, "the line's own rec plus one advisor rec");
+
+    let main = &recs[0];
+    assert_eq!(main.tok_key, "msg_x");
+    assert_eq!(main.model, "claude-sonnet-4-5");
+    assert_eq!((main.input, main.output), (30, 7), "top-level is untouched");
+    assert!(main.is_message && !main.advisor);
+
+    let adv = &recs[1];
+    assert_eq!(adv.tok_key, "msg_x#adv0");
+    assert_eq!(adv.model, "claude-opus-5-5");
+    assert_eq!(
+        (adv.input, adv.output, adv.cache_read, adv.cache_create),
+        (301_544, 5_477, 0, 0)
+    );
+    assert!(adv.has_usage && adv.advisor);
+    assert!(!adv.is_message, "an advisor call is not a message");
+    assert_eq!((adv.date.as_str(), adv.hour), ("2026-06-11", 10));
+}
+
+#[test]
+fn an_advisor_iteration_carries_all_four_token_fields() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("advisor-four.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (1, 1),
+            &[
+                r#"{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":11,"output_tokens":22,"cache_read_input_tokens":33,"cache_creation_input_tokens":44}"#
+                    .to_owned(),
+            ],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let adv = parse_file(&path)
+        .into_iter()
+        .find(|r| r.advisor)
+        .expect("advisor rec");
+    assert_eq!(
+        (adv.input, adv.output, adv.cache_read, adv.cache_create),
+        (11, 22, 33, 44)
+    );
+}
+
+#[test]
+fn only_advisor_iterations_are_read_from_the_list() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("kinds.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (10, 3),
+            &[
+                message_iteration(10, 3),
+                // Another server-side tool's call, and a typeless entry: neither
+                // is an advisor call, so neither is counted.
+                r#"{"type":"web_search","model":"claude-opus-5-5","input_tokens":999,"output_tokens":999}"#
+                    .to_owned(),
+                r#"{"model":"claude-opus-5-5","input_tokens":999,"output_tokens":999}"#.to_owned(),
+            ],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].advisor);
+}
+
+#[test]
+fn a_null_iterations_line_still_counts_as_a_message() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("null-iterations.jsonl");
+    // The shape of a `<synthetic>` refusal line: `"iterations":null`.
+    std::fs::write(
+        &path,
+        r#"{"timestamp":"2026-06-11T10:00:00+00:00","uuid":"u1","sessionId":"s1","message":{"id":"msg_x","role":"assistant","model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":30,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations":null}}}"#,
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 1, "the line survives and adds no advisor rec");
+    assert!(recs[0].is_message && !recs[0].advisor);
+    assert_eq!((recs[0].input, recs[0].output), (30, 7));
+    assert_eq!(recs[0].session, "s1");
+}
+
+#[test]
+fn an_empty_iterations_list_counts_as_a_message() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("empty-iterations.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line("2026-06-11T10:00:00+00:00", "msg_x", "u1", (30, 7), &[], ""),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 1);
+    assert!(recs[0].is_message);
+    assert_eq!((recs[0].input, recs[0].output), (30, 7));
+}
+
+#[test]
+fn a_null_token_field_on_an_advisor_iteration_reads_as_zero() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("null-token.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (30, 7),
+            &[
+                r#"{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":null,"output_tokens":9,"cache_read_input_tokens":null,"cache_creation_input_tokens":null}"#
+                    .to_owned(),
+                // null `type` and `model` are no advisor entry and no model.
+                r#"{"type":null,"model":null,"input_tokens":5,"output_tokens":5}"#.to_owned(),
+            ],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let recs = parse_file(&path);
+    assert_eq!(recs.len(), 2, "the line plus the one advisor rec");
+    assert!(recs[0].is_message);
+    assert_eq!((recs[0].input, recs[0].output), (30, 7));
+    let adv = &recs[1];
+    assert!(adv.advisor);
+    assert_eq!(adv.model, "claude-opus-5-5");
+    assert_eq!(
+        (adv.input, adv.output, adv.cache_read, adv.cache_create),
+        (0, 9, 0, 0)
+    );
+}
+
+#[test]
+fn a_zero_token_advisor_iteration_adds_no_rec() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("zero.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (10, 3),
+            &[advisor_iteration("claude-opus-5-5", 0, 0)],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    assert_eq!(parse_file(&path).len(), 1);
+}
+
+#[test]
+fn an_advisor_iteration_without_a_model_counts_as_unknown() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("nomodel.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (10, 3),
+            &[
+                r#"{"type":"advisor_message","input_tokens":5,"output_tokens":1}"#.to_owned(),
+                r#"{"type":"advisor_message","model":"   ","input_tokens":7,"output_tokens":2}"#
+                    .to_owned(),
+            ],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let advisors: Vec<_> = parse_file(&path)
+        .into_iter()
+        .filter(|r| r.advisor)
+        .collect();
+    assert_eq!(advisors.len(), 2);
+    assert!(
+        advisors.iter().all(|r| r.model == "unknown"),
+        "an absent or blank model keeps the unknown bucket, as a main line does"
+    );
+}
+
+#[test]
+fn a_placeholder_advisor_model_is_dropped_like_a_placeholder_main_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    write_project_file(
+        &claude_dir,
+        "s.jsonl",
+        &[iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (10, 3),
+            &[advisor_iteration("<synthetic>", 500, 50)],
+            "",
+        )],
+    );
+    let stats = load(&claude_dir).expect("load");
+    assert!(stats.models.iter().all(|m| !m.model.contains('<')));
+    assert_eq!(stats.models.len(), 1);
+}
+
+#[test]
+fn an_idless_line_keys_its_advisor_iteration_off_the_composite_key() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let line = format!(
+        r#"{{"timestamp":"2026-06-11T10:00:00+00:00","message":{{"model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":3,"iterations":[{}]}}}}}}"#,
+        advisor_iteration("claude-opus-5-5", 100, 10)
+    );
+    // The same id-less line in two files: the content-derived key dedups the
+    // main rec, and the advisor key hangs off it, so the advisor dedups too.
+    write_project_file(&claude_dir, "a.jsonl", std::slice::from_ref(&line));
+    write_project_file(&claude_dir, "b.jsonl", &[line]);
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (100, 10));
+}
+
+#[test]
+fn advisor_iterations_dedupe_across_streamed_copies_and_files() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    // Three streamed copies of one turn in file A (one line per content block,
+    // each repeating the same iterations), and the turn carried forward into a
+    // second file under the same message id.
+    let iterations = [
+        message_iteration(30, 7),
+        advisor_iteration("claude-opus-5-5", 301_544, 5_477),
+    ];
+    let copies: Vec<String> = ["u1", "u2", "u3"]
+        .iter()
+        .enumerate()
+        .map(|(i, uuid)| {
+            iterations_line(
+                &format!("2026-06-11T10:00:0{i}+00:00"),
+                "msg_x",
+                uuid,
+                (30, 7),
+                &iterations,
+                "",
+            )
+        })
+        .collect();
+    write_project_file(&claude_dir, "a.jsonl", &copies);
+    write_project_file(
+        &claude_dir,
+        "b.jsonl",
+        &[iterations_line(
+            "2026-06-11T10:00:09+00:00",
+            "msg_x",
+            "u4",
+            (30, 7),
+            &iterations,
+            "",
+        )],
+    );
+
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor lifetime row");
+    assert_eq!((opus.input, opus.output), (301_544, 5_477), "counted once");
+    let day_rows: Vec<_> = stats
+        .daily_models
+        .iter()
+        .filter(|d| d.model == "claude-opus-5-5")
+        .collect();
+    assert_eq!(day_rows.len(), 1);
+    assert_eq!(day_rows[0].date, "2026-06-11");
+    assert_eq!(day_rows[0].in_out, 301_544 + 5_477);
+
+    // The main model's numbers are exactly what they were before the advisor
+    // was read: one turn, top-level usage only.
+    let sonnet = lifetime_row(&stats, "claude-sonnet-4-5").expect("main row");
+    assert_eq!((sonnet.input, sonnet.output), (30, 7));
+}
+
+#[test]
+fn a_growing_iterations_list_counts_each_advisor_call_once() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let first = [
+        message_iteration(30, 7),
+        advisor_iteration("claude-opus-5-5", 100, 10),
+    ];
+    let grown = [
+        message_iteration(30, 7),
+        advisor_iteration("claude-opus-5-5", 100, 10),
+        message_iteration(5, 1),
+        advisor_iteration("claude-opus-5-5", 50, 5),
+    ];
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_x",
+                "u1",
+                (30, 7),
+                &first,
+                "",
+            ),
+            iterations_line(
+                "2026-06-11T10:00:01+00:00",
+                "msg_x",
+                "u2",
+                (35, 8),
+                &grown,
+                "",
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!(
+        (opus.input, opus.output),
+        (150, 15),
+        "adv0 counted once across both copies, adv1 once from the later one"
+    );
+}
+
+#[test]
+fn reordered_non_advisor_entries_keep_the_advisor_key() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let advisor = advisor_iteration("claude-opus-5-5", 100, 10);
+    // The ordinal counts advisor entries only, so moving the advisor entry
+    // within the list, or adding message entries around it, does not move it
+    // to a new key.
+    let early = [advisor.clone(), message_iteration(30, 7)];
+    let late = [
+        message_iteration(1, 1),
+        message_iteration(2, 2),
+        advisor,
+        message_iteration(3, 3),
+    ];
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_x",
+                "u1",
+                (30, 7),
+                &early,
+                "",
+            ),
+            iterations_line(
+                "2026-06-11T10:00:01+00:00",
+                "msg_x",
+                "u2",
+                (30, 7),
+                &late,
+                "",
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (100, 10));
+}
+
+#[test]
+fn differing_advisor_totals_for_one_key_keep_the_larger() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    // A streamed copy written while the advisor call was still accumulating,
+    // then the settled one: the max-total record wins, as for a main line.
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_x",
+                "u1",
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 100, 2)],
+                "",
+            ),
+            iterations_line(
+                "2026-06-11T10:00:01+00:00",
+                "msg_x",
+                "u2",
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 100, 40)],
+                "",
+            ),
+            iterations_line(
+                "2026-06-11T10:00:02+00:00",
+                "msg_x",
+                "u3",
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 100, 9)],
+                "",
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (100, 40));
+}
+
+#[test]
+fn the_same_message_id_in_two_files_counts_its_advisor_call_once() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let line = |uuid: &str, advisor_out: u64| {
+        iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            uuid,
+            (30, 7),
+            &[advisor_iteration("claude-opus-5-5", 100, advisor_out)],
+            "",
+        )
+    };
+    // The files merge in path order and the first-seen key wins across files
+    // (the rule main lines follow too), so the differing copy in `b` is not
+    // added on top.
+    write_project_file(&claude_dir, "a.jsonl", &[line("u1", 10)]);
+    write_project_file(&claude_dir, "b.jsonl", &[line("u2", 25)]);
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (100, 10));
+}
+
+#[test]
+fn two_advisor_iterations_on_one_line_count_once_each() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (30, 7),
+            &[
+                message_iteration(30, 7),
+                advisor_iteration("claude-opus-5-5", 100, 10),
+                advisor_iteration("claude-opus-5-5", 200, 20),
+                advisor_iteration("claude-haiku-4-5", 7, 3),
+            ],
+            "",
+        )],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("opus row");
+    assert_eq!(
+        (opus.input, opus.output),
+        (300, 30),
+        "same-model iterations sum into the model's row"
+    );
+    let haiku = lifetime_row(&stats, "claude-haiku-4-5").expect("haiku row");
+    assert_eq!((haiku.input, haiku.output), (7, 3));
+}
+
+/// An advisor iteration that records its own `speed`.
+fn advisor_iteration_at(model: &str, input: u64, output: u64, speed: &str) -> String {
+    format!(
+        r#"{{"type":"advisor_message","model":"{model}","speed":"{speed}","input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#
+    )
+}
+
+#[test]
+fn a_fast_line_leaves_its_advisor_iteration_standard() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            iterations_line(
+                "2026-06-11T09:00:00+00:00",
+                "msg_fast",
+                "u1",
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 100, 10)],
+                r#","speed":"fast""#,
+            ),
+            iterations_line(
+                "2026-06-11T15:00:00+00:00",
+                "msg_std",
+                "u2",
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 40, 4)],
+                r#","speed":"standard""#,
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (140, 14));
+    assert_eq!(
+        (opus.fast_input, opus.fast_output),
+        (0, 0),
+        "the line's speed is not the advisor's: no iteration speed, no fast subset"
+    );
+    // The main model's own fast line keeps its fast subset.
+    let sonnet = lifetime_row(&stats, "claude-sonnet-4-5").expect("main row");
+    assert_eq!((sonnet.fast_input, sonnet.fast_output), (30, 7));
+}
+
+#[test]
+fn an_advisor_iteration_carrying_its_own_speed_is_priced_at_it() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            // A standard line whose advisor call is fast.
+            iterations_line(
+                "2026-06-11T09:00:00+00:00",
+                "msg_a",
+                "u1",
+                (30, 7),
+                &[advisor_iteration_at("claude-opus-5-5", 100, 10, "fast")],
+                "",
+            ),
+            // A fast line whose advisor call says standard.
+            iterations_line(
+                "2026-06-11T15:00:00+00:00",
+                "msg_b",
+                "u2",
+                (30, 7),
+                &[advisor_iteration_at("claude-opus-5-5", 40, 4, "standard")],
+                r#","speed":"fast""#,
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load");
+    let opus = lifetime_row(&stats, "claude-opus-5-5").expect("advisor row");
+    assert_eq!((opus.input, opus.output), (140, 14));
+    assert_eq!((opus.fast_input, opus.fast_output), (100, 10));
+    let row = stats
+        .daily_models
+        .iter()
+        .find(|d| d.model == "claude-opus-5-5")
+        .expect("day row");
+    let hours = row.hours.as_ref().expect("hours");
+    assert_eq!((hours[9].fast_input, hours[9].fast_output), (100, 10));
+    assert_eq!((hours[15].input, hours[15].fast_input), (40, 0));
+}
+
+#[test]
+fn advisor_rows_never_classify_or_correct_the_shape() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("shape.jsonl");
+    // Nine lines whose advisor iteration reports input and no cache fields on
+    // a model with no main rows: over the row floor, that would classify as a
+    // provider that reports no cache. The main model beside it is a plain
+    // healthy cache-writing model.
+    let lines: Vec<String> = (0..9)
+        .map(|i| {
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                &format!("msg_{i}"),
+                &format!("u{i}"),
+                (30, 7),
+                &[advisor_iteration("claude-opus-5-5", 100, 10)],
+                "",
+            )
+            .replace(
+                r#""cache_creation_input_tokens":0,"iterations""#,
+                r#""cache_creation_input_tokens":5,"iterations""#,
+            )
+        })
+        .collect();
+    std::fs::write(&path, lines.join("\n")).expect("write transcript");
+    let recs = parse_file(&path);
+    let advisors: Vec<_> = recs.iter().filter(|r| r.advisor).collect();
+    assert_eq!(advisors.len(), 9);
+    assert!(
+        advisors
+            .iter()
+            .all(|r| r.shape == UsageShape::Healthy && r.input == 100),
+        "advisor rows are never classified and never input-corrected"
+    );
+    let main: Vec<_> = recs.iter().filter(|r| !r.advisor).collect();
+    assert!(main.iter().all(|r| r.shape == UsageShape::Healthy));
+}
+
+#[test]
+fn advisor_rows_do_not_count_toward_a_main_models_row_floor() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("floor.jsonl");
+    // Four main turns on one model, reading cache and writing none: under the
+    // row floor (8) that classifies as healthy. Each line also carries an
+    // advisor call on the SAME model id, so if those rows joined the model's
+    // group it would reach the floor and the main rows would be re-classified
+    // as not writing cache.
+    let lines: Vec<String> = (0..4)
+        .map(|i| {
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                &format!("msg_{i}"),
+                &format!("u{i}"),
+                (100, 10),
+                &[
+                    message_iteration(100, 10),
+                    advisor_iteration("claude-sonnet-4-5", 5, 1),
+                ],
+                "",
+            )
+            .replace(
+                r#""cache_read_input_tokens":0,"cache_creation_input_tokens":0,"iterations""#,
+                r#""cache_read_input_tokens":1000,"cache_creation_input_tokens":0,"iterations""#,
+            )
+        })
+        .collect();
+    std::fs::write(&path, lines.join("\n")).expect("write transcript");
+    let recs = parse_file(&path);
+    let main: Vec<_> = recs.iter().filter(|r| !r.advisor).collect();
+    assert_eq!(main.len(), 4);
+    assert_eq!(recs.len(), 8);
+    assert!(
+        main.iter()
+            .all(|r| r.shape == UsageShape::Healthy && r.input == 100),
+        "four main rows stay under the floor however many advisor rows share the model"
+    );
+}
+
+#[test]
+fn advisor_iterations_leave_message_and_tool_counts_alone() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let build = |advisor: bool| -> Vec<String> {
+        (0..3)
+            .map(|i| {
+                let iterations = if advisor {
+                    vec![
+                        message_iteration(30, 7),
+                        advisor_iteration("claude-opus-5-5", 100, 10),
+                    ]
+                } else {
+                    vec![message_iteration(30, 7)]
+                };
+                iterations_line(
+                    &format!("2026-06-11T1{i}:00:00+00:00"),
+                    &format!("msg_{i}"),
+                    &format!("u{i}"),
+                    (30, 7),
+                    &iterations,
+                    "",
+                )
+            })
+            .collect()
+    };
+    write_project_file(&claude_dir, "s.jsonl", &build(true));
+    let with = load(&claude_dir).expect("load");
+    write_project_file(&claude_dir, "s.jsonl", &build(false));
+    let without = load(&claude_dir).expect("load");
+
+    let day = |s: &TokenStats| {
+        s.activity
+            .iter()
+            .find(|a| a.date == "2026-06-11")
+            .map(|a| (a.messages, a.sessions, a.tool_calls))
+    };
+    assert_eq!(day(&with), day(&without));
+    assert_eq!(day(&with), Some((3, 1, 3)));
+    assert_eq!(with.total_messages, without.total_messages);
+    assert_eq!(with.hour_counts, without.hour_counts);
+}
+
+#[test]
+fn file_hourly_model_tokens_includes_advisor_rows() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("sessions.jsonl");
+    std::fs::write(
+        &path,
+        iterations_line(
+            "2026-06-11T10:30:00+00:00",
+            "msg_x",
+            "u1",
+            (30, 7),
+            &[advisor_iteration("claude-opus-5-5", 100, 10)],
+            "",
+        ),
+    )
+    .expect("write transcript");
+    let rows = file_hourly_model_tokens(&path);
+    let opus = rows
+        .iter()
+        .find(|r| r.model == "claude-opus-5-5")
+        .expect("the sessions cost view prices the advisor's model");
+    assert_eq!(opus.day, "2026-06-11");
+    assert_eq!(opus.hours[10].input, 100);
+    assert_eq!(opus.hours[10].output, 10);
+    let sonnet = rows
+        .iter()
+        .find(|r| r.model == "claude-sonnet-4-5")
+        .expect("main row");
+    assert_eq!(sonnet.hours[10].input, 30);
+}
+
+/// The first-paint view is stats-cache only: no advisor tokens. The topped-up
+/// view then carries exactly one advisor contribution for each date class the
+/// merge treats differently — today (cutoff day, and a later day), and a
+/// post-cutoff day that is not today.
+#[test]
+fn the_first_paint_has_no_advisor_tokens_and_each_merged_view_exactly_one() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    let iterations = [advisor_iteration("claude-opus-5-5", 100, 10)];
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[
+            iterations_line(
+                "2026-06-10T10:00:00+00:00",
+                "msg_cutoff",
+                "u1",
+                (30, 7),
+                &iterations,
+                "",
+            ),
+            iterations_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_post",
+                "u2",
+                (30, 7),
+                &iterations,
+                "",
+            ),
+            iterations_line(
+                "2026-06-12T10:00:00+00:00",
+                "msg_later",
+                "u3",
+                (30, 7),
+                &iterations,
+                "",
+            ),
+        ],
+    );
+
+    let base = load_base(&claude_dir).expect("base");
+    assert!(
+        lifetime_row(&base, "claude-opus-5-5").is_none() && base.today.is_none(),
+        "the stats-cache first paint never carries advisor tokens"
+    );
+
+    let mut cache = TopUpCache::default();
+    refresh_topup_cache(
+        &claude_dir,
+        TopUpCutoff::After("2026-06-10"),
+        &mut cache,
+        |_, _| {},
+    );
+    let advisor_in = |s: &TokenStats| {
+        s.today.as_ref().map_or(0, |t| {
+            t.models
+                .iter()
+                .filter(|m| m.model == "claude-opus-5-5")
+                .map(|m| m.input)
+                .sum::<u64>()
+        })
+    };
+    let day_input = |s: &TokenStats, date: &str| {
+        s.daily_models
+            .iter()
+            .filter(|d| d.date == date && d.model == "claude-opus-5-5")
+            .filter_map(|d| d.split.as_ref())
+            .map(|m| m.input)
+            .sum::<u64>()
+    };
+
+    // Today IS the cutoff day: the cutoff day's lines feed today's rollup only
+    // (the stats-cache owns that day's history), the later days feed day rows.
+    let mut merged = load_base(&claude_dir).expect("base");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-10",
+    );
+    assert_eq!(advisor_in(&merged), 100);
+    assert_eq!(day_input(&merged, "2026-06-10"), 0);
+    assert_eq!(day_input(&merged, "2026-06-11"), 100);
+    assert_eq!(day_input(&merged, "2026-06-12"), 100);
+    assert_eq!(
+        lifetime_row(&merged, "claude-opus-5-5").map(|m| m.input),
+        Some(200)
+    );
+
+    // Today is a post-cutoff day: it lands in today's rollup and in its day
+    // row, once each; the other post-cutoff day stays a day row only.
+    let mut merged = load_base(&claude_dir).expect("base");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-12",
+    );
+    assert_eq!(advisor_in(&merged), 100);
+    assert_eq!(day_input(&merged, "2026-06-11"), 100);
+    assert_eq!(day_input(&merged, "2026-06-12"), 100);
+    assert_eq!(
+        lifetime_row(&merged, "claude-opus-5-5").map(|m| m.input),
+        Some(200)
+    );
+
+    // Today with no advisor lines: nothing is attributed to it.
+    let mut merged = load_base(&claude_dir).expect("base");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-20",
+    );
+    assert_eq!(advisor_in(&merged), 0);
+    assert_eq!(day_input(&merged, "2026-06-11"), 100);
+    assert_eq!(day_input(&merged, "2026-06-12"), 100);
+}
+
+// ── advisor pricing ──────────────────────────────────────────────────────────
+
+fn advisor_price_table(
+    opus_entries: Vec<crate::pricing::PriceEntry>,
+) -> crate::pricing::PriceTable {
+    let priced = |id: &str, entries| crate::pricing::PricedModel {
+        id: id.to_owned(),
+        prices: entries,
+        effective_at: None,
+    };
+    let entry = |input, output, mode| crate::pricing::PriceEntry {
+        input,
+        output,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        constraint: None,
+        mode,
+        window_only: false,
+    };
+    crate::pricing::PriceTable::capture(
+        vec![
+            priced("claude-opus-5-5", opus_entries),
+            priced("claude-sonnet-4-5", vec![entry(0.001, 0.002, None)]),
+        ],
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        "2026-06-01".to_owned(),
+        0,
+        Vec::new(),
+    )
+}
+
+fn advisor_rate_entry(
+    input: f64,
+    output: f64,
+    mode: Option<crate::pricing::SpeedMode>,
+) -> crate::pricing::PriceEntry {
+    crate::pricing::PriceEntry {
+        input,
+        output,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        constraint: None,
+        mode,
+        window_only: false,
+    }
+}
+
+/// Load one advisor-bearing transcript (main line on sonnet, advisor on
+/// `advisor_model`, `extra_usage` spliced into the usage) and return the
+/// advisor model's day row.
+fn advisor_day_row(advisor_model: &str, extra_usage: &str) -> DayModelTokens {
+    advisor_day_row_with(
+        advisor_model,
+        &advisor_iteration(advisor_model, 1_000, 100),
+        extra_usage,
+    )
+}
+
+/// [`advisor_day_row`] with the advisor iteration given verbatim.
+fn advisor_day_row_with(advisor_model: &str, iteration: &str, extra_usage: &str) -> DayModelTokens {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    cutoff_stats_cache(&claude_dir);
+    write_project_file(
+        &claude_dir,
+        "a.jsonl",
+        &[iterations_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_x",
+            "u1",
+            (30, 7),
+            &[iteration.to_owned()],
+            extra_usage,
+        )],
+    );
+    load(&claude_dir)
+        .expect("load")
+        .daily_models
+        .into_iter()
+        .find(|d| d.model == advisor_model)
+        .expect("advisor day row")
+}
+
+fn day_cost(table: &crate::pricing::PriceTable, row: &DayModelTokens) -> Option<f64> {
+    table.cost_day(&row.model, &row.date, row.hours.as_ref().expect("hours"))
+}
+
+#[test]
+fn advisor_spend_prices_at_the_advisor_models_rate() {
+    use crate::pricing::SpeedMode;
+    // Opus and sonnet carry distinct rates; the advisor's 1,000 in / 100 out
+    // must price at opus's, not at the sonnet line it rode in on.
+    let table = advisor_price_table(vec![advisor_rate_entry(0.01, 0.05, None)]);
+    let row = advisor_day_row("claude-opus-5-5", "");
+    let cost = day_cost(&table, &row).expect("priced");
+    assert!((cost - (1_000.0 * 0.01 + 100.0 * 0.05)).abs() < 1e-9);
+
+    // An advisor call with its own fast speed: the fast subset prices at the
+    // fast entry.
+    let fast_call = advisor_iteration_at("claude-opus-5-5", 1_000, 100, "fast");
+    let table = advisor_price_table(vec![
+        advisor_rate_entry(0.01, 0.05, None),
+        advisor_rate_entry(0.02, 0.10, Some(SpeedMode::Fast)),
+    ]);
+    let row = advisor_day_row_with("claude-opus-5-5", &fast_call, "");
+    let cost = day_cost(&table, &row).expect("priced");
+    assert!((cost - (1_000.0 * 0.02 + 100.0 * 0.10)).abs() < 1e-9);
+
+    // A fast line does not make its advisor call fast: it prices at the
+    // standard rate even though a fast rate exists.
+    let row = advisor_day_row("claude-opus-5-5", r#","speed":"fast""#);
+    let cost = day_cost(&table, &row).expect("priced");
+    assert!((cost - (1_000.0 * 0.01 + 100.0 * 0.05)).abs() < 1e-9);
+
+    // Fast call, model with a standard-only entry: no fast rate exists, so the
+    // row is unpriced exactly as a fast main-model row would be.
+    let table = advisor_price_table(vec![advisor_rate_entry(
+        0.01,
+        0.05,
+        Some(SpeedMode::Standard),
+    )]);
+    let row = advisor_day_row_with("claude-opus-5-5", &fast_call, "");
+    assert_eq!(day_cost(&table, &row), None);
+    // The same table prices a standard call, and a call on a fast line.
+    let row = advisor_day_row("claude-opus-5-5", "");
+    assert!(day_cost(&table, &row).is_some());
+    let row = advisor_day_row("claude-opus-5-5", r#","speed":"fast""#);
+    assert!(day_cost(&table, &row).is_some());
+}
+
+#[test]
+fn an_unknown_advisor_model_is_unpriced_and_a_free_id_costs_nothing() {
+    let table = advisor_price_table(vec![advisor_rate_entry(0.01, 0.05, None)]);
+    let unknown = advisor_day_row("claude-mystery-9", "");
+    assert_eq!(day_cost(&table, &unknown), None, "no rate, no price");
+
+    let free = advisor_day_row("acme/advisor-model:free", "");
+    assert_eq!(day_cost(&table, &free), Some(0.0));
 }

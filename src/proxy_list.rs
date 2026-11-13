@@ -16,6 +16,7 @@ use anyhow::Result;
 
 use crate::daemon::proxies::{ProxySlot, ProxyState, resolve_binary, unsupervised_slot};
 use crate::daemon::{daemon_health, proxy_slots};
+use crate::format::{col_width, pad_cells, shows_nothing, terminal_safe};
 use crate::out::{out, outln};
 use crate::proxy::{Registry, Service, discover, read_manifest};
 
@@ -214,17 +215,14 @@ fn read_manifests(targets: Vec<(Service, PathBuf)>) -> BTreeMap<Service, Option<
         .collect()
 }
 
-fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
-    cells
-        .map(|c| c.chars().count())
-        .chain(std::iter::once(header.chars().count()))
-        .max()
-        .unwrap_or(0)
-}
-
-/// The table cell for a value the row may not have: `-`, the `jobs` precedent.
+/// The table cell for a value the row may not have: `-`, the `jobs` precedent,
+/// also where filtering leaves text that shows nothing.
 fn dash(value: &Option<String>) -> String {
-    value.clone().unwrap_or_else(|| "-".to_string())
+    value
+        .as_deref()
+        .map(terminal_safe)
+        .filter(|text| !shows_nothing(text))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn render_table(rows: &[Row]) -> String {
@@ -232,8 +230,23 @@ fn render_table(rows: &[Row]) -> String {
         return "no clauth proxies. install a clauth-<service>-proxy on PATH, then `clauth proxy enable <service>`.\n"
             .to_string();
     }
+    // A foreign proxy's manifest, `/health` answer, binary name or error body
+    // supplies every cell but `state` and the figures; each is filtered once
+    // here, so the column widths measure the same text the row prints. A cell
+    // or reason whose filtered text shows nothing is missing: `-` for a version
+    // or contract, no line for a reason.
+    let services: Vec<String> = rows.iter().map(|r| terminal_safe(&r.service)).collect();
     let versions: Vec<String> = rows.iter().map(|r| dash(&r.version)).collect();
     let contracts: Vec<String> = rows.iter().map(|r| dash(&r.contract)).collect();
+    let reasons: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| {
+            r.reason
+                .as_deref()
+                .map(terminal_safe)
+                .filter(|text| !shows_nothing(text))
+        })
+        .collect();
     let ports: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -243,33 +256,40 @@ fn render_table(rows: &[Row]) -> String {
         })
         .collect();
     let enabled: Vec<String> = rows.iter().map(|r| r.enabled.to_string()).collect();
-    let w_service = col_width("SERVICE", rows.iter().map(|r| r.service.as_str()));
+    let w_service = col_width("SERVICE", services.iter().map(String::as_str));
     let w_version = col_width("VERSION", versions.iter().map(String::as_str));
     let w_contract = col_width("CONTRACT", contracts.iter().map(String::as_str));
     let w_enabled = col_width("ENABLED", enabled.iter().map(String::as_str));
     let w_port = col_width("PORT", ports.iter().map(String::as_str));
     let w_state = col_width("STATE", rows.iter().map(|r| r.state.as_str()));
     let mut out = format!(
-        "{:<w_service$}  {:<w_version$}  {:<w_contract$}  {:<w_enabled$}  {:>w_port$}  {:<w_state$}\n",
-        "SERVICE", "VERSION", "CONTRACT", "ENABLED", "PORT", "STATE",
+        "{}  {}  {}  {}  {}  {}\n",
+        pad_cells("SERVICE", w_service, false),
+        pad_cells("VERSION", w_version, false),
+        pad_cells("CONTRACT", w_contract, false),
+        pad_cells("ENABLED", w_enabled, false),
+        pad_cells("PORT", w_port, true),
+        pad_cells("STATE", w_state, false),
     );
     for (index, row) in rows.iter().enumerate() {
         out.push_str(&format!(
-            "{:<w_service$}  {:<w_version$}  {:<w_contract$}  {:<w_enabled$}  {:>w_port$}  {:<w_state$}\n",
-            row.service, versions[index], contracts[index], enabled[index], ports[index], row.state,
+            "{}  {}  {}  {}  {}  {}\n",
+            pad_cells(&services[index], w_service, false),
+            pad_cells(&versions[index], w_version, false),
+            pad_cells(&contracts[index], w_contract, false),
+            pad_cells(&enabled[index], w_enabled, false),
+            pad_cells(&ports[index], w_port, true),
+            pad_cells(&row.state, w_state, false),
         ));
     }
     // After the table, one blank line, then one `<service>: <reason>` line per
     // row that has a reason, in row order; none when no row has one.
-    let reason_rows: Vec<&Row> = rows.iter().filter(|row| row.reason.is_some()).collect();
-    if !reason_rows.is_empty() {
+    if reasons.iter().any(Option::is_some) {
         out.push('\n');
-        for row in reason_rows {
-            out.push_str(&format!(
-                "{}: {}\n",
-                row.service,
-                row.reason.as_deref().unwrap_or_default()
-            ));
+        for (index, reason) in reasons.iter().enumerate() {
+            if let Some(reason) = reason {
+                out.push_str(&format!("{}: {reason}\n", services[index]));
+            }
         }
     }
     out

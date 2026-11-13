@@ -2,11 +2,12 @@
 //!
 //! The usage poll already READS the banked count off `wham/usage`
 //! (`rate_limit_reset_credits.available_count`, carried on `UsageInfo` as
-//! `codex_reset_credits` and shown as `↺ N` on the Overview's codex row while
+//! `limit_resets.usable` and shown as `↺ N` on the Overview's codex row while
 //! one is available).
-//! This module is the one place clauth SPENDS one, and only because the
-//! operator asked for it: `clauth limit-reset <name>`. Nothing here is on a
-//! timer, and nothing retries.
+//! This module is the one place clauth SPENDS a codex one, and only because
+//! the operator asked for it: `clauth limit-reset <name>`. A run sends each
+//! call once; a lost reply leaves a pending record so a later run re-sends the
+//! same ids instead of picking another credit.
 //!
 //! The wire is codex's own, verified against openai/codex
 //! (`backend-client/src/client/rate_limit_resets.rs`, `types.rs`, and the TUI's
@@ -22,11 +23,16 @@
 
 use std::time::Duration;
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::fetch::iso_to_epoch_secs;
-use crate::format::{local_stamp, plural, terminal_safe, truncate};
+use super::fetch::{ANTHROPIC_ORIGIN, iso_to_epoch_secs, parse_retry_after};
+use crate::format::{
+    draws_nothing, grapheme_cells, is_blank, local_stamp, plural, shows_nothing, terminal_safe,
+    truncate,
+};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
 /// one a clauth-held login reaches (see `codex::CODEX_USAGE_URL`).
@@ -45,13 +51,21 @@ const RESET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// The only reset type codex's picker knows by name; preferred when an account
 /// holds credits of more than one type.
 const CODEX_RATE_LIMITS: &str = "codex_rate_limits";
+/// The server's re-send window: a pending record stamped within this of now is
+/// re-sent. The copy that names the deadline derives it from the same constant.
+pub(crate) const RESEND_WINDOW_MS: u64 = 600_000;
 const AVAILABLE: &str = "available";
 
-/// Where the two calls go. Split out so a test points both at a loopback stub.
+/// Where the five calls go: codex's list and consume, and the claude arm's
+/// read, profile read and spend. Split out so a test points them all at a
+/// loopback stub.
 #[derive(Debug, Clone)]
 pub(crate) struct ResetUrls {
     pub(crate) list: String,
     pub(crate) consume: String,
+    /// The claude `api.anthropic.com` origin; the claude read, profile read and
+    /// spend append their own paths (the spend's names the org uuid).
+    pub(crate) claude_origin: String,
 }
 
 impl ResetUrls {
@@ -59,15 +73,17 @@ impl ResetUrls {
         Self {
             list: CODEX_RESET_CREDITS_URL.to_string(),
             consume: CODEX_RESET_CONSUME_URL.to_string(),
+            claude_origin: ANTHROPIC_ORIGIN.to_string(),
         }
     }
 
-    /// The same two paths under a stub's `http://127.0.0.1:<port>` origin.
+    /// The same paths under a stub's `http://127.0.0.1:<port>` origin.
     #[cfg(test)]
     pub(crate) fn under(origin: &str) -> Self {
         Self {
             list: format!("{origin}/backend-api/wham/rate-limit-reset-credits"),
             consume: format!("{origin}/backend-api/wham/rate-limit-reset-credits/consume"),
+            claude_origin: origin.to_string(),
         }
     }
 }
@@ -217,20 +233,73 @@ pub(crate) enum ResetCallError {
     Parse,
 }
 
-fn read_reply<T: DeserializeOwned>(
+/// Whether an error settles the spend's outcome, so its pending record is
+/// cleared: a 401 proves nothing was spent, and any other 4xx spent nothing.
+/// A transport failure, a body clauth cannot read, or a 5xx leaves the outcome
+/// open, so the record stays.
+pub(crate) fn settled(err: &ResetCallError) -> bool {
+    matches!(
+        err,
+        ResetCallError::Unauthorized | ResetCallError::Status(400..=499)
+    )
+}
+
+/// Whether a POST's reply lets the pending record go. A fresh send's 401 or any
+/// other 4xx proves that request spent nothing, so it settles. A re-send's
+/// failure only refuses the re-send, and the earlier request's outcome stays
+/// unknown, so there only a reply naming a definite outcome settles.
+pub(crate) fn post_settles<T>(
+    re_send: bool,
+    reply: &Result<T, ResetCallError>,
+    reply_settles: fn(&T) -> bool,
+) -> bool {
+    match reply {
+        Ok(reply) => reply_settles(reply),
+        Err(_) if re_send => false,
+        Err(err) => settled(err),
+    }
+}
+
+/// Whether a consume reply names a definite outcome, so its pending record
+/// clears: a defined code (`reset`, `already_redeemed`, `nothing_to_reset`,
+/// `no_credit`) is settled, an unknown one leaves the outcome open.
+pub(crate) fn consume_settled(reply: &ConsumeReply) -> bool {
+    !matches!(reply.outcome(), ConsumeOutcome::Unknown(_))
+}
+
+/// Read a 2xx body as `T`, mapping the status and transport into the one
+/// [`ResetCallError`] both reset arms share.
+pub(crate) fn read_reply<T: DeserializeOwned>(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<T, ResetCallError> {
-    let mut response = result.map_err(|_| ResetCallError::Transport)?;
-    match response.status().as_u16() {
-        200..=299 => {}
-        401 => return Err(ResetCallError::Unauthorized),
-        status => return Err(ResetCallError::Status(status)),
+    read_reply_hinted(result).map_err(|(err, _)| err)
+}
+
+/// [`read_reply`] carrying a non-2xx reply's `retry-after` beside its error,
+/// read by the poll's own parser: `None` when no reply came, the header is
+/// absent, or it does not parse.
+pub(crate) fn read_reply_hinted<T: DeserializeOwned>(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<T, (ResetCallError, Option<Duration>)> {
+    let mut response = result.map_err(|_| (ResetCallError::Transport, None))?;
+    let status = response.status().as_u16();
+    if !(200..=299).contains(&status) {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
+        let err = match status {
+            401 => ResetCallError::Unauthorized,
+            status => ResetCallError::Status(status),
+        };
+        return Err((err, retry_after));
     }
     let body = response
         .body_mut()
         .read_to_string()
-        .map_err(|_| ResetCallError::Transport)?;
-    serde_json::from_str(&body).map_err(|_| ResetCallError::Parse)
+        .map_err(|_| (ResetCallError::Transport, None))?;
+    serde_json::from_str(&body).map_err(|_| (ResetCallError::Parse, None))
 }
 
 /// GET the account's credits. Spends nothing.
@@ -266,7 +335,8 @@ fn consume_body(redeem_request_id: &str, credit_id: &str) -> String {
 }
 
 /// POST one consume. Sent once: a lost reply is reported as unconfirmed rather
-/// than retried, since the server may already have spent the credit.
+/// than retried within the run, since the server may already have spent the
+/// credit; the caller's pending record lets a later run re-send these ids.
 pub(crate) fn consume_reset_credit_at(
     url: &str,
     access_token: &str,
@@ -299,6 +369,16 @@ pub(crate) fn new_redeem_request_id() -> anyhow::Result<String> {
     Ok(uuid_v4_from(bytes))
 }
 
+/// Whether an id fits the server's `^[A-Za-z0-9_-]{1,64}$` pattern, the shape
+/// [`new_redeem_request_id`]'s v4 UUIDs satisfy. A pending record's id off
+/// this shape was not written by clauth.
+pub(crate) fn request_id_is_sendable(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Stamp the version (4) and variant (RFC 4122) bits onto 16 random bytes.
 fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -319,46 +399,11 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 // One spelling per outcome. A script can read the first stdout line as the
 // success summary and a failure off stderr.
 
-/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
-/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
-/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
-/// Asian Width calls them wide and halfwidth), so they count as blank: a cap
-/// cuts early rather than late, and a status holding one inside is never spent.
-fn is_blank(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
-}
-
 /// Whether a terminal draws nothing for `c` and it takes no cell either: a
 /// `Default_Ignorable_Code_Point` character that is neither a blank nor the
 /// soft hyphen `U+00AD`, which glibc's `wcwidth` gives a cell.
 fn is_invisible(c: char) -> bool {
     draws_nothing(c) && !is_blank(c) && c != '\u{AD}'
-}
-
-/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
-/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
-/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
-fn draws_nothing(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'..='\u{1160}'
-            | '\u{17B4}'..='\u{17B5}'
-            | '\u{180B}'..='\u{180F}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFA0}'
-            | '\u{FFF0}'..='\u{FFF8}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
 }
 
 /// Whether `c` takes a cell in a terminal: every character but an invisible one
@@ -367,17 +412,11 @@ fn takes_a_cell(c: char) -> bool {
     !is_invisible(c)
 }
 
-/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
-/// soft hyphen included. Callers pass `terminal_safe` output.
-fn shows_nothing(text: &str) -> bool {
-    text.chars().all(|c| is_blank(c) || draws_nothing(c))
-}
-
 /// `text` without the blank and `draws_nothing` padding on either end: the slice from
 /// the first drawn character through the last, plus the invisible characters
 /// directly after the last one (a variation selector travels with its emoji).
 /// `""` when `text` holds no drawn character.
-fn trim_padding(text: &str) -> &str {
+pub(crate) fn trim_padding(text: &str) -> &str {
     let drawn = |c: char| !is_blank(c) && !draws_nothing(c);
     let Some(start) = text.find(drawn) else {
         return "";
@@ -390,38 +429,66 @@ fn trim_padding(text: &str) -> &str {
     &text[start..after + tail]
 }
 
-/// Cap `text` at `max` characters that take a cell — drawn characters and
-/// blanks alike, never the invisible ones — appending `...` when it is over; at
-/// or under the cap the text comes back unchanged, padding and all. A cut keeps
-/// the invisible characters directly after the last character that takes a
-/// cell, so an emoji keeps its variation selector, and never counts those
-/// against the cap.
-fn cap_drawn(text: &str, max: usize) -> String {
-    if text.chars().filter(|&c| takes_a_cell(c)).count() <= max {
+/// Cap `text` at `max` terminal cells — the widths the drawn characters and
+/// blanks take, never the invisible ones, so a wide CJK glyph or an emoji
+/// presentation sequence spends its two — appending `...` when it is over; at
+/// or under the cap the text comes back unchanged, padding and all. A cut
+/// keeps whole graphemes, so an emoji's variation selector travels with its
+/// base and never counts against the cap. A cut drops a grapheme the
+/// remaining budget cannot hold whole. Cost is per grapheme, never below one
+/// per character the model counts as taking a cell: a filler the grapheme
+/// measure gives no cell still takes its blank one, and an emoji sequence
+/// draws both its cells, so a cap cuts early rather than late.
+pub(crate) fn cap_drawn(text: &str, max: usize) -> String {
+    // The whole-string grapheme measure is not the guard: a combining mark
+    // costs its own cell here.
+    let cost = |g: &str| grapheme_cells(g).max(g.chars().filter(|&c| takes_a_cell(c)).count());
+    let cells = |t: &str| {
+        Span::raw(t)
+            .styled_graphemes(Style::default())
+            .map(|g| cost(g.symbol))
+            .sum::<usize>()
+    };
+    if cells(text) <= max {
         return text.to_string();
     }
     if max < 3 {
         return truncate(text, max);
     }
     let mut kept = String::new();
-    let mut cells = 0;
-    for c in text.chars() {
-        if takes_a_cell(c) {
-            if cells == max - 3 {
-                break;
-            }
-            cells += 1;
+    let mut spent = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
+        let c = cost(grapheme.symbol);
+        if spent + c > max - 3 {
+            break;
         }
-        kept.push(c);
+        spent += c;
+        kept.push_str(grapheme.symbol);
     }
     kept.push_str("...");
     kept
 }
 
+/// A server-sent code or result shown back to the operator with each character
+/// escaped on its own before the cut, so the cut can neither drop a control
+/// character nor split an escape; inside double quotes an apostrophe needs no
+/// escape, as `{:?}` on a string prints it.
+pub(crate) fn quoted_escaped(text: &str) -> String {
+    crate::format::truncate_escaped(
+        text,
+        40,
+        |c| match c {
+            '\'' => c.to_string(),
+            _ => c.escape_debug().to_string(),
+        },
+        true,
+    )
+}
+
 /// An RFC 3339 stamp as local wall-clock time, or the raw text (made
 /// terminal-safe) when it does not parse — a stamp shown verbatim beats one
 /// dropped.
-fn stamp(raw: &str) -> String {
+pub(crate) fn stamp(raw: &str) -> String {
     iso_to_epoch_secs(raw)
         .and_then(local_stamp)
         .unwrap_or_else(|| cap_drawn(&terminal_safe(raw), 40))
@@ -461,6 +528,26 @@ pub(crate) fn limit_reset_prompt(
         "clauth: use a usage-limit reset on '{name}'? {subject}, 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
         credits.stated_count()
+    )
+}
+
+/// The `[y/N]` question for a re-send, without the `[y/N]`: a fresh record
+/// means the earlier consume's answer never arrived, so the prompt names that
+/// request, not a credit pick.
+pub(crate) fn re_send_prompt(name: &str) -> String {
+    format!(
+        "clauth: re-send the usage-limit reset on '{name}' whose answer never arrived? It \
+         cannot be undone."
+    )
+}
+
+/// The abort line after a declined re-send: the record stays, so the earlier
+/// request's outcome is still unknown — the line never claims nothing was
+/// spent. Shared by both arms.
+pub(crate) fn declined_re_send_line(name: &str) -> String {
+    format!(
+        "clauth: aborted. the earlier reset request on '{name}' was not re-sent; its outcome \
+         is still unknown."
     )
 }
 
@@ -506,6 +593,18 @@ pub(crate) fn no_resets_available(name: &str) -> String {
     format!("no usage-limit resets available on '{name}'")
 }
 
+/// `--list`'s extra line when a fresh record exists: a consume sent at a local
+/// time got no answer, and running `limit-reset` again before the window's end
+/// re-sends it.
+pub(crate) fn list_pending_note(name: &str, sent_at_ms: u64) -> String {
+    let at = local_stamp((sent_at_ms / 1000) as i64).unwrap_or_else(|| sent_at_ms.to_string());
+    format!(
+        "clauth: a usage-limit reset sent at {at} got no answer; run `clauth limit-reset {name}` \
+         again before {} to re-send it.",
+        re_send_deadline(sent_at_ms)
+    )
+}
+
 /// A 401 on either call. The store is never refreshed here, so the message says
 /// who does refresh it.
 fn token_rejected(name: &str) -> String {
@@ -515,47 +614,146 @@ fn token_rejected(name: &str) -> String {
     )
 }
 
-fn check_list_hint(name: &str) -> String {
+pub(super) fn check_list_hint(name: &str) -> String {
     format!("check `clauth limit-reset {name} --list` before retrying")
 }
 
-/// A failed GET. Nothing was spent, and every line says so.
-pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
+/// One reset arm's words for the shared failure lines: who answered, the 401
+/// sentence, and how that arm names its read. Both arms call one body with
+/// their own voice, so neither arm's copy can drift from the other's.
+pub(crate) struct FailureVoice {
+    pub(crate) provider: &'static str,
+    pub(crate) rejected: fn(&str) -> String,
+    /// The object of the read: `the reset list` or `the account read`.
+    pub(crate) read_noun: &'static str,
+    /// The read's verb phrase: `list the resets on` or `read the account for`.
+    pub(crate) read_phrase: &'static str,
+}
+
+const CODEX_VOICE: FailureVoice = FailureVoice {
+    provider: "codex",
+    rejected: token_rejected,
+    read_noun: "the reset list",
+    read_phrase: "list the resets on",
+};
+
+/// A failed read. Nothing was spent, and every line says so.
+pub(crate) fn read_failure(name: &str, err: &ResetCallError, voice: &FailureVoice) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
-        ResetCallError::Status(status) => format!(
-            "codex answered the reset list for '{name}' with HTTP {status}; no reset was used"
-        ),
-        ResetCallError::Transport => {
-            format!("could not reach codex to list the resets on '{name}'; no reset was used")
+        ResetCallError::Unauthorized => {
+            format!("{}. No reset was used", (voice.rejected)(name))
         }
+        ResetCallError::Status(status) => format!(
+            "{} answered {} for '{name}' with HTTP {status}; no reset was used",
+            voice.provider, voice.read_noun
+        ),
+        ResetCallError::Transport => format!(
+            "could not reach {} to {} '{name}'; no reset was used",
+            voice.provider, voice.read_phrase
+        ),
         ResetCallError::Parse => format!(
-            "codex answered the reset list for '{name}' in a shape clauth does not read; \
-             no reset was used"
+            "{} answered {} for '{name}' in a shape clauth does not read; no reset was used",
+            voice.provider, voice.read_noun
         ),
     }
 }
 
-/// A failed POST. Only a 401 proves nothing was spent; every other failure
-/// leaves the outcome open, and the line says to look before retrying.
-pub(crate) fn consume_failure(name: &str, err: &ResetCallError) -> String {
+/// The clause a re-send's failed POST adds: the earlier request's reply never
+/// arrived, so this refusal says nothing about whether it spent.
+const EARLIER_OUTCOME_OPEN: &str = "the earlier request's outcome is still unknown";
+
+/// A failed POST. A fresh send's 401 proves nothing was spent and any other 4xx
+/// spent nothing, so those keep the look-before-retrying hint; every other
+/// failure leaves the outcome open, and the pending record means a re-run
+/// before the window's end re-sends the same ids, so those end on that re-run
+/// instead. A re-send's failure only refuses the re-send, so every line says
+/// the earlier request's outcome is still unknown.
+pub(crate) fn spend_failure(
+    name: &str,
+    err: &ResetCallError,
+    voice: &FailureVoice,
+    sent_at_ms: u64,
+    re_send: bool,
+) -> String {
     match err {
-        ResetCallError::Unauthorized => format!("{}. No reset was used", token_rejected(name)),
-        ResetCallError::Status(status) => format!(
-            "codex answered the reset request for '{name}' with HTTP {status}; {}",
+        ResetCallError::Unauthorized if re_send => format!(
+            "{}, and {EARLIER_OUTCOME_OPEN}; {}",
+            (voice.rejected)(name),
+            re_send_hint(sent_at_ms)
+        ),
+        ResetCallError::Unauthorized => {
+            format!("{}. No reset was used", (voice.rejected)(name))
+        }
+        ResetCallError::Status(status) if re_send => format!(
+            "{} answered the re-sent reset request for '{name}' with HTTP {status}; \
+             {EARLIER_OUTCOME_OPEN}; {}",
+            voice.provider,
+            re_send_hint(sent_at_ms)
+        ),
+        ResetCallError::Status(status) if (400..=499).contains(status) => format!(
+            "{} answered the reset request for '{name}' with HTTP {status}; {}",
+            voice.provider,
             check_list_hint(name)
+        ),
+        ResetCallError::Status(status) => format!(
+            "{} answered the reset request for '{name}' with HTTP {status}; {}",
+            voice.provider,
+            re_send_hint(sent_at_ms)
+        ),
+        ResetCallError::Transport if re_send => format!(
+            "the re-sent reset request for '{name}' got no answer; {EARLIER_OUTCOME_OPEN}; {}",
+            re_send_hint(sent_at_ms)
         ),
         ResetCallError::Transport => format!(
             "the reset request for '{name}' got no answer, so the reset may or may not have \
              gone through; {}",
-            check_list_hint(name)
+            re_send_hint(sent_at_ms)
+        ),
+        ResetCallError::Parse if re_send => format!(
+            "{} answered the re-sent reset request for '{name}' in a shape clauth does not \
+             read; {EARLIER_OUTCOME_OPEN}; {}",
+            voice.provider,
+            re_send_hint(sent_at_ms)
         ),
         ResetCallError::Parse => format!(
-            "codex answered the reset request for '{name}' in a shape clauth does not read, \
+            "{} answered the reset request for '{name}' in a shape clauth does not read, \
              so the reset may or may not have gone through; {}",
-            check_list_hint(name)
+            voice.provider,
+            re_send_hint(sent_at_ms)
         ),
     }
+}
+
+/// The end of the re-send window as a local wall-clock stamp: the record's
+/// instant plus the 600 s the server holds the request. The raw instant is the
+/// out-of-range fallback, matching the note's `at`.
+pub(crate) fn re_send_deadline(sent_at_ms: u64) -> String {
+    local_stamp(((sent_at_ms.saturating_add(RESEND_WINDOW_MS)) / 1000) as i64)
+        .unwrap_or_else(|| sent_at_ms.to_string())
+}
+
+/// The clause an open-outcome failure ends on: the pending record re-sends the
+/// same ids, so a re-run before the window's end is the safe move, not a look.
+pub(crate) fn re_send_hint(sent_at_ms: u64) -> String {
+    format!(
+        "a re-run before {} re-sends the same request",
+        re_send_deadline(sent_at_ms)
+    )
+}
+
+/// A failed codex GET.
+pub(crate) fn list_failure(name: &str, err: &ResetCallError) -> String {
+    read_failure(name, err, &CODEX_VOICE)
+}
+
+/// A failed codex consume.
+pub(crate) fn consume_failure(
+    name: &str,
+    err: &ResetCallError,
+    sent_at_ms: u64,
+    re_send: bool,
+) -> String {
+    spend_failure(name, err, &CODEX_VOICE, sent_at_ms, re_send)
 }
 
 /// A consume reply as the line to print (`Ok`) or the error to exit with
@@ -565,6 +763,7 @@ pub(crate) fn outcome_line(
     name: &str,
     credits: &ResetCredits,
     reply: &ConsumeReply,
+    sent_at_ms: u64,
 ) -> Result<String, String> {
     match reply.outcome() {
         ConsumeOutcome::Reset { windows_reset } => {
@@ -582,12 +781,14 @@ pub(crate) fn outcome_line(
             "that reset on '{name}' is no longer available (used or expired meanwhile); \
              run `clauth limit-reset {name} --list` to see what is left"
         )),
-        ConsumeOutcome::Unknown(code) => Err(format!(
-            "codex answered the reset request for '{name}' with an unrecognized code {:?}, \
-             so the outcome is unconfirmed; {}",
-            truncate(&code, 40),
-            check_list_hint(name)
-        )),
+        ConsumeOutcome::Unknown(code) => {
+            let shown = quoted_escaped(&code);
+            Err(format!(
+                "codex answered the reset request for '{name}' with an unrecognized code \
+                 {shown}, so the outcome is unconfirmed; {}",
+                re_send_hint(sent_at_ms)
+            ))
+        }
     }
 }
 

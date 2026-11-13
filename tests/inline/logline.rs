@@ -26,22 +26,45 @@ fn daemon_mode_stays_bare_on_stderr() {
 fn only_a_non_daemon_line_on_a_terminal_diverts_to_the_log_file() {
     // The 2026-07-14 corruption: a background scheduler thread's stderr line
     // paints over the TUI's alternate screen. Diverting to the log file is the
-    // fix, and it must fire in exactly one context.
+    // fix, and it must fire only where the process's stderr is, or was, a
+    // terminal: never for the daemon or a redirected stderr.
     assert_eq!(
-        route(false, true),
+        route(false, false, true),
         Sink::LogFile,
         "interactive TUI/CLI on a tty"
     );
-    assert_eq!(route(false, false), Sink::Stderr, "piped/redirected stderr");
     assert_eq!(
-        route(true, true),
+        route(false, false, false),
+        Sink::Stderr,
+        "piped/redirected stderr"
+    );
+    assert_eq!(
+        route(true, false, true),
         Sink::Stderr,
         "daemon in a foreground console"
     );
     assert_eq!(
-        route(true, false),
+        route(true, false, false),
         Sink::Stderr,
         "daemon under a supervisor"
+    );
+}
+
+/// A TUI pins the log file while its stderr is its terminal, so a line raised
+/// after that terminal hung up (stderr no longer a terminal) still goes to the
+/// file rather than the dead stderr. Not seen here: `tui::run`'s call and
+/// `line`'s read of the pin, which no test drives (the pin is process-global).
+#[test]
+fn a_diverted_process_keeps_the_log_file_after_its_terminal_is_gone() {
+    assert_eq!(
+        route(false, true, false),
+        Sink::LogFile,
+        "a TUI whose terminal hung up"
+    );
+    assert_eq!(
+        route(true, true, false),
+        Sink::Stderr,
+        "stamping still means the daemon's stderr"
     );
 }
 
@@ -105,6 +128,26 @@ fn the_census_diagnostics_route_through_the_durable_logfile_sink() {
         !census_body.contains("logline!("),
         "no census diagnostic reaches a raw logline call site"
     );
+}
+
+/// The keychain sign-out's restore hint names the switch verb in full: a bare
+/// `clauth <name>` reads as a flag for a dash-led name and as clauth's own
+/// command for a subcommand name. The sign-out body is macOS-only code no
+/// Linux run compiles, so the pin is a source scan (the census pin above).
+#[test]
+fn the_keychain_sign_out_hint_names_the_switch_command_in_full() {
+    let src = include_str!("../../src/keychain.rs");
+    let hint = "Run `clauth switch <name>` to put one back";
+    let count = |text: &str| text.matches(hint).count();
+    assert_eq!(
+        count(src),
+        1,
+        "the sign-out hint must sit in the source once, in the switch form"
+    );
+    // Positive control: the scan sees a synthetic carrier and rejects the bare
+    // form, so a scan that reads nothing cannot keep this pin green.
+    assert_eq!(count(&format!("a {hint} b")), 1);
+    assert_eq!(count("Run `clauth <name>` to put one back"), 0);
 }
 
 #[test]

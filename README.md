@@ -31,7 +31,7 @@
 
 **Juggle every Claude Code account from one terminal: switch in a keypress, track live 5h / 7d usage, auto-switch before a limit stops you, even hand a task to another account from inside Claude.**
 
-Most account tools do one half. clauth pairs instant **switching between multiple Claude Code accounts** with a live **usage monitor**, then wires the two together so a fallback chain moves you off an exhausted account before Claude Code ever blocks. Works with Claude Pro, Max, Team, Enterprise OAuth accounts or any custom API endpoint. Linux, macOS, Windows.
+Most account tools do one half. clauth pairs instant **switching between multiple Claude Code accounts** with a live **usage monitor**, then wires the two together so a fallback chain moves you off an exhausted account before Claude Code ever blocks. Works with Claude Pro, Max, Ultra, Team, Enterprise OAuth accounts or any custom API endpoint. Linux, macOS, Windows.
 
 ![clauth TUI demo: switching Claude Code accounts with live usage bars](media/demo.gif)
 
@@ -39,9 +39,9 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ## Features
 
-- 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Team / Enterprise) or a custom API endpoint, plan tier detected for you
+- 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Ultra / Team / Enterprise) or a custom API endpoint, plan tier detected for you
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
-- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
+- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts on a plan with a 5h limit queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, tells a session when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a paired phone
 - 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves to another machine over HTTPS with `--listen`: that feed, the account switch, the herdr panes with their terminal streams, Claude Code session history, prompts and key presses into a pane, and prompts and interrupts into a session
@@ -106,7 +106,7 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth` | open the TUI |
 | `clauth <profile>` | switch and exit |
 | `clauth start <profile>` | run `claude` under that account, in its own config dir |
-| `clauth login <profile>` | add or re-authenticate an account, browser or API key; the browser login also takes a code from a link opened on any device (ssh, no browser) |
+| `clauth login <profile>` | add or re-authenticate an account, browser or API key, or through an enabled clauth proxy (`--proxy <service>`, the only login a proxy account takes); the browser login also takes a code from a link opened on any device (ssh, no browser) |
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
 | `clauth daemon` | headless refresh + auto-switch loop, optionally serving the REST API (`--listen`) |
@@ -134,7 +134,7 @@ A registration that breaks repairs itself: `clauth mcp` heals one at startup, so
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, and the account states worth a look before spending (disabled and no api key, both of which refuse a delegate; login expired, which refuses one except on an account that runs its own endpoint with its own key; a canceled subscription or an organization's refusal, neither of which refuses); `scope: "session"` names the account this session runs on | zero (disk cache) |
+| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session count, observed throughput, and the account states worth a look before spending (disabled and no api key, both of which refuse a delegate; login expired, which refuses one except on an account that runs its own endpoint with its own key; a canceled subscription or an organization's refusal, neither of which refuses); `scope: "session"` names the account this session runs on | zero (disk cache) |
 | `switch_profile` | relink the global active profile; the reply says what it does to this session | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |
 | `monitor` | check, collect or wait on backgrounded delegates' results, or wait on clauth's state (active profile, its usage cache, the credentials file) | zero (filesystem) |
@@ -168,7 +168,7 @@ clauth is the only one of these that pairs account switching with a live usage m
 
 **How do I monitor Claude Code usage and rate limits?** The Overview tab shows color-coded 5h (and 7-day) bars per account with reset times; the Usage tab breaks down every rate-limit window the API reports; the Tokens tab adds a global token dashboard with API-equivalent cost.
 
-**Does it work with Claude Pro, Max, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected, including Max 5x / 20x). API-endpoint profiles cover the Anthropic API or any compatible proxy.
+**Does it work with Claude Pro, Max, Ultra, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected): the label is the plan name Anthropic's own profile sends when it sends one, else clauth's map of Pro, Max, Ultra, Team, and Enterprise. API-endpoint profiles cover the Anthropic API or any compatible proxy.
 
 **Where does clauth store my Claude Code credentials?** Locally under `~/.clauth/`, with `0600` permissions on Unix. Claude tokens only ever go to Anthropic, codex tokens only to OpenAI. See [SECURITY.md](SECURITY.md).
 
@@ -183,7 +183,8 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Interface and keys](https://github.com/uwuclxdy/clauth/wiki/Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](https://github.com/uwuclxdy/clauth/wiki/Configuration) | both TOML files key by key, model routing, storage layout |
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
-| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
+| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
+| [REST API](https://github.com/uwuclxdy/clauth/wiki/REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server, `delegate` in full, answering a session from your phone |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |

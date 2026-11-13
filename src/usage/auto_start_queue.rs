@@ -60,11 +60,12 @@
 //! The switch action primes its target's window through
 //! [`crate::oauth::prime_window`] — the second caller of
 //! [`crate::oauth::auto_start_kick`] — and that path checks neither the toggle
-//! nor the anchor. It is an override on purpose: the operator switched because
-//! they are about to work on that account, and a switch that silently declined
-//! to prime would be a worse lie than a collapsed gap. It also cannot
-//! practically be gated, because the CLI is a one-shot process with no
-//! scheduler and no share of this queue's memory.
+//! nor the anchor. The one target it skips is a plan whose stored body says it
+//! has no 5h limit, where there is no window to open. It is an override on
+//! purpose: the operator switched because they are about to work on that
+//! account, and a switch that silently declined to prime would be a worse lie
+//! than a collapsed gap. It also cannot practically be gated, because the CLI
+//! is a one-shot process with no scheduler and no share of this queue's memory.
 //!
 //! What the override costs is one interval of spacing, not the invariant: the
 //! primed window lands in that profile's history like any other, so the next
@@ -418,14 +419,19 @@ fn span_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
 /// The exclusions are the ones that mean "cannot open a window", because a
 /// member that can never kick would still take a slot and thin everyone else's
 /// share of the 5h span: user-disabled, `auth_broken`, no stored OAuth pair,
+/// a pair clauth never spends ([`crate::profile::Profile::spends_oauth_chain`]),
 /// a canceled subscription (its windows are
-/// gone, a kick cannot open one), and a switch-grade kick block. `blocked` is that last set, which only a
+/// gone, a kick cannot open one), a plan whose own `/usage` body says it has no
+/// 5h limit ([`UsageInfo::no_five_hour_limit`]), and a switch-grade kick block.
+/// `blocked` is that last set, which only a
 /// caller holding the kick blocks can supply
 /// ([`crate::usage::switch_grade_kick_lifts`]); pass an empty slice where none
 /// is available. `canceled` is the caller's own-context reading: the daemon's
 /// OAuth store snapshot for the election and `status.json`, the per-frame
 /// snapshot for the TUI chips, and the disk plan for the daemonless
-/// `status --json`.
+/// `status --json`. `marked` reads the same context's stored verdict, off the
+/// in-memory usage snapshot where one is held and the disk cache for the
+/// daemonless `status --json`.
 ///
 /// Empty when the queue toggle is off, which is what makes the toggle a real
 /// off switch on every surface at once: no queue, so nothing to elect, publish,
@@ -434,6 +440,7 @@ pub(crate) fn auto_start_queue_members(
     config: &AppConfig,
     blocked: &[ProfileName],
     canceled: impl Fn(&ProfileName) -> bool,
+    marked: impl Fn(&ProfileName) -> bool,
 ) -> Vec<ProfileName> {
     if !config.state.auto_start_queue {
         return Vec::new();
@@ -453,11 +460,12 @@ pub(crate) fn auto_start_queue_members(
         .profiles
         .iter()
         .filter(|p| {
-            p.auto_start
+            p.has_effective_auto_start()
                 && !p.is_disabled()
                 && p.access_token().is_some()
                 && !config.is_auth_broken(&p.name)
                 && !canceled(&p.name)
+                && !marked(&p.name)
                 && !blocked.contains(&p.name)
         })
         .map(|p| &p.name)

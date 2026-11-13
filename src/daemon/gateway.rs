@@ -109,9 +109,10 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// draining past it is left running with its stop deadline in its child
 /// marker; the next daemon start waits out the rest and kills it there.
 ///
-/// The token-spend drain needs no longer budget here: it runs CONCURRENTLY
-/// with these stops ([`stop_for_exit`]), so the exit takes the longer of the
-/// two rather than their sum, and [`REPLACE_WAIT`] covers that longer term.
+/// The drain (the token spend in flight and the tick thread's exit save)
+/// needs no longer budget here: it runs CONCURRENTLY with these stops
+/// ([`stop_for_exit`]), so the exit takes the longer of the two rather than
+/// their sum, and [`REPLACE_WAIT`] covers that longer term.
 pub(crate) const DAEMON_STOP_BUDGET: Duration = Duration::from_secs(4);
 
 /// How often a supervisor wait re-checks its subject: the child inside
@@ -2568,6 +2569,10 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
 /// the TLS listener's FQDN lookup already runs.
 #[cfg(windows)]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    // A daemon started without a console would otherwise give each lookup a
+    // visible window of its own.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -2577,6 +2582,7 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     let ticks = String::from_utf8(output.stdout).ok()?;
@@ -3007,9 +3013,10 @@ pub(crate) fn stop_on_signal(
     None
 }
 
-/// Send every child its stop on its own thread, wait out the token spend in
-/// flight on the calling thread, then join the stops. Concurrent on purpose:
-/// the exit then takes max(spend, children), never their sum. Split from
+/// Send every child its stop on its own thread, run the drain (the token
+/// spend in flight and the tick thread's exit save, sharing one bound) on
+/// the calling thread, then join the stops. Concurrent on purpose: the exit
+/// then takes max(drain, children), never their sum. Split from
 /// [`stop_on_signal`]'s watcher so a test can pin the wait without dying.
 #[cfg(unix)]
 pub(crate) fn stop_for_exit(

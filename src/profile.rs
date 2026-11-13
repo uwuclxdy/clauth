@@ -16,6 +16,7 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
@@ -346,17 +347,25 @@ pub(crate) struct Profile {
     /// Opt-in usage probe for an account `/usage` cannot read: a
     /// `claude setup-token` login with no OAuth pair stored. A 1-token Haiku
     /// message every [`Profile::usage_probe_interval_ms`], read for the usage
-    /// its response headers carry; it may start the 5h window. Inert while a
-    /// pair is stored, since `/usage` reads that account.
+    /// its response headers carry; it may start the 5h window, on a plan
+    /// that has one. Inert while a pair is stored, since `/usage` reads
+    /// that account.
     pub(crate) usage_probe: bool,
     /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
     /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
     pub(crate) usage_probe_interval_ms: u64,
-    /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
+    /// Extra env vars merged into `settings.json`'s `env` block while active.
+    /// A switch away removes each one, or puts back the value the user's
+    /// `~/.claude/settings.json` held under that key before it.
     pub(crate) env: BTreeMap<String, String>,
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
     pub(crate) models: ModelSettings,
+    /// Per-account Claude Code reasoning effort, written as
+    /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the carrier a
+    /// running CC 2.1.317 re-reads live; clauth never writes `effortLevel`.
+    /// Unset = the key written empty.
+    pub(crate) effort: Option<String>,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     /// Per-account override of the chain-wide weekly (7d) switch line
@@ -458,6 +467,52 @@ pub(crate) struct Profile {
     pub(crate) setup_token_digest: Option<u64>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
+    /// What `config.toml` typed for the endpoint keys the load derives, beside
+    /// the derived values as of the last load or credentials change; in memory
+    /// only. [`Profile::new`] and a struct literal hold `Default` (nothing
+    /// typed).
+    pub(crate) typed_endpoint: TypedEndpoint,
+    /// The `[proxy]` record `config.toml` held when this profile loaded, read
+    /// once there so the cache selector never parses the file per call. Never
+    /// serialized: the table stays the one on-disk record, carried through every
+    /// rewrite as an unmodelled key, and a writer of it sets this beside it.
+    pub(crate) proxy: Option<ProxyAccount>,
+    /// Recorded at load beside `proxy`: `config.toml` holds a `[proxy]` table
+    /// that is no record ([`ProxyClaim::Unreadable`]), so `proxy` is `None`
+    /// while the table still names an upstream account. Never serialized; a
+    /// writer of the record clears it. A struct literal / [`Profile::new`]
+    /// leaves it `false`.
+    pub(crate) has_unreadable_proxy_record: bool,
+}
+
+/// The endpoint keys as typed, beside what clauth derived from them. `base_url`
+/// is derived under the login state (`effective_base_url`), `[console]`
+/// through `console_credential`; a save writes the typed value back unless the
+/// caller moved the derived one off its snapshot, so a value clauth hid is
+/// never read as the caller's edit.
+#[derive(Clone, Default)]
+pub(crate) struct TypedEndpoint {
+    base_url: Option<String>,
+    console: ConsoleConfig,
+    derived_base_url: Option<String>,
+    derived_console: Option<ConsoleCredential>,
+}
+
+impl std::fmt::Debug for TypedEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The typed `[console]` token is a credential: only its presence prints.
+        f.debug_struct("TypedEndpoint")
+            .field("base_url", &self.base_url)
+            .field(
+                "console_token",
+                &self.console.token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("console_site", &self.console.site)
+            .field("console_region", &self.console.region)
+            .field("derived_base_url", &self.derived_base_url)
+            .field("derived_console", &self.derived_console)
+            .finish()
+    }
 }
 
 /// The one judgment behind both login reads — [`Profile::holds_login`] over
@@ -479,6 +534,7 @@ impl Profile {
             usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -497,6 +553,9 @@ impl Profile {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider,
+            typed_endpoint: TypedEndpoint::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         }
     }
 
@@ -562,6 +621,27 @@ impl Profile {
         self.provider.is_some()
     }
 
+    /// Whether this account's inference needs a key it does not carry
+    /// ([`crate::claude::has_inference_auth`]), so a spawned `claude` would die
+    /// on an empty envelope. Needing one: a recognised provider's endpoint, or
+    /// a proxy account ([`Profile::proxy`]) routed to a loopback bind
+    /// ([`Profile::routing_endpoint`]), which its proxy serves on the
+    /// inference key it minted alone. An unrecognised endpoint needs none here,
+    /// since it may be a local model taking no key, and so does a proxy account
+    /// whose `[env] ANTHROPIC_BASE_URL` routes it elsewhere. A proxy record the
+    /// load boundary re-read as an OAuth login (a stored pair, no key) loses
+    /// its managed bind, so it is keyless only where that override still
+    /// routes it to one.
+    pub(crate) fn is_keyless(&self) -> bool {
+        let needs_key = self.is_third_party()
+            || (self.proxy.is_some()
+                && self
+                    .routing_endpoint()
+                    .and_then(crate::proxy::loopback_port)
+                    .is_some());
+        needs_key && !crate::claude::has_inference_auth(self)
+    }
+
     /// Whether this account's usage figures live in `third_party_cache.json`
     /// rather than the OAuth `usage_cache.json` — the question every reader of a
     /// cached figure asks, and the one the scheduler answers by writing.
@@ -570,11 +650,15 @@ impl Profile {
     /// discovered usage is cached the same way: `third_party_entry_for` builds a
     /// `ThirdPartyTarget::Generic` whenever `provider` is `None` and a
     /// `base_url` is set, so that leg genuinely fetches and caches for it.
+    /// True too for a proxy account on its loopback bind, keyed or keyless,
+    /// by the record it loaded with ([`Profile::proxy`]): a keyless one is
+    /// never polled, and its last copy still renders, aging to stale.
     /// A stored pair with an env token serving inference and nothing that leg
     /// could fetch with answers false: the chain feeds usage polling for such
     /// an account (the env-token account's inference spends on the token
     /// while the pair serves usage), and the OAuth leg writes the figures
-    /// this reader should read.
+    /// this reader should read. A proxy account of that shape answers false
+    /// too, though no leg polls it ([`Profile::spends_oauth_chain`]).
     /// Keying a reader on [`Profile::is_third_party`] instead answers a
     /// DIFFERENT question and renders a generic account, refreshed hourly, as
     /// never fetched.
@@ -585,6 +669,8 @@ impl Profile {
             self.api_key.as_deref(),
             self.credentials.is_some(),
             &self.env,
+            // The record as `load_profile` read it, so no call reads the file.
+            || self.proxy.is_some(),
         )
     }
 
@@ -619,6 +705,58 @@ impl Profile {
         self.disabled
     }
 
+    /// Whether this account has a Claude Code login clauth may use: poll
+    /// `/usage` on its access token, kick a window on it, refresh, rotate,
+    /// adopt or stamp it, probe with its setup token, or quarantine it on a
+    /// refusal. Never for a proxy account ([`Profile::proxy`]): it sends every
+    /// request with the key its proxy minted and never uses the chain, so a
+    /// pair stored beside its record stays on disk untouched. A `[proxy]`
+    /// table clauth cannot read ([`Profile::has_unreadable_proxy_record`]) is a
+    /// proxy account here too, as it is to the deletes and the re-login. The
+    /// one decision the OAuth leg's poll pair (`usage::usage_poll_pair`, which
+    /// seeds the scheduler's work list), the usage probe
+    /// (`usage::usage_probe_admits`), the live-mirror adopt
+    /// (`oauth::try_adopt_live_rotation`), the switch gate
+    /// (`oauth::oauth_shape`), its rolling stamp
+    /// (`oauth::roll_from_stored_chain`), the start-time rolling stamp
+    /// (`claude::arm_rolling_from_disk_synced`), rotate-all
+    /// (`oauth::rotation_candidates`), the rotate worker
+    /// (`oauth::rotate_one_inner`), the auto-start opt-in
+    /// ([`Profile::has_effective_auto_start`]: the switch kick
+    /// `oauth::prime_window`, the auto-start queue
+    /// `usage::auto_start_queue_members`, the Usage tab's auto-start countdown,
+    /// the Config tab's `auto-start queue` row and its key, the scheduler's
+    /// weekly-reset mark `usage::scheduler::drain_oauth_completions`), the token-mode
+    /// commands and the TUI clear's confirm
+    /// (`actions::refuse_token_mode_on_proxy`), `clauth limit-reset`
+    /// (`actions::refuse_limit_reset_on_proxy`), the status feed's refresh
+    /// countdown (`daemon::status_json::build_profile_entries`), the Usage
+    /// tab's empty body, the Setup tab's auto-start, usage-probe and clear
+    /// rows (`tui::app::config_rows`), its auto-start toggle, `build_snap`'s
+    /// log-out hint, the session env (`claude::session_env`) and the TUI's
+    /// rotate action read. Memory can lag the record on disk, so every write,
+    /// spend, mark, adopt and delete also takes the decision off the disk
+    /// through [`stored_proxy_claim_failing_closed`]: the stage landing every
+    /// lander shares (`oauth::land_pair`), the send rule every refresh asks
+    /// (`oauth::send_rule`), the kick (`oauth::auto_start_kick`), the rolling
+    /// stamp, the live-mirror adopt, the weekly-reset mark's confirmation, the
+    /// Claude Code login adopts (`claude::adopt_skips_proxy_account`), a
+    /// session's drain (`runtime::keeps_login_off_proxy_store`) and the
+    /// deletes.
+    pub(crate) fn spends_oauth_chain(&self) -> bool {
+        self.proxy.is_none() && !self.has_unreadable_proxy_record
+    }
+
+    /// Whether this account's stored `auto_start` opts it into anything: the
+    /// flag on an account that spends its own OAuth chain. A proxy account
+    /// carrying the flag (set before it became one, or by a hand edit) opts
+    /// into no kick and no queue seat, so it never makes the queue look
+    /// populated either. Surfaces that show or edit the stored flag itself
+    /// read [`Profile::auto_start`] instead.
+    pub(crate) fn has_effective_auto_start(&self) -> bool {
+        self.auto_start && self.spends_oauth_chain()
+    }
+
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.credentials.as_ref()?.refresh_token()
     }
@@ -640,23 +778,160 @@ impl Profile {
     /// the slot is read-modify-written cross-process, so an unlocked write can
     /// clobber a concurrent rotation. Any install or blanking replaces whatever
     /// bytes the disk held, so the unreadable-store fact clears with it.
+    ///
+    /// `base_url` follows the login state, so the store is written first and
+    /// then re-derived, the way the next load derives it: a login hides a
+    /// keyless URL and a logout makes it live, in memory as on disk.
     pub(crate) fn set_credentials(
         &mut self,
         credentials: Option<ClaudeCredentials>,
-        _held: &StateLockHeld,
+        held: &StateLockHeld,
     ) {
         self.unreadable_credentials_store = None;
-        self.credentials.set(credentials, _held);
+        self.credentials.set(credentials, held);
+        self.rederive_base_url();
+    }
+
+    /// Derive `base_url` and `provider` again from the typed value after a
+    /// change to what decides them — the login, `api_key`, `[env]` — the way
+    /// the next load derives them: a keyless URL under a login hides in memory
+    /// as on disk, and an inference token beside it makes it live again.
+    pub(crate) fn rederive_base_url(&mut self) {
+        self.fold_base_url_edit();
+        // A torn store counts as a login, as the load counts it.
+        let has_login = self.credentials.is_some() || self.unreadable_credentials_store.is_some();
+        let base_url = self.derived_base_url(has_login);
+        if base_url != self.base_url {
+            self.provider = base_url.as_deref().and_then(Provider::from_base_url);
+        }
+        self.typed_endpoint.derived_base_url.clone_from(&base_url);
+        self.base_url = base_url;
+    }
+
+    /// Set `base_url` to the caller's own value. A value that differs from what
+    /// clauth derived becomes the typed value; one equal to it leaves the typed
+    /// value as it was, so re-committing a URL clauth hides keeps the line. A
+    /// caller replacing the endpoint outright wants
+    /// [`Profile::replace_base_url`].
+    pub(crate) fn set_base_url(&mut self, base_url: Option<String>) {
+        self.base_url = base_url;
+        self.fold_endpoint_edits();
+    }
+
+    /// Replace `base_url` with a value the caller states outright (a captured
+    /// endpoint): it becomes the typed value even where it equals the derived
+    /// one, so a snapshot carrying a key and no URL drops the stored host
+    /// instead of pairing its key with it.
+    pub(crate) fn replace_base_url(&mut self, base_url: Option<String>) {
+        self.set_base_url(base_url.clone());
+        self.typed_endpoint.base_url = base_url;
+    }
+
+    /// Set the console session to the caller's own value, as
+    /// [`Profile::set_base_url`] does for `base_url`.
+    pub(crate) fn set_console(&mut self, console: Option<ConsoleCredential>) {
+        self.console = console;
+        self.fold_endpoint_edits();
+    }
+
+    /// The `base_url` this profile routes to once its login state is
+    /// `has_credentials`, derived from what a save would write, the way the
+    /// next load derives it.
+    pub(crate) fn derived_base_url(&self, has_credentials: bool) -> Option<String> {
+        effective_base_url(
+            self.saved_base_url(),
+            has_credentials,
+            self.api_key.as_deref(),
+            &self.env,
+        )
+    }
+
+    /// The `base_url` a save writes: the in-memory value when the caller moved
+    /// it off the derived snapshot, else the typed one.
+    pub(crate) fn saved_base_url(&self) -> Option<String> {
+        if self.base_url == self.typed_endpoint.derived_base_url {
+            self.typed_endpoint.base_url.clone()
+        } else {
+            self.base_url.clone()
+        }
+    }
+
+    /// The `[console]` table a save writes, by the same rule as
+    /// [`Profile::saved_base_url`].
+    fn saved_console(&self) -> ConsoleConfig {
+        if self.console == self.typed_endpoint.derived_console {
+            self.typed_endpoint.console.clone()
+        } else {
+            console_config(self.console.as_ref())
+        }
+    }
+
+    /// Make a caller's edit of `base_url` the typed value and its new snapshot.
+    fn fold_base_url_edit(&mut self) {
+        self.typed_endpoint.base_url = self.saved_base_url();
+        self.typed_endpoint
+            .derived_base_url
+            .clone_from(&self.base_url);
+    }
+
+    /// Make a caller's edit of an endpoint key the typed value and its new
+    /// snapshot.
+    fn fold_endpoint_edits(&mut self) {
+        self.fold_base_url_edit();
+        self.typed_endpoint.console = self.saved_console();
+        self.typed_endpoint
+            .derived_console
+            .clone_from(&self.console);
     }
 }
 
-/// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
-/// the file stays human-readable: `theme = "full"` / `theme = "compatible"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Theme tier a `profiles.toml` theme name maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThemeName {
     Full,
     Compatible,
+}
+
+impl ThemeName {
+    const ALL: [ThemeName; 2] = [ThemeName::Full, ThemeName::Compatible];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Full => "full",
+            ThemeName::Compatible => "compatible",
+        }
+    }
+}
+
+/// Theme selection in `profiles.toml`: the scalar `theme = "full"` or the table
+/// `[theme] name = "full"`. The form the file held is kept, so a save never
+/// rewrites an older reader's scalar into a form it refuses; a pick writes the
+/// table, and a name this build does not know rides every save verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, expecting = "a theme name, or a [theme] table with a name")]
+pub(crate) enum ThemeSetting {
+    Scalar(String),
+    Table { name: String },
+}
+
+impl AppState {
+    /// The configured theme tier, `None` when the file names none this build
+    /// knows.
+    pub(crate) fn theme_tier(&self) -> Option<ThemeName> {
+        let name = match self.theme.as_ref()? {
+            ThemeSetting::Scalar(name) | ThemeSetting::Table { name } => name,
+        };
+        ThemeName::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == name.as_str())
+    }
+
+    /// Record a theme pick for the next save.
+    pub(crate) fn set_theme(&mut self, name: ThemeName) {
+        self.theme = Some(ThemeSetting::Table {
+            name: name.as_str().to_string(),
+        });
+    }
 }
 
 /// How a usage window's reset renders across the TUI (`AppState.reset_display`,
@@ -810,6 +1085,11 @@ pub(crate) struct HerdrSettings {
     /// The sidebar row `clauth herdr install` appends gains the
     /// `$clauth_delegate` token, so a running delegate reads as text.
     pub(crate) delegate_row_text: bool,
+    /// Whether a herdr restore that dropped launch options refuses the
+    /// conversation's first prompt with the restore notice.
+    /// Read by the hook only; the TUI toggle persists it without pushing
+    /// anything live.
+    pub(crate) restore_notice: bool,
     /// Set once the first herdr-mode landing fires, so that landing happens
     /// exactly once; every later launch — herdr mode included — opens the
     /// top-level `home_tab` instead.
@@ -825,20 +1105,151 @@ impl Default for HerdrSettings {
             border_label: false,
             delegate_dot: true,
             delegate_row_text: false,
+            restore_notice: true,
             first_landing_done: false,
         }
     }
 }
 
-/// The daemon's session-creation knob, persisted under `[serve]` in
-/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
-/// partial: a missing field fills from [`Default`] rather than erroring.
+/// The daemon's API knobs, persisted under `[serve]` in profiles.toml. Like
+/// [`HerdrSettings`], the table may be absent (defaults) or partial: a missing
+/// field fills from [`Default`] rather than erroring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ServeSettings {
     /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
     /// (default off). Each calling device also needs its own `sessions` grant.
     pub(crate) session_creation: bool,
+    /// The exact origins whose pages may read the API (default empty: no CORS
+    /// header and no origin gate).
+    #[serde(
+        deserialize_with = "tolerant_origins",
+        skip_serializing_if = "AppOrigins::is_empty"
+    )]
+    pub(crate) app_origins: AppOrigins,
+}
+
+/// `[serve] app_origins` as the file holds it. A hand edit of the wrong type
+/// must not stop every clauth command, so [`tolerant_origins`] keeps what is
+/// not a string in `unreadable` for the API to log: this runs on every
+/// `profiles.toml` read, hooks and the MCP server included, and a line from
+/// here would land on their stderr once per process.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AppOrigins {
+    /// Every string, verbatim, valid or not: a save never rewrites one.
+    pub(crate) entries: Vec<String>,
+    /// Each value that is no string in a list, as text.
+    #[serde(skip)]
+    pub(crate) unreadable: Vec<String>,
+}
+
+impl AppOrigins {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// `unreadable` is a note about one read and renders nothing, so a table
+/// holding only that stays default.
+impl PartialEq for AppOrigins {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for AppOrigins {}
+
+fn tolerant_origins<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AppOrigins, D::Error> {
+    let mut origins = AppOrigins::default();
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::Array(items) => {
+            for item in items {
+                match item {
+                    toml::Value::String(entry) => origins.entries.push(entry),
+                    other => origins.unreadable.push(other.to_string()),
+                }
+            }
+        }
+        other => origins.unreadable.push(other.to_string()),
+    }
+    Ok(origins)
+}
+
+/// Why `entry` cannot count as an origin, or `None` when it can: exactly
+/// `scheme://host[:port]`, the form a browser serializes, so anything else
+/// could only ever fail to match or be read as more than one site. `http` is
+/// loopback alone: a page there has no secure context, and on any other host a
+/// network peer can write its script.
+pub(crate) fn origin_entry_fault(entry: &str) -> Option<&'static str> {
+    if entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("it holds whitespace or a control character");
+    }
+    if entry.contains('*') {
+        return Some("it holds a wildcard");
+    }
+    let Some((scheme, authority)) = entry.split_once("://") else {
+        return Some("it is not scheme://host[:port]");
+    };
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return Some("its scheme is not https or http"),
+    };
+    if authority.contains('/') {
+        return Some("it has a path or a trailing slash");
+    }
+    if authority.contains(['?', '#']) {
+        return Some("it has a query or a fragment");
+    }
+    if authority.contains('@') {
+        return Some("it has userinfo");
+    }
+    let host_end = if authority.starts_with('[') {
+        authority.find(']').map_or(authority.len(), |at| at + 1)
+    } else {
+        authority.find(':').unwrap_or(authority.len())
+    };
+    let (host, port) = authority.split_at(host_end);
+    if !origin_host_is_lowercase_name(host) {
+        return Some("its host is empty, not lowercase, or malformed");
+    }
+    if !port.is_empty() {
+        let Some(digits) = port.strip_prefix(':') else {
+            return Some("it is not scheme://host[:port]");
+        };
+        if digits == default_port {
+            return Some("it names its scheme's default port");
+        }
+        let as_sent = digits.bytes().all(|b| b.is_ascii_digit())
+            && !digits.starts_with('0')
+            && digits.parse::<u16>().is_ok();
+        if !as_sent {
+            return Some("its port is not a number a browser would send");
+        }
+    }
+    if scheme == "http" && !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return Some("it is plain http on a host other than loopback");
+    }
+    None
+}
+
+/// A DNS name or a dotted address in lowercase, or a bracketed IPv6 address.
+fn origin_host_is_lowercase_name(host: &str) -> bool {
+    if host.chars().any(char::is_uppercase) {
+        return false;
+    }
+    if let Some(address) = host.strip_prefix('[') {
+        return address
+            .strip_suffix(']')
+            .is_some_and(|address| address.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+        })
 }
 
 /// The auto-updater knob, persisted under `[update]` in profiles.toml. Like
@@ -857,6 +1268,24 @@ pub(crate) struct UpdateSettings {
 impl Default for UpdateSettings {
     fn default() -> Self {
         Self { auto_update: true }
+    }
+}
+
+/// The Claude Code plugin's knobs, persisted under `[plugin]` in profiles.toml
+/// and edited from the Services tab's plugin card. Like [`UpdateSettings`],
+/// the table may be absent (defaults) or partial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PluginSettings {
+    /// The one wake `clauth mcp-await-job` sends a session idle
+    /// `AWAIT_IDLE_WAKE_SECS` on a 1 h prompt cache while a delegate of its
+    /// own still runs (default on). Off, the wait runs on to the job's end.
+    pub(crate) idle_wake: bool,
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self { idle_wake: true }
     }
 }
 
@@ -916,14 +1345,14 @@ pub(crate) struct AppState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) auth_broken: Vec<ProfileName>,
     /// When true, the fallback-chain auto-switch decision for the ACTIVE
-    /// profile projects its utilization at the next poll (current + recent
-    /// burn rate × refresh interval) instead of comparing against the static
-    /// per-profile threshold — switching exactly when it would otherwise
-    /// cross 100% before the scheduler notices. Falls back to the static
-    /// threshold check when no burn rate is available yet. Off by default:
-    /// the static threshold stays the default auto-switch behavior (issue #8
-    /// follow-up b). Candidate selection and `soonest_resume` are unaffected
-    /// either way — the ACTIVE-side check is the walk's own.
+    /// profile also projects its utilization (current + recent burn rate ×
+    /// `min(poll interval, burn_horizon_cap_ms)`, the poll interval being the
+    /// active's usage-probe interval where the probe reads it) beside the static
+    /// per-profile threshold check, which always applies — switching early
+    /// when the projection would reach 100%, never later than static. With no
+    /// burn rate yet, or on a third-party provider window, the static check
+    /// alone decides. Off by default. Candidate selection and `soonest_resume`
+    /// are unaffected either way — the ACTIVE-side check is the walk's own.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
     /// Which member the fallback-chain walk lands on WITHIN one accept pass
@@ -997,6 +1426,23 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) preserve_non_login_keys: bool,
+    /// Keep every account's MCP-server logins (`mcpOAuth`) in step: an MCP
+    /// login belongs to no Claude account, so a fresh one made on any account
+    /// or inside any live session is copied to every account's credential
+    /// store that holds a Claude login or MCP logins (an account with no such
+    /// store gets none), where that store holds a copy of the same login or
+    /// none (`claude::sync_mcp_pass`; an account's own separately made login
+    /// is kept, and a login signed out of is removed everywhere); a running
+    /// session takes it at its next switch. With it on, a switch's carry keeps
+    /// the incoming account's own logins too. The daemon
+    /// does it on its tick and a swap's hand-off does it at once, neither into
+    /// a store a running session reads through its link. Default ON; off leaves
+    /// each account with its own copies (the carries' usable-first rule still
+    /// applies). Read off disk where it is used (`claude::sync_mcp_logins`),
+    /// where an unreadable file counts as on; the daemon tick gates the pass
+    /// off the config it reloads.
+    #[serde(default = "default_sync_mcp_logins", skip_serializing_if = "is_true")]
+    pub(crate) sync_mcp_logins: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -1020,9 +1466,10 @@ pub(crate) struct AppState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) auto_start_queue: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
-    /// detect applies when this is `None` and no flag was passed.
+    /// detect applies when this is `None` and no flag was passed. Read through
+    /// [`AppState::theme_tier`], written through [`AppState::set_theme`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) theme: Option<ThemeName>,
+    pub(crate) theme: Option<ThemeSetting>,
     /// Shape of every reset countdown in the TUI. `None` = the
     /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
     /// this key nor [`AppState::clock_format`] and renders exactly as it did
@@ -1042,6 +1489,13 @@ pub(crate) struct AppState {
     /// through [`AppState::home_tab`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) home_tab: Option<HomeTab>,
+    /// Holds the header mascot on its rest pose, and the header gauge's account
+    /// name and the Overview's provider names flat (the Config tab's
+    /// `reduce motion` row); spinners and the saving shimmers keep moving, since
+    /// they mark work in flight. `false` is skipped, so an untouched
+    /// profiles.toml carries no key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) reduce_motion: bool,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
@@ -1080,20 +1534,23 @@ pub(crate) struct AppState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_switch_threshold: Option<f64>,
     /// Burn-aware floor: the lowest 5h utilization at which a projected switch
-    /// may fire (`burn_aware_switching` only). The projection replaces the
-    /// static threshold with "would cross 100% before the next poll", and on a
+    /// may fire (`burn_aware_switching` only). The projection adds "would
+    /// reach 100% within the look-ahead" beside the static threshold, and on a
     /// small window (Pro) the window-relative burn %/h reads high, so the
     /// projection trips from well below 100 — this caps the wasted headroom at
-    /// `100 - floor` on every tier. `None` = [`DEFAULT_BURN_FLOOR_PCT`]. Read
+    /// `100 - min(floor, threshold)` on every tier, and a floor at or above
+    /// the threshold does nothing. `None` = [`DEFAULT_BURN_FLOOR_PCT`]. Read
     /// through [`AppState::burn_switch_floor_pct`], which resets a hand-edited
     /// out-of-band value to the default. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_switch_floor_pct: Option<f64>,
     /// Burn-aware horizon cap (ms): the projection looks ahead by
-    /// `min(refresh_interval, this)` instead of the full refresh interval, so a
-    /// long poll cadence can't balloon the early-switch margin (it scales
-    /// linearly with the look-ahead). `None` = [`DEFAULT_BURN_HORIZON_MS`]. Read
-    /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
+    /// `min(poll interval, this)` instead of the full poll interval (the
+    /// refresh interval, or the active's usage-probe interval where the probe
+    /// reads it), so a long poll cadence can't balloon the early-switch margin
+    /// (it scales linearly with the look-ahead). `None` =
+    /// [`DEFAULT_BURN_HORIZON_MS`]. Read through
+    /// [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_horizon_cap_ms: Option<u64>,
     /// The `[herdr]` table: the herdr-plugin knobs plus the first-landing
@@ -1111,11 +1568,21 @@ pub(crate) struct AppState {
     /// block on the next save; an explicit `auto_update = false` serializes.
     #[serde(default, skip_serializing_if = "update_is_default")]
     pub(crate) update: UpdateSettings,
+    /// The `[plugin]` table: the delegate idle-wake toggle. Omitted from the
+    /// file while at its default, like `[update]`.
+    #[serde(default, skip_serializing_if = "plugin_is_default")]
+    pub(crate) plugin: PluginSettings,
     /// The built-in bind-table digest the TUI last offered to move accounts
     /// onto. `None` = never offered, so the next TUI launch with a non-empty
     /// offer list re-offers. The CLI never reads or writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) preset_binds_offered: Option<String>,
+    /// [`AppState::set_active`] ran on this copy, so [`save_app_state`]
+    /// moves `~/.clauth/base-env.json`'s recorded account with the marker it
+    /// saves: a marker move by this clauth never reads as one by an older
+    /// clauth that predates the record. Never serialized.
+    #[serde(skip)]
+    pub(crate) active_moved: bool,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1130,6 +1597,10 @@ fn update_is_default(update: &UpdateSettings) -> bool {
     *update == UpdateSettings::default()
 }
 
+fn plugin_is_default(plugin: &PluginSettings) -> bool {
+    *plugin == PluginSettings::default()
+}
+
 impl AppState {
     /// Whether `name` is on the persisted quarantine list.
     pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
@@ -1141,6 +1612,7 @@ impl AppState {
     /// lose a concurrent switch.
     pub(crate) fn set_active(&mut self, active: Option<ProfileName>, _held: &StateLockHeld) {
         self.active_profile.set(active, _held);
+        self.active_moved = true;
     }
 
     /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
@@ -1156,6 +1628,42 @@ impl AppState {
             true
         } else {
             false
+        }
+    }
+
+    /// Drop `name` from every name list and clear the active marker when it
+    /// named `name`. State-only mirror of [`AppConfig::remove`] so a caller can
+    /// apply the delete onto a freshly read state rather than its stale copy.
+    pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
+        self.profiles.retain(|n| n != name);
+        self.fallback_chain.retain(|n| n != name);
+        self.auth_broken.retain(|n| n != name);
+        if self.active_profile.as_ref() == Some(name) {
+            self.set_active(None, held);
+        }
+    }
+
+    /// Replace `old` with `new` in every name list and the active marker.
+    /// State-only mirror of [`AppConfig::rename_all_occurrences`] so a caller
+    /// can apply the rename onto a freshly read state rather than its stale
+    /// copy.
+    pub(crate) fn rename_all_occurrences(
+        &mut self,
+        old: &ProfileName,
+        new: &ProfileName,
+        held: &StateLockHeld,
+    ) {
+        if let Some(slot) = self.profiles.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.fallback_chain.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.auth_broken.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if self.active_profile.as_ref() == Some(old) {
+            self.set_active(Some(new.clone()), held);
         }
     }
 
@@ -1203,7 +1711,9 @@ impl AppState {
 
     /// The effective burn-aware horizon cap (ms), resetting an out-of-band
     /// hand-edit to the default. Shares the refresh-interval band since the cap
-    /// is only ever compared against — and floored by — the refresh interval.
+    /// only ever bounds the look-ahead from above together with the poll
+    /// interval (`min(poll interval, cap)`; the poll interval being the refresh
+    /// interval, or a probe-read active's usage-probe interval).
     pub(crate) fn burn_horizon_cap_ms(&self) -> u64 {
         self.burn_horizon_cap_ms
             .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
@@ -1240,6 +1750,10 @@ fn default_preemptive_rotation() -> bool {
 }
 
 fn default_preserve_non_login_keys() -> bool {
+    true
+}
+
+fn default_sync_mcp_logins() -> bool {
     true
 }
 
@@ -1316,25 +1830,27 @@ pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
 pub(crate) const MIN_CONTEXT_NUDGE_TOKENS: u64 = 50_000;
 pub(crate) const MAX_CONTEXT_NUDGE_TOKENS: u64 = 2_000_000;
 
-/// Default burn-aware floor (percent). 98 mirrors the weekly default: a safe
-/// backstop that never lets a projected switch waste more than 2% of the
-/// window, while the horizon cap does the common-case reclaiming. Tune up for
-/// tighter margins (more window used, small rate-limit risk), 100 = only ever
-/// switch at the cap.
+/// Default burn-aware floor (percent), level with the weekly default. It sits
+/// above the default member threshold (95), so stock settings switch exactly
+/// like static; only a member threshold above 98 gives the projection room,
+/// and then a projected switch wastes at most 2% of the window. Lower it for
+/// an earlier projected switch (less window used, less rate-limit risk); at
+/// or above a member's threshold it does nothing for that member.
 pub(crate) const DEFAULT_BURN_FLOOR_PCT: f64 = 98.0;
 
 /// Lowest configurable burn-aware floor. Below this the projection may switch
 /// so far from 100 that the poll-lag margin it exists to protect is gone.
 pub(crate) const MIN_BURN_FLOOR_PCT: f64 = 90.0;
 
-/// Highest configurable burn-aware floor — 100 makes the projection fire only
-/// once utilization is already at the cap.
+/// Highest configurable burn-aware floor — 100 sits at or above every member
+/// threshold, so the projection never switches earlier than static.
 pub(crate) const MAX_BURN_FLOOR_PCT: f64 = 100.0;
 
 /// Default burn-aware horizon cap (60 s). Under the default 90 s cadence this
-/// shrinks the projected look-ahead below the full interval, reclaiming most of
-/// the early-switch margin while keeping a poll-lag cushion. Bounded by the
-/// refresh interval either way (`min(interval, cap)`).
+/// cuts the projected look-ahead, and with it the early-switch margin, by a
+/// third, while keeping a poll-lag cushion. Bounded by the
+/// poll interval either way (`min(interval, cap)`; the usage-probe interval on
+/// a probe-read active).
 pub(crate) const DEFAULT_BURN_HORIZON_MS: u64 = 60_000;
 
 impl Default for AppState {
@@ -1352,12 +1868,14 @@ impl Default for AppState {
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
             preserve_non_login_keys: default_preserve_non_login_keys(),
+            sync_mcp_logins: default_sync_mcp_logins(),
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,
             reset_display: None,
             clock_format: None,
             home_tab: None,
+            reduce_motion: false,
             show_estimates: true,
             show_pace: false,
             count_cache: false,
@@ -1370,7 +1888,9 @@ impl Default for AppState {
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
+            plugin: PluginSettings::default(),
             preset_binds_offered: None,
+            active_moved: false,
         }
     }
 }
@@ -1559,6 +2079,36 @@ impl AppConfig {
         .collect()
     }
 
+    /// One notice per stored account whose name the commands clauth prints
+    /// cannot address, the claude roster then the codex one, each in roster
+    /// order. A name both rosters hold — or one listed twice — is one account,
+    /// so it is noticed at its first occurrence alone: the claude roster's,
+    /// the account a bare name resolves to and the only one Setup can rename,
+    /// while the codex row for the same name is a hand edit. New names refuse
+    /// both shapes at creation; these are the accounts stored before that, or
+    /// by hand.
+    pub(crate) fn name_notices<'a>(
+        &'a self,
+        codex: impl IntoIterator<Item = &'a ProfileName>,
+    ) -> Vec<NameNotice> {
+        let mut notices: Vec<NameNotice> = Vec::new();
+        for (name, harness) in self
+            .profiles
+            .iter()
+            .map(|profile| (&profile.name, Harness::Claude))
+            .chain(codex.into_iter().map(|name| (name, Harness::Codex)))
+        {
+            let Some(notice) = NameNotice::of(name, harness) else {
+                continue;
+            };
+            if notices.iter().any(|seen| seen.name == notice.name) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
+    }
+
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
     /// per chain build rather than at load: the fingerprint that drives a hot
     /// reload is built from `config.toml` mtimes, and midnight moves no file.
@@ -1577,8 +2127,8 @@ impl AppConfig {
     }
 
     /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
-    /// actually changed, so the caller can skip a redundant `save_app_state`.
-    /// Pure in-memory mutation — the caller persists via `save_app_state`.
+    /// actually changed. Pure in-memory mutation — the caller persists via
+    /// `set_auth_broken_persisted`.
     pub(crate) fn set_auth_broken(&mut self, name: &ProfileName, broken: bool) -> bool {
         self.state.set_auth_broken(name, broken)
     }
@@ -1618,17 +2168,7 @@ impl AppConfig {
 
     pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
         self.profiles.retain(|p| p.name != *name);
-        self.state.profiles.retain(|n| n != name);
-        self.state.fallback_chain.retain(|n| n != name);
-        self.state.auth_broken.retain(|n| n != name);
-        if self.is_active(name) {
-            self.state.set_active(None, held);
-        }
-    }
-
-    /// Resync `state.profiles` from in-memory list to fix length drift from partial saves.
-    pub(crate) fn sync_state_profiles(&mut self) {
-        self.state.profiles = self.profiles.iter().map(|p| p.name.clone()).collect();
+        self.state.remove(name, held);
     }
 
     /// Replace `old` with `new` in every name list and the active marker.
@@ -1641,25 +2181,15 @@ impl AppConfig {
         if let Some(profile) = self.find_mut(old) {
             profile.name = new.clone();
         }
-        if let Some(slot) = self.state.profiles.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if self.is_active(old) {
-            self.state.set_active(Some(new.clone()), held);
-        }
+        self.state.rename_all_occurrences(old, new, held);
     }
 }
 
 /// Per-account model knobs written into the profile's Claude Code `settings.json`.
 /// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
-/// `CLAUDE_CODE_SUBAGENT_MODEL`.
+/// `CLAUDE_CODE_SUBAGENT_MODEL`; `advisor` is the top-level `advisorModel`
+/// setting, the model Claude Code's server-side advisor tool runs on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1674,6 +2204,8 @@ pub(crate) struct ModelSettings {
     pub(crate) fable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subagent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) advisor: Option<String>,
 }
 
 impl ModelSettings {
@@ -1684,10 +2216,11 @@ impl ModelSettings {
             && self.haiku.is_none()
             && self.fable.is_none()
             && self.subagent.is_none()
+            && self.advisor.is_none()
     }
 
     /// The stored id for a row named by its settings key (`default`, `opus`,
-    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    /// `sonnet`, `haiku`, `fable`, `subagent`, `advisor`). `None` outside that set.
     pub(crate) fn field(&self, row: &str) -> Option<&String> {
         match row {
             "default" => self.default.as_ref(),
@@ -1696,6 +2229,7 @@ impl ModelSettings {
             "haiku" => self.haiku.as_ref(),
             "fable" => self.fable.as_ref(),
             "subagent" => self.subagent.as_ref(),
+            "advisor" => self.advisor.as_ref(),
             _ => None,
         }
     }
@@ -1709,6 +2243,7 @@ impl ModelSettings {
             "haiku" => self.haiku = value,
             "fable" => self.fable = value,
             "subagent" => self.subagent = value,
+            "advisor" => self.advisor = value,
             _ => {}
         }
     }
@@ -1784,7 +2319,7 @@ impl std::fmt::Debug for ConsoleCredential {
 /// On-disk `[console]` table. Every field is optional so an absent table, a
 /// half-filled one, and a hand-edited one all parse; [`load_profile`]
 /// normalizes it into an `Option<ConsoleCredential>` at the load boundary.
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct ConsoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -1832,6 +2367,8 @@ struct ProfileConfig {
     #[serde(default)]
     models: ModelSettings,
     #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
     weekly_threshold: Option<f64>,
@@ -1871,6 +2408,259 @@ struct ProfileConfig {
     /// must render after every scalar key in `render_config_toml`.
     #[serde(default)]
     console: ConsoleConfig,
+}
+
+/// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
+/// only. The record is deliberately UNMODELLED in [`ProfileConfig`]: a table
+/// `ProfileConfig` holds but `render_config_toml` never writes is dropped by
+/// the next rewrite, while a table neither holds stays where it sits through
+/// every in-place `config.toml` write. That is what keeps every pre-existing
+/// state file and fixture byte-identical: the record reaches the runtime
+/// [`Profile`] only as its never-serialized `proxy` field.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+struct ProxyTable {
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// The typed proxy-account record a profile's `[proxy]` table carries: which
+/// proxy owns the account and the account's id there. `clauth delete` keys the
+/// upstream delete off it, the settings engine keys its PATCH off it, and the
+/// usage arm keys its per-account read off it — the registry bind match alone
+/// decides the arm, this record decides the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyAccount {
+    pub(crate) service: crate::proxy::Service,
+    pub(crate) account: String,
+}
+
+/// [`ProxyTable`] as the typed record. Both keys must be present and the
+/// service must still parse, so a hand-truncated or misnamed record reads as
+/// no record — the profile falls back to today's generic-endpoint arm rather
+/// than half-claiming an account.
+fn proxy_record(table: &ProxyTable) -> Option<ProxyAccount> {
+    let service = table
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let account = table
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())?;
+    Some(ProxyAccount {
+        service: crate::proxy::Service::parse(service).ok()?,
+        account: account.to_string(),
+    })
+}
+
+/// What `name`'s config.toml says about a proxy account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProxyClaim {
+    /// No `[proxy]` table (or no config clauth can read).
+    None,
+    Account(ProxyAccount),
+    /// A `[proxy]` table is there but is no record: a missing or blank key, a
+    /// service name that does not parse, or a config.toml whose TOML no longer
+    /// parses around a `[proxy]` header. The CLI loads every profile before it
+    /// asks, which refuses that last file first; the shared delete
+    /// ([`crate::actions::delete_profile`]) reads it under a config the TUI
+    /// loaded before the edit, and refuses it here.
+    Unreadable,
+    /// No reading of config.toml can say whether it holds a `[proxy]` table:
+    /// the file cannot be read, or its TOML does not parse and its text holds
+    /// `proxy` or a backslash on no `[proxy]` header line of its own, which
+    /// reads [`ProxyClaim::Unreadable`] first. Only
+    /// [`stored_proxy_claim_failing_closed`] answers it; [`stored_proxy_claim`]
+    /// reads such a file as [`ProxyClaim::None`].
+    Unclassifiable,
+}
+
+impl ProxyClaim {
+    /// The record, `None` for no record and for one clauth cannot read alike
+    /// ([`stored_proxy_record`]).
+    fn into_record(self) -> Option<ProxyAccount> {
+        match self {
+            Self::Account(record) => Some(record),
+            Self::None | Self::Unreadable | Self::Unclassifiable => None,
+        }
+    }
+}
+
+/// The proxy claim `name`'s config.toml carries, read lock-free off one file
+/// read — the [`stored_provider`] shape, for the same reason: callers hold no
+/// [`Profile`] or must not take the state flock for a read-only question. The
+/// re-login tells [`ProxyClaim::Unreadable`] from [`ProxyClaim::None`]: a
+/// table clauth cannot read still names an upstream account; each landing it
+/// guards then refuses a config.toml this reads as [`ProxyClaim::None`]
+/// without being able to tell, on its id check or claim
+/// ([`require_profile_id`], [`claim_profile_id`]). Any
+/// other guard on a write, a spend or a delete reads
+/// [`stored_proxy_claim_failing_closed`].
+pub(crate) fn stored_proxy_claim(name: &ProfileName) -> ProxyClaim {
+    // A config clauth cannot read claims nothing, as an empty one.
+    proxy_claim_in(&read_profile_config_text(name).unwrap_or_default())
+}
+
+/// [`stored_proxy_claim`] for a guard deciding whether clauth may write into,
+/// spend, mark, adopt into or delete `name` as an account that is no proxy
+/// account: what [`stored_proxy_claim`] reads as [`ProxyClaim::None`] because
+/// it cannot tell is [`ProxyClaim::Unclassifiable`] here. A missing file
+/// claims nothing, as [`load_profile`] reads it as an empty config: the
+/// record's one writer ([`write_proxy_record`]) edits the file in place, so no
+/// record exists without it.
+pub(crate) fn stored_proxy_claim_failing_closed(name: &ProfileName) -> ProxyClaim {
+    match profile_config_path(name) {
+        Ok(path) => proxy_claim_failing_closed_at(&path),
+        Err(_) => ProxyClaim::Unclassifiable,
+    }
+}
+
+/// [`stored_proxy_claim_failing_closed`] for the profile whose credential
+/// store is `store`, read off the `config.toml` beside it: a session's drain
+/// knows its store's path, not a name to resolve under the home.
+pub(crate) fn proxy_claim_beside_failing_closed(store: &Path) -> ProxyClaim {
+    proxy_claim_failing_closed_at(&store.with_file_name("config.toml"))
+}
+
+/// The fail-closed proxy claim of the `config.toml` at `path`.
+fn proxy_claim_failing_closed_at(path: &Path) -> ProxyClaim {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return ProxyClaim::Unclassifiable,
+    };
+    match parsed_proxy_claim(&raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(&raw) => ProxyClaim::Unreadable,
+        None if may_name_proxy_key(&raw) => ProxyClaim::Unclassifiable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse may still name a `proxy`
+/// key. TOML keys compare byte for byte, so such a key spells `proxy` out or
+/// escapes it with a backslash. A text that does not parse has no grammar to
+/// tell a key from a comment or a string, so either one anywhere counts: a
+/// plain account whose broken config only mentions one stays refused until
+/// the file is fixed. A text with a `[proxy]` header line never gets here: it
+/// reads [`ProxyClaim::Unreadable`] first.
+fn may_name_proxy_key(raw: &str) -> bool {
+    raw.contains("proxy") || raw.contains('\\')
+}
+
+/// The proxy claim a `config.toml` text carries, as [`stored_proxy_claim`]
+/// reads it.
+fn proxy_claim_in(raw: &str) -> ProxyClaim {
+    match parsed_proxy_claim(raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(raw) => ProxyClaim::Unreadable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse still opens a `[proxy]`
+/// table on a line of its own.
+fn has_proxy_header_line(raw: &str) -> bool {
+    raw.lines().any(|line| line.trim() == "[proxy]")
+}
+
+/// The proxy claim of a `config.toml` text that parses as TOML; `None` when it
+/// does not.
+fn parsed_proxy_claim(raw: &str) -> Option<ProxyClaim> {
+    #[cfg(test)]
+    PROXY_CLAIM_READS.with(|reads| reads.set(reads.get() + 1));
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(match table.get("proxy") {
+        None => ProxyClaim::None,
+        Some(proxy) => proxy
+            .clone()
+            .try_into::<ProxyTable>()
+            .ok()
+            .as_ref()
+            .and_then(proxy_record)
+            .map_or(ProxyClaim::Unreadable, ProxyClaim::Account),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The proxy-claim reads on this thread ([`stored_proxy_claim`] and the
+    /// name-keyed classifier's record read alike), so a pin can see which
+    /// paths parse a config.toml for a proxy record.
+    static PROXY_CLAIM_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many proxy claims were read on this thread.
+#[cfg(test)]
+pub(crate) fn proxy_claim_reads() -> usize {
+    PROXY_CLAIM_READS.with(std::cell::Cell::get)
+}
+
+/// The proxy-account record `name`'s config.toml carries; `None` for no
+/// record and for one clauth cannot read alike, which every reader but the
+/// delete treats as the generic-endpoint profile it then is.
+pub(crate) fn stored_proxy_record(name: &ProfileName) -> Option<ProxyAccount> {
+    stored_proxy_claim(name).into_record()
+}
+
+/// Write `name`'s proxy-account record into its `config.toml` in place — the
+/// ONE write path for the record. A file already holding a `proxy` table (a
+/// block table, an inline table, or dotted `proxy.*` keys) gets its `service`
+/// and `account` values replaced where they sit (a `service` or `account` that
+/// is itself a table is replaced by the value); a file without one gets the
+/// table appended after its last item; a profile with no file yet gets one
+/// holding the record. An existing record is replaced (the re-bind login's
+/// re-mint). A file that is not TOML refuses with the load's own parse error
+/// and is never written over; a file holding any CRLF line is written CRLF
+/// throughout.
+pub(crate) fn write_proxy_record(name: &ProfileName, record: &ProxyAccount) -> Result<()> {
+    let path = profile_config_path(name)?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        // A missing file reads as empty: the append below writes one holding
+        // the record, so the create and the append stay one path.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {name}/config.toml"));
+        }
+    };
+    let lf = raw.replace("\r\n", "\n");
+    let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
+        // A file that is not TOML refuses with the load's own parse error;
+        // the bytes on disk are never written over.
+        return Err(ConfigParseRefusal::new(name.as_str(), &raw).into());
+    };
+    let service = toml::Value::from(record.service.as_str());
+    let account = toml::Value::from(record.account.as_str());
+    let set = |t: &mut dyn toml_edit::TableLike| {
+        set_state_entry(t, "service", &service);
+        set_state_entry(t, "account", &account);
+    };
+    let item = doc.get_mut("proxy");
+    let non_table = item.as_ref().is_some_and(|i| !i.is_table_like());
+    if let Some(table) = item.and_then(toml_edit::Item::as_table_like_mut) {
+        set(table);
+    } else {
+        // A `proxy` value that is no table cannot hold the record: removed
+        // with its comments kept, and the table appended, as a modelled table
+        // does over a value where it belongs.
+        if non_table {
+            remove_key_keeping_comments(&mut doc, "proxy", &[], "");
+        }
+        append_root_table(&mut doc, "proxy", set);
+    }
+    let mut out = doc.to_string();
+    if raw.contains("\r\n") {
+        // Normalize before the expand, as the config save does: a multi-line
+        // string's own `\r\n` survives the parse, and a blanket expand writes
+        // a bare `\r` the file no longer parses.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    atomic_write_600(&path, out).context("failed to write the proxy record")
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -1969,6 +2759,11 @@ pub(crate) struct ReloadFingerprint {
     /// never shift the fingerprint. The dir walk below already covers a codex
     /// profile's `config.toml`; this is the only codex-specific stat needed.
     codex_toml_mtime: Option<SystemTime>,
+    /// `proxies.toml`'s mtime — a registry edit decides which usage arm (the
+    /// proxy's, or the generic endpoint scan) a proxy account's entry is built
+    /// on, and touches no profile file, so without this stat a fixed row
+    /// would wait for some unrelated reload to rebuild the entries.
+    proxies_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time,
     /// credentials.json write time)`, each `None` when the file is absent, sorted
     /// by name so readdir order can't spuriously flip equality. The store rides
@@ -2051,6 +2846,10 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     ReloadFingerprint {
         profiles_toml_mtime,
         codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
+        proxies_toml_mtime: crate::proxy::registry_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok()),
         config_mtimes,
         identity_mtimes,
     }
@@ -2296,7 +3095,7 @@ pub(crate) fn profile_wallet_history_path(name: &ProfileName) -> Result<PathBuf>
 
 /// Append this landing fetch's wallet readings to `wallet_history.jsonl` —
 /// the durable balance series the wallet-burn rate replays
-/// (`usage::burn::compute_wallet_rate_from_history`).
+/// (`usage::burn::compute_wallet_rate_from_history_at`).
 ///
 /// Mirrors [`append_usage_sample`]: per wallet, an unchanged reading (same
 /// amount under the same `(label, currency)` identity) writes nothing, and a
@@ -2548,17 +3347,19 @@ pub(crate) fn atomic_write_with(
     }
     let tmp = tmp_sibling(path);
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write)
+    publish_temp(&tmp, path, f, write, None)
 }
 
 /// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
 /// `path`; the temp is removed when either step fails, so a failing writer
-/// never leaves one behind (each temp name is used once).
+/// never leaves one behind (each temp name is used once). With `modified` the
+/// closed temp takes that mtime before the rename.
 fn publish_temp(
     tmp: &Path,
     path: &Path,
     mut f: std::fs::File,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let written = write(&mut f);
     drop(f);
@@ -2566,7 +3367,23 @@ fn publish_temp(
         let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
-    match std::fs::rename(tmp, path) {
+    if let Some(at) = modified {
+        // Through a handle of its own, opened once the writing one closed:
+        // Windows settles a written file's last write time when its writing
+        // handle closes, after a time set through that same handle.
+        let handle = std::fs::OpenOptions::new().write(true).open(tmp);
+        #[cfg(test)]
+        let handle = handle.map(|file| DatingHandle {
+            file,
+            fault: take_dating_fault(path),
+        });
+        let dated = handle.and_then(|file| file.set_modified(at));
+        if let Err(e) = dated {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
+        }
+    }
+    match land(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
@@ -2580,10 +3397,27 @@ fn publish_temp(
 /// and a stale temp at its name is removed first, so the mode is applied at
 /// creation.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    atomic_write_600_with(path, |f| {
-        use std::io::Write;
-        f.write_all(content.as_ref())
-    })
+    atomic_write_600_dated(path, content, None)
+}
+
+/// [`atomic_write_600`] whose file lands already carrying the mtime
+/// `modified`: the temp file takes it before the rename, which moves the name
+/// and keeps the file's times, so no reader sees the new bytes under any
+/// other mtime, and a write that fails leaves the old file's bytes and mtime
+/// as they were.
+pub(crate) fn atomic_write_600_dated(
+    path: &Path,
+    content: impl AsRef<[u8]>,
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    atomic_write_600_dated_with(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())
+        },
+        modified,
+    )
 }
 
 /// [`atomic_write_600`] with the content written by `write` into the temp
@@ -2593,6 +3427,16 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
 pub(crate) fn atomic_write_600_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_write_600_dated_with(path, write, None)
+}
+
+/// [`atomic_write_600_with`] landing with the mtime `modified` when given
+/// ([`atomic_write_600_dated`]).
+fn atomic_write_600_dated_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -2619,7 +3463,88 @@ pub(crate) fn atomic_write_600_with(
     };
     #[cfg(not(unix))]
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write)
+    publish_temp(&tmp, path, f, write, modified)
+}
+
+/// [`publish_temp`]'s rename. In a test build the file is read at the instant
+/// it lands, inside this step, so whatever the writer does after the rename
+/// shows as a landed file that lacks it ([`set_landed_hook`]).
+fn land(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    #[cfg(test)]
+    run_landed_hook(path);
+    Ok(())
+}
+
+/// A test's reader at the instant a dated write lands at a path, run once.
+#[cfg(test)]
+pub(crate) type LandedHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static LANDED_HOOKS: std::sync::Mutex<Option<HashMap<PathBuf, LandedHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_landed_hook(path: &Path, f: LandedHook) {
+    if let Ok(mut hooks) = LANDED_HOOKS.lock() {
+        hooks
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_landed_hook(path: &Path) {
+    let hook = LANDED_HOOKS
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(path)));
+    if let Some(f) = hook {
+        f(path);
+    }
+}
+
+/// The paths whose next dated write fails at its dating step, as a failed
+/// `set_modified` would; each fault fires once.
+#[cfg(test)]
+static DATING_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_dating(path: &Path) {
+    if let Ok(mut faults) = DATING_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The dated writer's dating handle in a test build: an armed fault is the
+/// result its `set_modified` answers, in place of the real call's, so the
+/// writer's handling of that result is what the fault exercises.
+#[cfg(test)]
+struct DatingHandle {
+    file: std::fs::File,
+    fault: std::io::Result<()>,
+}
+
+#[cfg(test)]
+impl DatingHandle {
+    fn set_modified(self, at: std::time::SystemTime) -> std::io::Result<()> {
+        self.fault.and_then(|()| self.file.set_modified(at))
+    }
+}
+
+#[cfg(test)]
+fn take_dating_fault(path: &Path) -> std::io::Result<()> {
+    let planted = DATING_FAULTS
+        .lock()
+        .ok()
+        .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,
@@ -2640,7 +3565,8 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
 /// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
-/// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`) routes
+/// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`,
+/// `limit-reset-locks/<name>.lock`) routes
 /// through here so no lock is born at the process umask — the file itself
 /// carries nothing secret, but a blanket owner-only tree is the invariant the
 /// perms test can check without an exceptions list.
@@ -2708,7 +3634,7 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
 
 /// Clear the group and other bits on the `~/.claude` dirs clauth's rescue and
 /// store-link writers create — the rescue's [`crate::sessions::SIDECAR_TREES`],
-/// the store-link dirs `jobs` and `projects`, and each direct child of
+/// the store-link dirs [`crate::runtime::SHARED_STORES`], and each direct child of
 /// `projects/` (CC's and clauth's alike) — so the session-id listing those
 /// trees expose stays owner-only. A dir those writers created under an older
 /// build keeps its umask mode forever (nothing revisits it once the bytes stop
@@ -2818,6 +3744,22 @@ pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
+/// [`read_json_file`] for a path the live-session count runs every tick: a
+/// regular file only and bounded ([`crate::runtime::read_regular_capped`]),
+/// since a blocking `open` on a FIFO never returns and a device read never
+/// ends. A non-regular or unreadable file
+/// reads `Err`, the same arm an unreadable file takes; the callers map it to
+/// "no sidecar".
+pub(crate) fn read_json_file_capped<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP)
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
+}
+
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -2837,6 +3779,21 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
     load_app_state()
         .ok()
         .and_then(|s| s.active_profile.into_inner())
+}
+
+/// `[plugin] idle_wake`, read lock-free from `profiles.toml`'s `[plugin]` table
+/// alone, for the await hook's idle-wake decision: a hand-written file holding
+/// only that table reads too. A file or table that does not read keeps the
+/// wake on: only a readable `false` turns it off.
+pub(crate) fn idle_wake_enabled() -> bool {
+    #[derive(Deserialize)]
+    struct PluginTable {
+        #[serde(default)]
+        plugin: PluginSettings,
+    }
+    app_state_path()
+        .and_then(|path| read_toml_file::<PluginTable>(&path))
+        .map_or(true, |t| t.plugin.idle_wake)
 }
 
 /// Whether the on-disk profile list still carries `name`, read from
@@ -2882,9 +3839,15 @@ pub(crate) fn claude_roster_names() -> Result<Vec<ProfileName>> {
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {
+    Ok(read_app_state()?.unwrap_or_default())
+}
+
+/// `profiles.toml`, `None` when it is missing, so a caller that cares can tell
+/// a first run from a good read in one step.
+pub(crate) fn read_app_state() -> Result<Option<AppState>> {
     let path = app_state_path()?;
     if !path.exists() {
-        return Ok(AppState::default());
+        return Ok(None);
     }
     let mut state: AppState = read_toml_file(&path)?;
     state.refresh_interval_ms = state.refresh_interval_ms.max(MIN_REFRESH_INTERVAL_MS);
@@ -2907,7 +3870,84 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     if state.context_nudge_threshold_tokens.is_some() {
         state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
     }
-    Ok(state)
+    Ok(Some(state))
+}
+
+/// The fresh-read proof for [`save_app_state`]. Sealed inside this module: only
+/// [`FreshState`] (and, in test builds, an [`AppState`] a fixture authored) can
+/// be handed to a save. The proof says the value came from a load inside a
+/// flock hold, not what it holds: a caller can still overwrite it through
+/// [`DerefMut`](std::ops::DerefMut).
+mod fresh {
+    pub(crate) trait Sealed {}
+}
+
+/// What [`save_app_state`] accepts. Closed by the private [`fresh::Sealed`]
+/// supertrait, so no caller outside this module can implement it for a stale
+/// snapshot of its own.
+pub(crate) trait SaveState: fresh::Sealed {
+    fn app_state(&self) -> &AppState;
+}
+
+/// An [`AppState`] read fresh from `profiles.toml` inside a state flock hold,
+/// carrying the proof that [`save_app_state`] requires. [`Deref`]/[`DerefMut`]
+/// keep field and method access the same as a bare [`AppState`], so a caller
+/// can still overwrite the fresh value through [`DerefMut`].
+///
+/// It borrows the hold it was read under, so it cannot outlive that hold's
+/// closure: a read in one hold saved after it, across a slow step, does not
+/// compile (`with_state_lock(|h| load_fresh_state(h))` fails with "lifetime
+/// may not live long enough", measured 2026-10-29). No test pins that, since a
+/// compile failure cannot run in this suite.
+pub(crate) struct FreshState<'h> {
+    state: AppState,
+    _hold: std::marker::PhantomData<&'h StateLockHeld>,
+}
+
+impl fresh::Sealed for FreshState<'_> {}
+impl SaveState for FreshState<'_> {
+    fn app_state(&self) -> &AppState {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+impl fresh::Sealed for AppState {}
+#[cfg(test)]
+impl SaveState for AppState {
+    fn app_state(&self) -> &AppState {
+        self
+    }
+}
+
+impl FreshState<'_> {
+    pub(crate) fn into_inner(self) -> AppState {
+        self.state
+    }
+}
+
+impl std::ops::Deref for FreshState<'_> {
+    type Target = AppState;
+    fn deref(&self) -> &AppState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for FreshState<'_> {
+    fn deref_mut(&mut self) -> &mut AppState {
+        &mut self.state
+    }
+}
+
+/// Read `profiles.toml` fresh inside the caller's state flock hold, returning
+/// the value with the proof [`save_app_state`] requires. The proof says the
+/// value came from a load inside this hold, and lives no longer than it; a
+/// caller can still overwrite it through [`DerefMut`].
+pub(crate) fn load_fresh_state<'h>(_held: &'h StateLockHeld) -> Result<FreshState<'h>> {
+    Ok(FreshState {
+        state: load_app_state()?,
+        _hold: std::marker::PhantomData,
+    })
 }
 
 /// Test seam: [`save_app_state`] writes fail the way the read-only `~/.clauth`
@@ -2943,548 +3983,934 @@ impl Drop for FailAppStateSave<'_> {
     }
 }
 
-pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
+/// Test seam: [`update_profile_config`]'s next write fails the way a read-only
+/// profile dir would, after its fresh read landed, so a test can fail the save
+/// alone. Armed through [`FailProfileConfigSave`], [`FailAppStateSave`]'s twin.
+#[cfg(test)]
+static FAIL_PROFILE_CONFIG_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`update_profile_config`] write failure for the
+/// guard's lifetime, borrowing the home sandbox as [`FailAppStateSave`] does.
+#[cfg(test)]
+pub(crate) struct FailProfileConfigSave<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailProfileConfigSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_PROFILE_CONFIG_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailProfileConfigSave<'_> {
+    fn drop(&mut self) {
+        FAIL_PROFILE_CONFIG_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
     #[cfg(test)]
     if FAIL_APP_STATE_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow::anyhow!(
             "failed to write profiles.toml: Permission denied (os error 13)"
         ));
     }
-    with_state_lock(|_held| {
-        mkdir_700(&clauth_dir()?)?;
+    let state = state.app_state();
+    with_state_lock(|held| {
         let path = app_state_path()?;
-        let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
-        atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
-            .context("failed to write profiles.toml")
+        let raw = read_state_file(&path)?;
+        // The edit runs before anything is written, so a file the writer
+        // refuses leaves the marker record untouched too.
+        let edited = raw
+            .as_deref()
+            .map(|raw| edit_state_in_place(&path, raw, state))
+            .transpose()?;
+        // The record first: a failed record write leaves the marker as it
+        // was, and only a crash between the two writes leaves them apart.
+        if state.active_moved {
+            let replaced = edited
+                .as_ref()
+                .and_then(|(_, disk)| disk.as_ref())
+                .and_then(|disk| disk.active_profile.as_ref().cloned());
+            crate::claude::note_active_marker(
+                state.active_profile.as_ref(),
+                replaced.as_ref(),
+                held,
+            )?;
+        }
+        write_state_file(&path, state, raw, edited.map(|(out, _)| out))
     })
 }
 
-/// Re-attach onto a rendered `profiles.toml` every key the on-disk file holds
-/// that `AppState` does not model — the `profiles.toml` half of the rule
-/// `serialize_credentials_preserving_extra` states for the credential store:
-/// a rewrite over itself must keep what the model cannot hold.
-///
-/// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
-/// on every save, and the writers that put them there are exactly the ones
-/// clauth must not overrule: a NEWER clauth whose keys this binary has not
-/// learned (an older install against a newer config silently erases them —
-/// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
-/// The carry is recursive: a future TOP-LEVEL key re-attaches whole, and a
-/// future sub-key inside a table the model DOES hold (`[update]`, `[herdr]`,
-/// `[serve]`) re-attaches inside that table's rendered block
-/// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
-/// the moment the model gains the table.
-///
-/// Three exclusions; the first two close each other's hole. "Modelled" is decided by
-/// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
-/// modelled key the new state just moved to a default (absent from the render,
-/// its `skip_serializing_if` omitted it) cannot come back from disk with its
-/// stale value — resurrection. But that round-trip erases a modelled key whose
-/// ON-DISK value is itself the skipped default (`show_pace = false` written
-/// by hand), so the second exclusion drops any key the RENDER already names —
-/// without it, a save that moves such a key off default emits it twice, and a
-/// duplicate top-level key is a hard parse error bricking the file. The third,
-/// [`carry_is_inert`] (per nested entry, [`nested_carry_if_inert`]), catches what
-/// the round-trip cannot see: a serde alias of a modelled key reads as
-/// unmodelled, and carried beside its field it duplicates that field. A carried
-/// key is one the model's round-trip never saw, the render does not write, and
-/// whose presence leaves what the file parses to unchanged.
-fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return rendered; // nothing on disk to preserve (first save)
-    };
-    let Ok(disk) = raw.parse::<toml::Table>() else {
-        return rendered; // unparseable: not ours to resurrect keys from
-    };
-    let Ok((modelled, modelled_nested)) = modelled_state_shape(&raw) else {
-        // The state did not parse, so which keys are modelled is UNKNOWN, and
-        // carrying everything would duplicate modelled keys already in the
-        // render — a duplicate top-level key is a hard parse error, bricking
-        // the file this save is supposed to keep loadable. Carry nothing.
-        return rendered;
-    };
-    // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
-        return rendered; // a render that does not parse: nothing safe to merge
-    };
-    let baseline = parsed_as::<AppState>(&rendered);
-    let rendered = nested_carry_if_inert::<AppState>(
-        rendered,
-        baseline.as_deref(),
-        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
-    );
-    let carried: Vec<(String, toml::Value)> = disk
-        .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| carry_is_inert::<AppState>(baseline.as_deref(), &rendered_table, k, v))
-        .collect();
-    if carried.is_empty() {
-        return rendered; // the common case: nothing unmodelled on disk
+/// A typed state file the in-place writer edits: `profiles.toml`,
+/// `codex-profiles.toml` or `proxies.toml`.
+pub(crate) trait StateFile: Serialize + serde::de::DeserializeOwned {
+    /// The file's name, as its refusals and write errors print it.
+    const LABEL: &'static str;
+
+    /// The list keys the type cannot read without: a key read alone sits
+    /// beside these, empty.
+    const REQUIRED_LISTS: &'static [&'static str] = &[];
+
+    /// Write a table the file does not hold yet into it, as a block table.
+    fn insert_new_table(doc: &mut toml_edit::DocumentMut, key: &str, new: &toml::Table) {
+        append_root_table(doc, key, |t| {
+            for (sub, v) in new {
+                t.insert(sub, toml_edit::Item::Value(state_edit_value(v)));
+            }
+        });
     }
-    merge_carried_keys(rendered, &carried)
 }
 
-/// What a store's model recognizes, derived by round-tripping the file
-/// through its type: the top-level keys it holds, plus the sub-keys of every
-/// modelled table — the shape [`nested_unmodelled`] classifies unmodelled
-/// nested keys against.
-type ModelledShape = (
-    std::collections::BTreeSet<String>,
-    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-);
+impl StateFile for AppState {
+    const LABEL: &'static str = "profiles.toml";
+    const REQUIRED_LISTS: &'static [&'static str] = &["profiles"];
+}
 
-/// What `AppState` holds, derived by round-tripping `raw` through the type:
-/// the top-level keys it recognizes, plus the sub-keys of every modelled
-/// table — the nested form of the same derivation, so a future sub-key inside
-/// a modelled table is recognized as unmodelled rather than silently deleted.
-/// Err on a file that does not parse as `AppState` — the caller must refuse to
-/// carry rather than guess.
-fn modelled_state_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
-    let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
-    toml::to_string_pretty(&state)
+/// `state` saved over the file at `path`: edited in place over the file's own
+/// bytes, rendered whole where there is no file. The caller holds the state
+/// flock, so the raw read and the typed state belong to one hold.
+pub(crate) fn save_state_in_place<T: StateFile>(path: &Path, state: &T) -> Result<()> {
+    let raw = read_state_file(path)?;
+    let edited = raw
+        .as_deref()
+        .map(|raw| edit_state_in_place(path, raw, state))
+        .transpose()?;
+    write_state_file(path, state, raw, edited.map(|(out, _)| out))
+}
+
+/// A state file's raw bytes, `None` when it does not exist.
+fn read_state_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Write `edited` over `path` unless it equals the file's own bytes; with no
+/// file to edit, the whole render of `state`.
+fn write_state_file<T: StateFile>(
+    path: &Path,
+    state: &T,
+    raw: Option<String>,
+    edited: Option<String>,
+) -> Result<()> {
+    let out = match (raw, edited) {
+        (Some(raw), Some(out)) if out == raw => return Ok(()),
+        (_, Some(out)) => out,
+        (_, None) => toml::to_string_pretty(state)
+            .with_context(|| format!("failed to render {}", T::LABEL))?,
+    };
+    mkdir_700(&clauth_dir()?)?;
+    atomic_write_600(path, out).with_context(|| format!("failed to write {}", T::LABEL))
+}
+
+/// A state file as it is on disk with `state` written into it in place: only
+/// the keys whose typed value moved are touched, so comments, key order, list
+/// layout and every key this clauth does not model stay as written (a newer
+/// clauth's keys included). Returns the edited bytes and the typed state the
+/// file held, `None` when it holds no readable state (an empty file).
+///
+/// Two shapes refuse and write nothing: a file that is not TOML (the load's
+/// own parse error, position only) and a modelled key clauth cannot read into
+/// its type ([`ConfigEditRefusal`], naming the key). Old and new are compared
+/// as typed values, so a spelling the model reads as the same value (a serde
+/// variant alias) stays as written until that setting changes.
+fn edit_state_in_place<T: StateFile>(
+    path: &Path,
+    raw: &str,
+    state: &T,
+) -> Result<(String, Option<T>)> {
+    let lf = raw.replace("\r\n", "\n");
+    let typed = toml::from_str::<T>(raw);
+    let parsed = lf
+        .parse::<toml_edit::DocumentMut>()
         .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|table| {
-            let nested = table
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_table()
-                        .map(|t| (k.clone(), t.keys().cloned().collect()))
-                })
-                .collect();
-            (table.keys().cloned().collect(), nested)
-        })
-        .ok_or(())
-}
-
-/// The sub-keys of `disk[k]` that neither the model nor the render holds, for
-/// every top-level key both sides hold as a table: the nested form of the
-/// unmodelled-key carry. A future sub-key inside a MODELLED table would
-/// otherwise be deleted by the next save. The top-level carry owns an
-/// unmodelled table whole, and the round-trip exclusion above owns a modelled
-/// key the new state moved to its default — this picks up exactly the gap:
-/// tables the render writes, sub-keys the model never learned.
-///
-/// A table the round-trip OMITTED (every modelled key in it parsed to its
-/// default — the round-trip skips a default table) is classified against the
-/// RENDER alone when the save writes it: the render's own keys are the
-/// duplicate guard, and a modelled key the render omits there is
-/// value-neutral to carry (it parsed to the same default the model holds).
-/// The alternative — deriving the recognized sets from a default render of
-/// the type — classifies nothing: `AppState`'s table fields all skip at their
-/// default, so a default render emits no table blocks at all.
-fn nested_unmodelled(
-    disk: &toml::Table,
-    modelled_nested: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    rendered: &toml::Table,
-) -> Vec<(String, String, toml::Value)> {
-    let mut out = Vec::new();
-    for (table, value) in disk {
-        let Some(disk_table) = value.as_table() else {
-            continue;
+        .zip(lf.parse::<toml::Table>().ok());
+    let Some((mut doc, literal)) = parsed else {
+        let position = match &typed {
+            Err(e) => crate::format::toml_parse_position(raw, e),
+            Ok(_) => None,
         };
-        let rendered_table = rendered.get(table.as_str()).and_then(toml::Value::as_table);
-        let known = modelled_nested.get(table.as_str());
-        if known.is_none() && rendered_table.is_none() {
-            continue; // neither side holds it: the top-level carry owns it whole
-        }
-        for (key, value) in disk_table {
-            if known.is_some_and(|k| k.contains(key.as_str())) {
-                continue; // the model holds it: the round-trip already decided
-            }
-            if rendered_table.is_some_and(|t| t.contains_key(key.as_str())) {
-                continue; // the render writes it: never carried beside its copy
-            }
-            out.push((table.clone(), key.clone(), value.clone()));
-        }
-    }
-    out
-}
-
-/// What `text` parses to as a `T`, re-rendered: the value the inert rule
-/// compares. Callers parse the render once per save and hand it down.
-fn parsed_as<T>(text: &str) -> Option<String>
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    toml::to_string(&toml::from_str::<T>(text).ok()?).ok()
-}
-
-/// Whether carrying `key = value` beside `rendered` leaves what the file parses
-/// to exactly as the render alone has it (`baseline`, the render's
-/// [`parsed_as`]): the last word on every top-level carry. The round-trip that
-/// decides "modelled" cannot see a serde alias (`kick_timer` for
-/// `auto_start`): the alias parses into its field and re-emits under the
-/// field's own name, so the alias reads as unmodelled. Serde counts an alias
-/// and its field as ONE field, so carried beside the render's copy it is a
-/// duplicate field and the next load fails outright; carried where the render
-/// leaves the field at its skipped default, it turns the field back on. Any
-/// carry that breaks the parse or changes a parsed value is dropped; a
-/// genuinely unmodelled key parses the same with or without it and stays. A
-/// render that does not parse (`baseline` `None`) carries nothing.
-fn carry_is_inert<T>(
-    baseline: Option<&str>,
-    rendered: &toml::Table,
-    key: &str,
-    value: &toml::Value,
-) -> bool
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    let mut with = rendered.clone();
-    with.insert(key.to_string(), value.clone());
-    let parsed = toml::to_string(&with)
-        .ok()
-        .and_then(|text| parsed_as::<T>(&text));
-    matches!((baseline, parsed), (Some(a), Some(b)) if a == b)
-}
-
-/// The nested carry with [`carry_is_inert`]'s rule one level down, entry by
-/// entry: each `[table] key = value` is merged only when it alone leaves what
-/// the file parses to as the render has it (`baseline`), so one bad nested
-/// key never costs the genuine ones beside it.
-fn nested_carry_if_inert<T>(
-    rendered: String,
-    baseline: Option<&str>,
-    nested: &[(String, String, toml::Value)],
-) -> String
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    let Some(baseline) = baseline else {
-        return rendered;
+        return Err(ConfigParseRefusal::at(path.display(), position).into());
     };
-    let inert: Vec<(String, String, toml::Value)> = nested
-        .iter()
-        .filter(|entry| {
-            let one = merge_nested_carried_keys(rendered.clone(), std::slice::from_ref(*entry));
-            parsed_as::<T>(&one).is_some_and(|parsed| parsed == baseline)
+    let disk = match typed {
+        Ok(disk) => Some(disk),
+        Err(_) => {
+            if let Some(key) = unreadable_state_key::<T>(&doc, &literal) {
+                return Err(ConfigEditRefusal::new(T::LABEL, &key).into());
+            }
+            // No single key explains the failure: a file missing a required
+            // key (an empty one) holds no state to diff against, so every
+            // modelled key is written in.
+            None
+        }
+    };
+    let old = match &disk {
+        Some(disk) => state_table(disk)?,
+        None => toml::Table::new(),
+    };
+    let rendered = doc.to_string();
+    apply_state_edits::<T>(&mut doc, &old, &state_table(state)?, &literal);
+    let mut out = doc.to_string();
+    if out == rendered {
+        // The edit list changed nothing, so the file already holds this state:
+        // hand back its own bytes (a missing final newline, mixed line endings)
+        // and the save's raw comparison skips the write.
+        return Ok((raw.to_string(), disk));
+    }
+    if raw.contains("\r\n") {
+        // The config.toml writer's rule: normalize, then expand, so a CRLF
+        // file stays CRLF, inserted lines included.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    Ok((out, disk))
+}
+
+/// `state` as the typed table a save writes: the serializer's own view, so a
+/// key at its `skip_serializing_if` default is absent.
+fn state_table<T: StateFile>(state: &T) -> Result<toml::Table> {
+    let render_failed = || format!("failed to render {}", T::LABEL);
+    match toml::Value::try_from(state).with_context(render_failed)? {
+        toml::Value::Table(t) => Ok(t),
+        _ => Err(anyhow::anyhow!(render_failed())),
+    }
+}
+
+/// `key = value` read alone as the file's type (beside the empty lists the
+/// type requires), or `None` when the model cannot read it.
+fn read_state_key_alone<T: StateFile>(key: &str, value: &toml::Value) -> Option<T> {
+    let mut t = toml::Table::new();
+    for required in T::REQUIRED_LISTS {
+        t.insert((*required).to_string(), toml::Value::Array(Vec::new()));
+    }
+    t.insert(key.to_string(), value.clone());
+    toml::Value::Table(t).try_into::<T>().ok()
+}
+
+/// Whether two values of `key` read as the same typed value: the comparison
+/// that keeps an alias spelling as written when the model reads it as the
+/// value the save holds.
+fn reads_the_same<T: StateFile>(key: &str, a: &toml::Value, b: &toml::Value) -> bool {
+    let view = |v| {
+        read_state_key_alone::<T>(key, v)
+            .and_then(|s| state_table(&s).ok())
+            .map(|mut t| t.remove(key))
+    };
+    match (view(a), view(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The first key, in file order, whose value the file's type cannot read on
+/// its own: the key a shape refusal names.
+fn unreadable_state_key<T: StateFile>(
+    doc: &toml_edit::DocumentMut,
+    literal: &toml::Table,
+) -> Option<String> {
+    doc.iter()
+        .map(|(key, _)| key)
+        .find(|key| {
+            literal
+                .get(*key)
+                .is_some_and(|v| read_state_key_alone::<T>(key, v).is_none())
         })
-        .cloned()
-        .collect();
-    if inert.is_empty() {
-        return rendered;
-    }
-    merge_nested_carried_keys(rendered, &inert)
+        .map(str::to_string)
 }
 
-/// Marker comment written above keys `AppState` does not model, so a hand-editor
-/// sees they were carried rather than authored by this save.
-const PRESERVED_KEYS_MARKER: &str =
-    "# keys preserved from the previous file; not modelled by this clauth:";
-
-/// Splice `carried` top-level keys into a rendered TOML document, preserving
-/// table-header scoping — the shared core of the `profiles.toml` and
-/// `config.toml` carries. Appending everything as trailing text (the shape this
-/// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
-/// inside that table: into `[env]` it is a type error that bricks
-/// `load_profile`, into `[herdr]` it is silently dropped on the next load.
-///
-/// So scalars insert as top-level lines BEFORE the first table header of the
-/// render, tables append at the end (a `[key]` block is top-level wherever it
-/// sits, and its own sub-scope is its own), and within the carried set a
-/// table-valued key is emitted before any carried scalar follows it — the same
-/// trap one level down, from `BTreeMap`'s ordering of the carry itself.
-/// An unrenderable value drops rather than corrupting the document.
-/// A value that renders as one or more `[key]`-headed blocks: a table, or an
-/// array of tables (`[[key]]`). `is_table()` alone misses the array shape,
-/// which is a `Value::Array` whose elements are all tables.
-fn is_table_shaped(value: &toml::Value) -> bool {
-    value.is_table()
-        || value
-            .as_array()
-            .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v.is_table()))
-}
-
-pub(crate) fn merge_carried_keys(rendered: String, carried: &[(String, toml::Value)]) -> String {
-    let lines: Vec<&str> = rendered.lines().collect();
-    // First line that opens a table header — `render_config_toml` and the state
-    // render both emit top-level scalars before any table, so this is the
-    // insertion point for carried scalars.
-    let first_table = lines.iter().position(|l| l.trim_start().starts_with('['));
-    let scalar_cutoff = first_table.unwrap_or(lines.len());
-
-    let mut out = String::with_capacity(rendered.len() + 64);
-    let mut head: Vec<String> = Vec::new();
-    let mut tail: Vec<String> = Vec::new();
-    for (key, value) in carried {
-        let entry: toml::Table = [(key.clone(), value.clone())].into_iter().collect();
-        let Ok(block) = toml::to_string(&entry) else {
-            continue; // unrenderable: drop rather than corrupt
-        };
-        let block = block.trim_end().to_string();
-        // Table-shaped values (a table, or an array of tables — `[[key]]`)
-        // go to the tail; everything else is a top-level scalar for the head.
-        // An array of tables landing in `head` would swallow a later scalar
-        // into its last element, the same scoping trap one level down.
-        if is_table_shaped(value) {
-            tail.push(block);
-        } else {
-            head.push(block);
-        }
-    }
-    if head.is_empty() && tail.is_empty() {
-        return rendered; // nothing renderable; the render alone is the answer
-    }
-    // Scalars: before the first table header, with the marker naming them.
-    if !head.is_empty() {
-        head.insert(0, PRESERVED_KEYS_MARKER.to_string());
-    }
-    // Tables carry the marker only when no scalar block introduced one above —
-    // a marker already naming this save's carried keys, and the tail's blocks
-    // are no farther from it than the render's own trailing sections are.
-    if !tail.is_empty() && head.is_empty() {
-        tail.insert(0, PRESERVED_KEYS_MARKER.to_string());
-    }
-    for (i, line) in lines.iter().enumerate() {
-        if i == scalar_cutoff && !head.is_empty() {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str(&head.join("\n"));
-            out.push('\n');
-            if !line.trim().is_empty() {
-                out.push('\n');
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Cutoff past the last line (render had no table header): the loop above
-    // never reached the insert point, so the head lands after everything.
-    if scalar_cutoff >= lines.len() && !head.is_empty() {
-        if !out.is_empty() && !out.ends_with("\n\n") {
-            out.push('\n');
-        }
-        out.push_str(&head.join("\n"));
-        out.push('\n');
-    }
-    if !tail.is_empty() {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(&tail.join("\n"));
-        out.push('\n');
-    }
-    out
-}
-
-/// Re-attach onto a rendered document the sub-keys of a modelled table that
-/// the model dropped — the nested half of the unmodelled-key carry
-/// ([`nested_unmodelled`] finds them). For each carried `(table, key, value)`
-/// whose `[table]` block the render writes (a non-default `[update]`,
-/// `[herdr]`, `[serve]`, `[console]`), the entry re-attaches so a future
-/// nested key survives the save exactly like a future top-level one.
-///
-/// Two shapes, each scoped correctly against this toml crate's parser: a
-/// table-valued entry (a table, or an array of tables) rides a wrapper table
-/// so the serializer's own path tracking emits an absolute `[table.key.sub]`
-/// header (a bare `[sub]` would scope to the root, and the render's own
-/// `[table]` re-open would be a duplicate table definition); a scalar entry
-/// is a bare `key = literal`, scoped by the `[table]` block it splices into
-/// — a dotted `table.key = v` there would re-define the table and read as a
-/// duplicate (this crate parses it current-table-relative anyway). Both land
-/// inside the block they belong to, before the next top-level header. A
-/// `table` or `key` that is not a bare identifier, and a value the serializer
-/// cannot re-emit, is DROPPED rather than risk a mis-scoped header (the same
-/// drop-don't-corrupt rule as [`merge_carried_keys`]).
-fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::Value)]) -> String {
-    // Two piles per table: bare scalars scope to the enclosing `[table]`
-    // block, so they must precede any `[table.key]` header of the same table
-    // (a scalar after one would scope to `table.key`).
-    let mut scalars: std::collections::BTreeMap<&str, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut headers: std::collections::BTreeMap<&str, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (table, key, value) in nested {
-        if !is_bare_key(table) || !is_bare_key(key) {
-            continue; // a non-bare segment cannot re-attach: drop rather than corrupt
-        }
-        let block = if is_table_shaped(value) {
-            let mut inner = toml::Table::new();
-            inner.insert(key.clone(), value.clone());
-            let wrapper: toml::Table = [(table.clone(), toml::Value::Table(inner))]
-                .into_iter()
-                .collect();
-            let Ok(block) = toml::to_string(&wrapper) else {
-                continue; // unrenderable: drop rather than corrupt
-            };
-            headers
-                .entry(table.as_str())
-                .or_default()
-                .push(block.trim_end().to_string());
-            continue;
-        } else if value
-            .as_array()
-            .is_some_and(|a| a.iter().any(toml::Value::is_table))
+/// The per-key edit list of a state save: every top-level key whose typed
+/// value moved between `old` (the file) and `new` (the save), and nothing
+/// else. `literal` is the file's own untyped view, for the keys `old` omits.
+fn apply_state_edits<T: StateFile>(
+    doc: &mut toml_edit::DocumentMut,
+    old: &toml::Table,
+    new: &toml::Table,
+    literal: &toml::Table,
+) {
+    for (key, n) in new {
+        let o = old.get(key);
+        if o == Some(n)
+            || (o.is_none()
+                && literal
+                    .get(key)
+                    .is_some_and(|l| reads_the_same::<T>(key, l, n)))
         {
-            continue; // a mixed table array: no literal form to trust, drop
-        } else {
-            // `Display` is the TOML literal (quotes, escapes, `.0` floats);
-            // the bare key scopes to the enclosing `[table]` block.
-            format!("{key} = {value}")
-        };
-        scalars
-            .entry(table.as_str())
-            .or_default()
-            .push(block.trim_end().to_string());
-    }
-    if scalars.is_empty() && headers.is_empty() {
-        return rendered; // nothing to splice: the render alone is the answer
-    }
-    // One pending run per table: its scalars, then its header blocks.
-    fn pending_for(
-        table: &str,
-        scalars: &std::collections::BTreeMap<&str, Vec<String>>,
-        headers: &std::collections::BTreeMap<&str, Vec<String>>,
-    ) -> Vec<String> {
-        let mut run = scalars.get(table).cloned().unwrap_or_default();
-        if let Some(more) = headers.get(table) {
-            run.extend(more.iter().cloned());
-        }
-        run
-    }
-    let mut out = String::with_capacity(rendered.len() + 64);
-    // The top-level table the walk sits in; `None` above the first table
-    // header, inside a multi-line string, or after a dotted sub-header (its
-    // root has no splice-capable block). Placement IS the scoping for the
-    // bare scalar entries, and keeps the header entries beside the table they
-    // belong to rather than in one tail pile.
-    let mut scope: Option<&str> = None;
-    // The multi-line string (`"""` / `'''`) a value line opened. The render is
-    // always serializer output, so tracking the one open delimiter line-wise
-    // is bounded, and a `[`-leading line inside a literal is content, never a
-    // header — a false header there would fire the leave-block flush INSIDE
-    // the string, corrupting the modelled value.
-    let mut ml_string: Option<&'static str> = None;
-    for line in rendered.lines() {
-        if let Some(delim) = ml_string {
-            // A raw delimiter inside the literal is its close (escaped ones
-            // don't appear in serializer output); an even count is a whole
-            // `""""""`-style empty string, still inside.
-            if line.matches(delim).count() % 2 == 1 {
-                ml_string = None;
-            }
-            out.push_str(line);
-            out.push('\n');
             continue;
         }
-        if line.trim_start().starts_with('[') {
-            let name = line
-                .trim_start()
-                .trim_start_matches('[')
-                .split(']')
-                .next()
-                .unwrap_or("");
-            // A dotted sub-header scopes to `t.s`, never to a splice-capable
-            // `[t]` block — and a pending scalar landing after one would
-            // mis-scope to `t.s`, so it ends the region like any other
-            // header (`[[a.b]]` included; a single-segment `[[t]]` keeps its
-            // root splice-capable, where a trailing scalar legally scopes to
-            // the last element). The array shape is UNREACHABLE today, not a
-            // blessed input: no modelled table is an array — the round-trip's
-            // `as_table()` excludes array values from `modelled_nested`, so
-            // nothing classifies one — and this walk states that bound
-            // rather than handling it as a supported case.
-            let dotted = name.contains('.');
-            let root = name.split('.').next().unwrap_or("");
-            if let Some(cur) = scope
-                && (root != cur || dotted)
-                && (!scalars.get(cur).is_none_or(Vec::is_empty)
-                    || !headers.get(cur).is_none_or(Vec::is_empty))
-            {
-                // The block we are leaving still owes its carried sub-keys.
-                let pending = pending_for(cur, &scalars, &headers);
-                scalars.remove(cur);
-                headers.remove(cur);
-                if !out.is_empty() && !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push('\n');
-                out.push_str(PRESERVED_KEYS_MARKER);
-                out.push('\n');
-                out.push_str(&pending.join("\n"));
-                out.push('\n');
-                out.push('\n');
+        match n {
+            toml::Value::Table(n) => {
+                edit_state_table::<T>(doc, key, o.and_then(toml::Value::as_table), n, literal);
             }
-            scope = if dotted { None } else { Some(root) };
-        } else {
-            // A multi-line string OPENS only in assignment form: the
-            // serializer's openers sit at line end after `= ` (the closer
-            // rides the last content line). A delimiter run inside a
-            // single-line value — `key = "a'''"`, `'p"""q'`, both measured —
-            // must not open string state, or the following header vanishes
-            // into it and the carry re-attaches a duplicate table. One
-            // serializer shape this rule misses, unreachable through the
-            // models today (no free-form `Vec<String>` field renders through
-            // `toml::Value` display): an array element opening a multi-line
-            // string, `days = ["""` — if a model ever gains one, this rule
-            // needs the array-element form before that field ships.
-            let trimmed = line.trim_end();
-            if trimmed.ends_with("= \"\"\"") {
-                ml_string = Some("\"\"\"");
-            } else if trimmed.ends_with("= '''") {
-                ml_string = Some("'''");
+            n => set_root_state_value(doc, key, n),
+        }
+    }
+    for (key, o) in old {
+        if new.contains_key(key) {
+            continue;
+        }
+        match o.as_table() {
+            Some(o) if doc.get(key).is_some_and(toml_edit::Item::is_table_like) => {
+                let subkeys: Vec<&str> = o.keys().map(String::as_str).collect();
+                unset_table(doc, key, &subkeys, &[], "");
             }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // The last table block runs to EOF: flush whatever it still owes.
-    if let Some(cur) = scope
-        && (!scalars.get(cur).is_none_or(Vec::is_empty)
-            || !headers.get(cur).is_none_or(Vec::is_empty))
-    {
-        let pending = pending_for(cur, &scalars, &headers);
-        scalars.remove(cur);
-        headers.remove(cur);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(PRESERVED_KEYS_MARKER);
-        out.push('\n');
-        out.push_str(&pending.join("\n"));
-        out.push('\n');
-    }
-    // Tables the render never opened — a modelled table back at its default
-    // emits no block on that same save — have nothing to splice into:
-    // re-attach at EOF, scalars under a fresh bare `[table]` header,
-    // table-valued entries through their already-absolute `[table.key]`
-    // headers. EOF sits past every render block, so a fresh header cannot
-    // collide with one, and the carried keys are what re-create the table on
-    // the next load (its modelled keys read at their defaults from absence).
-    let mut rest: std::collections::BTreeSet<&str> = scalars.keys().copied().collect();
-    rest.extend(headers.keys().copied());
-    for table in rest {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(PRESERVED_KEYS_MARKER);
-        out.push('\n');
-        if let Some(pending) = scalars.get(table) {
-            out.push_str(&format!("[{table}]\n"));
-            out.push_str(&pending.join("\n"));
-            out.push('\n');
-        }
-        if let Some(blocks) = headers.get(table) {
-            out.push_str(&blocks.join("\n"));
-            out.push('\n');
+            _ => remove_key_keeping_comments(doc, key, &[], ""),
         }
     }
-    out
 }
 
-/// A key segment the carry ([`merge_nested_carried_keys`]) can re-attach: a
-/// bare TOML identifier, the charset the model's own fields serialize with.
-/// Anything else is dropped rather than risk a mis-scoped header.
-fn is_bare_key(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+/// A modelled table written into the file: edited subkey by subkey where the
+/// file already holds it in any table form (block, dotted or inline, the form
+/// kept), else inserted as a new block table. A value where the table belongs
+/// (the scalar `theme = "full"` a pick turns into `[theme]`) is removed with
+/// its comments kept, and the table takes its place.
+fn edit_state_table<T: StateFile>(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    old: Option<&toml::Table>,
+    new: &toml::Table,
+    literal: &toml::Table,
+) {
+    if !doc.get(key).is_some_and(toml_edit::Item::is_table_like) {
+        if doc.contains_key(key) {
+            remove_key_keeping_comments(doc, key, &[], "");
+        }
+        T::insert_new_table(doc, key, new);
+        return;
+    }
+    let literal = literal.get(key).and_then(toml::Value::as_table);
+    let alone = |sub: &str, v: &toml::Value| {
+        toml::Value::Table([(sub.to_string(), v.clone())].into_iter().collect())
+    };
+    for (sub, n) in new {
+        let o = old.and_then(|t| t.get(sub));
+        if o == Some(n)
+            || (old.is_none()
+                && literal
+                    .and_then(|t| t.get(sub))
+                    .is_some_and(|l| reads_the_same::<T>(key, &alone(sub, l), &alone(sub, n))))
+        {
+            continue;
+        }
+        if let Some(t) = doc
+            .get_mut(key)
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            set_state_entry(t, sub, n);
+        }
+    }
+    for sub in old.into_iter().flat_map(toml::Table::keys) {
+        if !new.contains_key(sub) {
+            remove_subkey_keeping_comments(doc, key, sub);
+        }
+    }
+}
+
+/// A modelled root value written into the file: in place where the file holds
+/// a value, through the root-section append where it holds none, and in place
+/// of a table where the file holds one there.
+fn set_root_state_value(doc: &mut toml_edit::DocumentMut, key: &str, value: &toml::Value) {
+    match doc.get(key) {
+        Some(item) if item.is_value() => set_state_entry(doc.as_table_mut(), key, value),
+        Some(_) => {
+            remove_key_keeping_comments(doc, key, &[], "");
+            append_root_value(doc, key, state_edit_value(value));
+        }
+        None => append_root_value(doc, key, state_edit_value(value)),
+    }
+}
+
+/// One entry of a table set to `value`: a list of names is edited element by
+/// element, any other value replaced keeping its decor, and an absent key
+/// inserted at the table's end.
+fn set_state_entry(t: &mut dyn toml_edit::TableLike, key: &str, value: &toml::Value) {
+    let names = value.as_array().and_then(|a| {
+        a.iter()
+            .map(toml::Value::as_str)
+            .collect::<Option<Vec<&str>>>()
+    });
+    match t.get_mut(key) {
+        Some(item) if item.is_value() => {
+            if let (Some(names), Some(arr)) = (names, item.as_array_mut())
+                && arr.iter().all(toml_edit::Value::is_str)
+            {
+                edit_name_list(arr, &names);
+                return;
+            }
+            set_value_preserving_decor(t, key, state_edit_value(value));
+        }
+        Some(_) => {
+            t.remove(key);
+            t.insert(key, toml_edit::Item::Value(state_edit_value(value)));
+        }
+        None => {
+            t.insert(key, toml_edit::Item::Value(state_edit_value(value)));
+        }
+    }
+}
+
+/// A typed value as the value the writer inserts: a list it creates is one
+/// line, a table inline (a block table is built by its own caller).
+pub(crate) fn state_edit_value(v: &toml::Value) -> toml_edit::Value {
+    match v {
+        toml::Value::String(s) => s.as_str().into(),
+        toml::Value::Integer(i) => (*i).into(),
+        toml::Value::Float(f) => (*f).into(),
+        toml::Value::Boolean(b) => (*b).into(),
+        toml::Value::Datetime(d) => (*d).into(),
+        toml::Value::Array(a) => toml_edit::Value::Array(a.iter().map(state_edit_value).collect()),
+        toml::Value::Table(t) => toml_edit::Value::InlineTable(
+            t.iter()
+                .map(|(k, v)| (k.as_str(), state_edit_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Which target slot a list edit fills: an element the two lists share in
+/// order, a name that moved in from another position, a new name replacing a
+/// removed one (taking its decor), or a new name with no removal to replace.
+#[derive(Clone, Copy)]
+enum ListSlot {
+    Kept,
+    Moved,
+    Paired(usize),
+    New,
+}
+
+/// A note written after an element's comma: the comment text and the line
+/// break it sat before, kept apart so a re-attach into a one-line list can
+/// mint a break of its own.
+struct CommaNote {
+    text: String,
+    line_break: String,
+}
+
+/// Split the same-line comment off the head of `text` when the first line
+/// holds one: the note (with its line break held apart) and the rest of the
+/// text. `None` when the first line holds no `#`.
+fn strip_head_note(text: &str) -> Option<(CommaNote, &str)> {
+    let nl = text.find('\n')?;
+    let before = &text[..nl];
+    if !before.contains('#') {
+        return None;
+    }
+    // The document reaches the editor LF-normalized, so a lifted break is
+    // always "\n"; the writer re-expands it on a CRLF file.
+    Some((
+        CommaNote {
+            text: before.to_string(),
+            line_break: "\n".to_string(),
+        },
+        &text[nl + 1..],
+    ))
+}
+
+/// Edit `arr` into `target` with the fewest element moves: the longest run the
+/// two share in order stays put with its decor, a name that moved carries its
+/// own comment to its new place, and a new name takes the list's own element
+/// layout (its own line in a multi-line list, a `, ` in a one-line one).
+///
+/// Within the gap between two kept elements, a name leaving the list (not
+/// moving elsewhere) and a name new to it pair off in order, the pair being one
+/// value replacement that keeps the removed element's whole decor; a comment
+/// above an unpaired removal moves onto the next element.
+///
+/// A note written after an element's comma is that element's, though toml_edit
+/// parks it in the next element's prefix (or the trailing after the last
+/// comma, or the last element's suffix when there is no trailing comma): each
+/// such note is lifted off before the decor moves and put back right after
+/// its owner's comma wherever the owner lands.
+///
+/// A comment on the open bracket's line is the list's, though toml_edit parks
+/// it in the first element's prefix (or the trailing of an empty list): it is
+/// lifted the same way and put back right after `[`.
+fn edit_name_list(arr: &mut toml_edit::Array, target: &[&str]) {
+    let cur: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if cur.iter().map(String::as_str).eq(target.iter().copied()) {
+        return;
+    }
+    // Lift each note after an element's comma off the decor it parked in,
+    // keyed by owner name plus occurrence so two equal names never lend each
+    // other a note. Every stripped decor keeps its line break.
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    let cur_keys: Vec<(String, usize)> = cur
+        .iter()
+        .map(|name| {
+            let n = seen.entry(name.clone()).or_default();
+            let key = (name.clone(), *n);
+            *n += 1;
+            key
+        })
+        .collect();
+    let mut notes: std::collections::HashMap<(String, usize), CommaNote> =
+        std::collections::HashMap::new();
+    for (i, key) in cur_keys.iter().enumerate() {
+        if i + 1 < arr.len() {
+            let note = arr.get_mut(i + 1).and_then(|v| {
+                let prefix = decor_prefix(v.decor()).to_string();
+                strip_head_note(&prefix).map(|(note, rest)| {
+                    v.decor_mut()
+                        .set_prefix(format!("{}{}", note.line_break, rest));
+                    note
+                })
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        } else if arr.trailing_comma() {
+            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+            let note = strip_head_note(&trailing).map(|(note, rest)| {
+                arr.set_trailing(format!("{}{}", note.line_break, rest));
+                note
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        } else {
+            let note = arr.get_mut(i).and_then(|v| {
+                let suffix = decor_suffix(v.decor()).to_string();
+                strip_head_note(&suffix).map(|(note, rest)| {
+                    v.decor_mut()
+                        .set_suffix(format!("{}{}", note.line_break, rest));
+                    note
+                })
+            });
+            if let Some(note) = note {
+                notes.insert(key.clone(), note);
+            }
+        }
+    }
+    // A comment on the open bracket's line labels the list, though toml_edit
+    // parks it in the first element's prefix head (or the trailing of an
+    // empty list): held apart, it stays on the bracket's line whichever
+    // element ends up first.
+    let open_note = arr
+        .get_mut(0)
+        .and_then(|v| {
+            let prefix = decor_prefix(v.decor()).to_string();
+            strip_head_note(&prefix).map(|(note, rest)| {
+                v.decor_mut()
+                    .set_prefix(format!("{}{}", note.line_break, rest));
+                note
+            })
+        })
+        .or_else(|| {
+            let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+            strip_head_note(&trailing).map(|(note, rest)| {
+                arr.set_trailing(format!("{}{}", note.line_break, rest));
+                note
+            })
+        });
+    // The whitespace closing a list with no trailing comma rides the last
+    // element's suffix, and so does a comment line after the last element:
+    // held as the list's trailing text, both stay at the end whichever
+    // element ends up last.
+    if !arr.trailing_comma()
+        && let Some(last) = arr.len().checked_sub(1)
+    {
+        let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+        let moved = arr.get_mut(last).and_then(|v| {
+            let suffix = decor_suffix(v.decor()).to_string();
+            (!suffix.is_empty() && (suffix.trim().is_empty() || suffix.contains('#'))).then(|| {
+                v.decor_mut().set_suffix("");
+                suffix
+            })
+        });
+        if let Some(suffix) = moved {
+            arr.set_trailing(format!("{suffix}{trailing}"));
+        }
+    }
+    let prefixes: Vec<String> = arr
+        .iter()
+        .map(|v| decor_prefix(v.decor()).to_string())
+        .collect();
+    let first_layout = prefixes.first().map(|p| layout_of(p)).unwrap_or_default();
+    let layout = prefixes
+        .iter()
+        .skip(1)
+        .next_back()
+        .or_else(|| prefixes.first().filter(|p| p.contains('\n')))
+        .map_or_else(|| " ".to_string(), |p| layout_of(p));
+
+    let (kept_cur, kept_target) = shared_run(&cur, target);
+    // Count each target name, then spend one per kept element and one per
+    // element that leaves its place: what remains is the names new to the list.
+    let mut moves: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for name in target {
+        *moves.entry(name).or_default() += 1;
+    }
+    for (i, name) in cur.iter().enumerate() {
+        if kept_cur[i] {
+            spend_one(&mut moves, name);
+        }
+    }
+    let mut moving = vec![false; cur.len()];
+    for i in (0..cur.len()).rev() {
+        if !kept_cur[i] && spend_one(&mut moves, &cur[i]) {
+            moving[i] = true;
+        }
+    }
+    let mut supply: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, name) in cur.iter().enumerate() {
+        if moving[i] {
+            *supply.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    let mut slots = vec![ListSlot::New; target.len()];
+    for (j, name) in target.iter().enumerate() {
+        if kept_target[j] {
+            slots[j] = ListSlot::Kept;
+        } else if spend_one(&mut supply, name) {
+            slots[j] = ListSlot::Moved;
+        }
+    }
+    // Pair, gap by gap between the elements both lists keep, a name leaving
+    // the list with a new name: the pair replaces one value in the same place.
+    let kept_at: Vec<usize> = (0..cur.len()).filter(|&i| kept_cur[i]).collect();
+    let target_at: Vec<usize> = (0..target.len()).filter(|&j| kept_target[j]).collect();
+    for gap in 0..=kept_at.len() {
+        let cur_lo = if gap == 0 { 0 } else { kept_at[gap - 1] + 1 };
+        let cur_hi = kept_at.get(gap).copied().unwrap_or(cur.len());
+        let target_lo = if gap == 0 { 0 } else { target_at[gap - 1] + 1 };
+        let target_hi = target_at.get(gap).copied().unwrap_or(target.len());
+        let leaving = (cur_lo..cur_hi).filter(|&i| !moving[i]);
+        let fresh: Vec<usize> = (target_lo..target_hi)
+            .filter(|&j| matches!(slots[j], ListSlot::New))
+            .collect();
+        for (i, j) in leaving.zip(fresh) {
+            slots[j] = ListSlot::Paired(i);
+        }
+    }
+    let mut pair_of = vec![None; cur.len()];
+    for (j, slot) in slots.iter().enumerate() {
+        if let ListSlot::Paired(i) = slot {
+            pair_of[*i] = Some(j);
+        }
+    }
+    // Remove every element the target does not keep, in reverse so the indexes
+    // stay the file's own. A paired removal keeps its decor for its
+    // replacement, a moved one for its new place, and only an unpaired one
+    // leaves its comment behind.
+    let mut moved_values: Vec<(String, toml_edit::Value)> = Vec::new();
+    let mut paired_values: Vec<Option<toml_edit::Value>> =
+        (0..target.len()).map(|_| None).collect();
+    for i in (0..cur.len()).rev() {
+        if kept_cur[i] {
+            continue;
+        }
+        if moving[i] {
+            moved_values.push((cur[i].clone(), remove_list_element(arr, i, false)));
+        } else if let Some(j) = pair_of[i] {
+            paired_values[j] = Some(remove_list_element(arr, i, false));
+        } else {
+            // An unpaired removal leaves its lifted note behind as a comment
+            // line of its own where it sat: riding the suffix, the carry
+            // renders it at the list's element indent.
+            if let Some(note) = notes.remove(&cur_keys[i])
+                && let Some(v) = arr.get_mut(i)
+            {
+                // The note lands after the comments the element already
+                // holds in its suffix, keeping the file's own order.
+                let suffix = decor_suffix(v.decor()).to_string();
+                v.decor_mut()
+                    .set_suffix(format!("{suffix}{}{}", note.text, note.line_break));
+            }
+            remove_list_element(arr, i, true);
+        }
+    }
+    // Pool the notes of the elements that survive as themselves, in file
+    // order per name: the re-attach hands them to that name's target slots
+    // in target order, so equal names keep their notes in file order while
+    // a renamed copy keeps its own (still keyed in `notes`).
+    let mut pool: std::collections::HashMap<String, Vec<CommaNote>> =
+        std::collections::HashMap::new();
+    for i in 0..cur.len() {
+        if (kept_cur[i] || moving[i])
+            && let Some(note) = notes.remove(&cur_keys[i])
+        {
+            pool.entry(cur[i].clone()).or_default().push(note);
+        }
+    }
+    for (j, name) in target.iter().enumerate() {
+        let slot = slots[j];
+        match slot {
+            ListSlot::Kept => {}
+            ListSlot::Moved => {
+                let value = moved_values
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .map(|p| moved_values.remove(p).1);
+                insert_list_element(arr, j, value, name, false, &layout, &first_layout);
+            }
+            ListSlot::Paired(_) => {
+                let value = paired_values[j]
+                    .take()
+                    .map(|removed| replacement_value(name, &removed));
+                insert_list_element(arr, j, value, name, true, &layout, &first_layout);
+            }
+            ListSlot::New => {
+                insert_list_element(arr, j, None, name, false, &layout, &first_layout);
+            }
+        }
+    }
+    // Put each lifted note back right after its owner's comma: at the head of
+    // the next element's prefix, of the trailing when the owner is last with a
+    // trailing comma, of its own suffix when it is last without one.
+    for j in 0..target.len() {
+        let note = match slots[j] {
+            ListSlot::Paired(i) => notes.remove(&cur_keys[i]),
+            ListSlot::New => continue,
+            _ => pool.get_mut(target[j]).and_then(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            }),
+        };
+        if let Some(note) = note {
+            if j + 1 < target.len() {
+                if let Some(next) = arr.get_mut(j + 1) {
+                    let prefix = decor_prefix(next.decor()).to_string();
+                    // A comment ends its line, so a prefix that does not
+                    // start on a new line (a one-line list) needs one before
+                    // the value, or the comment swallows it.
+                    let line_break = if prefix.starts_with('\n') {
+                        ""
+                    } else {
+                        note.line_break.as_str()
+                    };
+                    next.decor_mut()
+                        .set_prefix(format!("{}{}{}", note.text, line_break, prefix));
+                }
+            } else if arr.trailing_comma() {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                // A close hugging the comma (`"b",]`) leaves no break between
+                // the note and the `]` unless the note's own is minted.
+                let line_break = if trailing.contains('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                arr.set_trailing(format!("{}{}{}", note.text, line_break, trailing));
+            } else {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                if let Some(v) = arr.get_mut(j) {
+                    let suffix = decor_suffix(v.decor()).to_string();
+                    // The close newline rides the suffix or the trailing: when
+                    // both hold none (a close on the last name's line, `"b"]`)
+                    // the note mints its own, or the comment swallows the `]`.
+                    let line_break = if suffix.contains('\n') || trailing.contains('\n') {
+                        ""
+                    } else {
+                        note.line_break.as_str()
+                    };
+                    v.decor_mut()
+                        .set_suffix(format!("{}{}{}", note.text, line_break, suffix));
+                }
+            }
+        }
+    }
+    // The held-apart bracket comment goes back right after `[`: onto the
+    // first element's prefix head, minting a line break when the list grew
+    // out of an empty one, or onto the trailing when the list emptied.
+    if let Some(note) = open_note {
+        match arr.get_mut(0) {
+            Some(first) => {
+                let prefix = decor_prefix(first.decor()).to_string();
+                let line_break = if prefix.starts_with('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                first
+                    .decor_mut()
+                    .set_prefix(format!("{}{}{}", note.text, line_break, prefix));
+            }
+            None => {
+                let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+                let line_break = if trailing.starts_with('\n') {
+                    ""
+                } else {
+                    note.line_break.as_str()
+                };
+                arr.set_trailing(format!("{}{}{}", note.text, line_break, trailing));
+            }
+        }
+    }
+    debug_assert!(
+        notes.is_empty(),
+        "every lifted note is re-attached or carried"
+    );
+    debug_assert!(
+        pool.values().all(Vec::is_empty),
+        "every pooled note finds a target slot"
+    );
+}
+
+/// Take one unit of `name`'s remaining count: `false` when none is left.
+fn spend_one(counts: &mut std::collections::HashMap<&str, usize>, name: &str) -> bool {
+    counts
+        .get_mut(name)
+        .is_some_and(|n| match n.checked_sub(1) {
+            Some(left) => {
+                *n = left;
+                true
+            }
+            None => false,
+        })
+}
+
+/// A new name wearing a removed element's decor: one value replaced by another
+/// in the same place.
+fn replacement_value(name: &str, removed: &toml_edit::Value) -> toml_edit::Value {
+    let mut v = toml_edit::Value::from(name);
+    v.decor_mut().set_prefix(decor_prefix(removed.decor()));
+    v.decor_mut().set_suffix(decor_suffix(removed.decor()));
+    v
+}
+
+/// Which elements of `cur` and `target` lie on a longest common subsequence:
+/// the elements a list edit leaves where they are.
+fn shared_run(cur: &[String], target: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let (n, m) = (cur.len(), target.len());
+    let mut len = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            len[i][j] = if cur[i] == target[j] {
+                len[i + 1][j + 1] + 1
+            } else {
+                len[i + 1][j].max(len[i][j + 1])
+            };
+        }
+    }
+    let mut kept_cur = vec![false; n];
+    let mut kept_target = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if cur[i] == target[j] {
+            kept_cur[i] = true;
+            kept_target[j] = true;
+            i += 1;
+            j += 1;
+        } else if len[i + 1][j] >= len[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    (kept_cur, kept_target)
+}
+
+/// Remove element `idx`. With `carry`, every comment the element holds moves
+/// to where the element sat: the block above it verbatim onto the element
+/// after it (or the list's end) and its same-line comment onto its own line
+/// at the list's element indent, leading newlines dropped so no blank line is
+/// left behind. Without, the comments leave with the element. An element
+/// taking first place takes the old first's layout.
+fn remove_list_element(arr: &mut toml_edit::Array, idx: usize, carry: bool) -> toml_edit::Value {
+    let removed = arr.remove(idx);
+    let lead = decor_prefix(removed.decor()).to_string();
+    let own = decor_suffix(removed.decor()).to_string();
+    let comment = {
+        let mut comment = lead
+            .rfind('\n')
+            .filter(|_| carry && lead.contains('#'))
+            .map(|nl| lead[..=nl].to_string())
+            .unwrap_or_default();
+        if carry && own.contains('#') {
+            let indent = layout_of(&lead);
+            let indent = if indent.is_empty() {
+                " "
+            } else {
+                indent.as_str()
+            };
+            let continuation = indent.trim_start_matches('\n');
+            for line in own.lines().map(str::trim).filter(|l| l.starts_with('#')) {
+                comment.push_str(if comment.is_empty() {
+                    indent
+                } else {
+                    continuation
+                });
+                comment.push_str(line);
+                comment.push('\n');
+            }
+        }
+        comment
+    };
+    if let Some(next) = arr.get_mut(idx) {
+        let existing = decor_prefix(next.decor()).to_string();
+        if !comment.is_empty() {
+            next.decor_mut()
+                .set_prefix(format!("{comment}{}", existing.trim_start_matches('\n')));
+        } else if idx == 0 {
+            next.decor_mut()
+                .set_prefix(format!("{}{}", layout_of(&lead), existing.trim_start()));
+        }
+    } else if !comment.is_empty() {
+        let trailing = arr.trailing().as_str().unwrap_or("").to_string();
+        arr.set_trailing(format!("{comment}{}", trailing.trim_start_matches('\n')));
+    }
+    removed
+}
+
+/// Insert `name` at `idx`: a moved element keeps the comment above it, a
+/// replacement keeps the whole decor it carries, and any other element takes
+/// the list's layout for that place.
+fn insert_list_element(
+    arr: &mut toml_edit::Array,
+    idx: usize,
+    value: Option<toml_edit::Value>,
+    name: &str,
+    keep_decor: bool,
+    layout: &str,
+    first_layout: &str,
+) {
+    let own_comment = value
+        .as_ref()
+        .is_some_and(|v| decor_prefix(v.decor()).contains('#'));
+    let mut v = value.unwrap_or_else(|| {
+        let mut v = toml_edit::Value::from(name);
+        v.decor_mut().set_suffix("");
+        v
+    });
+    if !keep_decor && !own_comment {
+        v.decor_mut()
+            .set_prefix(if idx == 0 { first_layout } else { layout });
+    }
+    if idx == 0
+        && let Some(first) = arr.get_mut(0)
+        && decor_prefix(first.decor()) == first_layout
+    {
+        first.decor_mut().set_prefix(layout);
+    }
+    arr.insert_formatted(idx, v);
+}
+
+/// An element prefix's layout without its comments: the line break and indent
+/// before the value, or the space of a one-line list.
+fn layout_of(prefix: &str) -> String {
+    match prefix.rfind('\n') {
+        Some(nl) => format!("\n{}", &prefix[nl + 1..]),
+        None => prefix.to_string(),
+    }
+}
+
+pub(crate) fn decor_prefix(decor: &toml_edit::Decor) -> &str {
+    decor.prefix().and_then(|r| r.as_str()).unwrap_or("")
+}
+
+fn decor_suffix(decor: &toml_edit::Decor) -> &str {
+    decor.suffix().and_then(|r| r.as_str()).unwrap_or("")
 }
 
 /// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
@@ -3502,8 +4928,8 @@ fn is_bare_key(segment: &str) -> bool {
 /// profile that is still present from one deleted and re-logged-in under the
 /// same name.
 pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Result<bool> {
-    with_state_lock(|_held| {
-        let mut state = load_app_state()?;
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
         if broken && !state.profiles.iter().any(|n| n == name) {
             return Ok(false);
         }
@@ -3512,6 +4938,22 @@ pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Res
         }
         save_app_state(&state)?;
         Ok(true)
+    })
+}
+
+/// Fresh read-modify-write of `profiles.toml` under the state flock: load the
+/// current state, apply `f` with the flock witness, save, and return the saved
+/// state. A closure that changes nothing writes nothing, so a no-op never
+/// touches the file or moves every peer's reload fingerprint.
+pub(crate) fn update_app_state(f: impl FnOnce(&mut AppState, &StateLockHeld)) -> Result<AppState> {
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
+        let before = toml::to_string_pretty(&*state).context("failed to render profiles.toml")?;
+        f(&mut state, held);
+        if toml::to_string_pretty(&*state).context("failed to render profiles.toml")? != before {
+            save_app_state(&state)?;
+        }
+        Ok(state.into_inner())
     })
 }
 
@@ -3580,8 +5022,9 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`crate::claude::has_inference_auth`] applies: the settings writer clears
 /// its own token and applies `profile.env` LAST, so the env token is what the
 /// spawned process authenticates with and the bearer never reaches the
-/// endpoint. Both boundaries must count the same ENV shapes — the preserve
-/// arm (`actions::overwrite_captured_profile`) keys on
+/// endpoint; a proxy account's usable key leaves the entry out, whatever its
+/// value, and sends itself instead. Both boundaries must count the same ENV shapes — the
+/// preserve arm (`actions::overwrite_captured_profile`) keys on
 /// [`crate::claude::has_own_inference_endpoint`], which is built on
 /// [`crate::claude::has_inference_auth`], so an endpoint that predicate
 /// preserves must survive the load. The api-key halves deliberately differ:
@@ -3668,17 +5111,29 @@ fn usage_cache_is_third_party(
     api_key: Option<&str>,
     has_credentials: bool,
     env: &BTreeMap<String, String>,
+    proxy_recorded: impl FnOnce() -> bool,
 ) -> bool {
     let fetchable = matches!(provider, Some(Provider::Alibaba))
         || api_key.map(str::trim).is_some_and(|k| !k.is_empty());
     if has_credentials && !fetchable && env_has_inference_token(env) {
         return false;
     }
-    provider.is_some() || (base_url.is_some() && api_key.is_some())
+    // A proxy account's figures live in the third-party cache by RECORD, not
+    // by key presence: a keyless (re-mint pending) proxy account is never
+    // polled, and the copy its last poll wrote is still its figures. The usage
+    // arm reads a proxy only on the loopback bind its `base_url` names
+    // (`proxy_target_for`), so the record is asked for there alone, after the
+    // pure test, the way that arm asks; off it, the account reads as before.
+    provider.is_some()
+        || base_url.is_some_and(|url| {
+            api_key.is_some() || (crate::proxy::loopback_port(url).is_some() && proxy_recorded())
+        })
 }
 
 /// [`Profile::usage_cache_is_third_party`] for a caller holding only a name,
-/// read from `config.toml` plus one stat. A config clauth cannot read or parse
+/// read from one `config.toml` read and parse plus one stat; a keyless
+/// loopback endpoint parses the same bytes once more for its `[proxy]`
+/// record, and no answer reads the file twice. A config clauth cannot read or parse
 /// proves no endpoint, so it answers `false` and its reader falls back to the
 /// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
 /// cannot classify.
@@ -3700,9 +5155,8 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
-/// [`crate::profile_json::published_windows`] — can observe it; every
-/// other caller runs
+/// caller that skips the full load, [`crate::mcp::digest`]'s sample, can
+/// observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
 /// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a
 /// lock-free read like this one, but both its callers run `load_config` first,
@@ -3711,9 +5165,13 @@ fn usage_cache_is_third_party(
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
-/// `the_lock_free_third_party_read_agrees_with_a_full_load`.
+/// `the_lock_free_third_party_read_agrees_with_a_full_load` and, for a
+/// keyless proxy account, `both_readers_read_a_keyless_proxy_account_as_third_party`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
-    let Some(config) = read_profile_config(name) else {
+    let Some(raw) = read_profile_config_text(name) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
         return false;
     };
     let has_credentials = stored_credentials_file_exists(name);
@@ -3729,6 +5187,7 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
         config.api_key.as_deref(),
         has_credentials,
         &config.env,
+        || matches!(proxy_claim_in(&raw), ProxyClaim::Account(_)),
     )
 }
 
@@ -3736,13 +5195,16 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// name-keyed lock-free reader shares. `None` when the config cannot be read or
 /// parsed.
 fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
-    let config_path = profile_config_path(name).ok()?;
-    let raw = std::fs::read_to_string(&config_path).ok()?;
-    toml::from_str::<ProfileConfig>(&raw).ok()
+    toml::from_str::<ProfileConfig>(&read_profile_config_text(name)?).ok()
+}
+
+/// `name`'s `config.toml` text, lock-free; `None` when it cannot be read.
+fn read_profile_config_text(name: &ProfileName) -> Option<String> {
+    std::fs::read_to_string(profile_config_path(name).ok()?).ok()
 }
 
 /// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
-fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
+pub(crate) fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
     profile_id_at(&profile_config_path(name).ok()?)
 }
 
@@ -3758,7 +5220,7 @@ pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
             return Ok(id);
         }
         let id = ProfileId::mint()?;
-        write_config_render(&read_profile(name)?, Some(&id))?;
+        write_config_render(&read_profile(name)?, Some(&id), false)?;
         Ok(id)
     })
 }
@@ -3932,10 +5394,9 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
 /// [`load_profile`]'s read-only form, used by the shared swap-target check and
 /// the `clauth mcp` handshake: the same read, but never through
 /// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
-/// write-through, both of which take the state flock — a `config.toml` whose
-/// canonical render does not parse back is left as it is, and an adoptable
-/// sidecar is answered from memory and left for the next ordinary load to
-/// land.
+/// write-through, both of which take the state flock — a `config.toml` a full
+/// load would normalize is left as it is, and an adoptable sidecar is answered
+/// from memory and left for the next ordinary load to land.
 pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
     load_profile_with(name, false)
 }
@@ -3949,83 +5410,257 @@ fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
     if rewrite {
         maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
     }
-    if unreadable_store_notice(&profile).is_some() {
-        notice_torn_store(&profile);
-    }
+    notice_profile_load(&profile);
     Ok(profile)
 }
 
-/// Whether the torn-store notice may print. Off by default — the TUI's stderr
-/// is its alternate screen, the daemon's is `daemon.log`, the MCP server's is
-/// Claude Code's, a hook's is its caller's — so only the CLI dispatch arms for
-/// the user-facing commands turn it on ([`enable_torn_store_notice`]).
-static TORN_STORE_NOTICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The thread the load notices may print on, if any. Off by default — the
+/// TUI's stderr is its alternate screen, the daemon's is `daemon.log`, the MCP
+/// server's is Claude Code's, a hook's is its caller's — so only the CLI
+/// dispatch arms, and for the user-facing commands alone
+/// ([`enable_load_notices`]). The arming thread is recorded because the flag
+/// is process-wide while stderr belongs to the foreground thread: a `clauth
+/// start` session's watchdog thread loads the roster mid-session, and a notice
+/// printed there would reach `errln!` — which panics on a write error no
+/// scheduler thread can answer for — on a screen Claude Code has already
+/// painted.
+static LOAD_NOTICES: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
 
-/// The account names whose notice already printed, so however many times one
-/// process reloads the roster, one torn store yields one line.
-static TORN_STORE_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The key of every notice already printed, so however many times one process
+/// reloads the roster, one torn store or one unaddressable name yields one
+/// line.
+static LOAD_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Turn the torn-store notice on for the rest of the process. Called once by
-/// the CLI dispatch, and only for the user-facing commands.
-pub(crate) fn enable_torn_store_notice() {
-    TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+fn load_notices_thread() -> std::sync::MutexGuard<'static, Option<std::thread::ThreadId>> {
+    LOAD_NOTICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// One stderr line naming an unreadable account, at most once per account per
-/// process. No-op unless [`enable_torn_store_notice`] ran and the account has
-/// not been named yet.
-fn notice_torn_store(profile: &Profile) {
-    if !TORN_STORE_NOTICE.load(std::sync::atomic::Ordering::Relaxed) {
+/// Turn the load notices on for the calling thread, and no other. Called once
+/// by the CLI dispatch, and only for the user-facing commands.
+pub(crate) fn enable_load_notices() {
+    *load_notices_thread() = Some(std::thread::current().id());
+}
+
+/// Whether this thread is the one [`enable_load_notices`] armed.
+fn load_notices_armed_here() -> bool {
+    *load_notices_thread() == Some(std::thread::current().id())
+}
+
+/// One load notice and the key it is deduplicated by.
+struct LoadNotice {
+    /// The identity the once-per-process set holds: a torn store keys by
+    /// ACCOUNT, so a reason whose text moved between two loads (a parse
+    /// failure, then an I/O failure) cannot print a second line; a name notice
+    /// keys by its account name too, so the two rosters — whose copy differs
+    /// by remedy — cannot print two lines for one name.
+    key: String,
+    line: String,
+}
+
+impl LoadNotice {
+    /// A name notice keyed by ACCOUNT, so the line of whichever roster loads
+    /// first is the only one printed.
+    fn for_name(notice: NameNotice) -> Self {
+        Self {
+            key: format!("name:{}", notice.name),
+            line: notice.cli_line(),
+        }
+    }
+}
+
+/// Print each notice once per process, skipping any key already told. No-op
+/// unless [`enable_load_notices`] ran on THIS thread.
+fn print_load_notices(notices: impl IntoIterator<Item = LoadNotice>) {
+    if !load_notices_armed_here() {
         return;
     }
-    let mut told = TORN_STORE_NOTICED
+    let mut told = LOAD_NOTICED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if told
-        .iter()
-        .any(|told_name| told_name == profile.name.as_str())
-    {
-        return;
+    for notice in notices {
+        if told.contains(&notice.key) {
+            continue;
+        }
+        crate::out::errln!("{}", notice.line);
+        told.push(notice.key);
     }
-    told.push(profile.name.as_str().to_string());
-    let Some(notice) = unreadable_store_notice(profile) else {
-        return;
-    };
-    crate::out::errln!("{notice}");
 }
 
-/// Test-only RAII: turn the torn-store notice on for the guard's lifetime,
-/// clearing it on drop so a test that loads a torn store cannot leak the
-/// enabled flag into a sibling test in the same process.
+/// The stderr lines a loaded account warrants: its unreadable store, then a
+/// name the printed commands cannot address.
+fn notice_profile_load(profile: &Profile) {
+    let store = unreadable_store_notice(profile).map(|line| LoadNotice {
+        // A key no name-notice can equal: those all start with `name:`.
+        key: format!("torn-store:{}", profile.name),
+        line,
+    });
+    let name = NameNotice::of(&profile.name, Harness::Claude).map(LoadNotice::for_name);
+    print_load_notices([store, name].into_iter().flatten());
+}
+
+/// The stderr lines a freshly loaded codex roster warrants: one per stored
+/// name the printed commands cannot address, through the same arming thread
+/// and once-per-process set as [`notice_profile_load`]. A name the claude
+/// roster also holds gets the CLAUDE copy even here: the codex roster may be
+/// the first one a command loads, and its account is the one a bare name
+/// resolves to.
+pub(crate) fn notice_codex_load(names: &[ProfileName]) {
+    // Checked here, not only in `print_load_notices`: an unarmed load must not
+    // read the claude roster for a line it will never print.
+    if !load_notices_armed_here() {
+        return;
+    }
+    let claude = load_app_state()
+        .map(|state| state.profiles)
+        .unwrap_or_default();
+    print_load_notices(names.iter().filter_map(|name| {
+        let harness = if claude.contains(name) {
+            Harness::Claude
+        } else {
+            Harness::Codex
+        };
+        NameNotice::of(name, harness).map(LoadNotice::for_name)
+    }));
+}
+
+/// Test-only RAII: arm the load notices for the guard's thread for its
+/// lifetime, clearing them on drop so a test that loads a torn store cannot
+/// leak the arming into a sibling test in the same process.
 #[cfg(test)]
-pub(crate) struct TornStoreNoticeArmed(());
+pub(crate) struct LoadNoticesArmed(());
 
 #[cfg(test)]
-impl TornStoreNoticeArmed {
+impl LoadNoticesArmed {
     pub(crate) fn new() -> Self {
-        TORN_STORE_NOTICE.store(true, std::sync::atomic::Ordering::Relaxed);
+        enable_load_notices();
         Self(())
     }
 }
 
 #[cfg(test)]
-impl Drop for TornStoreNoticeArmed {
+impl Drop for LoadNoticesArmed {
     fn drop(&mut self) {
-        TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
+        *load_notices_thread() = None;
     }
 }
 
-/// Test-only: put the torn-store notice back to its off default and clear the
-/// already-named set, so an in-process `dispatch()` test that armed the
-/// process-global flag cannot leak it into a sibling test. Called by the test
-/// home sandbox, which already resets the other process-global overrides.
+/// Test-only: put the load notices back to their off default and clear the
+/// already-printed set, so an in-process `dispatch()` test that armed cannot
+/// leak the arming into a sibling test. Called by the test home sandbox, which
+/// already resets the other process-global overrides.
 #[cfg(test)]
-pub(crate) fn reset_torn_store_notice_for_test() {
-    TORN_STORE_NOTICE.store(false, std::sync::atomic::Ordering::Relaxed);
-    TORN_STORE_NOTICED
+pub(crate) fn reset_load_notices_for_test() {
+    *load_notices_thread() = None;
+    LOAD_NOTICED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
+}
+
+/// What makes a stored account name unaddressable by the commands clauth
+/// prints for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameHazard {
+    /// A leading `-` longer than a lone `-`: clap reads `clauth login -x` as
+    /// a flag, while `clauth login -` parses as a value.
+    LeadingDash,
+    /// A clauth subcommand: a bare `clauth list` runs the command, never the
+    /// switch.
+    Subcommand,
+}
+
+/// A stored account whose name the printed commands cannot address, with the
+/// copy each surface shows for it. Its equality is the TUI's and the daemon's
+/// once-gate key: one account renamed, added or dropped changes the set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameNotice {
+    name: ProfileName,
+    hazard: NameHazard,
+    /// The roster that holds the name, which decides the remedy: a claude
+    /// account is renamed in place, a codex one has no rename at all.
+    harness: Harness,
+}
+
+impl NameNotice {
+    /// The notice `name` warrants on `harness`'s roster, `None` for an
+    /// ordinary name.
+    pub(crate) fn of(name: &ProfileName, harness: Harness) -> Option<Self> {
+        let hazard = if name.as_str() != "-" && name.starts_with('-') {
+            NameHazard::LeadingDash
+        } else if crate::cli::is_subcommand_name(name) {
+            NameHazard::Subcommand
+        } else {
+            return None;
+        };
+        Some(Self {
+            name: name.clone(),
+            hazard,
+            harness,
+        })
+    }
+
+    /// The remedy a CLI line ends with, `name` already escaped: a claude
+    /// account gets the runnable `clauth rename` command, with `--` ahead of a
+    /// dash-led name so clap reads it as a value; a codex account has no
+    /// rename, so its only fix is deleting it and logging in again under
+    /// another name.
+    fn cli_remedy(&self, name: &str) -> String {
+        match (self.harness, self.hazard) {
+            (Harness::Claude, NameHazard::LeadingDash) => {
+                format!("rename it with `clauth rename -- {name} <new-name>`")
+            }
+            (Harness::Claude, NameHazard::Subcommand) => {
+                format!("rename it with `clauth rename {name} <new-name>`")
+            }
+            (Harness::Codex, _) => "delete it and log in again under another name".to_string(),
+        }
+    }
+
+    /// The remedy the toast's detail line ends with: the toast stands inside
+    /// the TUI, so a claude account is pointed at the Setup tab.
+    fn toast_remedy(&self) -> &'static str {
+        match self.harness {
+            Harness::Claude => "rename it on the Setup tab",
+            Harness::Codex => "delete it and log in again under another name",
+        }
+    }
+
+    /// The one stderr line, also the line a TUI or daemon log records. The
+    /// name prints escaped where it holds a byte a name cannot
+    /// ([`crate::format::escape_unless`]), so a hand-edited roster cannot drive
+    /// the terminal or forge a line; a name of name chars is byte-identical.
+    pub(crate) fn cli_line(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.cli_remedy(&name);
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "clauth: {name}: a name starting with '-' reads as a flag, so the commands \
+                 clauth prints for it fail; {remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "clauth: {name}: a bare `clauth {name}` runs clauth's own {name} command, never \
+                 a switch to this account; switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
+
+    /// The TUI toast body: the title line, then the detail line, the name
+    /// escaped as in [`Self::cli_line`].
+    pub(crate) fn toast_body(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.toast_remedy();
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "{name} starts with '-', so the commands clauth prints for it fail\n{remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "`clauth {name}` runs clauth's own command, not a switch to {name}\n\
+                 switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
 }
 
 /// Why a profile's committed `credentials.json` could not be read, recorded at
@@ -4059,7 +5694,7 @@ pub(crate) fn unreadable_store_notice(profile: &Profile) -> Option<String> {
         "clauth: {name}: {} ({}), so it shows as logged out until `clauth login {name}`",
         crate::format::STORED_LOGIN_UNREADABLE,
         unreadable_store_parenthetical(reason),
-        name = profile.name,
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
     ))
 }
 
@@ -4071,7 +5706,7 @@ pub(crate) fn unreadable_store_refusal(profile: &Profile) -> Option<String> {
         "{name}: {} ({}); log in again with `clauth login {name}` first, or the re-key would drop it",
         crate::format::STORED_LOGIN_UNREADABLE,
         unreadable_store_parenthetical(reason),
-        name = profile.name,
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
     ))
 }
 
@@ -4264,13 +5899,23 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
     };
 
     let base_url = effective_base_url(
-        config.base_url,
+        config.base_url.clone(),
         credentials.is_some() || unreadable_credentials_store.is_some(),
         config.api_key.as_deref(),
         &config.env,
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
+    let console = console_credential(&config.console);
+    let typed_endpoint = TypedEndpoint {
+        base_url: config.base_url,
+        console: config.console,
+        derived_base_url: base_url.clone(),
+        derived_console: console.clone(),
+    };
+    let claim = proxy_claim_in(&raw_config);
+    let has_unreadable_proxy_record = claim == ProxyClaim::Unreadable;
+    let proxy = claim.into_record();
 
     let profile = Profile {
         name: name.clone(),
@@ -4281,6 +5926,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
+        effort: config.effort,
         fallback_threshold: finite_pct(config.fallback_threshold),
         // Reset-not-clamp, mirroring the chain-wide line this overrides
         // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
@@ -4308,69 +5954,111 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         check_credit_cap: config.check_credit_cap.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
-        console: console_credential(&config.console),
+        console,
         credentials: slot(credentials),
         has_long_lived_sidecar: crate::claude::has_session_token(name),
         unreadable_credentials_store,
         setup_token_digest: crate::claude::installed_session_token(name)
             .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
+        typed_endpoint,
+        proxy,
+        has_unreadable_proxy_record,
     };
 
     (profile, config_path, raw_config)
 }
 
-/// Rewrite config.toml only when the canonical render of the loaded profile does
-/// not parse back to it. The parsed comparison never reads the raw file: a hand
-/// edit that parses stays on disk as written until the next save, so the TUI's
-/// reload on every state-file change never touches disk. A render that does not
-/// parse is compared byte-wise against the raw file instead.
-fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
-    let rendered = render_config_toml(profile);
-    let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
-        Ok(canonical) => {
-            let on_disk = ProfileConfig {
-                base_url: profile.base_url.clone(),
-                api_key: profile.api_key.clone(),
-                auto_start: profile.auto_start,
-                usage_probe: profile.usage_probe,
-                usage_probe_interval_ms: (profile.usage_probe_interval_ms
-                    != DEFAULT_USAGE_PROBE_INTERVAL_MS)
-                    .then_some(profile.usage_probe_interval_ms),
-                env: profile.env.clone(),
-                models: profile.models.clone(),
-                fallback_threshold: profile.fallback_threshold,
-                weekly_threshold: profile.weekly_threshold,
-                last_resort: profile.last_resort,
-                preferred: profile.preferred,
-                preferred_days: render_preferred_days(&profile.preferred_days),
-                rolling_token: profile.rolling_token,
-                max_auto_spend: profile.max_auto_spend,
-                // Default-on booleans render as commented examples when on, so
-                // the canonical form is `None` (unset) — an explicit `= true`
-                // on disk normalizes away on the next rewrite.
-                check_weekly: (!profile.check_weekly).then_some(false),
-                check_scoped: (!profile.check_scoped).then_some(false),
-                check_credit_cap: (!profile.check_credit_cap).then_some(false),
-                bell_threshold: profile.bell_threshold,
-                disabled: profile.disabled,
-                console: console_config(profile.console.as_ref()),
-            };
-            canonical != on_disk
-        }
-        Err(_) => raw_config != rendered,
-    };
-    if needs_rewrite {
-        let _ = with_state_lock(|_held| {
-            // Read under the hold: a claim may have minted one since the load.
-            let id = profile_id_at(config_path);
-            // config.toml can carry `api_key` — same 0600 rule as save_profile.
-            let rendered =
-                preserving_config_render(&with_profile_id(rendered, id.as_ref()), config_path);
-            let _ = atomic_write_600(config_path, &rendered);
-            Ok(())
-        });
+/// The canonical typed [`ProfileConfig`] for a loaded [`Profile`] — what the
+/// save writer persists and what the load's drift comparison compares against.
+/// One construction, so the two paths cannot drift. The endpoint keys clauth
+/// derives at load go back as typed unless the caller moved them
+/// ([`Profile::saved_base_url`]), so a freshly loaded profile is canonical in
+/// them and the load never edits one.
+fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
+    ProfileConfig {
+        base_url: profile.saved_base_url(),
+        api_key: profile.api_key.clone(),
+        auto_start: profile.auto_start,
+        usage_probe: profile.usage_probe,
+        usage_probe_interval_ms: (profile.usage_probe_interval_ms
+            != DEFAULT_USAGE_PROBE_INTERVAL_MS)
+            .then_some(profile.usage_probe_interval_ms),
+        env: profile.env.clone(),
+        models: profile.models.clone(),
+        effort: profile.effort.clone(),
+        fallback_threshold: profile.fallback_threshold,
+        weekly_threshold: profile.weekly_threshold,
+        last_resort: profile.last_resort,
+        preferred: profile.preferred,
+        preferred_days: render_preferred_days(&profile.preferred_days),
+        rolling_token: profile.rolling_token,
+        max_auto_spend: profile.max_auto_spend,
+        // Default-on booleans render as commented examples when on, so the
+        // canonical form is `None` (unset) — an explicit `= true` on disk
+        // normalizes away on the next rewrite.
+        check_weekly: (!profile.check_weekly).then_some(false),
+        check_scoped: (!profile.check_scoped).then_some(false),
+        check_credit_cap: (!profile.check_credit_cap).then_some(false),
+        bell_threshold: profile.bell_threshold,
+        disabled: profile.disabled,
+        console: profile.saved_console(),
     }
+}
+
+/// The normalizing write of a full load: when the raw file's typed
+/// [`ProfileConfig`] differs from the canonical form derived from the loaded
+/// [`Profile`], edit the file in place to the canonical value of only the keys
+/// that differ. The comparison is typed-vs-typed, never raw bytes or a
+/// `toml::Value` table, so an unmodelled key, a comment, a blank line, the key
+/// order and the `kick_timer` alias never trigger a write. The
+/// read-compare-write runs under the state flock and re-reads `config.toml`
+/// inside it, writing only if still different, so a peer write landing between
+/// the pre-flock read and the flock is never overwritten by a stale edit. The
+/// write never fails the load: an edit the writer refuses loads with the
+/// normalized in-memory value and writes nothing.
+fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
+    if on_disk_profile_config(raw_config)
+        .is_ok_and(|on_disk| on_disk == canonical_profile_config(profile))
+    {
+        return;
+    }
+    let name = profile.name.clone();
+    let _ = with_state_lock(|_held| {
+        // Re-read under the hold: a peer's write landed between the read and
+        // this hold is kept, never rewound.
+        let now = match std::fs::read_to_string(config_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Ok(()),
+        };
+        if now != raw_config {
+            // A peer wrote: normalize its fresh bytes from a profile rebuilt
+            // from them, never from the pre-flock copy.
+            let Ok(source) = read_profile_source(&name) else {
+                return Ok(());
+            };
+            let (fresh_profile, _, fresh_raw) = build_profile(&name, source);
+            if on_disk_profile_config(&fresh_raw)
+                .is_ok_and(|on_disk| on_disk == canonical_profile_config(&fresh_profile))
+            {
+                return Ok(());
+            }
+            let _ = edit_existing_config_toml(
+                config_path,
+                &fresh_raw,
+                &fresh_profile,
+                ConfigEditMode::Load,
+                None,
+            );
+            return Ok(());
+        }
+        // An edit the writer refuses (a non-plain or unreadable shape) is a
+        // no-op for the load: the value is already normalized in memory.
+        let _ =
+            edit_existing_config_toml(config_path, raw_config, profile, ConfigEditMode::Load, None);
+        Ok(())
+    });
 }
 
 /// Serialize `creds` for the profile store at `cred_path`, re-attaching every
@@ -4536,17 +6224,69 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
     })
 }
 
-/// The whole-profile save: the credential store, then `config.toml`. Only a
-/// caller that sets or blanks the login (an install, a capture, an adopt, a
-/// clear) saves through here; a settings edit saves [`save_profile_config`],
-/// because an in-memory pair can lag a rotation another process landed and
-/// writing it back rewinds the store to a spent token.
+/// The whole-profile save: the credential store, then `config.toml`, both from
+/// `profile` as given. A test fixture's write: outside tests a login install,
+/// adopt or clear saves through [`update_profile`] and a settings edit through
+/// [`update_profile_config`], so no caller can persist a profile it read before
+/// a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     save_profile_with_id(profile, None)
 }
 
-/// [`save_profile`] for a create: the new account gets a fresh [`ProfileId`],
-/// whatever a leftover directory under its name still holds.
+/// Fresh read-modify-write of one profile's credential store and `config.toml`
+/// under the state flock: `None` (nothing read, nothing written) when the
+/// roster on disk no longer holds `name`; else `f` edits the profile re-read
+/// off disk, which is then saved whole, the credential store before
+/// `config.toml`, and comes back with `f`'s value.
+/// So a login install, adopt or clear changes only the fields `f` sets, and
+/// the caller mirrors those into memory once this returns.
+pub(crate) fn update_profile<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let out = f(&mut fresh)?;
+        save_profile_with_id(&fresh, None)?;
+        Ok(Some((fresh, out)))
+    })
+}
+
+/// [`update_profile`] for a capture that sets the stored login alone, coming
+/// back with the login it stored (`None` when the roster on disk no longer
+/// holds `name`). A `config.toml` that does not parse is left as it is and the
+/// credential store is still written: a hand-edit typo in the outgoing account
+/// must not block every switch away from it, while a failed store write still
+/// fails the capture.
+pub(crate) fn update_profile_login(
+    name: &ProfileName,
+    credentials: ClaudeCredentials,
+    held: &StateLockHeld,
+) -> Result<Option<ClaudeCredentials>> {
+    if !is_configured(name)? {
+        return Ok(None);
+    }
+    // A parse failure carries no `io::Error` (`read_profile_source`'s split);
+    // a read failure does, and fails below as `update_profile` would.
+    if let Err(e) = read_profile_config_source(name)
+        && e.downcast_ref::<std::io::Error>().is_none()
+    {
+        write_profile_credentials(name, Some(&credentials), held)?;
+        return Ok(Some(credentials));
+    }
+    Ok(update_profile(name, |fresh| {
+        fresh.set_credentials(Some(credentials), held);
+        Ok(())
+    })?
+    .and_then(|(fresh, ())| fresh.credentials.into_inner()))
+}
+
+/// The whole-profile save for a create: the new account gets a fresh
+/// [`ProfileId`], whatever a leftover directory under its name still holds.
 pub(crate) fn save_new_profile(profile: &Profile) -> Result<()> {
     save_profile_with_id(profile, Some(ProfileId::mint()?))
 }
@@ -4558,13 +6298,17 @@ fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<(
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
         match fresh {
-            Some(id) => write_config_render(profile, Some(&id)),
+            Some(id) => write_config_render(profile, Some(&id), true),
             None => write_profile_config(profile),
         }
     })
 }
 
 /// The config leg of [`save_profile`] alone: `config.toml`, never the store.
+/// A test fixture's whole-profile write: outside tests the one `config.toml`
+/// settings writer is [`update_profile_config`], so no caller can persist a
+/// profile it read before a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     with_state_lock(|_held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
@@ -4572,10 +6316,126 @@ pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     })
 }
 
+/// Fresh read-modify-write of one profile's `config.toml` under the state
+/// flock: `None` (nothing read, nothing created) when the roster on disk no
+/// longer holds `name`; else `f` edits the profile re-read off disk, which is
+/// saved unless `f` errs or changed nothing a `config.toml` on disk holds, and
+/// comes back with `f`'s value.
+/// So a settings edit changes only its own fields, never rewinding a peer's
+/// edit to another one or recreating a peer-deleted account's directory; the
+/// caller mirrors its fields into memory once this returns.
+pub(crate) fn update_profile_config<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let before = profile_config_path(name)?
+            .exists()
+            .then(|| render_config_toml(&fresh));
+        let out = f(&mut fresh)?;
+        if before.as_deref() != Some(render_config_toml(&fresh).as_str()) {
+            #[cfg(test)]
+            if FAIL_PROFILE_CONFIG_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow::anyhow!(
+                    "failed to write config.toml: Permission denied (os error 13)"
+                ));
+            }
+            mkdir_700(&profile_dir(name)?)?;
+            write_profile_config(&fresh)?;
+        }
+        Ok(Some((fresh, out)))
+    })
+}
+
+/// A save over a modelled key whose on-disk shape the writer does not edit.
+/// In a profile's `config.toml`: an inline table, a dotted or implicit table, a
+/// multi-line string, a multi-line array, a value of the wrong type, a table
+/// where a value belongs or a value where a table belongs, or the `kick_timer`
+/// alias beside `auto_start`. In a [`StateFile`], which edits every readable
+/// shape in place: a key its model cannot read. Nothing is written; the file
+/// and the key are named and the file is left byte for byte. A distinct type so
+/// a caller can `downcast_ref` the refusal instead of matching its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigEditRefusal {
+    file: String,
+    key: String,
+}
+
+impl ConfigEditRefusal {
+    fn new(file: impl Into<String>, key: &str) -> Self {
+        Self {
+            file: file.into(),
+            key: key.to_string(),
+        }
+    }
+
+    /// The key whose on-disk shape stopped the save, for a caller wording its
+    /// own message around it.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Display for ConfigEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} has `{}` in a shape clauth cannot read; fix or remove that line, then try again",
+            self.file, self.key
+        )
+    }
+}
+
+impl std::error::Error for ConfigEditRefusal {}
+
+/// A save refused because the file (`config.toml` or a [`StateFile`]) does not
+/// parse as TOML. Its `Display` is that file's load error, `failed to parse
+/// <label> at line L, column C`, byte for byte; the position rides on the type
+/// so a caller can name it without matching the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigParseRefusal {
+    message: String,
+    position: Option<crate::format::ParsePosition>,
+}
+
+impl ConfigParseRefusal {
+    fn new(profile: &str, raw: &str) -> Self {
+        let position = on_disk_profile_config(raw)
+            .err()
+            .and_then(|e| crate::format::toml_parse_position(raw, &e));
+        Self::at(format!("{profile}/config.toml"), position)
+    }
+
+    /// The refusal for the file the load names `label`.
+    fn at(label: impl std::fmt::Display, position: Option<crate::format::ParsePosition>) -> Self {
+        Self {
+            message: crate::format::parse_error(label, position).to_string(),
+            position,
+        }
+    }
+
+    /// The parse position the load named, for a caller wording its own message.
+    pub(crate) fn position(&self) -> Option<crate::format::ParsePosition> {
+        self.position
+    }
+}
+
+impl std::fmt::Display for ConfigParseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigParseRefusal {}
+
 /// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
     let id = profile_id_at(&profile_config_path(&profile.name)?);
-    write_config_render(profile, id.as_ref())
+    write_config_render(profile, id.as_ref(), false)
 }
 
 /// The `id` key of the `config.toml` at `config_path`, read on its own so a
@@ -4587,15 +6447,94 @@ fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
 }
 
 /// `config.toml` from `profile` plus `id`, carrying every unmodelled key the
-/// file already holds. The caller holds the state flock.
-fn write_config_render(profile: &Profile, id: Option<&ProfileId>) -> Result<()> {
+/// file already holds. The caller holds the state flock. `replace_unreadable`
+/// is true only for a create claiming a fresh directory: a leftover config the
+/// writer cannot read belongs to no account, so it is replaced instead of
+/// refusing, and the create's undo still names it if the roster write then
+/// fails.
+fn write_config_render(
+    profile: &Profile,
+    id: Option<&ProfileId>,
+    replace_unreadable: bool,
+) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
     let rendered = with_profile_id(render_config_toml(profile), id);
-    atomic_write_600(
-        &config_path,
-        preserving_config_render(&rendered, &config_path),
-    )
-    .context("failed to write config.toml")
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || replace_unreadable => {
+            return atomic_write_600(&config_path, rendered).context("failed to write config.toml");
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}/config.toml", profile.name));
+        }
+    };
+    edit_existing_config_toml(&config_path, &raw, profile, ConfigEditMode::Save, id)
+}
+
+/// Which edit step a config write runs: the save writes every drifted key; the
+/// load comments out a tuning value it ignores outright.
+#[derive(Clone, Copy)]
+enum ConfigEditMode {
+    Save,
+    Load,
+}
+
+/// The read-edit-write core of a config write over a file that already exists:
+/// parse, refuse a non-plain or unreadable shape, apply the edit step, and
+/// write atomically (a CRLF file stays CRLF). Shared by the save writer and the
+/// normalizing load so the two cannot drift.
+fn edit_existing_config_toml(
+    config_path: &Path,
+    raw: &str,
+    profile: &Profile,
+    mode: ConfigEditMode,
+    id: Option<&ProfileId>,
+) -> Result<()> {
+    let lf = raw.replace("\r\n", "\n");
+    let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
+        // A file that is not TOML refuses with the load's own parse error: the
+        // user's bytes are never replaced by the template, and the position
+        // rides on a typed error the rollback warning names without matching
+        // text.
+        return Err(ConfigParseRefusal::new(profile.name.as_str(), raw).into());
+    };
+    let on_disk = on_disk_profile_config(raw);
+    let canonical = canonical_profile_config(profile);
+    if let Some(key) = non_plain_edit(&doc, on_disk.as_ref().ok(), &canonical) {
+        return Err(ConfigEditRefusal::new(format!("{}: config.toml", profile.name), key).into());
+    }
+    let on_disk = match on_disk {
+        Ok(on_disk) => on_disk,
+        // A typed-parse failure no key's shape explains refuses as the load
+        // does, so the edit step only ever runs over a file that parsed.
+        Err(e) => {
+            return Err(crate::format::parse_error(
+                format!("{}/config.toml", profile.name),
+                crate::format::toml_parse_position(raw, &e),
+            ));
+        }
+    };
+    apply_config_edits(&mut doc, &on_disk, &canonical, mode);
+    if let Some(id) = id
+        && doc.get("id").and_then(|v| v.as_str()) != Some(id.0.as_str())
+    {
+        doc["id"] = toml_edit::value(id.0.clone());
+    }
+    let mut out = doc.to_string();
+    if raw.contains("\r\n") {
+        // toml_edit normalizes line endings to `\n` on parse; a CRLF file stays
+        // CRLF through the save, inserted lines included. A multi-line string's
+        // own `\r\n` survives the parse, so normalize first, then expand, or the
+        // blanket replace writes a bare `\r` the file no longer parses.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    // A load whose edit leaves the bytes unchanged writes nothing: an edit that
+    // computes the same bytes as the raw file is a no-op, not a rewrite that
+    // bumps the mtime and flips the reload fingerprint.
+    if matches!(mode, ConfigEditMode::Load) && out == raw {
+        return Ok(());
+    }
+    atomic_write_600(config_path, out).context("failed to write config.toml")
 }
 
 /// `rendered` with `id = "…"` as its first key, under the header comment.
@@ -4607,18 +6546,119 @@ fn with_profile_id(rendered: String, id: Option<&ProfileId>) -> String {
     rendered.replacen("\n\n", &line, 1)
 }
 
+/// A login write refused because another roster profile's `credentials.json`
+/// already holds its refresh token: a single-use chain lives in one store, or
+/// the first refresh through either store kills the other.
+#[derive(Debug)]
+pub(crate) struct ChainHeldElsewhere {
+    pub(crate) owner: ProfileName,
+}
+
+impl std::fmt::Display for ChainHeldElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this login is already saved in '{}'", self.owner)
+    }
+}
+
+impl std::error::Error for ChainHeldElsewhere {}
+
+impl ChainHeldElsewhere {
+    /// The refusal anywhere in `e`'s chain.
+    pub(crate) fn find(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+/// Refuse writing `credentials` into `store` while another roster profile's
+/// `credentials.json` holds its refresh token. A login with no refresh token
+/// passes, and so does a store that already holds this chain: rewriting it
+/// (a re-capture, a tier stamp) puts it in no store it was not in. A store
+/// that does not read or parse holds no chain this can see. The caller holds
+/// the state flock, so the roster and the stores read here are the ones the
+/// write lands beside.
+pub(crate) fn refuse_chain_held_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    match chain_holder_elsewhere(store, credentials)? {
+        Some(owner) => Err(ChainHeldElsewhere { owner }.into()),
+        None => Ok(()),
+    }
+}
+
+/// The roster profile other than `store`'s whose `credentials.json` holds
+/// `credentials`' refresh token, on [`refuse_chain_held_elsewhere`]'s rules.
+/// Every store of `store`'s own profile (its `credentials.json` and its
+/// `session-token.json` sidecar share one dir) is that profile's, never
+/// another's. Reads only, so a caller without the state flock gets a
+/// best-effort answer a peer's write can move.
+pub(crate) fn chain_holder_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+) -> Result<Option<ProfileName>> {
+    let Some(refresh) = credentials.refresh_token().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let holds = |path: &Path| {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok())
+            .is_some_and(|stored| stored.refresh_token() == Some(refresh))
+    };
+    if holds(store) {
+        return Ok(None);
+    }
+    // A caller can hand the store in its resolved spelling (a session tree's
+    // link target), so the dirs compare by identity as well as by spelling.
+    let own_dir = store.parent();
+    let own_identity = own_dir.and_then(|dir| crate::canonical::identity(dir).ok());
+    let is_own = |path: &Path| {
+        let dir = path.parent();
+        dir == own_dir
+            || own_identity.is_some()
+                && dir.and_then(|d| crate::canonical::identity(d).ok()) == own_identity
+    };
+    for name in load_app_state()?.profiles {
+        let path = profile_credentials_path(&name)?;
+        if !is_own(&path) && holds(&path) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// [`refuse_chain_held_elsewhere`] for `name`'s `credentials.json`, asked by a
+/// writer before the first write it makes ahead of the store write (a
+/// forget, a seed, a detach), so the refusal leaves everything as it was.
+pub(crate) fn refuse_login_held_elsewhere(
+    name: &ProfileName,
+    credentials: Option<&ClaudeCredentials>,
+    held: &StateLockHeld,
+) -> Result<()> {
+    match credentials {
+        Some(credentials) => {
+            refuse_chain_held_elsewhere(&profile_credentials_path(name)?, credentials, held)
+        }
+        None => Ok(()),
+    }
+}
+
 /// The credential leg every store writer shares: `Some` writes the login
 /// through the preserving serializer, so `mcpOAuth` and every other top-level
 /// block the store holds survive, and restores whatever MCP logins the profile
-/// parked; `None` parks those logins and removes the store.
+/// parked; `None` parks those logins and removes the store. A login whose
+/// chain another profile's store holds is refused before anything is written
+/// ([`refuse_chain_held_elsewhere`]).
 pub(crate) fn write_profile_credentials(
     name: &ProfileName,
     credentials: Option<&ClaudeCredentials>,
-    _held: &StateLockHeld,
+    held: &StateLockHeld,
 ) -> Result<()> {
     let cred_path = profile_credentials_path(name)?;
     match credentials {
         Some(creds) => {
+            refuse_chain_held_elsewhere(&cred_path, creds, held)?;
             let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
             atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
             // This profile has a store again, so whatever it parked when it
@@ -4637,86 +6677,6 @@ pub(crate) fn write_profile_credentials(
         None => {}
     }
     Ok(())
-}
-
-/// `render_config_toml`'s output with every key the config already holds that
-/// `ProfileConfig` does not model re-attached under a marker — the
-/// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
-/// states for the credential store. The writers that put such keys there are
-/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
-/// `fallback_threshold` ancestors were themselves once new keys) and an
-/// operator's hand-edit; deleting them on every config mutation (issue #75's
-/// `clauth disable` erasure) loses data no other writer holds.
-///
-/// "Modelled" is decided by round-tripping the ON-DISK file through
-/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
-/// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
-/// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. The same three
-/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
-/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
-/// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
-/// them does not add write thrash.
-pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return rendered.to_string(); // no file yet: nothing to preserve
-    };
-    let Ok(disk) = raw.parse::<toml::Table>() else {
-        return rendered.to_string(); // unparseable: not ours to resurrect keys from
-    };
-    let Ok((modelled, modelled_nested)) = modelled_config_shape(&raw) else {
-        // Same refusal as the profiles.toml carry: an unparseable config
-        // cannot be classified, and carrying everything would duplicate the
-        // modelled keys already in the render — a duplicate top-level key is
-        // a hard parse error on the next load.
-        return rendered.to_string();
-    };
-    // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
-        return rendered.to_string(); // a render that does not parse: merge nothing
-    };
-    let baseline = parsed_as::<ProfileConfig>(rendered);
-    let merged = nested_carry_if_inert::<ProfileConfig>(
-        rendered.to_string(),
-        baseline.as_deref(),
-        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
-    );
-    let carried: Vec<(String, toml::Value)> = disk
-        .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| {
-            carry_is_inert::<ProfileConfig>(baseline.as_deref(), &rendered_table, k, v)
-        })
-        .collect();
-    if carried.is_empty() {
-        return merged; // the common case
-    }
-    merge_carried_keys(merged, &carried)
-}
-
-/// What `ProfileConfig` holds, derived by round-tripping `raw` through the
-/// type: the top-level keys it recognizes, plus the sub-keys of every modelled
-/// table — the same derivation [`modelled_state_shape`] runs for
-/// `profiles.toml`, so a future sub-key inside a modelled table is recognized
-/// as unmodelled rather than silently deleted. Err on a file that does not
-/// parse as `ProfileConfig` — the caller must refuse to carry rather than
-/// guess.
-fn modelled_config_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
-    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
-    toml::to_string(&config)
-        .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|table| {
-            let nested = table
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_table()
-                        .map(|t| (k.clone(), t.keys().cloned().collect()))
-                })
-                .collect();
-            (table.keys().cloned().collect(), nested)
-        })
-        .ok_or(())
 }
 
 /// Write a legacy `credentials.json.pending` sidecar the way a binary predating
@@ -4934,6 +6894,275 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
         .collect()
 }
 
+/// Every modelled top-level scalar key, read by the completeness test and
+/// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
+/// added to the model without a doc block and example fails a test.
+#[cfg(test)]
+const MODELLED_SCALARS: [&str; 18] = [
+    "base_url",
+    "api_key",
+    "auto_start",
+    "usage_probe",
+    "usage_probe_interval_ms",
+    "fallback_threshold",
+    "weekly_threshold",
+    "last_resort",
+    "preferred",
+    "preferred_days",
+    "rolling_token",
+    "max_auto_spend",
+    "check_weekly",
+    "check_scoped",
+    "check_credit_cap",
+    "bell_threshold",
+    "disabled",
+    "effort",
+];
+
+/// The template shape of one modelled top-level scalar key: the comment block
+/// `render_config_toml` emits above it and the commented example line it emits
+/// when the key is unset. The doc text is pushed through `out.push_str("# …")`
+/// lines so the in-place writer and the render share one source and the glyph
+/// test's exemption keeps covering the config-template prose.
+#[rustfmt::skip]
+fn push_scalar_doc(out: &mut String, key: &str) {
+    match key {
+        "base_url" => {
+            out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
+            out.push_str("# (Pro / Max / Ultra / Team / Enterprise) profile.\n");
+        }
+        "api_key" => {
+            out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+        }
+        "auto_start" => {
+            out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
+            out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
+            out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+            out.push_str("# A plan with no 5-hour limit gets no ping.\n");
+            out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+        }
+        "usage_probe" => {
+            out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
+            out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
+            out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
+            out.push_str("# window. A plan with no 5-hour limit has none to start. Inert while an\n");
+            out.push_str("# OAuth pair is stored. OAuth profiles only.\n");
+        }
+        "usage_probe_interval_ms" => {
+            out.push_str(&format!(
+                "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
+                 # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
+            ));
+        }
+        "fallback_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth will auto-switch\n",
+            );
+            out.push_str("# off this profile, provided the profile is also a member of the\n");
+            out.push_str(
+                "# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n",
+            );
+        }
+        "weekly_threshold" => {
+            out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
+            out.push_str(
+                "# Config tab's `weekly limit`, default 98). Governs when auto-switching\n",
+            );
+            out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
+            out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+        }
+        "last_resort" => {
+            out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
+            out.push_str(
+                "# auto-switch walk lands here with no other member having headroom, it\n",
+            );
+            out.push_str("# parks instead of turning off all accounts. Independent of\n");
+            out.push_str("# fallback_threshold, this profile still switches away at its own\n");
+            out.push_str("# threshold whenever another chain member has headroom.\n");
+        }
+        "preferred" => {
+            out.push_str(
+                "# Marks this profile as the fallback chain's preferred (home) account.\n",
+            );
+            out.push_str(
+                "# At most one member is preferred; the toggle is a radio. Once live work\n",
+            );
+            out.push_str(
+                "# has drifted off it and it reads clear and fresh again, the daemon walks\n",
+            );
+            out.push_str("# the active account — and every following session — back to it. Mutually\n");
+            out.push_str("# exclusive with last_resort.\n");
+        }
+        "preferred_days" => {
+            out.push_str(
+                "# Weekdays this account is the home account, in local time. Empty (the\n",
+            );
+            out.push_str(
+                "# default) leaves `preferred` above in charge every day. A non-empty list\n",
+            );
+            out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
+            out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
+            out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
+            out.push_str(
+                "# serve claim: a list on a removed, disabled or auth-broken account is\n",
+            );
+            out.push_str(
+                "# inert. Full names and three-letter forms both parse, and an entry that\n",
+            );
+            out.push_str("# does not is dropped on the next rewrite.\n");
+        }
+        "rolling_token" => {
+            out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
+            out.push_str("# chain's current access token on every rotation (plan-gated models\n");
+            out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
+            out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+        }
+        "max_auto_spend" => {
+            out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
+            out.push_str(
+                "# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n",
+            );
+            out.push_str(
+                "# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n",
+            );
+            out.push_str("# default) never spends. The chain stops using this account once its\n");
+            out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
+            out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
+            out.push_str("# per `switch_off_when_budget_spent`.\n");
+        }
+        "check_weekly" => {
+            out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
+            out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
+            out.push_str(
+                "# rotation across the soft weekly band; the 100% hard cap always blocks.\n",
+            );
+        }
+        "check_scoped" => {
+            out.push_str(
+                "# Whether auto-switching checks this account's per-model weekly windows\n",
+            );
+            out.push_str(
+                "# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n",
+            );
+            out.push_str("# and keep this account in rotation for use with other models.\n");
+        }
+        "check_credit_cap" => {
+            out.push_str(
+                "# Whether auto-switching keeps off this account while its usage-credit cap\n",
+            );
+            out.push_str(
+                "# is spent (Claude Code then refuses credit-billed models such as Fable).\n",
+            );
+            out.push_str("# Set false to keep it in rotation for other models.\n");
+        }
+        "bell_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n",
+            );
+            out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
+        }
+        "disabled" => {
+            out.push_str(
+                "# Disable this account: it becomes invisible to the fallback chain, the\n",
+            );
+            out.push_str(
+                "# usage/rotation scheduler, and the daemon status feed (by default), while\n",
+            );
+            out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+        }
+        "effort" => {
+            out.push_str("# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n");
+            out.push_str("# (`effortLevel` is Claude Code's own key).\n");
+        }
+        _ => unreachable!("no doc block for modelled scalar {key}"),
+    }
+}
+
+fn scalar_example(key: &str) -> String {
+    match key {
+        "base_url" => "# base_url = \"https://api.anthropic.com\"\n".to_string(),
+        "api_key" => "# api_key = \"sk-ant-...\"\n".to_string(),
+        "auto_start" => "# auto_start = true\n".to_string(),
+        "usage_probe" => "# usage_probe = true\n".to_string(),
+        "usage_probe_interval_ms" => {
+            format!("# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n")
+        }
+        "fallback_threshold" => "# fallback_threshold = 95.0\n".to_string(),
+        "weekly_threshold" => "# weekly_threshold = 98.0\n".to_string(),
+        "last_resort" => "# last_resort = true\n".to_string(),
+        "preferred" => "# preferred = true\n".to_string(),
+        "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n".to_string(),
+        "rolling_token" => "# rolling_token = true\n".to_string(),
+        "max_auto_spend" => "# max_auto_spend = 5.0\n".to_string(),
+        "check_weekly" => "# check_weekly = false\n".to_string(),
+        "check_scoped" => "# check_scoped = false\n".to_string(),
+        "check_credit_cap" => "# check_credit_cap = false\n".to_string(),
+        "bell_threshold" => "# bell_threshold = 95.0\n".to_string(),
+        "disabled" => "# disabled = true\n".to_string(),
+        "effort" => "# effort = \"high\"\n".to_string(),
+        _ => unreachable!("no example for modelled scalar {key}"),
+    }
+}
+
+fn scalar_doc(key: &str) -> String {
+    let mut out = String::new();
+    push_scalar_doc(&mut out, key);
+    out
+}
+
+#[rustfmt::skip]
+fn push_console_doc(out: &mut String) {
+    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
+    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
+    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
+    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
+    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
+    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
+    out.push_str("# site: domestic | international.\n");
+}
+
+fn console_doc() -> String {
+    let mut out = String::new();
+    push_console_doc(&mut out);
+    out
+}
+
+const CONSOLE_EXAMPLE: &str =
+    "# [console]\n# token = \"...\"\n# site = \"international\"\n# region = \"ap-southeast-1\"\n";
+
+#[rustfmt::skip]
+fn push_models_doc(out: &mut String) {
+    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
+    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
+    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
+    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n");
+    out.push_str("# server-side advisor model (the `advisorModel` setting).\n");
+}
+
+fn models_doc() -> String {
+    let mut out = String::new();
+    push_models_doc(&mut out);
+    out
+}
+
+const MODELS_EXAMPLE: &str = "# [models]\n# default = \"opusplan\"\n";
+
+#[rustfmt::skip]
+fn push_env_doc(out: &mut String) {
+    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
+    out.push_str("# this profile is active. A switch to another profile removes each one,\n");
+    out.push_str("# or puts back the value ~/.claude/settings.json held before it.\n");
+}
+
+fn env_doc() -> String {
+    let mut out = String::new();
+    push_env_doc(&mut out);
+    out
+}
+
+const ENV_EXAMPLE: &str = "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n";
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
@@ -4942,51 +7171,39 @@ fn render_config_toml(profile: &Profile) -> String {
 
     let mut out = String::from("# clauth profile configuration\n\n");
 
-    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
-    out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
-    match profile.base_url.as_deref() {
+    push_scalar_doc(&mut out, "base_url");
+    match profile.saved_base_url().as_deref() {
         Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
-        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
+        None => out.push_str(&scalar_example("base_url")),
     }
     out.push('\n');
 
-    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+    push_scalar_doc(&mut out, "api_key");
     match profile.api_key.as_deref() {
         Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
-        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
+        None => out.push_str(&scalar_example("api_key")),
     }
     out.push('\n');
 
-    out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
-    out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
-    out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
-    out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+    push_scalar_doc(&mut out, "auto_start");
     if profile.auto_start {
         out.push_str("auto_start = true\n");
     } else {
-        out.push_str("# auto_start = true\n");
+        out.push_str(&scalar_example("auto_start"));
     }
     out.push('\n');
 
-    out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
-    out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
-    out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
-    out.push_str("# window. Inert while an OAuth pair is stored. OAuth profiles only.\n");
+    push_scalar_doc(&mut out, "usage_probe");
     if profile.usage_probe {
         out.push_str("usage_probe = true\n");
     } else {
-        out.push_str("# usage_probe = true\n");
+        out.push_str(&scalar_example("usage_probe"));
     }
     out.push('\n');
 
-    out.push_str(&format!(
-        "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
-         # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
-    ));
+    push_scalar_doc(&mut out, "usage_probe_interval_ms");
     if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
-        out.push_str(&format!(
-            "# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n"
-        ));
+        out.push_str(&scalar_example("usage_probe_interval_ms"));
     } else {
         out.push_str(&format!(
             "usage_probe_interval_ms = {}\n",
@@ -4995,59 +7212,39 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
-    out.push_str("# off this profile, provided the profile is also a member of the\n");
-    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "fallback_threshold");
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
-        None => out.push_str("# fallback_threshold = 95.0\n"),
+        None => out.push_str(&scalar_example("fallback_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
-    out.push_str("# Config tab's `weekly limit`, default 98). Governs when auto-switching\n");
-    out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
-    out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "weekly_threshold");
     match profile.weekly_threshold {
         Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
-        None => out.push_str("# weekly_threshold = 98.0\n"),
+        None => out.push_str(&scalar_example("weekly_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
-    out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
-    out.push_str("# parks instead of turning off all accounts. Independent of\n");
-    out.push_str("# fallback_threshold, this profile still switches away at its own\n");
-    out.push_str("# threshold whenever another chain member has headroom.\n");
+    push_scalar_doc(&mut out, "last_resort");
     if profile.last_resort {
         out.push_str("last_resort = true\n");
     } else {
-        out.push_str("# last_resort = true\n");
+        out.push_str(&scalar_example("last_resort"));
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's preferred (home) account.\n");
-    out.push_str("# At most one member is preferred; the toggle is a radio. Once live work\n");
-    out.push_str("# has drifted off it and it reads clear and fresh again, the daemon walks\n");
-    out.push_str("# the active account — and every following session — back to it. Mutually\n");
-    out.push_str("# exclusive with last_resort.\n");
+    push_scalar_doc(&mut out, "preferred");
     if profile.preferred {
         out.push_str("preferred = true\n");
     } else {
-        out.push_str("# preferred = true\n");
+        out.push_str(&scalar_example("preferred"));
     }
     out.push('\n');
 
-    out.push_str("# Weekdays this account is the home account, in local time. Empty (the\n");
-    out.push_str("# default) leaves `preferred` above in charge every day. A non-empty list\n");
-    out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
-    out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
-    out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
-    out.push_str("# serve claim: a list on a removed, disabled or auth-broken account is\n");
-    out.push_str("# inert. Full names and three-letter forms both parse, and an entry that\n");
-    out.push_str("# does not is dropped on the next rewrite.\n");
+    push_scalar_doc(&mut out, "preferred_days");
     if profile.preferred_days.is_empty() {
-        out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
+        out.push_str(&scalar_example("preferred_days"));
     } else {
         out.push_str("preferred_days = [");
         for (i, day) in render_preferred_days(&profile.preferred_days)
@@ -5065,86 +7262,70 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
-    out.push_str("# chain's current access token on every rotation (plan-gated models\n");
-    out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
-    out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+    push_scalar_doc(&mut out, "rolling_token");
     if profile.rolling_token {
         out.push_str("rolling_token = true\n");
     } else {
-        out.push_str("# rolling_token = true\n");
+        out.push_str(&scalar_example("rolling_token"));
     }
     out.push('\n');
 
-    out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
-    out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
-    out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
-    out.push_str("# default) never spends. The chain stops using this account once its\n");
-    out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
-    out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
-    out.push_str("# per `switch_off_when_budget_spent`.\n");
+    push_scalar_doc(&mut out, "max_auto_spend");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
-        None => out.push_str("# max_auto_spend = 5.0\n"),
+        None => out.push_str(&scalar_example("max_auto_spend")),
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
-    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
-    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
+    push_scalar_doc(&mut out, "check_weekly");
     if profile.check_weekly {
-        out.push_str("# check_weekly = false\n");
+        out.push_str(&scalar_example("check_weekly"));
     } else {
         out.push_str("check_weekly = false\n");
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
-    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
-    out.push_str("# and keep this account in rotation for use with other models.\n");
+    push_scalar_doc(&mut out, "check_scoped");
     if profile.check_scoped {
-        out.push_str("# check_scoped = false\n");
+        out.push_str(&scalar_example("check_scoped"));
     } else {
         out.push_str("check_scoped = false\n");
     }
     out.push('\n');
-    out.push_str("# Whether auto-switching keeps off this account while its usage-credit cap\n");
-    out.push_str("# is spent (Claude Code then refuses credit-billed models such as Fable).\n");
-    out.push_str("# Set false to keep it in rotation for other models.\n");
+
+    push_scalar_doc(&mut out, "check_credit_cap");
     if profile.check_credit_cap {
-        out.push_str("# check_credit_cap = false\n");
+        out.push_str(&scalar_example("check_credit_cap"));
     } else {
         out.push_str("check_credit_cap = false\n");
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n");
-    out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "bell_threshold");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
-        None => out.push_str("# bell_threshold = 95.0\n"),
+        None => out.push_str(&scalar_example("bell_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Disable this account: it becomes invisible to the fallback chain, the\n");
-    out.push_str("# usage/rotation scheduler, and the daemon status feed (by default), while\n");
-    out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+    push_scalar_doc(&mut out, "disabled");
     if profile.disabled {
         out.push_str("disabled = true\n");
     } else {
-        out.push_str("# disabled = true\n");
+        out.push_str(&scalar_example("disabled"));
+    }
+    out.push('\n');
+
+    push_scalar_doc(&mut out, "effort");
+    match profile.effort.as_deref() {
+        Some(v) => out.push_str(&format!("effort = {}\n", toml_str(v))),
+        None => out.push_str(&scalar_example("effort")),
     }
     out.push('\n');
 
     // Tables last: every key after a `[table]` header belongs to that table, so
     // this block and the two below must follow every scalar key above.
-    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
-    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
-    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
-    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
-    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
-    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
-    out.push_str("# site: domestic | international.\n");
+    push_console_doc(&mut out);
     match profile.console.as_ref() {
         Some(c) => {
             out.push_str("[console]\n");
@@ -5152,20 +7333,11 @@ fn render_config_toml(profile: &Profile) -> String {
             out.push_str(&format!("site = {}\n", toml_str(c.site.as_str())));
             out.push_str(&format!("region = {}\n", toml_str(&c.region)));
         }
-        None => {
-            out.push_str("# [console]\n");
-            out.push_str("# token = \"...\"\n");
-            out.push_str("# site = \"international\"\n");
-            out.push_str("# region = \"ap-southeast-1\"\n");
-        }
+        None => out.push_str(CONSOLE_EXAMPLE),
     }
     out.push('\n');
 
-    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
-    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
-    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
-    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
-    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    push_models_doc(&mut out);
     let m = &profile.models;
     let scalars = [
         ("default", &m.default),
@@ -5174,10 +7346,10 @@ fn render_config_toml(profile: &Profile) -> String {
         ("haiku", &m.haiku),
         ("fable", &m.fable),
         ("subagent", &m.subagent),
+        ("advisor", &m.advisor),
     ];
     if scalars.iter().all(|(_, v)| v.is_none()) {
-        out.push_str("# [models]\n");
-        out.push_str("# default = \"opusplan\"\n");
+        out.push_str(MODELS_EXAMPLE);
     } else {
         out.push_str("[models]\n");
         for (k, v) in scalars {
@@ -5188,11 +7360,9 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
-    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
+    push_env_doc(&mut out);
     if profile.env.is_empty() {
-        out.push_str("# [env]\n");
-        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
+        out.push_str(ENV_EXAMPLE);
     } else {
         out.push_str("[env]\n");
         for (k, v) in &profile.env {
@@ -5208,6 +7378,1505 @@ fn render_config_toml(profile: &Profile) -> String {
     }
 
     out
+}
+
+/// The site where a template example (or doc block) sits in a parsed document.
+enum ExampleSite {
+    /// The document's trailing comments, after the last table.
+    Trailing,
+    /// The leading comment of a root key (a scalar, or a table's header key).
+    KeyPrefix(String),
+    /// The leading comment above a root `[table]` header.
+    TablePrefix(String),
+}
+
+/// The byte offset of `example` where it sits directly under one of the key's
+/// doc blocks, the block starting a line of its own: only the example under a
+/// doc block clauth wrote for that key is the key's, so a lookalike line, or
+/// one under a doc block whose first line was edited, never matches.
+fn find_example_line(hay: &str, example: &str, doc_blocks: &[String]) -> Option<usize> {
+    hay.match_indices(example)
+        .map(|(i, _)| i)
+        .find(|&i| ends_with_any_doc_block(&hay[..i], doc_blocks))
+}
+
+/// Whether `text` ends with `doc_block` at the start of a line: the doc block
+/// must start the text or sit right after a `\n`, so a comment whose first
+/// line was prefixed (a longer line ending in the block's text) never matches.
+fn ends_with_doc_block(text: &str, doc_block: &str) -> bool {
+    text.strip_suffix(doc_block)
+        .is_some_and(|above| above.is_empty() || above.ends_with('\n'))
+}
+
+/// Whether `text` ends with any doc block clauth wrote for a key, each matched
+/// at the start of a line.
+fn ends_with_any_doc_block(text: &str, doc_blocks: &[String]) -> bool {
+    doc_blocks
+        .iter()
+        .any(|doc_block| ends_with_doc_block(text, doc_block))
+}
+
+/// The em dash older `config.toml` doc text used. Spelled as a char literal so
+/// the CLI's ASCII-only guard (which skips `'\u{...}'`) reads this source as
+/// ASCII while the generated comment keeps the typographic dash.
+const EM_DASH: char = '\u{2014}';
+
+/// The cent sign the `auto_start` doc uses, spelled like [`EM_DASH`] so the
+/// older doc block in `known_doc_blocks` stays ASCII too.
+const CENT: char = '\u{a2}';
+
+/// Every `config.toml` doc block clauth has written for `key`, current first.
+/// A file last saved before a doc rewording carries the older block; it is
+/// still the key's own, so its example toggles in place. Set and unset both
+/// match against this list.
+fn known_doc_blocks(key: &str) -> Vec<String> {
+    let mut docs = vec![doc_block_for(key)];
+    match key {
+        // The v0.18.0 form, before the Ultra tier.
+        "base_url" => docs.push(
+            "# Base URL for an API-endpoint profile. Leave commented for an OAuth\n\
+             # (Pro / Max / Team / Enterprise) profile.\n"
+                .to_string(),
+        ),
+        // The v0.18.0 form, before the no-5-hour-limit line.
+        "auto_start" => docs.push(format!(
+            "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+             # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+             # no running window. ~0.001{CENT} per ping. OAuth profiles only.\n\
+             # Old name `kick_timer = true` is still accepted.\n"
+        )),
+        // ce69b154 reworded the alert copy (90205d2d wrote the older block).
+        "bell_threshold" => docs.push(
+            "# 5-hour utilization percentage at/above which clauth fires a bell\n\
+             # notification in the overview tab. Range 0..=100.\n"
+                .to_string(),
+        ),
+        // d5ea42d5 added the fable tier to the alias list (5ab01076 wrote the
+        // three-model form).
+        "models" => {
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n\
+                 # those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n\
+                 # subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+            // The v0.18.1 form, before the advisor row.
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n\
+                 # pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n\
+                 # forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+        }
+        // 027afde6 renamed the wrap-off flag; 3076ec9b made the spend line a
+        // stop-using cap; 5f840f3c wrote the original stop-at-90% text.
+        "max_auto_spend" => {
+            docs.push(format!(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops using this account once its\n\
+                 # spend reaches 90% of this or of the account's own cap, whichever is\n\
+                 # lower {EM_DASH} parking on a `last_resort` member if the chain has one, else\n\
+                 # per `budget_wrap_off`.\n"
+            ));
+            docs.push(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops at 90% of this or the account's\n\
+                 # own cap, whichever is lower.\n"
+                    .to_string(),
+            );
+        }
+        // 300cc6bf turned the em-dash after fallback_threshold into a comma
+        // (d6b5bfa2 wrote the em-dash form).
+        "last_resort" => docs.push(format!(
+            "# Marks this profile as the fallback chain's last resort. Once the\n\
+             # auto-switch walk lands here with no other member having headroom, it\n\
+             # parks instead of turning off all accounts. Independent of\n\
+             # fallback_threshold {EM_DASH} this profile still switches away at its own\n\
+             # threshold whenever another chain member has headroom.\n"
+        )),
+        // 09a1dd3c reworded the switch-away clause (f4c9ca1e wrote the older
+        // block).
+        "env" => docs.push(
+            "# Extra env vars merged into ~/.claude/settings.json's env block while\n\
+             # this profile is active. Cleared on switch to another profile.\n"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    docs
+}
+
+fn doc_block_for(key: &str) -> String {
+    match key {
+        "console" => console_doc(),
+        "models" => models_doc(),
+        "env" => env_doc(),
+        k => scalar_doc(k),
+    }
+}
+
+/// The single search the in-place writer uses: root items in file order first,
+/// the document trailing last, matching only the example line that sits
+/// directly under a doc block clauth wrote for the key. Any other copy is the
+/// user's prose, never a site.
+fn locate_example(
+    doc: &toml_edit::DocumentMut,
+    example: &str,
+    doc_blocks: &[String],
+) -> Option<(ExampleSite, String, String)> {
+    let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+    for k in &keys {
+        let (key_prefix, table_prefix) = {
+            let Some((key_handle, item)) = doc.get_key_value(k) else {
+                continue;
+            };
+            let kp = key_handle
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            let tp = item
+                .as_table()
+                .and_then(|t| t.decor().prefix())
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            (kp, tp)
+        };
+        if let Some(p) = &key_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::KeyPrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+        if let Some(p) = &table_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::TablePrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+    }
+    let t = doc.trailing().as_str()?;
+    let i = find_example_line(t, example, doc_blocks)?;
+    Some((
+        ExampleSite::Trailing,
+        t[..i].to_string(),
+        t[i + example.len()..].to_string(),
+    ))
+}
+
+fn find_example(doc: &toml_edit::DocumentMut, example: &str, doc_blocks: &[String]) -> bool {
+    locate_example(doc, example, doc_blocks).is_some()
+}
+
+fn set_value_preserving_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+    value: toml_edit::Value,
+) {
+    let Some(item) = table.get_mut(key) else {
+        return;
+    };
+    let Some(old) = item.as_value() else { return };
+    let decor = old.decor().clone();
+    let mut v = value;
+    *v.decor_mut() = decor;
+    *item = toml_edit::Item::Value(v);
+}
+
+fn insert_root_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    doc.as_table_mut()
+        .insert_formatted(&k, toml_edit::Item::Value(value));
+}
+
+fn insert_root_value_before(
+    doc: &mut toml_edit::DocumentMut,
+    before_key: &str,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let table = doc.as_table_mut();
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+    let Some(pos) = keys.iter().position(|k| k == before_key) else {
+        let mut k = toml_edit::Key::new(key);
+        if let Some(p) = leaf_prefix {
+            k.leaf_decor_mut().set_prefix(p);
+        }
+        table.insert_formatted(&k, toml_edit::Item::Value(value));
+        return;
+    };
+    let mut tail: Vec<(toml_edit::Key, toml_edit::Item)> = Vec::new();
+    for k in &keys[pos..] {
+        if let Some(e) = table.remove_entry(k) {
+            tail.push(e);
+        }
+    }
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    table.insert_formatted(&k, toml_edit::Item::Value(value));
+    for (k, item) in tail {
+        table.insert_formatted(&k, item);
+    }
+}
+
+/// An appended root table goes after the document's trailing comments, never
+/// before them: the trailing text moves onto the table's header prefix so a
+/// root-level trailing comment stays above the new header instead of landing
+/// inside the table's body.
+pub(crate) fn append_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let tail = take_trailing_lines(doc);
+    insert_root_table(doc, key, build, (!tail.is_empty()).then_some(tail), None);
+}
+
+/// An appended root scalar goes at the end of its section, never above the
+/// document's trailing comments: with no header in the document, the trailing
+/// text moves onto the key's prefix so a root-level trailing comment stays
+/// above the new key; with a header, the root section ends before the first
+/// one and the trailing text belongs to the last table, so nothing moves.
+fn append_root_value(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    let tail = if doc.iter().any(|(_, item)| opens_a_header(item)) {
+        String::new()
+    } else {
+        take_trailing_lines(doc)
+    };
+    insert_root_value(doc, key, value, (!tail.is_empty()).then_some(tail));
+}
+
+/// Whether a root item opens a `[table]` or `[[array]]` header line; a table
+/// written as dotted keys (`env.A = "b"`) sits among the root keys and opens
+/// none.
+fn opens_a_header(item: &toml_edit::Item) -> bool {
+    item.is_array_of_tables() || item.as_table().is_some_and(|t| !t.is_dotted())
+}
+
+/// The document's trailing text, taken off the document as whole lines: a last
+/// comment with no final newline gets one, so an item placed after it never
+/// lands inside that comment.
+fn take_trailing_lines(doc: &mut toml_edit::DocumentMut) -> String {
+    let mut tail = doc.trailing().as_str().unwrap_or("").to_string();
+    doc.set_trailing("");
+    if !tail.is_empty() && !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    tail
+}
+
+pub(crate) fn insert_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+    header_prefix: Option<String>,
+    position: Option<isize>,
+) {
+    let mut t = toml_edit::Table::new();
+    build(&mut t);
+    if let Some(p) = header_prefix {
+        t.decor_mut().set_prefix(p);
+    }
+    t.set_position(position);
+    doc.insert(key, toml_edit::Item::Table(t));
+}
+
+fn replace_example_with_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    example: &str,
+) {
+    // A root key opens before the first table header: an example after any
+    // header (a later table's prefix, or the trailing text after a table)
+    // cannot become a key where it sits.
+    let first_header = doc
+        .iter()
+        .find(|(_, item)| opens_a_header(item))
+        .map(|(k, _)| k.to_string());
+    let site =
+        locate_example(doc, example, &known_doc_blocks(key)).filter(|(site, _, _)| match site {
+            ExampleSite::KeyPrefix(_) => true,
+            ExampleSite::TablePrefix(k) => first_header.as_deref() == Some(k.as_str()),
+            ExampleSite::Trailing => first_header.is_none(),
+        });
+    let Some((site, before, after)) = site else {
+        append_root_value(doc, key, value);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_value(doc, key, value, Some(before));
+        }
+        ExampleSite::KeyPrefix(k) => {
+            if let Some(mut km) = doc.as_table_mut().key_mut(&k) {
+                km.leaf_decor_mut().set_prefix(after);
+            }
+            insert_root_value_before(doc, &k, key, value, Some(before));
+        }
+        ExampleSite::TablePrefix(k) => {
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_value(doc, key, value, Some(before));
+        }
+    }
+}
+
+fn replace_example_with_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let Some((site, before, after)) = locate_example(doc, example, &known_doc_blocks(key)) else {
+        append_root_table(doc, key, build);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_table(doc, key, build, Some(before), None);
+        }
+        ExampleSite::KeyPrefix(_) => {
+            // The example block sits in a root scalar's prefix: a table cannot
+            // open above a root key, so the block stays as written and the
+            // table appends after the last table.
+            append_root_table(doc, key, build);
+        }
+        ExampleSite::TablePrefix(k) => {
+            let position = doc
+                .get(&k)
+                .and_then(toml_edit::Item::as_table)
+                .and_then(toml_edit::Table::position);
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_table(doc, key, build, Some(before), position.map(|p| p - 1));
+        }
+    }
+}
+
+/// The comment on the same line as `item`'s value or header, trimmed and kept
+/// as its own comment line; empty when there is none. A comment is a comment
+/// whether it trails a value or a table header, so an unset keeps it.
+fn same_line_comment(item: &toml_edit::Item) -> String {
+    let suffix = match item {
+        toml_edit::Item::Value(v) => v.decor().suffix(),
+        toml_edit::Item::Table(t) => t.decor().suffix(),
+        toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => None,
+    };
+    suffix
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with('#'))
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default()
+}
+
+/// The comment lines inside a removed value, each trimmed onto its own line:
+/// the text before the value, every list element's prefix and suffix, the
+/// list's trailing text, and an inline table's trailing text. Empty when the
+/// value holds no comment, so a removal without one stays byte-identical.
+fn interior_comments(item: &toml_edit::Item) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let Some(value) = item.as_value() else {
+        return String::new();
+    };
+    parts.push(decor_prefix(value.decor()));
+    if let toml_edit::Value::Array(a) = value {
+        for v in a.iter() {
+            parts.push(decor_prefix(v.decor()));
+            parts.push(decor_suffix(v.decor()));
+            if let toml_edit::Value::InlineTable(t) = v {
+                parts.push(t.trailing().as_str().unwrap_or(""));
+            }
+        }
+        parts.push(a.trailing().as_str().unwrap_or(""));
+    } else if let toml_edit::Value::InlineTable(t) = value {
+        parts.push(t.trailing().as_str().unwrap_or(""));
+    }
+    parts
+        .iter()
+        .flat_map(|p| p.lines())
+        .map(str::trim)
+        .filter(|l| l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+fn remove_key_keeping_comments(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    doc_blocks: &[String],
+    example: &str,
+) {
+    let (lead, same_line, interior) = {
+        let table = doc.as_table();
+        let Some((k, item)) = table.get_key_value(key) else {
+            return;
+        };
+        let lead = if let Some(t) = item.as_table() {
+            let lead = t
+                .decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            // A table appended by the writer carries toml_edit's default `\n`
+            // separator as its prefix; dropping the table must drop that blank
+            // line too, or the set-then-unset cycle leaves it behind.
+            if lead.trim().is_empty() {
+                String::new()
+            } else {
+                lead
+            }
+        } else {
+            k.leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (lead, same_line_comment(item), interior_comments(item))
+    };
+    let next = {
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    if ends_with_any_doc_block(&kept, doc_blocks) {
+        kept.push_str(example);
+    }
+    kept.push_str(&interior);
+    kept.push_str(&same_line);
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+pub(crate) fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_dotted())
+    {
+        prepend_to_first_leaf(t, prefix);
+        return;
+    }
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_implicit())
+    {
+        prepend_to_first_header(t, prefix);
+        return;
+    }
+    let header = match doc.get_mut(key) {
+        Some(toml_edit::Item::Table(t)) => Some(t),
+        Some(toml_edit::Item::ArrayOfTables(a)) => a.get_mut(0),
+        _ => None,
+    };
+    if let Some(tm) = header {
+        let existing = tm
+            .decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        tm.decor_mut().set_prefix(format!("{prefix}{existing}"));
+    } else if let Some(mut km) = doc.as_table_mut().key_mut(key) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+/// The document position of the first header `item` renders: its own for a
+/// header table, its first element's for an array of tables, and its earliest
+/// child's for an implicit table, which renders no header of its own.
+pub(crate) fn first_header_position(item: &toml_edit::Item) -> Option<isize> {
+    match item {
+        toml_edit::Item::Table(t) if t.is_implicit() => {
+            t.iter().filter_map(|(_, c)| first_header_position(c)).min()
+        }
+        toml_edit::Item::Table(t) => t.position(),
+        toml_edit::Item::ArrayOfTables(a) => a.get(0).and_then(toml_edit::Table::position),
+        _ => None,
+    }
+}
+
+/// An implicit table (`foo` of `[foo.bar]`) renders no decor of its own, so a
+/// comment moved onto it goes on the first header rendered beneath it.
+fn prepend_to_first_header(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t
+        .iter()
+        .filter_map(|(k, c)| first_header_position(c).map(|p| (p, k.to_string())))
+        .min()
+        .map(|(_, k)| k)
+    else {
+        return;
+    };
+    let target = match t.get_mut(&first) {
+        Some(toml_edit::Item::Table(c)) if c.is_implicit() => {
+            prepend_to_first_header(c, prefix);
+            return;
+        }
+        Some(toml_edit::Item::Table(c)) => c,
+        Some(toml_edit::Item::ArrayOfTables(a)) => match a.get_mut(0) {
+            Some(c) => c,
+            None => return,
+        },
+        _ => return,
+    };
+    let existing = target
+        .decor()
+        .prefix()
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    target.decor_mut().set_prefix(format!("{prefix}{existing}"));
+}
+
+/// A dotted line (`env.A = "b"`) renders the prefix of its first leaf key,
+/// never its table's own decor, so a comment moved onto it goes there.
+fn prepend_to_first_leaf(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t.iter().next().map(|(k, _)| k.to_string()) else {
+        return;
+    };
+    if let Some(inner) = t
+        .get_mut(&first)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|inner| inner.is_dotted())
+    {
+        prepend_to_first_leaf(inner, prefix);
+        return;
+    }
+    if let Some(mut km) = t.key_mut(&first) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+fn remove_subkey_keeping_comments(doc: &mut toml_edit::DocumentMut, table_key: &str, subkey: &str) {
+    let (lead, inline_close) = {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let Some((k, item)) = t.get_key_value(subkey) else {
+            return;
+        };
+        let inline = doc
+            .get(table_key)
+            .is_some_and(toml_edit::Item::is_inline_table);
+        let comment_bearing = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .is_some_and(|s| s.contains('#'))
+            || item
+                .as_value()
+                .and_then(|v| v.decor().suffix())
+                .and_then(|r| r.as_str())
+                .is_some_and(|s| s.contains('#'));
+        if inline && !comment_bearing {
+            // An inline table key keeps its own separator, so a removed key's
+            // whitespace prefix has nowhere to go. The whitespace that closed
+            // the table dies with its last key, so that one moves to the
+            // table's trailing instead of another key. A key whose own prefix
+            // or value suffix holds a comment is not this case: it takes the
+            // carry path below, which moves that comment onto the next key, or
+            // past the table from the last one.
+            let last = t.iter().last().is_some_and(|(last, _)| last == subkey);
+            let close = if last {
+                item.as_value()
+                    .and_then(|v| v.decor().suffix())
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            (String::new(), Some(close))
+        } else {
+            let mut lead = k
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            lead.push_str(&same_line_comment(item));
+            (lead, None)
+        }
+    };
+    // The next subkey is the block-table carry target only; the inline path
+    // returns through its own close handling. Computed before the removal so
+    // the removed key still holds its place in the table.
+    let next_sub = if inline_close.is_none() {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let keys: Vec<String> = t.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == subkey)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    } else {
+        None
+    };
+    {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        t.remove(subkey);
+    }
+    if let Some(close) = inline_close {
+        if !close.is_empty()
+            && let Some(t) = doc
+                .get_mut(table_key)
+                .and_then(toml_edit::Item::as_inline_table_mut)
+            && !t.trailing_comma()
+        {
+            let existing = t.trailing().as_str().unwrap_or("").to_string();
+            t.set_trailing(format!("{close}{existing}"));
+        }
+        return;
+    }
+    if let Some(ns) = next_sub {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        if let Some(inner) = t
+            .get_mut(&ns)
+            .and_then(toml_edit::Item::as_table_mut)
+            .filter(|inner| inner.is_dotted())
+        {
+            prepend_to_first_leaf(inner, &lead);
+        } else if let Some(mut km) = t.key_mut(&ns) {
+            let existing = km
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            km.leaf_decor_mut().set_prefix(format!("{lead}{existing}"));
+        }
+    } else {
+        let root_keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        if let Some(pos) = root_keys.iter().position(|k| k == table_key)
+            && let Some(next_root) = root_keys.get(pos + 1)
+        {
+            prepend_prefix(doc, next_root, &lead);
+        } else {
+            let t = doc.trailing().as_str().unwrap_or("").to_string();
+            doc.set_trailing(format!("{lead}{t}"));
+        }
+    }
+}
+
+fn set_subkey_string_in_table(t: &mut dyn toml_edit::TableLike, key: &str, value: &str) {
+    let v = toml_edit::Value::from(value.to_string());
+    if t.contains_key(key) {
+        set_value_preserving_decor(t, key, v);
+    } else {
+        t.insert(key, toml_edit::Item::Value(v));
+    }
+}
+
+fn set_subkey_string(doc: &mut toml_edit::DocumentMut, table_key: &str, key: &str, value: &str) {
+    let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+        return;
+    };
+    set_subkey_string_in_table(t, key, value);
+}
+
+fn set_scalar(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    if doc.contains_key(key) {
+        set_value_preserving_decor(doc.as_table_mut(), key, value);
+        return;
+    }
+    let example = scalar_example(key);
+    replace_example_with_value(doc, key, value, &example);
+}
+
+fn unset_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if !doc.contains_key(key) {
+        return;
+    }
+    let example = scalar_example(key);
+    remove_key_keeping_comments(doc, key, &known_doc_blocks(key), &example);
+}
+
+fn set_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    if doc.contains_key(key) {
+        if let Some(t) = doc.get_mut(key).and_then(|i| i.as_table_like_mut()) {
+            build(t);
+        }
+    } else if find_example(doc, example, &known_doc_blocks(key)) {
+        replace_example_with_table(doc, key, example, build);
+    } else {
+        append_root_table(doc, key, build);
+    }
+}
+
+/// Remove every modelled subkey through the keep-the-comments removal, then
+/// drop the table only once it holds no key at all (an unknown subkey keeps
+/// it). The header's trailing comment and every comment inside stay, as lines,
+/// where the table was.
+fn unset_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    subkeys: &[&str],
+    doc_blocks: &[String],
+    example: &str,
+) {
+    for subkey in subkeys {
+        remove_subkey_keeping_comments(doc, key, subkey);
+    }
+    if doc
+        .get(key)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(toml_edit::TableLike::is_empty)
+    {
+        remove_key_keeping_comments(doc, key, doc_blocks, example);
+    }
+}
+
+fn preferred_days_value(days: &[String]) -> toml_edit::Value {
+    let mut arr = toml_edit::Array::new();
+    for d in days {
+        arr.push(d.clone());
+    }
+    toml_edit::Value::from(arr)
+}
+
+const MODELS_FIELDS: [&str; 7] = [
+    "default", "opus", "sonnet", "haiku", "fable", "subagent", "advisor",
+];
+
+fn models_fields(m: &ModelSettings) -> [(&'static str, Option<&String>); 7] {
+    MODELS_FIELDS.map(|k| (k, m.field(k)))
+}
+
+fn build_models_table(t: &mut dyn toml_edit::TableLike, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        if let Some(v) = v {
+            set_subkey_string_in_table(t, k, v);
+        }
+    }
+}
+
+fn edit_models_existing(doc: &mut toml_edit::DocumentMut, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        match v {
+            Some(v) => set_subkey_string(doc, "models", k, v),
+            None => remove_subkey_keeping_comments(doc, "models", k),
+        }
+    }
+}
+
+fn edit_string_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: &Option<String>,
+    ca: &Option<String>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v.clone())),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_f64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<f64>, ca: Option<f64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_u64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<u64>, ca: Option<u64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        // TOML integers are i64; the load clamps the interval into
+        // MIN..=MAX_USAGE_PROBE_INTERVAL_MS, so the cast is lossless.
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v as i64)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_bool_scalar(doc: &mut toml_edit::DocumentMut, od: bool, ca: bool, key: &str) {
+    if od == ca {
+        return;
+    }
+    if ca {
+        set_scalar(doc, key, toml_edit::Value::from(true));
+    } else {
+        unset_scalar(doc, key);
+    }
+}
+
+fn edit_opt_bool_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<bool>,
+    ca: Option<bool>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(_) => set_scalar(doc, key, toml_edit::Value::from(false)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+const CONSOLE_FIELDS: [&str; 3] = ["token", "site", "region"];
+
+fn edit_console(doc: &mut toml_edit::DocumentMut, od: &ConsoleConfig, ca: &ConsoleConfig) {
+    if od == ca {
+        return;
+    }
+    if ca.token.is_some() || ca.site.is_some() || ca.region.is_some() {
+        if doc.contains_key("console") {
+            for (k, v) in [
+                ("token", ca.token.as_deref()),
+                ("site", ca.site.as_deref()),
+                ("region", ca.region.as_deref()),
+            ] {
+                if let Some(v) = v {
+                    set_subkey_string(doc, "console", k, v);
+                }
+            }
+        } else {
+            set_table(doc, "console", CONSOLE_EXAMPLE, |t| {
+                for (k, v) in [
+                    ("token", ca.token.as_deref()),
+                    ("site", ca.site.as_deref()),
+                    ("region", ca.region.as_deref()),
+                ] {
+                    if let Some(v) = v {
+                        set_subkey_string_in_table(t, k, v);
+                    }
+                }
+            });
+        }
+    } else {
+        unset_table(
+            doc,
+            "console",
+            &CONSOLE_FIELDS,
+            &known_doc_blocks("console"),
+            CONSOLE_EXAMPLE,
+        );
+    }
+}
+
+fn edit_models(doc: &mut toml_edit::DocumentMut, od: &ModelSettings, ca: &ModelSettings) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        unset_table(
+            doc,
+            "models",
+            &MODELS_FIELDS,
+            &known_doc_blocks("models"),
+            MODELS_EXAMPLE,
+        );
+    } else if doc.contains_key("models") {
+        edit_models_existing(doc, ca);
+    } else {
+        set_table(doc, "models", MODELS_EXAMPLE, |t| build_models_table(t, ca));
+    }
+}
+
+fn edit_env(
+    doc: &mut toml_edit::DocumentMut,
+    od: &BTreeMap<String, String>,
+    ca: &BTreeMap<String, String>,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        let keys: Vec<&str> = od.keys().map(String::as_str).collect();
+        unset_table(doc, "env", &keys, &known_doc_blocks("env"), ENV_EXAMPLE);
+    } else if doc.contains_key("env") {
+        for k in od.keys() {
+            if !ca.contains_key(k) {
+                remove_subkey_keeping_comments(doc, "env", k);
+            }
+        }
+        for (k, v) in ca {
+            set_subkey_string(doc, "env", k, v);
+        }
+    } else {
+        set_table(doc, "env", ENV_EXAMPLE, |t| {
+            for (k, v) in ca {
+                set_subkey_string_in_table(t, k, v);
+            }
+        });
+    }
+}
+
+/// The on-disk config typed whole: `Ok` when the file parses into
+/// [`ProfileConfig`], `Err` when it holds a modelled key clauth cannot read
+/// (a wrong type, or the `kick_timer` alias beside `auto_start`, which serde
+/// counts as one field). An `Err` file still reaches the shape check, which
+/// then refuses on the first unreadable key and never runs the
+/// non-plain/`edited` comparison over a defaulted view; one the shape check
+/// cannot attribute to a key refuses with the load's own parse error.
+fn on_disk_profile_config(raw: &str) -> Result<ProfileConfig, toml::de::Error> {
+    toml::from_str::<ProfileConfig>(raw)
+}
+
+/// What a modelled key's on-disk shape means for the save writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyShape {
+    /// Plain: the writer edits it in place (a one-line scalar of the right
+    /// type, or a block table whose modelled subkeys are one-line strings).
+    Plain,
+    /// Readable but not plain: an inline table, a dotted or implicit table, a
+    /// multi-line string, or a multi-line array. The save refuses only when it
+    /// would edit this key.
+    NonPlain,
+    /// Clauth cannot read the key into its field type (the wrong kind or
+    /// type). The save refuses whenever this key sits in the file.
+    Unreadable,
+}
+
+/// The scalar type a modelled scalar field reads from TOML.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    Str,
+    F64,
+    U64,
+    Bool,
+    OptBool,
+    StrArray,
+}
+
+/// The modelled scalar a top-level key names, with its read type; the
+/// `kick_timer` alias reads as the bool `auto_start` does.
+fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
+    Some(match key {
+        "base_url" => (ScalarKind::Str, "base_url"),
+        "api_key" => (ScalarKind::Str, "api_key"),
+        "effort" => (ScalarKind::Str, "effort"),
+        "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
+        "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
+        "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
+        "bell_threshold" => (ScalarKind::F64, "bell_threshold"),
+        "auto_start" => (ScalarKind::Bool, "auto_start"),
+        "usage_probe" => (ScalarKind::Bool, "usage_probe"),
+        "usage_probe_interval_ms" => (ScalarKind::U64, "usage_probe_interval_ms"),
+        "kick_timer" => (ScalarKind::Bool, "kick_timer"),
+        "last_resort" => (ScalarKind::Bool, "last_resort"),
+        "preferred" => (ScalarKind::Bool, "preferred"),
+        "rolling_token" => (ScalarKind::Bool, "rolling_token"),
+        "disabled" => (ScalarKind::Bool, "disabled"),
+        "check_weekly" => (ScalarKind::OptBool, "check_weekly"),
+        "check_scoped" => (ScalarKind::OptBool, "check_scoped"),
+        "check_credit_cap" => (ScalarKind::OptBool, "check_credit_cap"),
+        "preferred_days" => (ScalarKind::StrArray, "preferred_days"),
+        _ => return None,
+    })
+}
+
+/// Whether a string value is written in a multi-line `"""` or `'''` form. The
+/// decoded content is the same as a one-line string, so the form is read off
+/// the value's rendered representation, minus the whitespace the key/value
+/// separator leaves on its prefix.
+fn is_multiline_string(v: &toml_edit::Value) -> bool {
+    if !v.is_str() {
+        return false;
+    }
+    let repr = v.to_string();
+    let repr = repr.trim_start();
+    repr.starts_with("\"\"\"") || repr.starts_with("'''")
+}
+
+fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a table or array-of-tables where a value belongs
+    };
+    match kind {
+        ScalarKind::Str => {
+            if v.is_str() {
+                if is_multiline_string(v) {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::F64 => {
+            if v.is_integer() || v.is_float() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::U64 => {
+            if v.as_integer().is_some_and(|i| i >= 0) {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::Bool | ScalarKind::OptBool => {
+            if v.is_bool() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::StrArray => {
+            if v.as_array().is_some_and(|a| a.iter().all(|e| e.is_str())) {
+                // The form is read off the value's own representation, the way
+                // `is_multiline_string` reads a string's form: an array written
+                // across several lines is not a one-line value.
+                if v.to_string().contains('\n') {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+    }
+}
+
+/// The shape of a table's relevant subkeys: every relevant subkey must be a
+/// one-line string for the table to count as plain.
+fn table_shape(item: &toml_edit::Item, subkeys: &[&str], all: bool) -> KeyShape {
+    let Some(t) = item.as_table_like() else {
+        return KeyShape::Unreadable; // a value (or none) where a table belongs
+    };
+    let mut shape = KeyShape::Plain;
+    for (k, sub) in t.iter() {
+        if !all && !subkeys.contains(&k) {
+            continue;
+        }
+        match subkey_shape(sub) {
+            KeyShape::Unreadable => return KeyShape::Unreadable,
+            KeyShape::NonPlain => shape = KeyShape::NonPlain,
+            KeyShape::Plain => {}
+        }
+    }
+    shape
+}
+
+fn subkey_shape(item: &toml_edit::Item) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a nested table or array where a value belongs
+    };
+    if v.is_str() {
+        if is_multiline_string(v) {
+            KeyShape::NonPlain
+        } else {
+            KeyShape::Plain
+        }
+    } else {
+        KeyShape::Unreadable
+    }
+}
+
+/// The shape of a modelled top-level key, with its static name, or `None` for
+/// a key clauth does not model.
+fn key_shape(key: &str, item: &toml_edit::Item) -> Option<(KeyShape, &'static str)> {
+    if let Some((kind, name)) = modelled_scalar(key) {
+        return Some((scalar_shape(item, kind), name));
+    }
+    let (subkeys, all, name) = match key {
+        "console" => (CONSOLE_FIELDS.as_slice(), false, "console"),
+        "models" => (MODELS_FIELDS.as_slice(), false, "models"),
+        "env" => (&[][..], true, "env"), // every env subkey is a modelled variable
+        _ => return None,
+    };
+    let inner = table_shape(item, subkeys, all);
+    let shape = if item.is_inline_table() || item.as_table().is_some_and(|t| t.is_implicit()) {
+        // An inline table or a table with no `[table]` header (a dotted key, or
+        // the parent of a nested table) stays non-plain however plain its
+        // subkeys are.
+        match inner {
+            KeyShape::Unreadable => KeyShape::Unreadable,
+            _ => KeyShape::NonPlain,
+        }
+    } else {
+        inner
+    };
+    Some((shape, name))
+}
+
+/// Whether the save would edit `key`: the same comparison the edit step uses
+/// to decide, listed once per modelled field so the refusal mirrors the writer.
+fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool {
+    match key {
+        "base_url" => on_disk.base_url != canonical.base_url,
+        "api_key" => on_disk.api_key != canonical.api_key,
+        "auto_start" => on_disk.auto_start != canonical.auto_start,
+        "usage_probe" => on_disk.usage_probe != canonical.usage_probe,
+        "usage_probe_interval_ms" => {
+            on_disk.usage_probe_interval_ms != canonical.usage_probe_interval_ms
+        }
+        "fallback_threshold" => on_disk.fallback_threshold != canonical.fallback_threshold,
+        "weekly_threshold" => on_disk.weekly_threshold != canonical.weekly_threshold,
+        "last_resort" => on_disk.last_resort != canonical.last_resort,
+        "preferred" => on_disk.preferred != canonical.preferred,
+        "preferred_days" => on_disk.preferred_days != canonical.preferred_days,
+        "rolling_token" => on_disk.rolling_token != canonical.rolling_token,
+        "max_auto_spend" => on_disk.max_auto_spend != canonical.max_auto_spend,
+        "check_weekly" => on_disk.check_weekly != canonical.check_weekly,
+        "check_scoped" => on_disk.check_scoped != canonical.check_scoped,
+        "check_credit_cap" => on_disk.check_credit_cap != canonical.check_credit_cap,
+        "bell_threshold" => on_disk.bell_threshold != canonical.bell_threshold,
+        "disabled" => on_disk.disabled != canonical.disabled,
+        "effort" => on_disk.effort != canonical.effort,
+        "console" => on_disk.console != canonical.console,
+        "models" => on_disk.models != canonical.models,
+        "env" => on_disk.env != canonical.env,
+        _ => false,
+    }
+}
+
+/// The first modelled key, in file order, whose on-disk shape the save cannot
+/// leave as written: an unreadable key, or a readable-but-non-plain key the
+/// save would edit. When the typed parse failed (`on_disk` is `None`), only the
+/// unreadable arm and the `kick_timer` pair run — the non-plain/`edited` test
+/// never compares a defaulted view. `None` when every edit is over a plain shape.
+fn non_plain_edit(
+    doc: &toml_edit::DocumentMut,
+    on_disk: Option<&ProfileConfig>,
+    canonical: &ProfileConfig,
+) -> Option<&'static str> {
+    for (key, item) in doc.iter() {
+        if key == "kick_timer"
+            && doc.get("auto_start").is_some_and(|it| {
+                key_shape("auto_start", it).is_some_and(|(s, _)| s != KeyShape::Unreadable)
+            })
+        {
+            // The pre-rename alias beside a readable `auto_start`: serde counts
+            // the alias and the field as one `auto_start`, so a file holding both
+            // cannot parse. A mistyped `auto_start` is named on its own, in file
+            // order, since removing the alias alone would not fix the file.
+            return Some("kick_timer");
+        }
+        let Some((shape, name)) = key_shape(key, item) else {
+            continue;
+        };
+        match shape {
+            KeyShape::Unreadable => return Some(name),
+            KeyShape::NonPlain => {
+                if let Some(on_disk) = on_disk
+                    && edited(key, on_disk, canonical)
+                {
+                    return Some(name);
+                }
+            }
+            KeyShape::Plain => {}
+        }
+    }
+    None
+}
+
+/// The one per-key edit list both writes share, so a key added here reaches the
+/// save and the load alike. The mode picks the arms that differ: the load
+/// comments out a threshold it ignores and keeps a typo'd weekday's line.
+fn apply_config_edits(
+    doc: &mut toml_edit::DocumentMut,
+    on_disk: &ProfileConfig,
+    canonical: &ProfileConfig,
+    mode: ConfigEditMode,
+) {
+    let od = on_disk;
+    edit_string_scalar(doc, &od.base_url, &canonical.base_url, "base_url");
+    edit_string_scalar(doc, &od.api_key, &canonical.api_key, "api_key");
+    edit_console(doc, &od.console, &canonical.console);
+    if od.auto_start != canonical.auto_start {
+        if doc.contains_key("kick_timer") {
+            remove_key_keeping_comments(doc, "kick_timer", &[], "");
+        }
+        if canonical.auto_start {
+            set_scalar(doc, "auto_start", toml_edit::Value::from(true));
+        } else {
+            unset_scalar(doc, "auto_start");
+        }
+    }
+    edit_bool_scalar(doc, od.usage_probe, canonical.usage_probe, "usage_probe");
+    edit_u64_scalar(
+        doc,
+        od.usage_probe_interval_ms,
+        canonical.usage_probe_interval_ms,
+        "usage_probe_interval_ms",
+    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_f64_scalar(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_threshold_load(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+    }
+    edit_bool_scalar(doc, od.last_resort, canonical.last_resort, "last_resort");
+    edit_bool_scalar(doc, od.preferred, canonical.preferred, "preferred");
+    match mode {
+        ConfigEditMode::Save => {
+            if od.preferred_days != canonical.preferred_days {
+                if canonical.preferred_days.is_empty() {
+                    unset_scalar(doc, "preferred_days");
+                } else {
+                    set_scalar(
+                        doc,
+                        "preferred_days",
+                        preferred_days_value(&canonical.preferred_days),
+                    );
+                }
+            }
+        }
+        ConfigEditMode::Load => {
+            edit_preferred_days_load(doc, &od.preferred_days, &canonical.preferred_days);
+        }
+    }
+    edit_bool_scalar(
+        doc,
+        od.rolling_token,
+        canonical.rolling_token,
+        "rolling_token",
+    );
+    edit_f64_scalar(
+        doc,
+        od.max_auto_spend,
+        canonical.max_auto_spend,
+        "max_auto_spend",
+    );
+    edit_opt_bool_scalar(doc, od.check_weekly, canonical.check_weekly, "check_weekly");
+    edit_opt_bool_scalar(doc, od.check_scoped, canonical.check_scoped, "check_scoped");
+    edit_opt_bool_scalar(
+        doc,
+        od.check_credit_cap,
+        canonical.check_credit_cap,
+        "check_credit_cap",
+    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+    }
+    edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
+    edit_string_scalar(doc, &od.effort, &canonical.effort, "effort");
+    edit_models(doc, &od.models, &canonical.models);
+    edit_env(doc, &od.env, &canonical.env);
+}
+
+/// A threshold the load clamps is written clamped; one it ignores outright (a
+/// non-finite value, or a `weekly_threshold` outside 50..=100) is commented out
+/// in place.
+fn edit_threshold_load(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<f64>,
+    ca: Option<f64>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_none() {
+        comment_out_scalar(doc, key);
+    } else {
+        edit_f64_scalar(doc, od, ca, key);
+    }
+}
+
+/// A typo'd weekday keeps the whole typed line commented above the fixed list;
+/// any other drift (a case or duplicate spelling) is written in place.
+fn edit_preferred_days_load(doc: &mut toml_edit::DocumentMut, od: &[String], ca: &[String]) {
+    if od == ca {
+        return;
+    }
+    if has_typoed_weekday(od) {
+        if ca.is_empty() {
+            comment_out_scalar(doc, "preferred_days");
+        } else {
+            comment_out_and_set_preferred_days(doc, preferred_days_value(ca));
+        }
+    } else if ca.is_empty() {
+        unset_scalar(doc, "preferred_days");
+    } else {
+        set_scalar(doc, "preferred_days", preferred_days_value(ca));
+    }
+}
+
+/// Whether an entry of the on-disk weekday list does not parse: the load drops
+/// it, so the line is commented out rather than rewritten in place.
+fn has_typoed_weekday(raw: &[String]) -> bool {
+    raw.iter().any(|e| e.trim().parse::<Weekday>().is_err())
+}
+
+/// Comment a modelled scalar out in place: the key's own line becomes `# ` plus
+/// the line's text (key, separator, value, trailing comment), its leading
+/// comments stay, and the key is removed so the file stops claiming the value.
+fn comment_out_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    let Some((kept, next)) = take_comment_out_line(doc, key) else {
+        return;
+    };
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+/// Remove `key`, returning the text that replaces it in place — its leading
+/// comments (the doc block) followed by its own line commented out — plus the
+/// next root key, if any, the caller places the text before.
+fn take_comment_out_line(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+) -> Option<(String, Option<String>)> {
+    let (lead, comment, next) = {
+        let table = doc.as_table();
+        let (k, item) = table.get_key_value(key)?;
+        let v = item.as_value()?;
+        let lead = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        // The key's own line text: the key name, its separator suffix, the `=`,
+        // then the value's own rendered text. `Value`'s `Display` already
+        // carries its decor (the separator space and any trailing comment), so
+        // what was typed stays visible byte for byte.
+        let key_suffix = k
+            .leaf_decor()
+            .suffix()
+            .and_then(|r| r.as_str())
+            .unwrap_or(" ");
+        let comment = format!("# {}{}={}", k, key_suffix, v);
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        let next = keys
+            .iter()
+            .position(|x| x == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned();
+        (lead, comment, next)
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    kept.push_str(&comment);
+    kept.push('\n');
+    Some((kept, next))
+}
+
+/// A typo'd `preferred_days` with some valid entries: the typed line stays as a
+/// comment above the fixed list, which becomes the key where the typed line was.
+fn comment_out_and_set_preferred_days(doc: &mut toml_edit::DocumentMut, value: toml_edit::Value) {
+    let Some((kept, next)) = take_comment_out_line(doc, "preferred_days") else {
+        return;
+    };
+    match next {
+        Some(next_key) => {
+            insert_root_value_before(doc, &next_key, "preferred_days", value, Some(kept));
+        }
+        None => insert_root_value(doc, "preferred_days", value, Some(kept)),
+    }
 }
 
 #[cfg(test)]

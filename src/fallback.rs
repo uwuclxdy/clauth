@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::actions::{switch_off_locked, switch_profile_locked};
+use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
@@ -642,7 +642,8 @@ pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
 /// The one fix line for a member clauth cannot measure ([`no_usage_source`]),
 /// naming both ways to a reading while sessions keep running on the session
 /// token: the login that gives `/usage` a pair to poll, or the usage probe,
-/// which reads the account off that token itself and may start its 5h window.
+/// which reads the account off that token itself and may start its 5h window
+/// on a plan that has one.
 /// Shared by the member card, the daemon boot line, the add confirm and the
 /// line after `clauth login <name> --setup-token`, the way
 /// [`uncapped_spend_fix`] is, so none of them can drift; `names` carries every
@@ -716,16 +717,16 @@ pub(crate) enum ActiveBurnRate {
     Supplied(Option<f64>),
 }
 
-/// Burn-aware exhaustion test shared by [`is_exhausted_active_from_usage`] and
-/// [`is_exhausted_projected`] (issue #8 follow-up b, opt-in — off by
-/// default). The static `util_pct >= threshold` check always applies, so
-/// enabling burn-aware can only ever move the switch EARLIER than mode-off,
-/// never later. `None` burn (no history yet, a fresh profile, or a provider
-/// with none) leaves only that static check — never uncovers an account for
-/// lack of data. With a rate, the projection ADDS an earlier trip inside the
-/// `floor_pct.min(threshold)..threshold` band: a heavier burn crosses the 100%
-/// cap before the next poll and switches sooner, a light one runs on since it
-/// won't blow the cap in time. (Above `threshold` the static check has already
+/// Burn-aware exhaustion test behind [`is_exhausted_active_from_usage`]
+/// (opt-in — off by default). The static
+/// `util_pct >= threshold` check always applies, so enabling burn-aware can
+/// only ever move the switch EARLIER than mode-off, never later. `None` burn
+/// (no history yet, a fresh profile, or a provider with none) leaves only that
+/// static check — never uncovers an account for lack of data. With a rate, the
+/// projection ADDS an earlier trip inside the
+/// `floor_pct.min(threshold)..threshold` band: a heavier burn reaches the 100%
+/// cap within the look-ahead and switches sooner, a light one runs on since it
+/// won't reach the cap in time. (Above `threshold` the static check has already
 /// fired, so the band's upper bound is `threshold`; a `floor_pct` set above
 /// `threshold` — the stock default 98 over 95 — just clamps to `threshold` and
 /// burn-aware reduces to static.)
@@ -1220,9 +1221,9 @@ pub(crate) struct ChainSnapshot {
     /// revoked/invalid (AUTH-1). Excluded from every walk pass so a dead token
     /// is never installed unattended.
     pub(crate) broken: Vec<ProfileName>,
-    /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
-    /// gates whether the ACTIVE-side check in `next_auto_switch_target`
-    /// projects ahead of the next poll instead of using the static threshold.
+    /// Snapshot of `AppState::burn_aware_switching` — gates whether the
+    /// ACTIVE-side check in `next_auto_switch_target` also projects ahead,
+    /// beside the static threshold, which still applies.
     pub(crate) burn_aware: bool,
     /// Snapshot of `AppState::walk_order()` (issue #86) — which member each
     /// accept pass lands on. `Chain` is the default and today's walk byte for
@@ -1352,64 +1353,25 @@ pub(crate) fn snapshot_chain(
 }
 
 /// [`snapshot_chain`]'s codex twin, built from `codex-profiles.toml` instead of
-/// `AppConfig`. Chains are strictly per-harness (decision 4), so this reads the
-/// codex active slot, the codex chain, and the codex wrap-off — and nothing
-/// from the claude state.
-///
-/// Every member takes the DEFAULTS a claude member would inherit from a missing
-/// `Profile` record, because a codex profile has none: `profiles.toml` is
-/// untouched by the file split, so `config.find` cannot answer for these names
-/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
-/// thresholds) simply do not exist on this harness yet.
-///
-/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
-/// per the delivery spec: per-model weekly windows and the usage-credit cap
-/// verdict are claude concepts (`"7d fable"` and friends come from the
-/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
-/// and `wham/usage` has no equivalent. An armed gate would judge codex members
-/// against windows or a cap that can never appear.
-///
-/// `broken` and `kick_rejected` are filled HERE, where the claude builder
-/// leaves the second to the scheduler's scan: the codex verdicts live beside
-/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
-/// scheduler store, so this is the one place that can read them.
+/// `AppConfig`. Chains are strictly per-harness: this reads the codex active
+/// slot, the codex chain, and the codex wrap-off — and nothing from the claude
+/// state. Members and dead verdicts come from [`codex_chain_members`].
 pub(crate) fn snapshot_codex_chain(
     state: &crate::codex_profiles::CodexState,
     interval_ms: u64,
 ) -> Option<ChainSnapshot> {
     let active = state.active_profile()?.clone();
-    let chain: Vec<ProfileName> = state.fallback_chain().to_vec();
-    if !chain.iter().any(|n| n == &active) {
+    if !state.fallback_chain().iter().any(|n| n == &active) {
         return None;
     }
-    let weekly_pct = state.weekly_switch_threshold_pct();
-    let broken = chain
-        .iter()
-        .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
-        .cloned()
-        .collect();
-    let kick_rejected = chain
-        .iter()
-        .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
-        .cloned()
-        .collect();
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
     Some(ChainSnapshot {
         active,
-        chain: chain
-            .into_iter()
-            .map(|name| ChainMember {
-                name,
-                threshold: DEFAULT_THRESHOLD,
-                last_resort: false,
-                preferred: false,
-                max_spend: 0.0,
-                weekly_line: weekly_pct,
-                scoped_line: weekly_pct,
-                check_scoped: false,
-                check_credit_cap: false,
-                own_inference: false,
-            })
-            .collect(),
+        chain: members,
         switch_off_when_spent: state.switch_off_when_spent(),
         broken,
         burn_aware: false,
@@ -1430,6 +1392,88 @@ pub(crate) fn snapshot_codex_chain(
         credit_refused: Vec::new(),
         credit_skip: Vec::new(),
     })
+}
+
+/// The codex chain's switch-off recovery: with the codex active slot clear,
+/// the member [`find_recovered_member`] re-arms, walked in chain order like
+/// [`snapshot_codex_chain`]. A member is a candidate only while its status
+/// entry is `Fresh`: a codex poll in this process fetched it, or a re-seed
+/// restored a usage-cache reading younger than one refresh interval
+/// ([`crate::usage::scheduler::seed_codex_name`]), and a later failed poll
+/// does not clear it, so the gate vouches for a past success, not the latest
+/// poll. A quarantined member is dropped here because
+/// [`find_recovered_member`] reads no dead verdict of its own.
+pub(crate) fn find_recovered_codex_member(
+    state: &crate::codex_profiles::CodexState,
+    usage: &HashMap<String, UsageInfo>,
+    fresh: &[ProfileName],
+) -> Option<String> {
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
+    let candidates: Vec<ChainMember> = members
+        .into_iter()
+        .filter(|m| fresh.contains(&m.name) && !broken.contains(&m.name))
+        .collect();
+    find_recovered_member(&candidates, usage, &kick_rejected, WalkOrder::Chain)
+}
+
+/// The codex chain's members plus the two dead verdicts the walks read.
+struct CodexChain {
+    members: Vec<ChainMember>,
+    broken: Vec<ProfileName>,
+    kick_rejected: Vec<ProfileName>,
+}
+
+/// Every member takes the DEFAULTS a claude member would inherit from a missing
+/// `Profile` record, because a codex profile has none: `profiles.toml` is
+/// untouched by the file split, so `config.find` cannot answer for these names
+/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
+/// thresholds) simply do not exist on this harness yet.
+///
+/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
+/// per the delivery spec: per-model weekly windows and the usage-credit cap
+/// verdict are claude concepts (`"7d fable"` and friends come from the
+/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
+/// and `wham/usage` has no equivalent. An armed gate would judge codex members
+/// against windows or a cap that can never appear.
+///
+/// `broken` and `kick_rejected` are filled HERE, where the claude builder
+/// leaves the second to the scheduler's scan: the codex verdicts live beside
+/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
+/// scheduler store, so this is the one place that can read them.
+fn codex_chain_members(state: &crate::codex_profiles::CodexState) -> CodexChain {
+    let chain = state.fallback_chain();
+    let weekly_pct = state.weekly_switch_threshold_pct();
+    CodexChain {
+        broken: chain
+            .iter()
+            .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
+            .cloned()
+            .collect(),
+        kick_rejected: chain
+            .iter()
+            .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
+            .cloned()
+            .collect(),
+        members: chain
+            .iter()
+            .map(|name| ChainMember {
+                name: name.clone(),
+                threshold: DEFAULT_THRESHOLD,
+                last_resort: false,
+                preferred: false,
+                max_spend: 0.0,
+                weekly_line: weekly_pct,
+                scoped_line: weekly_pct,
+                check_scoped: false,
+                check_credit_cap: false,
+                own_inference: false,
+            })
+            .collect(),
+    }
 }
 
 /// [`snapshot_chain`] anchored on an explicit member instead of the global
@@ -1790,7 +1834,7 @@ fn is_exhausted_active_from_usage(
         // A third-party member's provider window has no burn history to pair
         // (no third-party leg appends `usage_history.jsonl`), so the static
         // threshold decides — never a cross-pool projection of the OAuth leg's
-        // burn onto the provider window (maintainer ruling 2026-09-10).
+        // burn onto the provider window.
         return window.utilization >= member.threshold;
     }
     let rate = match rate {
@@ -2123,12 +2167,12 @@ pub(crate) struct StartCandidate {
 
 /// The `--auto` walk: every resolvable fallback-chain member in walk order,
 /// each judged by [`start_block`] with the models THAT member's session will
-/// run (its own runtime overlay plus the process-env pair passed in and the
+/// run (its own runtime overlay plus the process-env triple passed in and the
 /// passthrough args — see [`crate::start::member_launch_demand`]), plus the
 /// index of the first clear member (freshness PREFERRED in pass one, any
 /// freshness accepted in pass two — the same preference the switch walk gives
 /// its target in [`next_auto_switch_target`]). `env_models` is the process-env
-/// model pair, read once by `cmd_start`, so this walk never reads the process
+/// launch triple, read once by `cmd_start`, so this walk never reads the process
 /// environment itself. Each pass follows the `walk_order` mode: chain position
 /// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
 /// the least-used week under `most-weekly-headroom`.
@@ -2136,7 +2180,7 @@ pub(crate) fn start_walk(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
     claude_args: &[String],
-    env_models: [Option<String>; 2],
+    env_models: [Option<String>; 3],
     needs_oauth: bool,
     cwd: Option<&Path>,
 ) -> (Vec<StartCandidate>, Option<usize>) {
@@ -2426,21 +2470,21 @@ pub(crate) type StartPick = (ProfileName, Vec<StartCandidate>, Option<usize>, Ve
 /// the picked member's name and the demand its pick/launch line prints. Held
 /// as a function — not inline in `cmd_start` — so the arm's `rows[pick]`
 /// choice is pinned at its real call site (see `tests/inline/fallback.rs`),
-/// not a hand-built-rows stand-in. `env_models` is the process-env model pair,
+/// not a hand-built-rows stand-in. `env_models` is the process-env launch triple,
 /// read once by `cmd_start`, so this never reads the process environment
 /// itself.
 pub(crate) fn start_pick(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
     claude_args: &[String],
-    env_models: [Option<String>; 2],
+    env_models: [Option<String>; 3],
     follows_chain: bool,
     cwd: Option<&Path>,
 ) -> Result<StartPick> {
     anyhow::ensure!(
         !config.state.fallback_chain.is_empty(),
         "--auto picks from the fallback chain and it is empty; add accounts on the \
-         fallback tab, or name one"
+         fallback tab of the `clauth` TUI, or name one"
     );
     // A chain whose every name has left the profile list judges nothing, so the
     // headroom refusal below would blame usage for a chain the user has to
@@ -3609,7 +3653,17 @@ pub(crate) fn auto_switch_if_needed(
                 // lock of its own.
                 match crate::profile::stored_login(&ProfileName::from(target.clone())) {
                     crate::profile::StoredLogin::HoldsLogin => {
-                        switch_profile_locked(config, &ProfileName::from(target.clone()))?
+                        // No AUTH-1 gate runs at the one-shot, and `gated: true`
+                        // only keeps the hold from refusing every switch with a
+                        // `GateNeeded` the caller would swallow. The walk excluded
+                        // the members flagged in this process's config copy
+                        // (`snapshot.broken`); a flag that copy lacks is not
+                        // re-checked in this hold.
+                        switch_profile_locked_gated(
+                            config,
+                            &ProfileName::from(target.clone()),
+                            true,
+                        )?
                     }
                     crate::profile::StoredLogin::HoldsNone
                     | crate::profile::StoredLogin::Unknown => {

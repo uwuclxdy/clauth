@@ -1788,9 +1788,10 @@ fn herdr_value(herdr: &crate::profile::HerdrSettings, key: &str) -> Result<Strin
         "border_label" => Ok(on_off(herdr.border_label).to_string()),
         "delegate_dot" => Ok(on_off(herdr.delegate_dot).to_string()),
         "delegate_row_text" => Ok(on_off(herdr.delegate_row_text).to_string()),
+        "restore_notice" => Ok(on_off(herdr.restore_notice).to_string()),
         _ => Err(crate::UsageError(format!(
             "unknown herdr config key '{key}'; valid keys: popup_width, pane_tag, \
-             tag_watch_secs, border_label, delegate_dot, delegate_row_text"
+             tag_watch_secs, border_label, delegate_dot, delegate_row_text, restore_notice"
         ))
         .into()),
     }

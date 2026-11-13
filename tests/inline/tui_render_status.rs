@@ -33,6 +33,7 @@ fn oauth(name: &str) -> Profile {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
         last_resort: false,
@@ -51,6 +52,9 @@ fn oauth(name: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 

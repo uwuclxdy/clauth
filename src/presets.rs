@@ -37,7 +37,7 @@ pub(crate) enum Leftover {
 fn block_rows<'a>(
     base_url: Option<&'a str>,
     m: &'a ModelSettings,
-) -> [(&'static str, Option<&'a str>); 7] {
+) -> [(&'static str, Option<&'a str>); 8] {
     [
         ("base url", base_url),
         ("model", m.default.as_deref()),
@@ -46,6 +46,7 @@ fn block_rows<'a>(
         ("sonnet", m.sonnet.as_deref()),
         ("haiku", m.haiku.as_deref()),
         ("subagent", m.subagent.as_deref()),
+        ("advisor", m.advisor.as_deref()),
     ]
 }
 
@@ -79,21 +80,56 @@ impl Preset {
         models: &ModelSettings,
         leftover: Leftover,
     ) -> (Option<String>, ModelSettings) {
-        let pick = |mine: &Option<String>, theirs: &Option<String>| match (mine, leftover) {
-            (Some(_), _) => mine.clone(),
-            (None, Leftover::Keep) => theirs.clone(),
-            (None, Leftover::Clear) => None,
+        self.applied_where(base_url, models, |_| leftover == Leftover::Clear)
+    }
+
+    /// [`Self::applied_to`] clearing an unset field only where `clear` names
+    /// its row label (an [`Self::apply_diff`] `leaves` list): a field the
+    /// confirm never showed keeps its value.
+    pub(crate) fn applied_clearing(
+        &self,
+        base_url: &Option<String>,
+        models: &ModelSettings,
+        clear: &[&str],
+    ) -> (Option<String>, ModelSettings) {
+        self.applied_where(base_url, models, |label| clear.contains(&label))
+    }
+
+    fn applied_where(
+        &self,
+        base_url: &Option<String>,
+        models: &ModelSettings,
+        clear: impl Fn(&str) -> bool,
+    ) -> (Option<String>, ModelSettings) {
+        // Keyed by `block_rows`' own labels, the ones `apply_diff` hands the
+        // confirm, so a `clear` list always names the row it clears.
+        // Each field is then bound by its label, never by its row's position.
+        let ours = block_rows(self.base_url.as_deref(), &self.models);
+        let theirs = block_rows(base_url.as_deref(), models);
+        let rows: [(&str, Option<String>); 8] = std::array::from_fn(|row| {
+            let ((label, mine), (_, theirs)) = (ours[row], theirs[row]);
+            let value = match mine {
+                Some(mine) => Some(mine.to_string()),
+                None if clear(label) => None,
+                None => theirs.map(str::to_string),
+            };
+            (label, value)
+        });
+        let get = |want: &str| {
+            rows.iter()
+                .find(|(label, _)| *label == want)
+                .and_then(|(_, value)| value.clone())
         };
-        let m = &self.models;
         (
-            pick(&self.base_url, base_url),
+            get("base url"),
             ModelSettings {
-                default: pick(&m.default, &models.default),
-                opus: pick(&m.opus, &models.opus),
-                sonnet: pick(&m.sonnet, &models.sonnet),
-                haiku: pick(&m.haiku, &models.haiku),
-                fable: pick(&m.fable, &models.fable),
-                subagent: pick(&m.subagent, &models.subagent),
+                default: get("model"),
+                opus: get("opus"),
+                sonnet: get("sonnet"),
+                haiku: get("haiku"),
+                fable: get("fable"),
+                subagent: get("subagent"),
+                advisor: get("advisor"),
             },
         )
     }
@@ -124,9 +160,11 @@ struct Builtin {
 /// How a built-in fills the account's model block: one id per Claude tier.
 /// `default` becomes the `opus` alias, so the main model follows the opus bind
 /// and a model release touches tier rows only; `subagent` stays unset, so a
-/// subagent's own tier pick resolves through that tier's bind. A `[1m]` suffix
-/// makes Claude Code size the context window at 1M, so it rides only an id
-/// whose endpoint takes that much.
+/// subagent's own tier pick resolves through that tier's bind; `advisor` stays
+/// unset too, since an advisor is an opt-in second model that no endpoint's
+/// bind should switch on for an account. A `[1m]` suffix makes Claude Code
+/// size the context window at 1M, so it rides only an id whose endpoint takes
+/// that much.
 struct Binds {
     opus: &'static str,
     sonnet: &'static str,
@@ -144,6 +182,7 @@ impl Binds {
             haiku: id(self.haiku),
             fable: id(self.fable),
             subagent: None,
+            advisor: None,
         }
     }
 }
@@ -375,9 +414,11 @@ pub(crate) fn delete_preset(name: &str) -> Result<()> {
 // ── Re-bind offer engine ──────────────────────────────────────────────────────
 
 /// The model rows the offer walks, in render order (`default` is the account's
-/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row).
-pub(crate) const MODEL_ROWS: [&str; 6] =
-    ["default", "opus", "sonnet", "haiku", "fable", "subagent"];
+/// `model` setting; `subagent` the `CLAUDE_CODE_SUBAGENT_MODEL` row; `advisor`
+/// the `advisorModel` setting).
+pub(crate) const MODEL_ROWS: [&str; 7] = [
+    "default", "opus", "sonnet", "haiku", "fable", "subagent", "advisor",
+];
 
 /// The `(unset)` marker for a row with no stored id, on both the old and the
 /// new side.
@@ -409,7 +450,7 @@ pub(crate) struct AccountOffers {
 }
 
 /// Accounts whose change sets are identical share one block: the shared rows
-/// once, then one toggle line per account.
+/// once, then one checkbox row per account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RebindBlock {
     pub(crate) rows: Vec<RowMove>,
@@ -515,6 +556,12 @@ fn digest_of_builtins(builtins: &[Builtin]) -> String {
         hasher.update([0u8]);
         let binds = builtin.binds.models();
         for row in MODEL_ROWS {
+            // A row no built-in binds must not move the digest: `advisor` is
+            // one, and folding it in would change the shipped digest and
+            // reopen the rebind confirm for every account that dismissed it.
+            if row == "advisor" && binds.field(row).is_none() {
+                continue;
+            }
             hasher.update(row.as_bytes());
             hasher.update([0u8]);
             if let Some(value) = binds.field(row) {

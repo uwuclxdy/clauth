@@ -7,21 +7,25 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use serde_json::Value;
 
-use crate::format::{format_pct, humanize_span, local_stamp};
+use crate::format::{format_pct, humanize_span, local_stamp, plural};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
-/// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
-/// provider, tier, base url). Volatile usage figures rot within a turn, so they are
-/// served fresh per call by `profiles`, never baked into the boot-time block.
+/// Per-profile snapshot fed to [`instructions_block`]: stable identity (name,
+/// provider, tier, base url), the active and disabled flags, and a sort key.
+/// Volatile usage figures rot within a turn, so they are served fresh per call by
+/// `profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
+    /// Whether the account is disabled. A disabled row the roster keeps says so in
+    /// its marker, since the header tells a reader disabled ones are left out.
+    pub(crate) disabled: bool,
     /// Where this profile sorts in the roster. See [`RosterRank`].
     pub(crate) rank: RosterRank,
 }
@@ -270,20 +274,35 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
 /// runtime marks the profile the session is pinned to and the account the global
 /// link points at separately; a global session IS the global link, so the active
 /// profile carries both names; a custom config dir holds no clauth session
-/// profile, so only the global link gets a name. The old bare `(active)` read as
+/// profile, so only the global link gets a name. A bare `active` would read as
 /// "this session's account" where a `clauth start` session does not spend the
 /// active profile at all.
 fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
     match auth {
         SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime && p.active => {
-            Some(" (global active, this session)")
+            Some("global active, this session")
         }
-        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some(" (this session)"),
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some("this session"),
         SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom if p.active => {
-            Some(" (global active)")
+            Some("global active")
         }
-        SessionAuth::Global if p.active => Some(" (global active, this session)"),
+        SessionAuth::Global if p.active => Some("global active, this session"),
         SessionAuth::Global | SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => None,
+    }
+}
+
+/// A roster member as the block spells it: the name, then one paren holding the
+/// [`marker`] and, for a kept disabled account, `disabled`. Composed here once so
+/// every marker arm carries the flag.
+fn member_label(p: &ProfileSnapshot, auth: &SessionAuth) -> String {
+    let tags: Vec<&str> = marker(p, auth)
+        .into_iter()
+        .chain(p.disabled.then_some("disabled"))
+        .collect();
+    if tags.is_empty() {
+        p.name.clone()
+    } else {
+        format!("{} ({})", p.name, tags.join("; "))
     }
 }
 
@@ -318,10 +337,7 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 
     let mut out = String::new();
     for (bracket, members) in &groups {
-        let names: Vec<String> = members
-            .iter()
-            .map(|p| marker(p, auth).map_or_else(|| p.name.clone(), |m| format!("{}{m}", p.name)))
-            .collect();
+        let names: Vec<String> = members.iter().map(|p| member_label(p, auth)).collect();
         out.push_str("- ");
         out.push_str(&names.join(", "));
         out.push(' ');
@@ -336,10 +352,12 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 /// the previous window's last reading and drops), and when no live bar remains
 /// the chain falls through to the first funded wallet row (an empty wallet a
 /// two-wallet provider lists first must not win the headline over the funded
-/// one), then the first stat row that carries a value; the plan label prefixes
-/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
-/// heading) are skipped so the headline never renders a dangling `label:` with
-/// nothing after it.
+/// one), then any wallet at all — a spent one included — so a row whose
+/// `has_wallet` drops the `no 5h/7d limits` denial always renders a wallet
+/// rather than a bare counter, then the first stat row that carries a value;
+/// the plan label prefixes the line when present. Value-less rows (e.g.
+/// DeepSeek's `USD balance` heading) are skipped so the headline never renders
+/// a dangling `label:` with nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
     // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
@@ -366,7 +384,15 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 
     let mut body = if !live_bars.is_empty() {
         live_bars
-    } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
+    } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            crate::providers::balance_wallets(&s.rows)
+                .into_iter()
+                .next()
+        })
+    {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s
         .rows
@@ -590,8 +616,8 @@ state).\n\n",
         switch_router_clause(auth),
     ));
     out.push_str(
-        "Profiles, most headroom first (session-start snapshot; call `profiles` for live usage \
-and anything added since):\n",
+        "Profiles, most headroom first (session-start snapshot, disabled accounts left out; call \
+`profiles` for live usage and anything added since):\n",
     );
     out.push_str(&roster_lines(profiles, auth));
     out
@@ -729,7 +755,9 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 /// One age per row and no tail, no quota and no deadline countdown: this
 /// enumerates so a caller can NAME a job, and `monitor({job_ids})` is the check
 /// that reports what one is doing. Ten rows of the full running line would cost
-/// more than the reply it rides on.
+/// more than the reply it rides on. An isolated orphan's row names no resume:
+/// its transcript left with the throwaway tree, so the session id is no handle
+/// `delegate` accepts.
 fn jobs_listing_prose(p: &Value) -> String {
     let Some(rows) = p.get("jobs").and_then(Value::as_array) else {
         return String::new();
@@ -759,13 +787,22 @@ fn jobs_listing_prose(p: &Value) -> String {
         }
         // The resume sentence is what makes the pair-loop possible from the
         // listing alone: a session id whose run is over is a handle. Rendered
-        // for an orphaned row (the only handle left) and a done one (the
-        // completion's own id, stamped by every completion arm). On a running
-        // row it would invite resuming a session the live run still holds, so
-        // it stays unsaid there — the JSON row still carries the key either way.
-        if matches!(state, "orphaned" | "done")
-            && let Some(sid) = row.get("session_id").and_then(Value::as_str)
-        {
+        // for a done row (the completion's own id, stamped by every completion
+        // arm) and for a stopped or orphaned row whose own `resumable` verdict
+        // says the handle is real now: a stopped row's transcript may never
+        // have reached the global store, and an orphan whose recorded child
+        // still writes the transcript would put a second writer on a live
+        // session. On a running row it would invite resuming a session the
+        // live run still holds, so it stays unsaid there — the JSON row still
+        // carries the key either way.
+        let resume_sentence = if matches!(state, "stopped" | "orphaned") {
+            row.get("resumable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        } else {
+            state == "done"
+        };
+        if resume_sentence && let Some(sid) = row.get("session_id").and_then(Value::as_str) {
             out.push_str(&format!("; resume with session id `{sid}`"));
         }
         out.push_str(&age_phrase(row));
@@ -783,7 +820,7 @@ fn jobs_listing_prose(p: &Value) -> String {
 /// The one age a listing row carries, named for the question that row's state
 /// makes worth asking: a live run's is how long it has been going, a finished
 /// one's how long its result has been sitting there, an orphan's how long ago
-/// anything last wrote to it.
+/// anything last wrote to it, a stopped one's how long ago the stop landed.
 fn age_phrase(row: &Value) -> String {
     // `humanize_span`, never `humanize_duration`: every figure here is a SPAN,
     // and at zero that function spells `now`, which renders `elapsed now` and
@@ -798,6 +835,7 @@ fn age_phrase(row: &Value) -> String {
     let when = humanize_span(secs);
     match row.get("state").and_then(Value::as_str) {
         Some("orphaned") => format!(", last seen {when} ago"),
+        Some("stopped") => format!(", stopped {when} ago"),
         _ => format!(", finished {when} ago"),
     }
 }
@@ -855,16 +893,22 @@ fn age_clause(v: &Value) -> String {
 /// limits, which is exactly what the denial would be claiming to know.
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
-/// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba, MiniMax) HAS limits of its own whether or not this one response
-/// carried any, so a denial beside its figure is false or unknowable (Alibaba's
-/// current window is monthly with a dormant 5h pair that may return, so clauth
-/// cannot know it has no 5h limit); a provider answering with a wallet or a counter
-/// (DeepSeek, ollama, a generic endpoint) has none, and saying so is what
-/// stops its figure reading as one more window someone can wait out. The split
-/// is the payload's `provider_windows` flag, decided from the provider plus
-/// the response's bars at the source — matching the rendered figure for a `5h`
-/// substring would make the copy decide its own meaning.
+/// it has none AND its figure is no wallet. A provider that publishes usage
+/// windows of its own (z.ai, Alibaba, MiniMax) HAS limits of its own whether or
+/// not this one response carried any, so a denial beside its figure is false or
+/// unknowable (Alibaba's current window is monthly with a dormant 5h pair that
+/// may return, so clauth cannot know it has no 5h limit); a no-windows account
+/// answering with a WALLET (DeepSeek, a generic endpoint's own balance row) gets
+/// the figure alone — the denial never rides an api balance, the one figure a
+/// reader can measure rather than wait out, and a spent wallet already refuses
+/// by its own verdict beside the number; a no-windows account whose figure is a
+/// COUNTER (ollama, a generic endpoint's scalar that parses as no wallet) keeps
+/// the denial, which is what stops its figure reading as one more window
+/// someone can wait out. Both splits are the payload's — `provider_windows` and
+/// `has_wallet`, decided at the source (`has_wallet` by the same
+/// `is_balance_row` + `parse_balance` pair every wallet surface uses,
+/// zero-amount wallets included) — never a match on the rendered `api balance`
+/// text, which would make the copy decide its own meaning.
 ///
 /// A freshness clause rides the FIGURE it dates, and the `stale` word never
 /// rides an unknown: a verdict qualifies a figure, and beside one the prose
@@ -886,19 +930,26 @@ fn windows_prose(windows: &Value) -> String {
                 .get("provider_windows")
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
+                || windows
+                    .get("has_wallet")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
             {
                 figure.to_string()
             } else {
                 format!("no 5h/7d limits; {figure}")
             };
             // The wallet-burn rate rides the figure it qualifies — the same
-            // first-class-figure shape the Usage tab's rate rows carry, so a
-            // reader picking a delegate target judges the runway themselves.
+            // first-class-figure shape the Usage tab's rate rows carry.
             if let (Some(per_day), Some(currency)) = (
                 windows.get("wallet_burn_per_day").and_then(Value::as_f64),
                 windows.get("wallet_burn_currency").and_then(Value::as_str),
             ) {
                 out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+                // The runway rides the burn it is derived from, in the same
+                // phrase, so the two figures the reader would divide always
+                // sit beside their answer.
+                out.push_str(&wallet_runway_clause(windows));
             }
             out.push_str(&freshness_clause(windows));
             out
@@ -942,6 +993,44 @@ fn windows_prose(windows: &Value) -> String {
             out
         }
         _ => "usage unknown".to_string(),
+    }
+}
+
+/// The funded wallet's runway — how long its balance lasts at its own burn —
+/// appended beside the two figures it divides, so a reader picking a delegate
+/// target never divides them itself. Whole days from one day up (`~1 day`,
+/// `~2 days`), whole hours under a day (`~7 h`), each rounded to nearest;
+/// under half an hour rounds to no hour at all and reads `<1 h`. Omitted when
+/// either figure is missing, when the burn reads as zero at one decimal (`0`
+/// never runs out), when the balance is not positive (a debt is no runway), and
+/// when the ratio overflows to a non-finite number.
+fn wallet_runway_clause(windows: &Value) -> String {
+    let balance = windows.get("wallet_balance").and_then(Value::as_f64);
+    let per_day = windows.get("wallet_burn_per_day").and_then(Value::as_f64);
+    let (Some(balance), Some(per_day)) = (balance, per_day) else {
+        return String::new();
+    };
+    // The burn as rendered (one decimal): one reading `~0.0` is no burn to the
+    // reader.
+    if !(balance > 0.0 && (per_day * 10.0).round() > 0.0) {
+        return String::new();
+    }
+    let days = balance / per_day;
+    // A ratio that overflows to infinity names no runway a reader can use.
+    if !days.is_finite() {
+        return String::new();
+    }
+    if days >= 1.0 {
+        let whole = days.round();
+        let unit = if whole == 1.0 { "day" } else { "days" };
+        format!(" (~{whole:.0} {unit} left)")
+    } else {
+        let hours = (days * 24.0).round();
+        if hours < 1.0 {
+            " (<1 h left)".to_string()
+        } else {
+            format!(" (~{hours:.0} h left)")
+        }
     }
 }
 
@@ -1034,12 +1123,34 @@ fn profile_line(row: &Value) -> String {
     if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
     }
-    if row
-        .get("has_live_session")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    if let Some(available) = row.get("limit_resets").and_then(Value::as_u64)
+        && available > 0
     {
-        out.push_str("; live session");
+        out.push_str(&format!(
+            "; {available} limit reset{} available",
+            plural(available as usize)
+        ));
+    }
+    // One snapshot per call, the Overview live column's per-account slice.
+    if let Some(sessions) = row.get("live_sessions").and_then(Value::as_u64)
+        && sessions > 0
+    {
+        let mut clause = if sessions == 1 {
+            "1 live session".to_string()
+        } else {
+            format!("{sessions} live sessions")
+        };
+        if let Some(delegates) = row.get("live_delegates").and_then(Value::as_u64)
+            && delegates > 0
+        {
+            clause.push_str(&if delegates == 1 {
+                " (1 delegate)".to_string()
+            } else {
+                format!(" ({delegates} delegates)")
+            });
+        }
+        out.push_str("; ");
+        out.push_str(&clause);
     }
     // Model binds ride only a row the call named (a `names` filter or the
     // session scope), so the unfiltered roster renders none; only set binds
@@ -1124,6 +1235,22 @@ fn profile_line(row: &Value) -> String {
     out
 }
 
+/// The line a reply carries when the live-session tally could not read every
+/// dir or record it counts from (a session or job store, a profile dir, a
+/// running job's supervisor record). The per-row counts it does carry may be short, so the
+/// reply names the unknown once instead of printing a count that reads as
+/// complete.
+const LIVE_SESSIONS_UNKNOWN: &str =
+    "live sessions: partly unknown (a session store could not be read)";
+
+/// Whether the reply's tally had a read fail (`live_sessions_unknown`).
+fn live_sessions_unknown(payload: &Value) -> bool {
+    payload
+        .get("live_sessions_unknown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Prose for `profiles`. The all-scope roster is one `profile_line` per
 /// profile; the session-scope arm is the folded-in former `which`: the one row
 /// THIS session resolves to, rendered through the same `profile_line` (so it
@@ -1184,12 +1311,28 @@ pub(crate) fn profiles_prose(p: &Value) -> String {
             out.push_str("; ");
             out.push_str(&digest);
         }
+        if live_sessions_unknown(p) {
+            out.push('\n');
+            out.push_str(LIVE_SESSIONS_UNKNOWN);
+        }
         return out;
     }
     if rows.is_empty() {
-        return "no profiles".to_string();
+        // The unknown clause is unconditional: a failed read marks every reply
+        // that renders tally figures, and an empty roster's would-be rows are
+        // figures too, so "no profiles" alone must not read as a full reply.
+        return if live_sessions_unknown(p) {
+            format!("no profiles\n{LIVE_SESSIONS_UNKNOWN}")
+        } else {
+            "no profiles".to_string()
+        };
     }
-    rows.iter().map(profile_line).collect::<Vec<_>>().join("\n")
+    let mut out = rows.iter().map(profile_line).collect::<Vec<_>>().join("\n");
+    if live_sessions_unknown(p) {
+        out.push('\n');
+        out.push_str(LIVE_SESSIONS_UNKNOWN);
+    }
+    out
 }
 
 /// Prose for `switch_profile`: the outcome, then the active profile's live
@@ -1442,14 +1585,16 @@ fn fmt_cost(cost: f64) -> String {
         .to_string()
 }
 
-/// The `permission_denials` field as a clause body, or `None` when the clause
-/// drops (absent, null, an empty list, or an empty string). A string renders
-/// as its own text. A list renders named tools once in first-seen order with
-/// a `N times` count when repeated, then any nameless entries as `N unnamed
-/// entries` after the named ones — `unnamed` is a spellable tool name, so the
-/// count keeps the synthetic group out of that namespace, and `entry` /
-/// `entries` pluralizes the group's own count. A present value of any other
-/// shape reads `(unreadable)`, so a denial the envelope carried is never
+/// The envelope field the finalize-time classification stamps: the
+/// `tool_use_id`s whose transcript `tool_result` is a user `PreToolUse` hook
+/// refusal. It rides the stored job record, so rendering a collected envelope
+/// never re-reads a transcript.
+pub(crate) const HOOK_REFUSAL_IDS: &str = "hook_refusal_ids";
+
+/// A denial list as a clause body, or `None` when the clause drops (absent,
+/// null, an empty list, or an empty string). A string renders as its own text.
+/// A list renders through [`denial_entries_names`]. A present value of any
+/// other shape reads `(unreadable)`, so a denial the envelope carried is never
 /// invisible.
 fn denial_names(denials: Option<&Value>) -> Option<String> {
     let value = denials?;
@@ -1462,12 +1607,22 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
     let Some(arr) = value.as_array() else {
         return Some("(unreadable)".to_string());
     };
-    if arr.is_empty() {
+    denial_entries_names(&arr.iter().collect::<Vec<_>>())
+}
+
+/// A set of denial entries as a clause body, or `None` when the set is empty.
+/// Named tools render once in first-seen order with a `N times` count when
+/// repeated, then any nameless entries as `N unnamed entries` after the named
+/// ones — `unnamed` is a spellable tool name, so the count keeps the synthetic
+/// group out of that namespace, and `entry` / `entries` pluralizes the group's
+/// own count.
+fn denial_entries_names(entries: &[&Value]) -> Option<String> {
+    if entries.is_empty() {
         return None;
     }
     let mut named: Vec<(String, usize)> = Vec::new();
     let mut unnamed = 0usize;
-    for entry in arr {
+    for entry in entries {
         let name = entry
             .get("tool_name")
             .and_then(Value::as_str)
@@ -1493,6 +1648,45 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
         });
     }
     Some(parts.join(", "))
+}
+
+/// The receipt's denial clauses split by layer, as `(hook refusals, permission
+/// denials)`, each `None` when empty.
+///
+/// An entry whose `tool_use_id` sits in [`HOOK_REFUSAL_IDS`] was refused by a
+/// user `PreToolUse` hook — enforcement the `--dangerously-skip-permissions`
+/// flag does not bypass, and one the agent usually retried past. Every other
+/// entry, a `permissions.deny` rule's or one carrying no id to look up, stays a
+/// permission denial. Without the stamp (no transcript found, an unreadable
+/// one, or a denial value that is not a list) the whole list stays in the
+/// permission clause.
+fn denial_clauses(e: &Value) -> (Option<String>, Option<String>) {
+    let denials = e.get("permission_denials");
+    let hook_ids: Vec<&str> = e
+        .get(HOOK_REFUSAL_IDS)
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(arr) = denials.and_then(Value::as_array) else {
+        return (None, denial_names(denials));
+    };
+    if hook_ids.is_empty() {
+        return (None, denial_names(denials));
+    }
+    let mut hooks: Vec<&Value> = Vec::new();
+    let mut others: Vec<&Value> = Vec::new();
+    for entry in arr {
+        let is_hook = entry
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| hook_ids.contains(&id));
+        if is_hook {
+            hooks.push(entry);
+        } else {
+            others.push(entry);
+        }
+    }
+    (denial_entries_names(&hooks), denial_entries_names(&others))
 }
 
 /// The cost clause an envelope earns: ` (cost $X)`, ` (equivalent Anthropic API
@@ -1521,10 +1715,77 @@ pub(crate) fn cost_clause(e: &Value) -> String {
     }
 }
 
-/// Prose for a `result: "file"` reply: the path, the sha256, and the envelope's
-/// cost clause — the model Reads the file for the body.
+/// The character budget a result's first line gets in a reply: wide enough to
+/// carry a real first line, narrow enough that a 256-id batch stays bounded.
+const FIRST_LINE_MAX_CHARS: usize = 200;
+
+/// `line` with every control character and every bidi formatting character
+/// written as its `\u{..}` escape (delegate output is untrusted: it can
+/// neither drive the terminal nor reorder the line), held to `max` characters
+/// of the ESCAPED spelling with `format::truncate`'s `...` marker. The cut is taken per raw character, so it never splits an escape
+/// and never mistakes a literal `\` in the text for one; the work stops one
+/// character past the bound, whatever the line's length.
+fn escape_within(line: &str, max: usize) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut used = 0;
+    for c in line.chars() {
+        let piece = crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !crate::format::unsafe_on_terminal(c)
+        });
+        used += piece.chars().count();
+        pieces.push(piece);
+        if used > max {
+            break;
+        }
+    }
+    if used <= max {
+        return pieces.concat();
+    }
+    let budget = max.saturating_sub(3);
+    let mut out = String::new();
+    let mut len = 0;
+    for piece in &pieces {
+        let n = piece.chars().count();
+        if len + n > budget {
+            break;
+        }
+        out.push_str(piece);
+        len += n;
+    }
+    out.push_str(&"..."[..max.min(3)]);
+    out
+}
+
+/// The first non-empty line of a delegate envelope's `result`, trimmed, every
+/// control and bidi formatting character written as its `\u{..}` escape, cut to
+/// [`FIRST_LINE_MAX_CHARS`] characters of the ESCAPED spelling with
+/// `format::truncate`'s `...` marker. A non-string result renders its literal
+/// and a missing one reads `unknown`, matching `envelope_prose`. A
+/// path-bearing reply carries this beside the result file, so the model can
+/// judge the answer without paying a Read for the body.
+pub(crate) fn result_first_line(e: &Value) -> String {
+    let text = match e.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown");
+    escape_within(line, FIRST_LINE_MAX_CHARS)
+}
+
+/// Prose for a `result: "file"` reply: the path, the sha256, the result's
+/// first line, and the envelope's cost clause — the model Reads the file for
+/// the body, and the first line tells it whether it needs to.
 pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
-    let mut out = format!("result written to {path} (sha256 {sha256})");
+    let mut out = format!(
+        "result written to {path} (sha256 {sha256}); first line: {}",
+        result_first_line(e)
+    );
     let cost = cost_clause(e);
     if !cost.is_empty() {
         out.push(';');
@@ -1597,7 +1858,11 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
     if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
         out.push_str(&format!("; resume with session id `{sid}`"));
     }
-    if let Some(names) = denial_names(e.get("permission_denials")) {
+    let (hook_refusals, permission_denials) = denial_clauses(e);
+    if let Some(names) = hook_refusals {
+        out.push_str(&format!("; hook refusals: {names}"));
+    }
+    if let Some(names) = permission_denials {
         out.push_str(&format!("; permission denials: {names}"));
     }
     out
@@ -1751,8 +2016,22 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
 pub(crate) fn monitor_job_prose(p: &Value) -> String {
-    // A crashed tombstone's owner copy is the whole line: no `delegate to`,
-    // `finished`/`failed`, or target footer may qualify it.
+    // A stopped tombstone's copy is the whole line: no `delegate to`,
+    // `finished`/`failed`, or target footer may qualify it. The text the run
+    // had written rides the same line when the record still holds it: the copy
+    // replaces the false resume promise, never the salvage.
+    if p.get("stopped").and_then(Value::as_bool).unwrap_or(false) {
+        let mut out = p
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if let Some(partial) = p.get("partial_result").and_then(Value::as_str) {
+            out.push_str(&format!("; partial result: {partial}"));
+        }
+        return out;
+    }
+    // A crashed tombstone's copy is the whole line, the same rule.
     if p.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
         return p
             .get("result")
@@ -1878,6 +2157,7 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
             }
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
             match r.get("status").and_then(Value::as_str) {
+                Some("done") if r.get("result_file").is_some() => compact_done_row(job_id, r),
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
                 Some("running") => running_status_prose(r),
                 _ => format!("job `{job_id}` unknown"),
@@ -1903,6 +2183,36 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
                 "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
             ),
         );
+    }
+    out
+}
+
+/// One done batch row whose envelope went to a result file: the verdict word,
+/// the result's first line, then the path and sha256 the body lives under, plus
+/// the cost clause. The entry carries only the fields this line and
+/// `cost_clause` read, so a batch of oversized envelopes never inlines their
+/// bodies; the file is the body's one delivery. A row without a
+/// `result_file` (a write that fell back inline) never reaches here.
+fn compact_done_row(job_id: &str, r: &Value) -> String {
+    let verdict = if r.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        "failed"
+    } else {
+        "finished"
+    };
+    let mut out = format!(
+        "job `{job_id}` {verdict}: {}; result written to {} (sha256 {})",
+        r.get("first_line")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("result_file")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        r.get("sha256").and_then(Value::as_str).unwrap_or("unknown"),
+    );
+    let cost = cost_clause(r);
+    if !cost.is_empty() {
+        out.push(';');
+        out.push_str(&cost);
     }
     out
 }

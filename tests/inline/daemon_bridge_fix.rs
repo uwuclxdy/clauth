@@ -237,6 +237,45 @@ fn a_transient_unreadable_record_keeps_the_instance() {
     assert!(queued, "the ask survived an unreadable record");
 }
 
+/// The mod reads the line, so the daemon only carries what it posted: a number,
+/// a null, or nothing at all from an older mod, which reads as null.
+#[test]
+fn an_ask_carries_the_start_line_its_mod_posted() {
+    let _home = HomeSandbox::new();
+    let (_t, r) = table(&[(100, instance("s1", "1"))]);
+    let hub = Hub::new(true, r);
+    assert_eq!(
+        ev(&hub, 100, json!({"session":"s1","seq":1,"kind":"start"})).0,
+        200
+    );
+    for (seq, ask, posted) in [
+        (2, "located", json!({"start_line": 42})),
+        (3, "unlocated", json!({"start_line": null})),
+        (4, "older-mod", json!({})),
+    ] {
+        let mut body = json!({"session":"s1","seq":seq,"kind":"ask_opened","ask":ask,"tool":"Edit","input":{}});
+        body.as_object_mut()
+            .expect("an object")
+            .extend(posted.as_object().expect("an object").clone());
+        assert_eq!(ev(&hub, 100, body).0, 200);
+    }
+    let snapshot = hub.snapshot();
+    let lines: Vec<_> = snapshot["asks"]
+        .as_array()
+        .expect("the asks")
+        .iter()
+        .map(|ask| (ask["ask"].clone(), ask["start_line"].clone()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (json!("located"), json!(42)),
+            (json!("unlocated"), json!(null)),
+            (json!("older-mod"), json!(null)),
+        ]
+    );
+}
+
 /// MB-7/SB-19: only a mod-HELD ask is answerable. An ask opened while
 /// hold=false (no control device yet) must not take a 200 answer later.
 #[test]
@@ -254,6 +293,12 @@ fn an_unheld_ask_is_not_answerable() {
         json!({"session":"s1","seq":2,"kind":"ask_opened","ask":"a1","tool":"Bash","input":{}}),
     );
     assert_eq!(opened.1["hold"], false);
+    let question = ev(
+        &hub,
+        100,
+        json!({"session":"s1","seq":3,"kind":"ask_opened","ask":"q1","tool":"AskUserQuestion","input":[{"question":"Which colour?"}]}),
+    );
+    assert_eq!(question.1["hold"], false);
     seed_device(DEVICE, Tier::Control, TOKEN);
     let queued = matches!(
         hub.answer(
@@ -264,6 +309,17 @@ fn an_unheld_ask_is_not_answerable() {
         AskOutcome::Queued
     );
     assert!(!queued, "an ask the mod never held took an answer");
+    // The held check comes before any form check: an unheld ask answers
+    // ask_not_found to a wrong form and to an unknown question alike.
+    for command in [
+        json!({"kind":"answer","ask":"q1","decision":"allow"}),
+        json!({"kind":"answer","ask":"q1","answers":{"Other?":"x"}}),
+    ] {
+        assert!(
+            matches!(hub.answer("s1", "q1", command), AskOutcome::AskNotFound),
+            "an unheld ask answers ask_not_found before any form check"
+        );
+    }
 }
 
 /// A 400 event (bad kind or a missing field) must not consume its sequence.
@@ -834,7 +890,8 @@ fn the_answer_and_interrupt_audit_lines_carry_no_text() {
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
     start(&hub, 100, "s-one");
-    open_ask(&hub, 100, "s-one", 2, "q1");
+    let question = json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}, {"question": "Other?"}]});
+    assert_eq!(hub.event(100, question.to_string().as_bytes()).0, 200);
     open_ask(&hub, 100, "s-one", 3, "q2");
     let ctx = ctx_over(&hub);
     let resp = call(
@@ -843,7 +900,7 @@ fn the_answer_and_interrupt_audit_lines_carry_no_text() {
             "POST",
             "/api/v1/sessions/s-one/asks/q1",
             Some(TOKEN),
-            r#"{"answers":{"Which colour?":"secret-canary","Other?":"x"}}"#,
+            r#"{"answers":{"Which colour?":"secret-canary","Other?":"x"},"notes":{"Other?":"note-canary"}}"#,
         ),
     );
     assert_eq!(resp.status, 200);
@@ -913,7 +970,9 @@ fn the_answer_and_interrupt_audit_lines_carry_no_text() {
     assert_eq!(
         lines.snapshot(),
         vec![
-            format!("clauth api: device '{DEVICE}' answered ask 'q1' on session 's-one' answers=2"),
+            format!(
+                "clauth api: device '{DEVICE}' answered ask 'q1' on session 's-one' answers=2 notes=1"
+            ),
             format!(
                 "clauth api: device '{DEVICE}' answered ask 'q2' on session 's-one' decision=allow"
             ),
@@ -921,6 +980,40 @@ fn the_answer_and_interrupt_audit_lines_carry_no_text() {
             format!("clauth api: device '{DEVICE}' prompted session 's-one' via herdr text_len=13"),
             format!("clauth api: device '{DEVICE}' interrupted session 's-one' via herdr"),
         ]
+    );
+}
+
+/// The audit line's no-notes branch counts the answers alone: a note count of
+/// zero is never appended.
+#[test]
+fn the_answer_audit_line_carries_no_note_count_without_a_note() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let question = json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "q1", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
+    assert_eq!(hub.event(100, question.to_string().as_bytes()).0, 200);
+    let ctx = ctx_over(&hub);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/sessions/s-one/asks/q1",
+            Some(TOKEN),
+            r#"{"answers":{"Which colour?":"red"}}"#,
+        ),
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth api: device '{DEVICE}' answered ask 'q1' on session 's-one' answers=1"
+        )]
     );
 }
 

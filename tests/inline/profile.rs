@@ -4,6 +4,7 @@
 //! test below fails.
 
 use super::*;
+use sha2::{Digest as _, Sha256};
 
 #[test]
 fn profile_config_reads_kick_timer_as_auto_start() {
@@ -52,6 +53,34 @@ fn last_resort_round_trips_through_config_toml() {
     let rendered = render_config_toml(&profile);
     let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
     assert!(parsed.last_resort);
+}
+
+// The generated auto-start comment says a plan with no 5-hour limit gets no
+// ping, beside the cost line it qualifies.
+#[test]
+fn the_auto_start_comment_names_a_plan_with_no_five_hour_limit() {
+    let profile = Profile::new("p".to_string(), None, None);
+    let rendered = render_config_toml(&profile);
+    let block = "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+                 # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+                 # no running window. ~0.001¢ per ping. OAuth profiles only.\n\
+                 # A plan with no 5-hour limit gets no ping.\n\
+                 # Old name `kick_timer = true` is still accepted.\n\
+                 # auto_start = true\n";
+    assert!(
+        rendered.contains(block),
+        "the auto-start block, whole, in order"
+    );
+    let probe = "# Probe this account's usage with a 1-token Haiku message, for a\n\
+                 # `claude setup-token` login that /usage cannot read (no OAuth pair\n\
+                 # stored). Every probe is an inference request and may start the 5h\n\
+                 # window. A plan with no 5-hour limit has none to start. Inert while an\n\
+                 # OAuth pair is stored. OAuth profiles only.\n\
+                 # usage_probe = true\n";
+    assert!(
+        rendered.contains(probe),
+        "the usage-probe block, whole, in order"
+    );
 }
 
 // `preferred_days` must default to empty so every config.toml written before
@@ -527,10 +556,6 @@ fn usage_gates_round_trip_through_config_toml() {
     assert_eq!(parsed.check_scoped, None);
 }
 
-// `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
-// every existing profiles.toml written before this field existed keeps
-// loading unchanged, matching the `last_resort` guarantee above at the
-// `AppState` level.
 // `context_nudge_threshold_tokens` defaults to off (`None`), so the key is
 // omitted from a stock profiles.toml; a set threshold must round-trip exactly.
 #[test]
@@ -555,6 +580,10 @@ fn context_nudge_threshold_defaults_off_and_round_trips() {
     assert_eq!(reparsed.context_nudge_threshold_tokens, Some(600_000));
 }
 
+// `burn_aware_switching` must default to `false` so
+// every existing profiles.toml written before this field existed keeps
+// loading unchanged, matching the `last_resort` guarantee above at the
+// `AppState` level.
 #[test]
 fn app_state_burn_aware_switching_defaults_false() {
     let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
@@ -715,7 +744,7 @@ fn preserve_non_login_keys_defaults_true_and_an_explicit_off_survives_a_round_tr
 // isolated run now gets unconditionally. `AppState` carries no
 // `deny_unknown_fields`, so a profiles.toml written while the key existed still
 // loads — the key is ignored rather than refused, and nothing renders it back
-// through the model. A save now CARRIES it like any unmodelled key
+// through the model. A save leaves it where it sits, like any unmodelled key
 // (`save_app_state_keeps_unknown_keys_the_file_already_holds`): retired here
 // is indistinguishable from future-here, and the file is the record. The load
 // half is the one that matters: refusing it would lock an operator out of
@@ -779,8 +808,7 @@ fn save_app_state_keeps_unknown_keys_the_file_already_holds() {
 }
 
 // A modelled key the new state moved off its on-disk value must take the new
-// value — carrying is for keys the model does not hold, never a stale-copy
-// resurrection of one it does.
+// value: only keys the model does not hold stay as the file has them.
 #[test]
 fn save_app_state_does_not_resurrect_a_modelled_key_from_disk() {
     let _home = HomeSandbox::new();
@@ -812,9 +840,6 @@ fn save_app_state_does_not_resurrect_a_modelled_key_from_disk() {
 
 // A future nested key inside a MODELLED table must survive the next save — the
 // recursive half of `save_app_state_keeps_unknown_keys_the_file_already_holds`.
-// `[update]` rides the top-level carry only while the key is unmodelled; the
-// moment the model gains the table (this task), a future sub-key inside it
-// would be deleted by every save — the class `[herdr]`/`[serve]` already had.
 #[test]
 fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
     let _home = HomeSandbox::new();
@@ -827,6 +852,7 @@ fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
         },
         serve: ServeSettings {
             session_creation: true,
+            ..ServeSettings::default()
         },
         ..AppState::default()
     };
@@ -935,79 +961,227 @@ fn update_settings_defaults_on_and_an_explicit_off_survives_a_round_trip() {
     );
 }
 
-// The move-to-default edge: a modelled table whose modelled key flips BACK to
-// its default renders no `[table]` block on the same save, so a carried
-// unknown sub-key has no block to splice into — it must re-attach at EOF
-// under a fresh header, never drop (round-2 review, major).
-#[test]
-fn save_app_state_carries_unknown_nested_keys_when_the_table_renders_default() {
-    let _home = HomeSandbox::new();
+/// Writes `body` as `profiles.toml` in the sandbox and returns its path.
+fn write_state_file(body: &str) -> std::path::PathBuf {
     let path = app_state_path().expect("app_state_path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(
-        &path,
-        "profiles = []\n\n[update]\nauto_update = false\nfuture = \"keepme\"\n",
-    )
-    .expect("write disk state");
+    std::fs::write(&path, body).expect("write disk state");
+    path
+}
+
+// A modelled key flipping back to its default inside a table that also holds a
+// key this clauth does not model: the modelled key goes (its default renders
+// absent), the unknown sibling stays where it was, under its own header.
+#[test]
+fn save_app_state_keeps_an_unknown_nested_key_in_place_when_the_table_returns_to_default() {
+    let _home = HomeSandbox::new();
+    let path =
+        write_state_file("profiles = []\n\n[update]\nauto_update = false\nfuture = \"keepme\"\n");
 
     let mut state = load_app_state().expect("load");
     assert!(!state.update.auto_update, "the saved off loads");
-    // The toggle flips back on: the next render omits the whole [update] table.
     state.update.auto_update = true;
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read after");
-    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
     assert_eq!(
-        parsed
-            .get("update")
-            .and_then(|u| u.get("future"))
-            .and_then(toml::Value::as_str),
-        Some("keepme"),
-        "the future key survives the move-to-default save:\n{after}"
-    );
-    assert!(
-        after.contains(PRESERVED_KEYS_MARKER),
-        "the carried key sits under the preserved-keys marker:\n{after}"
+        after, "profiles = []\n\n[update]\nfuture = \"keepme\"\n",
+        "only the modelled key left; the unknown one stayed in place"
     );
 }
 
-// The disk-side skip (round-3 review, blocker): a disk table holding ONLY an
-// unmodelled sub-key parses with the model's table at its default, so the
-// round-trip renders no block and classifies nothing — and the top-level carry
-// excludes the table because the SAVE renders it (non-default). The sub-key
-// must survive via the nested path, classified against the render's own keys.
+// `[plugin] idle_wake` round-trips through the in-place writer beside other
+// tables: off writes the table, the load reads it back, and back on removes
+// the key and the emptied table, the `[update]` and `[herdr]` keys untouched.
 #[test]
-fn save_app_state_carries_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() {
+fn save_app_state_writes_the_plugin_table_only_while_the_idle_wake_is_off() {
     let _home = HomeSandbox::new();
-    let path = app_state_path().expect("app_state_path");
-    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&path, "profiles = []\n\n[serve]\nfuture = \"keepme\"\n")
-        .expect("write disk state");
+    let before = "profiles = []\n\n[update]\nauto_update = false\n\n[herdr]\npane_tag = false\n";
+    let path = write_state_file(before);
+
+    let mut state = load_app_state().expect("load");
+    assert!(state.plugin.idle_wake, "an absent table reads on");
+    state.plugin.idle_wake = false;
+    save_app_state(&state).expect("save off");
+    let off = std::fs::read_to_string(&path).expect("read off");
+    assert_eq!(
+        off,
+        format!("{before}\n[plugin]\nidle_wake = false\n"),
+        "off appends the table, the other tables kept byte for byte"
+    );
+
+    let mut state = load_app_state().expect("reload");
+    assert!(!state.plugin.idle_wake, "the saved off loads");
+    assert!(!state.update.auto_update && !state.herdr.pane_tag);
+    state.plugin.idle_wake = true;
+    save_app_state(&state).expect("save on");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read on"),
+        before,
+        "back on removes the key and its emptied table"
+    );
+}
+
+// A table holding only a key this clauth does not model gains a modelled key:
+// the new key lands at the table's end, the unknown one stays where it was.
+#[test]
+fn save_app_state_adds_a_modelled_key_beside_an_unknown_one_in_place() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\n\n[serve]\nfuture = \"keepme\"\n");
 
     let mut state = load_app_state().expect("load");
     assert!(
         !state.serve.session_creation,
         "the table loads at its default"
     );
-    // The save renders [serve] non-default, so the render writes the block.
     state.serve.session_creation = true;
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read after");
-    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
     assert_eq!(
-        parsed
-            .get("serve")
-            .and_then(|s| s.get("future"))
-            .and_then(toml::Value::as_str),
-        Some("keepme"),
-        "the sub-key survives the all-unmodelled-disk-table save:\n{after}"
+        after, "profiles = []\n\n[serve]\nfuture = \"keepme\"\nsession_creation = true\n",
+        "the modelled key appended inside [serve]; nothing else moved"
+    );
+}
+
+#[test]
+fn a_state_save_edits_profiles_toml_in_place_keeping_comments_and_unknown_keys() {
+    let _home = HomeSandbox::new();
+    let before = "# top note\n\
+                  wrap_off = false   # trailing\n\
+                  # an unknown key a newer clauth wrote\n\
+                  from_the_future = 7\n\
+                  active_profile = \"a\"\n\
+                  profiles = [\"a\"]\n";
+    let path = write_state_file(before);
+
+    let mut state = load_app_state().expect("load");
+    state.switch_off_when_spent = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(
+        after,
+        before.replace(
+            "wrap_off = false   # trailing",
+            "wrap_off = true   # trailing"
+        ),
+        "only the changed value moved; comments, key order and the unknown key stayed"
+    );
+}
+
+#[test]
+fn a_new_profile_appends_into_the_existing_list_with_comments_intact() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\",\n  # note for b\n  \"b\",\n]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("c"));
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(
+        after, "profiles = [\n  \"a\",\n  # note for b\n  \"b\",\n  \"c\",\n]\n",
+        "the new name lands on its own line in the list's own style"
+    );
+}
+
+#[test]
+fn a_one_line_list_stays_one_line_through_an_append() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\"]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("c"));
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(after, "profiles = [\"a\", \"b\", \"c\"]\n");
+}
+
+#[test]
+fn a_profile_reorder_moves_the_element_with_its_comment() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\n  \"a\",\n  # note for b\n  \"b\",\n  \"c\",\n  \"d\",\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c", "d", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(
+        after, "profiles = [\n  \"a\",\n  \"c\",\n  \"d\",\n  # note for b\n  \"b\",\n]\n",
+        "the moved name carries its comment; the others keep their lines"
+    );
+}
+
+#[test]
+fn a_chain_delete_moves_the_removed_elements_comment_onto_the_next() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\"a\", \"b\", \"c\"]\n\
+         fallback_chain = [\n  \"a\",\n  # note for b\n  \"b\",\n  \"c\",\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.fallback_chain = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(
+        after,
+        "profiles = [\"a\", \"b\", \"c\"]\n\
+         fallback_chain = [\n  \"a\",\n  # note for b\n  \"c\",\n]\n",
+        "the comment moves onto the next name, with no blank line left behind"
+    );
+}
+
+#[test]
+fn a_profiles_key_of_the_wrong_type_refuses_the_save_naming_it() {
+    let _home = HomeSandbox::new();
+    let before = "# hand note\nprofiles = \"oops\"\nwrap_off = true\n";
+    let path = write_state_file(before);
+
+    let err = save_app_state(&AppState {
+        profiles: vec![ProfileName::from("a")],
+        ..AppState::default()
+    })
+    .expect_err("a save over an unreadable key refuses");
+
+    let expected = "profiles.toml has `profiles` in a shape clauth cannot read; \
+                    fix or remove that line, then try again";
+    assert!(
+        err.chain().any(|cause| cause.to_string() == expected),
+        "the refusal names the key: {err:#}"
     );
     assert_eq!(
-        parsed["serve"]["session_creation"],
-        toml::Value::Boolean(true),
-        "the modelled change landed:\n{after}"
+        std::fs::read_to_string(&path).expect("read after"),
+        before,
+        "nothing written"
+    );
+}
+
+#[test]
+fn a_state_save_whose_edits_change_no_bytes_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let before = "# hand note\nprofiles = [\"a\"]   # mine\nwrap_off = false\n";
+    let path = write_state_file(before);
+    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    crate::testutil::set_mtime(&path, stamp);
+
+    let state = load_app_state().expect("load");
+    save_app_state(&state).expect("save");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("read after"), before);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        stamp,
+        "a save that changes no bytes leaves the file unwritten"
     );
 }
 
@@ -1048,100 +1222,6 @@ fn save_profile_keeps_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() 
         toml::Value::String("claude-opus".into()),
         "the modelled change landed:\n{after}"
     );
-}
-
-// The splice walk must not read `[`-leading content of a multi-line string as
-// a table header: the serializer renders a multi-line value as `key = """` on
-// its own line with the closer riding the last content line, so a value like
-// `opus = """\na\n[evil] = 1"""` puts a `[`-leading line inside the literal,
-// and a false header there fires the leave-block flush INSIDE it — the
-// modelled value corrupts and the carried key lands as string text (round-2
-// review, minor; doc re-shaped in round 3 to the serializer's measured form).
-// Direct unit on the merge, hand-built doc.
-#[test]
-fn merge_nested_carried_keys_never_reads_a_multiline_string_as_a_header() {
-    let rendered = "[models]\nopus = \"\"\"\na\n[evil] = 1\"\"\"\n";
-    let nested = vec![(
-        "models".to_string(),
-        "future".to_string(),
-        toml::Value::Integer(7),
-    )];
-    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
-    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
-    assert_eq!(
-        parsed["models"]["opus"],
-        toml::Value::String("a\n[evil] = 1".into()),
-        "the modelled value is byte-identical:\n{out}"
-    );
-    assert_eq!(
-        parsed["models"]["future"],
-        toml::Value::Integer(7),
-        "the carried key lands as a key, not string text:\n{out}"
-    );
-}
-
-// A dotted sub-header `[t.s]` of the same root is NOT the table's block: the
-// walk must end the splice-capable region there, so a pending scalar never
-// lands after it (it would scope to `t.s`) — and a table with no bare block
-// re-attaches at EOF (round-2 review, nit). Direct unit, hand-built doc.
-#[test]
-fn merge_nested_carried_keys_treats_a_dotted_subheader_as_end_of_block() {
-    let rendered = "[a]\nx = 1\n[t.s]\ny = 2\n";
-    let nested = vec![("t".to_string(), "wait".to_string(), toml::Value::Integer(7))];
-    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
-    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
-    assert_eq!(parsed["a"]["x"], toml::Value::Integer(1), "{out}");
-    assert_eq!(parsed["t"]["s"]["y"], toml::Value::Integer(2), "{out}");
-    assert_eq!(
-        parsed["t"]["wait"],
-        toml::Value::Integer(7),
-        "the scalar scopes to [t], never to [t.s] or [a]:\n{out}"
-    );
-    assert!(
-        out.contains("[t]\nwait = 7"),
-        "the no-block table re-attaches at EOF under a fresh header:\n{out}"
-    );
-}
-
-// The odd-count entry rule breaks on two measured serializer shapes (round-3
-// review, major): a single-line BASIC string ending in a `'''` run
-// (`key = "a'''"`) and a single-line LITERAL holding `"""` (`'p"""q'`) each
-// contain one delimiter occurrence, so line-wise counting read them as
-// multi-line openers — the following header vanished into string state and
-// the carry re-attached a SECOND table at EOF, a file that no longer parses.
-// Direct units on the merge, hand-built docs.
-#[test]
-fn merge_nested_carried_keys_never_opens_string_state_on_a_single_line_value() {
-    for (rendered, value) in [
-        (
-            "[models]\nopus = \"a'''\"\n\n[herdr]\npane_tag = false\n",
-            "a'''",
-        ),
-        (
-            "[models]\ntitle = 'p\"\"\"q'\n\n[herdr]\npane_tag = false\n",
-            "p\"\"\"q",
-        ),
-    ] {
-        let nested = vec![(
-            "herdr".to_string(),
-            "future".to_string(),
-            toml::Value::Integer(7),
-        )];
-        let out = merge_nested_carried_keys(rendered.to_string(), &nested);
-        let parsed: toml::Table = toml::from_str(&out).expect("output parses");
-        assert_eq!(
-            parsed["models"]
-                .get("opus")
-                .or_else(|| parsed["models"].get("title")),
-            Some(&toml::Value::String(value.into())),
-            "the modelled value is byte-identical:\n{out}"
-        );
-        assert_eq!(
-            parsed["herdr"]["future"],
-            toml::Value::Integer(7),
-            "the carried key lands inside the render's own [herdr] block:\n{out}"
-        );
-    }
 }
 
 // The reset-display pair (issue #39) renders as its own on-disk vocabulary, so
@@ -1599,6 +1679,36 @@ fn non_finite_percent_fields_read_as_unset_at_load() {
         load_profile(&crate::profile::ProfileName::from(name))
             .expect("re-load after the bell_threshold rewrite");
     }
+}
+
+/// A load's canonical rewrite writes only while the file still holds what the
+/// load read: a peer's write landed between that read and the rewrite's flock
+/// is kept. The profile's NaN ceiling renders differently from the file the
+/// load read, so the render reads as non-canonical.
+#[test]
+fn a_load_rewrite_keeps_a_peer_write_landed_before_its_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p");
+    save_profile(&Profile::new("p".to_string(), None, None)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.max_auto_spend = Some(f64::NAN);
+
+    let read = std::fs::read_to_string(&config_path).expect("the load's read");
+    maybe_rewrite_config_toml(&config_path, &read, &profile);
+    let rewritten = std::fs::read_to_string(&config_path).expect("after the rewrite");
+    assert_ne!(
+        rewritten, read,
+        "control: an unchanged file takes the rewrite"
+    );
+
+    std::fs::write(&config_path, "max_auto_spend = 7.0\n").expect("peer write");
+    maybe_rewrite_config_toml(&config_path, &read, &profile);
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("after the skipped rewrite"),
+        "max_auto_spend = 7.0\n",
+        "the peer's write survives the rewrite rendered from the earlier read"
+    );
 }
 
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
@@ -2360,6 +2470,53 @@ fn a_touch_receipt_only_resolves_the_store_it_names() {
     );
 }
 
+/// One MCP login sync pass rewrites both of a profile's stores, so the receipt
+/// file holds one receipt per store: stamping one never replaces the other's.
+/// A file an older clauth wrote, holding one receipt, still resolves its store.
+#[test]
+fn a_touch_receipt_for_one_store_keeps_the_other_stores_receipt() {
+    let _home = HomeSandbox::new();
+    let name = "receipt-pair";
+    let profile = crate::profile::ProfileName::from(name);
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("access", "refresh"));
+    let cred_path = profile_subpath(&profile, "credentials.json").expect("cred path");
+    let sidecar = profile_subpath(&profile, "session-token.json").expect("sidecar path");
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    let now = std::time::SystemTime::now();
+    let cred_written = now - std::time::Duration::from_secs(300);
+    let sidecar_written = now - std::time::Duration::from_secs(200);
+    crate::testutil::set_mtime(&cred_path, now);
+    crate::testutil::set_mtime(&sidecar, now);
+    crate::profile_cache::write_touch_receipt(&profile, &cred_path, now, Some(cred_written));
+    crate::profile_cache::write_touch_receipt(&profile, &sidecar, now, Some(sidecar_written));
+
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(cred_written),
+        "the first store's receipt survives the second store's stamp",
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&sidecar),
+        Some(sidecar_written),
+    );
+
+    let receipt_file =
+        profile_subpath(&profile, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path");
+    std::fs::write(
+        &receipt_file,
+        serde_json::json!({ "store": "credentials.json", "stamped": now, "prev": cred_written })
+            .to_string(),
+    )
+    .expect("an older clauth's receipt");
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(cred_written),
+        "a single receipt an older clauth wrote still resolves its store",
+    );
+}
+
 /// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
 /// credential's granted scopes on refresh). Order must survive and an empty set
 /// must read as `None` so the refresh path falls back instead of sending `""`.
@@ -2410,6 +2567,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -2428,6 +2586,9 @@ fn credential_and_cache_files_have_restricted_permissions() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.
@@ -2592,7 +2753,7 @@ fn disabling_persists_and_leaves_credentials_byte_unchanged() {
     assert_eq!(reloaded.refresh_token(), profile.refresh_token());
 }
 
-/// The real usage-cache writer (`profile_cache::write_profile_cache`) must
+/// The per-profile cache file write every cache writer ends in must
 /// create usage_cache.json at 0o600 and, when it has to create the per-profile
 /// dir, that dir at 0o700. Driven on a FRESH profile name so the dir does not
 /// pre-exist.
@@ -2614,7 +2775,7 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         "precondition: profile dir must not pre-exist for a fresh profile"
     );
 
-    // Drive the actual production writer.
+    // Drive the cache file write every production writer ends in.
     let info = crate::usage::UsageInfo::default();
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),
@@ -2793,8 +2954,8 @@ fn the_perms_sweep_keeps_an_executables_owner_exec_bit() {
 /// Each of the 512 modes is posed on a file and on an empty dir directly under
 /// the root, which pins the per-bit rule there; a 0o755 root, two 0o755
 /// non-empty dirs below it and a 0o644 file at the bottom pin that the walk
-/// reads the root and descends. A rule that differs only at another depth is
-/// not pinned here.
+/// reads the root and descends. A per-bit rule that differs only at another
+/// depth is not pinned here.
 #[cfg(unix)]
 #[test]
 fn the_owner_only_checker_names_every_mode_but_0600_files_and_0700_dirs() {
@@ -2951,8 +3112,8 @@ fn profile_config_reads_models_table() {
 }
 
 // Model config must survive a config.toml render→parse round-trip, or
-// `maybe_rewrite_config_toml` would either drop a hand-set value or thrash the
-// file on every reload.
+// a load would normalize a hand-set value away or thrash the file on every
+// reload.
 #[test]
 fn model_settings_round_trip_through_config_toml() {
     let mut profile = Profile::new("p".to_string(), None, None);
@@ -2963,10 +3124,89 @@ fn model_settings_round_trip_through_config_toml() {
         haiku: None,
         fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
+        advisor: Some("opus".to_string()),
     };
     let rendered = render_config_toml(&profile);
     let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
     assert_eq!(parsed.models, profile.models);
+    assert!(
+        rendered.contains("advisor = \"opus\"\n"),
+        "the advisor row is written under [models]: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "`advisor` is the\n# server-side advisor model (the `advisorModel` setting)."
+        ),
+        "the generated comment block names the row"
+    );
+}
+
+/// The account's effort is its own top-level `effort` key, outside `[models]`
+/// (presets re-bind and launch demand read `[models]`), and survives a
+/// render→parse round-trip; an unset effort writes no key at all.
+#[test]
+fn effort_round_trips_as_its_own_account_key() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.effort = Some("max".to_string());
+    profile.models.default = Some("opus".to_string());
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.effort.as_deref(), Some("max"));
+    assert_eq!(
+        parsed.models, profile.models,
+        "effort never lands in [models]"
+    );
+    let doc: toml::Table = toml::from_str(&rendered).expect("parse as a table");
+    assert_eq!(
+        doc.get("effort").and_then(toml::Value::as_str),
+        Some("max"),
+        "`effort` is a top-level key: {rendered}"
+    );
+    assert!(
+        doc.get("models")
+            .and_then(toml::Value::as_table)
+            .is_none_or(|m| !m.contains_key("effort")),
+        "`effort` is not a [models] row"
+    );
+
+    let unset = render_config_toml(&Profile::new("q".to_string(), None, None));
+    let doc: toml::Table = toml::from_str(&unset).expect("parse as a table");
+    assert!(!doc.contains_key("effort"), "an unset effort writes no key");
+}
+
+/// The generated `config.toml` names the effort key and its one carrier in
+/// its comment block, so a hand-editor knows which `settings.json` key it
+/// feeds.
+#[test]
+fn the_config_comment_names_the_effort_carrier() {
+    let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        rendered.contains(concat!(
+            "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
+            "# (`effortLevel` is Claude Code's own key).\n",
+        )),
+        "the comment names the key and its one carrier: {rendered}"
+    );
+    assert!(
+        rendered.contains("# effort = \"high\"\n"),
+        "an unset effort renders as a commented example: {rendered}"
+    );
+}
+
+#[test]
+fn model_settings_advisor_row_is_a_settable_field() {
+    let mut models = ModelSettings::default();
+    assert!(models.is_empty());
+    models.set_field("advisor", Some("opus".to_string()));
+    assert_eq!(models.field("advisor").map(String::as_str), Some("opus"));
+    assert_eq!(models.advisor.as_deref(), Some("opus"));
+    assert!(
+        !models.is_empty(),
+        "a lone advisor row is not an empty block"
+    );
+    models.set_field("advisor", None);
+    assert!(models.field("advisor").is_none());
+    assert!(models.is_empty());
 }
 
 /// Write `profiles.toml` into the sandboxed home and read it back through the
@@ -4377,14 +4617,14 @@ fn a_carried_scalar_stays_top_level_beside_a_trailing_table() {
     );
 }
 
-/// The profiles.toml carry owes the same scoping rule: a scalar carried beside
-/// a non-default `[herdr]` block must not land inside it (`HerdrSettings`
-/// would silently drop the key on the next load — a loss, not a carry).
+/// An unknown top-level key above a non-default `[herdr]` block stays top-level
+/// through a save: inside `[herdr]`, `HerdrSettings` would silently drop it on
+/// the next load.
 #[test]
-fn a_carried_profiles_toml_scalar_stays_top_level_beside_herdr() {
+fn an_unknown_profiles_toml_scalar_stays_top_level_beside_herdr() {
     let _home = HomeSandbox::new();
 
-    let state = AppState {
+    let mut state = AppState {
         herdr: HerdrSettings {
             popup_width: crate::profile::PopupWidth::Half,
             ..HerdrSettings::default()
@@ -4395,9 +4635,9 @@ fn a_carried_profiles_toml_scalar_stays_top_level_beside_herdr() {
     save_app_state(&state).expect("save with herdr non-default");
 
     // The unknown key must be planted TOP-LEVEL, above the rendered [herdr]
-    // block — appending after it would nest the key inside [herdr] in the
-    // fixture itself, which is the corrupted-file shape, not a valid carry
-    // input. A hand-edit or an older clauth writes it top-level.
+    // block: appending after it would nest the key inside [herdr] in the
+    // fixture itself, which is the corrupted-file shape. A hand-edit or an
+    // older clauth writes it top-level.
     let path = app_state_path().expect("app_state_path");
     let raw = std::fs::read_to_string(&path).expect("read");
     let herdr_at = raw.find("[herdr]").expect("herdr block present");
@@ -4408,64 +4648,39 @@ fn a_carried_profiles_toml_scalar_stays_top_level_beside_herdr() {
     );
     std::fs::write(&path, planted).expect("plant unknown key top-level");
 
-    // The second save ALSO renders a [herdr] block (non-default again), so
-    // the carried scalar must splice in ABOVE it — the exact shape where a
-    // trailing-append carry would nest it inside [herdr].
+    // The second save adds a root key, so it writes: the new key and the
+    // unknown one must both stay above [herdr], where a root key appended at
+    // the end of the file would nest inside the table.
+    state.show_pace = true;
     save_app_state(&state).expect("save again, herdr still non-default");
     let after = std::fs::read_to_string(&path).expect("read after");
     let table: toml::Table = after.parse().expect("whole file parses");
     assert_eq!(
         table.get("some_unknown_future_key"),
         Some(&toml::Value::String("keepme".into())),
-        "the carried key is top-level, not inside [herdr]:\n{after}"
+        "the unknown key is top-level, not inside [herdr]:\n{after}"
     );
     assert!(
         table
             .get("herdr")
             .and_then(|h| h.get("some_unknown_future_key"))
             .is_none(),
-        "the carried key did not nest inside [herdr]:\n{after}"
+        "the unknown key did not nest inside [herdr]:\n{after}"
     );
-}
-
-/// A carried table-valued key and a carried scalar in one save: the scalar
-/// must not end up inside the carried table's own block either.
-#[test]
-fn carried_tables_and_scalars_keep_their_own_scopes() {
-    let merged = crate::profile::merge_carried_keys(
-        "fallback_threshold = 95.0\n".to_string(),
-        &[
-            (
-                "a_table".to_string(),
-                toml::Value::Table(
-                    [("x".to_string(), toml::Value::Integer(2))]
-                        .into_iter()
-                        .collect(),
-                ),
-            ),
-            ("z_scalar".to_string(), toml::Value::Boolean(true)),
-        ],
-    );
-    let table: toml::Table = merged.parse().expect("merged doc parses");
     assert_eq!(
-        table.get("z_scalar"),
+        table.get("show_pace"),
         Some(&toml::Value::Boolean(true)),
-        "scalar stays top-level:\n{merged}"
-    );
-    assert!(
-        table.get("a_table").is_some_and(|t| t.get("x").is_some()),
-        "table keeps its own sub-keys:\n{merged}"
+        "the second save wrote its change, top-level:\n{after}"
     );
 }
 
-/// Round-2 review hole: a modelled key whose on-disk value EQUALS its
-/// `skip_serializing_if` default (`show_pace = false`, a hand-edit writing the
-/// default) is erased from the round-trip key set. When the new state then
-/// moves the key OFF default, the render emits it AND the disk copy gets
-/// carried — a duplicate top-level key, which TOML hard-rejects, bricking
-/// profiles.toml. A carried key must be absent from the render as well.
+/// A modelled key whose on-disk value EQUALS its `skip_serializing_if` default
+/// (`show_pace = false`, a hand-edit writing the default) reads absent from the
+/// typed view. When the new state moves the key OFF default, the edit must take
+/// the line that is there: a second `show_pace` is a duplicate top-level key,
+/// which TOML hard-rejects, bricking profiles.toml.
 #[test]
-fn a_modelled_key_moved_off_default_is_not_carried_beside_its_render() {
+fn a_modelled_key_moved_off_default_edits_the_explicit_default_line() {
     let _home = HomeSandbox::new();
 
     save_app_state(&AppState::default()).expect("save a default state");
@@ -4496,89 +4711,35 @@ fn a_modelled_key_moved_off_default_is_not_carried_beside_its_render() {
     );
 }
 
-/// TOML-valid but `AppState`-invalid disk (a modelled key with a wrong-typed
-/// value) reaches the classification refusal — the round-1 finding-4 path —
-/// and must carry nothing: the render alone lands, loadable.
+/// A file that is not TOML is never written over: the save refuses with the
+/// load's own position-only parse error and leaves the bytes as they were.
 #[test]
-fn a_state_file_with_a_wrongly_typed_modelled_key_carries_nothing() {
+fn a_state_save_over_an_unparseable_file_refuses_and_writes_nothing() {
     let _home = HomeSandbox::new();
-
-    let path = app_state_path().expect("app_state_path");
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    // Valid TOML; `profiles` is not a list, so `AppState` refuses it.
-    std::fs::write(
-        &path,
-        "profiles = \"holder\"\nsome_unknown_future_key = \"keepme\"\n",
-    )
-    .expect("write unclassifiable state");
-
-    save_app_state(&AppState::default()).expect("save over it");
-
-    let after = std::fs::read_to_string(&path).expect("read after");
-    let parsed: AppState = toml::from_str(&after).expect("the written file loads");
-    assert!(parsed.profiles.is_empty(), "the render landed whole");
+    let before = "profiles = [\"holder\"\nnot toml at all {{{\n";
+    let path = write_state_file(before);
+    let load_err = load_app_state()
+        .expect_err("the fixture does not load")
+        .to_string();
     assert!(
-        !after.contains("some_unknown_future_key"),
-        "an unclassifiable file carries nothing — duplicating the render's keys would brick it:\n{after}"
+        load_err.starts_with("failed to parse ") && load_err.contains(" at line "),
+        "the load names a position: {load_err}"
     );
-}
 
-/// An array-of-tables (`[[key]]`) is not `is_table()`; carried with a scalar it
-/// must still land in the tail (after every scalar), or the scalar sorts after
-/// the array block and is swallowed into its last element.
-#[test]
-fn a_carried_array_of_tables_does_not_swallow_a_later_scalar() {
-    let merged = crate::profile::merge_carried_keys(
-        "fallback_threshold = 95.0\n".to_string(),
-        &[
-            (
-                "a_arr".to_string(),
-                toml::Value::Array(vec![toml::Value::Table(
-                    [("x".to_string(), toml::Value::Integer(2))]
-                        .into_iter()
-                        .collect(),
-                )]),
-            ),
-            ("z_scalar".to_string(), toml::Value::Boolean(true)),
-        ],
-    );
-    let table: toml::Table = merged.parse().expect("merged doc parses");
-    assert_eq!(
-        table.get("z_scalar"),
-        Some(&toml::Value::Boolean(true)),
-        "scalar stays top-level after the array-of-tables:\n{merged}"
-    );
-}
-
-/// An unparseable on-disk file must not widen the carry to everything: modelled
-/// keys would come back from disk beside the render's copy of the same key,
-/// and a duplicate top-level key is a hard parse error — the file this save
-/// was supposed to keep loadable. Carrying nothing is the safe direction.
-#[test]
-fn an_unparseable_state_file_carries_nothing() {
-    let _home = HomeSandbox::new();
-
-    let path = app_state_path().expect("app_state_path");
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&path, "profiles = [\"holder\"\nnot toml at all {{{\n")
-        .expect("write unparseable state");
-
-    save_app_state(&AppState {
+    let err = save_app_state(&AppState {
         profiles: vec![crate::profile::ProfileName::from("holder")],
         ..AppState::default()
     })
-    .expect("save over unparseable file");
+    .expect_err("a save over a file that is not TOML refuses");
 
-    let after = std::fs::read_to_string(&path).expect("read after");
-    let parsed: AppState = toml::from_str(&after).expect("the written file loads");
-    assert_eq!(parsed.profiles.len(), 1, "the render landed whole");
     assert!(
-        !after.contains("not toml at all"),
-        "nothing is resurrected from an unparseable body — carrying nothing is the safe direction:\n{after}"
+        err.chain().any(|cause| cause.to_string() == load_err),
+        "the refusal is the load's own parse error ({load_err}): {err:#}"
     );
-    assert!(
-        !after.contains(PRESERVED_KEYS_MARKER),
-        "no carry marker over an unclassifiable file:\n{after}"
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after"),
+        before,
+        "nothing written"
     );
 }
 
@@ -4807,88 +4968,226 @@ fn a_serve_table_round_trips() {
     );
 }
 
-/// A key inside `[serve]` that `ServeSettings` does not model now SURVIVES the
-/// next save while the table renders (its modelled key is non-default) — the
-/// recursive carry, the `[update]`-task class fix: a future nested key of a
-/// modelled table is carried inside that table's block, exactly like a future
-/// top-level key. The default-table case carries the whole table — see the
-/// sibling test.
+/// A key inside `[serve]` that `ServeSettings` does not model stays where it
+/// is, beside the modelled key, through a save that changes another key.
 #[test]
-fn a_stray_serve_key_survives_while_the_table_renders_non_default() {
+fn a_stray_serve_key_stays_in_place_while_the_table_renders_non_default() {
+    let _home = HomeSandbox::new();
+    let path =
+        write_state_file("profiles = []\n\n[serve]\nsession_creation = true\nstray = \"gone\"\n");
+
+    let mut state = load_app_state().expect("load");
+    assert!(state.serve.session_creation, "the modelled key loads");
+    state.switch_off_when_spent = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the stray key stays inside [serve]:\n{after}"
+    );
+    assert!(
+        after.ends_with("[serve]\nsession_creation = true\nstray = \"gone\"\n"),
+        "the [serve] block is byte for byte as written:\n{after}"
+    );
+}
+
+/// The boundary of an entry past the shapes a page can send: each near-miss
+/// names its own reason, and the forms a browser serializes all count.
+#[test]
+fn an_origin_entry_counts_only_as_a_browser_would_send_it() {
+    use crate::profile::origin_entry_fault as fault;
+
+    for (entry, reason) in [
+        (
+            "https://x.example.com:",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:+8443",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:08443",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:0",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://x.example.com:65536",
+            "its port is not a number a browser would send",
+        ),
+        (
+            "https://[::1",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://[zz]:8443",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://[2001:DB8::1]",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://b\u{fc}cher.example.com",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        ("https://[::1]x", "it is not scheme://host[:port]"),
+        (
+            "https://a\u{a0}b.example.com",
+            "it holds whitespace or a control character",
+        ),
+        (
+            "https://a.example.com\r\nX: y",
+            "it holds whitespace or a control character",
+        ),
+        (
+            "http://[::2]:5173",
+            "it is plain http on a host other than loopback",
+        ),
+        (
+            "https://x.example.com/p",
+            "it has a path or a trailing slash",
+        ),
+        ("https://x.example.com?q", "it has a query or a fragment"),
+        ("https://u@x.example.com", "it has userinfo"),
+        ("https://*.example.com", "it holds a wildcard"),
+    ] {
+        assert_eq!(fault(entry), Some(reason), "{entry:?}");
+    }
+
+    for entry in [
+        "https://a_b.example.com",
+        "https://x.example.com:65535",
+        "https://[::1]",
+        "http://[::1]",
+        "http://127.0.0.1",
+    ] {
+        assert_eq!(fault(entry), None, "{entry:?}");
+    }
+}
+
+/// A hand-set list survives every other writer's save, in order and verbatim,
+/// an entry that does not count included, and names its key exactly once: a
+/// duplicate key would stop the file parsing.
+#[test]
+fn a_set_app_origins_list_survives_a_state_save() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+
+    // From memory alone, so no carry of the old file can stand in for the field.
+    let state = AppState {
+        serve: ServeSettings {
+            app_origins: crate::profile::AppOrigins {
+                entries: vec![
+                    "https://b.example.com".to_string(),
+                    "https://a.example.com/not-an-origin".to_string(),
+                ],
+                ..Default::default()
+            },
+            ..ServeSettings::default()
+        },
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save");
+    let want = [
+        "https://b.example.com".to_string(),
+        "https://a.example.com/not-an-origin".to_string(),
+    ];
+    assert_eq!(
+        load_app_state().expect("load").serve.app_origins.entries,
+        want
+    );
+
+    // A save over that file, the shape every other writer takes.
+    let state = load_app_state().expect("load");
+    save_app_state(&state).expect("save again");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(after.matches("app_origins").count(), 1, "{after}");
+    assert_eq!(
+        load_app_state().expect("load").serve.app_origins.entries,
+        want
+    );
+}
+
+/// A value of the wrong type stays on disk through a save, so the next read
+/// meets what the user typed rather than a key that silently vanished.
+#[test]
+fn a_wrong_type_on_app_origins_survives_a_state_save() {
     let _home = HomeSandbox::new();
     let path = app_state_path().expect("app_state_path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(
         &path,
-        "profiles = []\n\n[serve]\nsession_creation = true\nstray = \"gone\"\n",
+        "profiles = []\n\n[serve]\napp_origins = \"https://x.example.com\"\n",
     )
     .expect("write");
 
     let state = load_app_state().expect("load");
-    assert!(state.serve.session_creation, "the modelled key loads");
+    assert_eq!(
+        state.serve.app_origins.entries,
+        Vec::<String>::new(),
+        "a bare string lists nothing"
+    );
+    assert_eq!(
+        state.serve.app_origins.unreadable,
+        ["\"https://x.example.com\""]
+    );
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read");
     let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
     assert_eq!(
-        parsed.get("serve").and_then(|serve| serve.get("stray")),
-        Some(&toml::Value::String("gone".into())),
-        "the future nested key survives inside the [serve] table:\n{after}"
-    );
-    assert!(
-        after.contains("session_creation = true"),
-        "the modelled key survives:\n{after}"
-    );
-    assert!(
-        after.contains(PRESERVED_KEYS_MARKER),
-        "the carried key sits under the preserved-keys marker:\n{after}"
+        parsed
+            .get("serve")
+            .and_then(|serve| serve.get("app_origins")),
+        Some(&toml::Value::String("https://x.example.com".into())),
+        "{after}"
     );
 }
 
-/// At its default on disk the whole `[serve]` table is itself unmodelled (the
-/// round-trip render omits it), so the carry keeps the table, stray included.
+/// A `[serve]` table holding only a key clauth does not model loads at its
+/// default and stays exactly as written through a save that changes another key.
 #[test]
-fn a_default_serve_table_carries_a_stray_key() {
+fn a_default_serve_table_keeps_a_stray_key_in_place() {
     let _home = HomeSandbox::new();
-    let path = app_state_path().expect("app_state_path");
-    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&path, "profiles = []\n\n[serve]\nstray = \"gone\"\n").expect("write");
+    let path = write_state_file("profiles = []\n\n[serve]\nstray = \"gone\"\n");
 
-    let state = load_app_state().expect("load");
+    let mut state = load_app_state().expect("load");
     assert!(
         !state.serve.session_creation,
         "the table loads at its default"
     );
+    state.switch_off_when_spent = true;
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read");
     let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
-    assert_eq!(
-        parsed.get("serve").and_then(|serve| serve.get("stray")),
-        Some(&toml::Value::String("gone".into())),
-        "the carried key stays inside the [serve] table:\n{after}"
-    );
     assert!(
         parsed.get("stray").is_none(),
-        "the carried key must not be hoisted to the top level:\n{after}"
+        "the stray key is not hoisted to the top level:\n{after}"
     );
     assert!(
-        after.contains(PRESERVED_KEYS_MARKER),
-        "the carry sits under the preserved-keys marker:\n{after}"
+        after.ends_with("\n[serve]\nstray = \"gone\"\n"),
+        "the [serve] block is byte for byte as written:\n{after}"
     );
-    let marker = after.find(PRESERVED_KEYS_MARKER).expect("marker present");
     assert!(
-        after[marker..].contains("[serve]"),
-        "the carried [serve] table lands after the marker:\n{after}"
+        !after.lines().any(|line| line.trim_start().starts_with('#')),
+        "the save writes no comment line of its own:\n{after}"
     );
 }
 
 /// A config.toml an older clauth wrote spells `auto_start` as its pre-rename
-/// alias `kick_timer`. The round-trip that decides "modelled" parses the alias
-/// into `auto_start` and re-emits it under that name, so `kick_timer` reads as
-/// unmodelled and was carried beside the render's own `auto_start`. Serde
-/// counts an alias and its field as one field, so the next load failed with a
-/// duplicate `auto_start` and the profile was unloadable until hand-edited.
+/// alias `kick_timer`. Serde counts an alias and its field as one field, so a
+/// save that writes `auto_start` beside the alias would fail the next load with
+/// a duplicate field. The in-place writer leaves the alias untouched when
+/// `auto_start` is unchanged, so the file keeps exactly one spelling.
 #[test]
 fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4910,8 +5209,8 @@ fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
     assert!(back.auto_start);
     let table: toml::Table = after.parse().expect("parses");
     assert!(
-        !table.contains_key("kick_timer"),
-        "the alias is rewritten under its field's name:\n{after}"
+        table.contains_key("kick_timer") && !table.contains_key("auto_start"),
+        "unchanged auto_start leaves the alias as the file's one spelling:\n{after}"
     );
 }
 
@@ -4940,60 +5239,6 @@ fn turning_auto_start_off_never_carries_the_alias_back() {
     assert!(!back.auto_start, "auto-start stays off:\n{after}");
     let table: toml::Table = after.parse().expect("parses");
     assert!(!table.contains_key("kick_timer"), "{after}");
-}
-
-/// A small model with a serde alias at the top level and inside a table, so
-/// the inert rule is pinned on its own: neither real model has a nested alias.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct AliasModel {
-    #[serde(alias = "old")]
-    new: bool,
-    #[serde(default)]
-    inner: AliasInner,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct AliasInner {
-    #[serde(alias = "old_in")]
-    new_in: bool,
-}
-
-#[test]
-fn an_alias_carry_is_never_inert_and_an_unmodelled_one_is() {
-    let render = "new = true\n\n[inner]\nnew_in = true\n";
-    let table: toml::Table = render.parse().unwrap();
-    let baseline = parsed_as::<AliasModel>(render);
-    assert!(baseline.is_some());
-    let yes = toml::Value::Boolean(true);
-
-    // Top level: the alias beside its field is a duplicate field.
-    assert!(!carry_is_inert::<AliasModel>(
-        baseline.as_deref(),
-        &table,
-        "old",
-        &yes
-    ));
-    assert!(carry_is_inert::<AliasModel>(
-        baseline.as_deref(),
-        &table,
-        "future",
-        &yes
-    ));
-    // A render that does not parse as the model carries nothing.
-    assert!(!carry_is_inert::<AliasModel>(None, &table, "future", &yes));
-
-    // Nested, entry by entry: the aliased key goes, its genuine sibling stays.
-    let nested = vec![
-        ("inner".to_string(), "old_in".to_string(), yes.clone()),
-        ("inner".to_string(), "future_in".to_string(), yes.clone()),
-    ];
-    let merged =
-        nested_carry_if_inert::<AliasModel>(render.to_string(), baseline.as_deref(), &nested);
-    let back: toml::Table = merged.parse().expect("merged parses");
-    let inner = back["inner"].as_table().expect("inner table");
-    assert!(inner.contains_key("future_in"), "{merged}");
-    assert!(!inner.contains_key("old_in"), "{merged}");
-    assert!(toml::from_str::<AliasModel>(&merged).is_ok(), "{merged}");
 }
 
 // `bell_command` is a hand-edited key: a rewrite keeps the operator's quoting
@@ -5654,7 +5899,7 @@ fn a_torn_store_notice_prints_once_per_account_per_process() {
 
     let capture = crate::out::ErrCapture::new();
     let guard = capture.capture_here();
-    let _armed = crate::profile::TornStoreNoticeArmed::new();
+    let _armed = crate::profile::LoadNoticesArmed::new();
 
     load_config().expect("first load");
     load_config().expect("second load");
@@ -5668,6 +5913,194 @@ fn a_torn_store_notice_prints_once_per_account_per_process() {
         String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
         expected,
         "two roster loads print the notice exactly once"
+    );
+}
+
+/// A torn store's reason can change between two loads of one account (a read
+/// failure, then a parse failure): the torn notice keys per account, so the
+/// second load prints nothing.
+#[test]
+fn a_torn_store_notice_prints_once_per_account_though_its_reason_changes() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("torn-notice-reason");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::create_dir_all(&store).expect("a directory in the store's place");
+    let io_error = crate::testutil::directory_read_error(&store);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let _armed = crate::profile::LoadNoticesArmed::new();
+
+    load_profile(&name).expect("a store that is a directory still loads");
+    std::fs::remove_dir(&store).expect("remove the directory");
+    std::fs::write(&store, TORN_STORE).expect("write torn credentials.json");
+    load_profile(&name).expect("a parse-torn store loads");
+
+    drop(guard);
+
+    let expected = format!(
+        "clauth: {name}: its stored login could not be read (credentials.json: {io_error}), so it \
+         shows as logged out until `clauth login {name}`\n"
+    );
+    assert_eq!(
+        String::from_utf8(capture.snapshot()).expect("utf-8 stderr"),
+        expected,
+        "one account keeps one torn line though its reason's text moved"
+    );
+}
+
+/// A stored name the roster never validated prints its bytes a name cannot
+/// hold as escapes: the notice cannot drive or reorder the terminal.
+#[test]
+fn a_name_notice_escapes_bytes_a_name_cannot_hold() {
+    let notice = crate::profile::NameNotice::of(
+        &crate::profile::ProfileName::from("-\u{1b}red"),
+        crate::harness::Harness::Claude,
+    )
+    .expect("a dash-led name is noticed");
+    assert_eq!(
+        notice.cli_line(),
+        "clauth: -\\u{001b}red: a name starting with '-' reads as a flag, so the commands clauth \
+         prints for it fail; rename it with `clauth rename -- -\\u{001b}red <new-name>`"
+    );
+    assert_eq!(
+        notice.toast_body(),
+        "-\\u{001b}red starts with '-', so the commands clauth prints for it fail\n\
+         rename it on the Setup tab"
+    );
+}
+
+/// A notice's remedy clause follows its roster: a claude account is renamed
+/// (`clauth rename` on the CLI line, Setup in the toast), a codex account has
+/// no rename and is deleted and logged in again.
+/// Each surface's copy is pinned whole, so a clause cannot drift between them.
+#[test]
+fn a_name_notice_copy_picks_the_remedy_its_roster_has() {
+    let claude = |name: &str| {
+        crate::profile::NameNotice::of(
+            &crate::profile::ProfileName::from(name),
+            crate::harness::Harness::Claude,
+        )
+        .expect("a hazardous name is noticed")
+    };
+    let codex = |name: &str| {
+        crate::profile::NameNotice::of(
+            &crate::profile::ProfileName::from(name),
+            crate::harness::Harness::Codex,
+        )
+        .expect("a hazardous name is noticed")
+    };
+
+    assert_eq!(
+        claude("-x").cli_line(),
+        "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; rename it with `clauth rename -- -x <new-name>`"
+    );
+    assert_eq!(
+        claude("-x").toast_body(),
+        "-x starts with '-', so the commands clauth prints for it fail\nrename it on the Setup tab"
+    );
+    assert_eq!(
+        codex("-c").cli_line(),
+        "clauth: -c: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; delete it and log in again under another name"
+    );
+    assert_eq!(
+        codex("-c").toast_body(),
+        "-c starts with '-', so the commands clauth prints for it fail\ndelete it and log in \
+         again under another name"
+    );
+    assert_eq!(
+        claude("list").cli_line(),
+        "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch to \
+         this account; switch with `clauth switch list`, or rename it with \
+         `clauth rename list <new-name>`"
+    );
+    assert_eq!(
+        claude("list").toast_body(),
+        "`clauth list` runs clauth's own command, not a switch to list\nswitch with `clauth \
+         switch list`, or rename it on the Setup tab"
+    );
+    assert_eq!(
+        codex("list").cli_line(),
+        "clauth: list: a bare `clauth list` runs clauth's own list command, never a switch to \
+         this account; switch with `clauth switch list`, or delete it and log in again under \
+         another name"
+    );
+    assert_eq!(
+        codex("list").toast_body(),
+        "`clauth list` runs clauth's own command, not a switch to list\nswitch with `clauth \
+         switch list`, or delete it and log in again under another name"
+    );
+}
+
+/// A torn store's notice and refusal print a stored name's bytes a name cannot
+/// hold as escapes, like the name notices: neither line can drive or reorder
+/// the terminal.
+#[test]
+fn a_torn_store_line_escapes_bytes_a_name_cannot_hold() {
+    let mut profile =
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("x\u{1b}[31mred"));
+    profile.unreadable_credentials_store = Some(crate::profile::UnreadableStoreReason::Parse);
+
+    assert_eq!(
+        crate::profile::unreadable_store_notice(&profile).expect("a torn store notices"),
+        "clauth: x\\u{001b}\\u{005b}31mred: its stored login could not be read \
+         (credentials.json does not parse), so it shows as logged out until \
+         `clauth login x\\u{001b}\\u{005b}31mred`"
+    );
+    assert_eq!(
+        crate::profile::unreadable_store_refusal(&profile).expect("a torn store refuses"),
+        "x\\u{001b}\\u{005b}31mred: its stored login could not be read \
+         (credentials.json does not parse); log in again with \
+         `clauth login x\\u{001b}\\u{005b}31mred` first, or the re-key would drop it"
+    );
+}
+
+/// The load notices print only on the thread the CLI dispatch armed: a roster
+/// load on a background thread (the `clauth start` watchdog's settings sync)
+/// writes nothing there, and must not spend the line the foreground load still
+/// owes.
+#[test]
+fn load_notices_print_only_on_the_arming_thread() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("-x");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save -x");
+    save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save state");
+
+    let capture = crate::out::ErrCapture::new();
+    let _guard = capture.capture_here();
+    let _armed = crate::profile::LoadNoticesArmed::new();
+
+    let behind = capture.clone();
+    std::thread::spawn(move || {
+        let _guard = behind.capture_here();
+        load_config().expect("a background roster load still loads");
+    })
+    .join()
+    .expect("the background load thread");
+
+    let before = capture.snapshot();
+    assert!(
+        before.is_empty(),
+        "a background load printed: {:?}",
+        String::from_utf8_lossy(&before)
+    );
+
+    load_config().expect("a load on the arming thread");
+    let after = capture.snapshot();
+    assert_eq!(
+        String::from_utf8_lossy(&after[before.len()..]),
+        "clauth: -x: a name starting with '-' reads as a flag, so the commands clauth prints \
+         for it fail; rename it with `clauth rename -- -x <new-name>`\n",
+        "the background load must not spend the arming thread's line"
     );
 }
 
@@ -5909,6 +6342,7 @@ fn create_account(name: &str) {
         None,
         Some("sk-id".to_string()),
         ModelSettings::default(),
+        None,
     )
     .expect("create");
 }
@@ -6279,7 +6713,7 @@ fn load_config_a_setgid_dir_keeps_setgid() {
 }
 
 /// Every top-level name in the set — the rescue's `SIDECAR_TREES` plus
-/// the store-link dirs `jobs` and `projects` — is retightened. The names are
+/// the store-link dirs in `SHARED_STORES` — is retightened. The names are
 /// hand-listed, not read from the constant, so a dropped or renamed entry reds
 /// here instead of hiding in a mirrored loop.
 #[cfg(unix)]
@@ -6458,7 +6892,7 @@ fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
         &config,
         crate::runtime::Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
@@ -6470,4 +6904,4582 @@ fn a_refused_setup_token_on_a_profile_loaded_from_disk_is_passed_over() {
         crate::fallback::durable_key_rejected_seed([loaded]).contains_key("refused"),
         "the verdict binds to the digest the loader read"
     );
+}
+
+/// A rotating pair whose refresh token is `refresh`.
+fn chain(refresh: &str, access: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The refresh token `name`'s `credentials.json` holds, read raw.
+fn raw_store_refresh(name: &str) -> Option<String> {
+    let path = profile_subpath(&ProfileName::from(name), "credentials.json").expect("path");
+    let creds: ClaudeCredentials = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    creds.refresh_token().map(str::to_string)
+}
+
+/// The store write refuses a chain another roster profile's store holds,
+/// naming that profile; the profile rewriting its own chain, and a chain no
+/// store holds, still land.
+#[test]
+fn a_store_write_refuses_a_chain_another_profile_holds() {
+    let _home = HomeSandbox::new();
+    for (name, refresh) in [("a", "rt-a"), ("b", "rt-b")] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain(refresh, &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    let write = |name: &str, creds: &ClaudeCredentials| {
+        with_state_lock(|held| {
+            write_profile_credentials(&ProfileName::from(name), Some(creds), held)
+        })
+    };
+    let err = write("b", &chain("rt-a", "at-b-copy")).expect_err("a's chain refuses");
+    assert_eq!(err.to_string(), "this login is already saved in 'a'");
+    assert_eq!(raw_store_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(raw_store_refresh("b").as_deref(), Some("rt-b"), "b's store");
+
+    write("a", &chain("rt-a", "at-a-refreshed")).expect("a rewrites its own chain");
+    write("b", &chain("rt-b-new", "at-b-new")).expect("a chain no store holds");
+    assert_eq!(raw_store_refresh("a").as_deref(), Some("rt-a"), "a's store");
+    assert_eq!(
+        raw_store_refresh("b").as_deref(),
+        Some("rt-b-new"),
+        "b's store"
+    );
+}
+
+/// A write into a profile's `session-token.json` sidecar never counts that
+/// profile's own `credentials.json` as another holder, whether the sidecar's
+/// path is spelled as the roster spells it or through a link to the profile's
+/// dir (unix); another profile's store still is one.
+#[test]
+fn a_sidecar_store_never_counts_its_own_profile_as_another_holder() {
+    let _home = HomeSandbox::new();
+    for (name, refresh) in [("a", "rt-a"), ("b", "rt-b")] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain(refresh, &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    let a_dir = profile_dir(&ProfileName::from("a")).expect("dir");
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut sidecars = vec![a_dir.join("session-token.json")];
+    #[cfg(unix)]
+    {
+        let link = home_dir().expect("home").join("a-dir-link");
+        std::os::unix::fs::symlink(&a_dir, &link).expect("link a's dir");
+        sidecars.push(link.join("session-token.json"));
+    }
+    for sidecar in sidecars {
+        assert_eq!(
+            chain_holder_elsewhere(&sidecar, &chain("rt-a", "at-a-item")).expect("roster"),
+            None,
+            "a's own chain at {}",
+            sidecar.display()
+        );
+        assert_eq!(
+            chain_holder_elsewhere(&sidecar, &chain("rt-b", "at-b-item")).expect("roster"),
+            Some(ProfileName::from("b")),
+            "b's chain at {}",
+            sidecar.display()
+        );
+    }
+}
+
+/// Two stores already holding one chain (written before the refusal
+/// existed) can each still rewrite it: the rewrite adds it to no store.
+#[test]
+fn a_store_already_sharing_a_chain_still_rewrites_it() {
+    let _home = HomeSandbox::new();
+    for name in ["a", "b"] {
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(chain("rt-shared", &format!("at-{name}")));
+        save_profile(&profile).expect("seed");
+    }
+    crate::testutil::register_names(&["a", "b"]);
+    with_state_lock(|held| {
+        write_profile_credentials(
+            &ProfileName::from("a"),
+            Some(&chain("rt-shared", "at-a-stamped")),
+            held,
+        )
+    })
+    .expect("a rewrites the chain it holds");
+    let stored = profile_subpath(&ProfileName::from("a"), "credentials.json").expect("path");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(stored).expect("read")).expect("parse");
+    assert_eq!(
+        creds.access_token(),
+        Some("at-a-stamped"),
+        "the rewrite landed"
+    );
+    assert_eq!(
+        raw_store_refresh("b").as_deref(),
+        Some("rt-shared"),
+        "b's store"
+    );
+}
+
+#[test]
+fn the_scalar_theme_key_still_reads() {
+    let state: AppState =
+        toml::from_str("profiles = []\ntheme = \"compatible\"\n").expect("parses");
+    assert_eq!(state.theme_tier(), Some(ThemeName::Compatible));
+}
+
+#[test]
+fn the_theme_table_names_the_tier() {
+    for (name, want) in [
+        ("full", ThemeName::Full),
+        ("compatible", ThemeName::Compatible),
+    ] {
+        let state: AppState =
+            toml::from_str(&format!("profiles = []\n[theme]\nname = \"{name}\"\n"))
+                .expect("parses");
+        assert_eq!(state.theme_tier(), Some(want), "{name}");
+    }
+}
+
+/// A name this build does not know leaves the tier to auto-detection and is
+/// kept, so a later build that knows it still finds it after any save.
+#[test]
+fn an_unknown_theme_name_reads_as_unset_and_survives_a_save() {
+    let mut state: AppState = toml::from_str("profiles = []\n[theme]\nname = \"dracula\"\n")
+        .expect("an unknown theme name parses");
+    assert_eq!(state.theme_tier(), None);
+    state.auto_start_queue = true;
+    let written = toml::to_string(&state).expect("serializes");
+    let back: toml::Value = toml::from_str(&written).expect("reparses");
+    assert_eq!(
+        back.get("theme")
+            .and_then(|t| t.get("name"))
+            .and_then(toml::Value::as_str),
+        Some("dracula"),
+        "the unknown name rides an unrelated save: {written}"
+    );
+}
+
+/// A save that picks no theme writes the form it read: an older clauth reads
+/// only the scalar, so an unrelated save never turns it into the table.
+#[test]
+fn a_save_without_a_theme_pick_keeps_the_scalar_form() {
+    let mut state: AppState = toml::from_str("profiles = []\ntheme = \"full\"\n").expect("parses");
+    state.auto_start_queue = true;
+    let written = toml::to_string(&state).expect("serializes");
+    let back: toml::Value = toml::from_str(&written).expect("reparses");
+    assert_eq!(
+        back.get("theme").and_then(toml::Value::as_str),
+        Some("full"),
+        "the scalar rides an unrelated save: {written}"
+    );
+}
+
+/// A pick writes the table form, never the scalar.
+#[test]
+fn a_theme_pick_writes_the_table_form() {
+    for scalar_first in [false, true] {
+        let mut state: AppState = if scalar_first {
+            toml::from_str("profiles = []\ntheme = \"full\"\n").expect("parses")
+        } else {
+            AppState::default()
+        };
+        state.set_theme(ThemeName::Compatible);
+        let written = toml::to_string(&state).expect("serializes");
+        let back: toml::Value = toml::from_str(&written).expect("reparses");
+        assert_eq!(
+            back.get("theme")
+                .and_then(|t| t.get("name"))
+                .and_then(toml::Value::as_str),
+            Some("compatible"),
+            "scalar first: {scalar_first}: {written}"
+        );
+        let reread: AppState = toml::from_str(&written).expect("reads back");
+        assert_eq!(reread.theme_tier(), Some(ThemeName::Compatible));
+    }
+}
+
+/// A multi-line inline table is refused the same as a one-line one: adding a
+/// subkey (c62b's shape) and removing one (c63's shape) both refuse and write
+/// nothing.
+#[test]
+fn a_save_editing_a_multiline_inline_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "env = {\n  A = \"b\" # note\n}\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("mlinlineadd", body);
+    profile.env.insert("C".to_string(), "d".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let body = "env = {\n  # proxy\n  A = \"b\",\n  B = \"c\",\n}\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("mlinlineremove", body);
+    profile.env.remove("A");
+    assert_save_refused(&profile, &path, body, "env");
+}
+
+/// A value where a table belongs (`env = "x"`) refuses the save when the
+/// profile sets an env key; the value is never edited in place.
+#[test]
+fn a_save_over_env_written_as_a_value_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "# keep\nenv = \"x\"\nlast_resort = true\n";
+    let path = profile_config_path(&ProfileName::from("envvalue")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("envvalue".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+}
+
+/// `kick_timer` beside `auto_start` is one serde field written twice, so the
+/// typed parse fails while `key_shape` still reads `auto_start` as a plain
+/// bool. A readable inline table before it in file order must not be named:
+/// the refusal names `kick_timer`, never the inline table the save leaves alone.
+#[test]
+fn a_refusal_names_the_kick_timer_alias_not_a_readable_inline_table_before_it() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\nkick_timer = true\nauto_start = true\n";
+    let path = profile_config_path(&ProfileName::from("aliasinline")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("aliasinline".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "kick_timer");
+}
+
+/// Writes `body` as profile `name`'s `config.toml` and loads it back.
+fn hand_written_config(name: &str, body: &str) -> (Profile, PathBuf) {
+    let name = ProfileName::from(name);
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    (load_profile(&name).unwrap(), path)
+}
+
+/// A save edits `config.toml` in place: a changed value keeps the comment
+/// above its key and the comment trailing its value.
+#[test]
+fn a_save_keeps_the_keys_and_values_decor() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("decor", "# my note\nfallback_threshold = 80  # inline\n");
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my note\nfallback_threshold = 90.0  # inline\n"
+    );
+}
+
+/// A save rewrites only the key whose value changed: an unchanged key keeps
+/// its spelling (`80`, not `80.0`), an unknown key stays where it sits, and a
+/// key the file never named appends at the end of its section.
+#[test]
+fn a_save_leaves_unknown_and_unchanged_keys_where_they_sit() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "inplace",
+        "fallback_threshold = 80\nsome_future_knob = true\nlast_resort = true\n",
+    );
+    profile.bell_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "fallback_threshold = 80\nsome_future_knob = true\nlast_resort = true\nbell_threshold = 90.0\n"
+    );
+}
+
+/// A newly set scalar lands top-level, never inside a trailing table, and the
+/// hand comment above that table stays.
+#[test]
+fn a_new_scalar_lands_top_level_and_a_tables_comment_stays() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("toplevel", "# hand note about env\n[env]\nFOO = \"bar\"\n");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.disabled, "disabled is a top-level key:\n{after}");
+    assert_eq!(parsed.env.len(), 1, "[env] gained nothing:\n{after}");
+    assert!(
+        after.contains("# hand note about env\n[env]\nFOO = \"bar\"\n"),
+        "the table and its comment stay as written:\n{after}"
+    );
+}
+
+/// A table the file never held is written as a `[console]` block, never an
+/// inline `console = { ... }`, and the rest of the file stays byte for byte.
+#[test]
+fn a_new_console_table_is_a_block_and_the_rest_of_the_file_stays() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("consoleblock", "# hand note\nfallback_threshold = 80\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.starts_with("# hand note\nfallback_threshold = 80\n"),
+        "{after}"
+    );
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert!(
+        doc.get("console").is_some_and(toml_edit::Item::is_table),
+        "a block table, not an inline one:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// Writing `auto_start` deletes its pre-rename alias `kick_timer`: left
+/// behind, it would bring the old value back on the next load. The alias's
+/// comment stays, since clauth never deletes a comment.
+#[test]
+fn a_save_writing_auto_start_drops_the_kick_timer_alias_and_keeps_its_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("alias", "# my alias note\nkick_timer = true\n");
+    assert!(profile.auto_start, "the alias loads as auto_start");
+    profile.auto_start = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# my alias note\n");
+}
+
+/// Removing a key from a hand-trimmed file (no template example to return
+/// to) deletes the key line alone: every comment line stays, whether the key
+/// sat before another key or last in the file.
+#[test]
+fn removing_a_key_keeps_every_comment_line() {
+    let _home = HomeSandbox::new();
+    let body =
+        "# Threshold docs.\nfallback_threshold = 80\n# Last-resort docs.\nlast_resort = true\n";
+
+    let (mut profile, path) = hand_written_config("trimmed", body);
+    profile.fallback_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Threshold docs.\n# Last-resort docs.\nlast_resort = true\n"
+    );
+
+    let (mut profile, path) = hand_written_config("trimmedlast", body);
+    profile.last_resort = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Threshold docs.\nfallback_threshold = 80\n# Last-resort docs.\n"
+    );
+}
+
+/// On a file shaped like the new-profile template, setting a key uncomments
+/// its example where it sits, under its doc, and unsetting it turns it back
+/// into the example: set-then-unset gives back the exact bytes, a hand
+/// comment included.
+#[test]
+fn a_save_toggles_a_template_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("toggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("toggle")).unwrap();
+    let original = format!("# my own note\n{}", std::fs::read_to_string(&path).unwrap());
+    std::fs::write(&path, &original).unwrap();
+
+    for (set, example, real) in [
+        (
+            (|p: &mut Profile| p.disabled = true) as fn(&mut Profile),
+            "# disabled = true\n",
+            "disabled = true\n",
+        ),
+        (
+            |p: &mut Profile| p.fallback_threshold = Some(90.0),
+            "# fallback_threshold = 95.0\n",
+            "fallback_threshold = 90.0\n",
+        ),
+    ] {
+        let mut profile = load_profile(&ProfileName::from("toggle")).unwrap();
+        set(&mut profile);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen(example, real, 1),
+            "the set uncomments {example:?} in place"
+        );
+
+        let profile = Profile::new("toggle".to_string(), None, None);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the unset turns {real:?} back into its example"
+        );
+    }
+}
+
+/// A scalar example under its doc block that sits before a later real key is
+/// replaced in place: the new key lands before the key that followed it, never
+/// appended after every other root key.
+#[test]
+fn a_save_toggles_an_example_under_its_doc_sitting_before_a_real_key() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("fallback_threshold");
+    let (mut profile, path) = hand_written_config(
+        "a2doc",
+        &format!("{doc}# fallback_threshold = 95.0\ndisabled = true\n"),
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{doc}fallback_threshold = 90.0\ndisabled = true\n")
+    );
+}
+
+/// The same toggle for a table: setting `[console]` on a template-shaped file
+/// replaces its commented example block where it sits, and unsetting brings
+/// the example block back byte for byte.
+#[test]
+fn a_save_toggles_the_console_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("tabletoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("tabletoggle")).unwrap();
+    let original = format!("# my own note\n{}", std::fs::read_to_string(&path).unwrap());
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tabletoggle")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let example = "# [console]\n# token = \"...\"\n# site = \"international\"\n# region = \"ap-southeast-1\"\n";
+    let real =
+        "[console]\ntoken = \"t0k\"\nsite = \"international\"\nregion = \"ap-southeast-1\"\n";
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(example, real, 1)
+    );
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A save over a file that is not TOML refuses with the load's own parse
+/// error and writes nothing: the user's bytes are never replaced by the
+/// template.
+#[test]
+fn a_save_over_a_file_that_is_not_toml_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("garbage");
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = "# my notes\nfallback_threshold = 9 0\nsome_future_knob = true\n";
+    std::fs::write(&path, body).unwrap();
+    let load_err = load_profile(&name).expect_err("the load refuses the file");
+    let mut profile = Profile::new("garbage".to_string(), None, None);
+    profile.disabled = true;
+    let save_err = save_profile_config(&profile).expect_err("the save refuses the file");
+    assert_eq!(save_err.to_string(), load_err.to_string());
+    assert!(
+        save_err
+            .to_string()
+            .starts_with("failed to parse garbage/config.toml at line 2, column "),
+        "{save_err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A doc block whose first line the user edited by prefixing it is no longer
+/// the key's doc: the match must start a line, so `## Disable this account`
+/// never reads as `# Disable this account`, and the key appends at the end.
+#[test]
+fn a_doc_block_with_a_prefixed_first_line_is_not_the_keys_doc() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("prefixed".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("prefixed")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let first = "# Disable this account: it becomes invisible to the fallback chain, the\n";
+    assert_eq!(template.matches(first).count(), 1);
+    let original = template.replace(first, &format!("#{first}"));
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("prefixed")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{original}disabled = true\n")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A key with no example site appends at the end of its section: in a file of
+/// comments alone, that is after the last comment, never above the first.
+#[test]
+fn an_appended_root_key_goes_after_a_comment_only_file() {
+    let _home = HomeSandbox::new();
+    let body = "# header\n\n# my notes\n";
+    let (mut profile, path) = hand_written_config("commentsonly", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A doc block clauth itself wrote in an earlier version is still the key's
+/// own doc: the example under it toggles in place, and the unset puts it back.
+#[test]
+fn an_example_under_an_earlier_clauth_doc_toggles_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("olddoc".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("olddoc")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n\
+                   # plus the daemon's bell_command when one is set. Range 0..=100.\n\
+                   # bell_threshold = 95.0\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# 5-hour utilization percentage at/above which clauth fires a bell\n\
+                 # notification in the overview tab. Range 0..=100.\n\
+                 # bell_threshold = 95.0\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("olddoc")).unwrap();
+    profile.bell_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace(
+            "notification in the overview tab. Range 0..=100.\n# bell_threshold = 95.0\n",
+            "notification in the overview tab. Range 0..=100.\nbell_threshold = 90.0\n"
+        )
+    );
+    profile.bell_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A file v0.18.0 wrote, before the no-5-hour-limit line, still toggles
+/// `auto_start` in place under its own older doc block, and unsetting gives the
+/// file back byte for byte.
+#[test]
+fn the_v0_18_0_auto_start_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldauto".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldauto")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = format!(
+        "{}{}",
+        scalar_doc("auto_start"),
+        scalar_example("auto_start")
+    );
+    assert_eq!(template.matches(&current).count(), 1);
+    let older = "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+                 # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+                 # no running window. ~0.001¢ per ping. OAuth profiles only.\n\
+                 # Old name `kick_timer = true` is still accepted.\n\
+                 # auto_start = true\n";
+    let original = template.replace(&current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldauto")).unwrap();
+    profile.auto_start = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("# auto_start = true\n", "auto_start = true\n")
+    );
+    profile.auto_start = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A file v0.18.1 wrote, before the `advisor` row, still toggles `[models]` in
+/// place under its own older doc block, and unsetting gives the file back byte
+/// for byte.
+#[test]
+fn the_v0_18_1_models_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldmodels".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldmodels")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n\
+                   # server-side advisor model (the `advisorModel` setting).\n\
+                   # [models]\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n# [models]\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldmodels")).unwrap();
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [models]\n# default = \"opusplan\"\n",
+            "[models]\ndefault = \"opusplan\"\n",
+            1
+        )
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A file written before the `[env]` doc named the put-back still toggles its
+/// `[env]` example in place under that older block, and unsetting gives the
+/// file back byte for byte.
+#[test]
+fn the_pre_put_back_env_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldenv".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldenv")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# this profile is active. A switch to another profile removes each one,\n\
+                   # or puts back the value ~/.claude/settings.json held before it.\n\
+                   # [env]\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# this profile is active. Cleared on switch to another profile.\n# [env]\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldenv")).unwrap();
+    profile.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n",
+            "[env]\nHTTP_PROXY = \"http://localhost:8080\"\n",
+            1
+        )
+    );
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// The `advisor` row saves into `[models]` in place beside the other rows and
+/// loads back, and clearing it deletes its line alone.
+#[test]
+fn a_save_writes_and_clears_the_advisor_row_in_place() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("madvisor", "[models]\ndefault = \"x\"  # keep\n");
+    profile.models.advisor = Some("opus".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\ndefault = \"x\"  # keep\nadvisor = \"opus\"\n"
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("madvisor"))
+            .unwrap()
+            .models
+            .advisor
+            .as_deref(),
+        Some("opus")
+    );
+    profile.models.advisor = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\ndefault = \"x\"  # keep\n"
+    );
+}
+
+/// The `effort` scalar saves into the template in place: a set value
+/// uncomments the example where it sits, a changed value edits its own line,
+/// and clearing it turns the line back into the example so the file is byte
+/// for byte the template again.
+#[test]
+fn a_save_writes_changes_and_clears_the_effort_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("efforttoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("efforttoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# effort = \"high\"\n").count(),
+        1,
+        "the template holds one effort example:\n{original}"
+    );
+
+    let mut profile = load_profile(&ProfileName::from("efforttoggle")).unwrap();
+    profile.effort = Some("max".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# effort = \"high\"\n", "effort = \"max\"\n", 1)
+    );
+
+    profile.effort = Some("low".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# effort = \"high\"\n", "effort = \"low\"\n", 1)
+    );
+
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// An `effort` line in a hand-written file keeps the comments around it and
+/// the unknown key beside it through a set and a clear.
+#[test]
+fn an_effort_line_beside_comments_and_an_unknown_key_survives_a_save() {
+    let _home = HomeSandbox::new();
+    let body = "# deployment note\neffort = \"high\"  # tuned by hand\ncustom_unknown = \"keep\"\n";
+    let (mut profile, path) = hand_written_config("efforthand", body);
+    profile.effort = Some("max".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# deployment note\neffort = \"max\"  # tuned by hand\ncustom_unknown = \"keep\"\n"
+    );
+
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# deployment note\n# tuned by hand\ncustom_unknown = \"keep\"\n"
+    );
+}
+
+/// Every `ModelSettings` field is a `[models]` row the in-place writer edits.
+/// The literal names every field, so a new one stops this test compiling until
+/// it is listed here and in the writer's rows.
+#[test]
+fn the_models_rows_cover_every_model_setting() {
+    let every = ModelSettings {
+        default: Some("a".to_string()),
+        opus: Some("a".to_string()),
+        sonnet: Some("a".to_string()),
+        haiku: Some("a".to_string()),
+        fable: Some("a".to_string()),
+        subagent: Some("a".to_string()),
+        advisor: Some("a".to_string()),
+    };
+    let serialized = serde_json::to_value(&every).unwrap();
+    let keys: std::collections::BTreeSet<&str> = serialized
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let rows: std::collections::BTreeSet<&str> = MODELS_FIELDS.iter().copied().collect();
+    assert_eq!(keys, rows);
+}
+
+/// The current doc block of every modelled key is in that key's list of doc
+/// blocks clauth has written, so a reworded doc can never drop its own.
+#[test]
+fn every_current_doc_block_is_among_its_keys_known_doc_blocks() {
+    for key in MODELLED_SCALARS
+        .iter()
+        .copied()
+        .chain(["console", "models", "env"])
+    {
+        assert!(
+            known_doc_blocks(key)
+                .iter()
+                .any(|d| *d == doc_block_for(key)),
+            "{key}'s current doc block is not in its known list"
+        );
+    }
+}
+
+/// A table set beside a hand-added root key below its example block keeps
+/// that block as written (a table cannot open above a root key), and the
+/// unset gives the file back byte for byte.
+#[test]
+fn a_table_set_below_a_hand_added_root_key_keeps_its_example_block() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("tablebelow".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("tablebelow")).unwrap();
+    let original = format!(
+        "{}last_resort = true\n",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tablebelow")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let mut rest = after.lines();
+    for line in original.lines() {
+        assert!(
+            rest.any(|l| l == line),
+            "`{line}` is gone or out of order:\n{after}"
+        );
+    }
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "last_resort stays a root key:\n{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"));
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table appended beside a root key whose prefix holds a commented example
+/// block with an edited doc (no site) round-trips byte for byte: removing the
+/// appended table drops its default separator, never leaves a stray blank.
+#[test]
+fn an_appended_table_beside_a_root_key_round_trips_byte_for_byte() {
+    let _home = HomeSandbox::new();
+    let edited = console_doc().replacen("international.\n", "international. (edited)\n", 1);
+    assert_ne!(edited, console_doc(), "the console doc is edited");
+    let body = format!("{edited}{CONSOLE_EXAMPLE}last_resort = true\n");
+    let (mut profile, path) = hand_written_config("t3shape", &body);
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let mut profile = load_profile(&ProfileName::from("t3shape")).unwrap();
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// Unsetting a key whose value carries a comment on its own line keeps that
+/// comment, on its own line where the key was.
+#[test]
+fn unsetting_a_key_keeps_its_inline_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "inlinecomment",
+        "# c\nfallback_threshold = 80  # my inline\nlast_resort = true\n",
+    );
+    profile.fallback_threshold = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# c\n# my inline\nlast_resort = true\n"
+    );
+}
+
+/// Clearing every key of a hand-written table drops the table, never a
+/// comment: the comments inside it and the one after its header stay.
+#[test]
+fn clearing_a_table_keeps_every_comment_in_it() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "envcomments",
+        "last_resort = true\n[env]\n# proxy for work\nA = \"b\"  # trailing\n",
+    );
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "last_resort = true\n# proxy for work\n# trailing\n"
+    );
+
+    let (mut profile, path) = hand_written_config(
+        "consolecomment",
+        "last_resort = true\n[console] # my console note\ntoken = \"t\"\nsite = \"international\"\nregion = \"r\"\n",
+    );
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "last_resort = true\n# my console note\n"
+    );
+}
+
+/// The error a save over a key in a shape the writer does not edit returns,
+/// as the CLI prints it after `clauth: `.
+fn refusal(profile: &str, key: &str) -> String {
+    format!(
+        "{profile}: config.toml has `{key}` in a shape clauth cannot read; fix or remove that line, then try again"
+    )
+}
+
+/// Saves `profile` over `path` holding `body`, and asserts the save is
+/// refused naming `key` with the file left byte for byte.
+fn assert_save_refused(profile: &Profile, path: &Path, body: &str, key: &str) {
+    let err = save_profile_config(profile).expect_err("the save is refused");
+    assert_eq!(err.to_string(), refusal(profile.name.as_str(), key));
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        body,
+        "nothing written"
+    );
+}
+
+/// A save that would edit a table written inline (`env = { ... }`) is
+/// refused and writes nothing: changing, adding and removing a key alike.
+#[test]
+fn a_save_editing_an_inline_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\n";
+
+    let (mut profile, path) = hand_written_config("inlineenv", body);
+    profile.env.insert("A".to_string(), "c".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let (mut profile, path) = hand_written_config("inlineadd", body);
+    profile.env.insert("C".to_string(), "d".to_string());
+    assert_save_refused(&profile, &path, body, "env");
+
+    let body = "models = { default = \"x\", opus = \"y\" }\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("inlineclear", body);
+    profile.models.default = None;
+    profile.models.opus = None;
+    assert_save_refused(&profile, &path, body, "models");
+}
+
+/// An inline table the save does not need to change stays as written while
+/// another key is set.
+#[test]
+fn an_inline_table_the_save_leaves_alone_stays_as_written() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }  # env note\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("inlinekeep", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A save that would edit a modelled key written as a multi-line string is
+/// refused and writes nothing.
+#[test]
+fn a_save_editing_a_multiline_string_value_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"\"\"https://a.example\"\"\"\n";
+    let (mut profile, path) = hand_written_config("multibase", body);
+    profile.base_url = Some("https://b.example".to_string());
+    assert_save_refused(&profile, &path, body, "base_url");
+}
+
+/// A save that would edit an `effort` written as a multi-line string is
+/// refused and writes nothing.
+#[test]
+fn a_save_editing_a_multiline_effort_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "effort = \"\"\"high\"\"\"\n";
+    let (mut profile, path) = hand_written_config("multieffort", body);
+    profile.effort = Some("max".to_string());
+    assert_save_refused(&profile, &path, body, "effort");
+}
+
+/// A key clauth cannot read (a wrong type, a table where a value belongs, the
+/// `kick_timer` alias beside `auto_start`) refuses the save and writes
+/// nothing; it is never repaired key by key.
+#[test]
+fn a_save_over_a_key_clauth_cannot_read_is_refused() {
+    let _home = HomeSandbox::new();
+    for (name, body, key) in [
+        (
+            "mistyped",
+            "# keep me\nfallback_threshold = \"90\"\nlast_resort = true\n",
+            "fallback_threshold",
+        ),
+        ("wrongshape", "[disabled]\nx = 1\n", "disabled"),
+        (
+            "aliasboth",
+            "kick_timer = true\nauto_start = true\n",
+            "kick_timer",
+        ),
+    ] {
+        let path = profile_config_path(&ProfileName::from(name)).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.fallback_threshold = Some(95.0);
+        profile.disabled = true;
+        assert_save_refused(&profile, &path, body, key);
+    }
+}
+
+/// Clearing every modelled key of `[models]` keeps a subkey clauth does not
+/// model, and the table holding it.
+#[test]
+fn clearing_modelled_models_keys_keeps_an_unknown_subkey() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "modelsunknown",
+        "[models]\ndefault = \"x\"\nfuture = \"y\"  # keep\n",
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[models]\nfuture = \"y\"  # keep\n"
+    );
+}
+
+/// On a file shaped like the new-profile template, toggling one table leaves
+/// the file exactly as the template renders the new profile, whatever other
+/// table is already set: no table moves, no doc line lands under the wrong
+/// header, and unsetting gives the original back.
+#[test]
+fn toggling_a_table_beside_a_set_table_matches_the_template_render() {
+    let _home = HomeSandbox::new();
+    let mut base = Profile::new("tpltables".to_string(), None, None);
+    base.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&base).unwrap();
+    let path = profile_config_path(&ProfileName::from("tpltables")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("tpltables")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile),
+        "console set beside env"
+    );
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile),
+        "models set beside env"
+    );
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A template example counts only as a whole comment line: the same text
+/// inside a longer comment is the user's prose, left as written, and the key
+/// appends at the end of its section.
+#[test]
+fn an_example_matches_only_as_a_whole_comment_line() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("disabled");
+    let prefixed = doc.replacen("# Disable", "## Disable", 1);
+    assert_ne!(prefixed, doc, "the first line is prefixed");
+    let body = format!("{prefixed}# disabled = true\nlast_resort = true\n");
+    let (mut profile, path) = hand_written_config("examplematch", &body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A file with CRLF line endings keeps them through a save.
+#[test]
+fn a_save_keeps_crlf_line_endings() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "crlf",
+        "# c\r\nfallback_threshold = 80\r\nlast_resort = true\r\n",
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# c\r\nfallback_threshold = 90.0\r\nlast_resort = true\r\n"
+    );
+}
+
+/// A CRLF file holding a multi-line string keeps that string's own line
+/// endings: a save never writes a bare carriage return, and a second save
+/// writes the same bytes.
+#[test]
+fn a_crlf_file_with_a_multiline_string_still_parses_after_a_save() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "crlfmulti",
+        "note = \"\"\"l1\r\nl2\"\"\"\r\nfallback_threshold = 80\r\n",
+    );
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    let expected = "note = \"\"\"l1\r\nl2\"\"\"\r\nfallback_threshold = 90.0\r\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+}
+
+/// A user's own comment line that reads like a template example is prose:
+/// the set uncomments the example under the key's doc block, never the
+/// user's line, and the unset gives the file back.
+#[test]
+fn a_set_uncomments_the_example_under_its_doc_not_a_users_copy() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("usercopy".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("usercopy")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let user = "# my notes:\n# disabled = true\n";
+    let original = format!("{user}{template}");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("usercopy")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!(
+            "{user}{}",
+            template.replacen("# disabled = true\n", "disabled = true\n", 1)
+        )
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table materialized from an example block that sits above a root key
+/// never takes the comments above that block with it: the file's header
+/// and the root key stay before the first table header.
+#[test]
+fn a_materialized_table_leaves_the_root_comments_at_the_root() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config(
+        "rootcomments",
+        &format!(
+            "# header\n\n{}{}last_resort = true\n\n[env]\nA = \"b\"\n",
+            console_doc(),
+            CONSOLE_EXAMPLE
+        ),
+    );
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let root = after.split("\n[").next().unwrap();
+    assert!(after.starts_with("# header\n"), "{after}");
+    assert!(
+        root.lines().any(|l| l == "last_resort = true"),
+        "the root key stays before every table header:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "{after}");
+    assert_eq!(parsed.env.len(), 1, "{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// `[models]` toggles the same way `[console]` does: the template example
+/// block becomes the real table where it sits, and back.
+#[test]
+fn a_save_toggles_the_models_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("mtoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("mtoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("mtoggle")).unwrap();
+    profile.models.default = Some("opusplan".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [models]\n# default = \"opusplan\"\n",
+            "[models]\ndefault = \"opusplan\"\n",
+            1
+        )
+    );
+
+    profile.models.default = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// `[env]` toggles the same way: the template example block becomes the real
+/// table where it sits, and unsetting brings the example block back.
+#[test]
+fn a_save_toggles_the_env_example_block_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("etoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("etoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("etoggle")).unwrap();
+    profile.env.insert(
+        "HTTP_PROXY".to_string(),
+        "http://localhost:8080".to_string(),
+    );
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n",
+            "[env]\nHTTP_PROXY = \"http://localhost:8080\"\n",
+            1
+        )
+    );
+
+    profile.env.clear();
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table materialized without a template example is removed whole when every
+/// subkey goes unset, and the file's other bytes stay.
+#[test]
+fn a_save_removes_a_materialized_table_when_all_subkeys_go_unset() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("consoleno", "# hand note\nfallback_threshold = 80\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[console]\n"),
+        "{path:?}"
+    );
+
+    profile.console = None;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let doc: toml_edit::DocumentMut = after.parse().unwrap();
+    assert!(doc.get("console").is_none(), "{after}");
+    assert!(
+        after.starts_with("# hand note\nfallback_threshold = 80\n"),
+        "{after}"
+    );
+}
+
+/// Writing a key beside an unchanged `auto_start` leaves the pre-rename alias
+/// untouched: only a set/unset of `auto_start` itself drops it.
+#[test]
+fn a_save_leaves_kick_timer_when_auto_start_is_unchanged() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("aliasunch", "kick_timer = true\n");
+    assert!(profile.auto_start, "the alias loads as auto_start on");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    let table: toml::Table = after.parse().unwrap();
+    assert!(table.contains_key("kick_timer"), "{after}");
+    assert!(
+        table.get("disabled").and_then(toml::Value::as_bool) == Some(true),
+        "{after}"
+    );
+}
+
+/// An example line with no doc block above it is prose even when a real key
+/// follows it: the set appends the key at its section's end and leaves the
+/// commented line where it sits.
+#[test]
+fn an_example_without_its_doc_block_stays_before_a_real_key() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("a2", "# fallback_threshold = 95.0\ndisabled = true\n");
+    profile.fallback_threshold = Some(90.0);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# fallback_threshold = 95.0\ndisabled = true\nfallback_threshold = 90.0\n"
+    );
+}
+
+/// Env keys that TOML requires quoted (`A:B`, `A.B`, `has space`) round-trip
+/// through the writer's key encoder.
+#[test]
+fn an_env_key_with_special_chars_is_quoted() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("envquote", "");
+    profile.env.insert("A:B".to_string(), "v1".to_string());
+    profile.env.insert("A.B".to_string(), "v2".to_string());
+    profile
+        .env
+        .insert("has space".to_string(), "v3".to_string());
+    save_profile_config(&profile).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("\"A:B\" = \"v1\"\n"), "{after}");
+    assert!(after.contains("\"A.B\" = \"v2\"\n"), "{after}");
+    assert!(after.contains("\"has space\" = \"v3\"\n"), "{after}");
+}
+
+/// A save with no `config.toml` yet writes the plain template render.
+#[test]
+fn a_save_over_a_missing_file_writes_the_template() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("nofile");
+    let path = profile_config_path(&name).unwrap();
+    let mut profile = Profile::new("nofile".to_string(), None, None);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_config_toml(&profile)
+    );
+}
+
+/// An example line with no template doc block above it is the user's prose,
+/// however many copies the file holds: the set appends the key at the end of
+/// its section and leaves every copy as written.
+#[test]
+fn an_example_without_its_doc_block_is_never_uncommented() {
+    let _home = HomeSandbox::new();
+    let body = "# disabled = true\n# disabled = true\nlast_resort = true\n";
+    let (mut profile, path) = hand_written_config("twice", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A lookalike example in another table's leading comments, with no doc block
+/// above it, stays where it is, blank line included; the new key lands at the
+/// root.
+#[test]
+fn a_lookalike_example_in_a_tables_comments_stays_prose() {
+    let _home = HomeSandbox::new();
+    let body = "[env]\nA = \"b\"\n\n# disabled = true\n[models]\ndefault = \"x\"\n";
+    let (mut profile, path) = hand_written_config("blankline", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("disabled = true\n{body}")
+    );
+}
+
+/// Once the user reworded a key's template doc block, no example line
+/// is the key's own any more: a lookalike line the user wrote above the
+/// template is never uncommented, nor is the template's own example; the set
+/// adds one live line, and the unset gives the file back byte for byte.
+#[test]
+fn a_reworded_doc_block_leaves_every_example_line_as_written() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("reworded".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("reworded")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let at = template
+        .find("\n# disabled = true\n")
+        .expect("the template carries the disabled example");
+    let doc_line_start = template[..at].rfind('\n').map_or(0, |i| i + 1);
+    let reworded = format!(
+        "{}{} (edited){}",
+        &template[..doc_line_start],
+        &template[doc_line_start..at],
+        &template[at..]
+    );
+    let original = format!("# my notes:\n# disabled = true\n{reworded}");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("reworded")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let live: Vec<&str> = after.lines().filter(|l| *l == "disabled = true").collect();
+    assert_eq!(live.len(), 1, "one live line:\n{after}");
+    let without_live: Vec<&str> = after.lines().filter(|l| *l != "disabled = true").collect();
+    assert_eq!(
+        without_live,
+        original.lines().collect::<Vec<_>>(),
+        "every other line as written:\n{after}"
+    );
+    assert!(
+        load_profile(&ProfileName::from("reworded"))
+            .unwrap()
+            .disabled
+    );
+
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table example whose doc block was reworded has no example site either:
+/// the set appends the table at the document's end and leaves the commented
+/// block as prose, as it does for a scalar.
+#[test]
+fn a_reworded_tables_doc_block_leaves_its_example_block_as_prose() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("rewordedtable".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("rewordedtable")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let original = template.replacen(
+        "# site: domestic | international.\n",
+        "# site: domestic | international. (edited)\n",
+        1,
+    );
+    assert_ne!(original, template, "the console doc block is edited");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("rewordedtable")).unwrap();
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("# [console]\n# token = \"...\"\n"),
+        "the commented example stays prose:\n{after}"
+    );
+    assert!(
+        after.ends_with(
+            "[console]\ntoken = \"t0k\"\nsite = \"international\"\nregion = \"ap-southeast-1\"\n"
+        ),
+        "the table appends at the document's end:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"));
+}
+
+/// Every modelled scalar key owns a non-empty doc block and example line: the
+/// exhaustive lookup must never silently yield nothing for a key the model
+/// knows.
+#[test]
+fn every_modelled_scalar_has_a_doc_and_an_example() {
+    for key in MODELLED_SCALARS {
+        assert!(!scalar_doc(key).is_empty(), "{key}");
+        assert!(!scalar_example(key).is_empty(), "{key}");
+    }
+}
+
+/// Every modelled scalar key's kind table names that key: a key in
+/// `MODELLED_SCALARS` with no `modelled_scalar` arm would be invisible to the
+/// shape check the writer refuses over.
+#[test]
+fn every_modelled_scalar_has_a_key_kind() {
+    for key in MODELLED_SCALARS {
+        assert_eq!(
+            modelled_scalar(key).map(|(_, name)| name),
+            Some(key),
+            "{key}"
+        );
+    }
+}
+
+/// Every scalar key a fully-set `ProfileConfig` serializes is in
+/// `MODELLED_SCALARS`: a scalar field added to the model without claiming a doc
+/// block and example fails this test.
+#[test]
+fn every_profile_config_scalar_is_modelled() {
+    let config = ProfileConfig {
+        base_url: Some("x".to_string()),
+        api_key: Some("x".to_string()),
+        auto_start: true,
+        usage_probe: true,
+        usage_probe_interval_ms: Some(120_000),
+        env: BTreeMap::new(),
+        models: ModelSettings::default(),
+        effort: Some("x".to_string()),
+        fallback_threshold: Some(0.0),
+        weekly_threshold: Some(0.0),
+        last_resort: true,
+        rolling_token: true,
+        preferred: true,
+        preferred_days: vec!["sat".to_string()],
+        max_auto_spend: Some(0.0),
+        check_weekly: Some(false),
+        check_scoped: Some(false),
+        check_credit_cap: Some(false),
+        bell_threshold: Some(0.0),
+        disabled: true,
+        console: ConsoleConfig::default(),
+    };
+    let serialized = toml::to_string(&config).unwrap();
+    let table: toml::Table = toml::from_str(&serialized).unwrap();
+    let unmodelled: Vec<&str> = table
+        .iter()
+        .filter(|(_, v)| !v.is_table())
+        .map(|(k, _)| k.as_str())
+        .filter(|k| !MODELLED_SCALARS.contains(k))
+        .collect();
+    assert!(
+        unmodelled.is_empty(),
+        "unmodelled scalar keys: {unmodelled:?}"
+    );
+}
+
+/// A template-shaped file saved with CRLF line endings toggles like an LF one:
+/// the set uncomments the example under its doc, the unset turns it back, and
+/// every line ending stays CRLF.
+#[test]
+fn a_crlf_template_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("crlftoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("crlftoggle")).unwrap();
+    let original = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("crlftoggle")).unwrap();
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen("# disabled = true\r\n", "disabled = true\r\n", 1)
+    );
+
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// A table appended to a file that ends in a root comment goes after that
+/// comment: the comment stays at the root, above the new table's header.
+#[test]
+fn an_appended_table_goes_after_the_files_trailing_root_comment() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) =
+        hand_written_config("trailingroot", "last_resort = true\n# my end note\n");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.starts_with("last_resort = true\n# my end note\n"),
+        "{after}"
+    );
+    let note = after.find("# my end note").unwrap();
+    let header = after.find("[console]").unwrap();
+    assert!(
+        note < header,
+        "the root comment stays above [console]:\n{after}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&after).unwrap();
+    assert!(parsed.last_resort, "{after}");
+    assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
+}
+
+/// A table field added to `ProfileConfig` without a writer arm fails: the
+/// modelled table key set is pinned against the model's serialized tables, so a
+/// 4th table the completeness test would otherwise never read reds here.
+#[test]
+fn every_profile_config_table_is_modelled() {
+    let config = ProfileConfig {
+        base_url: Some("x".to_string()),
+        api_key: Some("x".to_string()),
+        auto_start: true,
+        usage_probe: true,
+        usage_probe_interval_ms: Some(120_000),
+        env: BTreeMap::from([("A".to_string(), "b".to_string())]),
+        models: ModelSettings {
+            default: Some("d".to_string()),
+            opus: Some("o".to_string()),
+            sonnet: Some("s".to_string()),
+            haiku: Some("h".to_string()),
+            fable: Some("f".to_string()),
+            subagent: Some("g".to_string()),
+            advisor: Some("v".to_string()),
+        },
+        effort: Some("x".to_string()),
+        fallback_threshold: Some(0.0),
+        weekly_threshold: Some(0.0),
+        last_resort: true,
+        rolling_token: true,
+        preferred: true,
+        preferred_days: vec!["sat".to_string()],
+        max_auto_spend: Some(0.0),
+        check_weekly: Some(false),
+        check_scoped: Some(false),
+        check_credit_cap: Some(false),
+        bell_threshold: Some(0.0),
+        disabled: true,
+        console: ConsoleConfig {
+            token: Some("t".to_string()),
+            site: Some("international".to_string()),
+            region: Some("ap-southeast-1".to_string()),
+        },
+    };
+    let serialized = toml::to_string(&config).unwrap();
+    let table: toml::Table = toml::from_str(&serialized).unwrap();
+    let mut tables: Vec<&str> = table
+        .iter()
+        .filter(|(_, v)| v.is_table())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    tables.sort_unstable();
+    assert_eq!(tables, ["console", "env", "models"]);
+}
+
+/// Every field the writer's edit step handles is pinned behaviourally: an empty
+/// file, a profile with every field off its default, one save, and the reloaded
+/// `ProfileConfig` equals the canonical one the writer builds from that profile.
+/// A field `apply_config_edits` skips stays absent on disk and the equality
+/// fails.
+#[test]
+fn a_save_writes_every_modelled_field_from_an_empty_file() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("fullyset");
+    let path = profile_config_path(&name).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "").unwrap();
+
+    let mut profile = Profile::new(
+        "fullyset".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-ant-test".to_string()),
+    );
+    profile.auto_start = true;
+    profile.env = BTreeMap::from([
+        ("A".to_string(), "b".to_string()),
+        ("C".to_string(), "d".to_string()),
+    ]);
+    profile.models = ModelSettings {
+        default: Some("d".to_string()),
+        opus: Some("o".to_string()),
+        sonnet: Some("s".to_string()),
+        haiku: Some("h".to_string()),
+        fable: Some("f".to_string()),
+        subagent: Some("g".to_string()),
+        advisor: Some("v".to_string()),
+    };
+    profile.effort = Some("high".to_string());
+    profile.fallback_threshold = Some(50.0);
+    profile.weekly_threshold = Some(70.0);
+    profile.last_resort = true;
+    profile.preferred = true;
+    profile.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    profile.rolling_token = true;
+    profile.max_auto_spend = Some(5.0);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    profile.check_credit_cap = false;
+    profile.bell_threshold = Some(90.0);
+    profile.disabled = true;
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    let reloaded: ProfileConfig = toml::from_str(&after).unwrap();
+    assert_eq!(reloaded, canonical_profile_config(&profile), "{after}");
+}
+
+/// A file holding a key clauth cannot read names that key, never a readable
+/// key before it the save leaves alone: an inline `env` the profile keeps as
+/// is is not the offender.
+#[test]
+fn a_refusal_names_the_unreadable_key_not_an_untouched_inline_table() {
+    let _home = HomeSandbox::new();
+    let body = "env = { A = \"b\" }\nfallback_threshold = \"90\"\n";
+    let path = profile_config_path(&ProfileName::from("unreadablenext")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("unreadablenext".to_string(), None, None);
+    profile.env.insert("A".to_string(), "b".to_string());
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "fallback_threshold");
+}
+
+/// A key clauth cannot read refuses the save even when the save leaves that
+/// key alone: the file's on-disk values are unknowable, as every load of it
+/// fails too.
+#[test]
+fn an_unreadable_key_refuses_a_save_that_leaves_it_alone() {
+    let _home = HomeSandbox::new();
+    let body = "# keep me\nfallback_threshold = \"90\"\nlast_resort = true\n";
+    let path = profile_config_path(&ProfileName::from("unreadablekeep")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("unreadablekeep".to_string(), None, None);
+    profile.last_resort = true;
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "fallback_threshold");
+}
+
+/// An array written across several lines is not a one-line value: a save
+/// that would change it is refused, so a comment inside it is never lost.
+#[test]
+fn a_save_editing_a_multiline_array_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "preferred_days = [\n  \"sat\", # weekend\n  \"sun\",\n]\n";
+    let (mut profile, path) = hand_written_config("multidays", body);
+    profile.preferred_days = vec![Weekday::Mon];
+    assert_save_refused(&profile, &path, body, "preferred_days");
+}
+
+/// A table written as dotted keys (`models.default = "x"`) is not a block
+/// table: a save that would change it is refused, and one that leaves it
+/// alone keeps it as written.
+#[test]
+fn a_save_editing_a_dotted_key_table_is_refused() {
+    let _home = HomeSandbox::new();
+    let body = "models.default = \"x\"\n";
+    let (mut profile, path) = hand_written_config("dottededit", body);
+    profile.models.default = Some("y".to_string());
+    assert_save_refused(&profile, &path, body, "models");
+
+    let (mut profile, path) = hand_written_config("dottedkeep", body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{body}disabled = true\n")
+    );
+}
+
+/// A mistyped `auto_start` beside the `kick_timer` alias names `auto_start`,
+/// whichever comes first: removing the alias alone would not fix the file.
+#[test]
+fn a_mistyped_auto_start_beside_its_alias_names_auto_start() {
+    let _home = HomeSandbox::new();
+    for (name, body) in [
+        ("aliasfirst", "kick_timer = true\nauto_start = \"x\"\n"),
+        ("aliassecond", "auto_start = \"x\"\nkick_timer = true\n"),
+    ] {
+        let path = profile_config_path(&ProfileName::from(name)).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.disabled = true;
+        assert_save_refused(&profile, &path, body, "auto_start");
+    }
+}
+
+/// A mistyped `kick_timer` alias on its own names `kick_timer`, as a mistyped
+/// `auto_start` names `auto_start`.
+#[test]
+fn a_mistyped_kick_timer_alias_names_kick_timer() {
+    let _home = HomeSandbox::new();
+    let body = "kick_timer = \"x\"\n";
+    let path = profile_config_path(&ProfileName::from("aliasmistyped")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let mut profile = Profile::new("aliasmistyped".to_string(), None, None);
+    profile.disabled = true;
+    assert_save_refused(&profile, &path, body, "kick_timer");
+}
+
+/// A file whose last line has no newline: an appended root key starts its own
+/// line instead of joining the last comment, and the reload reads it.
+#[test]
+fn an_appended_key_after_a_last_line_with_no_newline_starts_its_own_line() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("nonl", "# my config");
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my config\ndisabled = true\n"
+    );
+    assert!(load_profile(&ProfileName::from("nonl")).unwrap().disabled);
+}
+
+/// The same for an appended table: its header starts its own line, and the
+/// reload reads the table.
+#[test]
+fn an_appended_table_after_a_last_line_with_no_newline_starts_its_own_line() {
+    let _home = HomeSandbox::new();
+    let (mut profile, path) = hand_written_config("nonltable", "# note");
+    profile.console = Some(ConsoleCredential {
+        token: "t0k".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile_config(&profile).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.starts_with("# note\n"), "{after}");
+    assert!(after.lines().any(|l| l == "[console]"), "{after}");
+    let reloaded = load_profile(&ProfileName::from("nonltable")).unwrap();
+    assert_eq!(reloaded.console.map(|c| c.token), Some("t0k".to_string()));
+}
+
+/// An example whose doc block sits after a table header cannot hold a root
+/// key: the key appends at the root, the block stays as written, and the unset
+/// gives the file back byte for byte.
+#[test]
+fn an_example_inside_a_tables_area_is_no_site_for_a_root_key() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[env]\nA = \"b\"\n\n{}# disabled = true\n\n[models]\ndefault = \"x\"\n",
+        scalar_doc("disabled")
+    );
+    let (mut profile, path) = hand_written_config("intable", &body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("disabled = true\n{body}")
+    );
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// Pins every key's and table's current doc block by digest. The list test
+/// above cannot catch a reword, since `known_doc_blocks` starts from the very
+/// `doc_block_for` it checks; a reword that forgets to keep the old text
+/// strands every file's example toggle, and turns this digest red.
+#[test]
+fn every_current_doc_block_matches_its_pinned_digest() {
+    let pinned: BTreeMap<&str, &str> = [
+        (
+            "base_url",
+            "95d4a572b6789c4aba79697e57461e564b11df50e8be7cb7fb2a4f3afca85a22",
+        ),
+        (
+            "api_key",
+            "945c16add014d73d50c4020b935205f4ba666a25287a1c29808db1861714b9d6",
+        ),
+        (
+            "auto_start",
+            "5a5fc00860ba38dbd36ed3958c1c4816ddc4f3a25c06cd2157bfce1c6108cbfb",
+        ),
+        (
+            "usage_probe",
+            "a898cf7d8afd331066cc2c206ca1cba8faad6675795a0de79303638f706a355e",
+        ),
+        (
+            "usage_probe_interval_ms",
+            "a6156cdb012c9f83e80563b0631987388fd32c7665538888c5016443055745f0",
+        ),
+        (
+            "fallback_threshold",
+            "0c070a2c69a7845aa1f46af795972817494d8a4b3a8d5a1f5438b07c876de77c",
+        ),
+        (
+            "weekly_threshold",
+            "c15467bc285c5aa05a8623a2b62205de50e3cc2e687e56cc88a9beb4f49eccae",
+        ),
+        (
+            "last_resort",
+            "9eb0d826508b3f0c62713a70b7655fa3569ab01cc1eff2cdedafc68e3933cc8d",
+        ),
+        (
+            "preferred",
+            "21ab90245e81e1ee27e2aa344084166a32ad1e81025c9f6a7e05c702bb4cd31c",
+        ),
+        (
+            "preferred_days",
+            "fd83d4867fb64b1be1e65d7fb4b2f2e2de0a84cfe84abba1a2dc7b25b78a5cfc",
+        ),
+        (
+            "rolling_token",
+            "c46cddebec5c30ab676b4d85eaaa9bc8f271d6a538e6f7d2ad1d0b04d5b8b7f6",
+        ),
+        (
+            "max_auto_spend",
+            "97f6df3ff75bfcd230c82eb74ae4e47a59de928c80ddce12917ffb375546672c",
+        ),
+        (
+            "check_weekly",
+            "c8bc09f45420250ac4fae943518ae5a23c3d3255a7ece3d90bdbeab3322f669b",
+        ),
+        (
+            "check_scoped",
+            "83c495c4a4e4454eefd6aa21f2b3332af553a89b21ee1fac55793658f795425c",
+        ),
+        (
+            "check_credit_cap",
+            "2cb02778fc772da97e63225c5cbdac1e6bde2ceb02f1989ac78e154eb991a4f7",
+        ),
+        (
+            "bell_threshold",
+            "572f681c3db92cfd56a2be24ec132c722ab7262b7c27b11bb8861e35eede469e",
+        ),
+        (
+            "disabled",
+            "c7135e357c78e98ebb2da8705ee8a860c347dced15df33b4d9c331c0b7a098e6",
+        ),
+        (
+            "effort",
+            "6c78fc0ab64d4df00a2325391b3a9081f006eac6f95b3d835d9869ff139058c3",
+        ),
+        (
+            "console",
+            "5c19e4ad7198513ecb3bb72ccdf09df4c4bb876409fc8c33f8ae07d3468095f2",
+        ),
+        (
+            "models",
+            "4a6551ff138bda9ba881637c888522937789bff1b50abb8af89719aa883393d8",
+        ),
+        (
+            "env",
+            "b1ecf434ca77d914fe3ad1493532e7c46a760ea8b3f6a1d43da92d7375921257",
+        ),
+    ]
+    .into_iter()
+    .collect();
+    for key in MODELLED_SCALARS
+        .iter()
+        .copied()
+        .chain(["console", "models", "env"])
+    {
+        let Some(&digest) = pinned.get(key) else {
+            panic!("`{key}` has no pinned doc digest: add its row");
+        };
+        let text = doc_block_for(key);
+        assert_eq!(
+            hex::encode(Sha256::digest(text.as_bytes())),
+            digest,
+            "the `{key}` doc block changed: push the previous text onto known_doc_blocks(\"{key}\"), then update this digest"
+        );
+    }
+}
+
+/// Sets `disabled` over `body`, asserts the file reads `expected`, then unsets
+/// it and asserts the file is `body` again, byte for byte.
+fn assert_disabled_round_trip(name: &str, body: &str, expected: &str) {
+    let (mut profile, path) = hand_written_config(name, body);
+    profile.disabled = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    profile.disabled = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// An example in the text after a table's last key sits in that table's
+/// area: no site for a root key, which appends at the root.
+#[test]
+fn an_example_after_a_tables_body_is_no_site_for_a_root_key() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[env]\nA = \"b\"\n\n{}# disabled = true\n",
+        scalar_doc("disabled")
+    );
+    assert_disabled_round_trip("aftertable", &body, &format!("disabled = true\n{body}"));
+}
+
+/// An array of tables is a header too: with `[[extra]]` first, an example
+/// above `[models]` sits in a table's area and the root key appends.
+#[test]
+fn an_array_of_tables_first_makes_the_next_tables_prefix_a_tables_area() {
+    let _home = HomeSandbox::new();
+    let body = format!(
+        "[[extra]]\nk = 1\n\n{}# disabled = true\n[models]\ndefault = \"x\"\n",
+        scalar_doc("disabled")
+    );
+    assert_disabled_round_trip("aotfirst", &body, &format!("disabled = true\n{body}"));
+}
+
+/// A dotted root key (`env.A = "b"`) opens no header: an example above the
+/// first real header is root level and toggles in place.
+#[test]
+fn a_dotted_root_key_is_not_the_first_table() {
+    let _home = HomeSandbox::new();
+    let doc = scalar_doc("disabled");
+    let body = format!("env.A = \"b\"\n\n{doc}# disabled = true\n[models]\ndefault = \"x\"\n");
+    let expected = format!("env.A = \"b\"\n\n{doc}disabled = true\n[models]\ndefault = \"x\"\n");
+    assert_disabled_round_trip("dottedfirst", &body, &expected);
+}
+
+/// A file whose only header is an array of tables: the comment after its body
+/// stays in the array's area and the key appends above the header.
+#[test]
+fn an_array_of_tables_only_file_keeps_its_trailing_comment_in_place() {
+    let _home = HomeSandbox::new();
+    let body = "[[extra]]\nk = 1\n# note\n";
+    assert_disabled_round_trip("aotonly", body, &format!("disabled = true\n{body}"));
+}
+
+/// A file whose only table is dotted keys opens no header: the key appends
+/// at the end, after the trailing comment.
+#[test]
+fn a_dotted_only_file_appends_the_key_after_its_trailing_comment() {
+    let _home = HomeSandbox::new();
+    let body = "env.A = \"b\"\n# note\n";
+    assert_disabled_round_trip("dottedonly", body, &format!("{body}disabled = true\n"));
+}
+
+/// Unsetting a key whose next root item is a dotted key keeps the comment
+/// above the unset key: it moves onto the dotted line, which renders it.
+#[test]
+fn an_unset_before_a_dotted_key_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "dottednext",
+            "# my note\ndisabled = true\nenv.A = \"b\"\n",
+            "# my note\nenv.A = \"b\"\n",
+        ),
+        (
+            "nesteddottednext",
+            "# my note\ndisabled = true\nx.y.z = 1\n",
+            "# my note\nx.y.z = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.disabled = false;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// Clearing a table subkey whose next subkey is dotted keeps the comment
+/// above the cleared one: it moves onto the dotted line, which renders it.
+#[test]
+fn clearing_a_subkey_before_a_dotted_subkey_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "dottedsub",
+            "[models]\n# my note\ndefault = \"x\"\nextra.x = 1\n",
+            "[models]\n# my note\nextra.x = 1\n",
+        ),
+        (
+            "nesteddottedsub",
+            "[models]\n# my note\ndefault = \"x\"\nextra.y.z = 1\n",
+            "[models]\n# my note\nextra.y.z = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.models.default = None;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// Writes `body` as `name`'s `config.toml` and returns its path, without
+/// loading it (`hand_written_config` loads, which would run the normalizing
+/// write before the test looks).
+fn raw_config(name: &str, body: &str) -> PathBuf {
+    let path = profile_config_path(&ProfileName::from(name)).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// Loads `name` once more and asserts the load wrote nothing: the file's
+/// mtime, pushed an hour into the past first, does not move, and its bytes
+/// equal `expected`.
+fn assert_next_load_writes_nothing(name: &str, path: &Path, expected: &str) {
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(path, past);
+    let before = std::fs::metadata(path).unwrap().modified().unwrap();
+    load_profile(&ProfileName::from(name)).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().modified().unwrap(),
+        before,
+        "the second load wrote the file"
+    );
+}
+
+/// `check_weekly = true` is the default spelled out: the load drops the key
+/// in place, and the next load finds nothing to change.
+#[test]
+fn a_load_normalizes_check_weekly_true_away_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "cw",
+        "base_url = \"x\"\ncheck_weekly = true\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("cw")).unwrap();
+    assert!(profile.check_weekly);
+    let expected = "base_url = \"x\"\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("cw", &path, expected);
+}
+
+/// A value the load clamps is written clamped, in place, keeping the comment
+/// above it and the one trailing it.
+#[test]
+fn a_load_writes_a_clamped_value_in_place_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "clamp",
+        "# my line\nfallback_threshold = 120  # too high\nmax_auto_spend = -5\n",
+    );
+    let profile = load_profile(&ProfileName::from("clamp")).unwrap();
+    assert_eq!(profile.fallback_threshold, Some(100.0));
+    let expected = "# my line\nfallback_threshold = 100.0  # too high\nmax_auto_spend = 0.0\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("clamp", &path, expected);
+}
+
+/// A value the load ignores outright is commented out where it sits, as
+/// typed: the file stops claiming a value clauth does not use.
+#[test]
+fn a_load_comments_out_an_ignored_weekly_threshold_and_settles() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "wt",
+        "base_url = \"x\"\nweekly_threshold = 0.98\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("wt")).unwrap();
+    assert_eq!(profile.weekly_threshold, None);
+    let expected = "base_url = \"x\"\n# weekly_threshold = 0.98\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("wt", &path, expected);
+}
+
+/// The comment-out keeps what the user typed, never the template's example:
+/// under the template's own doc block, `weekly_threshold = 0.98` becomes
+/// `# weekly_threshold = 0.98`, not `# weekly_threshold = 98.0`.
+#[test]
+fn a_commented_out_value_keeps_the_typed_text_under_the_template_doc() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("wtt".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("wtt")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(template.matches("# weekly_threshold = 98.0\n").count(), 1);
+    std::fs::write(
+        &path,
+        template.replace("# weekly_threshold = 98.0\n", "weekly_threshold = 0.98\n"),
+    )
+    .unwrap();
+    load_profile(&ProfileName::from("wtt")).unwrap();
+    let expected = template.replace("# weekly_threshold = 98.0\n", "# weekly_threshold = 0.98\n");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("wtt", &path, expected.as_str());
+}
+
+/// A typo'd weekday: the whole typed line stays above as a comment and the
+/// list without the typo becomes the key.
+#[test]
+fn a_load_keeps_a_typoed_weekday_line_commented_above_the_fixed_one() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "days",
+        "preferred_days = [\"sat\", \"Saturdy\"]\nlast_resort = true\n",
+    );
+    load_profile(&ProfileName::from("days")).unwrap();
+    let expected = "# preferred_days = [\"sat\", \"Saturdy\"]\npreferred_days = [\"sat\"]\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("days", &path, expected);
+}
+
+/// Every weekday a typo: the line is just commented out, no empty list.
+#[test]
+fn a_load_comments_out_a_weekday_line_with_no_valid_entry() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "nodays",
+        "preferred_days = [\"Saturdy\"]\nlast_resort = true\n",
+    );
+    load_profile(&ProfileName::from("nodays")).unwrap();
+    let expected = "# preferred_days = [\"Saturdy\"]\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("nodays", &path, expected);
+}
+
+/// A canonical hand edit stays byte for byte and the load writes nothing,
+/// comments, blank lines, an unknown key and the `kick_timer` alias included.
+#[test]
+fn a_canonical_hand_edit_is_never_written() {
+    let _home = HomeSandbox::new();
+    let body = "# mine\n\nkick_timer = true\nsome_future_knob = 3\n\n[env]\nA = \"b\"  # note\n";
+    let path = raw_config("canon", body);
+    assert_next_load_writes_nothing("canon", &path, body);
+}
+
+/// A file the load cannot parse fails the load and is never written.
+#[test]
+fn an_unparseable_config_load_fails_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"x\"\nbroken [ =\n";
+    let path = raw_config("unparseable", body);
+    assert!(load_profile(&ProfileName::from("unparseable")).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A value to normalize in a shape the writer refuses to edit (a multi-line
+/// array) loads with the normalized value and leaves the file as written: the
+/// load never fails over a value it can read.
+#[test]
+fn a_load_over_a_refused_shape_keeps_the_value_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "preferred_days = [\n  \"sat\",\n  \"Saturdy\",\n]\nlast_resort = true\n";
+    let path = raw_config("multiline", body);
+    let profile = load_profile(&ProfileName::from("multiline")).unwrap();
+    assert!(profile.last_resort);
+    assert_next_load_writes_nothing("multiline", &path, body);
+}
+
+/// A CRLF `config.toml` that drifts is normalized in place and stays CRLF, and
+/// the next load settles.
+#[test]
+fn a_load_normalizes_a_crlf_file_in_place_and_keeps_crlf() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("crlf", "base_url = \"x\"\r\nweekly_threshold = 0.98\r\n");
+    let profile = load_profile(&ProfileName::from("crlf")).unwrap();
+    assert_eq!(profile.weekly_threshold, None);
+    let expected = "base_url = \"x\"\r\n# weekly_threshold = 0.98\r\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("crlf", &path, expected);
+}
+
+/// A non-finite threshold is ignored outright: the load comments the typed
+/// value out in place and settles.
+#[test]
+fn a_load_comments_out_a_non_finite_threshold_in_place() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("nan", "fallback_threshold = nan\nlast_resort = true\n");
+    let profile = load_profile(&ProfileName::from("nan")).unwrap();
+    assert_eq!(profile.fallback_threshold, None);
+    let expected = "# fallback_threshold = nan\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("nan", &path, expected);
+}
+
+/// The normalizing write re-reads `config.toml` under the state flock: a peer
+/// write landing after the pre-flock read but before the flock is never
+/// overwritten by a stale edit. Driven through the seam the load already has —
+/// `maybe_rewrite_config_toml`'s `raw_config`/`profile` arguments ARE the
+/// pre-flock read's products, so the test feeds them while the file has since
+/// moved on.
+#[test]
+fn the_rmw_re_read_never_overwrites_a_peer_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw");
+    let path = raw_config("rmw", "fallback_threshold = 120\nlast_resort = true\n");
+    // The pre-flock read: the load parsed `120` and clamped it to 100 in memory.
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    assert_eq!(stale_profile.fallback_threshold, Some(100.0));
+    // A peer write lands between the pre-flock read and the flock: the operator
+    // sets a canonical in-range value.
+    let peer = "fallback_threshold = 85\nlast_resort = true\n";
+    std::fs::write(&config_path, peer).unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        peer,
+        "the stale edit must not overwrite the peer's write"
+    );
+}
+
+/// A peer write that still needs normalizing is edited from its own fresh
+/// bytes and the profile rebuilt from them, never from the pre-flock copy:
+/// the peer's comment and `last_resort = false` survive, its out-of-range
+/// threshold is clamped.
+#[test]
+fn the_rmw_edit_uses_the_fresh_bytes_and_profile() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw2");
+    let path = raw_config("rmw2", "fallback_threshold = 120\nlast_resort = true\n");
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    let peer = "# peer note\nfallback_threshold = 130\nlast_resort = false\n";
+    std::fs::write(&config_path, peer).unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# peer note\nfallback_threshold = 100.0\nlast_resort = false\n"
+    );
+}
+
+/// A peer write that is already canonical is never rewritten: its mtime does
+/// not move.
+#[test]
+fn the_rmw_never_rewrites_a_canonical_peer_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("rmw3");
+    let path = raw_config("rmw3", "fallback_threshold = 120\nlast_resort = true\n");
+    let source = read_profile_source(&name).unwrap();
+    let (stale_profile, config_path, stale_raw) = build_profile(&name, source);
+    let peer = "fallback_threshold = 85\nlast_resort = true\n";
+    std::fs::write(&config_path, peer).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(&path, past);
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    maybe_rewrite_config_toml(&config_path, &stale_raw, &stale_profile);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+/// Commenting out an ignored value never loses it when the next root item is
+/// an implicit table (`[foo.bar]` opens no `foo` header): the doc line and the
+/// commented-out line stay above that header.
+#[test]
+fn a_comment_out_before_an_implicit_table_keeps_the_lines() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "implicitnext",
+        "last_resort = true\n# my doc\nweekly_threshold = 0.98\n\n[foo.bar]\nx = 1\n",
+    );
+    load_profile(&ProfileName::from("implicitnext")).unwrap();
+    let expected = "last_resort = true\n# my doc\n# weekly_threshold = 0.98\n\n[foo.bar]\nx = 1\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("implicitnext", &path, expected);
+}
+
+/// The save's unset keeps the comment above the unset key when the next root
+/// item is an implicit table, in a table or an array of tables.
+#[test]
+fn an_unset_before_an_implicit_table_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, expected) in [
+        (
+            "implicittable",
+            "# my note\ndisabled = true\n\n[foo.bar]\nx = 1\n",
+            "# my note\n\n[foo.bar]\nx = 1\n",
+        ),
+        (
+            "implicitaot",
+            "# my note\ndisabled = true\n\n[[foo.bar]]\nx = 1\n",
+            "# my note\n\n[[foo.bar]]\nx = 1\n",
+        ),
+    ] {
+        let (mut profile, path) = hand_written_config(name, body);
+        profile.disabled = false;
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// The load never edits an endpoint key it ignores for a reason outside
+/// `config.toml`: a `base_url` beside a `credentials.json` holding no usable
+/// key (with or without a blank `api_key`), and a `[console]` table whose
+/// token is blank, stay exactly as typed, and the next load writes nothing.
+#[test]
+fn a_load_never_edits_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    for (name, body, with_store) in [
+        (
+            "ignoredurl",
+            "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+            true,
+        ),
+        (
+            "ignoredkey",
+            "base_url = \"https://x.example\"  # mine\napi_key = \"\"\nlast_resort = true\n",
+            true,
+        ),
+        (
+            "ignoredconsole",
+            "last_resort = true\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+            false,
+        ),
+    ] {
+        let path = raw_config(name, body);
+        if with_store {
+            std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+        }
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert!(profile.last_resort, "{name}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body, "{name}");
+        assert_next_load_writes_nothing(name, &path, body);
+    }
+}
+
+/// An ignored endpoint key beside a value the load does normalize: only the
+/// normalized value moves.
+#[test]
+fn a_load_normalizes_beside_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nweekly_threshold = 0.98\n";
+    let path = raw_config("ignoredbeside", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    load_profile(&ProfileName::from("ignoredbeside")).unwrap();
+    let expected = "base_url = \"https://x.example\"  # mine\n# weekly_threshold = 0.98\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("ignoredbeside", &path, expected);
+}
+
+/// A save edits an endpoint key only when the profile's value differs from
+/// what the on-disk file loads as: a save changing another key keeps an
+/// ignored `base_url` and an ignored `[console]` table as typed.
+#[test]
+fn a_save_keeps_an_ignored_endpoint_key() {
+    let _home = HomeSandbox::new();
+    for (name, body, with_store, expected) in [
+        (
+            "savedurl",
+            "base_url = \"https://x.example\"  # mine\nfallback_threshold = 50.0\n",
+            true,
+            "base_url = \"https://x.example\"  # mine\nfallback_threshold = 60.0\n",
+        ),
+        (
+            "savedconsole",
+            "fallback_threshold = 50.0\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+            false,
+            "fallback_threshold = 60.0\n\n[console]\ntoken = \"\"\nsite = \"cn\"\nregion = \"r1\"\n",
+        ),
+    ] {
+        let path = raw_config(name, body);
+        if with_store {
+            std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+        }
+        let mut profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(profile.fallback_threshold, Some(50.0), "{name}");
+        profile.fallback_threshold = Some(60.0);
+        save_profile_config(&profile).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// A `base_url` the profile sets to a new value is still written over an
+/// ignored one: the save compares against the loaded view, so a real change
+/// is never mistaken for the ignored value.
+#[test]
+fn a_save_writes_a_new_base_url_over_an_ignored_one() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("savednewurl", "base_url = \"https://x.example\"  # mine\n");
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("savednewurl")).unwrap();
+    profile.base_url = Some("https://y.example".to_owned());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://y.example\"  # mine\n"
+    );
+}
+
+/// A logout's save judges an ignored `base_url` against the login state the
+/// file had before the save, so the typed line stays and the next load,
+/// with no store left, reads it.
+#[test]
+fn a_logout_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nlast_resort = true\n";
+    let path = raw_config("logoutkeep", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("logoutkeep")).unwrap();
+    assert_eq!(profile.base_url, None);
+    profile.credentials = None;
+    save_profile(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    assert_eq!(
+        load_profile(&ProfileName::from("logoutkeep"))
+            .unwrap()
+            .base_url
+            .as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A logout through the real action, then an unrelated toggle on the same
+/// in-memory profile, keeps the typed `base_url`: the profile follows the disk
+/// after the logout, so the toggle never reads the old ignore as a cleared URL.
+#[test]
+fn a_logout_then_a_toggle_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "lt",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    crate::testutil::register_names(&["lt"]);
+    let name = ProfileName::from("lt");
+    let mut config = load_config().unwrap();
+    crate::actions::clear_profile_credentials(&mut config, &name).unwrap();
+    let p = config.find_mut(&name).unwrap();
+    p.check_weekly = false;
+    save_profile_config(p).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\ncheck_weekly = false\n"
+    );
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A login over a live keyless `base_url` keeps the typed line: ignored while
+/// the login exists, live again once the store is gone.
+#[test]
+fn a_login_keeps_a_live_keyless_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"http://127.0.0.1:1234\"\nlast_resort = true\n";
+    let path = raw_config("loginkeep", body);
+    let name = ProfileName::from("loginkeep");
+    let mut profile = load_profile(&name).unwrap();
+    assert_eq!(profile.base_url.as_deref(), Some("http://127.0.0.1:1234"));
+    crate::lock::with_state_lock(|held| {
+        profile.set_credentials(Some(serde_json::from_str("{}").unwrap()), held);
+        Ok(())
+    })
+    .unwrap();
+    save_profile(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    assert_eq!(load_profile(&name).unwrap().base_url, None);
+    std::fs::remove_file(path.with_file_name("credentials.json")).unwrap();
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+}
+
+/// A login adopted in-process over a keyless live `base_url` routes the
+/// account to Anthropic for the rest of that process: switching away and back
+/// writes no `ANTHROPIC_BASE_URL`, as a fresh process would not.
+#[test]
+fn an_adopted_login_over_a_keyless_url_never_routes_to_it() {
+    let _home = HomeSandbox::new();
+    raw_config(
+        "e",
+        "base_url = 'http://127.0.0.1:1234'  # mine\nlast_resort = true\n",
+    );
+    let mut o = Profile::new("o".to_string(), None, None);
+    o.credentials = Some(
+        serde_json::from_str(
+            "{\"claudeAiOauth\":{\"accessToken\":\"oa\",\"refreshToken\":\"or\",\"expiresAt\":4102444800000}}",
+        )
+        .unwrap(),
+    );
+    save_profile(&o).unwrap();
+    crate::testutil::register_names(&["e", "o"]);
+    let mut state = load_app_state().unwrap();
+    state.active_profile = Some("e".into());
+    save_app_state(&state).unwrap();
+    let mut cfg = load_config().unwrap();
+    let e = ProfileName::from("e");
+    crate::testutil::write_live_creds(
+        &serde_json::from_str(
+            "{\"claudeAiOauth\":{\"accessToken\":\"ea\",\"refreshToken\":\"er\",\"expiresAt\":4102444800000}}",
+        )
+        .unwrap(),
+    );
+    crate::claude::adopt_first_login(&mut cfg, &e).unwrap();
+    assert_eq!(cfg.find(&e).unwrap().base_url, None);
+    crate::actions::switch_profile_locked(&mut cfg, &ProfileName::from("o")).unwrap();
+    crate::actions::switch_profile_locked(&mut cfg, &e).unwrap();
+    // A switch with nothing to apply creates no `settings.json`: absent reads
+    // as no `ANTHROPIC_BASE_URL`.
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(crate::claude::claude_settings_path().unwrap())
+            .unwrap_or_else(|_| "{}".to_owned()),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"].get("ANTHROPIC_BASE_URL"),
+        None,
+        "{settings}"
+    );
+}
+
+/// A peer process logging out between this process's load and its next
+/// config save never turns the toggle into a cleared URL: the typed line stays.
+#[test]
+fn a_toggle_after_a_peer_logout_keeps_the_typed_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "peerout",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    let cred = path.with_file_name("credentials.json");
+    std::fs::write(&cred, "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("peerout")).unwrap();
+    assert_eq!(profile.base_url, None);
+    std::fs::remove_file(&cred).unwrap();
+    profile.check_weekly = false;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\ncheck_weekly = false\n"
+    );
+}
+
+/// A fresh login profile created over a leftover dir resets the typed
+/// `base_url` like every other key: nothing of the orphan's endpoint survives.
+#[test]
+fn a_fresh_profile_over_a_leftover_dir_drops_its_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "orphan",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    let mut fresh = Profile::new("orphan".into(), None, None);
+    fresh.credentials = Some(serde_json::from_str("{}").unwrap());
+    save_profile(&fresh).unwrap();
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("base_url ="),
+        "{}",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    std::fs::remove_file(path.with_file_name("credentials.json")).unwrap();
+    assert_eq!(
+        load_profile(&ProfileName::from("orphan")).unwrap().base_url,
+        None
+    );
+}
+
+/// A reauth through the real capture action over a keyless live URL keeps
+/// the typed line, and the in-memory profile reads it as hidden.
+#[test]
+fn a_reauth_keeps_a_live_keyless_base_url() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"http://127.0.0.1:1234\"\nlast_resort = true\n";
+    let path = raw_config("rk", body);
+    crate::testutil::register_names(&["rk"]);
+    let name = ProfileName::from("rk");
+    let mut config = load_config().unwrap();
+    let account = crate::testutil::profile_id("rk");
+    let after_claim = std::fs::read_to_string(&path).unwrap();
+    crate::actions::overwrite_captured_profile(
+        &mut config,
+        &name,
+        &account,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(
+                serde_json::from_str(
+                    "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"r\",\"expiresAt\":1}}",
+                )
+                .unwrap(),
+            ),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), after_claim);
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+}
+
+fn oauth_pair(tag: &str) -> ClaudeCredentials {
+    serde_json::from_str(&format!(
+        "{{\"claudeAiOauth\":{{\"accessToken\":\"{tag}a\",\"refreshToken\":\"{tag}r\",\"expiresAt\":4102444800000}}}}"
+    ))
+    .unwrap()
+}
+
+/// `settings.json`'s `env.ANTHROPIC_BASE_URL`, `None` when the file or key is
+/// absent.
+fn settings_base_url() -> Option<String> {
+    let raw = std::fs::read_to_string(crate::claude::claude_settings_path().unwrap())
+        .unwrap_or_else(|_| "{}".to_owned());
+    let settings: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    settings["env"]
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// Registers `names`, makes `active` the active profile, and loads the config.
+fn active_config(names: &[&str], active: &str) -> AppConfig {
+    crate::testutil::register_names(names);
+    let mut state = load_app_state().unwrap();
+    state.active_profile = Some(active.into());
+    save_app_state(&state).unwrap();
+    load_config().unwrap()
+}
+
+/// A second account `o` on its own OAuth pair, to switch away to and back.
+fn save_other_account() {
+    let mut o = Profile::new("o".to_string(), None, None);
+    crate::lock::with_state_lock(|held| {
+        o.set_credentials(Some(oauth_pair("o")), held);
+        Ok(())
+    })
+    .unwrap();
+    save_profile(&o).unwrap();
+}
+
+/// A capture whose snapshot carries a key and no URL replaces the stored
+/// endpoint as a pair: the hidden typed URL goes, and the key never reaches it.
+#[test]
+fn a_key_capture_replaces_a_hidden_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "h",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("h")).unwrap(),
+    )
+    .unwrap();
+    let mut config = active_config(&["h"], "h");
+    let name = ProfileName::from("h");
+    let account = crate::testutil::profile_id("h");
+    crate::actions::overwrite_captured_profile(
+        &mut config,
+        &name,
+        &account,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(oauth_pair("n")),
+            base_url: None,
+            api_key: Some("sk-ant-api03-livekey".into()),
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.lines().any(|l| l.starts_with("base_url")), "{body}");
+    assert!(
+        body.lines()
+            .any(|l| l == "api_key = \"sk-ant-api03-livekey\""),
+        "{body}"
+    );
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+    assert_eq!(settings_base_url(), None);
+    assert_eq!(load_profile(&name).unwrap().base_url, None);
+}
+
+/// Clearing the api key of a hybrid account (OAuth pair + key + URL) hides
+/// the URL in this process at once: a switch away and back routes the OAuth
+/// login to Anthropic, as a fresh process does.
+#[test]
+fn clearing_a_hybrids_key_hides_its_url_in_process() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "y",
+        "base_url = \"https://x.example\"  # mine\napi_key = \"sk-third-party\"\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("y")).unwrap(),
+    )
+    .unwrap();
+    save_other_account();
+    let mut config = active_config(&["y", "o"], "y");
+    let name = ProfileName::from("y");
+    crate::actions::clear_profile_api_key(&mut config, &name).unwrap();
+    assert_eq!(config.find(&name).unwrap().base_url, None);
+    crate::actions::switch_profile_locked(&mut config, &ProfileName::from("o")).unwrap();
+    crate::actions::switch_profile_locked(&mut config, &name).unwrap();
+    assert_eq!(settings_base_url(), None);
+}
+
+/// An env inference token added beside a hidden URL makes it live in this
+/// process at once, as the next load reads it.
+#[test]
+fn an_env_token_beside_a_hidden_url_makes_it_live_in_process() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "h",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(
+        path.with_file_name("credentials.json"),
+        serde_json::to_string(&oauth_pair("h")).unwrap(),
+    )
+    .unwrap();
+    let mut config = active_config(&["h"], "h");
+    let name = ProfileName::from("h");
+    let mut env = config.find(&name).unwrap().env.clone();
+    env.insert("ANTHROPIC_API_KEY".into(), "sk-env-key".into());
+    crate::actions::edit_profile_env(&mut config, &name, |e| *e = env).unwrap();
+    assert_eq!(
+        config.find(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// An env edit mirrors the console pair beside the url the fresh read holds: a
+/// peer's console move on disk reaches memory whole, as a fresh load reads it.
+#[test]
+fn an_env_edit_mirrors_the_console_a_peer_moved() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("al");
+    let console_old = ConsoleCredential {
+        token: "console-old".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let mut target = Profile::new(
+        "al".to_string(),
+        Some("https://coding-intl.dashscope.aliyuncs.com".to_string()),
+        None,
+    );
+    target.set_console(Some(console_old.clone()));
+    crate::testutil::register_names(&["al"]);
+    save_profile(&target).expect("save target");
+    let mut config = load_config().expect("load");
+    assert_eq!(
+        config.find(&name).expect("al in memory").console,
+        Some(console_old),
+        "control: memory holds the console disk holds"
+    );
+
+    // The peer moves the console between this process's load and its env edit.
+    let console_peer = ConsoleCredential {
+        token: "console-peer".to_string(),
+        site: ConsoleSite::Domestic,
+        region: "cn-beijing".to_string(),
+    };
+    update_profile_config(&name, |p| {
+        p.set_console(Some(console_peer));
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("al stays on the roster");
+
+    crate::actions::edit_profile_env(&mut config, &name, |env| {
+        env.insert("FOO".to_string(), "bar".to_string());
+    })
+    .expect("env edit");
+
+    let memory = config.find(&name).expect("al in memory");
+    let fresh = load_profile(&name).expect("fresh load");
+    assert_eq!(
+        memory.console, fresh.console,
+        "memory holds the console a fresh load holds"
+    );
+    assert_eq!(
+        memory.saved_console(),
+        fresh.saved_console(),
+        "memory saves the console a fresh load saves"
+    );
+}
+
+/// A capture into a new profile of an OAuth login pointed at a keyless URL
+/// writes the typed URL, as a capture over a leftover `config.toml` does: it
+/// is hidden under the login and live once the store is gone.
+#[test]
+fn a_capture_into_a_new_profile_keeps_its_keyless_url() {
+    let _home = HomeSandbox::new();
+    let mut config = load_config().unwrap();
+    crate::actions::capture_into_profile(
+        &mut config,
+        "cn".into(),
+        ModelSettings::default(),
+        None,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(oauth_pair("c")),
+            base_url: Some("http://127.0.0.1:1234".into()),
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .unwrap();
+    let name = ProfileName::from("cn");
+    let body = std::fs::read_to_string(profile_config_path(&name).unwrap()).unwrap();
+    assert!(
+        body.lines()
+            .any(|l| l == "base_url = \"http://127.0.0.1:1234\""),
+        "{body}"
+    );
+    std::fs::remove_file(profile_credentials_path(&name).unwrap()).unwrap();
+    assert_eq!(
+        load_profile(&name).unwrap().base_url.as_deref(),
+        Some("http://127.0.0.1:1234")
+    );
+}
+
+/// A preset that repoints an account, then one that clears its `base_url`,
+/// leaves no `base_url` line: the clear is the caller's edit, never a cue to
+/// write back the URL the login was hiding.
+#[test]
+fn a_preset_clear_after_a_repoint_never_restores_a_hidden_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "pr",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    crate::testutil::register_names(&["pr"]);
+    let name = ProfileName::from("pr");
+    let mut config = load_config().unwrap();
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models, _| {
+        *url = Some("https://y.example".to_owned());
+        *models = ModelSettings::default();
+        Ok(())
+    })
+    .unwrap();
+    crate::actions::edit_profile_preset(&mut config, &name, |url, models, _| {
+        *url = None;
+        *models = ModelSettings::default();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# mine\nlast_resort = true\n"
+    );
+}
+
+/// A console login over an ignored `[console]` table, then an endpoint move
+/// off Alibaba, drops the table: the move clears the session the login stored
+/// and never restores the table the load ignored.
+#[test]
+fn an_endpoint_move_after_a_console_login_drops_the_console_table() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "al",
+        "base_url = \"https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic\"\napi_key = \"sk-sp-k\"\n\n[console]\ntoken = \"\"\nsite = \"domestic\"\n",
+    );
+    crate::testutil::register_names(&["al"]);
+    let name = ProfileName::from("al");
+    let mut config = load_config().unwrap();
+    let account = crate::testutil::profile_id("al");
+    crate::actions::store_console_login(
+        &mut config,
+        &name,
+        &account,
+        ConsoleCredential {
+            token: "t".to_owned(),
+            site: ConsoleSite::default(),
+            region: "cn-beijing".to_owned(),
+        },
+    )
+    .unwrap();
+    crate::actions::edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://api.deepseek.com/anthropic".to_owned());
+        *key = Some("sk-k".to_owned());
+    })
+    .unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("[console]"), "{body}");
+    assert!(
+        body.lines()
+            .any(|l| l == "base_url = \"https://api.deepseek.com/anthropic\""),
+        "{body}"
+    );
+    assert!(body.lines().any(|l| l == "api_key = \"sk-k\""), "{body}");
+}
+
+/// A store torn after the load still counts as a login: a toggle keeps the
+/// ignored `base_url` instead of reading it as live and the in-memory `None`
+/// as a cleared URL.
+#[test]
+fn a_toggle_over_a_torn_store_keeps_an_ignored_base_url() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "torn",
+        "base_url = \"https://x.example\"  # mine\ncheck_weekly = false\n",
+    );
+    let cred = path.with_file_name("credentials.json");
+    std::fs::write(&cred, "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("torn")).unwrap();
+    assert_eq!(profile.base_url, None);
+    std::fs::write(&cred, "{\"claudeAiOauth\":").unwrap();
+    profile.check_weekly = true;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\n"
+    );
+}
+
+/// A save adding an api key beside an ignored `base_url` keeps the line, and
+/// the next load reads the URL as live: the key decides.
+#[test]
+fn a_save_adding_a_key_keeps_an_ignored_base_url_live() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "addkeylive",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let mut profile = load_profile(&ProfileName::from("addkeylive")).unwrap();
+    assert_eq!(profile.base_url, None);
+    profile.api_key = Some("sk-ant-k".to_owned());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\napi_key = \"sk-ant-k\"\n"
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("addkeylive"))
+            .unwrap()
+            .base_url
+            .as_deref(),
+        Some("https://x.example")
+    );
+}
+
+/// A load whose only drift is an ignored endpoint key returns before the
+/// state flock.
+#[test]
+fn a_load_over_an_ignored_endpoint_key_takes_no_flock() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "noflock",
+        "base_url = \"https://x.example\"  # mine\nlast_resort = true\n",
+    );
+    std::fs::write(path.with_file_name("credentials.json"), "{}").unwrap();
+    let flocks = || crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get);
+    let before = flocks();
+    load_profile(&ProfileName::from("noflock")).unwrap();
+    assert_eq!(flocks() - before, 0, "the load took the state flock");
+}
+
+/// A torn `credentials.json` counts as a login for the load's endpoint
+/// compare, as it does for the loaded profile: an ignored `base_url` beside it
+/// is no drift, so the load takes no flock and writes nothing.
+#[test]
+fn a_load_over_an_ignored_endpoint_key_beside_a_torn_store_takes_no_flock() {
+    let _home = HomeSandbox::new();
+    let body = "base_url = \"https://x.example\"  # mine\nlast_resort = true\n";
+    let path = raw_config("tornflock", body);
+    std::fs::write(path.with_file_name("credentials.json"), "{").unwrap();
+    let flocks = || crate::lock::OUTERMOST_ACQUISITIONS.with(std::cell::Cell::get);
+    let before = flocks();
+    let profile = load_profile(&ProfileName::from("tornflock")).unwrap();
+    assert!(profile.unreadable_credentials_store.is_some());
+    assert_eq!(profile.base_url, None);
+    assert_eq!(flocks() - before, 0, "the load took the state flock");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// A negative probe interval is a value clauth cannot read: a save names the
+/// key and writes nothing.
+#[test]
+fn a_negative_probe_interval_refuses_a_save_by_name() {
+    let _home = HomeSandbox::new();
+    let body = "usage_probe_interval_ms = -5\n";
+    let path = raw_config("neg", body);
+    let mut profile = Profile::new("neg".to_string(), None, None);
+    profile.auto_start = true;
+    let err = save_profile_config(&profile).expect_err("the save refuses");
+    assert_eq!(
+        format!("{err:#}"),
+        "neg: config.toml has `usage_probe_interval_ms` in a shape clauth cannot read; fix or remove that line, then try again"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+}
+
+/// An out-of-band probe interval is written clamped in place, keeping the
+/// comment above it and the one trailing it, at both ends of the band.
+#[test]
+fn a_load_writes_a_clamped_probe_interval_in_place_and_settles() {
+    let _home = HomeSandbox::new();
+    for (name, typed, clamped) in [
+        ("probelow", "5000", 60_000),
+        ("probehigh", "999999", 450_000),
+    ] {
+        let path = raw_config(
+            name,
+            &format!("# mine\nusage_probe_interval_ms = {typed}  # cadence\nusage_probe = true\n"),
+        );
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(profile.usage_probe_interval_ms, clamped, "{name}");
+        let expected =
+            format!("# mine\nusage_probe_interval_ms = {clamped}  # cadence\nusage_probe = true\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+        assert_next_load_writes_nothing(name, &path, &expected);
+    }
+}
+
+/// The probe switch and interval toggle their template example lines in
+/// place, and unsetting both gives the template back byte for byte.
+#[test]
+fn the_probe_keys_toggle_their_template_examples_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("probetoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("probetoggle")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(template.matches("# usage_probe = true\n").count(), 1);
+    assert_eq!(
+        template
+            .matches("# usage_probe_interval_ms = 90000\n")
+            .count(),
+        1
+    );
+
+    let mut profile = load_profile(&ProfileName::from("probetoggle")).unwrap();
+    profile.usage_probe = true;
+    profile.usage_probe_interval_ms = 120_000;
+    save_profile_config(&profile).unwrap();
+    let expected = template
+        .replace("# usage_probe = true\n", "usage_probe = true\n")
+        .replace(
+            "# usage_probe_interval_ms = 90000\n",
+            "usage_probe_interval_ms = 120000\n",
+        );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+
+    profile.usage_probe = false;
+    profile.usage_probe_interval_ms = 90_000;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), template);
+}
+
+// `sync_mcp_logins` defaults ON with the same serde contract as
+// `preserve_non_login_keys`: absent reads on, an explicit off round-trips.
+#[test]
+fn sync_mcp_logins_defaults_true_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(state.sync_mcp_logins);
+    assert!(AppState::default().sync_mcp_logins);
+    let off = AppState {
+        sync_mcp_logins: false,
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&off).expect("render");
+    assert!(rendered.contains("sync_mcp_logins = false"), "{rendered}");
+    assert!(
+        !toml::from_str::<AppState>(&rendered)
+            .expect("reparse")
+            .sync_mcp_logins
+    );
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render");
+    assert!(!rendered_on.contains("sync_mcp_logins"), "{rendered_on}");
+}
+
+/// The fail-closed claim of a profile whose `config.toml` is each of `lines`
+/// over a `broken =` line, so the text fails to parse.
+fn claims_of_unparsed_configs(lines: &[&str]) -> Vec<(String, ProxyClaim)> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let text = format!("{line}\nbroken =\n");
+            assert!(
+                text.parse::<toml::Table>().is_err(),
+                "fixture control: {line:?}'s config fails to parse"
+            );
+            let name = ProfileName::from(format!("unparsed-{i}").as_str());
+            let path = profile_subpath(&name, "config.toml").expect("config path");
+            std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir");
+            std::fs::write(&path, text).expect("write config.toml");
+            (
+                (*line).to_string(),
+                stored_proxy_claim_failing_closed(&name),
+            )
+        })
+        .collect()
+}
+
+/// A `config.toml` that fails to parse is unclassifiable whenever its text
+/// holds `proxy` or a backslash, the only two ways a TOML key can name
+/// `proxy`, wherever they stand: no reading of a text that does not parse can
+/// vouch that a comment or a string value stays one once the text is repaired.
+#[test]
+fn a_config_that_fails_to_parse_and_may_name_the_proxy_key_is_unclassifiable() {
+    let _home = HomeSandbox::new();
+    let backslash = char::from(0x5c_u8);
+    let escaped = format!("\"prox{backslash}u0079\" = 1");
+    let lines = [
+        "\"proxy\" = 1",
+        "'proxy' = 1",
+        escaped.as_str(),
+        "proxy.service = \"stub\"",
+        "a.\"proxy\" = 1",
+        "proxy = { service = \"stub\", account = \"acct-1\" }",
+        "a = { proxy = 1 }",
+        "a = { b = [1, 2], proxy = 1 }",
+        "[ proxy ]",
+        "[proxy] # note",
+        "[[proxy]]",
+        "note = \"\"\"\nproxy = \"stub\"\n\"\"\"",
+        "x = { a = 1 } proxy = 2",
+        "x = { a = 1, b = 2 } proxy = 3",
+        "x = 1 proxy = 2",
+        "x = \"a\" proxy = 1",
+        "x = 'a' proxy = 1",
+        "x = \"a=b\" proxy = 1",
+        "x = [1] proxy = 2",
+        "x = [1, 2], proxy = 3",
+        "x = [{ a = 1 }, proxy = 2]",
+        "a{b=1}.proxy = 2",
+        "x = { } proxy = 2",
+        "a = { b = 1,\n c = 2, proxy = 3 }",
+        "x = \"unterminated\nb = 1, proxy = 2",
+        "a = \"proxy\" = 1",
+        "a = \"proxy\".b = 1",
+        "x = \"a\" \"proxy\" = 1",
+        "x = { a = 1 } \"proxy\" = 2",
+        "x = 1, \"proxy\" = 2",
+        "x = 1 [\"proxy\"]",
+        "x = [\"a\" \"proxy\"]",
+        "x = [{ a = 1 }, \"proxy\" = 2]",
+        "x = \"\"\"a\"\"\" proxy = 1",
+        "x = \"a, proxy = 1",
+        "[a = \"proxy\"]",
+        "x = [1, { a = 1 }, proxy]",
+        "x = [a = 1, \"proxy\"]",
+        "x = [a = 1, 'proxy']",
+        "x = \"proxy\"\u{feff}= 1",
+        "x = 'proxy'\u{200b}= 1",
+        "# proxy note",
+        "note = \"proxy\"",
+        "path = \"C:\\\\Users\\\\x\"",
+        "# C:\\path",
+        "tags = [\"a\", \"proxy\"]",
+        "a = { note = \"proxy\" }",
+        "note = 'proxy'",
+        "x = { a = 1 } # proxy",
+        "\u{e9} = \"proxy\"",
+        "x = [1, { a = 1 }, \"proxy\"]",
+        "a = { b = 1, # proxy",
+        "k = \"C:\\foo\"",
+        "k = 'C:\\path'",
+        "x = 1\r# proxy",
+        "note = \"\"\"proxy\"\"\"",
+        "note = '''C:\\path'''",
+        "note = \"\"\"proxy",
+        "x = \"a\\\"proxy\"",
+        "x = { a = [\"proxy\"], b = 'proxy' }",
+        "[a] x = \"proxy\"",
+        "x = 1 y = \"proxy\"",
+    ];
+    let claims = claims_of_unparsed_configs(&lines);
+    assert_eq!(
+        claims,
+        lines
+            .iter()
+            .map(|line| ((*line).to_string(), ProxyClaim::Unclassifiable))
+            .collect::<Vec<_>>(),
+        "(config line, fail-closed claim) per shape"
+    );
+}
+
+/// A `config.toml` that fails to parse with neither `proxy` nor a backslash in
+/// its text claims no proxy account, a differently cased or split key
+/// included: a TOML key compares byte for byte.
+#[test]
+fn a_config_that_fails_to_parse_naming_no_proxy_claims_none() {
+    let _home = HomeSandbox::new();
+    let lines = [
+        "Proxy = 1",
+        "PROXY = 1",
+        "a.pro.xy = 1",
+        "\u{440}r\u{43e}\u{445}\u{443} = 1",
+        "note = \"C:/Users\"",
+        "=",
+        "",
+        "#",
+        "x = [\n  1,\n]",
+        "rolling_token = [unterminated",
+    ];
+    let claims = claims_of_unparsed_configs(&lines);
+    assert_eq!(
+        claims,
+        lines
+            .iter()
+            .map(|line| ((*line).to_string(), ProxyClaim::None))
+            .collect::<Vec<_>>(),
+        "(config line, fail-closed claim) per shape"
+    );
+}
+
+#[test]
+fn a_crlf_state_file_stays_crlf_through_an_append() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("# note\r\nprofiles = [\r\n  \"a\",\r\n]\r\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("b"));
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "# note\r\nprofiles = [\r\n  \"a\",\r\n  \"b\",\r\n]\r\n"
+    );
+}
+
+#[test]
+fn a_dotted_serve_key_is_edited_without_changing_its_form() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\nserve.session_creation = false # mine\n");
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = true;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\nserve.session_creation = true # mine\n"
+    );
+}
+
+#[test]
+fn an_inline_serve_table_is_edited_without_changing_its_form() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\nserve = { session_creation = false }\n");
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = true;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\nserve = { session_creation = true }\n"
+    );
+}
+
+#[test]
+fn an_aliased_home_tab_stays_as_written_while_another_key_changes() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\nhome_tab = \"plugin\"\n");
+    let mut state = load_app_state().expect("load");
+    state.show_pace = true;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\nhome_tab = \"plugin\"\nshow_pace = true\n"
+    );
+}
+
+#[test]
+fn a_theme_pick_turns_the_legacy_scalar_into_a_table_keeping_its_comment() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\n# my theme\ntheme = \"full\"\n");
+    let mut state = load_app_state().expect("load");
+    state.set_theme(crate::profile::ThemeName::Compatible);
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\n# my theme\n[theme]\nname = \"compatible\"\n"
+    );
+}
+
+#[test]
+fn deleting_the_first_name_of_a_one_line_list_keeps_its_layout() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\", \"c\"]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"b\", \"c\"]\n"
+    );
+}
+
+#[test]
+fn moving_the_first_name_of_a_one_line_list_to_the_end_keeps_its_layout() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\", \"c\"]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "c", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"b\", \"c\", \"a\"]\n"
+    );
+}
+
+#[test]
+fn an_append_to_a_multi_line_list_without_a_trailing_comma_keeps_the_close_on_its_own_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\",\n  \"b\"\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("c"));
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"a\",\n  \"b\",\n  \"c\"\n]\n"
+    );
+}
+
+#[test]
+fn an_empty_state_file_is_edited_in_place() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("# only a comment\n");
+    save_app_state(&AppState {
+        profiles: ["a", "b"].map(ProfileName::from).to_vec(),
+        ..AppState::default()
+    })
+    .expect("save");
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(after.starts_with("# only a comment\n"), "{after}");
+    assert!(
+        after
+            .lines()
+            .any(|line| line == "profiles = [\"a\", \"b\"]"),
+        "a list the writer creates fresh is one line:\n{after}"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["a", "b"].map(ProfileName::from).to_vec());
+}
+
+#[test]
+fn a_dotted_serve_key_back_at_its_default_leaves_its_comment() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\n# mine\nserve.session_creation = true\n");
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = false;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\n# mine\n"
+    );
+}
+
+#[test]
+fn an_inline_serve_table_back_at_its_default_leaves_its_comment() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = []\n# mine\nserve = { session_creation = true }\n");
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = false;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = []\n# mine\n"
+    );
+}
+
+#[test]
+fn an_inline_table_keeps_its_spacing_when_a_modelled_key_leaves_beside_an_unknown_one() {
+    let _home = HomeSandbox::new();
+    let first = write_state_file("profiles = []\nserve = { session_creation = true, stray = 1 }\n");
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = false;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("read"),
+        "profiles = []\nserve = { stray = 1 }\n"
+    );
+
+    let last = write_state_file(
+        "profiles = []\nserve = { stray = 1, session_creation = true }\nwrap_off = true\n",
+    );
+    let mut state = load_app_state().expect("load");
+    state.serve.session_creation = false;
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&last).expect("read"),
+        "profiles = []\nserve = { stray = 1 }\nwrap_off = true\n"
+    );
+}
+
+#[test]
+fn a_multi_line_inline_table_keeps_the_comment_above_a_removed_key() {
+    let _home = HomeSandbox::new();
+    for (fixture, stray_stays) in [
+        (
+            "profiles = []\nserve = {\n  # mine\n  session_creation = true,\n  stray = 1\n}\n",
+            true,
+        ),
+        (
+            "profiles = []\nserve = {\n  session_creation = true, # mine\n  stray = 1\n}\n",
+            true,
+        ),
+        (
+            "profiles = []\nserve = {\n  stray = 1,\n  session_creation = true # mine\n}\n",
+            true,
+        ),
+        (
+            "profiles = []\nserve = {\n  stray = 1,\n  # mine\n  session_creation = true\n}\n",
+            true,
+        ),
+        (
+            "profiles = []\nserve = {\n  stray = 1,\n  session_creation = true,\n  # mine\n}\n",
+            true,
+        ),
+        (
+            "profiles = []\nserve = {\n  # mine\n  session_creation = true\n}\n",
+            false,
+        ),
+        (
+            "profiles = []\nserve = {\n  session_creation = true # mine\n}\nwrap_off = true\n",
+            false,
+        ),
+    ] {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.serve.session_creation = false;
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(after.contains("# mine"), "the comment survives:\n{after}");
+        assert_eq!(after.contains("stray = 1"), stray_stays, "{after}");
+        assert!(
+            !after.contains("session_creation"),
+            "the key is gone:\n{after}"
+        );
+        after
+            .parse::<toml::Table>()
+            .unwrap_or_else(|e| panic!("the edit keeps the file valid: {e}\n{after}"));
+    }
+}
+
+#[test]
+fn a_list_leaving_the_file_keeps_the_comments_inside_its_brackets() {
+    let _home = HomeSandbox::new();
+    for (fixture, expected) in [
+        (
+            "profiles = []\nauth_broken = [\n  # why\n  \"b\",\n]\nwrap_off = true\n",
+            "profiles = []\n# why\nwrap_off = true\n",
+        ),
+        (
+            "profiles = []\nauth_broken = [ # open\n  \"b\", # same\n  # end\n]\n",
+            "profiles = []\n# open\n# same\n# end\n",
+        ),
+        (
+            "profiles = []\nauth_broken = [\n  \"b\" # s\n]\n",
+            "profiles = []\n# s\n",
+        ),
+        (
+            "profiles = []\r\nauth_broken = [\r\n  # why\r\n  \"b\",\r\n]\r\n",
+            "profiles = []\r\n# why\r\n",
+        ),
+    ] {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.auth_broken.clear();
+        save_app_state(&state).expect("save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), expected);
+    }
+}
+
+#[test]
+fn an_emptied_multi_line_inline_table_keeps_the_comments_after_its_last_comma() {
+    let _home = HomeSandbox::new();
+    for (fixture, expected) in [
+        (
+            "profiles = []\nserve = {\n  session_creation = true,\n  # mine\n}\n",
+            "profiles = []\n# mine\n",
+        ),
+        (
+            "profiles = []\nserve = {\n  session_creation = true, # mine\n}\nwrap_off = true\n",
+            "profiles = []\n# mine\nwrap_off = true\n",
+        ),
+        (
+            "profiles = []\nserve = {\n  session_creation = true, # one\n  # two\n}\n",
+            "profiles = []\n# one\n# two\n",
+        ),
+    ] {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.serve.session_creation = false;
+        save_app_state(&state).expect("save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), expected);
+    }
+}
+
+#[test]
+fn removing_the_last_name_of_a_list_with_no_trailing_comma_keeps_its_comments() {
+    let _home = HomeSandbox::new();
+    for (fixture, expected) in [
+        (
+            "profiles = [\n  \"a\",\n  \"b\"\n]\n",
+            "profiles = [\n  \"a\"\n]\n",
+        ),
+        (
+            "profiles = [\n  \"a\",\n  \"b\" # the work account\n]\n",
+            "profiles = [\n  \"a\"\n  # the work account\n]\n",
+        ),
+        (
+            "profiles = [\n  \"a\",\n  \"b\"\n  # below\n]\n",
+            "profiles = [\n  \"a\"\n  # below\n]\n",
+        ),
+        (
+            "profiles = [\n  \"a\",\n  # above\n  \"b\" # same\n]\n",
+            "profiles = [\n  \"a\"\n  # above\n  # same\n]\n",
+        ),
+    ] {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = vec![ProfileName::from("a")];
+        save_app_state(&state).expect("save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), expected);
+    }
+}
+
+#[test]
+fn an_append_after_a_commented_last_name_keeps_the_comma_on_that_line() {
+    let _home = HomeSandbox::new();
+    for (fixture, expected) in [
+        (
+            "profiles = [\n  \"a\",\n  \"b\" # note\n]\n",
+            "profiles = [\n  \"a\",\n  \"b\", # note\n  \"c\"\n]\n",
+        ),
+        (
+            "profiles = [\"a\", \"b\" # note\n]\n",
+            "profiles = [\"a\", \"b\", # note\n \"c\"\n]\n",
+        ),
+    ] {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles.push(ProfileName::from("c"));
+        save_app_state(&state).expect("save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), expected);
+        let back = load_app_state().expect("reload");
+        assert_eq!(back.profiles, ["a", "b", "c"].map(ProfileName::from));
+    }
+}
+
+#[test]
+fn removing_a_middle_name_keeps_the_comment_after_its_value() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\",\n  \"b\" # note\n  ,\n  \"c\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"a\",\n  # note\n  \"c\",\n]\n"
+    );
+}
+
+/// A note written after an element's comma (`"work", # day job`) belongs to
+/// that element, though toml_edit parses it into the NEXT element's prefix (or
+/// the list's trailing after the last comma): every list edit keeps each note
+/// on its own name's line, and a removed name's note stays as a line of its
+/// own where the name sat.
+#[test]
+fn a_note_after_an_elements_comma_stays_with_that_name_through_every_list_edit() {
+    let _home = HomeSandbox::new();
+    let noted = "profiles = [\n  \"a\", # first\n  \"b\", # second\n]\n";
+    let cases: [(&str, &str, &[&str], &str); 9] = [
+        (
+            "append",
+            noted,
+            &["a", "b", "c"],
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n]\n",
+        ),
+        (
+            "swap",
+            noted,
+            &["b", "a"],
+            "profiles = [\n  \"b\", # second\n  \"a\", # first\n]\n",
+        ),
+        (
+            "middle insert",
+            noted,
+            &["a", "x", "b"],
+            "profiles = [\n  \"a\", # first\n  \"x\",\n  \"b\", # second\n]\n",
+        ),
+        (
+            "rename in place",
+            noted,
+            &["a", "z"],
+            "profiles = [\n  \"a\", # first\n  \"z\", # second\n]\n",
+        ),
+        (
+            "remove a noted middle name",
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n]\n",
+            &["a", "c"],
+            "profiles = [\n  \"a\", # first\n  # second\n  \"c\",\n]\n",
+        ),
+        (
+            "swap with no trailing comma",
+            "profiles = [\n  \"a\", # first\n  \"b\" # second\n]\n",
+            &["b", "a"],
+            "profiles = [\n  \"b\", # second\n  \"a\" # first\n]\n",
+        ),
+        (
+            "swap under an own-line comment",
+            "profiles = [\n  # group\n  \"a\", # first\n  \"b\",\n]\n",
+            &["b", "a"],
+            "profiles = [\n  \"b\",\n  # group\n  \"a\", # first\n]\n",
+        ),
+        (
+            "append, CRLF",
+            "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n]\r\n",
+            &["a", "b", "c"],
+            "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n  \"c\",\r\n]\r\n",
+        ),
+        (
+            "append to a list ending in a note line",
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  # end\n]\n",
+            &["a", "b", "c"],
+            "profiles = [\n  \"a\", # first\n  \"b\", # second\n  \"c\",\n  # end\n]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!("{name}:\n  got  {after:?}\n  want {expected:?}"));
+        }
+        let back = load_app_state().expect("reload");
+        assert_eq!(
+            back.profiles, state.profiles,
+            "{name}: the edit keeps the names"
+        );
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The chain the TUI reorders, beside a one-line roster: each account's note
+/// rides its own name.
+#[test]
+fn a_chain_reorder_keeps_each_accounts_note_on_its_own_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [\n  \"work\", # day job\n  \"home\", # weekend\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.fallback_chain = ["home", "work"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [\n  \"home\", # weekend\n  \"work\", # day job\n]\n"
+    );
+}
+
+/// A list with no notes goes through the lift byte-identically: the same
+/// bytes come back from an append and from a reorder.
+#[test]
+fn a_one_line_list_with_no_notes_survives_every_edit_byte_identical() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\"]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles.push(ProfileName::from("c"));
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after append"),
+        "profiles = [\"a\", \"b\", \"c\"]\n"
+    );
+
+    state.profiles = ["c", "a", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after reorder"),
+        "profiles = [\"c\", \"a\", \"b\"]\n"
+    );
+}
+
+/// Two equal names never lend each other a note: each copy keeps its own
+/// through a reorder.
+#[test]
+fn two_equal_names_keep_each_their_own_note_through_a_reorder() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n");
+
+    let mut state = load_app_state().expect("load");
+    assert_eq!(state.profiles.len(), 3, "the load keeps duplicates");
+    state.profiles = ["b", "a", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"b\",\n  \"a\", # one\n  \"a\", # two\n]\n"
+    );
+}
+
+/// A name leaving the list keeps its notes in file order: the note on its own
+/// value's line before the after-comma one.
+#[test]
+fn a_leaving_name_keeps_its_own_line_notes_in_file_order() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  \"a\",\n  \"b\" # s\n  , # t\n  \"c\",\n]\n");
+
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"a\",\n  # s\n  # t\n  \"c\",\n]\n"
+    );
+}
+
+/// The list's end shapes a person writes: the close on the last name's line
+/// (`"b"]`, `"b",]`) and a comment line after the last name with no trailing
+/// comma. A note re-attached there still ends its own line, so the close and
+/// the next value stay outside it, the end comment stays at the end, and a
+/// duplicate name's note survives a rename of its twin.
+#[test]
+fn a_note_reattached_at_the_lists_end_keeps_the_file_valid_and_every_comment() {
+    let _home = HomeSandbox::new();
+    let cases: [(&str, &str, &[&str], &str); 6] = [
+        (
+            "reorder past an earlier copy of a name keeps equal names in file order",
+            "profiles = [\n  \"a\", # one\n  \"x\",\n  \"a\", # two\n]\n",
+            &["x", "a", "a"],
+            "profiles = [\n  \"x\",\n  \"a\", # one\n  \"a\", # two\n]\n",
+        ),
+        (
+            "two moving pairs of equal names keep their notes in file order",
+            "profiles = [\n  \"a\", # a1\n  \"a\", # a2\n  \"b\", # b1\n  \"b\", # b2\n]\n",
+            &["b", "b", "a", "a"],
+            "profiles = [\n  \"b\", # b1\n  \"b\", # b2\n  \"a\", # a1\n  \"a\", # a2\n]\n",
+        ),
+        (
+            "removal leaves a noted name last, close on the removed name's line",
+            "profiles = [\n  \"a\", # first\n  \"b\"]\n",
+            &["a"],
+            "profiles = [\n  \"a\" # first\n]\n",
+        ),
+        (
+            "reorder lands a noted name last, close after a trailing comma",
+            "profiles = [\n  \"work\", # day job\n  \"home\",]\n",
+            &["home", "work"],
+            "profiles = [\n  \"home\",\n  \"work\", # day job\n]\n",
+        ),
+        (
+            "reorder with an end comment and no trailing comma",
+            "profiles = [\n  \"work\", # day job\n  \"home\" # weekend\n  # end\n]\n",
+            &["home", "work"],
+            "profiles = [\n  \"home\", # weekend\n  \"work\" # day job\n  # end\n]\n",
+        ),
+        (
+            "rename of the first of two equal names",
+            "profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+            &["x", "a", "b"],
+            "profiles = [\n  \"x\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!("{name}:\n  got  {after:?}\n  want {expected:?}"));
+        }
+        if let Err(e) = load_app_state() {
+            wrong.push(format!("{name}: the saved file no longer loads: {e:#}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A CRLF file stays CRLF when a removal carries a note: the writer
+/// normalizes before the edit and re-expands every line on the way out.
+#[test]
+fn a_crlf_removal_that_carries_a_note_keeps_crlf_on_every_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\r\n  \"a\", # first\r\n  \"b\", # second\r\n  \"c\",\r\n]\r\n",
+    );
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\r\n  \"a\", # first\r\n  # second\r\n  \"c\",\r\n]\r\n"
+    );
+}
+
+/// A reorder that lands a noted name last in a compact list mints the line
+/// break the close no longer provides, so the `]` stays outside the comment.
+#[test]
+fn a_reorder_landing_a_noted_name_last_in_a_compact_list_keeps_the_close() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", # one\n  \"b\"]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"b\",\n  \"a\" # one\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b", "a"].map(ProfileName::from));
+}
+
+/// One sweep row: the fixture, its names, and each after-comma note's owner
+/// and trimmed text.
+type SweepCase<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)]);
+
+/// Every edit of every list shape keeps the file loadable, every comment
+/// line, every after-comma note on its owner's line while that owner's
+/// copies all survive, and a bracket-line comment on the bracket's line.
+#[test]
+fn list_edits_keep_every_comment_and_every_note_on_its_owner() {
+    let _home = HomeSandbox::new();
+    let corpus: &[SweepCase] = &[
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\", # two\n  \"c\",\n]\n",
+            &["a", "b", "c"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        ("profiles = [\"a\", \"b\"]\n", &["a", "b"], &[]),
+        (
+            "profiles = [\"a\", # one\n  \"b\"]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\" # two\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\", # two\n  # end\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"a\", # two\n  \"b\",\n]\n",
+            &["a", "a", "b"],
+            &[("a", "# one"), ("a", "# two")],
+        ),
+        (
+            "profiles = [\n  # group\n  \"a\", # one\n  \"b\",\n]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\n  \"a\",\n  \"b\" # pre\n  ,\n]\n",
+            &["a", "b"],
+            &[],
+        ),
+        (
+            "profiles = [\n  \"a\", # one\n  \"b\" # two\n  # end\n]\n",
+            &["a", "b"],
+            &[("a", "# one"), ("b", "# two")],
+        ),
+        (
+            "profiles = [\n  \"work\", # day job\n  \"home\",]\n",
+            &["work", "home"],
+            &[("work", "# day job")],
+        ),
+        (
+            "profiles = [ # open\n  \"a\", # one\n  \"b\",\n]\n",
+            &["a", "b"],
+            &[("a", "# one")],
+        ),
+        (
+            "profiles = [\"solo\" # only\n]\n",
+            &["solo"],
+            &[("solo", "# only")],
+        ),
+        ("profiles = [ # open\n  \"a\"]\n", &["a"], &[]),
+    ];
+    let mut wrong = Vec::new();
+    for &(fixture, names, notes) in corpus {
+        let edits: [(&str, Vec<&str>); 6] = [
+            ("append", [names, &["z"]].concat()),
+            ("remove first", names[1..].to_vec()),
+            (
+                "remove middle",
+                [&names[..names.len() / 2], &names[names.len() / 2 + 1..]].concat(),
+            ),
+            ("remove last", names[..names.len() - 1].to_vec()),
+            ("reverse", names.iter().rev().copied().collect()),
+            (
+                "rename first",
+                std::iter::once("z")
+                    .chain(names[1..].iter().copied())
+                    .collect(),
+            ),
+        ];
+        for (edit, target) in edits {
+            let path = write_state_file(fixture);
+            let mut state = load_app_state().expect("load");
+            state.profiles = target.iter().copied().map(ProfileName::from).collect();
+            save_app_state(&state).expect("save");
+            let after = std::fs::read_to_string(&path).expect("read");
+            match load_app_state() {
+                Ok(back) if back.profiles == state.profiles => {}
+                Ok(back) => wrong.push(format!("{edit} of {fixture:?}: names moved to {back:?}")),
+                Err(e) => wrong.push(format!(
+                    "{edit} of {fixture:?}: the saved file no longer loads: {e:#}"
+                )),
+            }
+            let comment_texts = |text: &str| {
+                let mut lines: Vec<String> = text
+                    .lines()
+                    .filter_map(|l| l.find('#').map(|i| l[i..].trim().to_string()))
+                    .collect();
+                lines.sort_unstable();
+                lines
+            };
+            if comment_texts(fixture) != comment_texts(&after) {
+                wrong.push(format!(
+                    "{edit} of {fixture:?}: a comment line was lost or gained\n  got  {after:?}"
+                ));
+            }
+            // A comment on the open bracket's line is the list's: it stays
+            // on that line, never on a name's.
+            let bracket_note = |text: &str| -> Option<String> {
+                let line = text.lines().find(|l| l.contains('['))?;
+                let head = &line[line.find('[')? + 1..];
+                match (head.find('#'), head.find('"')) {
+                    (Some(hash), Some(quote)) if hash < quote => Some(head[hash..].trim().into()),
+                    (Some(hash), None) => Some(head[hash..].trim().into()),
+                    _ => None,
+                }
+            };
+            if let Some(note) = bracket_note(fixture)
+                && bracket_note(&after).as_deref() != Some(note.as_str())
+            {
+                wrong.push(format!(
+                    "{edit} of {fixture:?}: the bracket comment {note:?} left \
+                     the bracket's line\n  got  {after:?}"
+                ));
+            }
+            for &(owner, note) in notes {
+                let all_copies_survive = names.iter().filter(|n| **n == owner).count()
+                    == target.iter().filter(|n| **n == owner).count();
+                if all_copies_survive
+                    && !after
+                        .lines()
+                        .any(|l| l.contains(&format!("\"{owner}\"")) && l.contains(note))
+                {
+                    wrong.push(format!(
+                        "{edit} of {fixture:?}: note {note:?} left its owner {owner:?}\n  got  {after:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_refusal_skips_a_readable_key_above_the_wrong_typed_one() {
+    let _home = HomeSandbox::new();
+    let before = "wrap_off = true\nprofiles = \"oops\"\n";
+    let path = write_state_file(before);
+    let err = save_app_state(&AppState::default()).expect_err("refuses");
+    assert!(
+        err.chain().any(|c| c.to_string()
+            == "profiles.toml has `profiles` in a shape clauth cannot read; \
+                fix or remove that line, then try again"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+}
+
+#[test]
+fn a_refusal_names_the_first_unreadable_key_in_file_order() {
+    let _home = HomeSandbox::new();
+    let before = "wrap_off = \"no\"\nprofiles = \"oops\"\n";
+    let path = write_state_file(before);
+    let err = save_app_state(&AppState::default()).expect_err("refuses");
+    assert!(
+        err.chain().any(|c| c.to_string()
+            == "profiles.toml has `wrap_off` in a shape clauth cannot read; \
+                fix or remove that line, then try again"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+}
+
+#[test]
+fn a_gap_holding_a_moved_and_a_renamed_name_keeps_each_comment_on_its_own() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\n  \"a\",\n  # moves\n  \"x\",\n  # renamed\n  \"y\",\n  \"b\",\n  \"c\",\n]\n",
+    );
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "z", "b", "c", "x"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  \"a\",\n  # renamed\n  \"z\",\n  \"b\",\n  \"c\",\n  # moves\n  \"x\",\n]\n"
+    );
+}
+
+#[test]
+fn a_wrongly_typed_nested_key_refuses_naming_its_table() {
+    let _home = HomeSandbox::new();
+    let before = "profiles = []\n[herdr]\npane_tag = \"yes\"\n";
+    let path = write_state_file(before);
+    let err = save_app_state(&AppState::default()).expect_err("refuses");
+    assert!(
+        err.chain().any(|c| c.to_string()
+            == "profiles.toml has `herdr` in a shape clauth cannot read; \
+                fix or remove that line, then try again"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+}
+
+#[test]
+fn a_renamed_name_keeps_the_comment_above_it() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n  # spare\n  \"c\",\n]\n",
+    );
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "b", "z"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n  # spare\n  \"z\",\n]\n"
+    );
+}
+
+#[test]
+fn a_renamed_first_name_keeps_its_comment() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\n  # work account\n  \"a\",\n  \"b\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["c", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"c\",\n  \"b\",\n]\n"
+    );
+}
+
+#[test]
+fn a_rename_in_a_one_line_list_keeps_its_layout() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [\"a\", \"b\", \"c\"]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a", "z", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"a\", \"z\", \"c\"]\n"
+    );
+}
+
+#[test]
+fn a_gap_with_more_removals_than_new_names_pairs_the_first_removal() {
+    let _home = HomeSandbox::new();
+    let path =
+        write_state_file("profiles = [\n  # one\n  \"a\",\n  # two\n  \"b\",\n  \"c\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["z", "c"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # one\n  \"z\",\n  # two\n  \"c\",\n]\n"
+    );
+}
+
+#[test]
+fn a_no_op_save_over_a_file_with_no_final_newline_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let before = "# hand note\nprofiles = []";
+    let path = write_state_file(before);
+    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    crate::testutil::set_mtime(&path, stamp);
+
+    let state = load_app_state().expect("load");
+    save_app_state(&state).expect("save");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("read after"), before);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        stamp,
+    );
+}
+
+#[test]
+fn a_no_op_save_over_mixed_line_endings_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let before = "# hand note\r\nprofiles = []\nwrap_off = false\r\n";
+    let path = write_state_file(before);
+    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    crate::testutil::set_mtime(&path, stamp);
+
+    let state = load_app_state().expect("load");
+    save_app_state(&state).expect("save");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("read after"), before);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        stamp,
+    );
+}
+
+fn proxy_account(service: &str, account: &str) -> ProxyAccount {
+    ProxyAccount {
+        service: crate::proxy::Service::parse(service).expect("service"),
+        account: account.to_string(),
+    }
+}
+
+/// `name`'s `config.toml` path, its directory created and `body` written.
+fn seed_config_toml(name: &ProfileName, body: &str) -> PathBuf {
+    let path = profile_config_path(name).expect("config path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(&path, body).expect("seed config.toml");
+    path
+}
+
+/// A first proxy record lands in `config.toml` in place: every byte already
+/// in the file stays where it was, comments included, and no preserved-keys
+/// marker is written.
+#[test]
+fn a_first_proxy_record_keeps_every_byte_already_in_config_toml() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-first");
+    let body =
+        "# my notes\nfallback_threshold = 90.0 # hand note\n\n[env]\n# keep me\nFOO = \"bar\"\n";
+    let path = seed_config_toml(&name, body);
+
+    write_proxy_record(&name, &proxy_account("stub", "acct-1")).expect("write the record");
+
+    let written = std::fs::read_to_string(&path).expect("read after");
+    assert!(written.starts_with(body), "{written}");
+    assert!(!written.contains("keys preserved"), "{written}");
+    assert_eq!(
+        stored_proxy_record(&name),
+        Some(proxy_account("stub", "acct-1"))
+    );
+}
+
+/// A re-bind's record replaces the values of the table already there, in
+/// place: the comments above and inside `[proxy]`, its position before
+/// `[env]`, and every other line stay byte for byte.
+#[test]
+fn a_rewritten_proxy_record_replaces_its_values_in_place() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-rebind");
+    let body = "# my notes\nfallback_threshold = 90.0\n\n# bound by the proxy login\n[proxy]\n# the service\nservice = \"stub\"\naccount = \"acct-1\"\n\n[env]\nFOO = \"bar\"\n";
+    let path = seed_config_toml(&name, body);
+
+    write_proxy_record(&name, &proxy_account("stub-two", "acct-2")).expect("rewrite the record");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after"),
+        "# my notes\nfallback_threshold = 90.0\n\n# bound by the proxy login\n[proxy]\n# the service\nservice = \"stub-two\"\naccount = \"acct-2\"\n\n[env]\nFOO = \"bar\"\n"
+    );
+}
+
+/// A `config.toml` that is not TOML is never written over: the record write
+/// refuses with the load's own parse error and the user's bytes stay.
+#[test]
+fn a_proxy_record_over_a_config_that_is_not_toml_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-garbage");
+    let body = "# my notes\nfallback_threshold = 9 0\n";
+    let path = seed_config_toml(&name, body);
+    let load_err = load_profile(&name).expect_err("the load refuses the file");
+
+    let write_err = write_proxy_record(&name, &proxy_account("stub", "acct-1"))
+        .expect_err("the record write refuses the file");
+
+    assert_eq!(write_err.to_string(), load_err.to_string());
+    assert_eq!(std::fs::read_to_string(&path).expect("read after"), body);
+}
+
+/// A CRLF `config.toml` stays CRLF: the record's lines take the file's own
+/// line ending, and the lines already there keep theirs.
+#[test]
+fn a_proxy_record_in_a_crlf_config_stays_crlf() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-crlf");
+    let body = "# my notes\r\nfallback_threshold = 90.0\r\n";
+    let path = seed_config_toml(&name, body);
+
+    write_proxy_record(&name, &proxy_account("stub", "acct-1")).expect("write the record");
+
+    let written = std::fs::read_to_string(&path).expect("read after");
+    assert!(written.starts_with(body), "{written:?}");
+    assert_eq!(
+        written.matches('\n').count(),
+        written.matches("\r\n").count(),
+        "every line ends CRLF: {written:?}"
+    );
+    assert_eq!(
+        stored_proxy_record(&name),
+        Some(proxy_account("stub", "acct-1"))
+    );
+}
+
+/// A profile with no `config.toml` yet gets one holding the record (the
+/// behaviour before the in-place writer, kept).
+#[test]
+fn a_proxy_record_for_a_profile_with_no_config_toml_creates_it() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-none");
+    let path = profile_config_path(&name).expect("config path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir");
+
+    write_proxy_record(&name, &proxy_account("stub", "acct-1")).expect("write the record");
+
+    assert_eq!(
+        stored_proxy_record(&name),
+        Some(proxy_account("stub", "acct-1"))
+    );
+}
+
+/// A record over an inline `proxy = { … }` table keeps the inline shape and
+/// its position between the keys around it, the values replaced in place.
+#[test]
+fn an_inline_proxy_record_keeps_the_inline_shape_in_place() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-inline");
+    let body = "name = \"px-inline\"\nproxy = { service = \"stub\", account = \"acct-1\" }\nid = \"p-1\"\n";
+    let path = seed_config_toml(&name, body);
+
+    write_proxy_record(&name, &proxy_account("stub-two", "acct-2")).expect("rewrite the record");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after"),
+        "name = \"px-inline\"\nproxy = { service = \"stub-two\", account = \"acct-2\" }\nid = \"p-1\"\n"
+    );
+}
+
+/// A CRLF config holding a multi-line basic string elsewhere survives a
+/// record write byte for byte: the string's own CRLF stays inside the string,
+/// the file stays CRLF, and it still parses.
+#[test]
+fn a_crlf_config_holding_a_multiline_string_survives_a_record_write() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("px-crlf-ml");
+    let body = "# my notes\r\nml = \"\"\"\r\nline one\r\nline two\r\n\"\"\"\r\nid = \"p-1\"\r\n";
+    let path = seed_config_toml(&name, body);
+
+    write_proxy_record(&name, &proxy_account("stub", "acct-1")).expect("write the record");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read after"),
+        "# my notes\r\nml = \"\"\"\r\nline one\r\nline two\r\n\"\"\"\r\nid = \"p-1\"\r\n\r\n[proxy]\r\nservice = \"stub\"\r\naccount = \"acct-1\"\r\n"
+    );
+    assert_eq!(
+        stored_proxy_record(&name),
+        Some(proxy_account("stub", "acct-1")),
+        "the file still parses"
+    );
+}
+
+/// A comment after a list's `[` labels the whole list: whichever name ends
+/// up first, the comment stays on the bracket's line and never becomes that
+/// name's note.
+#[test]
+fn a_comment_on_a_lists_open_bracket_line_stays_on_that_line_through_every_edit() {
+    let _home = HomeSandbox::new();
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "profiles = [ # tried in order\n  \"work\",\n  \"home\",\n]\n",
+            &["home", "work"],
+            "profiles = [ # tried in order\n  \"home\",\n  \"work\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+            &["c", "a", "b"],
+            "profiles = [ # accounts\n  \"c\",\n  \"a\",\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+            &["b", "a", "c"],
+            "profiles = [ # accounts\n  \"b\",\n  \"a\",\n  \"c\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n  \"b\", # B\n]\n",
+            &["b", "a"],
+            "profiles = [ # accounts\n  \"b\", # B\n  \"a\", # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n]\n",
+            &["a", "b", "c"],
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n  \"b\",\n]\n",
+            &["b"],
+            "profiles = [ # accounts\n  # A\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n]\n",
+            &[],
+            "profiles = [ # accounts\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\",\n  \"b\",\n]\n",
+            &["z", "b"],
+            "profiles = [ # accounts\n  \"z\",\n  \"b\",\n]\n",
+        ),
+        (
+            "profiles = [ # open\r\n  \"a\", # A\r\n  \"b\",\r\n]\r\n",
+            &["b", "a"],
+            "profiles = [ # open\r\n  \"b\",\r\n  \"a\", # A\r\n]\r\n",
+        ),
+        (
+            "profiles = [ \"a\", # A\n  \"b\", # B\n]\n",
+            &["b", "a"],
+            "profiles = [ \"b\", # B\n  \"a\", # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\", # A\n]\n",
+            &[],
+            "profiles = [ # accounts\n  # A\n]\n",
+        ),
+        (
+            "profiles = [ # accounts\n  \"a\"]\n",
+            &["b", "a"],
+            "profiles = [ # accounts\n  \"b\",\n  \"a\"]\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for &(fixture, target, expected) in cases {
+        let path = write_state_file(fixture);
+        let mut state = load_app_state().expect("load");
+        state.profiles = target.iter().copied().map(ProfileName::from).collect();
+        save_app_state(&state).expect("save");
+        let after = std::fs::read_to_string(&path).expect("read");
+        if after != expected {
+            wrong.push(format!(
+                "{fixture:?} -> {target:?}\n  got  {after:?}\n  want {expected:?}"
+            ));
+        }
+        if load_app_state()
+            .map(|s| s.profiles != state.profiles)
+            .unwrap_or(true)
+        {
+            wrong.push(format!("{fixture:?}: reload failed or names moved"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The Fallback tab's swap reaches the same editor through the chain: the
+/// bracket comment stays put there too.
+#[test]
+fn a_chain_swap_keeps_the_open_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file(
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [ # tried in order\n  \"work\", # day job\n  \"home\",\n]\n",
+    );
+
+    let mut state = load_app_state().expect("load");
+    state.fallback_chain = ["home", "work"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\"work\", \"home\"]\n\
+         fallback_chain = [ # tried in order\n  \"home\",\n  \"work\", # day job\n]\n"
+    );
+}
+
+/// An unpaired removal of the first name under a bracket comment: the
+/// comment stays on the bracket's line and the comment block above the
+/// removed name carries onto the next one.
+#[test]
+fn a_bracket_comment_rides_out_an_unpaired_removal_of_the_first_name() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  # above\n  \"a\",\n  \"b\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # above\n  \"b\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b"].map(ProfileName::from).to_vec());
+}
+
+/// The list emptied by a save while `auth_broken` still names the removed
+/// account: the bracket comment stays on the bracket's line and the
+/// quarantine key beside it keeps its bytes.
+#[test]
+fn an_auth_broken_save_keeps_the_bracket_comment_when_the_list_empties() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n]\n");
+    crate::profile::set_auth_broken_persisted(&ProfileName::from("a"), true)
+        .expect("flag the quarantine");
+    crate::profile::update_app_state(|state, _held| {
+        state.profiles.clear();
+    })
+    .expect("empty the list");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n]\nauth_broken = [\"a\"]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, Vec::<ProfileName>::new(), "the list emptied");
+    assert_eq!(
+        back.auth_broken,
+        ["a"].map(ProfileName::from).to_vec(),
+        "the quarantine stayed"
+    );
+}
+
+/// The first name moving down: the next name takes the first slot with its
+/// own comment block, and the bracket comment stays on the bracket's line.
+#[test]
+fn a_moved_name_with_its_own_comment_keeps_the_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n  # moves\n  \"b\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["b", "a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # moves\n  \"b\",\n  \"a\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["b", "a"].map(ProfileName::from).to_vec());
+}
+
+/// A name moved to the top of a longer list takes its own comment block
+/// into the first slot, below the bracket comment, which stays on the
+/// bracket's line.
+#[test]
+fn a_name_moved_to_the_top_with_its_own_comment_leaves_the_bracket_comment_in_place() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n  \"a\",\n  \"b\",\n  # top\n  \"c\",\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["c", "a", "b"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  # top\n  \"c\",\n  \"a\",\n  \"b\",\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(
+        back.profiles,
+        ["c", "a", "b"].map(ProfileName::from).to_vec()
+    );
+}
+
+/// Appending the first name to an empty bracket-comment list: the comment
+/// stays right after `[` and never reads as the name's note.
+#[test]
+fn appending_to_an_empty_bracket_comment_list_keeps_the_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    let path = write_state_file("profiles = [ # open\n]\n");
+    let mut state = load_app_state().expect("load");
+    state.profiles = ["a"].map(ProfileName::from).to_vec();
+    save_app_state(&state).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n\"a\"\n]\n"
+    );
+    let back = load_app_state().expect("reload");
+    assert_eq!(back.profiles, ["a"].map(ProfileName::from).to_vec());
+}
+
+/// The codex roster's own save reaches the same editor: a removal there
+/// keeps the bracket comment on the bracket's line.
+#[test]
+fn a_codex_roster_edit_keeps_the_open_bracket_comment_on_the_bracket_line() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_state("profiles = [ # open\n  \"work\",\n  \"home\",\n]\n");
+    let path = clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    crate::codex_profiles::CodexState::update(|state| {
+        state.remove_profile("work");
+        Ok(())
+    })
+    .expect("update");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [ # open\n  \"home\",\n]\n"
+    );
+    let back = crate::codex_profiles::CodexState::load().expect("reload");
+    assert_eq!(back.profiles(), [ProfileName::from("home")].as_slice());
 }

@@ -33,6 +33,7 @@ fn binds(opus: &str, sonnet: &str, haiku: &str, fable: &str) -> ModelSettings {
         haiku: Some(haiku.to_string()),
         fable: Some(fable.to_string()),
         subagent: None,
+        advisor: None,
     }
 }
 
@@ -412,6 +413,7 @@ fn the_retired_qwen_ids_are_offered_the_qwen_cloud_binds() {
         haiku: Some(id.to_string()),
         fable: Some(id.to_string()),
         subagent: Some(id.to_string()),
+        advisor: None,
     };
     let own = ModelSettings {
         opus: Some("qwen3.8-max[1m]".to_string()),
@@ -695,4 +697,126 @@ fn the_shipped_binds_digest_is_a_stable_literal() {
         builtin_binds_digest(),
         "2903a49cd2ef4476f104b8bd169e0a29475727ce7505914b8bd7f1e4f3de3585"
     );
+}
+
+/// A model block whose every field holds its own value, prefixed `tag`.
+fn every_field(tag: &str) -> ModelSettings {
+    ModelSettings {
+        default: Some(format!("{tag}-default")),
+        opus: Some(format!("{tag}-opus")),
+        sonnet: Some(format!("{tag}-sonnet")),
+        haiku: Some(format!("{tag}-haiku")),
+        fable: Some(format!("{tag}-fable")),
+        subagent: Some(format!("{tag}-subagent")),
+        advisor: Some(format!("{tag}-advisor")),
+    }
+}
+
+/// Applying a preset lands each of its values in the field of its own row, and
+/// a clear list clears only the field its label names: every value distinct,
+/// so a value bound to a neighbour's field reds.
+#[test]
+fn a_preset_applies_and_clears_each_field_by_its_own_row() {
+    let full = super::Preset {
+        name: "full".to_string(),
+        base_url: Some("p-url".to_string()),
+        models: every_field("p"),
+        builtin: false,
+    };
+    assert_eq!(
+        full.applied_to(
+            &Some("t-url".to_string()),
+            &every_field("t"),
+            super::Leftover::Keep
+        ),
+        (Some("p-url".to_string()), every_field("p"))
+    );
+    let opus_only = super::Preset {
+        name: "opus-only".to_string(),
+        base_url: None,
+        models: ModelSettings {
+            opus: Some("p-opus".to_string()),
+            ..ModelSettings::default()
+        },
+        builtin: false,
+    };
+    assert_eq!(
+        opus_only.applied_clearing(&Some("t-url".to_string()), &every_field("t"), &["sonnet"]),
+        (
+            Some("t-url".to_string()),
+            ModelSettings {
+                default: Some("t-default".to_string()),
+                opus: Some("p-opus".to_string()),
+                sonnet: None,
+                haiku: Some("t-haiku".to_string()),
+                fable: Some("t-fable".to_string()),
+                subagent: Some("t-subagent".to_string()),
+                advisor: Some("t-advisor".to_string()),
+            }
+        )
+    );
+}
+
+#[test]
+fn the_advisor_is_a_model_row_no_built_in_binds() {
+    assert!(super::MODEL_ROWS.contains(&"advisor"));
+    for builtin in super::BUILTINS {
+        assert!(
+            builtin.binds.models().advisor.is_none(),
+            "{} must leave the advisor unset",
+            builtin.name
+        );
+    }
+}
+
+/// A custom advisor id on a built-in's endpoint is never an offered move: the
+/// built-in leaves the row unset, and an account's own id is only ever replaced
+/// when it is a former id of that built-in.
+#[test]
+fn an_advisor_id_on_a_built_in_endpoint_gets_no_rebind_move() {
+    let ds = super::BUILTINS
+        .iter()
+        .find(|b| b.name == "DeepSeek")
+        .expect("DeepSeek built-in");
+    let mut held = ds.binds.models();
+    held.advisor = Some("my-id".to_string());
+    let config = config_with(vec![account("ds", ds.base_url, held)]);
+    assert!(
+        rebind_offers(&config).is_empty(),
+        "nothing to offer: every bound row is current and the advisor is the account's own"
+    );
+}
+
+#[test]
+fn apply_diff_and_applied_to_carry_the_advisor_row() {
+    let preset = super::Preset {
+        name: "p".to_string(),
+        base_url: None,
+        models: ModelSettings::default(),
+        builtin: false,
+    };
+    let held = ModelSettings {
+        advisor: Some("opus".to_string()),
+        ..ModelSettings::default()
+    };
+    let (replaces, leaves) = preset.apply_diff(None, &held);
+    assert!(replaces.is_empty());
+    assert_eq!(leaves, vec!["advisor"]);
+
+    let (_, kept) = preset.applied_to(&None, &held, super::Leftover::Keep);
+    assert_eq!(kept.advisor.as_deref(), Some("opus"));
+    let (_, cleared) = preset.applied_to(&None, &held, super::Leftover::Clear);
+    assert_eq!(cleared.advisor, None);
+
+    let setting = super::Preset {
+        models: ModelSettings {
+            advisor: Some("sonnet".to_string()),
+            ..ModelSettings::default()
+        },
+        ..preset
+    };
+    let (replaces, _) = setting.apply_diff(None, &held);
+    assert_eq!(replaces, vec!["advisor"]);
+    let (_, replaced) = setting.applied_to(&None, &held, super::Leftover::Keep);
+    assert_eq!(replaced.advisor.as_deref(), Some("sonnet"));
 }

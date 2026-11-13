@@ -19,7 +19,7 @@ use crate::profile::{
     AppState, ClaudeCredentials, OAuthToken, Profile, save_app_state, save_profile,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
-use crate::testutil::{ConfigDirSandbox, HomeSandbox};
+use crate::testutil::{ConfigDirSandbox, HomeSandbox, oauth_profile, write_linked_credentials};
 use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
 /// Two profiles: one plain OAuth account, one third-party with an endpoint.
@@ -68,6 +68,52 @@ fn first_text(result: &CallToolResult) -> String {
 /// The reply's prose lines, one per roster row.
 fn lines(result: &CallToolResult) -> Vec<String> {
     first_text(result).lines().map(str::to_string).collect()
+}
+
+/// A row names the available resets its account's last read found, singular
+/// at one, and says nothing at zero or with no reading.
+#[test]
+fn a_row_names_the_banked_limit_resets_it_read() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let row = || lines(&call_profiles(Some(vec!["solo"]), None));
+
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "no reading names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("solo", 2, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             2 limit resets available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 1, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             1 limit reset available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 0, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a reading of zero names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("vendor", 1, &[], None, 1);
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; 1 limit reset available; \
+             no api key"
+        ],
+        "the file decides, on an api-key account too",
+    );
 }
 
 #[test]
@@ -163,7 +209,7 @@ fn a_token_rejected_marker_renders_in_the_state_group() {
             "tier": null,
             "host": "api.deepseek.com",
             "windows": {"kind": "third_party"},
-            "has_live_session": true,
+            "live_sessions": 1,
             "disabled": true,
             "auth_broken": true,
             "token_rejected": true,
@@ -172,12 +218,14 @@ fn a_token_rejected_marker_renders_in_the_state_group() {
     }));
     assert_eq!(
         line,
-        "- tok [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; token rejected; subscription canceled",
+        "- tok [DeepSeek, api.deepseek.com]: usage unknown; 1 live session; disabled; login expired; token rejected; subscription canceled",
     );
 }
 
-/// The `profiles` pass reads the job store once for the whole roster, never
-/// once per row (the `gc_runtime_trees` snapshot precedent).
+/// The `profiles` pass reads the job store ONCE, for the live-session tally's
+/// background-job term, and shares that one snapshot across the row map; a
+/// per-row marker or job walk would be the per-row read this pass must never
+/// do.
 #[test]
 fn the_profiles_pass_reads_the_job_store_once() {
     let _home = HomeSandbox::new();
@@ -188,34 +236,376 @@ fn the_profiles_pass_reads_the_job_store_once() {
     assert_eq!(
         crate::claude_jobs::job_trees_reads(),
         1,
-        "the whole pass reads the store once, never once per row"
+        "one job-store snapshot per pass, shared by every row"
     );
 }
 
-/// A job naming a tree under `solo/` makes `solo`'s roster row carry the live
-/// flag while `vendor` stays without it: the row derives liveness from the same
-/// per-pass job snapshot, not from the marker alone.
+/// The session scope holds the same one-snapshot rule: one tally collect per
+/// pass, shared by the row, the unknown flag and the live-usage fold — a
+/// second collect (or one re-added around `profile_row`) would double the
+/// store reads.
 #[test]
-fn a_job_under_one_profile_marks_only_that_profiles_row_live() {
+fn the_session_pass_reads_the_job_store_once() {
     let home = HomeSandbox::new();
-    seed_two_profiles();
-    let solo_dir =
-        crate::profile::profile_dir(&crate::profile::ProfileName::from("solo")).expect("solo dir");
-    let runtime = solo_dir.join("runtime-4242-0");
-    std::fs::create_dir_all(&runtime).expect("mkdir runtime tree");
-    crate::testutil::write_claude_job(home.home(), "37560ded", &runtime);
+    seed_canceled_account();
+    let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = ConfigDirSandbox::new(&home, &runtime);
 
-    let text = first_text(&call_profiles(None, None));
-    assert!(
-        text.lines()
-            .any(|l| l.starts_with("- solo") && l.contains("live session")),
-        "a job under solo/ is a live solo session: {text}"
+    crate::claude_jobs::reset_job_trees_reads();
+    call_profiles(None, Some("session"));
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "one job-store snapshot per session pass, resolved row included"
     );
-    assert!(
-        !text
-            .lines()
-            .any(|l| l.starts_with("- vendor") && l.contains("live session")),
-        "a job under solo/ is nobody's vendor session: {text}"
+}
+
+/// The unresolved shape too: the collect sits before the resolve branch, so a
+/// session that resolves nowhere still reads the store exactly once — and no
+/// more than once.
+#[test]
+fn an_unresolved_session_pass_reads_the_job_store_once() {
+    let home = HomeSandbox::new();
+    let foreign = home.home().join("foreign-config");
+    std::fs::create_dir_all(&foreign).expect("foreign dir");
+    let _dir = ConfigDirSandbox::new(&home, &foreign);
+
+    crate::claude_jobs::reset_job_trees_reads();
+    call_profiles(None, Some("session"));
+    assert_eq!(
+        crate::claude_jobs::job_trees_reads(),
+        1,
+        "one job-store snapshot per session pass, unresolved session included"
+    );
+}
+
+/// The live-session clause is a COUNT off the shared tally the TUI reads
+/// ([`crate::live_sessions::LiveTally::collect`]), never a flag: one session
+/// renders singular with no delegate clause, on its account alone — pinned by
+/// whole-line equality, so a miscount or a stray clause cannot hide behind a
+/// substring.
+#[test]
+fn one_own_session_renders_singular_on_its_account_alone() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "solo"))
+        .expect("register own");
+    let _m0 = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("solo"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the own session's marker");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; 1 live session"
+                .to_string(),
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+        ],
+        "one session renders singular, zero delegates omit the clause, and an \
+         account hosting nothing renders none",
+    );
+}
+
+/// The count is the shared tally's, bare fold included: a bare `claude` starts
+/// without `clauth start`, holds no registry row, and burns the account the
+/// shared credential link resolves to — so that account's row carries it.
+#[test]
+fn a_bare_session_counts_on_the_account_the_credential_link_resolves_to() {
+    let _home = HomeSandbox::new();
+    save_profile(&oauth_profile("solo", "rt-solo")).expect("save solo");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    write_linked_credentials("rt-solo");
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; 1 live session"
+                .to_string()
+        ],
+        "the bare session burns the account the link resolves to",
+    );
+}
+
+/// The same bare-session row, with the credentials file padded by an `mcpOAuth`
+/// block past a job record's size: the login still resolves, so the account's
+/// row still carries the session.
+#[test]
+fn a_bare_session_counts_off_a_credentials_file_padded_by_mcp_oauth() {
+    let _home = HomeSandbox::new();
+    save_profile(&oauth_profile("solo", "rt-solo")).expect("save solo");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    write_linked_credentials("rt-solo");
+    crate::testutil::pad_linked_credentials_past_record_cap();
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; 1 live session"
+                .to_string()
+        ],
+        "a padded credentials file still attributes the bare session to its account",
+    );
+}
+
+/// A dead session's registry row — its marker released, awaiting GC — is no
+/// live session: the count reads the tally's held-marker filter, never the raw
+/// registry.
+#[test]
+fn a_dead_sessions_row_adds_no_live_session_clause() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "solo"))
+        .expect("register a row nothing holds live");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown".to_string(),
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+        ],
+        "a row whose marker is not held adds no clause",
+    );
+}
+
+/// A tally that could not read every dir it counts from has no fleet total, so
+/// the per-row counts it does carry may be short. The reply says so instead of
+/// printing them as a complete count: an agent picking a target must not read
+/// an undercount as the account's real headroom for sessions.
+#[test]
+fn an_unreadable_store_marks_the_reply_partly_unknown() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "solo"))
+        .expect("register own");
+    let _m0 = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("solo"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the own session's marker");
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(claude.join("jobs"), b"not a directory").expect("block the job store");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; 1 live session"
+                .to_string(),
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+            "live sessions: partly unknown (a session store could not be read)".to_string(),
+        ],
+        "an unreadable store leaves the count incomplete, and the reply says so",
+    );
+}
+
+/// Two sessions with a delegate among them render plural with the split the
+/// chip's own/delegates form carries; three with two delegates keep counting.
+#[test]
+fn plural_sessions_split_their_delegates_out() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let name = crate::profile::ProfileName::from("solo");
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "solo"))
+        .expect("register own");
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        is_delegate: true,
+        ..crate::testutil::live_row("4242-1", "solo")
+    })
+    .expect("register delegate");
+    let _m0 = crate::runtime::hold_session_row_marker(&name, false, "4242-0")
+        .expect("hold the own session's marker");
+    let _m1 = crate::runtime::hold_session_row_marker(&name, false, "4242-1")
+        .expect("hold the delegate's marker");
+
+    let solo = |lines: Vec<String>| {
+        lines
+            .into_iter()
+            .find(|l| l.starts_with("- solo"))
+            .expect("solo row")
+    };
+    assert_eq!(
+        solo(lines(&call_profiles(None, None))),
+        "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+         2 live sessions (1 delegate)",
+        "plural with the delegate split the chip carries",
+    );
+
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        is_delegate: true,
+        ..crate::testutil::live_row("4242-2", "solo")
+    })
+    .expect("register second delegate");
+    let _m2 = crate::runtime::hold_session_row_marker(&name, false, "4242-2")
+        .expect("hold the second delegate's marker");
+    assert_eq!(
+        solo(lines(&call_profiles(None, None))),
+        "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+         3 live sessions (2 delegates)",
+        "two delegates name plural",
+    );
+}
+
+/// A session that swapped counts ONCE, on the account it currently runs as —
+/// the chip's own attribution rule (`current_member`, else the start profile) —
+/// never once per member its visit history or markers still name.
+#[test]
+fn a_swapped_session_counts_once_on_its_current_account() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let mut moved = crate::testutil::live_row("4242-0", "solo");
+    moved.current_member = Some("vendor".to_string());
+    moved.visited_members = vec!["solo".to_string(), "vendor".to_string()];
+    crate::live_sessions::register(&moved).expect("register moved");
+    // The marker lives under the CURRENT member, where `marker_is_held` probes.
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("vendor"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the moved session's marker");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown".to_string(),
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; 1 live session; no api key"
+                .to_string(),
+        ],
+        "the account swapped off counts nothing; the account it runs on now \
+         counts it once, in the clause slot ahead of the account-state marker \
+         run",
+    );
+}
+
+/// A no-windows account WITHOUT a balance — a counter, a generic endpoint's
+/// scalar figure that is no wallet — keeps the `no 5h/7d limits` denial:
+/// clauth knows the provider publishes no
+/// windows, and a counter is exactly the figure a reader needs telling not to
+/// wait out. The split rides the payload's `has_wallet`, decided by the same
+/// `is_balance_row` + `parse_balance` pair every wallet surface uses — never a
+/// match on the rendered figure.
+#[test]
+fn a_counter_without_a_wallet_keeps_the_no_limits_denial() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "cnt".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save generic counter profile");
+    save_app_state(&AppState {
+        active_profile: Some("cnt".into()),
+        profiles: vec!["cnt".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("cnt"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::write(
+        &cache,
+        r#"{"is_available":true,"rows":[{"label":"credits","value":"42 units","kind":"body"}],"bars":[],"best_effort":true}"#,
+    )
+    .expect("provider cache");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- cnt (global active) [generic, 127.0.0.1:4000, local endpoint]: \
+              no 5h/7d limits; credits: 42 units"
+                .to_string()
+        ],
+        "no wallet in the stats, so the denial rides the counter",
+    );
+}
+
+/// The denial never rides an api balance: a
+/// DeepSeek wallet row renders the figure alone, the denial `windows_prose`
+/// drops at unit level is dropped on the row the production cache reader
+/// built.
+#[test]
+fn a_wallet_row_denies_nothing() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "ds".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save ds");
+    save_app_state(&AppState {
+        active_profile: Some("ds".into()),
+        profiles: vec!["ds".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache("ds", crate::testutil::DEEPSEEK_CACHE_BYTES);
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- ds (global active) [DeepSeek, api.deepseek.com]: api balance: 31.45 CNY".to_string()
+        ],
+        "the wallet figure renders with no denial before it",
+    );
+}
+
+/// The headline and the denial pick ONE wallet set: a spent (`total: 0.00
+/// USD`) wallet listed after a counter still wins the headline, so the
+/// `has_wallet` that drops the denial never leaves a bare counter standing as
+/// a window a reader could wait out.
+#[test]
+fn a_spent_wallet_after_a_counter_keeps_the_wallet_figure() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "cnt".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save generic counter profile");
+    save_app_state(&AppState {
+        active_profile: Some("cnt".into()),
+        profiles: vec!["cnt".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("cnt"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::write(
+        &cache,
+        r#"{"is_available":true,"rows":[{"label":"used","value":"5.00 USD","kind":"body"},{"label":"total","value":"0.00 USD","kind":"body"}],"bars":[],"best_effort":true}"#,
+    )
+    .expect("provider cache");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- cnt (global active) [generic, 127.0.0.1:4000, local endpoint]: \
+             total: 0.00 USD"
+                .to_string()
+        ],
+        "the wallet is the figure, so the dropped denial fronts a wallet",
     );
 }
 
@@ -266,10 +656,10 @@ fn an_unrecognised_scope_value_is_echoed_flat() {
     );
 }
 
-/// The trim itself. `has_live_session` and `throughput` are absent unless they
+/// The trim itself. `live_sessions` and `throughput` are absent unless they
 /// say something, and the endpoint prints as a host. Emitted unconditionally
-/// these were 39% of a 27-profile response, nearly all of it `false` and rows
-/// carrying no warning at all.
+/// these were 39% of a 27-profile response, nearly all of them carrying
+/// nothing and rows with no warning at all.
 #[test]
 fn quiet_fields_are_absent_and_the_endpoint_prints_as_a_host() {
     let _home = HomeSandbox::new();
@@ -285,7 +675,7 @@ fn quiet_fields_are_absent_and_the_endpoint_prints_as_a_host() {
     );
     assert!(
         !solo.contains("live session"),
-        "no live session, so the flag must not appear",
+        "no live session, so no live-session clause appears",
     );
     assert!(
         !solo.contains("throughput"),
@@ -342,8 +732,9 @@ fn seed_auth_states() {
 }
 
 /// `keyless` is the only-when-news signal a picker needs before a `delegate`:
-/// true on a third-party profile with no inference auth source, absent (never
-/// `false`) on a keyed third-party and on an OAuth profile.
+/// true on a profile whose inference needs a key it does not carry
+/// (`Profile::is_keyless`), absent (never `false`) on a keyed third-party and
+/// on an OAuth profile.
 #[test]
 fn keyless_flag_names_only_the_keyless_third_party_profile() {
     let _home = HomeSandbox::new();
@@ -409,6 +800,7 @@ fn seed_flag_states() {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -459,6 +851,7 @@ fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
                 codex_plan: None,
                 email: None,
@@ -479,6 +872,49 @@ fn the_roster_names_an_organizations_refusal_apart_from_a_canceled_plan() {
     );
 }
 
+/// An OAuth account retyped to an api key of its own keeps the
+/// `usage_cache.json` its OAuth life wrote, and no leg rewrites it: a canceled
+/// plan left there is a fossil, so its roster row reads as it did before the
+/// file existed.
+#[test]
+fn the_roster_drops_a_retyped_accounts_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "moved".to_string(),
+        Some("https://llm.example.test".to_string()),
+        Some("sk-moved".to_string()),
+    ))
+    .expect("save moved");
+    save_app_state(&AppState {
+        active_profile: Some("moved".into()),
+        profiles: vec!["moved".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let before = lines(&call_profiles(None, None));
+
+    write_profile_cache(
+        &crate::profile::ProfileName::from("moved"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                plan_display_name: None,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped row"
+    );
+}
+
 /// The marker group is contiguous: a profile in all four states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.
@@ -492,7 +928,7 @@ fn the_four_state_markers_render_as_one_group() {
             "tier": null,
             "host": "api.deepseek.com",
             "windows": {"kind": "third_party"},
-            "has_live_session": true,
+            "live_sessions": 1,
             "disabled": true,
             "auth_broken": true,
             "keyless": true,
@@ -502,7 +938,7 @@ fn the_four_state_markers_render_as_one_group() {
     }));
     assert_eq!(
         line,
-        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; key rejected; subscription canceled",
+        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; 1 live session; disabled; login expired; no api key; key rejected; subscription canceled",
     );
 }
 
@@ -517,7 +953,6 @@ fn the_credit_cap_marker_follows_the_canceled_marker() {
             "provider": "anthropic",
             "tier": null,
             "windows": {"kind": "oauth"},
-            "has_live_session": false,
             "disabled": true,
             "canceled": true,
             "credit_capped": true,
@@ -610,6 +1045,7 @@ fn seed_canceled_account() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -699,10 +1135,13 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     assert_eq!(
         row,
         "- litellm (global active) [generic, 127.0.0.1:4000, local endpoint]: \
-         no 5h/7d limits; total: 31.45 CNY",
+         total: 31.45 CNY",
         "the account's own cached figures, no claim about a plan it cannot have, and the \
          locality marker its loopback base url earns — pinned here on a row the production \
-         path built from a saved profile, rather than on a hand-written one",
+         path built from a saved profile, rather than on a hand-written one. The figure \
+         rides no denial: a parseable balance row is a wallet (`is_balance_row` + \
+         `parse_balance`, the pair every wallet surface uses), and the denial never \
+         rides an api balance",
     );
 }
 
@@ -875,6 +1314,143 @@ fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
     assert!(
         !row.contains("USD/day"),
         "the unfunded USD wallet's series stays off the row: {row}",
+    );
+}
+
+/// The runway reaches the roster row through the payload: `windows_payload`
+/// carries the funded wallet's numeric balance beside its burn, so the prose
+/// divides two numbers and never parses its own rendered figure. The burn is
+/// recency-weighted, so the row's exact runway is the prose test's job; this
+/// one pins that the clause reaches the row at all.
+#[test]
+fn a_wallet_series_renders_its_runway_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                    raw: None,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    let runway = row
+        .split_once("CNY/day (~")
+        .and_then(|(_, rest)| rest.split_once(" left)"))
+        .map(|(n, _)| n.to_string());
+    assert!(
+        runway
+            .as_deref()
+            .is_some_and(|n| n.ends_with(" day") || n.ends_with(" days") || n.ends_with(" h")),
+        "the funded wallet's runway rides its burn: {row}",
+    );
+    // The series burns ~393 CNY/day, so 498.18 CNY lasts 1.27 days; the
+    // count stays 1 for any burn between ~333 and ~498 CNY/day, so the
+    // recency weighting's drift between the fixture's stamps and the call
+    // cannot move it, while a wrong unit does.
+    assert!(
+        row.ends_with(" CNY/day (~1 day left)"),
+        "the funded wallet's runway in whole days: {row}",
+    );
+}
+
+/// The numeric balance the prose divides rides the payload, and it is the
+/// FUNDED wallet's amount in the burn's currency — the two-wallet cache lists
+/// an empty USD row first, so a balance taken off the first row would name a
+/// different wallet than the burn.
+#[test]
+fn the_runway_payload_carries_the_funded_wallets_balance() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let now = crate::usage::now_ms();
+    let history = [
+        (now - 2 * 3_600_000, 600.18),
+        (now - 3_600_000, 550.18),
+        (now - 30 * 60_000, 520.18),
+    ]
+    .into_iter()
+    .map(|(ts, amount)| crate::usage::WalletSample {
+        ts,
+        label: "api balance".to_string(),
+        amount,
+        currency: "CNY".to_string(),
+    })
+    .collect::<Vec<_>>();
+    let rate = crate::usage::funded_wallet_rate(&history, &stats.rows)
+        .expect("the funded CNY wallet carries a rate");
+    assert_eq!(rate.currency, "CNY");
+    let payload = windows_payload(&ProfileWindows::ThirdParty {
+        stats: Some(stats),
+        age_secs: None,
+        chain_age_secs: None,
+        provider: None,
+        wallet_rate: Some(rate),
+    });
+    assert_eq!(payload["wallet_balance"].as_f64(), Some(498.18));
+    assert_eq!(payload["wallet_burn_currency"], "CNY");
+}
+
+/// The receipt's `target` clause reads the payload `windows_payload` builds:
+/// `live_usage_json` folds `wallet_balance` and the burn in through
+/// `dated_windows_payload`, so a delegate reply names the target wallet's
+/// runway without a second render path. 498.18 CNY at 160.7/day lasts 3.10
+/// days -> three whole days.
+#[test]
+fn the_runway_reaches_the_delegate_receipt_through_live_usage_json() {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let rate = crate::usage::WalletRate {
+        label: "api balance".to_string(),
+        currency: "CNY".to_string(),
+        amount: 498.18,
+        per_day: 160.7,
+    };
+    let lu = live_usage_json(
+        Some("vendor"),
+        Some(&ProfileWindows::ThirdParty {
+            stats: Some(stats),
+            age_secs: None,
+            chain_age_secs: None,
+            provider: None,
+            wallet_rate: Some(rate),
+        }),
+    );
+    let prose = render::live_usage_prose(&lu, "target");
+    assert!(
+        prose.ends_with("(~3 days left)"),
+        "the receipt's target clause names the target wallet's runway: {prose}",
     );
 }
 
@@ -1071,6 +1647,93 @@ fn an_unresolved_session_reads_unknown_not_empty() {
     );
 }
 
+/// The session scope's row is a slice of the same tally the roster renders, so
+/// a read that failed there fails here too: the resolved row is followed by the
+/// unknown line, word for word, whatever scope the reply carries.
+#[test]
+fn a_session_scopes_unreadable_store_marks_its_reply_partly_unknown() {
+    let home = HomeSandbox::new();
+    seed_canceled_account();
+    let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = ConfigDirSandbox::new(&home, &runtime);
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(claude.join("jobs"), b"not a directory").expect("block the job store");
+
+    assert_eq!(
+        lines(&call_profiles(None, Some("session"))),
+        vec![
+            "- kerry (global active) [anthropic, Free]: usage unknown; \
+             subscription canceled; source `session_dir`"
+                .to_string(),
+            "live sessions: partly unknown (a session store could not be read)".to_string(),
+            String::new(),
+            "switch_profile & this session: repoints the global `~/.claude` credentials, \
+             but THIS session runs in an isolated `clauth start` runtime pinned to `kerry` \
+             and is unaffected. Only a later session on the global credentials adopts the \
+             change."
+                .to_string(),
+        ],
+        "the session row and the unknown line, by whole-line equality",
+    );
+}
+
+/// The unknown line is unconditional: an empty roster with a failed read
+/// carries it too — no row presents a count there, but nothing in the reply
+/// would say the tally read only part of its input either.
+#[test]
+fn an_empty_roster_with_an_unreadable_store_still_carries_the_unknown_line() {
+    let _home = HomeSandbox::new();
+    save_app_state(&AppState {
+        active_profile: None,
+        profiles: Vec::new(),
+        ..Default::default()
+    })
+    .expect("an empty roster");
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(claude.join("jobs"), b"not a directory").expect("block the job store");
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "no profiles".to_string(),
+            "live sessions: partly unknown (a session store could not be read)".to_string(),
+        ],
+        "no profiles and a failed read: the reply carries both, by whole-line equality",
+    );
+}
+
+/// The session scope collects the tally before it resolves, so a session whose
+/// account resolves nowhere still learns a read failed — an unresolved session
+/// is not a read that succeeded.
+#[test]
+fn an_unresolved_sessions_unreadable_store_still_carries_the_unknown_line() {
+    let home = HomeSandbox::new();
+    let foreign = home.home().join("foreign-config");
+    std::fs::create_dir_all(&foreign).expect("foreign dir");
+    let _dir = ConfigDirSandbox::new(&home, &foreign);
+    let claude = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude).expect("mkdir .claude");
+    std::fs::write(claude.join("jobs"), b"not a directory").expect("block the job store");
+
+    assert_eq!(
+        lines(&call_profiles(None, Some("session"))),
+        vec![
+            "session profile unknown, source unknown; active profile none".to_string(),
+            "live sessions: partly unknown (a session store could not be read)".to_string(),
+            String::new(),
+            "switch_profile & this session: repoints the global `~/.claude` credentials, \
+             but THIS session uses a custom `CLAUDE_CONFIG_DIR` and reads its own \
+             credentials, so it is unaffected. Only a later session on the global \
+             credentials adopts the change."
+                .to_string(),
+        ],
+        "the unresolved row and the unknown line, by whole-line equality",
+    );
+}
+
 /// `names` filters the roster; the session scope IS already a one-row answer,
 /// so the pair is a cross-mode mistake. Refused by name with the fix — the
 /// same boundary rule as `monitor`'s job/state seam — instead of silently
@@ -1113,7 +1776,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["cx"]), None);
@@ -1121,7 +1784,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: cx; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX", "zz"]), None);
@@ -1130,7 +1793,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
         first_text(&result),
         "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
          account, which these tools do not manage — they are Claude Code only. Switch it \
-         with `clauth <name>`"
+         with `clauth switch <name>`"
     );
 
     let result = call_profiles(Some(vec!["CX"]), None);
@@ -1138,7 +1801,7 @@ fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
     assert_eq!(
         first_text(&result),
         "error: profile not found: CX; cx names a CODEX account, which these tools do not \
-         manage — they are Claude Code only. Switch it with `clauth <name>`"
+         manage — they are Claude Code only. Switch it with `clauth switch <name>`"
     );
 }
 
@@ -1199,7 +1862,9 @@ fn model_binds_print_only_when_the_filter_names_the_account() {
 }
 
 /// The session scope names its account by construction, so its one row prints
-/// the binds the way a `names` call does — it is the same `profile_line`.
+/// the binds the way a `names` call does — it is the same `profile_line`. Its
+/// live-session clause proves the scope's own liveness snapshot reaches the
+/// row: an empty map would drop it.
 #[test]
 fn session_scope_prints_the_resolved_accounts_binds() {
     let home = HomeSandbox::new();
@@ -1219,6 +1884,14 @@ fn session_scope_prints_the_resolved_accounts_binds() {
     let runtime = home.home().join(".clauth/profiles/vendor/runtime-4242-1");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     let _dir = ConfigDirSandbox::new(&home, &runtime);
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "vendor"))
+        .expect("register own");
+    let _m0 = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("vendor"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the own session's marker");
 
     let row = first_text(&call_profiles(None, Some("session")))
         .lines()
@@ -1228,6 +1901,10 @@ fn session_scope_prints_the_resolved_accounts_binds() {
     assert!(
         row.contains("models: opus -> deepseek-v4-pro"),
         "the session row names its account's binds: {row}"
+    );
+    assert!(
+        row.contains("; 1 live session; models: opus -> deepseek-v4-pro"),
+        "the session row carries the one live session's count beside its account's binds: {row}"
     );
 }
 
@@ -1267,5 +1944,154 @@ fn only_set_binds_print_and_a_named_unbound_account_stays_identical() {
         lines(&call_profiles(Some(vec!["solo"]), None)),
         vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
         "a named account with no binds stays byte-identical",
+    );
+}
+
+/// The reply's row counts the job-store term, not held markers alone: a
+/// launcher that exited releases its marker while Claude Code still runs the
+/// job, so that job is the only evidence of the second session. A stopped job
+/// adds none, and a job whose tree has no live supervisor adds none either.
+#[test]
+fn a_launcher_exited_bg_job_and_a_held_row_render_two_live_sessions() {
+    let home = HomeSandbox::new();
+    seed_two_profiles();
+    let solo = crate::profile::ProfileName::from("solo");
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "solo"))
+        .expect("register the held row");
+    let _m0 = crate::runtime::hold_session_row_marker(&solo, false, "4242-0")
+        .expect("hold the row's marker");
+    let tree = crate::runtime::background_runtime_tree(&solo).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        background: true,
+        ..crate::testutil::live_row("4243-0", "solo")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job(home.home(), "jobrun", &tree);
+    crate::testutil::write_claude_job_in(
+        home.home(),
+        "jobstop",
+        &tree,
+        "stopped",
+        Some("2026-10-30T00:00:00Z"),
+    );
+    let vendor = crate::profile::ProfileName::from("vendor");
+    let vendor_tree = crate::runtime::background_runtime_tree(&vendor).expect("vendor tree");
+    std::fs::create_dir_all(&vendor_tree).expect("build the vendor tree");
+    crate::testutil::write_claude_job(home.home(), "jobdead", &vendor_tree);
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; 2 live sessions"
+                .to_string(),
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+        ],
+        "the held row and the launcher-exited job count; a stopped job and a \
+         supervisorless tree's job do not",
+    );
+}
+
+/// The advisor row is a bind like any other: a named account that sets it
+/// shows `advisor -> <id>` after its tier binds.
+#[test]
+fn a_named_accounts_advisor_row_prints_among_its_binds() {
+    let _home = HomeSandbox::new();
+    let mut vendor = Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    vendor.models.opus = Some("deepseek-v4-pro".to_string());
+    vendor.models.advisor = Some("opus".to_string());
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    save_profile(&vendor).expect("save vendor");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: opus -> \
+             deepseek-v4-pro, advisor -> opus; no api key"
+        ],
+    );
+}
+
+/// A keyless third-party control (`vendor`), then two proxy accounts on their
+/// proxy's loopback bind as `clauth login <name> --proxy <service>` creates
+/// them: `pb` with its key cleared, `pk` keyed.
+fn seed_proxy_auth_states() {
+    save_profile(&Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    ))
+    .expect("save vendor");
+    save_app_state(&AppState {
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+}
+
+/// The roster flags exactly the accounts the delegate refuses as keyless: a
+/// keyless proxy account on its bind carries `keyless` and renders `no api
+/// key`, the keyed proxy account beside it carries neither, and the keyless
+/// third-party control keeps its flag.
+#[test]
+fn the_roster_flags_a_keyless_proxy_account_on_its_bind_keyless() {
+    let _home = HomeSandbox::new();
+    seed_proxy_auth_states();
+
+    let config = crate::profile::load_config().expect("config");
+    let live = crate::live_sessions::LiveTally::collect(&config);
+    let keyless = |name: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("seeded");
+        profile_row(p, &config, crate::usage::now_epoch_secs(), &live)
+            .get("keyless")
+            .cloned()
+    };
+    assert_eq!(
+        (
+            lines(&call_profiles(None, None)),
+            [keyless("vendor"), keyless("pb"), keyless("pk")],
+        ),
+        (
+            vec![
+                "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+                "- pb [generic, 127.0.0.1:9141, local endpoint]: usage unknown; no api key"
+                    .to_string(),
+                "- pk [generic, 127.0.0.1:9141, local endpoint]: usage unknown".to_string(),
+            ],
+            [
+                Some(serde_json::json!(true)),
+                Some(serde_json::json!(true)),
+                None
+            ],
+        ),
+        "(the reply's rows, the JSON `keyless` value of vendor, pb, pk)"
     );
 }

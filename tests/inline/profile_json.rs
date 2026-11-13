@@ -238,12 +238,13 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
     // The fresh direction at a DATED body: a live fetch younger than the
     // threshold reads not-stale on the same surface that publishes the marker,
     // so the flag cannot flip to "always stale once dated" and pass.
+    let t0 = crate::usage::now_ms();
     seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(60));
     let fresh = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
     assert!(!fresh.stale(), "a body fetched a minute ago is current");
     let age = fresh.age_secs().expect("a dated body publishes its age");
     assert!(
-        (55..=65).contains(&age),
+        (55..=65 + (crate::usage::now_ms() - t0) / 1000).contains(&age),
         "the fresh direction is exercised at a real dated age: {age}s"
     );
 
@@ -335,6 +336,7 @@ fn a_body_with_no_window_is_never_stale() {
     let plan_only = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -512,6 +514,7 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -540,6 +543,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -552,7 +556,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
         &usage,
     );
 
-    assert_eq!(tier_label(&profile), Some("Max 20x".to_string()));
+    assert_eq!(tier_label(&profile), Some("Ultra".to_string()));
 }
 
 /// Regression guard the other direction: an un-canceled cached plan still
@@ -565,6 +569,7 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(5)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -577,14 +582,92 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
         &usage,
     );
 
-    assert_eq!(tier_label(&profile), Some("Max 5x".to_string()));
+    assert_eq!(tier_label(&profile), Some("Max".to_string()));
 }
 
-/// `tier_label` reads the same OAuth cache `published_windows` does, so it
+/// The server's own plan name, cached beside the tier, is the label every
+/// published surface reads, over the local map.
+#[test]
+fn tier_label_prefers_the_server_plan_name() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
+    let profile = blank_profile(&crate::profile::ProfileName::from("kerry"));
+    let mut usage = serde_json::to_value(UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(Some(5)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .expect("serializes");
+    usage["plan"]["plan_display_name"] = serde_json::json!("Ultra Lite");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    assert_eq!(tier_label(&profile), Some("Ultra Lite".to_string()));
+}
+
+/// Write `kerry`'s `usage_cache.json` with `plan` spliced in raw, so a test
+/// can hand the reader a plan no fetch would write.
+fn cache_raw_plan(plan: serde_json::Value) -> Profile {
+    crate::testutil::register_names(&["kerry"]);
+    let mut usage = serde_json::to_value(UsageInfo::default()).expect("serializes");
+    usage["plan"] = plan;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
+    blank_profile(&crate::profile::ProfileName::from("kerry"))
+}
+
+/// A canceled subscription drops the organization to the free tier; a paid
+/// plan name beside that tier never outranks it.
+#[test]
+fn tier_label_keeps_the_free_tier_over_a_paid_server_name() {
+    let _home = HomeSandbox::new();
+    let profile = cache_raw_plan(serde_json::json!({
+        "tier": "Free",
+        "plan_display_name": "Ultra",
+        "subscription_status": "canceled",
+    }));
+    assert_eq!(tier_label(&profile), Some("Free".to_string()));
+}
+
+/// The stored name passes the same check the wire read applies: a cache
+/// carrying a control sequence falls back to the local map.
+#[test]
+fn tier_label_rejects_a_malformed_cached_server_name() {
+    let _home = HomeSandbox::new();
+    for name in ["Bad\u{1b}[31m", "Ultra\n", " Ultra"] {
+        let profile = cache_raw_plan(serde_json::json!({
+            "tier": {"Max": 5},
+            "plan_display_name": name,
+        }));
+        assert_eq!(tier_label(&profile), Some("Max".to_string()), "{name:?}");
+    }
+}
+
+/// A server name is an answer on its own: an organization type this build
+/// does not classify still shows the name it sent.
+#[test]
+fn tier_label_shows_the_server_name_of_an_unclassified_tier() {
+    let _home = HomeSandbox::new();
+    let profile = cache_raw_plan(serde_json::json!({
+        "tier": "Unknown",
+        "plan_display_name": "Ultra Lite",
+    }));
+    assert_eq!(tier_label(&profile), Some("Ultra Lite".to_string()));
+}
+
+/// `tier_label` reads the same OAuth cache `published_windows_with_label` does, so it
 /// inherits the same leftover: a CONVERTED profile — a `base_url` + key saved on
 /// disk, the `edit_profile_endpoint` shape — publishes no tier even with a
 /// plan-bearing `usage_cache.json` from its earlier OAuth life still on disk:
-/// publishing that leftover rendered `Max 5x` beside the account's new
+/// publishing that leftover rendered a plan label beside the account's new
 /// `generic` label. The OAuth half is the guard's other direction: an account
 /// whose figures do live in the OAuth cache keeps its tier.
 #[test]
@@ -599,6 +682,7 @@ fn tier_label_is_none_for_a_converted_profile() {
     let stale_plan = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(5)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -616,8 +700,90 @@ fn tier_label_is_none_for_a_converted_profile() {
     seed_usage_cache("kerry", &stale_plan, Duration::from_secs(100));
     assert_eq!(
         tier_label(&blank_profile(&crate::profile::ProfileName::from("kerry"))),
-        Some("Max 5x".to_string()),
+        Some("Max".to_string()),
         "an OAuth account keeps its tier"
+    );
+}
+
+/// The fossil drop reaches the published tier too: an env-token retype (an
+/// endpoint plus an `[env] ANTHROPIC_AUTH_TOKEN`, no OAuth pair) owns no
+/// `usage_cache.json` leg, so a `Free` plan its OAuth life left on disk reads
+/// the same tier as no cache file at all. A pair + endpoint + key keeps
+/// `usage_cache_is_third_party`'s early `None`, fossil plan or not, and a pair +
+/// endpoint + `[env]` token, which the OAuth leg still polls, keeps its tier.
+#[test]
+fn tier_label_drops_a_fossil_plan_on_an_env_token_retype() {
+    let _home = HomeSandbox::new();
+    let mut envtok = Profile::new(
+        "envtok-tier".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    envtok.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envtok-tier".to_string(),
+    );
+    crate::testutil::register_names(&["envtok-tier"]);
+    let without_cache = tier_label(&envtok);
+
+    let fossil = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            plan_display_name: None,
+            subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
+            email: None,
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("envtok-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+
+    assert_eq!(
+        tier_label(&envtok),
+        without_cache,
+        "a plan no leg feeds must not publish a tier"
+    );
+
+    let mut hybrid = crate::testutil::oauth_profile("both-tier", "rt-both-tier");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both-tier".to_string());
+    crate::testutil::register_names(&["both-tier"]);
+    let hybrid_without_cache = tier_label(&hybrid);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("both-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+
+    assert_eq!(
+        tier_label(&hybrid),
+        hybrid_without_cache,
+        "the hybrid's early None is where it is today, fossil plan or not"
+    );
+
+    // The hybrid whose tier does go through the maintained-plan read: a pair
+    // plus an endpoint authenticated by an `[env]` token keeps its figures in
+    // `usage_cache.json` and the OAuth leg still polls it, so its plan is live.
+    let mut env_hybrid = crate::testutil::oauth_profile("envboth-tier", "rt-envboth-tier");
+    env_hybrid.base_url = Some("https://llm.example.test".to_string());
+    env_hybrid.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envboth-tier".to_string(),
+    );
+    crate::testutil::register_names(&["envboth-tier"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("envboth-tier"),
+        USAGE_CACHE_FILE,
+        &fossil,
+    );
+    assert_eq!(
+        tier_label(&env_hybrid),
+        Some("Free".to_string()),
+        "a hybrid the OAuth leg still polls publishes its cached tier"
     );
 }
 
@@ -671,7 +837,9 @@ fn published_windows_is_empty_for_a_converted_profile() {
     seed_usage_cache("litellm", &five_hour_at(100.0), Duration::from_secs(100));
 
     assert!(
-        published_windows(&crate::profile::ProfileName::from("litellm")).is_empty(),
+        published_windows_with_label(&crate::profile::ProfileName::from("litellm"))
+            .0
+            .is_empty(),
         "a converted account publishes no Anthropic window"
     );
 }
@@ -683,7 +851,7 @@ fn published_windows_carries_an_oauth_accounts_windows() {
     let _home = HomeSandbox::new();
     seed_usage_cache("kerry", &five_hour_at(42.0), Duration::from_secs(100));
 
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 42.0);
@@ -723,7 +891,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         Duration::from_secs(100),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(
         windows.len(),
         2,
@@ -753,7 +921,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         },
         Duration::from_secs(100),
     );
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(
         windows.len(),
         1,
@@ -789,7 +957,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         },
         Duration::from_secs(100),
     );
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert!(
         windows.is_empty(),
         "every lapsed row drops, 7d and weekly and 5h alike: {windows:?}"
@@ -821,7 +989,7 @@ fn published_windows_carries_a_third_party_accounts_provider_windows() {
         ]),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("zai-keyed"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("zai-keyed")).0;
     assert_eq!(windows.len(), 2, "both provider windows publish");
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 62.0);
@@ -852,11 +1020,77 @@ fn published_windows_drops_a_lapsed_provider_bar() {
         ]),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("zai-old"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("zai-old")).0;
     assert_eq!(
         windows.len(),
         1,
         "only the live 7d row survives: {windows:?}"
     );
     assert_eq!(windows[0].label, "7d");
+}
+
+/// What the daemon's `refuses_service_cached` consumers (the auto-start queue
+/// `status --json` publishes, the boot uncapped-spend warning) read: a refusal
+/// cached for a retyped account no leg feeds is no refusal, whether the retype
+/// left its credential in `api_key` or in an `[env]` inference token, while the
+/// same file on an account a leg still polls (including a pair+endpoint+env
+/// token hybrid), or on a logged-out OAuth account whose figures live there,
+/// still refuses.
+#[test]
+fn a_cached_refusal_binds_only_where_a_leg_feeds_the_file() {
+    let _home = HomeSandbox::new();
+    let mut hybrid = crate::testutil::oauth_profile("both", "rt-both");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both".to_string());
+    let mut envtok = Profile::new(
+        "envtok".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    envtok
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-envtok".to_string());
+    let mut env_hybrid = crate::testutil::oauth_profile("envboth", "rt-envboth");
+    env_hybrid.base_url = Some("https://llm.example.test".to_string());
+    env_hybrid.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-envboth".to_string(),
+    );
+    let shapes = [
+        (
+            Profile::new(
+                "moved".to_string(),
+                Some("https://llm.example.test".to_string()),
+                Some("sk-moved".to_string()),
+            ),
+            false,
+        ),
+        (envtok, false),
+        (hybrid, true),
+        (env_hybrid, true),
+        (Profile::new("gone".to_string(), None, None), true),
+    ];
+    for (p, _) in &shapes {
+        crate::testutil::register_names(&[p.name.as_str()]);
+        write_profile_cache(
+            &p.name,
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                    ..PlanInfo::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    let got: Vec<(&str, bool)> = shapes
+        .iter()
+        .map(|(p, _)| (p.name.as_str(), refuses_service_cached(p)))
+        .collect();
+    let want: Vec<(&str, bool)> = shapes
+        .iter()
+        .map(|(p, refuses)| (p.name.as_str(), *refuses))
+        .collect();
+    assert_eq!(got, want);
 }

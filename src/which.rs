@@ -24,6 +24,10 @@
 //!
 //! Path: honors `CLAUDE_CONFIG_DIR` (the same env var `clauth start` sets) so
 //! a status line running inside an isolated session finds the right file.
+//!
+//! `clauth which --pid <pid>` answers for another process instead: a
+//! live-session registry row found up its parent chain, else a bare codex's
+//! adopted login, else the global login a bare `claude` reads.
 
 use std::path::{Path, PathBuf};
 
@@ -71,7 +75,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
     // carries the ancestor's CODEX_HOME — but its own CLAUDE_CONFIG_DIR names
     // a clauth runtime, which is this process's identity. Only when no clauth
     // claude runtime claims the asker does a clauth-shaped CODEX_HOME answer.
-    // And a clauth-SHAPED home answers or answers unknown — never falls
+    // And a clauth-SHAPED home answers, or says nothing — never falls
     // through: the claude tiers below would attribute a codex session to
     // whatever the GLOBAL ~/.claude credentials resolve to, a different
     // harness's answer entirely. A CODEX_HOME that is not a clauth codex home
@@ -90,7 +94,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
                 // Shaped like ours, naming no stored codex profile (or the
                 // roster was unreadable): the same fail-closed answer the
                 // claude session-dir tier gives an unrecognized runtime —
-                // unknown, not somebody else's profile.
+                // no answer, not somebody else's profile.
                 if json {
                     outln!(
                         "{}",
@@ -367,8 +371,17 @@ fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
 }
 
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    // A regular file only, bounded: the credentials path is read every
+    // session-scope `profiles` call and every bare-marker tally tick, and an
+    // `open` on a FIFO blocks forever (a device read never ends). A
+    // non-regular or unreadable file reads `None`, the arm an unreadable
+    // credentials file already takes: the resolution proceeds credential-less.
+    // The cap is the Keychain blob ceiling, not the job-record one: a
+    // credentials file carries Claude Code's `mcpOAuth` block beside the login
+    // and grows far past a job record's size.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::CREDENTIALS_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// [`resolve_profile_candidate`] filtered so a user-disabled account is never
@@ -459,8 +472,7 @@ fn resolve_profile_candidate<'a>(
     // Attribute to the active profile when it has no stored OAuth creds
     // (API-key/endpoint, or a fresh login not yet snapshotted). Not gated on
     // `creds`: switching to an API-key profile deletes the creds file, so a
-    // prior refresh-token guard here mis-attributed the active profile as
-    // `unknown`.
+    // prior refresh-token guard here left the active profile unresolved.
     config
         .state
         .active_profile
@@ -530,10 +542,10 @@ fn match_by_session_token<'a>(
     fallback
 }
 
+/// The plain answer: the profile, or nothing at all when nothing resolved.
 fn emit_plain(matched: Option<&str>) {
-    match matched {
-        Some(name) => outln!("{name}"),
-        None => outln!("unknown"),
+    if let Some(name) = matched {
+        outln!("{name}");
     }
 }
 
@@ -735,7 +747,15 @@ fn keychain_cache_entry(
 
 #[cfg(any(target_os = "macos", test))]
 fn read_keychain_cache_entry(dir: &Path, service: &str) -> Option<KeychainEvidenceEntry> {
-    let bytes = std::fs::read(keychain_cache_entry_path(dir, service)).ok()?;
+    // A regular file only, bounded like `read_credentials` and by the same
+    // ceiling: the entry wraps one credential blob, so it can run as large.
+    // A non-regular or unreadable entry reads `None`, the arm an absent or
+    // unparseable entry already takes ("no evidence").
+    let bytes = crate::runtime::read_regular_capped(
+        &keychain_cache_entry_path(dir, service),
+        crate::runtime::CREDENTIALS_READ_CAP,
+    )
+    .ok()??;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -786,6 +806,370 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Where `clauth which --pid` found the account a process spends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidSource {
+    /// A live-session registry row keyed on the process or an ancestor.
+    LiveSession,
+    /// A bare codex whose login clauth adopted.
+    CodexAdopted,
+    /// A bare `claude`: whatever owns the global credentials.
+    Global,
+}
+
+impl PidSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            PidSource::LiveSession => "live_session",
+            PidSource::CodexAdopted => "codex_adopted",
+            PidSource::Global => "global",
+        }
+    }
+}
+
+/// One `which --pid` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PidResolution {
+    pub(crate) profile: String,
+    pub(crate) source: PidSource,
+    pub(crate) harness: crate::harness::Harness,
+}
+
+/// The two process facts the parent walk reads, behind a seam so tests feed a
+/// fake table.
+pub(crate) trait ProcTable {
+    /// The parent pid, `None` when the process is gone or unreadable.
+    fn parent(&self, pid: u32) -> Option<u32>;
+    /// The argv, `None` when the process is gone or unreadable.
+    fn argv(&self, pid: u32) -> Option<Vec<String>>;
+}
+
+/// The host's process table.
+pub(crate) struct SystemProcs;
+
+/// How many processes the parent walk visits, the target included.
+const WALK_LIMIT: usize = 8;
+
+#[cfg(target_os = "linux")]
+impl ProcTable for SystemProcs {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        parent_at(Path::new("/proc"), pid)
+    }
+
+    fn argv(&self, pid: u32) -> Option<Vec<String>> {
+        argv_at(Path::new("/proc"), pid)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl ProcTable for SystemProcs {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        ps_parent(pid)
+    }
+
+    fn argv(&self, pid: u32) -> Option<Vec<String>> {
+        ps_argv(pid)
+    }
+}
+
+#[cfg(not(unix))]
+impl ProcTable for SystemProcs {
+    fn parent(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+
+    fn argv(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// The parent from `<root>/<pid>/stat`. The comm sits in parentheses and may
+/// hold `) ` itself, so the split runs from the LAST one: what follows is the
+/// state letter, then the ppid.
+#[cfg(target_os = "linux")]
+fn parent_at(root: &Path, pid: u32) -> Option<u32> {
+    let path = root.join(pid.to_string()).join("stat");
+    let bytes =
+        crate::runtime::read_regular_capped(&path, crate::runtime::RECORD_READ_CAP).ok()??;
+    let stat = String::from_utf8_lossy(&bytes);
+    let rest = stat.rsplit_once(") ")?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The NUL-separated argv from `<root>/<pid>/cmdline`, without the trailing
+/// NUL's empty tail.
+#[cfg(target_os = "linux")]
+fn argv_at(root: &Path, pid: u32) -> Option<Vec<String>> {
+    let path = root.join(pid.to_string()).join("cmdline");
+    let bytes =
+        crate::runtime::read_regular_capped(&path, crate::runtime::RECORD_READ_CAP).ok()??;
+    let mut argv: Vec<String> = bytes
+        .split(|byte| *byte == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    if argv.last().is_some_and(String::is_empty) {
+        argv.pop();
+    }
+    (!argv.is_empty()).then_some(argv)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", field, "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_parent(pid: u32) -> Option<u32> {
+    ps_field(pid, "ppid=")?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_argv(pid: u32) -> Option<Vec<String>> {
+    Some(
+        ps_field(pid, "args=")?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// What `which --pid` resolves against, injected so tests never touch the
+/// real registry, `$CODEX_HOME` or the global credentials.
+pub(crate) struct PidContext<'a> {
+    /// `~/.clauth/live_sessions`.
+    pub(crate) registry: &'a Path,
+    /// `~/.clauth/profiles`.
+    pub(crate) profiles: &'a Path,
+    /// The CALLER's `$CODEX_HOME`, else `~/.codex`.
+    pub(crate) codex_home: &'a Path,
+    /// The profile owning the global credentials, asked only for a bare `claude`.
+    pub(crate) global: &'a dyn Fn() -> Option<String>,
+}
+
+pub(crate) fn resolve_pid(
+    pid: u32,
+    procs: &dyn ProcTable,
+    ctx: &PidContext<'_>,
+) -> Option<PidResolution> {
+    let rows = crate::live_sessions::rows_in(ctx.registry);
+    let mut cursor = Some(pid);
+    let mut depth = 0;
+    let mut target_argv = None;
+    while depth < WALK_LIMIT {
+        let Some(current) = cursor.filter(|p| *p > 1) else {
+            break;
+        };
+        let Some(argv) = procs.argv(current) else {
+            break;
+        };
+        if depth == 0 {
+            target_argv = Some(argv.clone());
+        }
+        // A `clauth mcp` hop is never matched: rows keyed on it belong to
+        // delegate runs the pane hosts, never the pane. The climb still passes
+        // through it, because the pane's own supervisor sits beyond.
+        if !is_clauth_mcp(&argv)
+            && let Some(row) = newest_row(&rows, current)
+        {
+            return Some(row_resolution(row));
+        }
+        cursor = procs.parent(current);
+        depth += 1;
+    }
+    match agent_kind(&target_argv?)? {
+        crate::harness::Harness::Claude => (ctx.global)().map(|profile| PidResolution {
+            profile,
+            source: PidSource::Global,
+            harness: crate::harness::Harness::Claude,
+        }),
+        crate::harness::Harness::Codex => {
+            adopted_codex_profile(ctx.profiles, ctx.codex_home).map(|profile| PidResolution {
+                profile,
+                source: PidSource::CodexAdopted,
+                harness: crate::harness::Harness::Codex,
+            })
+        }
+    }
+}
+
+/// The newest row keyed on `pid`. A recycled pid can match a stale row and a
+/// live one at once, and the stale one may sort first by name.
+fn newest_row(
+    rows: &[(
+        crate::live_sessions::LiveSession,
+        Option<std::time::SystemTime>,
+    )],
+    pid: u32,
+) -> Option<&crate::live_sessions::LiveSession> {
+    rows.iter()
+        .filter(|(row, _)| row.pid == pid)
+        .max_by(|(_, left), (_, right)| left.cmp(right))
+        .map(|(row, _)| row)
+}
+
+/// A row answers with the member a `--with-fallback` session swapped onto,
+/// else its launch member.
+fn row_resolution(row: &crate::live_sessions::LiveSession) -> PidResolution {
+    let profile = row
+        .current_member
+        .as_deref()
+        .filter(|member| !member.is_empty())
+        .unwrap_or(&row.start_profile)
+        .to_owned();
+    PidResolution {
+        profile,
+        source: PidSource::LiveSession,
+        harness: row.harness,
+    }
+}
+
+fn is_clauth_mcp(argv: &[String]) -> bool {
+    matches!(
+        argv,
+        [program, subcommand, ..]
+            if command_basename(program) == Some("clauth") && subcommand == "mcp"
+    )
+}
+
+/// Which agent a process runs, off its PROGRAM and never a substring anywhere
+/// in the argv: an editor whose argument names `claude` spends no account.
+fn agent_kind(argv: &[String]) -> Option<crate::harness::Harness> {
+    let program = argv.first()?;
+    let basename = command_basename(program)?;
+    if basename == "claude" || program.contains("/claude/versions/") {
+        return Some(crate::harness::Harness::Claude);
+    }
+    if basename == "codex" {
+        return Some(crate::harness::Harness::Codex);
+    }
+    if matches!(basename, "node" | "bun" | "deno") {
+        let script = argv.get(1)?;
+        if script.contains("/@anthropic-ai/claude-code/") {
+            return Some(crate::harness::Harness::Claude);
+        }
+        if script.contains("/@openai/codex/") {
+            return Some(crate::harness::Harness::Codex);
+        }
+    }
+    None
+}
+
+fn command_basename(program: &str) -> Option<&str> {
+    Path::new(program).file_name()?.to_str()
+}
+
+/// The profile a bare codex's login was adopted into: `$CODEX_HOME/auth.json`
+/// is a link onto `profiles/<name>/auth.json` after
+/// `clauth login <name> --codex`. A plain file, a link elsewhere, or a nested
+/// target names no profile.
+fn adopted_codex_profile(profiles: &Path, codex_home: &Path) -> Option<String> {
+    let target = std::fs::read_link(codex_home.join("auth.json")).ok()?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        codex_home.join(target)
+    };
+    let target = lexical_normalize(&target);
+    let profiles = lexical_normalize(profiles);
+    let relative = target.strip_prefix(&profiles).ok()?;
+    let mut parts = relative.components();
+    let std::path::Component::Normal(name) = parts.next()? else {
+        return None;
+    };
+    if parts.next()?.as_os_str().to_str()? != "auth.json" {
+        return None;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    name.to_str().map(str::to_owned)
+}
+
+/// Resolve `..` without touching the filesystem: a relative adoption link is
+/// read as the caller spelled it, and its target may not exist yet.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// `clauth which --pid <pid>`: the account a running process spends.
+pub(crate) fn run_pid(pid: u32, json: bool) -> Result<()> {
+    if cfg!(windows) {
+        anyhow::bail!("`clauth which --pid` is unsupported on Windows");
+    }
+    let resolved = resolve_pid_env(pid, &SystemProcs, &|| load_config().ok())?;
+    if json {
+        outln!("{}", pid_json_view(resolved.as_ref()));
+    } else {
+        emit_plain(resolved.as_ref().map(|resolved| resolved.profile.as_str()));
+    }
+    Ok(())
+}
+
+/// `which --pid`'s answer for `pid` against this process's environment: the
+/// registry and profiles under `~/.clauth`, the caller's codex home, and the
+/// global login. `config` is called only when the global login is asked for,
+/// so a registry or adoption answer never depends on `profiles.toml`.
+pub(crate) fn resolve_pid_env(
+    pid: u32,
+    procs: &dyn ProcTable,
+    config: &dyn Fn() -> Option<AppConfig>,
+) -> Result<Option<PidResolution>> {
+    let base = crate::profile::clauth_dir()?;
+    let registry = base.join("live_sessions");
+    let profiles = base.join("profiles");
+    let codex_home = caller_codex_home()?;
+    let global = || {
+        config()
+            .as_ref()
+            .and_then(resolve_global)
+            .map(|(name, _)| name)
+    };
+    let ctx = PidContext {
+        registry: &registry,
+        profiles: &profiles,
+        codex_home: &codex_home,
+        global: &global,
+    };
+    Ok(resolve_pid(pid, procs, &ctx))
+}
+
+/// A codex adoption is read from the CALLER's home, never the target
+/// process's: the link is the caller's own `codex login`, which the target
+/// inherited nothing of.
+fn caller_codex_home() -> Result<PathBuf> {
+    match std::env::var_os("CODEX_HOME").filter(|dir| !dir.is_empty()) {
+        Some(home) => Ok(PathBuf::from(home)),
+        None => Ok(crate::profile::home_dir()?.join(".codex")),
+    }
+}
+
+fn pid_json_view(resolved: Option<&PidResolution>) -> serde_json::Value {
+    serde_json::json!({
+        "profile": resolved.map(|resolved| resolved.profile.as_str()),
+        "source": resolved.map(|resolved| resolved.source.as_str()),
+        "harness": resolved.map(|resolved| resolved.harness.as_str()),
+    })
 }
 
 #[cfg(test)]

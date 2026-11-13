@@ -299,10 +299,7 @@ fn every_transient_cause_renders_its_own_copy() {
         for (retry, suffix) in [
             (Retry::Wait, ": retry in a moment"),
             (Retry::Connection, ": check your connection and retry"),
-            (
-                Retry::Restart,
-                ": run `clauth login` again for a fresh code",
-            ),
+            (Retry::Restart, ": start the login again for a fresh code"),
         ] {
             let retry_name = format!("{retry:?}");
             if names_next_step {
@@ -388,7 +385,33 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 
 #[test]
 fn resolve_in_tui_names_the_clauth_surface() {
-    assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
+    assert!(RESOLVE_IN_TUI.contains("`clauth` TUI"));
+}
+
+/// The follow-up each of these messages names has to be runnable as typed: the
+/// dead-refresh pointer says what to redo instead of repeating the command that
+/// just failed, and the divergence and long-lived pointers name the surface and
+/// the command that clears them.
+#[test]
+fn the_relogin_and_divergence_pointers_name_the_follow_up_exactly() {
+    assert_eq!(
+        Transient::new(
+            Cause::Endpoint("anthropic is throttling requests"),
+            Retry::Restart
+        )
+        .text(),
+        "anthropic is throttling requests: start the login again for a fresh code"
+    );
+    assert_eq!(RESOLVE_IN_TUI, "resolve the divergence in the `clauth` TUI");
+    assert_eq!(
+        unsaved_live_login("work"),
+        "'work' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(
+        long_lived_cannot_hold_login("work"),
+        "'work' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
+    );
 }
 
 #[test]
@@ -483,6 +506,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
     let canceled_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -490,7 +514,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&canceled, Some(&canceled_usage)),
+        account_tier(&canceled, Some(&canceled_usage)).map(|p| p.tier),
         Some(PlanTier::Free)
     );
 
@@ -500,13 +524,17 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// An unfetched plan has no tier at all. `account_tier` says so with `None`
@@ -517,7 +545,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
     let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    assert_eq!(account_tier(&bare, None), None);
+    assert_eq!(account_tier(&bare, None).map(|p| p.tier), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
@@ -532,7 +560,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&unclassified, None), None);
+    assert_eq!(account_tier(&unclassified, None).map(|p| p.tier), None);
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
@@ -540,13 +568,17 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     let unknown_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&unknown_plan, Some(&unknown_usage)), None);
+    assert_eq!(
+        account_tier(&unknown_plan, Some(&unknown_usage)).map(|p| p.tier),
+        None
+    );
 }
 
 /// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
@@ -570,6 +602,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let plan = |tier| crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -581,7 +614,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let unclassified_usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
-        account_tier(&unclassified, Some(&unclassified_usage)),
+        account_tier(&unclassified, Some(&unclassified_usage)).map(|p| p.tier),
         Some(PlanTier::Max(None)),
         "an unclassified fetched tier must not mask the token's claim"
     );
@@ -592,7 +625,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let disagreeing_usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
-        account_tier(&disagreeing, Some(&disagreeing_usage)),
+        account_tier(&disagreeing, Some(&disagreeing_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20))),
         "the fetched tier is the better source and still wins"
     );
@@ -615,7 +648,10 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&free, None), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, None).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// The other direction: a real tier still renders, and `Free` is untouched by
@@ -626,6 +662,7 @@ fn account_tier_still_renders_every_known_tier() {
     let fetched_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -633,7 +670,7 @@ fn account_tier_still_renders_every_known_tier() {
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&fetched, Some(&fetched_usage)),
+        account_tier(&fetched, Some(&fetched_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20)))
     );
 
@@ -641,13 +678,17 @@ fn account_tier_still_renders_every_known_tier() {
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 
     let mut token_only = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
@@ -660,7 +701,10 @@ fn account_tier_still_renders_every_known_tier() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&token_only, None), Some(PlanTier::Pro));
+    assert_eq!(
+        account_tier(&token_only, None).map(|p| p.tier),
+        Some(PlanTier::Pro)
+    );
 }
 
 /// The splitter family's bytes, pinned here because every routing test asserts
@@ -673,11 +717,11 @@ fn account_tier_still_renders_every_known_tier() {
 fn the_split_state_sentences_render_their_ruled_bytes() {
     let name = crate::profile::ProfileName::from("qwen");
     assert_eq!(
-        third_party_keyless(&name),
+        third_party_keyless(&name, None),
         "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
     );
     assert_eq!(
-        third_party_dead_chain(&name),
+        third_party_dead_chain(&name, None),
         "stored OAuth chain is dead, its api key still works: qwen \
          (run `clauth login qwen --api-key <key>` to clear the quarantine)"
     );
@@ -1190,6 +1234,21 @@ fn the_missing_chain_refusal_shows_an_empty_name() {
     );
 }
 
+/// A budget bounds terminal cells as well as characters: six CJK glyphs
+/// occupy twelve cells but only six characters, so the cell budget runs out
+/// first and the three ASCII dots stay inside it. ASCII output is unchanged.
+#[test]
+fn truncate_budgets_grapheme_cells_not_chars() {
+    assert_eq!(truncate("漢字漢字漢字", 8), "漢字...");
+    // `ab` takes the 2-cell content budget (`5 - 3`), so the next 2-cell glyph
+    // has none left and the cut stops before it.
+    assert_eq!(truncate("ab漢字", 5), "ab...");
+    assert_eq!(truncate("abc", 8), "abc");
+    assert_eq!(truncate("abcdefgh", 8), "abcdefgh");
+    assert_eq!(truncate("abcdefghi", 8), "abcde...");
+    assert_eq!(truncate("xyz", 2), "..");
+}
+
 /// One word per cause of a dead usage credential, shared by the Usage tab and
 /// `clauth list`: a refused setup token, a lapsed console session, a rejected
 /// api key, and an Alibaba account that never stored a session.
@@ -1216,4 +1275,223 @@ fn a_dead_usage_credential_is_named_by_its_cause() {
     ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
     ds.api_key = Some("sk-dead".to_string());
     assert_eq!(auth_expired_label(&ds), DIAG_KEY_REJECTED);
+}
+
+/// `pad_cells` pads to a width counted in drawn cells, either alignment, and
+/// leaves a value already at or past the width whole.
+#[test]
+fn pad_cells_pads_by_drawn_cells_in_either_alignment() {
+    assert_eq!(pad_cells("abc", 5, false), "abc  ");
+    assert_eq!(pad_cells("abc", 5, true), "  abc");
+    // Two glyphs drawing four cells: two blanks, not the four a char count adds.
+    assert_eq!(pad_cells("漢字", 6, false), "漢字  ");
+    assert_eq!(pad_cells("漢字", 6, true), "  漢字");
+    assert_eq!(pad_cells("abcdef", 3, false), "abcdef");
+    assert_eq!(pad_cells("abcdef", 3, true), "abcdef");
+    assert_eq!(pad_cells("漢字漢字", 6, false), "漢字漢字");
+}
+
+/// `col_width` takes the header or the widest cell, whichever draws wider, and
+/// counts a wide cell by its cells rather than its chars.
+#[test]
+fn col_width_lets_a_wide_cell_win_by_cells() {
+    assert_eq!(col_width("HEADER", ["ab", "cde"].into_iter()), 6);
+    // Four glyphs, eight cells, against a six-cell header: the cells win.
+    assert_eq!(col_width("HEADER", ["漢字漢字"].into_iter()), 8);
+    assert_eq!(col_width("", std::iter::empty::<&str>()), 0);
+}
+
+/// The `--explain` walk sizes its name column by drawn cells, never bytes: a
+/// name of four wide glyphs (twelve bytes, eight cells) lays the walk out
+/// exactly as an eight-letter ASCII name does.
+#[test]
+fn a_wide_script_name_in_the_start_walk_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let walk = |first: &str| {
+        let row = |name: &str| StartCandidate {
+            name: crate::profile::ProfileName::from(name),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
+        };
+        render_start_walk(&[row(first), row("D2")], Some(1))
+    };
+    let twin = walk(TWIN);
+    assert!(
+        twin.contains(TWIN),
+        "the twin walk renders the twin: {twin}"
+    );
+    assert_eq!(walk(WIDE), twin.replace(TWIN, WIDE));
+}
+
+/// A cap bounds what a zero-width grapheme can add: each one draws nothing but
+/// spends a character of the budget, so a run of them stops at the cap instead
+/// of carrying unbounded bytes through, while every string the cap already
+/// held comes back unchanged.
+#[test]
+fn truncate_bounds_a_run_of_zero_width_characters() {
+    let hidden = format!("{}hi", "\u{200b}".repeat(100_000));
+    let cut = truncate(&hidden, 200);
+    assert_eq!(
+        cut,
+        format!("{}...", "\u{200b}".repeat(197)),
+        "197 zero-width characters take the content budget, then the dots"
+    );
+    assert_eq!(cut.chars().count(), 200, "the cap bounds the count too");
+    assert_eq!(
+        truncate("a\u{200b}b", 5),
+        "a\u{200b}b",
+        "a short run stays whole"
+    );
+}
+
+/// A cap keeps the line structure of what it cuts: a control character costs
+/// its character and no cell, so an over-cap multi-line payload keeps its
+/// newlines instead of fusing into one line, and a run of them stops at the
+/// char budget the way a run of zero-width characters does.
+#[test]
+fn truncate_keeps_the_lines_of_an_over_cap_payload() {
+    let payload = "xxxx\n".repeat(500);
+    let cut = truncate(&payload, 1000);
+    assert_eq!(
+        cut,
+        format!("{}xx...", "xxxx\n".repeat(199)),
+        "199 five-character lines take 995 of the 997-character budget, two more x's take the last, then the dots"
+    );
+    assert_eq!(
+        cut.matches('\n').count(),
+        199,
+        "the cut keeps the newlines instead of fusing the lines"
+    );
+}
+
+#[test]
+fn truncate_bounds_a_run_of_control_characters() {
+    assert_eq!(
+        truncate(&"\u{1}".repeat(1000), 20),
+        format!("{}...", "\u{1}".repeat(17)),
+        "17 control characters take the content budget, then the dots"
+    );
+    assert_eq!(
+        truncate("a\nb", 5),
+        "a\nb",
+        "a short run of control characters comes back unchanged"
+    );
+}
+
+/// A cap keeps the one grapheme a control character does not break: a carriage
+/// return and the line feed right after it are one cluster, so the cut either
+/// keeps the pair whole or leaves it out whole, and never ends on a bare
+/// carriage return whose line feed is gone — the dots then print over the kept
+/// line instead of starting a new one.
+#[test]
+fn truncate_keeps_a_carriage_return_and_line_feed_together() {
+    assert_eq!(
+        truncate("abc\r\ndef", 7),
+        "abc...",
+        "the pair needs both its characters, so the 4-character budget takes `abc` and leaves the pair out whole"
+    );
+    assert_eq!(
+        truncate("abc\r\ndefgh", 8),
+        "abc\r\n...",
+        "one more character of budget keeps the pair whole"
+    );
+    assert_eq!(
+        truncate("abc\rdefg", 7),
+        "abc\r...",
+        "a carriage return with no line feed behind it is one control piece on its own"
+    );
+}
+
+/// A cap bounds the work of escaping as well as the output: the escaped body is
+/// built only up to the cap, so a body far over it never exists whole. The
+/// piece counter pins that bound, and the cut a multi-megabyte input gets is the
+/// one its first 64 KiB gets.
+#[test]
+fn truncate_escaped_builds_only_the_body_the_cap_can_keep() {
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let calls = std::cell::Cell::new(0usize);
+    let cut = crate::format::truncate_escaped(
+        &huge,
+        40,
+        |c| {
+            calls.set(calls.get() + 1);
+            c.to_string()
+        },
+        false,
+    );
+    assert!(
+        calls.get() <= 41,
+        "the cap bounds the characters escaped to 41 (the 40 the cap holds and the one that proves the cut), got {}",
+        calls.get()
+    );
+    assert_eq!(cut, format!("{}...", "x".repeat(37)));
+    assert_eq!(
+        cut,
+        crate::format::truncate_escaped(&huge[..64 * 1024], 40, |c| c.to_string(), false),
+        "the kept body lies inside the first 64 KiB, so the rest changes nothing"
+    );
+}
+
+/// The cut lands on a grapheme of the text the cap prints: a prepended
+/// character (`U+0600`) directly before an escaped control character is its own
+/// cluster in the body built so far but joins the escape's backslash in what is
+/// printed, so the body has to carry the piece that overran the cap or the cut
+/// keeps a character that then merges with the dots.
+#[test]
+fn truncate_escaped_cuts_where_the_kept_piece_joins_the_next() {
+    let escape = |c: char| {
+        crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !crate::format::unsafe_on_terminal(c)
+        })
+    };
+    assert_eq!(
+        crate::format::truncate_escaped("\u{600}\u{1b}\u{2026}", 4, escape, false),
+        "...",
+        "the number sign joins the escape's backslash, so the 1-character budget keeps no piece at all and the sign is never left alone before the dots"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("aa\u{1b}bb", 4, escape, false),
+        "a...",
+        "a cut that already lands between pieces keeps the same text"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("a\u{1b}b", 10, escape, false),
+        "a\\u{001b}b",
+        "a body inside the cap comes back whole"
+    );
+}
+
+/// A cap bounds characters as well as cells: one grapheme can carry unbounded
+/// characters (a base with ~250 KB of combining marks is a single cluster), so
+/// the char count — each char at most four bytes — stops it where the cell
+/// measure alone would pass it whole.
+#[test]
+fn truncate_bounds_a_single_oversized_grapheme() {
+    let marks = format!("a{}", "\u{301}".repeat(125_000));
+    let cut = truncate(&marks, 200);
+    assert_eq!(
+        cut, "...",
+        "one 250 KB cluster overruns the char budget whole, so only the dots survive"
+    );
+    assert_eq!(cut.len(), 3, "the cut is bounded in bytes as well as cells");
+    assert_eq!(
+        truncate(&"e\u{301}".repeat(100), 9),
+        format!("{}...", "e\u{301}".repeat(3)),
+        "a two-character grapheme spends two of the six-character budget"
+    );
+}
+
+/// A wide glyph carrying a halfwidth sound mark draws three cells on two
+/// characters, so the cut spends the cells the buffer draws, not the
+/// characters: one `漢ﾞ` fills 3 of the 5-cell content budget and a second
+/// would reach 6.
+#[test]
+fn truncate_cuts_a_wide_glyph_with_a_sound_mark_by_drawn_cells() {
+    assert_eq!(truncate(&"漢\u{ff9e}".repeat(10), 8), "漢\u{ff9e}...");
 }

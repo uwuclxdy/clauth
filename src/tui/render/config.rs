@@ -12,17 +12,19 @@ use ratatui::text::{Line, Span};
 use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
 
 use super::super::app::{
-    App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, HarnessFilter,
-    InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow, PoolMutationKind, ReadingsSnapshot,
-    SetupSelection, config_rows, escape_control, new_form_draft, pool_auth_label,
+    App, BandEntry, CodexDetailRow, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin,
+    EFFORT_PRESETS, HarnessFilter, InputState, MODEL_PRESETS, MainItemKind, PoolDetailRow,
+    PoolMutationKind, ReadingsSnapshot, SetupSelection, config_rows, escape_control,
+    new_form_draft, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
     cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color,
-    picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value, value_caret,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, marked_picker_row, master_detail,
+    name_color, picker_row, pill, place_caret, section_box, section_box_verbatim, toggle_value,
+    value_caret,
 };
 use super::prose::{cmd, key_lit, spans as prose_spans};
 
@@ -97,9 +99,10 @@ pub(super) fn draw_band_selector(
                 rows.push(ratatui::widgets::ListItem::new(Line::from("")));
             }
             BandEntry::Heading(text) => {
-                let heading = if ranges
-                    .iter()
-                    .any(|&(hi, start, end)| hi == i && (start..end).contains(&pos))
+                let heading = if focused
+                    && ranges
+                        .iter()
+                        .any(|&(hi, start, end)| hi == i && (start..end).contains(&pos))
                 {
                     theme::label_active()
                 } else {
@@ -175,19 +178,21 @@ fn setup_selector_row(
             } else {
                 name_color(cfg.is_active(&p.name))
             };
-            picker_row(selected, focused, p.name.to_string(), ns, width)
+            let mark = (app.deleting.as_ref() == Some(&p.name)).then(|| {
+                Span::styled(
+                    format!("{} ", spinner_frame(app.tick_count)),
+                    theme::accent(),
+                )
+            });
+            marked_picker_row(selected, focused, mark, p.name.to_string(), ns, width)
         }
         MainItemKind::Codex(i) => {
             let Some(row) = app.codex_rows.get(i) else {
                 return Line::from("");
             };
             let ns = theme::base();
-            let name = if row.broken {
-                format!("{} {}", theme::dead_credential_glyph(), row.name)
-            } else {
-                row.name.to_string()
-            };
-            picker_row(selected, focused, name, ns, width)
+            let mark = row.broken.then(|| dead_credential_mark(ns));
+            marked_picker_row(selected, focused, mark, row.name.to_string(), ns, width)
         }
         MainItemKind::Shunt(pi, ai) => {
             let Some(provider) = app.shunt_pool_row(pi, ai) else {
@@ -200,14 +205,16 @@ fn setup_selector_row(
             };
             // Names off the wire are escaped before render, the Overview's rule.
             let account = escape_control(&provider.0.name);
-            let name = if provider.0.needs_relogin {
-                format!("{} {account}", theme::dead_credential_glyph())
-            } else {
-                account
-            };
-            picker_row(selected, focused, name, ns, width)
+            let mark = provider.0.needs_relogin.then(|| dead_credential_mark(ns));
+            marked_picker_row(selected, focused, mark, account, ns, width)
         }
     }
+}
+
+/// The `× ` a selector row leads with while its credential is dead, in the
+/// row's resting name style.
+fn dead_credential_mark(style: Style) -> Span<'static> {
+    Span::styled(format!("{} ", theme::dead_credential_glyph()), style)
 }
 
 /// Snapshot taken under one short `config` guard, decoupled from render so
@@ -216,18 +223,37 @@ fn setup_selector_row(
 struct Snap {
     title: String,
     name: String,
+    /// The spinner frame the delete row shows while this card's account is the
+    /// one being deleted.
+    delete_frame: Option<&'static str>,
+    /// The saved (typed) base URL — what the base-url row shows at rest, even
+    /// while a keyless URL is hidden behind the login.
     base_url: String,
+    /// The derived base URL — where the profile routes once its login state is
+    /// folded in. Empty while a keyless URL hides.
+    base_url_derived: String,
+    /// The profile holds a saved base URL it does not route to (no api key or
+    /// env token): the row notes it until one is set.
+    base_url_unused: bool,
     api_key: String,
     model: String,
+    effort: String,
     opus: String,
     sonnet: String,
     haiku: String,
     fable: String,
     subagent: String,
+    advisor: String,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
+    /// The key an Overwrite left pending (`ConfigDraft::env_pending`) on this
+    /// account: the `+ add env` row's editor types its value.
+    env_pending: Option<String>,
     auto_start: bool,
     usage_probe: bool,
+    /// [`ReadingsSnapshot::no_five_hour_limit`] for this account: rewords the
+    /// auto-start + usage-probe hints on a plan with no 5h limit.
+    no_five_hour_limit: bool,
     /// `Profile::usage_probe_interval_ms` in seconds, as the `probe every`
     /// buffer spells it.
     usage_probe_interval: String,
@@ -235,6 +261,9 @@ struct Snap {
     bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
     disabled: bool,
+    /// The account's login is quarantined (`AppState::auth_broken`): the
+    /// `switch to a rolling token` row's dim gate, beside `disabled`.
+    auth_broken: bool,
     /// The global active profile — one of the two gates (mirroring
     /// `actions::disable_profile`'s own gate) that dims the `disabled` row inert.
     is_active: bool,
@@ -250,6 +279,13 @@ struct Snap {
     /// Whether the stored api key is non-blank: read off the profile, not the
     /// `api_key` text field, which a draft-open snap leaves empty.
     has_api_key: bool,
+    /// [`crate::profile::Profile::spends_oauth_chain`] read false: a proxy
+    /// account, whose log out blanks the key alone, whatever it stores.
+    logs_out_by_key: bool,
+    /// [`crate::actions::proxy_login_command`] on a proxy account
+    /// ([`crate::profile::Profile::proxy`]): the one login it takes, so the
+    /// `Login` row's hint names it over either account-type hint.
+    proxy_login: Option<String>,
     /// Credential typing for the login / log-out rows (`Profile::login_is_oauth`,
     /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
     /// keep tracking the base-url buffer instead.
@@ -336,21 +372,46 @@ struct Snap {
     login_disabled_reason: Option<String>,
 }
 
+/// The `ClearSessionToken` gate — ONE formula for every reader: the card's
+/// [`Snap`] feeds it the per-frame sidecar read, the footer and help feed it
+/// the tick's sidecar cache, and `run_config_row` makes the same judgment
+/// from a fresh disk read. Refused only when clearing would strip the
+/// account's LAST credential, i.e. a stored PIECE (sidecar or preserved mint)
+/// with no other login behind it. A flag-only account disarms without
+/// touching a credential, so it is never gated — a row that dims while its
+/// press acts would be the renderer's own lie.
+pub(crate) fn clear_gated_facts(
+    has_other_login: bool,
+    rolling_armed: bool,
+    holds_sidecar: bool,
+    has_static_backup: bool,
+) -> bool {
+    if has_other_login {
+        return false;
+    }
+    let flag_only = rolling_armed && !holds_sidecar && !has_static_backup;
+    !flag_only
+}
+
 impl Snap {
-    /// The `ClearSessionToken` gate — ONE spelling for both render readers
-    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row` makes
-    /// the same judgment from a fresh disk read): refused only when clearing
-    /// would strip the account's LAST credential, i.e. a stored PIECE (sidecar
-    /// or preserved mint) with no other login behind it. A flag-only account
-    /// disarms without touching a credential, so it is never gated — a row
-    /// that dims while its press acts would be the renderer's own lie.
+    /// The `ClearSessionToken` gate off the per-frame facts [`Self`] holds,
+    /// through the one formula [`clear_gated_facts`].
     fn clear_gated(&self) -> bool {
-        if self.has_other_login {
-            return false;
-        }
-        let flag_only =
-            self.rolling_armed && self.session_token.is_none() && !self.has_static_backup;
-        !flag_only
+        clear_gated_facts(
+            self.has_other_login,
+            self.rolling_armed,
+            self.session_token.is_some(),
+            self.has_static_backup,
+        )
+    }
+
+    /// The `RollingTokenSwitch` gate — ONE spelling for both render readers
+    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row`
+    /// re-derives the same judgment from the live config): inert on a
+    /// disabled account or a quarantined login, the two states the CLI
+    /// refuses up front.
+    fn rolling_switch_gated(&self) -> bool {
+        self.disabled || self.auth_broken
     }
 
     /// Blank snapshot for the `+ new` form and the empty fallback.
@@ -358,25 +419,35 @@ impl Snap {
         Snap {
             title: title.to_string(),
             name: String::new(),
+            delete_frame: None,
             base_url: String::new(),
+            base_url_derived: String::new(),
+            base_url_unused: false,
             api_key: String::new(),
             model: String::new(),
+            effort: String::new(),
             opus: String::new(),
             sonnet: String::new(),
             haiku: String::new(),
             fable: String::new(),
             subagent: String::new(),
+            advisor: String::new(),
             env: Vec::new(),
+            env_pending: None,
             auto_start: false,
             usage_probe: false,
+            no_five_hour_limit: false,
             usage_probe_interval: String::new(),
             bell_threshold: String::new(),
             disabled: false,
+            auth_broken: false,
             is_active: false,
             has_live_session: false,
             logged_in: false,
             has_unreadable_store: false,
             has_api_key: false,
+            logs_out_by_key: false,
+            proxy_login: None,
             login_is_oauth: true,
             has_other_login: false,
             clear_falls_back_to_oauth: false,
@@ -461,6 +532,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
     match cfg.profiles.get(profile_idx) {
         Some(p) => {
             let sidecar = crate::claude::sidecar_summary(&p.name);
+            let saved_url = p.saved_base_url();
             Snap {
                 title: p.name.to_string(),
                 name: if with_text {
@@ -468,25 +540,40 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 } else {
                     String::new()
                 },
-                base_url: text(&p.base_url),
+                // The stored name, never the draft's typed buffer, so a rename
+                // typed mid-delete keeps the mark.
+                delete_frame: (app.deleting.as_ref() == Some(&p.name))
+                    .then(|| spinner_frame(app.tick_count)),
+                base_url: text(&saved_url),
+                base_url_derived: text(&p.base_url),
+                base_url_unused: saved_url.is_some() && p.base_url.is_none(),
                 api_key: text(&p.api_key),
                 model: text(&p.models.default),
+                effort: text(&p.effort),
                 opus: text(&p.models.opus),
                 sonnet: text(&p.models.sonnet),
                 haiku: text(&p.models.haiku),
                 fable: text(&p.models.fable),
                 subagent: text(&p.models.subagent),
+                advisor: text(&p.models.advisor),
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                env_pending: app
+                    .config_draft
+                    .as_ref()
+                    .filter(|d| d.editing_name.as_deref() == Some(p.name.as_str()))
+                    .and_then(|d| d.env_pending.clone()),
                 auto_start: p.auto_start,
                 usage_probe: p.usage_probe,
+                no_five_hour_limit: readings.no_five_hour_limit(p.name.as_str()),
                 usage_probe_interval: (p.usage_probe_interval_ms / 1000).to_string(),
                 bell_threshold: p
                     .bell_threshold
                     .map(crate::tui::app::format_weekly_pct)
                     .unwrap_or_default(),
                 disabled: p.is_disabled(),
+                auth_broken: cfg.state.auth_broken.contains(&p.name),
                 is_active: cfg.is_active(&p.name),
                 // The marker probe reads fresh for the selected profile only
                 // (same as `session_token` below), but the job-store walk and
@@ -515,6 +602,10 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 },
                 has_unreadable_store: p.unreadable_credentials_store.is_some(),
                 has_api_key: p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+                logs_out_by_key: !p.spends_oauth_chain(),
+                proxy_login: p.proxy.as_ref().map(|record| {
+                    crate::actions::proxy_login_command(p.name.as_str(), &record.service)
+                }),
                 login_is_oauth: p.login_is_oauth(),
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
@@ -683,7 +774,7 @@ fn draw_codex_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selected = actions_focused && i == cursor;
         starts.push(lines.len());
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         };
@@ -704,12 +795,15 @@ fn draw_codex_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             focus.0 = lines.len();
         }
         let line = Line::from(vec![arrow, Span::styled(label, style)]);
-        // The focused action row takes the claude detail's full-width tint.
-        lines.push(if selected {
-            highlight_row(line, inner.width as usize)
-        } else {
-            line
-        });
+        // The cursor row takes the claude detail's full-width tint, gated so
+        // a detail nobody entered shades nothing at rest.
+        lines.push(
+            if i == cursor && (actions_focused || app.config_detail_entered) {
+                highlight_row(line, inner.width as usize)
+            } else {
+                line
+            },
+        );
         if selected {
             focus.1 = lines.len();
         }
@@ -828,7 +922,7 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("{} ", spinner_frame(app.tick_count)),
                 theme::accent(),
             ),
-            _ if selected => Span::styled("❯ ", theme::accent().bold()),
+            _ if selected => Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
             _ => Span::raw("  "),
         };
         let (label, style) = match row_kind {
@@ -846,11 +940,15 @@ fn draw_pool_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             focus.0 = lines.len();
         }
         let line = Line::from(vec![arrow, Span::styled(label, style)]);
-        lines.push(if selected {
-            highlight_row(line, inner.width as usize)
-        } else {
-            line
-        });
+        // The cursor row keeps its full-width tint, gated so a detail nobody
+        // entered shades nothing at rest.
+        lines.push(
+            if i == cursor && (actions_focused || app.config_detail_entered) {
+                highlight_row(line, inner.width as usize)
+            } else {
+                line
+            },
+        );
         if selected {
             focus.1 = lines.len();
         }
@@ -1028,13 +1126,21 @@ fn draw_settings_rows(
         _ => app.config_draft.as_ref(),
     };
     let editing = draft.and_then(|d| d.active);
-    let armed_action = draft.and_then(|d| d.armed_action);
+    // An arm belongs to the draft's account: the worker's removal can leave the
+    // draft open on a neighbour's card until the result drains.
+    let armed_action = draft
+        .filter(|d| d.editing_name.as_deref() == Some(snap.title.as_str()))
+        .and_then(|d| d.armed_action);
 
-    // Derived from the base-url buffer so it tracks the draft live.
-    let is_api = !row_input(draft, snap, ConfigRow::BaseUrl)
-        .value
-        .trim()
-        .is_empty();
+    // The endpoint-shaped typing reads the derived URL (the draft buffer live,
+    // else the profile's routing URL), never the saved value the base-url row
+    // shows: a keyless saved URL still types the account oauth. An unused saved
+    // URL keeps the OAuth rows whatever the buffer holds: the account routes to
+    // claude.ai until a key commits.
+    let is_api = match draft {
+        Some(d) => !snap.base_url_unused && !d.base_url.value.trim().is_empty(),
+        None => !snap.base_url_derived.trim().is_empty(),
+    };
     let (type_value, type_style) = if is_api {
         ("api", theme::accent())
     } else {
@@ -1161,7 +1267,7 @@ fn draw_settings_rows(
         } else if let Some(reason) = refusal {
             invalid_tooltip_lines(&reason, inner.width as usize)
         } else {
-            row_hint(*row, snap)
+            row_hint(*row, snap, &input.value)
                 .map(|text| help_tooltip_lines(&text, inner.width as usize))
                 .unwrap_or_default()
         };
@@ -1178,8 +1284,9 @@ fn draw_settings_rows(
         if selected || is_editing {
             focus.0 = line_idx as usize;
         }
+        let tinted = i == cursor && (actions_focused || app.config_detail_entered);
         for line in row_lines {
-            lines.push(if selected {
+            lines.push(if tinted {
                 highlight_row(line, inner.width as usize)
             } else {
                 line
@@ -1243,11 +1350,13 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::BaseUrl => &snap.base_url,
         ConfigRow::ApiKey => &snap.api_key,
         ConfigRow::Model => &snap.model,
+        ConfigRow::Effort => &snap.effort,
         ConfigRow::OpusModel => &snap.opus,
         ConfigRow::SonnetModel => &snap.sonnet,
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::AdvisorModel => &snap.advisor,
         ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::UsageProbeInterval => &snap.usage_probe_interval,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
@@ -1261,6 +1370,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
+        | ConfigRow::RollingTokenSwitch
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => "",
@@ -1270,11 +1380,19 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe, phrased for the row's
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
-/// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
-/// on their own value.
-fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
+/// name what ⏎ really does, and a proxy account's log out blanks only its key
+/// — while `auto_start`, `base_url` and `alert at` flip
+/// on their own value, and auto-start and the usage probe also on whether the
+/// plan has a 5h limit at all.
+/// `value` is the row's own live value (the draft buffer while a draft holds
+/// the row): the effort hint names what the CURRENT value does, so it must not
+/// read the snap, whose text fields empty while a draft is open.
+fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
+        ConfigRow::BaseUrl if snap.base_url_unused => {
+            "this account calls claude.ai until it has an api key"
+        }
         ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
             "leave empty for a Claude account, or set an API endpoint"
         }
@@ -1282,6 +1400,11 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::ApiKey if snap.mint_armed => "clauth mints a client token for this profile",
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
+        ConfigRow::AdvisorModel => "server-side advisor model in this account",
+        ConfigRow::Effort if value.trim().is_empty() => {
+            "no effort set: /effort and Claude Code's default apply"
+        }
+        ConfigRow::Effort => "reasoning effort for this account; /effort can't change it while set",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
@@ -1297,11 +1420,25 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Disabled => {
             "excludes this account from auto-switch, usage polling, and status until re-enabled"
         }
+        // A plan with no 5h limit never gets a ping: the scheduler's election
+        // skips a marked account, so the window arms below would promise work
+        // that never happens. The toggle itself stays live and unchanged.
+        ConfigRow::AutoStart if snap.no_five_hour_limit => {
+            "this plan has no 5h limit, so nothing is sent"
+        }
         ConfigRow::AutoStart if snap.auto_start => {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
-        // Both states name the cost, since turning it on is what pays it.
+        // Both states name the cost, since turning it on is what pays it. On a
+        // plan with no 5h limit there is no window to start, so the cost line
+        // drops it and only the read remains.
+        ConfigRow::UsageProbe if snap.no_five_hour_limit && snap.usage_probe => {
+            "a 1-token request to Haiku reads usage"
+        }
+        ConfigRow::UsageProbe if snap.no_five_hour_limit => {
+            "usage goes unread; a probe is a 1-token request to Haiku"
+        }
         ConfigRow::UsageProbe if snap.usage_probe => {
             "a 1-token request to Haiku reads usage and may start the 5h window"
         }
@@ -1329,12 +1466,19 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Login if snap.login_disabled_reason.is_some() => {
             return Some(snap.login_disabled_reason.clone().unwrap_or_default());
         }
+        ConfigRow::Login if snap.proxy_login.is_some() => {
+            return snap
+                .proxy_login
+                .as_ref()
+                .map(|command| format!("log in with `{command}`"));
+        }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "browser OAuth login",
         ConfigRow::CaptureLogin if snap.account_type == crate::tui::app::NewAccountType::Codex => {
             "capture the current codex login into this account"
         }
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if snap.logs_out_by_key => "clears the stored API key",
         ConfigRow::DeleteCreds if api_login && snap.has_unreadable_store => {
             if snap.has_api_key {
                 "clears the stored API key and the unreadable credentials.json"
@@ -1391,6 +1535,19 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
                 hint.push_str(" · the preserved mint goes too");
             }
             return Some(hint);
+        }
+        // Gate reason first (same order as the clear row: a gate only ever
+        // bites the armable state), then the disclosure — this hint is the
+        // TUI's entire statement that the session credential gets wider.
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() && snap.disabled => {
+            "cannot switch a disabled account"
+        }
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() => {
+            "cannot switch: this login is dead · log in again first"
+        }
+        ConfigRow::RollingTokenSwitch => {
+            "sessions get this login's full-scope token, re-stamped by the daemon · \
+             wider than a setup token · no refresh token"
         }
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
@@ -1450,7 +1607,7 @@ fn detail_row(
     let arrow = if editing {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -1485,15 +1642,37 @@ fn detail_row(
             return cycle_row_lines(lead, &options, None, None, selected, width);
         }
         ConfigRow::BaseUrl => {
-            return kv_field(
-                arrow, "base url", input, editing, selected, false, true, width,
+            // At rest the row shows the saved URL from the snapshot — a keyless
+            // saved URL still shows, with its note. The `+ new` form holds no
+            // saved URL, so its value stays the draft buffer; while editing the
+            // draft buffer is the value and the caret renders.
+            if editing {
+                return kv_field(
+                    arrow, "base url", input, editing, selected, false, true, width,
+                );
+            }
+            let value = if snap.base_url.is_empty() {
+                input.value.as_str()
+            } else {
+                snap.base_url.as_str()
+            };
+            let at_rest = InputState::new(value);
+            let mut lines = kv_field(
+                arrow, "base url", &at_rest, false, selected, false, true, width,
             );
+            if snap.base_url_unused && !value.is_empty() {
+                let note = Span::styled("  · unused until an api key is set", theme::dim());
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(note);
+                }
+            }
+            return lines;
         }
         // The mint-seeded key row is a Disabled row: whole line faint,
         // focusable but inert, the tooltip (below) naming what happens on save.
         ConfigRow::ApiKey if snap.mint_armed => {
             let row_arrow = if selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 Span::raw("  ")
             };
@@ -1526,6 +1705,16 @@ fn detail_row(
                 arrow, "model", input, editing, selected, false, false, width,
             );
         }
+        // The `model` row's shape: the fixed cycle at rest, a plain text field
+        // while typing a custom value.
+        ConfigRow::Effort if !editing => {
+            return effort_cycle_lines(arrow, &input.value, selected, width);
+        }
+        ConfigRow::Effort => {
+            return kv_field(
+                arrow, "effort", input, editing, selected, false, false, width,
+            );
+        }
         ConfigRow::OpusModel => {
             return kv_field(arrow, "opus", input, editing, selected, false, false, width);
         }
@@ -1549,12 +1738,22 @@ fn detail_row(
                 arrow, "subagent", input, editing, selected, false, false, width,
             );
         }
+        ConfigRow::AdvisorModel => {
+            return kv_field(
+                arrow, "advisor", input, editing, selected, false, false, width,
+            );
+        }
         // A custom env entry: its key is the label; mask the value when the key
         // looks like a credential (mirrors the api-key row).
         ConfigRow::EnvEntry(i) => {
             let key = snap.env.get(i).map(|(k, _)| k.clone()).unwrap_or_default();
             let mask = env_key_is_secret(&key);
             return kv_field(arrow, &key, input, editing, selected, mask, false, width);
+        }
+        // A pending key's value editor reads as that key's own entry row.
+        ConfigRow::EnvAdd if editing && let Some(key) = snap.env_pending.as_deref() => {
+            let mask = env_key_is_secret(key);
+            return kv_field(arrow, key, input, editing, selected, mask, false, width);
         }
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => {
@@ -1581,7 +1780,7 @@ fn detail_row(
         ConfigRow::Disabled => {
             let gated = snap.is_active || snap.has_live_session;
             let row_arrow = if gated && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1665,10 +1864,13 @@ fn detail_row(
             selected,
         ),
         ConfigRow::Delete => {
-            let label = if armed_action == Some(ConfigRow::Delete) {
-                "press again to delete".to_string()
-            } else {
-                "delete account".to_string()
+            let (arrow, label) = match snap.delete_frame {
+                Some(frame) => (
+                    Span::styled(format!("{frame} "), theme::accent()),
+                    "deleting\u{2026}",
+                ),
+                None if armed_action == Some(ConfigRow::Delete) => (arrow, "press again to delete"),
+                None => (arrow, "delete account"),
             };
             Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }
@@ -1683,7 +1885,7 @@ fn detail_row(
                 Line::from(vec![
                     arrow,
                     Span::styled(
-                        "✓ captured current login",
+                        format!("{} captured current login", theme::DONE),
                         bold_when(theme::success(), selected),
                     ),
                 ])
@@ -1703,7 +1905,7 @@ fn detail_row(
             // its `└` line (via `row_hint`).
             if snap.login_disabled_reason.is_some() {
                 let row_arrow = if selected {
-                    Span::styled("❯ ", theme::faint())
+                    Span::styled(format!("{} ", theme::CARET), theme::faint())
                 } else {
                     Span::raw("  ")
                 };
@@ -1717,7 +1919,10 @@ fn detail_row(
             if snap.captured || snap.captured_codex_mint {
                 Line::from(vec![
                     arrow,
-                    Span::styled("✓ logged in", bold_when(theme::success(), selected)),
+                    Span::styled(
+                        format!("{} logged in", theme::DONE),
+                        bold_when(theme::success(), selected),
+                    ),
                 ])
             } else {
                 let label = if snap.logged_in {
@@ -1743,7 +1948,7 @@ fn detail_row(
         ConfigRow::ClearSessionToken => {
             let gated = snap.clear_gated();
             let row_arrow = if gated && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1753,6 +1958,30 @@ fn detail_row(
                 ("press again to clear", theme::danger().bold())
             } else {
                 ("clear long-lived token", theme::danger().bold())
+            };
+            Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
+        // The `switch to a rolling token` row: `Delete`'s button class —
+        // always-bold DANGER, `press again to switch` once armed — because an
+        // arm retargets every future switch and, on the active account, moves
+        // a running session's credentials. Dimmed/inert (arrow included,
+        // matching the gated `disabled` row) on a disabled account or a
+        // quarantined login: `run_config_row`'s own gate no-ops there, and
+        // `Snap::rolling_switch_gated` is the one spelling both render
+        // readers share.
+        ConfigRow::RollingTokenSwitch => {
+            let gated = snap.rolling_switch_gated();
+            let row_arrow = if gated && selected {
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
+            } else {
+                arrow
+            };
+            let (label, style) = if gated {
+                ("switch to a rolling token", theme::faint())
+            } else if armed_action == Some(ConfigRow::RollingTokenSwitch) {
+                ("press again to switch", theme::danger().bold())
+            } else {
+                ("switch to a rolling token", theme::danger().bold())
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
         }
@@ -1891,6 +2120,23 @@ fn model_cycle_lines(
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
     let custom =
         (!current.is_empty() && !MODEL_PRESETS.contains(&current)).then_some((current, true));
+    cycle_row_lines(lead, &options, custom, None, selected, width)
+}
+
+/// The `effort` row at rest: the same shape as the `model` row, with `unset`
+/// where the model row says `default`. A custom value (set via ⏎) matches no
+/// preset, so it trails the run rather than mis-bracketing the nearest one.
+fn effort_cycle_lines(
+    arrow: Span<'static>,
+    current: &str,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let lead = kv_lead(arrow, "effort", selected);
+    let mut options: Vec<(&str, bool)> = vec![("unset", current.is_empty())];
+    options.extend(EFFORT_PRESETS.iter().map(|p| (*p, *p == current)));
+    let custom =
+        (!current.is_empty() && !EFFORT_PRESETS.contains(&current)).then_some((current, true));
     cycle_row_lines(lead, &options, custom, None, selected, width)
 }
 

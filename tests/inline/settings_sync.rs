@@ -28,7 +28,8 @@ fn base_path(home: &Path) -> PathBuf {
 }
 
 fn runtime_path(home: &Path, profile: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".clauth")
+        .join("profiles")
         .join(profile)
         .join("runtime")
         .join("settings.json")
@@ -36,14 +37,16 @@ fn runtime_path(home: &Path, profile: &str) -> PathBuf {
 
 /// A live session's own copy, `runtime-<sid>/settings.json`.
 fn session_runtime_path(home: &Path, profile: &str, sid: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".clauth")
+        .join("profiles")
         .join(profile)
         .join(format!("runtime-{sid}"))
         .join("settings.json")
 }
 
 fn isolated_path(home: &Path, profile: &str) -> PathBuf {
-    home.join(".clauth/profiles")
+    home.join(".clauth")
+        .join("profiles")
         .join(profile)
         .join("runtime-isolated")
         .join("settings.json")
@@ -59,11 +62,59 @@ fn write_config(home: &Path, profile: &str, body: &str) {
 /// minus the `LAST_SYNCED` fast path (a process-wide static that would make test
 /// order significant).
 fn sync() {
-    let paths = known_paths().expect("known paths");
     assert!(
-        sync_members(&paths).expect("sync"),
+        sync_members().expect("sync"),
         "the merge must have run; a paused tick means a config.toml did not parse"
     );
+}
+
+fn mtime_parts(when: SystemTime) -> (i64, u32) {
+    let d = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("post-epoch");
+    (d.as_secs() as i64, d.subsec_nanos())
+}
+
+/// A live `clauth start` session's flock-held marker on the sessions dir
+/// `runtime::paired_sessions_name` pairs with `runtime_dir` (`runtime-<sid>` ↔
+/// `sessions-<sid>`). Keep the returned handle alive for as long as the copy
+/// should read as a live session's.
+fn arm_runtime_marker(runtime_dir: &Path) -> std::fs::File {
+    let name = runtime_dir
+        .file_name()
+        .expect("runtime dir name")
+        .to_string_lossy()
+        .replacen("runtime", "sessions", 1);
+    let sessions = runtime_dir.with_file_name(name);
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
+}
+
+/// Write `path` as a copy clauth wrote: the production write-and-record path,
+/// stamped at `when`, so the reconciler reads it as a recorded copy carrying
+/// that write.
+fn write_recorded_json(home: &Path, path: &Path, value: &Value, when: SystemTime) {
+    let bytes = serde_json::to_vec_pretty(value).expect("serialize");
+    crate::jsonsync::write_copy_and_record(
+        Some(&home.join(".clauth").join(SETTINGS_SYNC_WRITTEN_FILENAME)),
+        path,
+        &bytes,
+        mtime_parts(when),
+        true,
+        Some(when),
+    )
+    .expect("write recorded copy");
+}
+
+/// The production shape of one runtime `settings.json`: clauth wrote and
+/// recorded it, and a live session holds the marker on its paired dir. Keep the
+/// returned handle alive for the copy to stay a member.
+fn live_recorded_json(home: &Path, path: &Path, value: &Value, when: SystemTime) -> std::fs::File {
+    let marker = arm_runtime_marker(path.parent().expect("runtime dir"));
+    write_recorded_json(home, path, value, when);
+    marker
 }
 
 #[test]
@@ -73,8 +124,18 @@ fn shared_field_reaches_the_base_and_every_sibling_runtime() {
     let p1 = runtime_path(home.home(), "p1");
     let p2 = runtime_path(home.home(), "p2");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
-    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(10));
-    write_json(&p2, &json!({"theme": "light", "env": {}}), t(5));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(
+        home.home(),
+        &p2,
+        &json!({"theme": "light", "env": {}}),
+        t(5),
+    );
 
     sync();
 
@@ -92,7 +153,8 @@ fn per_profile_env_never_leaves_its_own_runtime() {
     write_config(home.home(), "p1", "[env]\nMY_TOKEN = \"p1-secret\"\n");
     write_config(home.home(), "p2", "");
     write_json(&base, &json!({"env": {"EDITOR": "nano"}}), t(1));
-    write_json(
+    let _live_p1 = live_recorded_json(
+        home.home(),
         &p1,
         &json!({
             "theme": "dark",
@@ -104,7 +166,7 @@ fn per_profile_env_never_leaves_its_own_runtime() {
         }),
         t(10),
     );
-    write_json(&p2, &json!({"env": {"EDITOR": "nano"}}), t(5));
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {"EDITOR": "nano"}}), t(5));
 
     sync();
 
@@ -132,6 +194,96 @@ fn per_profile_env_never_leaves_its_own_runtime() {
     );
 }
 
+/// A key the active account covers stays per-profile while its cover is live,
+/// even after a hand edit drops it from that account's `config.toml` before any
+/// apply: `~/.clauth/base-env.json` still records the cover, so the account's
+/// live value never reaches a sibling runtime.
+#[test]
+fn a_covered_key_dropped_from_its_config_by_hand_never_leaves_the_live_file() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p2 = runtime_path(home.home(), "p2");
+    write_config(home.home(), "p1", "[env]\nOTHER = \"x\"\n");
+    write_config(home.home(), "p2", "");
+    let record = home.home().join(".clauth").join("base-env.json");
+    fs::write(
+        &record,
+        r#"{"v":1,"keys":{"K":{"base":"user","wrote":"a913e7808d8b9993a294b7cec166ea558c8faaf8e32163ed36f83753330c4e0b"}}}"#,
+    )
+    .expect("write record");
+    write_json(
+        &base,
+        &json!({"theme": "dark", "env": {"K": "p1-value", "OTHER": "x"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    let env = read_json(&p2)["env"].clone();
+    assert!(
+        env.get("K").is_none(),
+        "p2 received the active account's covered value: {env}"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "control: the merge ran and carried a shared key"
+    );
+    assert_eq!(
+        read_json(&base)["env"]["K"],
+        json!("p1-value"),
+        "the live file keeps its cover"
+    );
+}
+
+/// A `~/.clauth/base-env.json` that does not parse pauses the merge like an
+/// unparseable `config.toml`: the keys it covers are unknown, so nothing is
+/// synced, and the one line it logs names the record, never what it holds.
+#[test]
+fn a_torn_base_env_record_pauses_the_merge_without_quoting_it() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p2 = runtime_path(home.home(), "p2");
+    write_config(home.home(), "p1", "");
+    write_config(home.home(), "p2", "");
+    fs::write(
+        home.home().join(".clauth").join("base-env.json"),
+        r#"{"v":1,"keys":{"K":{"base":"sk-torn-secret""#,
+    )
+    .expect("write torn record");
+    write_json(
+        &base,
+        &json!({"theme": "dark", "env": {"K": "p1-value"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let merged = sync_members().expect("sync");
+    drop(capture);
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+
+    assert!(!merged, "the tick reports the pause");
+    let synced = read_json(&p2);
+    assert!(
+        synced.get("theme").is_none() && synced["env"].get("K").is_none(),
+        "the merge paused: {synced}"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(logged.len(), 1, "one pause line: {logged:?}");
+    assert!(
+        logged[0].contains("settings.json sync paused") && logged[0].contains("base-env.json"),
+        "the line names the record: {logged:?}"
+    );
+    assert!(
+        !logged[0].contains("sk-torn-secret"),
+        "the line never quotes the record"
+    );
+}
+
 /// The protective direction: a target must KEEP the per-profile keys the winner
 /// does not have. Every other fixture here gives both sides the same keys, which
 /// leaves the two `retain`s in `jsonsync::merge_member` unreached — so this one
@@ -148,8 +300,14 @@ fn an_api_key_target_keeps_its_routing_when_the_winner_has_none() {
     write_config(home.home(), "p1", "");
     write_config(home.home(), "p2", "[env]\nDEEPSEEK_TIER = \"paid\"\n");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
-    write_json(&oauth, &json!({"theme": "dark", "env": {}}), t(10));
-    write_json(
+    let _live_oauth = live_recorded_json(
+        home.home(),
+        &oauth,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    let _live_apikey = live_recorded_json(
+        home.home(),
         &apikey,
         &json!({
             "theme": "light",
@@ -208,7 +366,8 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
         &json!({"apiKeyHelper": "clauth __api-key active", "model": "opus", "env": {}}),
         t(1),
     );
-    write_json(
+    let _live_p1 = live_recorded_json(
+        home.home(),
         &p1,
         &json!({
             "apiKeyHelper": "clauth __api-key p1",
@@ -218,7 +377,8 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
         }),
         t(10),
     );
-    write_json(
+    let _live_p2 = live_recorded_json(
+        home.home(),
         &p2,
         &json!({"apiKeyHelper": "clauth __api-key p2", "model": "haiku", "env": {}}),
         t(5),
@@ -254,6 +414,93 @@ fn api_key_helper_and_model_stay_exactly_where_they_were() {
     assert_eq!(read_json(&p2)["theme"], json!("dark"));
 }
 
+/// Effort is per account through its one carrier,
+/// `env.CLAUDE_CODE_EFFORT_LEVEL`, an empty value included: it stays with the
+/// member that holds it and never spreads to a sibling or the base.
+/// `effortLevel` is Claude Code's own key, which clauth never writes, so it
+/// syncs like any shared key.
+#[test]
+fn effort_stays_exactly_where_it_was() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    let p2 = runtime_path(home.home(), "p2");
+    write_json(
+        &base,
+        &json!({"effortLevel": "low", "env": {"CLAUDE_CODE_EFFORT_LEVEL": ""}}),
+        t(1),
+    );
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"effortLevel": "high", "theme": "dark", "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+        json!(""),
+        "the base kept its own empty override"
+    );
+    assert_eq!(
+        read_json(&p1)["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+        json!("max")
+    );
+    assert!(
+        read_json(&p2)["env"]
+            .get("CLAUDE_CODE_EFFORT_LEVEL")
+            .is_none(),
+        "p2 received a sibling's override"
+    );
+    assert_eq!(
+        read_json(&p2)["effortLevel"],
+        json!("high"),
+        "effortLevel is shared: the newest member's value reaches p2"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "precondition: this sync did rewrite p2"
+    );
+}
+
+/// `advisorModel` is a model choice written per account (`[models] advisor`), so
+/// a sibling's value must never reach another member: not the base, not a
+/// runtime copy, and not the other way round.
+#[test]
+fn advisor_model_stays_exactly_where_it_was() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    let p2 = runtime_path(home.home(), "p2");
+    write_json(&base, &json!({"advisorModel": "opus", "env": {}}), t(1));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"advisorModel": "sonnet", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    // p2 has no advisor row, so its runtime copy carries no `advisorModel`.
+    let _live_p2 = live_recorded_json(home.home(), &p2, &json!({"env": {}}), t(5));
+
+    sync();
+
+    assert_eq!(read_json(&base)["advisorModel"], json!("opus"));
+    assert_eq!(read_json(&p1)["advisorModel"], json!("sonnet"));
+    assert!(
+        read_json(&p2).get("advisorModel").is_none(),
+        "p2 received a sibling's advisor, turning its advisor on"
+    );
+    assert_eq!(
+        read_json(&p2)["theme"],
+        json!("dark"),
+        "precondition: this sync did rewrite p2"
+    );
+}
+
 #[test]
 fn unparseable_member_is_skipped_not_clobbered() {
     let home = HomeSandbox::new();
@@ -262,10 +509,16 @@ fn unparseable_member_is_skipped_not_clobbered() {
     let p2 = runtime_path(home.home(), "p2");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
     write_json(&p1, &json!({}), t(2));
+    let _live_p1 = arm_runtime_marker(p1.parent().expect("runtime dir"));
     // Newest by mtime, but caught mid-write → never read from nor written to.
     fs::write(&p1, b"{ \"theme\": \"dar").expect("write partial");
     set_mtime(&p1, t(20));
-    write_json(&p2, &json!({"theme": "dark", "env": {}}), t(10));
+    let _live_p2 = live_recorded_json(
+        home.home(),
+        &p2,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
     let before = fs::read(&p1).expect("read p1");
 
     sync();
@@ -291,12 +544,19 @@ fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
     let sibling = session_runtime_path(home.home(), "p2", "4242-1");
     let isolated = home
         .home()
-        .join(".clauth/profiles/p1")
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
         .join("runtime-isolated-4242-2")
         .join("settings.json");
     for path in [&base, &legacy, &session, &sibling, &isolated] {
         write_json(path, &json!({"env": {}}), t(1));
     }
+    // Each of the three shared copies is a live session's own tree; the
+    // isolated copy has no live session armable through this walk at all.
+    let _live_legacy = arm_runtime_marker(legacy.parent().expect("runtime dir"));
+    let _live_session = arm_runtime_marker(session.parent().expect("runtime dir"));
+    let _live_sibling = arm_runtime_marker(sibling.parent().expect("runtime dir"));
 
     let paths = known_paths().expect("known paths");
 
@@ -335,12 +595,14 @@ fn isolated_runtime_neither_wins_nor_receives() {
         &json!({"theme": "light", "hooks": {"PreToolUse": ["x"]}, "env": {}}),
         t(1),
     );
-    write_json(
+    let _live_p1 = live_recorded_json(
+        home.home(),
         &p1,
         &json!({"theme": "dark", "hooks": {"PreToolUse": ["x"]}, "env": {}}),
         t(10),
     );
-    write_json(
+    let _live_p2 = live_recorded_json(
+        home.home(),
         &p2,
         &json!({"theme": "light", "hooks": {"PreToolUse": ["x"]}, "env": {}}),
         t(5),
@@ -382,7 +644,7 @@ fn shared_env_key_dropped_by_the_winner_is_removed_from_targets() {
         &json!({"env": {"EDITOR": "nano", "PAGER": "less"}}),
         t(1),
     );
-    write_json(&p1, &json!({"env": {"EDITOR": "vim"}}), t(10));
+    let _live_p1 = live_recorded_json(home.home(), &p1, &json!({"env": {"EDITOR": "vim"}}), t(10));
 
     sync();
 
@@ -411,8 +673,18 @@ fn runtime_copies_are_owner_only_and_the_base_keeps_its_posture() {
     let p1 = runtime_path(home.home(), "p1");
     let p2 = runtime_path(home.home(), "p2");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
-    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(10));
-    write_json(&p2, &json!({"theme": "light", "env": {}}), t(5));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    let _live_p2 = live_recorded_json(
+        home.home(),
+        &p2,
+        &json!({"theme": "light", "env": {}}),
+        t(5),
+    );
     for path in [&base, &p2] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("chmod");
     }
@@ -476,6 +748,7 @@ fn every_credential_minting_top_level_key_is_per_profile() {
         "forceLoginGatewayUrl",
         "forceLoginOrgUUID",
         "model",
+        "advisorModel",
     ] {
         assert_eq!(
             key_role(KeyPath::Top(key), &custom_env),
@@ -506,7 +779,12 @@ fn a_non_object_env_on_the_winner_leaves_targets_alone() {
         &json!({"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"}}),
         t(1),
     );
-    write_json(&p1, &json!({"theme": "dark", "env": null}), t(10));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"theme": "dark", "env": null}),
+        t(10),
+    );
 
     sync();
 
@@ -613,10 +891,7 @@ fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
         CODEX_ROSTER_WARNED.load(Ordering::Relaxed),
         "the roster failure is reported once"
     );
-    assert!(
-        sync_members(&known_paths().expect("known paths")).expect("sync"),
-        "the merge runs"
-    );
+    assert!(sync_members().expect("sync"), "the merge runs");
 
     // A valid roster naming a codex dir whose own config.toml does not parse:
     // the dir is skipped by membership, the claude keys still arrive.
@@ -740,7 +1015,7 @@ fn a_config_that_does_not_parse_aborts_the_tick() {
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 
     assert!(
-        !sync_members(&known_paths().expect("known paths")).expect("sync"),
+        !sync_members().expect("sync"),
         "the merge must not run while a profile's [env] set is unknown"
     );
     assert_eq!(
@@ -827,6 +1102,7 @@ fn a_claude_code_write_tying_a_copy_write_on_mtime_wins_the_next_pass() {
     let p1 = runtime_path(home.home(), "p1");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(10));
     write_json(&p1, &json!({"theme": "dark", "env": {}}), t(5));
+    let _live_p1 = arm_runtime_marker(p1.parent().expect("runtime dir"));
 
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     crate::jsonsync::set_post_write_hook(Some(Box::new({
@@ -897,11 +1173,19 @@ fn the_settings_record_is_owner_only_and_holds_no_member_bytes() {
     let base = base_path(home.home());
     let p1 = runtime_path(home.home(), "p1");
     write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
-    write_json(&p1, &json!({"theme": "dark", "env": {}}), t(10));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
 
     sync();
 
-    let record = home.home().join(".clauth/.settings-sync-written.json");
+    let record = home
+        .home()
+        .join(".clauth")
+        .join(SETTINGS_SYNC_WRITTEN_FILENAME);
     let meta = fs::metadata(&record).expect("the record exists");
     assert_eq!(
         meta.permissions().mode() & 0o777,
@@ -916,9 +1200,1276 @@ fn the_settings_record_is_owner_only_and_holds_no_member_bytes() {
     );
 
     let entries: Vec<Value> = serde_json::from_str(&text).expect("record parses");
-    assert_eq!(entries.len(), 1, "one copy was written (the base)");
+    let mut recorded: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            entry["path"]
+                .as_str()
+                .expect("every record entry names a path")
+                .to_owned()
+        })
+        .collect();
+    recorded.sort();
+    let mut expected = vec![
+        base.to_string_lossy().into_owned(),
+        p1.to_string_lossy().into_owned(),
+    ];
+    expected.sort();
     assert_eq!(
-        entries[0]["path"],
-        json!(base.to_string_lossy().into_owned())
+        recorded, expected,
+        "the record holds the base and the copy the pass wrote, nothing else"
+    );
+}
+
+#[test]
+fn a_copy_no_live_session_holds_never_rewrites_the_base() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let rich = json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+        "attribution": {"commit": ""}, "hooks": {"PreToolUse": []},
+        "env": {"SHARED_VAR": "1"}, "theme": "dark"});
+    write_json(&base_path(&h), &rich, t(10));
+    // A stray Claude Code's first start in a runtime-named dir under a profile
+    // clauth never made, and one beside a sessions dir whose marker no
+    // process holds: both newer than the base, holding only the theme pick.
+    write_json(
+        &h.join(".clauth/profiles/zcode9/runtime-3532172-11/settings.json"),
+        &json!({"theme": "dark"}),
+        t(20),
+    );
+    fs::create_dir_all(h.join(".clauth/profiles/cld0/sessions-4242-0")).expect("mkdir");
+    write_json(
+        &h.join(".clauth/profiles/cld0/runtime-4242-0/settings.json"),
+        &json!({"theme": "dark"}),
+        t(21),
+    );
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base_path(&h)),
+        rich,
+        "a dead runtime copy took part in the sync and rewrote ~/.claude/settings.json"
+    );
+}
+
+// ── the reconciler's three safety guards ────────────────────────────────────
+
+/// The backups under `dir` named `<file>.<stamp>`, oldest first. An absent dir
+/// has none.
+fn backups_named(dir: &Path, file: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{file}.");
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A path as the refusal line renders it: the sandbox home shortened to `~`.
+fn tilde(home: &Path, path: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn settings_record(home: &Path) -> PathBuf {
+    home.join(".clauth").join(SETTINGS_SYNC_WRITTEN_FILENAME)
+}
+
+/// Guard 2: a live runtime copy clauth never wrote still joins the pass (so its
+/// per-profile state converges) but can never WIN it. A stray Claude Code's
+/// first-start copy is exactly this shape: newest, and holding only the keys it
+/// wrote, so winning would delete every shared key the base holds.
+#[test]
+fn a_live_copy_clauth_never_wrote_never_wins_the_base() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let rich = json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+        "attribution": {"commit": ""}, "hooks": {"PreToolUse": []},
+        "env": {"SHARED_VAR": "1"}, "theme": "light"});
+    write_json(&base, &rich, t(1));
+    let stray = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(&stray, &json!({"theme": "dark"}), t(20));
+    let _live = arm_runtime_marker(stray.parent().expect("runtime dir"));
+
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        rich,
+        "an unrecorded live copy won the pass and rewrote the base"
+    );
+}
+
+/// Guard 2's positive control: a copy clauth WROTE, then carrying a newer
+/// in-session edit, still propagates to the base — the sync's whole purpose.
+#[test]
+fn a_recorded_live_copy_carrying_a_newer_edit_still_reaches_the_base() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let live = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"theme": "light", "cleanupPeriodDays": 30, "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &live,
+        &json!({"theme": "dark", "cleanupPeriodDays": 30, "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "a recorded live copy's newer shared edit must still reach the base"
+    );
+}
+
+/// Guard 3: a recorded live winner lacking four of the base's shared top-level
+/// keys is one over the bound, so the pass writes nothing, backs the base up
+/// once, and says so with the exact line.
+#[test]
+fn a_winner_lacking_four_shared_keys_writes_nothing_and_backs_the_base_up() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+            "hooks": {"PreToolUse": []}, "attribution": {"commit": ""}, "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(home.home(), &winner, &json!({"model": "opus"}), t(10));
+    let record = settings_record(home.home());
+    let backups_dir = home.home().join(".clauth").join("backups");
+
+    let before_base = fs::read(&base).expect("read base");
+    let before_winner = fs::read(&winner).expect("read winner");
+    let before_record = fs::read(&record).expect("read record");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(
+        fs::read(&base).expect("read base"),
+        before_base,
+        "a refused pass must leave the base byte-identical"
+    );
+    assert_eq!(
+        fs::read(&winner).expect("read winner"),
+        before_winner,
+        "a refused pass must leave every member byte-identical"
+    );
+    assert_eq!(
+        fs::read(&record).expect("read record"),
+        before_record,
+        "a refused pass must not persist a record"
+    );
+    let backups = backups_named(&backups_dir, "settings.json");
+    assert_eq!(backups.len(), 1, "exactly one backup: {backups:#?}");
+    assert_eq!(
+        fs::read(&backups[0]).expect("read backup"),
+        before_base,
+        "the backup holds the base's own bytes"
+    );
+    let expected = format!(
+        "clauth: settings.json sync skipped: applying {} would delete 4 keys from {}; \
+         saved a copy at {}",
+        tilde(home.home(), &winner),
+        tilde(home.home(), &base),
+        tilde(home.home(), &backups[0]),
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![expected],
+        "the refusal line is pinned exactly"
+    );
+
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "a second pass over the same winner must not raise a second line"
+    );
+    assert_eq!(
+        backups_named(&backups_dir, "settings.json").len(),
+        1,
+        "a second pass over the same winner must not take a second backup"
+    );
+}
+
+/// Guard 3's boundary: exactly three dropped shared keys is still a pass.
+#[test]
+fn a_winner_lacking_exactly_three_shared_keys_still_merges() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"outputStyle": "x", "hooks": {}, "attribution": {}, "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "dark", "env": {}}),
+        "three dropped keys are under the bound, so the merge runs"
+    );
+    assert!(
+        backups_named(
+            &home.home().join(".clauth").join("backups"),
+            "settings.json"
+        )
+        .is_empty(),
+        "a pass under the bound takes no backup"
+    );
+}
+
+/// Guard 3's retention: the newest ten backups of one file are kept, the oldest
+/// goes on the eleventh refusal, and the other operator file's backups are
+/// untouched.
+#[test]
+fn the_eleventh_refusal_keeps_ten_backups_and_spares_the_other_files() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+            "hooks": {"PreToolUse": []}, "attribution": {"commit": ""}, "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(home.home(), &winner, &json!({"model": "opus"}), t(10));
+    let backups_dir = home.home().join(".clauth").join("backups");
+    fs::create_dir_all(&backups_dir).expect("mkdir backups");
+    let other = backups_dir.join(".claude.json.2020-01-01T00-00-00Z");
+    fs::write(&other, b"the other operator file's backup").expect("write other backup");
+
+    let mut oldest = None;
+    for round in 0..11u64 {
+        // A fresh recorded write each round changes the winner's stat, which is
+        // the refusal latch's key, so every round takes its own backup.
+        write_recorded_json(
+            home.home(),
+            &winner,
+            &json!({"model": "opus", "round": round}),
+            t(10 + round),
+        );
+        sync();
+        let backups = backups_named(&backups_dir, "settings.json");
+        if round == 0 {
+            oldest = backups.first().cloned();
+        }
+    }
+
+    let backups = backups_named(&backups_dir, "settings.json");
+    assert_eq!(backups.len(), 10, "ten backups are kept: {backups:#?}");
+    let oldest = oldest.expect("the first refusal took a backup");
+    assert!(
+        !oldest.exists(),
+        "the eleventh refusal must delete the oldest backup {oldest:?}"
+    );
+    assert!(
+        other.exists(),
+        "backups of the other operator file are never pruned here"
+    );
+}
+
+/// The delete bound carries one protected key: a winner lacking
+/// `cleanupPeriodDays` refuses even when that is the only shared key the pass
+/// would delete, because its absence re-arms Claude Code's 30-day sweep.
+#[test]
+fn a_winner_lacking_only_the_cleanup_retention_key_refuses_the_pass() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"theme": "light", "env": {}}),
+        t(10),
+    );
+    let backups_dir = home.home().join(".clauth").join("backups");
+
+    let before_base = fs::read(&base).expect("read base");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(
+        fs::read(&base).expect("read base"),
+        before_base,
+        "a pass deleting the retention key must leave the base byte-identical"
+    );
+    let backups = backups_named(&backups_dir, "settings.json");
+    assert_eq!(backups.len(), 1, "exactly one backup: {backups:#?}");
+    assert_eq!(
+        fs::read(&backups[0]).expect("read backup"),
+        before_base,
+        "the backup holds the base's own bytes"
+    );
+    let expected = format!(
+        "clauth: settings.json sync skipped: applying {} would delete 1 key from {}; \
+         saved a copy at {}",
+        tilde(home.home(), &winner),
+        tilde(home.home(), &base),
+        tilde(home.home(), &backups[0]),
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![expected],
+        "the refusal line is pinned exactly"
+    );
+}
+
+/// The protection is the key's presence, not its value: a winner carrying
+/// `cleanupPeriodDays` still merges, deleting one other shared key.
+#[test]
+fn a_winner_carrying_the_cleanup_retention_key_still_deletes_another_shared_key() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"cleanupPeriodDays": 30, "theme": "dark", "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 30, "theme": "dark", "env": {}}),
+        "a winner carrying the retention key still merges"
+    );
+}
+
+// ── the guards pinned one at a time ──────────────────────────────────────────
+
+/// Guard 1 alone: a DEAD runtime copy that is recorded (so guard 2 lets it win),
+/// newest, and lacking only one non-protected shared key (so guard 3 lets the
+/// pass run) is still excluded by membership, so the base keeps its keys.
+#[test]
+fn a_dead_recorded_copy_cannot_wipe_the_base_when_only_membership_can_stop_it() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    // A dead tree under a profile clauth never made, and one beside a sessions
+    // dir no process holds: both recorded and newest, each keeping the
+    // protected retention key and lacking only one shared key.
+    let ghost = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("runtime-3532172-11")
+        .join("settings.json");
+    write_recorded_json(
+        &h,
+        &ghost,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(20),
+    );
+    let stale = h
+        .join(".clauth")
+        .join("profiles")
+        .join("cld0")
+        .join("runtime-4242-0")
+        .join("settings.json");
+    fs::create_dir_all(
+        h.join(".clauth")
+            .join("profiles")
+            .join("cld0")
+            .join("sessions-4242-0"),
+    )
+    .expect("mkdir");
+    write_recorded_json(
+        &h,
+        &stale,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(21),
+    );
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        "a dead recorded copy took part in the sync and rewrote the base"
+    );
+}
+
+/// Guard 2 alone: a LIVE runtime copy clauth never recorded, newest and lacking
+/// only one non-protected shared key, is admitted (guard 1) and under the bound
+/// (guard 3) — only the winner gate keeps the base intact.
+#[test]
+fn an_unrecorded_live_copy_cannot_win_when_only_the_winner_gate_can_stop_it() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        t(1),
+    );
+    let stray = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &stray,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(20),
+    );
+    let _live = arm_runtime_marker(stray.parent().expect("runtime dir"));
+
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        "an unrecorded live copy won the pass and rewrote the base"
+    );
+}
+
+/// The settings bound alone: a recorded live winner that KEEPS the protected
+/// retention key but lacks four other shared keys refuses, so the >3 bound is
+/// what stops the wipe, not the protected key.
+#[test]
+fn a_winner_keeping_the_retention_key_but_lacking_four_shared_keys_refuses() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "hooks": {},
+            "attribution": {}, "theme": "dark", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"cleanupPeriodDays": 3650, "env": {}}),
+        t(10),
+    );
+    let backups_dir = home.home().join(".clauth").join("backups");
+
+    let before_base = fs::read(&base).expect("read base");
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(
+        fs::read(&base).expect("read base"),
+        before_base,
+        "a refused pass must leave the base byte-identical"
+    );
+    let backups = backups_named(&backups_dir, "settings.json");
+    assert_eq!(backups.len(), 1, "exactly one backup: {backups:#?}");
+    assert_eq!(
+        fs::read(&backups[0]).expect("read backup"),
+        before_base,
+        "the backup holds the base's own bytes"
+    );
+    let expected = format!(
+        "clauth: settings.json sync skipped: applying {} would delete 4 keys from {}; \
+         saved a copy at {}",
+        tilde(home.home(), &winner),
+        tilde(home.home(), &base),
+        tilde(home.home(), &backups[0]),
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![expected],
+        "the refusal line is pinned exactly"
+    );
+}
+
+/// A refusal whose backup cannot be written still refuses and writes nothing,
+/// says once that it could not save a copy (naming the io error), and sets no
+/// latch — so every later pass retries the backup, stays quiet while it keeps
+/// failing, and logs the "saved a copy" line once the backup lands.
+#[test]
+fn a_failed_backup_still_refuses_and_the_next_pass_retries_it() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "hooks": {},
+            "attribution": {}, "theme": "dark", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"cleanupPeriodDays": 3650, "env": {}}),
+        t(10),
+    );
+    let backups_dir = home.home().join(".clauth").join("backups");
+    fs::create_dir_all(&backups_dir).expect("mkdir backups");
+
+    let before_base = fs::read(&base).expect("read base");
+    let lines = crate::logline::LogLines::new();
+    let failed = {
+        let _unwritable = crate::testutil::UnwritableDir::new(&backups_dir);
+        // The io error the backup's own file create meets, as the platform
+        // words it: taken off a create in the same refusing dir.
+        let io_error = fs::File::create(backups_dir.join("probe"))
+            .expect_err("the unwritable dir refuses a new file")
+            .to_string();
+        let failed = format!(
+            "clauth: settings.json sync skipped: applying {} would delete 4 keys from {}; \
+             could not save a copy in {}: {io_error}",
+            tilde(home.home(), &winner),
+            tilde(home.home(), &base),
+            tilde(home.home(), &backups_dir),
+        );
+        {
+            let _capture = lines.capture_here();
+            sync();
+        }
+        assert_eq!(
+            lines.snapshot(),
+            vec![failed.clone()],
+            "a refused pass whose backup failed says so once, naming the io error"
+        );
+        {
+            let _capture = lines.capture_here();
+            sync();
+        }
+        assert_eq!(
+            lines.snapshot(),
+            vec![failed.clone()],
+            "a second pass over the same refused copy whose backup still fails stays quiet"
+        );
+        failed
+    };
+    assert_eq!(
+        fs::read(&base).expect("read base"),
+        before_base,
+        "a refused pass whose backup failed must leave the base byte-identical"
+    );
+    assert!(
+        backups_named(&backups_dir, "settings.json").is_empty(),
+        "a refused pass whose backup failed must take no backup"
+    );
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+    let backups = backups_named(&backups_dir, "settings.json");
+    assert_eq!(
+        backups.len(),
+        1,
+        "the retried pass backs up once: {backups:#?}"
+    );
+    assert_eq!(
+        fs::read(&backups[0]).expect("read backup"),
+        before_base,
+        "the retried pass backs up the base's own bytes"
+    );
+    let expected = format!(
+        "clauth: settings.json sync skipped: applying {} would delete 4 keys from {}; \
+         saved a copy at {}",
+        tilde(home.home(), &winner),
+        tilde(home.home(), &base),
+        tilde(home.home(), &backups[0]),
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![failed, expected],
+        "the retried pass logs the saved-copy line exactly once, after the failure line"
+    );
+}
+
+/// The job half of membership: a shared tree with no marker is still a member
+/// while a live background job NAMES it and its supervisor record reads live,
+/// so its newer edit propagates. Deleting the job term must red this (the tree
+/// then reads as dead and is excluded).
+#[test]
+fn a_job_named_tree_with_no_marker_joins_the_members_and_syncs() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let tree = h
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-bg");
+    let copy = tree.join("settings.json");
+    write_recorded_json(&h, &copy, &json!({"theme": "dark", "env": {}}), t(10));
+    crate::testutil::write_claude_job(&h, "0add99aa", &tree);
+    crate::testutil::write_live_supervisor(&tree);
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "a job-named tree with no marker must join the sync"
+    );
+}
+
+/// An unreadable job record must EXCLUDE every dead tree, never admit it: the
+/// job term reads an unreadable store as naming no tree — the reverse of the
+/// GC, which spares every tree it cannot read — so a torn `state.json` leaves a
+/// dead recorded copy out of the pass and the base byte-identical.
+#[test]
+fn an_unreadable_job_record_excludes_every_dead_tree() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    // A dead recorded copy, newest, keeping the protected retention key and
+    // lacking only one shared key: admitted, it would win and drop `outputStyle`.
+    let ghost = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("runtime-3532172-11")
+        .join("settings.json");
+    write_recorded_json(
+        &h,
+        &ghost,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(20),
+    );
+    let job = h.join(".claude").join("jobs").join("0add99ed");
+    fs::create_dir_all(&job).expect("mkdir job dir");
+    fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        "an unreadable job record must exclude the dead tree, not admit it"
+    );
+}
+
+/// An unreadable session marker must EXCLUDE the dead tree, never admit it: the
+/// marker term reads a marker it cannot open as unknown, so a dead recorded copy
+/// whose only marker is unreadable stays out of the pass and the base stays
+/// byte-identical. Unix-only: mode 000 yields the open error portably there.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_marker_excludes_the_dead_tree() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    // A dead recorded copy, newest, keeping the protected retention key and
+    // lacking only one shared key: admitted, it would win and drop `outputStyle`.
+    let ghost = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("runtime-3532172-11")
+        .join("settings.json");
+    write_recorded_json(
+        &h,
+        &ghost,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(20),
+    );
+    // A crashed session left its marker behind at mode 000: the probe's open
+    // fails with EACCES, which the marker term reads as unknown, never live.
+    let sessions = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("sessions-3532172-11");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let marker = sessions.join("test-pid");
+    fs::write(&marker, b"x").expect("write marker");
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        "an unreadable marker must exclude the dead tree, not admit it"
+    );
+}
+
+/// A readable but unlocked marker still reads as a dead session: the marker term
+/// folds neither an open nor a lock success into liveness, so a dead recorded
+/// copy whose marker nobody holds stays out of the pass and the base stays
+/// byte-identical.
+#[test]
+fn a_readable_unlocked_marker_keeps_the_dead_tree_out() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        t(10),
+    );
+    let ghost = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("runtime-3532172-11")
+        .join("settings.json");
+    write_recorded_json(
+        &h,
+        &ghost,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(20),
+    );
+    let sessions = h
+        .join(".clauth")
+        .join("profiles")
+        .join("zcode9")
+        .join("sessions-3532172-11");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    fs::write(sessions.join("test-pid"), b"x").expect("write marker");
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "outputStyle": "x", "theme": "dark", "env": {}}),
+        "a readable unlocked marker must exclude the dead tree, not admit it"
+    );
+}
+
+/// The refusal latch is keyed per operator file: a `.claude.json` refusal must
+/// not re-arm a standing settings refusal. Settings refuses once, then
+/// `.claude.json` refuses once, then the same settings pass runs again: still
+/// exactly one settings line and one settings backup in total.
+#[test]
+fn a_claude_json_refusal_does_not_rearm_a_standing_settings_refusal() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+            "hooks": {}, "attribution": {}, "theme": "dark", "env": {}}),
+        t(1),
+    );
+    let s_winner = session_runtime_path(&h, "p1", "4242-0");
+    let _live = live_recorded_json(
+        &h,
+        &s_winner,
+        &json!({"cleanupPeriodDays": 3650, "env": {}}),
+        t(10),
+    );
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    // A `.claude.json` refusal on the same live tree: home holds four shared
+    // keys and the recorded newest winner holds none of them.
+    let c_home = h.join(".claude.json");
+    write_json(
+        &c_home,
+        &json!({"numStartups": 1, "projects": {}, "userID": "u", "installMethod": "native"}),
+        t(1),
+    );
+    let c_winner = h
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-0")
+        .join(".claude.json");
+    let c_bytes = serde_json::to_vec_pretty(&json!({"firstStartTime": "x"})).expect("serialize");
+    crate::jsonsync::write_copy_and_record(
+        crate::claude_json::written_record_path().as_deref(),
+        &c_winner,
+        &c_bytes,
+        mtime_parts(t(10)),
+        true,
+        Some(t(10)),
+    )
+    .expect("write recorded .claude.json winner");
+    {
+        let _capture = lines.capture_here();
+        crate::claude_json::merge_paths(&[c_home.clone(), c_winner.clone()])
+            .expect(".claude.json sync");
+    }
+
+    // The same settings pass again: the standing settings refusal must stay
+    // latched, so it must not back up or log a second time.
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    let snapshot = lines.snapshot();
+    let settings_lines: Vec<&String> = snapshot
+        .iter()
+        .filter(|l| l.contains("settings.json sync skipped"))
+        .collect();
+    assert_eq!(
+        settings_lines.len(),
+        1,
+        "exactly one settings line in total: {snapshot:#?}"
+    );
+    assert_eq!(
+        backups_named(&h.join(".clauth").join("backups"), "settings.json").len(),
+        1,
+        "exactly one settings backup in total"
+    );
+    assert_eq!(
+        backups_named(&h.join(".clauth").join("backups"), ".claude.json").len(),
+        1,
+        "the .claude.json refusal took its own one backup"
+    );
+}
+
+/// The merge re-reads the member list inside the state lock, so a pass whose
+/// fast-path list was read before a just-started session's job named its tree
+/// still keeps that session's record entry (a start records its copy). The
+/// pre-lock hook poses the start between the fast path's list and the lock;
+/// moving the list read back outside the lock reds this by pruning the entry.
+#[test]
+fn a_pass_that_listed_members_before_a_session_started_keeps_its_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let _live1 = live_recorded_json(&h, &p1, &json!({"theme": "dark", "env": {}}), t(10));
+    // A session starting between the fast path's list and the lock: its copy is
+    // recorded (as a start records it) and a job names its tree (so the re-read
+    // inside the lock admits it without a marker).
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let tree2 = p2.parent().expect("runtime dir").to_path_buf();
+    set_pre_lock_hook(Some(Box::new({
+        let h = h.clone();
+        let p2 = p2.clone();
+        move || {
+            write_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(20));
+            crate::testutil::write_claude_job(&h, "0add99bb", &tree2);
+            crate::testutil::write_live_supervisor(&tree2);
+        }
+    })));
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            set_pre_lock_hook(None);
+        }
+    }
+    let _hook_guard = HookGuard;
+    *LAST_SYNCED.lock().expect("lock") = None;
+
+    sync_once().expect("sync");
+
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p2_str = p2.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p2_str)),
+        "the just-started session's record entry must survive the pass: {entries:#?}"
+    );
+}
+
+/// A running session whose copy no record names (a start by an older clauth
+/// left it unrecorded) but whose bytes already equal the merge is recorded on
+/// the first pass that sees it, without a rewrite, so the session's later
+/// in-session edit can win and reach the base.
+#[test]
+fn a_live_unrecorded_copy_matching_the_merge_is_recorded_and_its_edit_reaches_the_base() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    write_json(&copy, &json!({"theme": "light", "env": {}}), t(5));
+    let _live = arm_runtime_marker(copy.parent().expect("runtime dir"));
+    crate::jsonsync::reset_write_counts();
+
+    sync();
+
+    assert_eq!(
+        crate::jsonsync::write_count(&copy),
+        0,
+        "a copy already equal to the merge is recorded without a rewrite"
+    );
+    // A pass that writes nothing leaves no record file at all on the old code:
+    // read a missing record as empty so the assertion below is what reds.
+    let entries: Vec<Value> = fs::read(settings_record(&h))
+        .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
+        .unwrap_or_default();
+    let copy_str = copy.to_string_lossy();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["path"].as_str() == Some(&*copy_str)),
+        "the matching live copy must be recorded on first sight: {entries:#?}"
+    );
+
+    write_json(&copy, &json!({"theme": "dark", "env": {}}), t(20));
+    sync();
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "dark", "env": {}}),
+        "the session's in-session edit must reach the base once its copy is recorded"
+    );
+}
+
+/// A live session's tree the sync leaves out for a moment because its liveness
+/// reads UNKNOWN (here: its held marker cannot be opened) keeps its record entry
+/// through a pass that writes the other members; once it rejoins, its in-session
+/// edit wins and reaches the base instead of being overwritten. Unix-only: mode
+/// 000 is the portable way to make the marker probe's open fail.
+#[cfg(unix)]
+#[test]
+fn a_live_tree_excluded_for_a_moment_keeps_its_record_entry_and_its_edit_wins() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let _live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    let marker = h
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("sessions-4242-0")
+        .join("test-pid");
+
+    // p1's marker stays held, but the probe cannot open it, so p1's liveness
+    // reads unknown and p1 is left out while p2 wins and the pass rewrites
+    // the base.
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    assert!(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .is_err(),
+        "the mode-000 marker must refuse an open (a root run would read it live)"
+    );
+    sync();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a left-out tree that still exists keeps its record entry: {entries:#?}"
+    );
+
+    // p1's marker reads again: p1 rejoins carrying the session's own newer edit.
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("blue"),
+        "the rejoined session's edit must win, not be overwritten"
+    );
+}
+
+/// The record-on-first-sight rule is for runtime copies only: a pass whose
+/// winner is a live copy and whose base already equals the merge rewrites
+/// nothing and records no entry for the base, which is not a clauth copy.
+#[test]
+fn a_base_already_equal_to_the_merge_gets_no_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "dark", "env": {}}), t(1));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    let _live = live_recorded_json(&h, &copy, &json!({"theme": "dark", "env": {}}), t(10));
+    let before = fs::read(settings_record(&h)).expect("read record");
+
+    sync();
+
+    assert_eq!(
+        fs::read(settings_record(&h)).expect("read record"),
+        before,
+        "a converged pass must leave the record as it was: no entry for the base"
+    );
+}
+
+/// A recorded copy that already equals the merge keeps its own entry, carried
+/// rank included: the first-sight rule records only a copy the record holds no
+/// entry for, so a converged pass never re-ranks an echo at the winner's rank.
+#[test]
+fn a_converged_pass_keeps_a_recorded_copys_carried_rank() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "dark", "env": {}}), t(20));
+    let copy = session_runtime_path(&h, "p1", "4242-0");
+    let _live = live_recorded_json(&h, &copy, &json!({"theme": "dark", "env": {}}), t(10));
+    let before = fs::read(settings_record(&h)).expect("read record");
+
+    sync();
+
+    assert_eq!(
+        fs::read(settings_record(&h)).expect("read record"),
+        before,
+        "a converged pass must keep the recorded copy's entry and its carried rank"
+    );
+}
+
+/// A tree whose session is known DEAD (its marker readable and unheld) loses its
+/// record entry on the next pass that writes, even while its dir still exists:
+/// an edit landing in it while dead (a stray Claude Code pointed at the tree)
+/// must not win once a later session makes the tree live again.
+#[test]
+fn a_dead_tree_loses_its_record_entry_so_an_edit_made_while_dead_never_wins() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+
+    // p1's session ends: its marker stays on disk, readable and unheld.
+    drop(live1);
+    sync();
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        !entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a known-dead tree must lose its record entry: {entries:#?}"
+    );
+
+    // A stray edit lands in the dead tree, then a session makes it live again.
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    let _relive = arm_runtime_marker(p1.parent().expect("runtime dir"));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "an edit made while the tree was dead must never win"
+    );
+}
+
+/// The dead-tree prune does not wait for a pass that writes: when the only
+/// session ends, the next pass has the base alone to merge and writes nothing,
+/// yet it still drops the dead tree's entry, so a stray edit there never wins
+/// once the tree is live again.
+#[test]
+fn the_last_sessions_death_drops_its_entry_on_a_pass_that_writes_nothing() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+
+    drop(live1);
+    sync();
+    let entries: Vec<Value> = fs::read(settings_record(&h))
+        .map(|bytes| serde_json::from_slice(&bytes).expect("record parses"))
+        .unwrap_or_default();
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        !entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "the last session's dead tree must lose its entry: {entries:#?}"
+    );
+
+    write_json(&p1, &json!({"theme": "blue", "env": {}}), t(30));
+    let _relive = arm_runtime_marker(p1.parent().expect("runtime dir"));
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("light"),
+        "an edit made while the only tree was dead must never win"
+    );
+}
+
+/// Unknown liveness through a torn global job record (portable: no chmod): a
+/// tree whose marker nobody holds while the job store cannot be read keeps its
+/// record entry through a pass that writes the other members.
+#[test]
+fn a_tree_left_out_while_the_job_store_is_torn_keeps_its_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    drop(live1);
+    let job = h.join(".claude").join("jobs").join("0add99ed");
+    fs::create_dir_all(&job).expect("mkdir job dir");
+    fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a tree whose job store cannot be read reads unknown and keeps its entry: {entries:#?}"
+    );
+}
+
+/// The same through a torn job record in the tree's OWN jobs store: that
+/// store's unreadability is unknown for this tree, never dead.
+#[test]
+fn a_tree_whose_own_job_store_is_torn_keeps_its_record_entry() {
+    let home = HomeSandbox::new();
+    let h = home.home().to_path_buf();
+    let base = base_path(&h);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(1));
+    let p1 = session_runtime_path(&h, "p1", "4242-0");
+    let p2 = session_runtime_path(&h, "p2", "4242-1");
+    let live1 = live_recorded_json(&h, &p1, &json!({"theme": "light", "env": {}}), t(5));
+    let _live2 = live_recorded_json(&h, &p2, &json!({"theme": "dark", "env": {}}), t(10));
+    drop(live1);
+    let job = p1
+        .parent()
+        .expect("runtime dir")
+        .join("jobs")
+        .join("0add99ee");
+    fs::create_dir_all(&job).expect("mkdir job dir");
+    fs::write(
+        job.join("state.json"),
+        br#"{"state":"working","providerEnv":{"CLAUDE_CON"#,
+    )
+    .expect("torn job record");
+
+    sync();
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the pass without p1 must still run and rewrite the base"
+    );
+    let entries: Vec<Value> =
+        serde_json::from_slice(&fs::read(settings_record(&h)).expect("read record"))
+            .expect("record parses");
+    let p1_str = p1.to_string_lossy();
+    assert!(
+        entries.iter().any(|e| e["path"].as_str() == Some(&*p1_str)),
+        "a tree whose own job store cannot be read reads unknown and keeps its entry: {entries:#?}"
+    );
+}
+
+/// `shorten_home` renders the home prefix as `~` plus the platform separator,
+/// never a hardcoded `/` (which would mix separators with a Windows `\`), and
+/// leaves a path outside home to `Path::display`.
+#[test]
+fn shorten_home_renders_the_platform_separator_and_leaves_foreign_paths_alone() {
+    let home = HomeSandbox::new();
+    let under = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4242-0")
+        .join("settings.json");
+    let rest = under.strip_prefix(home.home()).expect("under home");
+    let expected = format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display());
+    assert_eq!(
+        crate::jsonsync::shorten_home(&under),
+        expected,
+        "a path under home renders ~ + MAIN_SEPARATOR + the rest"
+    );
+    let foreign = std::path::PathBuf::from("/elsewhere").join("x.json");
+    assert_eq!(
+        crate::jsonsync::shorten_home(&foreign),
+        foreign.display().to_string(),
+        "a path outside home renders through Path::display"
     );
 }

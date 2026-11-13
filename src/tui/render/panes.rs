@@ -4,15 +4,15 @@
 use std::cell::Cell;
 
 use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 
 use super::super::app::InputState;
 use super::super::theme;
-use super::format::{fixed_split, grapheme_cells, truncate};
+use super::format::{fixed_split, grapheme_cell_width, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
 
@@ -190,7 +190,11 @@ pub(super) fn cells_window(text: &str, start: usize, width: usize) -> String {
     let mut out = String::new();
     let mut at = 0;
     for g in Span::raw(text).styled_graphemes(Style::default()) {
-        let (from, to) = (at, at + Span::raw(g.symbol).width());
+        // Drawn cells: callers measure `start` by
+        // [`grapheme_cells`] (`cell_width`), and a halfwidth katakana sound
+        // mark draws its own cell a `Span::width` per-grapheme walk reads
+        // zero — mixing the measures blanks the window over content.
+        let (from, to) = (at, at + grapheme_cell_width(g.symbol));
         at = to;
         if from < start {
             out.extend(std::iter::repeat_n(' ', to.saturating_sub(start)));
@@ -228,7 +232,11 @@ pub(super) fn with_bg(style: Style, tint: Option<Color>) -> Style {
 /// keeps the gap separate from the width so it never collides. Each pane passes
 /// its own `width` (its longest key) and the house `gutter` of 2.
 pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
-    let kw = Span::raw(key).width();
+    // Drawn cells, matching the `truncate` that pre-cuts caller keys
+    // (services passes a profile name): a whole-string width folds a lam-alef
+    // pair and reads a halfwidth katakana sound mark zero, overpadding the
+    // gap.
+    let kw = grapheme_cells(key);
     format!("{key}{}", " ".repeat(width.max(kw) - kw + gutter))
 }
 
@@ -300,10 +308,12 @@ pub(super) fn cycle_row_lines(
         })
         .collect();
     let mut trail = |text: &str, lead_gap: usize, style: Style| {
-        let whole = Span::raw(text).width();
+        // Drawn cells: the trail can carry typed user text (the custom model
+        // id), which a whole-string width under-measures for fold classes.
+        let whole = grapheme_cells(text);
         let widest_word = text
             .split_whitespace()
-            .map(|w| Span::raw(w).width())
+            .map(grapheme_cells)
             .max()
             .unwrap_or(0);
         let indent = if run_indent + widest_word > width {
@@ -313,7 +323,7 @@ pub(super) fn cycle_row_lines(
         };
         chips.extend(text.split_whitespace().enumerate().map(|(i, word)| {
             let chip = Span::styled(word.to_string(), style);
-            let fit = chip.width();
+            let fit = grapheme_cells(word);
             let (gap, ask) = if i == 0 { (lead_gap, whole) } else { (1, fit) };
             (gap, chip, fit, ask, indent)
         }));
@@ -435,11 +445,12 @@ impl QueueView {
         kick_lifts: &std::collections::HashMap<String, i64>,
         anchor: Option<i64>,
         canceled: impl Fn(&crate::profile::ProfileName) -> bool,
+        marked: impl Fn(&crate::profile::ProfileName) -> bool,
     ) -> Self {
         let blocked: Vec<crate::profile::ProfileName> =
             kick_lifts.keys().map(|k| k.as_str().into()).collect();
         Self {
-            members: crate::usage::auto_start_queue_members(cfg, &blocked, canceled),
+            members: crate::usage::auto_start_queue_members(cfg, &blocked, canceled, marked),
             anchor,
             interval_ms: cfg.state.refresh_interval_ms,
             now_secs: crate::usage::now_epoch_secs(),
@@ -498,22 +509,41 @@ pub(super) fn picker_row(
     name_style: Style,
     width: u16,
 ) -> Line<'static> {
+    marked_picker_row(selected, focused, None, name, name_style, width)
+}
+
+/// [`picker_row`] with an icon `mark` before the name. The mark is its own
+/// span so a selected row promotes the name alone.
+pub(super) fn marked_picker_row(
+    selected: bool,
+    focused: bool,
+    mark: Option<Span<'static>>,
+    name: String,
+    name_style: Style,
+    width: u16,
+) -> Line<'static> {
     // Caret only in the focused pane; blurred rows keep BG_HOVER via select_line.
     let arrow = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled(
+            format!("{} ", theme::CARET),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     };
+    let mark_w = mark.as_ref().map_or(0, Span::width);
     // A profile name longer than the selector (an email address passes
     // `validate_name_chars`) clamps with `…` instead of running past the pane
     // edge — the marked Fallback arm's clamp, without the marker column.
-    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2));
-    let line = Line::from(vec![
-        arrow,
-        Span::styled(text, bold_when(name_style, selected && focused)),
-        Span::raw(pad),
-    ]);
-    select_line(line, selected, focused, width)
+    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2 + mark_w));
+    let mut spans = vec![arrow];
+    spans.extend(mark);
+    spans.push(Span::styled(
+        text,
+        bold_when(name_style, selected && focused),
+    ));
+    spans.push(Span::raw(pad));
+    select_line(Line::from(spans), selected, focused, width)
 }
 
 /// The empty state's two text lines (dim hint, hotkey-accented action), shared
@@ -529,17 +559,92 @@ pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<L
     ]
 }
 
-/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
-/// hotkey `ACCENT` + action on second line.
-pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
-    Paragraph::new(empty_state_lines(hint, hotkey, action))
-        .block(
-            Block::bordered()
-                .border_set(border::ROUNDED)
-                .border_style(Style::default().fg(theme::line_color())),
-        )
-        .style(theme::base())
-        .wrap(Wrap { trim: false })
+/// Empty-state widget: rounded frame in `LINE`, hint on the first line
+/// `TEXT_DIM`, hotkey `ACCENT` + action on the second. Each line wraps to the
+/// pane's inner width at its spaces (a marked key stays whole); the frame is
+/// sized to the wrapped copy — height = rows + 2, width = widest row + 2 — and
+/// centred in the pane, never stretched to fill it. When the pane cannot hold
+/// the frame, the copy re-wraps at the pane's own width and renders bare and
+/// centred, no frame.
+pub(super) fn empty_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hint: &str,
+    hotkey: &str,
+    action: &str,
+) {
+    let base = theme::dim();
+    let action_text = format!("{} {action}", prose::key(hotkey));
+    let inner_w = usize::from(area.width.saturating_sub(2));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for text in [hint, action_text.as_str()] {
+        for wrapped in prose::wrap(text, inner_w, base) {
+            lines.push(Line::from(wrapped));
+        }
+    }
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let frame_w = widest.saturating_add(2);
+    let frame_h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    if area.width < frame_w || area.height < frame_h {
+        // Bare fallback: re-wrap at the pane's own width — the copy wrapped for
+        // the frame's inner width clips its action line on a pane too narrow
+        // for the frame even when the whole copy would fit. When the wrapped
+        // copy still runs taller than the pane, the hint drops whole (never as
+        // a fragment) before any action row drops, and the action's first rows
+        // keep the key row first.
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let pane_w = usize::from(area.width);
+        let mut hint_rows: Vec<Line<'static>> = Vec::new();
+        let mut action_rows: Vec<Line<'static>> = Vec::new();
+        for wrapped in prose::wrap(hint, pane_w, base) {
+            hint_rows.push(Line::from(wrapped));
+        }
+        for wrapped in prose::wrap(action_text.as_str(), pane_w, base) {
+            action_rows.push(Line::from(wrapped));
+        }
+        let pane_h = usize::from(area.height);
+        let kept: Vec<Line<'static>> = if hint_rows.len() + action_rows.len() <= pane_h {
+            hint_rows.into_iter().chain(action_rows).collect()
+        } else {
+            action_rows.into_iter().take(pane_h).collect()
+        };
+        let rows = u16::try_from(kept.len()).unwrap_or(area.height);
+        let y = area.y + area.height.saturating_sub(rows) / 2;
+        frame.render_widget(
+            Paragraph::new(kept)
+                .style(base)
+                .alignment(Alignment::Center),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: rows,
+            },
+        );
+        return;
+    }
+    let x = area.x + (area.width - frame_w) / 2;
+    let y = area.y + (area.height - frame_h) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: frame_w,
+        height: frame_h,
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::default().fg(theme::line_color())),
+            )
+            .style(theme::base()),
+        rect,
+    );
 }
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
@@ -575,10 +680,10 @@ pub(super) fn draw_scrollbar(
         let cell = buf.cell_mut((col_x, col_y + row as u16));
         if let Some(cell) = cell {
             if row >= thumb_top && row < thumb_end {
-                cell.set_symbol("┃");
+                cell.set_symbol(theme::BAR);
                 cell.set_style(Style::default().fg(theme::text_dim_color()));
             } else {
-                cell.set_symbol("┊");
+                cell.set_symbol(theme::TRACK);
                 cell.set_style(Style::default().fg(theme::line_color()));
             }
         }
@@ -631,6 +736,14 @@ pub(super) fn footnote_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         .into_iter()
         .map(|seg| Line::from(Span::styled(seg, theme::faint())))
         .collect()
+}
+
+/// The height a [`footnote_lines`] wrap produces: the one footnote-height
+/// derival, so every caller feeding [`footnote_layout`] or
+/// [`footnote_split`] — the draw helper and any caller pre-computing the
+/// pinned-footnote geometry before the draw — counts the lines the same way.
+pub(super) fn footnote_height(text: &str, width: usize) -> usize {
+    footnote_lines(text, width).len()
 }
 
 /// How a pinned footnote splits the pane interior.
@@ -722,7 +835,8 @@ pub(super) fn draw_scrolled_lines_with_footnote(
     let foot: Vec<Line<'static>> = footnote
         .map(|text| footnote_lines(text, inner.width as usize))
         .unwrap_or_default();
-    match footnote_layout(inner.height as usize, foot.len()) {
+    let foot_h = footnote.map_or(0, |text| footnote_height(text, inner.width as usize));
+    match footnote_layout(inner.height as usize, foot_h) {
         FootnoteLayout::Absent => {
             let total = lines.len();
             let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
@@ -757,7 +871,7 @@ pub(super) fn draw_scrolled_lines_with_footnote(
         }
         FootnoteLayout::Pinned { .. } => {
             let total = lines.len();
-            let (scroll_area, foot_area) = footnote_split(inner, foot.len());
+            let (scroll_area, foot_area) = footnote_split(inner, foot_h);
             let offset = draw_scrolled_lines(frame, scroll_area, lines, focus, saved);
             if let Some(area) = foot_area {
                 frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
@@ -798,9 +912,9 @@ pub(crate) fn follow_scroll_offset(
 }
 
 /// Tail-priority variant for the re-bind confirm's first account: when the
-/// focus range (the block head..the cursor's toggle) is taller than the
-/// viewport, the toggle — the end — stays visible instead of the head, so
-/// `space` always flips a visible account.
+/// focus range (the block head..the cursor's account row) is taller than the
+/// viewport, that row — the end — stays visible instead of the head, so
+/// `space` always toggles a visible account's box.
 pub(crate) fn follow_scroll_offset_tail(
     total: usize,
     viewport: usize,
@@ -917,7 +1031,7 @@ pub(super) fn draw_selector_list(
         list.starts.replace(Vec::new());
         list.block_ends.replace(Vec::new());
         list.tips.replace(Vec::new());
-        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        empty_state(frame, inner, "no accounts yet", "n", "to create one");
         return;
     }
 
@@ -960,16 +1074,18 @@ pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Ve
 
 /// Chunk `text` into `width`-cell runs, splitting between graphemes by their
 /// display width and never on whitespace: every byte lands in exactly one
-/// chunk. A path whose name holds spaces keeps them.
+/// chunk. A path whose name holds spaces keeps them. At width 0 no row holds
+/// a grapheme, so each takes a run of its own — the rule the modal chunker
+/// keeps too, so the two walkers agree at every width.
 pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
     let mut lines = Vec::new();
     let mut chunk = String::new();
     let mut chunk_w = 0;
     for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
-        let grapheme_w = Span::raw(grapheme.symbol).width();
+        // Drawn cells ([`format::grapheme_cell_width`]): a halfwidth katakana
+        // sound mark draws one cell a `Span::width` per-grapheme sum reads
+        // zero, so a chunk cut on that measure overruns.
+        let grapheme_w = grapheme_cell_width(grapheme.symbol);
         if !chunk.is_empty() && chunk_w + grapheme_w > width {
             lines.push(std::mem::take(&mut chunk));
             chunk_w = 0;
@@ -1016,6 +1132,14 @@ pub(super) fn help_tooltip_lines_at(
 /// reason render in `DANGER`.
 pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     tooltip_lines(text, width, 1, theme::danger(), theme::danger())
+}
+
+/// A card-body error reason: `└ ` leader stays `LINE`, the reason renders
+/// `DANGER`, wrapped like the other tooltip lines. The `└` sits one cell right
+/// of the failed pill row's first character (the path's `~`), so the cause
+/// reads indented under the row it explains.
+pub(super) fn danger_hint_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, 1, theme::line(), theme::danger())
 }
 
 fn tooltip_lines(
@@ -1096,15 +1220,24 @@ pub(super) fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
                 Span::styled(part, if c == '─' { theme::line() } else { state })
             })
             .collect(),
-        theme::Tier::Compatible => {
-            let word = glyph.trim_start_matches('[').trim_end_matches(']');
-            vec![
-                Span::styled("[", theme::dim()),
-                Span::styled(word, state),
-                Span::styled("]", theme::dim()),
-            ]
-        }
+        theme::Tier::Compatible => compatible_toggle_spans(glyph, state),
     }
+}
+
+/// The compatible tier's toggle frame: the glyph's word between dim brackets.
+/// Only the outermost bracket pair is the frame's — a glyph carrying its own
+/// (`[[on]]`) keeps the inner pair in the word, so the glyph renders whole
+/// instead of shedding every bracket it has.
+pub(super) fn compatible_toggle_spans(glyph: &'static str, state: Style) -> Vec<Span<'static>> {
+    let word = glyph
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(glyph);
+    vec![
+        Span::styled("[", theme::dim()),
+        Span::styled(word, state),
+        Span::styled("]", theme::dim()),
+    ]
 }
 
 /// Rounded box with contract-compliant chrome.
@@ -1132,18 +1265,48 @@ pub(super) fn section_box_verbatim(
 /// single dash between the two reads as part of the title's own rule run.
 pub(super) const META_RULE_MIN: usize = 3;
 
+/// The cells a line draws: each span's width summed per grapheme
+/// ([`grapheme_cells`]), the measure the buffer lays down. The whole-string
+/// [`Line::width`] folds an Arabic lam-alef ligature to one cell, so a border
+/// budgeted on it overruns.
+pub(super) fn line_cells(line: &Line<'_>) -> usize {
+    spans_cells(&line.spans)
+}
+
+/// [`line_cells`] over a row still held as spans.
+pub(super) fn spans_cells(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| grapheme_cells(span.content.as_ref()))
+        .sum()
+}
+
+/// Whether ratatui can place a title-right `meta_slot` ([`meta_line`]) whole:
+/// it right-aligns a title by the whole-string [`Line::width`] and clips the
+/// draw to it, and a span holding a halfwidth katakana sound mark reads one
+/// cell short per mark under that measure (no span layout compensates — the
+/// mark's whole-string width is 0), so such a slot would clip at the corner
+/// and lose the slot's closing dash.
+pub(super) fn meta_placeable(meta_slot: &Line<'_>) -> bool {
+    meta_slot.width() == line_cells(meta_slot)
+}
+
 /// Whether a title-right `meta` fits a `width`-cell top border beside the
 /// title (and a `left_w`-cell left slot) with [`META_RULE_MIN`] cells of rule
-/// between them; the title names the box and the meta only describes it, so
-/// the meta is what gives way.
+/// between them, and ratatui can place the drawn slot ([`meta_placeable`]);
+/// the title names the box and the meta only describes it, so the meta is what
+/// gives way.
 pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16) -> bool {
+    let meta_slot = meta_line(meta, Style::default());
     // `╭─` + ` TITLE ` + left + rule + ` meta ─` + `╮`: the corner-adjacent dash
     // is a border cell of its own.
     let insets = 3
-        + Line::from(title_label(title, true, u16::MAX)).width()
+        + line_cells(&Line::from(title_label(title, true, u16::MAX)))
         + left_w
-        + meta_line(meta, Style::default()).width();
-    !meta.is_empty() && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
+        + line_cells(&meta_slot);
+    !meta.is_empty()
+        && meta_placeable(&meta_slot)
+        && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
 }
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
@@ -1157,7 +1320,8 @@ pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16
 ///
 /// Only the right slot gives way: it renders while `width` leaves it at least
 /// [`META_RULE_MIN`] border cells of rule after the title and the left slot,
-/// since the title names the panel and the meta only describes what is in it.
+/// and ratatui can place its drawn cells, since the title names the panel and
+/// the meta only describes what is in it.
 /// The left slot never gives way to the right one, because it qualifies what
 /// the title names; only a panel too narrow for the title line itself clips
 /// that line from the right, the left slot first. An empty `meta` renders no
@@ -1300,10 +1464,21 @@ pub(super) fn title_label(title: &str, uppercase: bool, width: u16) -> String {
 /// The title-right meta slot. A right-aligned title ends flush against the
 /// top-right corner, so the slot closes with a border cell of its own:
 /// `… meta ─╮`.
+///
+/// The name renders one span per grapheme: ratatui places a right-aligned
+/// title by the whole-string [`Line::width`], which folds a lam-alef pair to
+/// one cell, while the buffer draws per grapheme — spans of one grapheme each
+/// keep the two measures equal for the lam-alef class, so the name lands
+/// inside its slot instead of clipping at the corner. The halfwidth katakana
+/// sound-mark class has no span layout that does (`Line::width` reads each
+/// mark zero and the buffer draws it one cell); the callers that can carry
+/// user text gate on [`right_meta_fits`], which drops such a meta whole. The
+/// one ungated draw, `tokens::card`, passes fixed labels and dates.
 pub(super) fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {meta} "), theme::dim()),
-        Span::styled("─", border_style),
-    ])
-    .right_aligned()
+    let mut spans: Vec<Span<'static>> = Span::raw(format!(" {meta} "))
+        .styled_graphemes(theme::dim())
+        .map(|g| Span::styled(g.symbol.to_owned(), g.style))
+        .collect();
+    spans.push(Span::styled("─", border_style));
+    Line::from(spans).right_aligned()
 }

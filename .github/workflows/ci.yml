@@ -4,7 +4,7 @@ name: ci
 # include_str!s it), so it is re-included; later patterns win.
 on:
   push:
-    branches: [mommy, dev]
+    branches: [mommy, dev, "dev-*"]
     paths:
       - "**"
       - "!**/*.md"
@@ -95,7 +95,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y mold
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
-      # Only mommy saves: a dev or PR run restores mommy's cache, and saving its
+      # Only mommy saves: a dev, dev-* or PR run restores mommy's cache, and saving its
       # own would store a second copy of every cold compile against the repo's
       # cache quota.
       - uses: Swatinem/rust-cache@v2
@@ -104,9 +104,16 @@ jobs:
       # nextest's own installer, not the taiki-e action: the shared
       # install-action hygiene guard bails on the mac/windows images' bash
       # startup (the same 2026-09-22 regression as the toolchain action above).
+      # The mac image's package-managed rustup leaves no ~/.cargo/bin, so it
+      # exists only after a rust-cache hit (measured 2026-11-12); cargo searches
+      # its home's bin dir for subcommands even off PATH (rust-lang/cargo#11020),
+      # so creating it suffices.
       - name: install nextest
         shell: bash
-        run: curl -LsSf https://get.nexte.st/latest/${{ matrix.os == 'windows-latest' && 'windows-tar' || matrix.os == 'macos-latest' && 'mac' || 'linux' }} | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        run: |
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "$bin"
+          curl -LsSf https://get.nexte.st/latest/${{ matrix.os == 'windows-latest' && 'windows-tar' || matrix.os == 'macos-latest' && 'mac' || 'linux' }} | tar zxf - -C "$bin"
       - if: runner.os == 'Linux'
         uses: taiki-e/install-action@cargo-llvm-cov
       # `every_completion_script_parses_in_its_own_shell` runs each shipped

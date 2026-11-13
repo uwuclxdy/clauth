@@ -7,8 +7,8 @@
 //! construction: `profiles.toml` keeps its exact pre-codex schema, and an OLD
 //! binary never opens this file at all — so the mixed-version dual-write and
 //! serde-drop hazards `profiles.toml` would have carried are dissolved, not
-//! handled. (A NEWER binary's unknown keys are tolerated on load and dropped
-//! on the next rewrite, exactly `profiles.toml`'s own contract.)
+//! handled. (A NEWER binary's unknown keys are tolerated on load and stay
+//! where they are on the next save, exactly `profiles.toml`'s own contract.)
 //!
 //! One namespace spans both files: a profile name held by either harness is
 //! taken (enforced by `actions::validate_profile_name`, which reads both
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::lock::StateLock;
 use crate::profile::{
     DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileId,
-    ProfileName, atomic_write_600, clauth_dir, mkdir_700,
+    ProfileName, StateFile, clauth_dir, save_state_in_place,
 };
 
 /// The codex roster and its per-harness slots: the same four fields
@@ -56,9 +56,9 @@ use crate::profile::{
 /// all-`pub(crate)` shape: every mutation goes through a writer on this type,
 /// and persistence happens only inside [`CodexState::update`], which holds the
 /// state lock across its load → mutate → save. That closes by construction the
-/// stale-snapshot class `save_profile` callers had to dodge by convention
-/// (load under the guard, mutate one field, never write a pre-prompt snapshot
-/// back).
+/// stale-snapshot class the claude profile writers close with a fresh re-read
+/// under the lock (load under the guard, mutate one field, never write a
+/// pre-prompt snapshot back).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CodexState {
     active_profile: Option<ProfileName>,
@@ -78,6 +78,19 @@ pub(crate) struct CodexState {
     /// save: the key is never invented into a file that did not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_switch_threshold: Option<f64>,
+    /// The auto switch-off's recovery marker: set only when the `Off` arm
+    /// clears the active slot, and cleared by clauth's own slot writes —
+    /// [`CodexState::set_active`] with a name, [`CodexState::remove_profile`]
+    /// of the active profile, and a capture that lands a login — so a slot
+    /// left empty without a switch-off never arms the recovery on its own. A
+    /// hand edit of `active_profile` leaves the key in the file, so a slot a
+    /// hand edit empties can still re-arm while no slot write has cleared the
+    /// record since the switch-off. Absent from disk while `false`, so a save
+    /// that leaves it false adds no key to a file that lacked it; an older binary
+    /// tolerates the key like every other unknown one, dropping it on its
+    /// next save.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    switched_off: bool,
     /// Each profile's [`ProfileId`], minted by [`CodexState::add_profile`] and
     /// dropped with the profile. A table beside the name list rather than
     /// records inside it, so an older binary still reads `profiles`; it drops
@@ -86,6 +99,25 @@ pub(crate) struct CodexState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     ids: BTreeMap<String, ProfileId>,
 }
+
+/// [`CodexState::refuse_if_slot_moved`]'s refusal: the codex active slot on
+/// disk no longer reads what a switch decision read when it was made, so the
+/// write is skipped. Typed so the scheduler can swallow it silently — a hand
+/// switch winning over the daemon's stale decision is normal, not an error to
+/// log.
+#[derive(Debug)]
+pub(crate) struct CodexSlotMoved;
+
+impl std::fmt::Display for CodexSlotMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the codex active slot moved since this switch was decided; left as is"
+        )
+    }
+}
+
+impl std::error::Error for CodexSlotMoved {}
 
 /// Why a codex roster could not be loaded, with the parse position carried
 /// apart from the io failure so a caller can render each by type. The parse
@@ -139,6 +171,7 @@ impl CodexState {
         if state.weekly_switch_threshold.is_some() {
             state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
         }
+        crate::profile::notice_codex_load(state.profiles());
         Ok(state)
     }
 
@@ -163,6 +196,14 @@ impl CodexState {
     /// member is spent — the codex twin of `AppState.switch_off_when_spent`.
     pub(crate) fn switch_off_when_spent(&self) -> bool {
         self.switch_off_when_spent
+    }
+
+    /// Whether the auto switch-off cleared the slot and armed the recovery —
+    /// the gate `apply_codex_switch` reads: recovery runs only while the slot
+    /// is clear AND this holds, so a slot left empty without a switch-off
+    /// stays empty until a switch fills it.
+    pub(crate) fn switched_off(&self) -> bool {
+        self.switched_off
     }
 
     /// The effective codex weekly line: the configured value inside
@@ -194,8 +235,47 @@ impl CodexState {
     /// Move (or clear) the active marker. Callers resolve membership first;
     /// under [`CodexState::update`] that resolution is re-made against the
     /// state this closure was handed, which was loaded under the lock.
+    /// Setting a slot clears [`CodexState::switched_off`]: any switch ends
+    /// the recovery record, so it cannot outlive the switch-off it recorded.
     pub(crate) fn set_active(&mut self, name: Option<&str>) {
         self.active_profile = name.map(ProfileName::from);
+        if name.is_some() {
+            self.switched_off = false;
+        }
+    }
+
+    /// Record that the auto switch-off cleared the slot — the marker's only
+    /// setter, called beside `set_active(None)` in the `Off` arm. Clauth's own
+    /// later slot writes clear it ([`CodexState::set_active`] with a name, a
+    /// delete of the active profile, a capture that lands a login); a hand
+    /// edit of `active_profile` leaves it, so a slot a hand edit empties
+    /// can still re-arm while none of those writes has cleared it since.
+    pub(crate) fn mark_switched_off(&mut self) {
+        self.switched_off = true;
+    }
+
+    /// End the switch-off's recovery record without a switch: the operator's
+    /// codex now runs the login the user chose — a capture linked that login's
+    /// store into the operator slot, or left the operator's file holding it —
+    /// so the chain must not move it.
+    pub(crate) fn clear_switched_off(&mut self) {
+        self.switched_off = false;
+    }
+
+    /// Refuse a slot write whose decision read a slot the disk no longer
+    /// holds: the daemon decides on the state its tick loaded before the
+    /// polls, and a hand switch landing in between wins. `expected` is the
+    /// slot the decision read, `None` disabling the guard (the hand switch's
+    /// own path); the refusal is the typed [`CodexSlotMoved`] so the
+    /// scheduler can swallow it silently — nothing was written, and there is
+    /// nothing to tell the user.
+    pub(crate) fn refuse_if_slot_moved(&self, expected: Option<Option<&str>>) -> Result<()> {
+        if let Some(expected) = expected
+            && self.active_profile().map(ProfileName::as_str) != expected
+        {
+            return Err(CodexSlotMoved.into());
+        }
+        Ok(())
     }
 
     /// Append `name` to the roster with a fresh [`ProfileId`]. Idempotent — a
@@ -228,13 +308,17 @@ impl CodexState {
     }
 
     /// Remove `name` from every slot — roster, fallback chain, the active
-    /// marker and its id — the codex twin of `AppConfig::remove`.
+    /// marker and its id — the codex twin of `AppConfig::remove`. Deleting
+    /// the active account never arms the recovery: the slot this delete
+    /// cleared is not one the auto switch-off cleared, so the marker goes
+    /// with it.
     pub(crate) fn remove_profile(&mut self, name: &str) {
         self.ids.remove(name);
         self.profiles.retain(|n| n.as_str() != name);
         self.fallback_chain.retain(|n| n.as_str() != name);
         if self.active_profile.as_deref() == Some(name) {
             self.active_profile = None;
+            self.switched_off = false;
         }
     }
 
@@ -249,8 +333,8 @@ impl CodexState {
     ///
     /// Saves only when the closure changed something: an untouched state
     /// leaves the file's bytes AND mtime alone, so a no-op verb (switching to
-    /// the already-active profile) neither rewrites a hand-edited file
-    /// through this binary's serializer nor bumps the reload fingerprint.
+    /// the already-active profile) never touches the file or bumps the reload
+    /// fingerprint.
     pub(crate) fn update<T>(f: impl FnOnce(&mut CodexState) -> Result<T>) -> Result<T> {
         let lock = StateLock::acquire()?;
         let mut state = Self::load()?;
@@ -266,10 +350,12 @@ impl CodexState {
     /// holds the cross-process state lock, and the only caller is
     /// [`CodexState::update`], which acquired it around the load.
     fn save(&self, _witness: &StateLock) -> Result<()> {
-        mkdir_700(&clauth_dir()?)?;
-        atomic_write_600(&codex_state_path()?, toml::to_string_pretty(self)?)
-            .context("failed to write codex-profiles.toml")
+        save_state_in_place(&codex_state_path()?, self)
     }
+}
+
+impl StateFile for CodexState {
+    const LABEL: &'static str = "codex-profiles.toml";
 }
 
 fn codex_state_path() -> Result<PathBuf> {

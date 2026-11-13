@@ -7,7 +7,7 @@
 
 use super::*;
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 
 /// Feed one request through `handle_callback` over a real loopback socket
@@ -43,7 +43,11 @@ fn the_callback_takes_the_code_only_under_the_expected_state() {
         verdict.expect("valid callback").as_deref(),
         Some("authcode-1")
     );
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 
     let (verdict, _) = callback_roundtrip("/auth/callback?code=authcode-1&state=EVIL", "STATE");
     assert_eq!(
@@ -55,6 +59,25 @@ fn the_callback_takes_the_code_only_under_the_expected_state() {
     assert!(
         verdict.expect("an unrelated path keeps waiting").is_none(),
         "not the redirect"
+    );
+}
+
+/// The page a callback writes needs no follow-up request, so a stray request
+/// on the same listener is answered as the waiting page and never taken for
+/// the callback.
+#[test]
+fn a_stray_request_is_answered_as_waiting_without_taking_a_code() {
+    let (verdict, response) = callback_roundtrip("/assets/login.css", "STATE");
+    assert!(verdict.expect("a non-callback is not a callback").is_none());
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("Waiting for the codex login"),
+        "the waiting page: {}",
+        response.lines().next().unwrap_or("")
     );
 }
 
@@ -83,12 +106,14 @@ fn the_callback_parses_an_error_into_the_closed_set_and_echoes_nothing() {
         assert!(!err.contains(injected), "echoed into the line: {err}");
         assert!(
             !response.contains(injected),
-            "echoed onto the page: {response}"
+            "echoed onto the page: {}",
+            response.lines().next().unwrap_or("")
         );
     }
     assert!(
-        response.ends_with("close this tab; you can retry from clauth any time."),
-        "the declined arm's own page: {response}"
+        response.contains("Authorization request declined. You can close this tab now."),
+        "the declined arm's own page: {}",
+        response.lines().next().unwrap_or("")
     );
 
     // A code outside the spec's set is where the bytes are least trustworthy:
@@ -103,7 +128,8 @@ fn the_callback_parses_an_error_into_the_closed_set_and_echoes_nothing() {
     assert_eq!(err, "openai refused the login");
     assert!(
         !response.contains("made_up_code"),
-        "echoed onto the page: {response}"
+        "echoed onto the page: {}",
+        response.lines().next().unwrap_or("")
     );
 
     let (verdict, _) = callback_roundtrip("/auth/callback?state=STATE&error=server_error", "STATE");

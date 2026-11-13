@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
+use super::fetch::{FetchError, LimitResets, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
 
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
@@ -189,15 +189,22 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
             .rate_limit_reached_type
             .and_then(|r| r.kind)
             .filter(|k| !k.is_empty()),
-        codex_reset_credits: raw.rate_limit_reset_credits.map(|c| c.available_count),
+        limit_resets: raw.rate_limit_reset_credits.map(|c| LimitResets {
+            usable: u32::try_from(c.available_count.max(0)).unwrap_or(u32::MAX),
+            banked: None,
+            clears: Vec::new(),
+            ends_at: None,
+            fetched_at: None,
+        }),
         ..UsageInfo::default()
     })
 }
 
 /// Poll one codex account's usage at `url`. Read-only: it neither mints nor
 /// spends anything — spending a banked reset is [`super::codex_reset`]'s, and
-/// only when the operator runs `clauth limit-reset`. Split from
-/// [`fetch_codex_usage`] so tests drive the wire shape against a local stub.
+/// only when the operator runs `clauth limit-reset`. The scheduler's fan-out
+/// resolves the URL at spawn ([`codex_usage_url_owned`]) and calls this with
+/// it, so tests drive the wire shape against a local stub.
 ///
 /// A 401 is the caller's signal that the access token is stale — it feeds
 /// [`crate::codex_auth::kick_codex`], the only producer of that queue.
@@ -226,19 +233,12 @@ pub(crate) fn fetch_codex_usage_at(
     map_usage(&body, now_secs)
 }
 
-pub(crate) fn fetch_codex_usage(
-    access_token: &str,
-    account_id: Option<&str>,
-    fedramp: bool,
-    now_secs: i64,
-) -> Result<UsageInfo, FetchError> {
-    fetch_codex_usage_at(
-        codex_usage_url().as_ref(),
-        access_token,
-        account_id,
-        fedramp,
-        now_secs,
-    )
+/// The codex usage URL resolved on the CALLING thread, for the fan-out's
+/// workers: the test override is a thread-local, so a worker reading it on its
+/// own thread would miss it (and a test build would panic without one). The
+/// production arm resolves the same static URL for every caller.
+pub(crate) fn codex_usage_url_owned() -> String {
+    codex_usage_url().into_owned()
 }
 
 /// The codex usage URL, or a test's override. A test build without an override

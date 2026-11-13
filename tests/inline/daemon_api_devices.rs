@@ -185,6 +185,25 @@ fn a_device_name_takes_the_profile_charset_trimmed() {
     }
 }
 
+/// `clauth devices revoke -tab` reads `-tab` as a flag, so a device named that
+/// way could never be revoked by the command clauth prints for it.
+#[test]
+fn a_new_device_name_starting_with_a_dash_is_refused() {
+    for dashed in ["-tab", "--tab", "-", " -tab "] {
+        let err = DeviceName::parse(dashed).expect_err("a dash-led device name must refuse");
+        assert_eq!(
+            err.to_string(),
+            "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'",
+            "{dashed:?}"
+        );
+    }
+    assert_eq!(
+        name("tab-1").as_str(),
+        "tab-1",
+        "a dash inside the name stays legal"
+    );
+}
+
 #[test]
 fn the_legacy_name_is_reserved_in_any_case() {
     for reserved in ["legacy", "LEGACY", "Legacy"] {
@@ -652,6 +671,28 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
     );
 }
 
+/// A column sizes and pads by drawn cells: a device name of four wide glyphs
+/// (eight cells) lays the table out exactly as an eight-letter ASCII name does.
+#[test]
+fn a_wide_script_device_name_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let table = |first: &str| {
+        let device = |name: &str| Device {
+            paired_at: "2026-01-02T03:04:05+00:00".to_string(),
+            ..Device::minted(name, Tier::View, false, TOKEN, Joined::Pair)
+        };
+        let epoch = iso_to_epoch_secs("2026-01-02T03:04:05+00:00").expect("parse");
+        render_table(&[device(first), device("tray")], epoch + 300)
+    };
+    let twin = table(TWIN);
+    assert!(
+        twin.contains(TWIN),
+        "the twin table renders the twin: {twin}"
+    );
+    assert_eq!(table(WIDE), twin.replace(TWIN, WIDE));
+}
+
 #[test]
 fn an_unparseable_stamp_renders_as_no_data() {
     assert_eq!(paired_cell("synthetic-fixture", 0), "-");
@@ -818,7 +859,7 @@ fn revoking_legacy_deletes_the_plaintext_copy_of_its_token() {
     assert!(authenticate(Some(TOKEN)).expect("read").is_none());
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n\
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n\
          clauth: deleted ~/.clauth/auth_token.json, which still held its token.\n"
     );
 }
@@ -842,7 +883,7 @@ fn revoking_legacy_keeps_a_file_holding_another_token() {
     );
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n"
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n"
     );
 }
 
@@ -921,7 +962,7 @@ fn a_failed_push_drop_still_deletes_the_plaintext_copy() {
     );
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n\
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n\
          clauth: deleted ~/.clauth/auth_token.json, which still held its token.\n"
     );
     assert!(authenticate(Some(TOKEN)).expect("read").is_none());
@@ -1040,7 +1081,7 @@ fn revoking_another_device_leaves_an_unreadable_plaintext_file_alone() {
 
     assert_eq!(
         printed,
-        "clauth: revoked device 'phone'; its next request is refused.\n"
+        "clauth: revoked device 'phone'; its next request is refused and its open streams close within seconds.\n"
     );
     assert!(path.is_dir(), "nothing is deleted");
 }
@@ -1239,4 +1280,65 @@ fn the_table_lists_sessions_yes_or_no() {
             width = cell.chars().count()
         )
     );
+}
+
+// --- An open stream's watch on its row -----------------------------------------
+
+fn watched_device() -> Device {
+    Device::minted("phone", Tier::View, false, TOKEN, Joined::Add)
+}
+
+/// Every due and undue instant across two intervals costs one read per
+/// interval, whatever the caller's own rate: a stream asks on every loop.
+#[test]
+fn a_row_watch_reads_once_per_interval_however_often_it_is_asked() {
+    let opened = std::time::Instant::now();
+    let device = watched_device();
+    let mut watch = RowWatch::new(&device, opened);
+    let reads = std::cell::Cell::new(0u32);
+    let read = |id: &str| {
+        reads.set(reads.get() + 1);
+        assert_eq!(id, device.pairing_id());
+        Ok(Some(device.clone()))
+    };
+    for millis in 0..4999 {
+        let now = opened + std::time::Duration::from_millis(millis);
+        assert!(!watch.due(now));
+        assert!(!watch.lost_by(now, read));
+    }
+    assert_eq!(reads.get(), 0, "nothing is due inside the first 5 s");
+
+    let first = opened + std::time::Duration::from_secs(5);
+    assert!(watch.due(first));
+    assert!(!watch.lost_by(first, read));
+    assert_eq!(reads.get(), 1);
+    assert!(!watch.due(first), "a read moves the next one out");
+    for millis in 0..4999 {
+        assert!(!watch.lost_by(first + std::time::Duration::from_millis(millis), read));
+    }
+    assert_eq!(reads.get(), 1);
+    assert!(!watch.lost_by(first + std::time::Duration::from_secs(5), read));
+    assert_eq!(reads.get(), 2);
+}
+
+#[test]
+fn a_row_watch_loses_a_gone_row_and_an_unreadable_list() {
+    let opened = std::time::Instant::now();
+    let due = opened + std::time::Duration::from_secs(5);
+    let device = watched_device();
+    assert!(RowWatch::new(&device, opened).lost_by(due, |_| Ok(None)));
+    assert!(RowWatch::new(&device, opened).lost_by(due, |_| Err(anyhow::anyhow!("torn"))));
+}
+
+#[test]
+fn a_pairing_id_finds_its_row_and_only_its_row() {
+    let _home = HomeSandbox::new();
+    seed("phone", Tier::View, TOKEN);
+    seed("tray", Tier::Control, OTHER);
+    let id = watched_device().pairing_id();
+    let row = by_pairing_id(&id)
+        .expect("the list reads")
+        .expect("the row");
+    assert_eq!(row.name, "phone");
+    assert!(by_pairing_id("nope").expect("the list reads").is_none());
 }

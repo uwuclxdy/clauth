@@ -687,8 +687,9 @@ fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
 /// it came from a watch we armed. inotify leaves `name` empty for those and
 /// notify then reports the watch root, with `WatchMask::OPEN` armed — so every
 /// `opendir` of a watched directory produces one, and clauth's own config leg
-/// does two per reconcile (`runtime::shared_runtime_dirs` reads the profile
-/// store directory). Reading them as unaccountable crosses the orphan floor in
+/// does at least two per reconcile (`runtime::live_shared_runtime_dirs` reads the
+/// profile store directory). Reading them as unaccountable crosses the orphan
+/// floor in
 /// under two minutes on a healthy install, which trains the operator to ignore
 /// the one line this whole signal exists to emit.
 #[test]

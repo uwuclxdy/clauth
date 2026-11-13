@@ -15,10 +15,12 @@
 //!
 //! Acquiring the cross-process flock is bounded by [`STATE_LOCK_TIMEOUT`]. A
 //! blocking flock has no deadline, so a lease-holding fetcher whose rotation path
-//! waits on a lock another clauth process holds forever would pin the usage-fetch
-//! lease and stand every TUI down permanently (no watchdog covers the scheduler
-//! thread). A bounded wait turns that silent wedge into a [`StateLockTimeout`] the
-//! caller retries instead of a hang.
+//! waits on a lock another clauth process holds forever would stall its tick and
+//! stand the other instances down with it. The bounded wait is the first defence:
+//! one tick returns a [`StateLockTimeout`] the caller retries instead of hanging.
+//! A wedge that outlives it is the scheduler lease watchdog's to break — it
+//! releases the lease once a tick has completed nothing for its bound (5 min of
+//! running time).
 
 use std::cell::Cell;
 use std::fs::File;
@@ -234,6 +236,18 @@ pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
         Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
         None => base,
     }
+}
+
+/// Whether this thread holds the state flock right now (any depth).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn state_lock_held() -> bool {
+    DEPTH.get() > 0
 }
 
 /// What the widest budget armed on this thread leaves to spend — the window

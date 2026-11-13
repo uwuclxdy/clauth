@@ -1,5 +1,6 @@
 //! Claude Code's config-dir permission exemptions, restored for a SHARED
-//! runtime whose entries resolve through symlinks into `~/.claude`.
+//! runtime whose entries resolve through symlinks into `~/.claude`, and the
+//! spawn guard every delegate carries.
 //!
 //! Claude Code builds each exempt dir (auto memory, a session's tool results)
 //! from the literal `CLAUDE_CONFIG_DIR` and requires BOTH the literal and the
@@ -7,7 +8,7 @@
 //! `projects` symlink the resolved spelling never does, so every auto-memory
 //! write and every tool-result read prompts, and a headless run loses it.
 //!
-//! Two repairs ride one per-spawn `--settings` FILE (never inline, so a user's
+//! The repairs ride one per-spawn `--settings` FILE (never inline, so a user's
 //! settings — credentials included — stay off the child's argv), written into
 //! the runtime's profile dir and removed when the runtime drops unless
 //! [`crate::claude_jobs::JobTrees::spares_settings`] spares it:
@@ -16,6 +17,13 @@
 //! - a `PreToolUse` `Read` hook that allows a read whose resolved path is this
 //!   session's own tool result. A hook allow clears a read prompt but not a
 //!   write one, so writes cannot take this route.
+//!
+//! Those two repair a symlinked runtime and are skipped when the literal and
+//! resolved spellings agree. A delegate adds a third that every delegate spawn
+//! carries: a `PreToolUse` hook on `Bash` that refuses a subagent's background
+//! shell, because a headless `claude -p` run never waits on one once that
+//! subagent's turn ends, so its output would be lost (measured 2026-11-02,
+//! Claude Code 2.1.314).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +34,9 @@ use serde_json::{Map, Value, json};
 
 /// The hidden subcommand the injected `Read` hook runs.
 pub(crate) const READ_HOOK_SUBCOMMAND: &str = "hook-read-exempt";
+
+/// The hidden subcommand the injected foreground-spawn hook runs.
+pub(crate) const FOREGROUND_SPAWN_HOOK_SUBCOMMAND: &str = "hook-foreground-spawn";
 
 /// The `PreToolUse` `Read` allow, byte-for-byte.
 const READ_ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"clauth: this session's own tool result, read through the runtime's projects link"}}"#;
@@ -201,22 +212,22 @@ fn normalize(p: &Path) -> PathBuf {
 
 /// The hook command for the binary at `exe`: the installed path (a self-update
 /// leaves a long-lived server's `current_exe` reading `(deleted)`), POSIX
-/// quoted, then the subcommand and a fail-open `|| true` — a binary that
-/// cannot parse the subcommand exits 2, which would block every Read.
-pub(crate) fn hook_command_for(exe: &Path) -> String {
+/// quoted, then `subcommand` and a fail-open `|| true` — a binary that cannot
+/// parse the subcommand exits 2, which would block the call it guards.
+pub(crate) fn hook_command_for(exe: &Path, subcommand: &str) -> String {
     let installed = crate::platform::installed_exe_path(exe);
     format!(
-        "{} {READ_HOOK_SUBCOMMAND} || true",
+        "{} {subcommand} || true",
         posix_quote(&installed.to_string_lossy())
     )
 }
 
-/// The shell command the injected `Read` hook runs: this binary (its installed
-/// path), quoted, plus [`READ_HOOK_SUBCOMMAND`] and a fail-open `|| true`.
-pub(crate) fn hook_command() -> String {
+/// The shell command running `subcommand` on this binary (its installed path),
+/// quoted, plus the fail-open `|| true`.
+pub(crate) fn hook_command(subcommand: &str) -> String {
     match std::env::current_exe() {
-        Ok(exe) => hook_command_for(&exe),
-        Err(_) => hook_command_for(Path::new("clauth")),
+        Ok(exe) => hook_command_for(&exe, subcommand),
+        Err(_) => hook_command_for(Path::new("clauth"), subcommand),
     }
 }
 
@@ -239,31 +250,35 @@ fn strip_os_error(s: &str) -> String {
 /// Append the exemption `--settings` (when the runtime needs it) and then the
 /// caller's `passthrough` args to `command`.
 ///
-/// Injects when the literal `config_dir/projects` differs from its resolved
-/// spelling (a symlinked `projects`, or a symlinked ancestor). The merged
-/// settings object is written to `settings_file` (0o600, atomic) and passed as
-/// `--settings <file>` — never inline, so a folded user settings value stays
-/// off the child's argv. The user's last pre-`--` `--settings` is the merge
-/// base; `autoMemoryDirectory` is added unless a settings source or the
-/// child's env already keys it. A user `--settings` that cannot be read or
-/// parsed, or whose `hooks` shape is wrong, disables the injection and comes
-/// back as `Some(warning)`, with the passthrough appended untouched.
+/// The symlink repairs are injected when the literal `config_dir/projects`
+/// differs from its resolved spelling (a symlinked `projects`, or a symlinked
+/// ancestor). A `foreground_hook_command` is written into the same file for
+/// every caller that passes one, whether or not the runtime needs those
+/// repairs; with neither, nothing is injected. The merged settings object is
+/// written to `settings_file` (0o600, atomic) and passed as `--settings
+/// <file>` — never inline, so a folded user settings value stays off the
+/// child's argv. The user's last pre-`--` `--settings` is the merge base;
+/// `autoMemoryDirectory` is added unless a settings source or the child's env
+/// already keys it. A user `--settings` that cannot be read or parsed, or
+/// whose `hooks` shape is wrong, disables the injection and comes back as
+/// `Some(warning)`, with the passthrough appended untouched.
 pub(crate) fn apply_spawn_settings(
     command: &mut Command,
     config_dir: &Path,
     cwd: &Path,
     passthrough: &[String],
-    hook_command: &str,
+    read_hook_command: &str,
+    foreground_hook_command: Option<&str>,
     settings_file: &Path,
 ) -> Option<String> {
     let literal = config_dir.join("projects");
-    let Some(real) = resolve_projects(config_dir) else {
-        command.args(passthrough);
-        return None;
-    };
-    let needs_injection = crate::canonical::claude_code_spelling(&literal.to_string_lossy())
-        != crate::canonical::claude_code_spelling(&real.to_string_lossy());
-    if !needs_injection {
+    // `Some` only when the symlink repairs are needed, so the memory dir and
+    // the Read hook below are skipped for a runtime whose spellings agree.
+    let real = resolve_projects(config_dir).filter(|real| {
+        crate::canonical::claude_code_spelling(&literal.to_string_lossy())
+            != crate::canonical::claude_code_spelling(&real.to_string_lossy())
+    });
+    if real.is_none() && foreground_hook_command.is_none() {
         command.args(passthrough);
         return None;
     }
@@ -298,60 +313,73 @@ pub(crate) fn apply_spawn_settings(
         None => Map::new(),
     };
 
-    // `autoMemoryDirectory` is ours only when no settings source or env var
-    // already keys it. At the real `$HOME` the spawn gets `--setting-sources
-    // user`, so the `<cwd>/.claude` project tier is never read. On unix Claude
-    // Code reads the local tier at `memory_base` (a linked worktree's main
-    // checkout) unless that root is the real `$HOME`, and still reads
-    // `<cwd>/.claude/settings.local.json` beside it as legacy local settings.
-    // Claude Code also skips a root unless the root, its `.git` and its
-    // `.claude` are owned by the euid; that check is not mirrored here, so a
-    // foreign-owned root's file still suppresses ours and its memory writes
-    // prompt, where mirroring it would need the euid (`unsafe` or a new dep).
-    let at_home = crate::runtime::cwd_is_real_home(cwd);
-    let base = memory_base(cwd);
-    let mut suppressed = sets_memory(&settings);
-    if !suppressed {
-        suppressed = settings_file_sets_memory(&config_dir.join("settings.json"));
-    }
-    if !suppressed && !at_home {
-        suppressed = settings_file_sets_memory(&cwd.join(".claude").join("settings.json"))
-            || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"))
-            || (cfg!(unix)
-                && !crate::runtime::cwd_is_real_home(&base)
-                && settings_file_sets_memory(&base.join(".claude").join("settings.local.json")));
-    }
-    if !suppressed {
-        // CC tests it for truthiness (`if(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR)`),
-        // so an empty value is unset to CC.
-        suppressed = child_env_value(command, "CLAUDE_CODE_REMOTE_MEMORY_DIR")
-            .is_some_and(|v| !v.is_empty());
-    }
-    if !suppressed {
-        suppressed = child_env_value(command, "CLAUDE_CODE_PROJECT_DIR_NAME")
-            .is_some_and(|v| valid_project_dir_name(&v));
-    }
-    if !suppressed {
-        let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
-        let key = project_key(&crate::canonical::claude_code_spelling(
-            &base.to_string_lossy(),
-        ));
-        settings.insert(
-            "autoMemoryDirectory".to_string(),
-            Value::String(
-                Path::new(&store)
-                    .join(key)
-                    .join("memory")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        );
+    if let Some(real) = real.as_ref() {
+        // `autoMemoryDirectory` is ours only when no settings source or env var
+        // already keys it. At the real `$HOME` the spawn gets `--setting-sources
+        // user`, so the `<cwd>/.claude` project tier is never read. On unix Claude
+        // Code reads the local tier at `memory_base` (a linked worktree's main
+        // checkout) unless that root is the real `$HOME`, and still reads
+        // `<cwd>/.claude/settings.local.json` beside it as legacy local settings.
+        // Claude Code also skips a root unless the root, its `.git` and its
+        // `.claude` are owned by the euid; that check is not mirrored here, so a
+        // foreign-owned root's file still suppresses ours and its memory writes
+        // prompt, where mirroring it would need the euid (`unsafe` or a new dep).
+        let at_home = crate::runtime::cwd_is_real_home(cwd);
+        let base = memory_base(cwd);
+        let mut suppressed = sets_memory(&settings);
+        if !suppressed {
+            suppressed = settings_file_sets_memory(&config_dir.join("settings.json"));
+        }
+        if !suppressed && !at_home {
+            suppressed = settings_file_sets_memory(&cwd.join(".claude").join("settings.json"))
+                || settings_file_sets_memory(&cwd.join(".claude").join("settings.local.json"))
+                || (cfg!(unix)
+                    && !crate::runtime::cwd_is_real_home(&base)
+                    && settings_file_sets_memory(
+                        &base.join(".claude").join("settings.local.json"),
+                    ));
+        }
+        if !suppressed {
+            // CC tests it for truthiness (`if(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR)`),
+            // so an empty value is unset to CC.
+            suppressed = child_env_value(command, "CLAUDE_CODE_REMOTE_MEMORY_DIR")
+                .is_some_and(|v| !v.is_empty());
+        }
+        if !suppressed {
+            suppressed = child_env_value(command, "CLAUDE_CODE_PROJECT_DIR_NAME")
+                .is_some_and(|v| valid_project_dir_name(&v));
+        }
+        if !suppressed {
+            let store = crate::canonical::claude_code_spelling(&real.to_string_lossy());
+            let key = project_key(&crate::canonical::claude_code_spelling(
+                &base.to_string_lossy(),
+            ));
+            settings.insert(
+                "autoMemoryDirectory".to_string(),
+                Value::String(
+                    Path::new(&store)
+                        .join(key)
+                        .join("memory")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+        }
     }
 
-    let our_hook = json!({
-        "matcher": "Read",
-        "hooks": [{"type": "command", "command": hook_command, "timeout": 10}]
-    });
+    let mut ours = Vec::with_capacity(2);
+    if real.is_some() {
+        ours.push(json!({
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": read_hook_command, "timeout": 10}]
+        }));
+    }
+    if let Some(hook) = foreground_hook_command {
+        ours.push(json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": hook, "timeout": 10}]
+        }));
+    }
     match settings
         .entry("hooks".to_string())
         .or_insert_with(|| Value::Object(Map::new()))
@@ -360,15 +388,14 @@ pub(crate) fn apply_spawn_settings(
             let pre = hooks
                 .entry("PreToolUse".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
-            if let Value::Array(arr) = pre {
-                arr.push(our_hook);
-            } else {
-                *pre = Value::Array(vec![our_hook]);
+            match pre {
+                Value::Array(arr) => arr.extend(ours),
+                other => *other = Value::Array(ours),
             }
         }
         other => {
             let mut hooks = Map::new();
-            hooks.insert("PreToolUse".to_string(), Value::Array(vec![our_hook]));
+            hooks.insert("PreToolUse".to_string(), Value::Array(ours));
             *other = Value::Object(hooks);
         }
     }
@@ -515,18 +542,48 @@ const OPTIONAL_VALUE_FLAGS: &[&str] = &[
     "--prompt-suggestions",
 ];
 
+/// What one [`fold_args`] walk of the args yields.
+struct FoldedArgs {
+    /// The last user `--settings` value.
+    settings: Option<String>,
+    /// The args with every `--settings` flag (and its value) removed.
+    clean: Vec<String>,
+    /// The last non-blank `--advisor` value, both spellings.
+    advisor: Option<String>,
+}
+
 /// Split `passthrough` into the last user `--settings` value (folded in) and
-/// the args with every `--settings` flag (and its value) removed, walking the
-/// words the way claude parses argv: a [`VALUE_FLAGS`] member takes the next
-/// word whatever it holds, a short cluster ending in exactly one `n` takes the
-/// next word, an [`OPTIONAL_VALUE_FLAGS`] member takes only a word without a
-/// leading `-`, and the first `--` that sits in a flag position (never a
-/// taken value) ends option parsing. A `--settings` flag with no word left to
-/// take is `Err`.
+/// the args with every `--settings` flag (and its value) removed. See
+/// [`fold_args`] for how the words are walked; a `--settings` flag with no
+/// word left to take is `Err`.
 pub(crate) fn fold_settings_args(
     passthrough: &[String],
 ) -> Result<(Option<String>, Vec<String>), ()> {
+    fold_args(passthrough).map(|folded| (folded.settings, folded.clean))
+}
+
+/// The model the last `--advisor` flag in `args` names, in both spellings.
+/// Read off the same walk that folds `--settings` out ([`fold_args`]), so a
+/// word another flag consumed as its value is never read as the advisor
+/// (`--name --advisor opus` names the session `--advisor`), and nothing past
+/// the `--` separator counts. A blank value is ignored: it names no model, so
+/// it neither clears an earlier flag nor shadows the settings tiers, and the
+/// launch demand over-counts rather than under-counts. An `Err` walk (a bare
+/// `--settings` claude refuses) reads no advisor.
+pub(crate) fn last_advisor_arg(args: &[String]) -> Option<String> {
+    fold_args(args).ok().and_then(|folded| folded.advisor)
+}
+
+/// Walk `passthrough` the way claude parses argv: a [`VALUE_FLAGS`] member
+/// takes the next word whatever it holds, a short cluster ending in exactly
+/// one `n` takes the next word, an [`OPTIONAL_VALUE_FLAGS`] member takes only a
+/// word without a leading `-`, and the first `--` that sits in a flag position
+/// (never a taken value) ends option parsing. One walk carries both the folded
+/// `--settings` and the last `--advisor`, so the two cannot disagree about
+/// which words are flags.
+fn fold_args(passthrough: &[String]) -> Result<FoldedArgs, ()> {
     let mut value: Option<String> = None;
+    let mut advisor: Option<String> = None;
     let mut clean: Vec<String> = Vec::with_capacity(passthrough.len());
     let mut i = 0;
     let mut positional = false; // past the end-of-options marker
@@ -559,45 +616,62 @@ pub(crate) fn fold_settings_args(
             }
             continue;
         }
-        if VALUE_FLAGS.contains(&arg) {
-            // the flag and its value stay in the passthrough: only a
-            // `--settings` flag itself is folded out
-            clean.push(arg.to_string());
-            i += match passthrough.get(i + 1) {
-                Some(next) => {
-                    clean.push(next.clone());
-                    2
-                }
-                None => 1,
-            };
-            continue;
+        // any other flag and its value stay in the passthrough: only a
+        // `--settings` flag itself is folded out
+        let span = option_span(passthrough, i);
+        if let Some(rest) = arg.strip_prefix("--advisor=") {
+            note_advisor(&mut advisor, rest);
+        } else if arg == "--advisor" && span == 2 {
+            note_advisor(&mut advisor, &passthrough[i + 1]);
         }
-        if OPTIONAL_VALUE_FLAGS.contains(&arg) {
-            clean.push(arg.to_string());
-            i += match passthrough.get(i + 1) {
-                // an optional value is never a `-`-led word
-                Some(next) if !next.starts_with('-') => {
-                    clean.push(next.clone());
-                    2
-                }
-                _ => 1,
-            };
-            continue;
-        }
-        if short_cluster_takes_value(arg) {
-            clean.push(arg.to_string());
-            if let Some(next) = passthrough.get(i + 1) {
-                clean.push(next.clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        clean.push(arg.to_string());
-        i += 1;
+        clean.extend_from_slice(&passthrough[i..i + span]);
+        i += span;
     }
-    Ok((value, clean))
+    Ok(FoldedArgs {
+        settings: value,
+        clean,
+        advisor,
+    })
+}
+
+/// Record one `--advisor` value, trimmed to match the settings values it is
+/// compared with, as the last advisor, ignoring a blank one.
+fn note_advisor(advisor: &mut Option<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        *advisor = Some(value.to_owned());
+    }
+}
+
+/// The index of the `--` that ends claude's option parsing, else
+/// `passthrough.len()`: the first `--` in a flag position, walked as
+/// [`fold_settings_args`] walks, so a `--` a flag takes as its value
+/// (`--name -- --bg`) never ends it.
+pub(crate) fn options_end(passthrough: &[String]) -> usize {
+    let mut i = 0;
+    while i < passthrough.len() {
+        if passthrough[i] == "--" {
+            return i;
+        }
+        i += option_span(passthrough, i);
+    }
+    passthrough.len()
+}
+
+/// How many words the word at `passthrough[i]` spans as claude parses argv: 2
+/// when it takes the next word (a [`VALUE_FLAGS`] member whatever that word
+/// holds, a short cluster ending in a value-taking `n`, an
+/// [`OPTIONAL_VALUE_FLAGS`] member only before a word without a leading `-`),
+/// else 1.
+fn option_span(passthrough: &[String], i: usize) -> usize {
+    let arg = passthrough[i].as_str();
+    let Some(next) = passthrough.get(i + 1) else {
+        return 1;
+    };
+    let takes_next = VALUE_FLAGS.contains(&arg)
+        || short_cluster_takes_value(arg)
+        || (OPTIONAL_VALUE_FLAGS.contains(&arg) && !next.starts_with('-'));
+    if takes_next { 2 } else { 1 }
 }
 
 /// Whether a short cluster takes the next word: `-n` is claude's only
@@ -827,17 +901,72 @@ struct ReadHookToolInput {
     file_path: String,
 }
 
-/// `clauth hook-read-exempt`: read the payload on stdin, print the verdict.
-/// Always exits 0: a hook exit of 2 would block the read.
-pub(crate) fn run_read_hook() {
+/// A hook's `PreToolUse` payload, read from stdin.
+fn read_pre_tool_use_payload() -> String {
     // Bound the stdin read to 1 MiB. `read_to_end` + `from_utf8_lossy`, never
     // `read_to_string` on the truncated reader: a cut UTF-8 codepoint would
     // read as an error and the whole payload would be dropped.
     let mut bytes = Vec::new();
     let stdin = std::io::stdin().lock();
     let _ = stdin.take(1 << 20).read_to_end(&mut bytes);
-    let payload = String::from_utf8_lossy(&bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// `clauth hook-read-exempt`: read the payload on stdin, print the verdict.
+/// Always exits 0: a hook exit of 2 would block the read.
+pub(crate) fn run_read_hook() {
+    let payload = read_pre_tool_use_payload();
     if let Some(verdict) = read_hook_verdict(&payload) {
+        outln!("{verdict}");
+    }
+}
+
+/// The `hook-foreground-spawn` refusal, naming the retry that runs the shell
+/// in the foreground.
+const SUBAGENT_SHELL_REASON: &str = "refused: a subagent's background shell is never waited on in a headless delegate (claude -p), so its output would be lost: re-send this call with run_in_background: false.";
+
+/// The deny verdict Claude Code reads off a `PreToolUse` hook's stdout.
+fn deny_verdict(reason: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
+}
+
+/// The `hook-foreground-spawn` verdict for one `PreToolUse` payload:
+/// `Some(stdout)` refusing a subagent's background shell, else `None` (print
+/// nothing, so Claude Code's own decision stands). Fails open on anything it
+/// cannot read.
+pub(crate) fn foreground_spawn_verdict(payload: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    if payload.get("tool_name")?.as_str()? != "Bash" {
+        return None;
+    }
+    // A subagent's own calls carry its `agent_id`; the main thread's carry none.
+    let is_subagent = payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if !is_subagent {
+        return None;
+    }
+    let input = payload.get("tool_input")?.as_object()?;
+    if input.get("run_in_background") == Some(&Value::Bool(true)) {
+        Some(deny_verdict(SUBAGENT_SHELL_REASON))
+    } else {
+        None
+    }
+}
+
+/// `clauth hook-foreground-spawn`: read the payload on stdin, print the
+/// verdict. Always exits 0: a hook exit of 2 would block the spawn it guards.
+pub(crate) fn run_foreground_spawn_hook() {
+    let payload = read_pre_tool_use_payload();
+    if let Some(verdict) = foreground_spawn_verdict(&payload) {
         outln!("{verdict}");
     }
 }

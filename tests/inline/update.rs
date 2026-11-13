@@ -301,6 +301,47 @@ fn verify_minisign_malformed_signature_fails() {
     assert!(verify_minisign(TEST_PUBKEY, b"test", "untrusted comment: x\nzzz").is_err());
 }
 
+/// The refusal the signature check itself gives: a parse or key-id refusal
+/// reads differently, so a test pinning this text proves which check refused.
+const SIGNATURE_CHECK_REFUSAL: &str =
+    "minisign signature did not verify; refusing update: The signature verification failed";
+
+/// The global signature covers the trusted comment: an edited comment over an
+/// untouched payload signature no longer verifies.
+#[test]
+fn verify_minisign_tampered_trusted_comment_fails() {
+    let sig = TEST_SIG.replace("timestamp:1633700835", "timestamp:1633700836");
+    assert_ne!(sig, TEST_SIG, "the tamper must change the signature text");
+    let err = verify_minisign(TEST_PUBKEY, b"test", &sig).expect_err("an edited comment refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
+/// The global signature is checked, not only the payload signature.
+#[test]
+fn verify_minisign_tampered_global_signature_fails() {
+    let sig = TEST_SIG.replace("wLMDjy9F", "xLMDjy9F");
+    assert_ne!(sig, TEST_SIG, "the tamper must change the signature text");
+    let err = verify_minisign(TEST_PUBKEY, b"test", &sig).expect_err("an edited signature refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
+/// A key carrying the signature's key id but other key bytes parses, matches
+/// the id, and still refuses: the id alone authenticates nothing.
+#[test]
+fn verify_minisign_other_key_with_the_same_id_fails() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut raw = engine.decode(TEST_PUBKEY).expect("the test key decodes");
+    // Layout: 2-byte algorithm, 8-byte key id, 32-byte Ed25519 key.
+    raw[10] ^= 0x01;
+    let key = engine.encode(&raw);
+    assert_ne!(key, TEST_PUBKEY, "the tamper must change the key");
+    PublicKey::from_base64(&key)
+        .expect("the altered key still parses, so the refusal is the signature check");
+    let err = verify_minisign(&key, b"test", TEST_SIG).expect_err("another key refuses");
+    assert_eq!(err.to_string(), SIGNATURE_CHECK_REFUSAL);
+}
+
 #[test]
 fn pinned_public_key_parses_when_set() {
     // A pinned key must decode — a typo would fail-close EVERY auto-update.
@@ -926,6 +967,66 @@ fn the_replace_gate_refuses_a_replace_after_the_exit_gave_up() {
         "after the replace ends the wait can give up"
     );
     assert!(gate.begin().is_none());
+}
+
+// ── the replace step ────────────────────────────────────────────────────────
+
+/// An abandoned gate refuses the replace step without touching the bytes: no
+/// replace starts once the exit wait has given up.
+#[test]
+fn the_replace_step_refuses_an_abandoned_gate() {
+    let gate = ReplaceGate::new();
+    gate.abandon();
+    assert!(
+        !replace_verified(b"payload", &gate, |_| Ok(())).expect("the step answers"),
+        "no replace starts after the give-up"
+    );
+}
+
+/// A failed replace fails the whole step: the error passes through unchanged,
+/// the self-update mark clears, and the gate returns to idle.
+#[test]
+fn the_injected_replace_failure_fails_the_replace_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let gate = ReplaceGate::new();
+    let err = replace_verified(b"payload", &gate, |_| {
+        Err(std::io::Error::other("rename refused"))
+    })
+    .expect_err("the failed replace fails the step");
+    assert_eq!(
+        err.to_string(),
+        "rename refused",
+        "the error passes through"
+    );
+    assert!(!replaced_by_self_update(), "the mark clears on the failure");
+    assert!(!gate.is_replacing(), "the gate returns to idle");
+}
+
+/// A successful replace marks the run as self-replaced from before the call,
+/// holds the gate while it runs, and returns both to their rest states after.
+#[test]
+fn the_injected_replace_success_marks_the_run() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let gate = ReplaceGate::new();
+    let mut seen_during = None;
+    let replaced = replace_verified(b"payload", &gate, |staged| {
+        assert!(staged.is_file(), "the staged file exists at the call");
+        seen_during = Some((replaced_by_self_update(), gate.is_replacing()));
+        Ok(())
+    })
+    .expect("the replace succeeds");
+    assert!(replaced, "the step reports the replace");
+    assert_eq!(
+        seen_during,
+        Some((true, true)),
+        "the mark is set and the gate held while the call runs"
+    );
+    assert!(replaced_by_self_update(), "the mark stays after success");
+    assert!(!gate.is_replacing(), "the gate returns to idle");
 }
 
 // ── replace_marked ─────────────────────────────────────────────────────────

@@ -389,6 +389,7 @@ fn apply_with(l: &Layout, command: &mut Command, passthrough: &[&str]) -> Applie
         &l.cwd,
         &strings(passthrough),
         HOOK,
+        None,
         &l.settings_file,
     );
     let argv = args_of(command);
@@ -468,6 +469,7 @@ fn a_fully_resolved_runtime_gets_nothing_injected() {
         &l.cwd,
         &passthrough,
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(args_of(&command), passthrough);
@@ -490,6 +492,7 @@ fn a_runtime_reached_through_a_symlinked_parent_is_injected_too() {
         &l.cwd,
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(warning, None);
@@ -527,13 +530,22 @@ fn an_isolated_runtime_without_projects_yet_is_judged_by_its_parent() {
         &l.cwd,
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     assert_eq!(args_of(&through_link)[0], "--settings");
 
     let direct_file = l.root.join("state").join("direct.json");
     let mut direct = Command::new("claude");
-    apply_spawn_settings(&mut direct, &l.runtime, &l.cwd, &[], HOOK, &direct_file);
+    apply_spawn_settings(
+        &mut direct,
+        &l.runtime,
+        &l.cwd,
+        &[],
+        HOOK,
+        None,
+        &direct_file,
+    );
     assert!(args_of(&direct).is_empty());
     assert!(!direct_file.exists());
 }
@@ -765,6 +777,7 @@ fn a_memory_dir_in_a_worktrees_main_checkout_local_tier_suppresses_ours() {
         &l.root.join("work/wt"),
         &[],
         HOOK,
+        None,
         &l.settings_file,
     );
     let settings: Value =
@@ -792,7 +805,15 @@ fn a_memory_dir_in_a_worktrees_own_root_local_tier_does_not_suppress_ours() {
     let cwd = l.root.join("work/wt/sub");
     fs::create_dir_all(&cwd).unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &cwd,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     assert_eq!(settings["autoMemoryDirectory"], json!(memory_dir(&l)));
@@ -815,7 +836,15 @@ fn a_memory_dir_in_the_home_local_tier_does_not_suppress_ours_from_a_subdir() {
     let cwd = home.join("sub");
     fs::create_dir_all(&cwd).unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &cwd, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &cwd,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -840,7 +869,15 @@ fn a_project_tier_claude_code_skips_at_home_does_not_suppress_ours() {
     )
     .unwrap();
     let mut command = Command::new("claude");
-    apply_spawn_settings(&mut command, &l.runtime, &home, &[], HOOK, &l.settings_file);
+    apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &home,
+        &[],
+        HOOK,
+        None,
+        &l.settings_file,
+    );
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -1121,6 +1158,7 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
                 &cwd,
                 &strings(&["--settings", user]),
                 HOOK,
+                None,
                 &settings_file,
             );
             tx.send((user, warning)).unwrap();
@@ -1146,7 +1184,15 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
     let (runtime, cwd, settings_file) = (l.runtime.clone(), l.cwd.clone(), l.settings_file.clone());
     std::thread::spawn(move || {
         let mut command = Command::new("claude");
-        apply_spawn_settings(&mut command, &runtime, &cwd, &[], HOOK, &settings_file);
+        apply_spawn_settings(
+            &mut command,
+            &runtime,
+            &cwd,
+            &[],
+            HOOK,
+            None,
+            &settings_file,
+        );
         tx.send(()).unwrap();
     });
     rx.recv_timeout(std::time::Duration::from_secs(5))
@@ -1351,21 +1397,27 @@ fn help_value_flags_reads_a_value_option_s_names_off_one_line() {
 }
 
 #[test]
+#[ignore = "needs a claude binary on PATH; run with --ignored where one is installed"]
 fn the_value_flags_cover_every_help_listed_value_option() {
     // drift guard: a value option a new claude release lists fails here until
     // VALUE_FLAGS carries it. Reads `claude --help` and nothing else: never a
-    // session, and never the real HOME.
+    // session, and never the real HOME. Ignored by default because the regular
+    // CI legs install no claude, where a skip would read as drift coverage; a
+    // run that asks for it fails without one.
     let home = crate::testutil::HomeSandbox::new();
-    let Ok(output) = Command::new("claude")
+    let output = Command::new("claude")
         .arg("--help")
         .env("HOME", home.home())
         .output()
-    else {
-        // no claude binary on this box: nothing to drift against. Say so, so
-        // a run without claude never reads as drift coverage.
-        eprintln!("SKIP: claude not installed; VALUE_FLAGS was NOT checked for drift");
-        return;
-    };
+        .unwrap_or_else(|e| {
+            panic!("`claude --help` did not run ({e}): the drift check needs claude on PATH")
+        });
+    assert!(
+        output.status.success(),
+        "`claude --help` exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let help = String::from_utf8_lossy(&output.stdout);
     let listed = help_value_flags(&help);
     // first, middle and last value option of the 2.1.311 help: the parser
@@ -1406,6 +1458,23 @@ fn clauth_start_routes_its_claude_args_through_the_exemption_settings() {
     assert!(
         body.contains("cc_exempt::apply_spawn_settings("),
         "clauth start must build its claude argv through apply_spawn_settings"
+    );
+}
+
+/// The subagent-shell guard is for a delegate's `claude -p` alone: an
+/// interactive `clauth start` session keeps running after a subagent's turn
+/// ends.
+#[test]
+fn only_a_delegate_names_the_foreground_spawn_hook() {
+    let start = body_of(include_str!("../../src/start.rs"), "pub(crate) fn run(");
+    let delegate = body_of(include_str!("../../src/mcp/mod.rs"), "fn run_delegate(");
+    assert!(
+        delegate.contains("FOREGROUND_SPAWN_HOOK_SUBCOMMAND"),
+        "run_delegate must hand apply_spawn_settings the foreground-spawn hook"
+    );
+    assert!(
+        !start.contains("FOREGROUND_SPAWN_HOOK_SUBCOMMAND"),
+        "clauth start must not hand its session the foreground-spawn hook"
     );
 }
 
@@ -1620,7 +1689,122 @@ fn hook_command_names_the_installed_binary_and_fails_open() {
     // `<path> (deleted)`; an exit 2 from a binary that lacks the subcommand
     // would block every Read, so the command can never exit non-zero.
     assert_eq!(
-        hook_command_for(Path::new("/opt/clauth bin/clauth (deleted)")),
+        hook_command_for(
+            Path::new("/opt/clauth bin/clauth (deleted)"),
+            READ_HOOK_SUBCOMMAND
+        ),
         "'/opt/clauth bin/clauth' hook-read-exempt || true"
+    );
+}
+
+// ── last_advisor_arg ─────────────────────────────────────────────────────────
+
+fn advisor_of(args: &[&str]) -> Option<String> {
+    last_advisor_arg(&strings(args))
+}
+
+/// The last non-blank `--advisor` value, read off the same walk that folds
+/// `--settings` out, so it follows claude's own argv reading.
+#[test]
+fn last_advisor_arg_reads_both_spellings_and_the_last_one_wins() {
+    assert_eq!(advisor_of(&[]), None);
+    assert_eq!(advisor_of(&["--advisor", "opus"]).as_deref(), Some("opus"));
+    assert_eq!(advisor_of(&["--advisor=opus"]).as_deref(), Some("opus"));
+    assert_eq!(
+        advisor_of(&["--advisor", "haiku", "-p", "--advisor=opus"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--advisor=haiku", "--advisor", "opus"]).as_deref(),
+        Some("opus")
+    );
+    // A model id with a context suffix or a path-like id is taken whole.
+    assert_eq!(
+        advisor_of(&["--advisor", "claude-opus-5-5[1m]"]).as_deref(),
+        Some("claude-opus-5-5[1m]")
+    );
+}
+
+#[test]
+fn last_advisor_arg_ignores_a_blank_value_without_clearing_an_earlier_one() {
+    assert_eq!(advisor_of(&["--advisor", ""]), None);
+    assert_eq!(advisor_of(&["--advisor", "  "]), None);
+    assert_eq!(advisor_of(&["--advisor="]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor", ""]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor="]).as_deref(),
+        Some("opus")
+    );
+}
+
+#[test]
+fn last_advisor_arg_trims_the_value() {
+    assert_eq!(advisor_of(&["--advisor", " opus"]).as_deref(), Some("opus"));
+    assert_eq!(advisor_of(&["--advisor=opus "]).as_deref(), Some("opus"));
+    assert_eq!(
+        advisor_of(&["--advisor", "\topus\n", "--advisor", "  "]).as_deref(),
+        Some("opus"),
+        "a blank later value still leaves the trimmed earlier one"
+    );
+}
+
+#[test]
+fn last_advisor_arg_follows_claudes_value_eating_and_separator_rules() {
+    // `--name` and `--model` take the next word whatever it holds, so an
+    // `--advisor` there is their value, not a flag.
+    assert_eq!(advisor_of(&["--name", "--advisor", "opus"]), None);
+    assert_eq!(advisor_of(&["--model", "--advisor", "opus"]), None);
+    assert_eq!(
+        advisor_of(&["--name", "--advisor", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "the second `--advisor` is a flag again"
+    );
+    // A short value-taking cluster and an optional-value flag follow the walk.
+    assert_eq!(
+        advisor_of(&["-pn", "--advisor", "--advisor", "opus"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--resume", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "an optional-value flag never takes a `-`-led word"
+    );
+    // A trailing flag has no value to take.
+    assert_eq!(advisor_of(&["--advisor"]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--advisor"]).as_deref(),
+        Some("opus")
+    );
+    // The first flag-position `--` ends option parsing; a value the separator
+    // is taken as is not a separator.
+    assert_eq!(advisor_of(&["--", "--advisor", "opus"]), None);
+    assert_eq!(
+        advisor_of(&["--advisor", "opus", "--", "--advisor", "haiku"]).as_deref(),
+        Some("opus")
+    );
+    assert_eq!(
+        advisor_of(&["--name", "--", "--advisor", "opus"]).as_deref(),
+        Some("opus"),
+        "a `--` taken as a value is not the separator"
+    );
+    // The prompt is positional: a word after it that spells the flag is not one.
+    assert_eq!(advisor_of(&["-p", "hello", "--", "--advisor=opus"]), None);
+}
+
+/// A bare `--settings` claude refuses reads no advisor; the fold still strips a
+/// `--settings` flag without touching `--advisor` in the clean args.
+#[test]
+fn the_advisor_flag_stays_in_the_clean_args_and_rides_beside_settings() {
+    let args = strings(&["--advisor", "opus", "--settings", "{}", "--advisor=haiku"]);
+    let (settings, clean) = fold_settings_args(&args).expect("folds");
+    assert_eq!(settings.as_deref(), Some("{}"));
+    assert_eq!(clean, strings(&["--advisor", "opus", "--advisor=haiku"]));
+    assert_eq!(last_advisor_arg(&args).as_deref(), Some("haiku"));
+    assert_eq!(
+        last_advisor_arg(&strings(&["--advisor", "opus", "--settings"])),
+        None
     );
 }

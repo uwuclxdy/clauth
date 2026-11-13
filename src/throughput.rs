@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile_cache::{load_profile_cache, write_profile_cache};
+use crate::harness::Harness;
+use crate::profile_cache::{load_profile_cache, write_profile_cache_for};
 
 /// Per-profile throughput cache filename, relative to the per-profile dir.
 pub(crate) const THROUGHPUT_CACHE_FILE: &str = "throughput_cache.json";
@@ -103,7 +104,7 @@ pub(crate) fn record_success(
     if tok_s > entry.best_tok_s {
         entry.best_tok_s = tok_s;
     }
-    write_profile_cache(profile, THROUGHPUT_CACHE_FILE, &store);
+    write_profile_cache_for(Harness::Claude, profile, THROUGHPUT_CACHE_FILE, &store);
 }
 
 /// Record a rate-limit / 429 hit for a model, with an optional Retry-After hint.
@@ -124,7 +125,7 @@ pub(crate) fn record_rate_limit(
     let entry = store.models.entry(model_key(model)).or_default();
     entry.last_rate_limited_at = Some(now);
     entry.last_retry_after_s = retry_after_s;
-    write_profile_cache(profile, THROUGHPUT_CACHE_FILE, &store);
+    write_profile_cache_for(Harness::Claude, profile, THROUGHPUT_CACHE_FILE, &store);
 }
 
 /// Whether the stored throughput identity still equals the one captured at

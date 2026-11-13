@@ -323,6 +323,65 @@ fn the_table_columns_widen_to_their_widest_cell_in_every_row() {
     assert!(child_row.starts_with(&child_cells), "{child_row:?}");
 }
 
+/// The profile column sizes and pads by drawn cells: a profile cell of eight
+/// wide glyphs (sixteen cells) lays the table out exactly as a sixteen-letter
+/// ASCII name does. The second row's fourteen-letter profile sits between the
+/// wide cell's char count (8) and its cell count (16), so measuring by chars
+/// sizes the column to 14 and shifts the rows apart, past the floor of 12.
+#[test]
+fn a_wide_script_profile_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字漢字漢字";
+    const TWIN: &str = "abcdefghijklmnop";
+    let sb = HomeSandbox::new();
+    let wide_id = "12345678-1234-4567-890a-123456789abc";
+    let narrow_id = "87654321-1234-4567-890a-123456789abc";
+    for (id, secs, preview) in [(wide_id, 4_000, "parent"), (narrow_id, 3_000, "sibling")] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", preview)]);
+        set_mtime(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    }
+
+    let mut groups = build_listing(false);
+    let mut lines_with = |profile: &str| {
+        for session in groups.iter_mut().flat_map(|g| &mut g.sessions) {
+            let name = if session.id == wide_id {
+                profile
+            } else {
+                "abcdefghijklmn"
+            };
+            session.last_ran_profile = Some(name.to_string());
+        }
+        table_lines(&groups, false, SystemTime::UNIX_EPOCH)
+    };
+    let twin = lines_with(TWIN).join("\n");
+    let wide = lines_with(WIDE).join("\n");
+    assert!(twin.contains(TWIN), "the twin row renders the twin: {twin}");
+    assert_eq!(wide, twin.replace(TWIN, WIDE));
+}
+
+/// A `--live` cwd is any path the session ran in, so its column sizes and
+/// pads by drawn cells: the tag after a wide-script cwd starts at the same
+/// column on every row.
+#[test]
+fn a_wide_script_live_cwd_keeps_the_tag_column_aligned() {
+    let row = |sid: &str, ago_secs: u64, cwd: &str| crate::live_sessions::LiveSession {
+        cwd: Some(std::path::PathBuf::from(cwd)),
+        background: true,
+        ..live_fixture_row(sid, "cld1", ago_secs)
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        live_lines_of(
+            &[row("100-0", 60, "/w/漢字"), row("200-0", 120, "/w/abc")],
+            now
+        ),
+        [
+            "100-0  cld1  claude  1m ago  -  /w/漢字  background",
+            "200-0  cld1  claude  2m ago  -  /w/abc   background",
+        ]
+    );
+}
+
 /// A 5-char stem pads to the id floor of 8, the `-` profile to 12.
 #[test]
 fn a_table_with_no_wide_cell_keeps_the_floor_widths() {
@@ -1118,6 +1177,7 @@ fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -1140,10 +1200,7 @@ fn resume_refuses_an_explicit_disabled_profile_before_any_spawn() {
 
     let err =
         run_resume("known-session", Some("off")).expect_err("a disabled target must be refused");
-    assert_eq!(
-        err.to_string(),
-        "'off': account is disabled, run `clauth enable off`"
-    );
+    assert_eq!(err.to_string(), "'off': account is disabled");
     assert!(
         !sb.home().join(".clauth/profiles/off/runtime").exists(),
         "the refusal must happen before any runtime is acquired"
@@ -1239,6 +1296,7 @@ fn add_keyed_profile(name: &str) {
         Some("https://api.example.internal".to_string()),
         Some("sk-test-not-a-real-key".to_string()),
         Default::default(),
+        None,
     )
     .expect("create keyed profile");
 }
@@ -1253,8 +1311,8 @@ fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
         let err = run_switch(sid, "work").expect_err("an unknown sid must be refused");
         assert_eq!(
             err.to_string(),
-            format!("no live session '{sid}'\nsee `clauth sessions --live`"),
-            "the refusal names the sid and the listing verb"
+            format!("no live session '{sid}'\nsee `clauth switch --list`"),
+            "the refusal names the sid and the listing of what switch accepts"
         );
         assert!(
             err.downcast_ref::<crate::UsageError>().is_none(),
@@ -1276,7 +1334,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
     let err = run_switch("work", "spare").expect_err("a profile name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'work'\nsee `clauth sessions --live`\nto switch the global account: `clauth switch work`"
+        "no live session 'work'\nsee `clauth switch --list`\nto switch the global account: `clauth switch work`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1293,7 +1351,7 @@ fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() 
     let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
     assert_eq!(
         err.to_string(),
-        "no live session 'cx'\nsee `clauth sessions --live`\nto switch the global account: `clauth switch cx`"
+        "no live session 'cx'\nsee `clauth switch --list`\nto switch the global account: `clauth switch cx`"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -1493,12 +1551,152 @@ fn switch_is_a_no_op_for_a_session_already_on_the_profile() {
             .expect("row")
             .intended_member,
         None,
-        "no intent is written for a session already on the profile: the executor \
-         treats an intent equal to the current member as the steady state"
+        "no intent is written for a session already on the profile with no intent \
+         to another account standing: the executor treats an intent equal to the \
+         current member as the steady state"
     );
     assert_eq!(
         already_on_line("4242-0", "work"),
         "clauth: session '4242-0' is already on 'work'"
+    );
+}
+
+/// An intent that already names the account the session runs is the steady
+/// state, not a standing move: switching onto that account stays the
+/// `already on` no-op and leaves the intent as it was.
+#[test]
+fn switch_onto_the_current_account_with_an_equal_intent_is_a_no_op() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    crate::live_sessions::update_as_daemon("4242-0", |d| d.set_intended_member("work"))
+        .expect("seed an intent equal to the current account");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "work").expect("already-on is a satisfied ask");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", already_on_line("4242-0", "work")),
+        "an intent equal to the current account is no move to replace"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("work"),
+        "the no-op leaves the intent as it was"
+    );
+}
+
+/// A switch back onto the account a session runs, while an earlier switch away
+/// still waits for the executor, replaces that intent: it is no `already on`
+/// no-op, or the session lands on the account the earlier switch named.
+#[test]
+fn a_switch_back_replaces_a_standing_intent() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    run_switch("4242-0", "spare").expect("the first switch");
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "fixture control: the first switch's intent stands"
+    );
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "work").expect("the switch back");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", switch_receipt("4242-0", "work")),
+        "the switch back prints the move receipt, never `already on`"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("work"),
+        "the switch back replaces the intent it found"
+    );
+}
+
+/// A session that moved off its launch account, as the executor leaves it.
+fn moved_live_row(sid: &str, start: &str, current: &str, intent: &str) -> std::fs::File {
+    let mut row = live_fixture_row(sid, start, 60);
+    row.current_member = Some(current.to_string());
+    row.visited_members = vec![start.to_string(), current.to_string()];
+    row.intended_member = Some(intent.to_string());
+    register_live(&row, current)
+}
+
+/// The no-op reads the account the session runs, never its launch account: a
+/// moved session with a move back to its launch account standing is no
+/// `already on` no-op when switched onto the account it runs.
+#[test]
+fn a_switch_back_on_a_moved_session_replaces_a_move_to_its_launch_account() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = moved_live_row("4242-0", "work", "spare", "work");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "spare").expect("the switch back");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", switch_receipt("4242-0", "spare")),
+        "the switch back prints the move receipt, never `already on`"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "the switch back replaces the move to the launch account"
+    );
+}
+
+/// A moved session's steady state (an intent equal to the account it runs)
+/// stays the `already on` no-op when switched onto that account.
+#[test]
+fn switch_onto_a_moved_sessions_current_account_is_a_no_op() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = moved_live_row("4242-0", "work", "spare", "spare");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "spare").expect("already-on is a satisfied ask");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", already_on_line("4242-0", "spare")),
+        "an intent equal to the account a moved session runs is no move to replace"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "the no-op leaves the intent as it was"
     );
 }
 
@@ -2176,4 +2374,1152 @@ fn live_rows_find_a_background_rows_record_in_the_background_tree() {
         crate::session_record::live_record(row).map(|r| r.session_id),
         Some("cccccccc-3333-4333-8333-cccccccccccc".to_string()),
     );
+}
+
+/// The `--live` table pads its account and cwd columns by terminal cells: a CJK
+/// account and cwd keep the tag column on one screen column across rows.
+#[test]
+fn a_cjk_live_account_and_cwd_keep_the_tag_column_aligned() {
+    let _sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    // 14_000_000 s ago pins `started_at` at 1_786_000_000_000 ms, after `now`,
+    // so both rows age as `just now`.
+    let row = |sid: &str, account: &str, cwd: &str| {
+        let mut r = live_fixture_row(sid, account, 14_000_000);
+        r.cwd = Some(std::path::PathBuf::from(cwd));
+        r.is_delegate = true;
+        r
+    };
+
+    let lines = live_lines_of(
+        &[
+            row("s-cjk", "漢字", "/ws/漢字"),
+            row("s-asc", "ascii-prof", "/ws/ascii-project"),
+        ],
+        now,
+    );
+
+    // ACCOUNT 10 cells, CWD 17 cells; the age is `just now` on both rows.
+    assert_eq!(
+        lines[0],
+        format!(
+            "s-cjk  漢字{}  claude  just now  -  /ws/漢字{}  delegate",
+            " ".repeat(6),
+            " ".repeat(9)
+        ),
+        "the CJK account or cwd overruns its column"
+    );
+    assert_eq!(
+        lines[1], "s-asc  ascii-prof  claude  just now  -  /ws/ascii-project  delegate",
+        "the ASCII row pads the CJK columns' widths"
+    );
+}
+
+// ── clauth switch --list ──
+
+/// Claude Code's own record for `pid`, carrying the session's name and status
+/// beside its transcript, the two cells `switch --list` reads off the record.
+fn seed_cc_record_named(sb: &HomeSandbox, pid: u32, transcript: &str, name: &str, status: &str) {
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        json!({ "sessionId": transcript, "pid": pid, "name": name, "status": status }).to_string(),
+    )
+    .unwrap();
+}
+
+/// The live roster of [`seed_live_roster`] with the two cells only
+/// `switch --list` shows: `100-0` named by its record, and `400-0` (the
+/// delegate) carrying a pending move to `D3` its executor has not made yet.
+fn seed_switch_roster(sb: &HomeSandbox) -> Vec<std::fs::File> {
+    let held = seed_live_roster(sb);
+    seed_cc_record_named(
+        sb,
+        7001,
+        "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+        "fix-auth",
+        "busy",
+    );
+    crate::live_sessions::update_as_daemon("400-0", |fields| {
+        fields.set_intended_member("D3");
+    })
+    .expect("record the pending move");
+    held
+}
+
+/// Only the rows `clauth switch <sid> <profile>` accepts print, newest first:
+/// the codex row (300-1), the background row (500-0), the dead row, the
+/// daemon's background hold and the torn file never do. Columns: sid, account
+/// (`start → current` once moved), pending move, the record's name, cwd, age,
+/// and the `delegate` tag; `-` fills an absent cell.
+#[test]
+fn switch_list_prints_only_the_rows_switch_accepts() {
+    let sb = HomeSandbox::new();
+    let _held = seed_switch_roster(&sb);
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        switch_list_lines(now),
+        [
+            "400-0  D1           → D3  -         /w/d  3m ago   delegate",
+            "200-0  cld1         -     -         -     12m ago",
+            "100-0  cld1 → cld2  -     fix-auth  /w/a  2h ago",
+        ]
+    );
+}
+
+/// A pending move equal to the account the session already runs is the
+/// executor's steady state, never a move: the cell stays `-`.
+#[test]
+fn switch_list_shows_no_pending_move_onto_the_current_account() {
+    let sb = HomeSandbox::new();
+    let _held = seed_switch_roster(&sb);
+    crate::live_sessions::update_as_daemon("100-0", |fields| {
+        fields.set_intended_member("cld2");
+    })
+    .expect("record an intent equal to the current member");
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    let lines = switch_list_lines(now);
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("100-0  cld1 → cld2  -     fix-auth  /w/a  2h ago")
+    );
+}
+
+/// `--json` carries the same rows in the `sessions --live --json` shape, plus
+/// the pending move, the record's name, its transcript id and its status;
+/// absent cells are `null`.
+#[test]
+fn switch_list_json_carries_the_same_rows_with_the_record_cells() {
+    let sb = HomeSandbox::new();
+    let _held = seed_switch_roster(&sb);
+
+    assert_eq!(
+        switch_list_json(),
+        json!([
+            {
+                "sid": "400-0",
+                "start_profile": "D1",
+                "current_profile": "D1",
+                "pending_profile": "D3",
+                "harness": "claude",
+                "name": null,
+                "cwd": "/w/d",
+                "started_at": "2027-01-15T07:57:00+00:00",
+                "transcript_id": "dddddddd-4444-4444-8444-dddddddddddd",
+                "status": null,
+                "delegate": true,
+                "background": false,
+            },
+            {
+                "sid": "200-0",
+                "start_profile": "cld1",
+                "current_profile": "cld1",
+                "pending_profile": null,
+                "harness": "claude",
+                "name": null,
+                "cwd": null,
+                "started_at": "2027-01-15T07:48:00+00:00",
+                "transcript_id": null,
+                "status": null,
+                "delegate": false,
+                "background": false,
+            },
+            {
+                "sid": "100-0",
+                "start_profile": "cld1",
+                "current_profile": "cld2",
+                "pending_profile": null,
+                "harness": "claude",
+                "name": "fix-auth",
+                "cwd": "/w/a",
+                "started_at": "2027-01-15T06:00:00+00:00",
+                "transcript_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+                "status": "busy",
+                "delegate": false,
+                "background": false,
+            },
+        ])
+    );
+}
+
+/// Nothing switchable running is the listing's empty case: exit 1 with a named
+/// error, the same scripting contract as `sessions --live`, even while
+/// sessions `switch` refuses (codex, background) run.
+#[test]
+fn switch_list_with_nothing_switchable_is_a_named_error() {
+    let _sb = HomeSandbox::new();
+    let mut codex = live_fixture_row("300-1", "cx0", 240);
+    codex.harness = crate::harness::Harness::Codex;
+    let _codex = register_live(&codex, "cx0");
+    let mut background = live_fixture_row("500-0", "cld1", 60);
+    background.background = true;
+    let _background = register_live(&background, "cld1");
+
+    for json in [false, true] {
+        let err = run_switch_list(json).expect_err("no switchable session is an error");
+        assert_eq!(err.to_string(), "no session clauth can switch is running");
+        assert_eq!(crate::exit_code(Err(err)), 1);
+    }
+}
+
+/// The stderr note on plain `claude` sessions the listing leaves out: none for
+/// zero, singular for one, plural above.
+#[test]
+fn the_plain_claude_note_counts_the_omitted_sessions() {
+    assert_eq!(plain_claude_note(0), None);
+    assert_eq!(
+        plain_claude_note(1).as_deref(),
+        Some(
+            "1 claude session not listed: switch can only move sessions started with `clauth start`"
+        )
+    );
+    assert_eq!(
+        plain_claude_note(2).as_deref(),
+        Some(
+            "2 claude sessions not listed: switch can only move sessions started with `clauth start`"
+        )
+    );
+}
+
+/// This process's own start time as `/proc/self/stat` field 22 spells it, the
+/// value Claude Code writes into a record's `procStart`.
+#[cfg(target_os = "linux")]
+fn own_proc_start() -> String {
+    let stat = fs::read_to_string("/proc/self/stat").unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+    after_comm.split_whitespace().nth(19).unwrap().to_string()
+}
+
+/// A running Claude Code whose record no registry row joins is a plain
+/// `claude` session: it counts. A record whose process start does not match
+/// (a dead or recycled pid), or one a live row already names, does not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_claude_no_row_names_counts_as_plain() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let me = std::process::id();
+    fs::write(
+        dir.join(format!("{me}.json")),
+        json!({
+            "sessionId": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+            "pid": me,
+            "procStart": own_proc_start(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("1.json"),
+        json!({ "sessionId": "ffffffff-6666-4666-8666-ffffffffffff", "pid": 1, "procStart": "0" })
+            .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(plain_claude_count(), 1);
+
+    // The same running process named by a live `clauth start` row is that
+    // session, not a plain one.
+    let mut row = live_fixture_row("910-0", "cld1", 30);
+    row.claude_pid = Some(me);
+    let _held = register_live(&row, "cld1");
+    assert_eq!(plain_claude_count(), 0);
+}
+
+/// Writes a record for this running process under the global
+/// `~/.claude/sessions`, naming conversation `transcript`.
+#[cfg(target_os = "linux")]
+fn seed_own_running_record(sb: &HomeSandbox, transcript: &str) {
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let me = std::process::id();
+    fs::write(
+        dir.join(format!("{me}.json")),
+        json!({ "sessionId": transcript, "pid": me, "procStart": own_proc_start() }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A delegate's row names its Claude Code process by the row's own `pid` (its
+/// `claude_pid` stays unset), so its record is that session, not a plain one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_delegate_row_names_its_record_by_the_rows_own_pid() {
+    let sb = HomeSandbox::new();
+    seed_own_running_record(&sb, "eeeeeeee-5555-4555-8555-eeeeeeeeeeee");
+    assert_eq!(plain_claude_count(), 1);
+
+    let mut delegate = live_fixture_row("920-0", "D1", 30);
+    delegate.is_delegate = true;
+    delegate.pid = std::process::id();
+    let _held = register_live(&delegate, "D1");
+    assert_eq!(plain_claude_count(), 0);
+}
+
+/// A `clauth start <p> -- --bg` job writes its record into the GLOBAL
+/// `~/.claude/sessions` under a pid no live row names; the job store ties its
+/// conversation to a clauth runtime tree, so it is a clauth session and never
+/// counts as plain. A `--bg` job on a config dir of the user's own (outside
+/// clauth's profiles) is still a plain `claude` session.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clauth_background_jobs_record_is_not_a_plain_session() {
+    let sb = HomeSandbox::new();
+    let transcript = "aaaaaaaa-0a6e-4b11-883e-fca3a218ae52";
+    seed_own_running_record(&sb, transcript);
+
+    let tree = sb
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("cld1")
+        .join("runtime-4242-0");
+    fs::create_dir_all(&tree).unwrap();
+    let job = crate::testutil::write_claude_job(sb.home(), "aaaaaaaa", &tree);
+    assert_eq!(plain_claude_count(), 0);
+
+    fs::remove_dir_all(&job).unwrap();
+    let own = sb.home().join("my-claude-config");
+    fs::create_dir_all(&own).unwrap();
+    crate::testutil::write_claude_job(sb.home(), "aaaaaaaa", &own);
+    assert_eq!(plain_claude_count(), 1);
+}
+
+/// A profile dir may be a symlink to a dir elsewhere; a `--bg` job on a
+/// runtime tree under it is still a clauth session, never plain.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_job_under_a_symlinked_profile_dir_is_not_a_plain_session() {
+    let sb = HomeSandbox::new();
+    seed_own_running_record(&sb, "aaaaaaaa-0a6e-4b11-883e-fca3a218ae52");
+
+    let real = sb.home().join("elsewhere").join("cld1");
+    fs::create_dir_all(real.join("runtime-4242-0")).unwrap();
+    let profiles = sb.home().join(".clauth").join("profiles");
+    fs::create_dir_all(&profiles).unwrap();
+    std::os::unix::fs::symlink(&real, profiles.join("cld1")).unwrap();
+    let tree = profiles.join("cld1").join("runtime-4242-0");
+    crate::testutil::write_claude_job(sb.home(), "aaaaaaaa", &tree);
+
+    assert_eq!(plain_claude_count(), 0);
+}
+
+/// A `claude` whose record sits under a pid no row names, but whose parent is
+/// a live row's process (a launcher whose `claude_pid` write failed, or a
+/// `claude` run from a clauth session's own shell), belongs to that session:
+/// the same ancestor join the scheduler's credit attribution makes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_record_whose_parent_a_live_row_holds_is_not_a_plain_session() {
+    let sb = HomeSandbox::new();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a child to pose the session's claude");
+    let child_pid = child.id();
+    let stat = fs::read_to_string(format!("/proc/{child_pid}/stat")).unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+    let proc_start = after_comm.split_whitespace().nth(19).unwrap().to_string();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{child_pid}.json")),
+        json!({
+            "sessionId": "cccccccc-7777-4777-8777-cccccccccccc",
+            "pid": child_pid,
+            "procStart": proc_start,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let unjoined = plain_claude_count();
+
+    let mut row = live_fixture_row("930-0", "cld1", 30);
+    row.pid = std::process::id();
+    let _held = register_live(&row, "cld1");
+    let joined = plain_claude_count();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(unjoined, 1, "no row holds the child or its parent yet");
+    assert_eq!(joined, 0, "the row holding the parent claims the child");
+}
+
+/// A codex session is no Claude Code session: a plain `claude` run under a
+/// codex row's process records into `~/.claude/sessions` like any other and
+/// still counts as plain.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_record_under_a_codex_rows_process_still_counts_as_plain() {
+    let sb = HomeSandbox::new();
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a child to pose the plain claude");
+    let child_pid = child.id();
+    let stat = fs::read_to_string(format!("/proc/{child_pid}/stat")).unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+    let proc_start = after_comm.split_whitespace().nth(19).unwrap().to_string();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{child_pid}.json")),
+        json!({
+            "sessionId": "cccccccc-8888-4888-8888-cccccccccccc",
+            "pid": child_pid,
+            "procStart": proc_start,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut codex = live_fixture_row("940-1", "cx0", 30);
+    codex.harness = crate::harness::Harness::Codex;
+    codex.pid = std::process::id();
+    let _held = register_live(&codex, "cx0");
+    let counted = plain_claude_count();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(counted, 1, "a codex row claims no claude");
+}
+
+/// A job store whose records cannot be read (one unparseable `state.json`)
+/// says nothing about which tree runs the conversation, so the record keeps
+/// counting as plain rather than vanishing from the note.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreadable_job_store_keeps_a_record_counting_as_plain() {
+    let sb = HomeSandbox::new();
+    seed_own_running_record(&sb, "aaaaaaaa-0a6e-4b11-883e-fca3a218ae52");
+    let tree = sb
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("cld1")
+        .join("runtime-4242-0");
+    fs::create_dir_all(&tree).unwrap();
+    let job = crate::testutil::write_claude_job(sb.home(), "aaaaaaaa", &tree);
+    fs::write(job.join("state.json"), b"{ not json").unwrap();
+
+    assert_eq!(plain_claude_count(), 1);
+}
+
+/// An adopted `--with-fallback` session (the daemon's background hold on a
+/// chain-following row, not a fixed-background one) is one `switch` accepts,
+/// so the listing shows it.
+#[test]
+fn switch_list_shows_an_adopted_chain_session() {
+    let _sb = HomeSandbox::new();
+    let mut adopted = live_fixture_row("450-0", "cld1", 90);
+    adopted.follows_chain = true;
+    adopted.background_hold = true;
+    let _held = register_live(&adopted, "cld1");
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(switch_list_lines(now), ["450-0  cld1  -  -  -  1m ago"]);
+}
+
+/// Columns are padded by the cells a terminal draws, so a wide-script name
+/// keeps every later column aligned.
+#[test]
+fn switch_list_aligns_columns_past_a_wide_script_name() {
+    let sb = HomeSandbox::new();
+    let mut wide = live_fixture_row("111-0", "cld1", 480);
+    wide.claude_pid = Some(7101);
+    wide.cwd = Some(std::path::PathBuf::from("/w/a"));
+    let _wide = register_live(&wide, "cld1");
+    seed_cc_record_named(
+        &sb,
+        7101,
+        "11111111-1111-4111-8111-111111111111",
+        "模型漢字",
+        "idle",
+    );
+    let mut narrow = live_fixture_row("222-0", "cld1", 540);
+    narrow.claude_pid = Some(7102);
+    narrow.cwd = Some(std::path::PathBuf::from("/w/b"));
+    let _narrow = register_live(&narrow, "cld1");
+    seed_cc_record_named(
+        &sb,
+        7102,
+        "22222222-2222-4222-8222-222222222222",
+        "abc",
+        "idle",
+    );
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(LIVE_NOW_SECS);
+    assert_eq!(
+        switch_list_lines(now),
+        [
+            "111-0  cld1  -  模型漢字  /w/a  8m ago",
+            "222-0  cld1  -  abc       /w/b  9m ago",
+        ]
+    );
+}
+
+/// `run_switch_list` itself: rows (table or JSON) go to stdout alone, the
+/// plain-session note to stderr alone, and with nothing switchable the note
+/// still prints before the error.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_switch_list_splits_rows_and_note_across_the_streams() {
+    let note =
+        "1 claude session not listed: switch can only move sessions started with `clauth start`\n";
+    let sb = HomeSandbox::new();
+    let _held = seed_switch_roster(&sb);
+    seed_own_running_record(&sb, "eeeeeeee-5555-4555-8555-eeeeeeeeeeee");
+
+    for json in [false, true] {
+        let out = crate::out::OutCapture::new();
+        let err = crate::out::ErrCapture::new();
+        let before = SystemTime::now();
+        {
+            let _out = out.capture_here();
+            let _err = err.capture_here();
+            run_switch_list(json).expect("switchable rows list");
+        }
+        let stdout = String::from_utf8(out.snapshot()).unwrap();
+        if json {
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+            assert_eq!(parsed, switch_list_json());
+            assert!(
+                stdout.ends_with("]\n"),
+                "one JSON document, then a newline: {stdout:?}"
+            );
+        } else {
+            // The run read the clock between `before` and now; an age that
+            // crossed a boundary in that span matches one of the two tables.
+            let table_at = |now| format!("{}\n", switch_list_lines(now).join("\n"));
+            assert!(
+                stdout == table_at(before) || stdout == table_at(SystemTime::now()),
+                "stdout is the table: {stdout:?}"
+            );
+        }
+        assert_eq!(String::from_utf8(err.snapshot()).unwrap(), note);
+    }
+}
+
+/// Claude Code retyping a record's `name` or `status` (a number, an array, a
+/// null, an empty string) loses no row and prints no empty cell: the transcript
+/// id stays and both cells read as absent.
+#[test]
+fn switch_list_reads_a_retyped_name_and_status_as_absent() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude").join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let mut held = Vec::new();
+    for (sid, pid, name, status) in [
+        ("100-0", 7401, json!(7), json!({ "busy": true })),
+        ("200-0", 7402, json!(null), json!([1, 2])),
+        ("300-0", 7403, json!(""), json!("")),
+    ] {
+        let mut row = live_fixture_row(sid, "cld1", 60);
+        row.claude_pid = Some(pid);
+        held.push(register_live(&row, "cld1"));
+        fs::write(
+            dir.join(format!("{pid}.json")),
+            json!({
+                "sessionId": format!("{pid}0000-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                "pid": pid,
+                "name": name,
+                "status": status,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    let listed = switch_list_json();
+    let mut cells: Vec<(
+        &str,
+        &serde_json::Value,
+        &serde_json::Value,
+        &serde_json::Value,
+    )> = listed
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| {
+            (
+                row["sid"].as_str().expect("sid"),
+                &row["transcript_id"],
+                &row["name"],
+                &row["status"],
+            )
+        })
+        .collect();
+    cells.sort_by_key(|cell| cell.0);
+    let absent = json!(null);
+    assert_eq!(
+        cells,
+        [
+            (
+                "100-0",
+                &json!("74010000-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                &absent,
+                &absent
+            ),
+            (
+                "200-0",
+                &json!("74020000-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                &absent,
+                &absent
+            ),
+            (
+                "300-0",
+                &json!("74030000-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                &absent,
+                &absent
+            ),
+        ]
+    );
+}
+
+/// A plain `claude --bg` on `~/.claude` records its job in the global store
+/// with no `CLAUDE_CONFIG_DIR` of its own: no clauth tree runs it, so it counts.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_background_job_on_the_global_config_dir_is_a_plain_session() {
+    let sb = HomeSandbox::new();
+    seed_own_running_record(&sb, "aaaaaaaa-0a6e-4b11-883e-fca3a218ae52");
+    let job = crate::testutil::write_claude_job(sb.home(), "aaaaaaaa", sb.home());
+    let state = job.join("state.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    record
+        .as_object_mut()
+        .expect("a job record is an object")
+        .remove("providerEnv");
+    fs::write(&state, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    assert_eq!(plain_claude_count(), 1);
+}
+
+/// With nothing switchable, `run_switch_list` prints the plain-session note on
+/// stderr, nothing on stdout, and returns the named error.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_switch_list_notes_plain_sessions_before_the_empty_error() {
+    let note =
+        "1 claude session not listed: switch can only move sessions started with `clauth start`\n";
+    let sb = HomeSandbox::new();
+    let mut codex = live_fixture_row("300-1", "cx0", 240);
+    codex.harness = crate::harness::Harness::Codex;
+    let _codex = register_live(&codex, "cx0");
+    seed_own_running_record(&sb, "eeeeeeee-5555-4555-8555-eeeeeeeeeeee");
+
+    for json in [false, true] {
+        let out = crate::out::OutCapture::new();
+        let err = crate::out::ErrCapture::new();
+        let result = {
+            let _out = out.capture_here();
+            let _err = err.capture_here();
+            run_switch_list(json)
+        };
+        let e = result.expect_err("nothing switchable is an error");
+        assert_eq!(e.to_string(), "no session clauth can switch is running");
+        assert!(out.snapshot().is_empty(), "stdout stays empty");
+        assert_eq!(String::from_utf8(err.snapshot()).unwrap(), note);
+    }
+}
+
+/// The plain-session note is a footer: through one buffer both streams write
+/// into, it lands after every row, table or JSON.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_switch_list_prints_the_plain_session_note_after_the_rows() {
+    let note =
+        "1 claude session not listed: switch can only move sessions started with `clauth start`\n";
+    let sb = HomeSandbox::new();
+    let _held = seed_switch_roster(&sb);
+    seed_own_running_record(&sb, "eeeeeeee-5555-4555-8555-eeeeeeeeeeee");
+
+    for json in [false, true] {
+        let both = crate::out::OutCapture::new();
+        let err = crate::out::ErrCapture::interleaved_with(&both);
+        let before = SystemTime::now();
+        {
+            let _out = both.capture_here();
+            let _err = err.capture_here();
+            run_switch_list(json).expect("switchable rows list");
+        }
+        let written = String::from_utf8(both.snapshot()).unwrap();
+        let rows = written
+            .strip_suffix(note)
+            .unwrap_or_else(|| panic!("the note is the last line (json: {json}): {written:?}"));
+        if json {
+            let parsed: serde_json::Value = serde_json::from_str(rows).expect("rows are JSON");
+            assert_eq!(parsed, switch_list_json());
+        } else {
+            let table_at = |now| format!("{}\n", switch_list_lines(now).join("\n"));
+            assert!(
+                rows == table_at(before) || rows == table_at(SystemTime::now()),
+                "the rows are the table: {rows:?}"
+            );
+        }
+    }
+}
+
+// ── `clauth resume --with-fallback` ─────────────────────────────────────────
+
+#[test]
+fn resume_parses_with_fallback() {
+    use clap::Parser as _;
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "resume", "sid", "--with-fallback"])
+        .expect("the flag parses");
+    match cli.command {
+        Some(crate::cli::Command::Resume {
+            target,
+            with_fallback,
+            ..
+        }) => {
+            assert_eq!(target, "sid");
+            assert!(with_fallback);
+        }
+        other => panic!("expected resume, got {other:?}"),
+    }
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "resume", "sid"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(crate::cli::Command::Resume {
+            with_fallback: false,
+            ..
+        })
+    ));
+}
+
+/// The eligible base: OAuth, a chain member, and a second member to move to.
+fn chain_config(name: &str) -> crate::profile::AppConfig {
+    crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            fallback_chain: vec![name.into(), "spare".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![
+            crate::profile::Profile::new(name.to_string(), None, None),
+            crate::profile::Profile::new("spare".to_string(), None, None),
+        ],
+    }
+}
+
+fn degraded(profile: &str, clause: &str) -> ChainOptIn {
+    ChainOptIn::Degraded(format!(
+        "clauth: resumed pinned to '{profile}', not following the fallback chain: {clause}. \
+         This prompt was not sent: submit it again to continue on '{profile}'."
+    ))
+}
+
+/// A restore never fails over the chain: an ineligible account resumes pinned,
+/// with the approved notice copy naming why.
+#[test]
+fn an_ineligible_chain_resume_degrades_to_pinned_with_its_reason() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let name = crate::profile::ProfileName::from("original");
+
+    let mut outside = chain_config("original");
+    outside.state.fallback_chain = vec!["spare".into(), "other".into()];
+    assert_eq!(
+        resume_chain_opt_in(&outside, &name, true),
+        degraded(
+            "original",
+            "'original' is no longer a fallback-chain member"
+        )
+    );
+
+    let mut alone = chain_config("original");
+    alone.state.fallback_chain = vec!["original".into()];
+    assert_eq!(
+        resume_chain_opt_in(&alone, &name, true),
+        degraded(
+            "original",
+            "the fallback chain has no second account to move to"
+        )
+    );
+
+    let mut keyed = chain_config("original");
+    keyed.profiles[0] = crate::profile::Profile::new(
+        "original".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-test".to_string()),
+    );
+    assert_eq!(
+        resume_chain_opt_in(&keyed, &name, true),
+        degraded("original", "'original' is no longer an OAuth account")
+    );
+}
+
+/// The eligible twin follows the chain (or, on a host that cannot swap, names
+/// that clause), and no ask means no chain and no notice.
+#[test]
+fn an_eligible_chain_resume_follows_the_chain() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let name = crate::profile::ProfileName::from("original");
+    let config = chain_config("original");
+    assert_eq!(resume_chain_opt_in(&config, &name, false), ChainOptIn::Off);
+    let verdict = resume_chain_opt_in(&config, &name, true);
+    match crate::runtime::unsupported_swap_transport(&name).expect("probe the transport") {
+        None => assert_eq!(verdict, ChainOptIn::Follow),
+        Some(_) => assert!(
+            matches!(&verdict, ChainOptIn::Degraded(text)
+                if text.starts_with("clauth: resumed pinned to 'original', not following the fallback chain: this host cannot swap credentials (")),
+            "{verdict:?}"
+        ),
+    }
+}
+
+/// At boot herdr can restore a pane before the daemon is up. That gate alone
+/// keeps the chain: the session follows it once `clauth daemon` runs, never a
+/// pinned degrade.
+#[test]
+fn a_chain_resume_before_the_daemon_runs_keeps_the_chain() {
+    let _sb = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("original");
+    let verdict = resume_chain_opt_in(&chain_config("original"), &name, true);
+    match crate::runtime::unsupported_swap_transport(&name).expect("probe the transport") {
+        None => assert_eq!(verdict, ChainOptIn::FollowAwaitingDaemon),
+        Some(_) => assert!(matches!(verdict, ChainOptIn::Degraded(_)), "{verdict:?}"),
+    }
+}
+
+// ── the `--with-fallback` restore arms drive a real spawn ───────────────────
+//
+// `resume_chain_opt_in` above is pure; these drive `run_resume_with` through
+// the repo's claude shims so the arm that acts on its verdict is pinned too.
+// The degrade rig is an account the chain cannot hold, so its launch proves the
+// chain went OFF: had the arm kept it on, `start::run` would have refused
+// before spawning. The no-daemon rig is chain-eligible with nobody holding the
+// daemon lock, so its launch proves the soft gate, and the live row read
+// MID-spawn proves the chain stayed ON.
+
+/// A resumable session `known-session` whose recorded workspace exists, with
+/// `profiles` persisted and `chain` as the stored fallback chain.
+#[cfg(unix)]
+fn resume_with_fallback_rig(sb: &HomeSandbox, profiles: &[&str], chain: &[&str]) {
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    seed_profiles(profiles, &[]);
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.fallback_chain = chain.iter().map(|n| (*n).into()).collect();
+    crate::profile::save_app_state(&state).expect("save app state");
+
+    let workspace = sb.home().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let path = claude.join("projects/-w/known-session.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "known-session",
+            &workspace.to_string_lossy(),
+            "hi",
+        )],
+    );
+}
+
+/// Whether a chain-eligible account can follow the chain on this host at all.
+/// A copy host cannot swap credentials, so every chain-on restore degrades
+/// there and the no-daemon arms are unreachable.
+#[cfg(unix)]
+fn chain_host_supported() -> bool {
+    crate::runtime::unsupported_swap_transport(&crate::profile::ProfileName::from("original"))
+        .expect("probe the transport")
+        .is_none()
+}
+
+/// The one shim call that launched the resumed conversation.
+#[cfg(unix)]
+fn resume_spawns(fake: &crate::testutil::FakeClaude<'_>) -> Vec<String> {
+    fake.spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == "--resume"))
+        .map(|(_, argv)| argv)
+        .collect()
+}
+
+/// A hard chain refusal degrades to pinned: the launch still happens, with the
+/// chain off (a chain-on launch of this account refuses before any spawn),
+/// and the notice rides the launched claude's own env, naming the
+/// conversation and this launcher, never the shared record: a launcher killed
+/// mid-session (a closed terminal's SIGHUP) leaves nothing behind there for a
+/// later process of the conversation to be refused with.
+#[cfg(unix)]
+#[test]
+fn a_degraded_resume_hands_its_claude_the_notice_and_spawns_pinned() {
+    let sb = HomeSandbox::new();
+    // OAuth, but not a fallback-chain member.
+    resume_with_fallback_rig(&sb, &["original"], &[]);
+    let ChainOptIn::Degraded(notice) = degraded(
+        "original",
+        "'original' is no longer a fallback-chain member",
+    ) else {
+        panic!("the fixture clause must build a degrade notice");
+    };
+
+    // The slow shim keeps the resumed child alive for the observation, and the
+    // live row exists only while that child is alive (teardown unregisters it):
+    // waiting for the row, then reading the record, reads it MID-spawn.
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let record_path = crate::hook_note::record_path("known-session", None).expect("record path");
+    // The shim records its own pid; its argv and env, read while it runs, are
+    // what the resume really spawned.
+    let pid_file = sb.home().join(".slow-claude.pid");
+    let observer = std::thread::spawn(move || {
+        let seen = crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "original",
+            Duration::from_secs(20),
+        );
+        let record_notice =
+            crate::hook_note::load_record(&record_path).and_then(|r| r.restore_notice);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut argv: Vec<String> = Vec::new();
+        let mut environ: Vec<String> = Vec::new();
+        while argv.is_empty() && std::time::Instant::now() < deadline {
+            let pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok());
+            argv = pid
+                .and_then(crate::runtime::process_argv)
+                .map(|words| {
+                    words
+                        .into_iter()
+                        .map(|w| String::from_utf8_lossy(&w).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            environ = pid
+                .and_then(crate::runtime::process_environ)
+                .map(|bytes| {
+                    bytes
+                        .split(|b| *b == 0)
+                        .map(|w| String::from_utf8_lossy(w).into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if argv.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        (!seen.is_empty(), record_notice, argv, environ)
+    });
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a degrade must resume pinned, not refuse");
+    drop(guard);
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+
+    let (live, record_notice, spawned, environ) = observer.join().expect("observer thread");
+    drop(shim);
+
+    assert!(live, "the resumed conversation was observed alive");
+    assert_eq!(
+        record_notice, None,
+        "nothing is armed on the shared record while the resume runs"
+    );
+    // macOS hides a platform binary's env (the `/bin/sh` shim) from its
+    // reader, so the env half is read on linux.
+    #[cfg(target_os = "linux")]
+    {
+        let notice_entry = format!("{}={notice}", crate::hook_resume::DEGRADE_NOTICE_ENV);
+        let marker_entry = format!(
+            "{}=known-session:{}",
+            crate::hook_resume::DEGRADE_MARKER_ENV,
+            std::process::id()
+        );
+        assert!(
+            environ.contains(&notice_entry),
+            "the launched claude carries the notice in its env"
+        );
+        assert!(
+            environ.contains(&marker_entry),
+            "the launched claude's env names the conversation and this launcher"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (environ, &notice);
+    assert!(
+        spawned
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == "known-session"),
+        "the launch resumes the requested conversation: {spawned:?}"
+    );
+    // At launch no prompt exists yet, so stderr carries the reason alone, never
+    // the refusal's "This prompt was not sent" sentence.
+    let launch_line = "clauth: resumed pinned to 'original', not following the fallback chain: \
+                       'original' is no longer a fallback-chain member.\n";
+    assert_eq!(
+        stderr.matches(launch_line).count(),
+        1,
+        "the degrade reason is said once on stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("This prompt was not sent"),
+        "no prompt exists at launch: {stderr:?}"
+    );
+    assert_eq!(
+        crate::hook_note::load_record(
+            &crate::hook_note::record_path("known-session", None).expect("record path")
+        )
+        .and_then(|r| r.restore_notice),
+        None,
+        "nothing is left on the record once the session ends"
+    );
+}
+
+/// A degraded resume whose claude exits non-zero (a refused resume, a crash, a
+/// signal) exits with that code and leaves no notice on the record for a
+/// later resume's first prompt.
+#[cfg(unix)]
+#[test]
+fn a_degraded_resume_that_exits_nonzero_keeps_the_code() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original"], &[]);
+    let mut fake = crate::testutil::FakeClaude::new(&sb);
+    fake.set_session_exit("3");
+    let code = run_resume_with("known-session", Some("original"), true)
+        .expect("a degrade must resume pinned, not refuse");
+    assert_eq!(code, 3, "clauth exits with the resumed claude's code");
+    assert_eq!(
+        crate::hook_note::load_record(
+            &crate::hook_note::record_path("known-session", None).expect("record path")
+        )
+        .and_then(|r| r.restore_notice),
+        None,
+        "no notice is left on the record"
+    );
+}
+
+/// A restore that beats the daemon up keeps the chain: the launch clears the
+/// soft daemon gate (a strict one would refuse the absent daemon before any
+/// spawn) and prints the wait once.
+#[cfg(unix)]
+#[test]
+fn a_no_daemon_resume_spawns_with_the_chain_on() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original", "spare"], &["original", "spare"]);
+    if !chain_host_supported() {
+        return;
+    }
+    let fake = crate::testutil::FakeClaude::new(&sb);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a no-daemon resume must keep the chain, not refuse");
+    drop(guard);
+
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+    assert!(
+        stderr.contains("clauth: 'original' follows the fallback chain once `clauth daemon` runs"),
+        "the wait is said once on stderr: {stderr:?}"
+    );
+    let spawns = resume_spawns(&fake);
+    assert_eq!(spawns.len(), 1, "one resume launch: {spawns:?}");
+
+    let record = crate::hook_note::load_record(
+        &crate::hook_note::record_path("known-session", None).expect("record path"),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        record.restore_notice, None,
+        "a no-daemon restore keeps the chain, so no prompt is refused"
+    );
+}
+
+/// The chain-on arm hands `follows_chain = true` to the runtime: read off the
+/// live row MID-spawn, which is the only place it is visible (teardown removes
+/// it). The shim keeps the child alive for the read.
+#[cfg(unix)]
+#[test]
+fn a_no_daemon_resume_registers_a_row_that_follows_the_chain() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &["original", "spare"], &["original", "spare"]);
+    if !chain_host_supported() {
+        return;
+    }
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let observer = std::thread::spawn(move || {
+        crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "original" && row.follows_chain,
+            Duration::from_secs(20),
+        )
+    });
+
+    run_resume_with("known-session", Some("original"), true)
+        .expect("a no-daemon resume must keep the chain, not refuse");
+    let seen = observer.join().expect("observer thread");
+    drop(shim);
+
+    assert!(
+        seen.iter()
+            .any(|row| row.start_profile == "original" && row.follows_chain && !row.isolated),
+        "the resume's row must follow the chain ({} rows observed)",
+        seen.len()
+    );
+}
+
+/// A degrade whose launch is then refused (here a disabled account) resumed
+/// nothing, so stderr carries the refusal alone, never the launch line that
+/// says the session resumed pinned.
+#[cfg(unix)]
+#[test]
+fn a_refused_degraded_resume_never_says_it_resumed() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &[], &[]);
+    seed_profiles(&[], &["original"]);
+    let _fake = crate::testutil::FakeClaude::new(&sb);
+
+    let capture = crate::out::ErrCapture::new();
+    let guard = capture.capture_here();
+    let err = run_resume_with("known-session", Some("original"), true)
+        .expect_err("a disabled account refuses the launch");
+    drop(guard);
+    let stderr = String::from_utf8(capture.snapshot()).expect("utf8 stderr");
+    assert!(
+        !stderr.contains("clauth: resumed pinned to 'original'"),
+        "a refused launch claimed a resume: {stderr:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        crate::disabled_account_refusal(&crate::profile::ProfileName::from("original")),
+        "the refusal is the disabled-account one"
+    );
+    assert_eq!(stderr, "", "the refusal is all the caller prints");
+}
+
+/// A degrade whose launch is then refused (here a disabled account) resumed
+/// nothing, so it must leave no notice behind: a later resume of the same
+/// conversation would otherwise have its first prompt refused for a restore
+/// that never happened.
+#[cfg(unix)]
+#[test]
+fn a_refused_degraded_resume_leaves_no_notice() {
+    let sb = HomeSandbox::new();
+    resume_with_fallback_rig(&sb, &[], &[]);
+    seed_profiles(&[], &["original"]);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+
+    run_resume_with("known-session", Some("original"), true)
+        .expect_err("a disabled account refuses the launch");
+
+    let record = crate::hook_note::load_record(
+        &crate::hook_note::record_path("known-session", None).expect("record path"),
+    )
+    .unwrap_or_default();
+    assert_eq!(record.restore_notice, None);
+    assert!(resume_spawns(&fake).is_empty(), "nothing was launched");
 }

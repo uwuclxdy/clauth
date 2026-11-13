@@ -67,20 +67,20 @@ fn serve_claimed(
     serve(stream, hub, event, parked, limits);
 }
 
-/// Serve one `GET /poll` through the real `serve` path with the reader kept
-/// alive, and return the response as a string.
+/// Serve one `GET /poll?<query>` through the real `serve` path with the reader
+/// kept alive, and return the response as a string.
 fn serve_poll_once(
     hub: &Arc<Hub>,
     events: &AtomicUsize,
     parked: &AtomicUsize,
-    session: &str,
+    query: &str,
 ) -> String {
     let (mut a, b) = UnixStream::pair().expect("pair");
     // Set before the peer end is served and dropped: macOS refuses
     // SO_RCVTIMEO (EINVAL) on a socket whose peer already closed.
     a.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
-    a.write_all(format!("GET /poll?session={session} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+    a.write_all(format!("GET /poll?{query} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
         .expect("write request");
     serve_claimed(b, hub, events, parked, Limits::default());
     let mut out = String::new();
@@ -468,6 +468,35 @@ fn the_production_resolver_reads_a_background_rows_tree() {
     assert_eq!(resolved.proc_start, start);
 }
 
+/// A peer no `live_sessions` row joins resolves from the global
+/// `~/.claude/sessions` — the arm a shared tree on a box without the store
+/// takes (SB-3).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_production_resolver_reads_the_global_store_for_an_unjoined_peer() {
+    let _home = HomeSandbox::new();
+    let mut peer = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("the peer child");
+    let peer_pid = peer.id();
+    let start = crate::testutil::proc_start_of(peer_pid).expect("field 22");
+    let sessions = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join(format!("{peer_pid}.json")),
+        format!(r#"{{"sessionId":"4242-0","pid":{peer_pid},"procStart":"{start}"}}"#),
+    )
+    .expect("record");
+    let resolved = production_resolver()(peer_pid).expect("resolve from the global store");
+    let _ = peer.kill();
+    let _ = peer.wait();
+    assert_eq!(resolved.session_id, "4242-0");
+    assert_eq!(resolved.proc_start, start);
+}
+
 /// A peer trickling one byte at a time is cut off at the whole-request
 /// deadline, not at any per-read bound (A#2/A#9).
 #[test]
@@ -760,7 +789,7 @@ fn successful_polls_never_fill_the_cap() {
             ),
             "command {i} refused: a polling mod must never hit the cap"
         );
-        let out = serve_poll_once(&hub, &events, &parked, "s-self");
+        let out = serve_poll_once(&hub, &events, &parked, "session=s-self");
         assert!(out.starts_with("HTTP/1.1 200"), "poll {i}: {out:?}");
     }
 }
@@ -779,7 +808,7 @@ fn a_replaced_instance_drops_a_failed_writes_commands() {
         hub.deliver("s-self", json!({"kind": "prompt", "text": "old"})),
         ModDelivery::Delivered
     ));
-    let PollAnswer { drained, .. } = hub.poll_answer(me, "s-self", Duration::ZERO);
+    let PollAnswer { drained, .. } = hub.poll_answer(me, "s-self", Duration::ZERO, false);
     t.lock().unwrap().insert(me, instance("s-new", "1"));
     start(&hub, me, "s-new");
     hub.requeue(drained.expect("the poll drained the delivered command"));
@@ -806,7 +835,7 @@ fn requeued_commands_go_ahead_of_newer_ones() {
         hub.deliver("s-self", json!({"kind": "prompt", "text": "one"})),
         ModDelivery::Delivered
     ));
-    let PollAnswer { drained, .. } = hub.poll_answer(me, "s-self", Duration::ZERO);
+    let PollAnswer { drained, .. } = hub.poll_answer(me, "s-self", Duration::ZERO, false);
     assert!(matches!(
         hub.deliver("s-self", json!({"kind": "prompt", "text": "two"})),
         ModDelivery::Delivered
@@ -913,4 +942,39 @@ fn idle_peers_hold_the_event_budget_only_until_their_deadline() {
         "the idled-out peers must free the budget so the event is served"
     );
     server.stop();
+}
+
+/// A restarted daemon first meets a live mod by its poll: the query's
+/// `prompt_reports=1`, read through the real `serve` path, turns prompt ids on
+/// for that instance; a poll without it leaves them off.
+#[test]
+fn a_flagged_poll_over_the_socket_turns_prompt_ids_on() {
+    let _home = HomeSandbox::new();
+    let me = std::process::id();
+    let events = AtomicUsize::new(0);
+    let parked = AtomicUsize::new(0);
+
+    let (_t, r) = table(&[(me, instance("s-self", "1"))]);
+    let hub = Hub::new(true, r);
+    let out = serve_poll_once(&hub, &events, &parked, "session=s-self");
+    assert!(out.starts_with("HTTP/1.1 200"), "{out:?}");
+    assert!(
+        matches!(
+            hub.deliver_prompt("s-self", "a"),
+            PromptDelivery::Queued { prompt: None }
+        ),
+        "a flagless poll turned ids on"
+    );
+
+    let (_t, r) = table(&[(me, instance("s-self", "1"))]);
+    let hub = Hub::new(true, r);
+    let out = serve_poll_once(&hub, &events, &parked, "session=s-self&prompt_reports=1");
+    assert!(out.starts_with("HTTP/1.1 200"), "{out:?}");
+    assert!(
+        matches!(
+            hub.deliver_prompt("s-self", "a"),
+            PromptDelivery::Queued { prompt: Some(_) }
+        ),
+        "a flagged poll left ids off"
+    );
 }

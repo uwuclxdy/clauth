@@ -8,9 +8,9 @@
 //! `build_status` appends after the claude ones. Presentation only: it reads
 //! the on-disk usage caches `build_status` reads and never fetches.
 //!
-//! Three facts do NOT come from the entries, because they carry neither: the
-//! `disabled` and `keyless` flags (both read off `config`) and the `canceled`
-//! flag (read off the per-profile usage cache). All three surface in the
+//! Three facts do NOT come from the entries, because they carry none of them:
+//! the `keyless` flag (read off `config`) and the `canceled` and org-refused
+//! flags (read off the per-profile usage cache). All three surface in the
 //! trailing state marker, so this table shows three states `status --json`
 //! does not expose. All three are claude-only: a codex row reads none of them.
 
@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use crate::codex_profiles::CodexState;
 use crate::daemon::{ProfileEntry, build_codex_entries, build_profile_entries};
-use crate::format::format_pct;
+use crate::format::{col_width, format_pct, pad_cells};
 use crate::harness::Harness;
 use crate::out::out;
 use crate::profile::{AppConfig, load_config};
@@ -43,14 +43,14 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
 
 /// One rendered table row. Three sources for a claude row, because the status
 /// entry carries only the first: a single `build_profile_entries` profile
-/// entry, `config` for the disabled and keyless flags, and the profile's own
+/// entry, `config` for the keyless flag, and the profile's own
 /// `usage_cache.json` for the canceled and org-refused ones (via
 /// `profile_json::is_canceled_cached`). A codex row reads its entry alone.
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
-    /// Tier for an anthropic account (`Max 5x`), else the provider name for a
+    /// Tier for an anthropic account (`Max`), else the provider name for a
     /// third-party one; a codex account's ChatGPT plan, else `-`, since its
     /// provider names no plan. Typed off the entry's `tier` field, keeping this
     /// in lockstep with `status`. A canceled subscription reads as its
@@ -99,9 +99,10 @@ impl Row {
     fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
         let typed_name = &entry.name;
         // A codex row reads its entry alone. The claude-only reads below would
-        // answer off a file the codex name shares: the cache write admits a
-        // name either roster holds, so a claude body can land in a codex
-        // profile's `usage_cache.json`.
+        // answer off a file the codex name shares: a claude body can sit in a
+        // codex profile's `usage_cache.json` — the writer refuses to add one
+        // now, but a file an older build wrote survives, and both bodies are
+        // one `UsageInfo` type, so the read side cannot tell them apart.
         let claude = entry.harness != Harness::Codex.as_str();
         let profile = if claude {
             config.find(typed_name)
@@ -137,11 +138,10 @@ impl Row {
             five_h,
             seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
-            disabled: profile.is_some_and(|p| p.is_disabled()),
-            keyless: profile
-                .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
-            canceled: claude && crate::profile_json::is_canceled_cached(typed_name),
-            org_refused: claude && crate::profile_json::is_org_refused_cached(typed_name),
+            disabled: entry.disabled,
+            keyless: profile.is_some_and(|p| p.is_keyless()),
+            canceled: profile.is_some_and(crate::profile_json::is_canceled_cached),
+            org_refused: profile.is_some_and(crate::profile_json::is_org_refused_cached),
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
@@ -209,20 +209,13 @@ fn window_pct(windows: &[Window], label: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Minimum column width: the header vs every cell, counted in `char`s so a
-/// multibyte profile name still aligns.
-fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
-    cells
-        .map(|c| c.chars().count())
-        .chain(std::iter::once(header.chars().count()))
-        .max()
-        .unwrap_or(0)
-}
-
 fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
+    // `clauth list` is single-shot: no live lease to consult, so the stamp
+    // derived from the cache keeps its derived form.
     let codex_entries = build_codex_entries(
         &CodexState::load().unwrap_or_default(),
         config.state.refresh_interval_ms,
+        true,
     );
     if entries.is_empty() && codex_entries.is_empty() {
         return "no accounts yet. add one with `clauth login <name>`.\n".to_string();
@@ -248,7 +241,13 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
     let w_5h = col_width(h_5h, all().map(|r| r.five_h.as_str()));
     let w_7d = col_width(h_7d, all().map(|r| r.seven_d.as_str()));
     let columns = |name: &str, plan: &str, five_h: &str, seven_d: &str| {
-        format!("{name:<w_name$}  {plan:<w_plan$}  {five_h:>w_5h$}  {seven_d:>w_7d$}")
+        format!(
+            "{}  {}  {}  {}",
+            pad_cells(name, w_name, false),
+            pad_cells(plan, w_plan, false),
+            pad_cells(five_h, w_5h, true),
+            pad_cells(seven_d, w_7d, true),
+        )
     };
 
     // Two leading columns: the 1-char active marker and a separating space.

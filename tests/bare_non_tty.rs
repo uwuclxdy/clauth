@@ -30,6 +30,7 @@ fn bare_clauth_with_piped_stdout_prints_help_and_exits_2() {
     let output = Command::new(env!("CARGO_BIN_EXE_clauth"))
         .env("HOME", home.path())
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

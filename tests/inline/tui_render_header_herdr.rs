@@ -1,12 +1,16 @@
 //! Row-0 pins: the version sits behind the brand, the `[ herdr ]` tag between
-//! them, and the `[ shunt ]  [ daemon ]` chips hold the right edge. The row
-//! sheds the tag first, the shunt chip second and the daemon chip third, so
-//! brand + version never clip.
+//! them, and the `[ shunt ]  [ daemon ]` chips hold the right edge. The art
+//! row sheds the tag first, the shunt chip second and the daemon chip third,
+//! so brand + version never clip.
 
 use super::*;
 use crate::profile::{AppConfig, AppState};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+
+/// Tall enough that the art header renders wherever the width allows it.
+const HEADER_TEST_ROWS: u16 = 24;
 
 fn app_with_mode(herdr_mode: bool) -> App {
     App::new(AppConfig {
@@ -16,10 +20,12 @@ fn app_with_mode(herdr_mode: bool) -> App {
     .with_herdr_mode(herdr_mode)
 }
 
-/// Row 0 past the 10-cell logo column, plus the buffer for style pins.
+/// Row 0 past the 10-cell logo column when the art renders, the whole row when
+/// it does not, plus the buffer for style pins.
 fn row0_render(app: &App, width: u16) -> (String, ratatui::buffer::Buffer) {
-    let height = header_height(app);
-    let mut term = Terminal::new(TestBackend::new(width, height)).expect("backend");
+    let area = Rect::new(0, 0, width, HEADER_TEST_ROWS);
+    let art = header_height(area) == 3;
+    let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).expect("backend");
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, app, &app.readings_snapshot());
@@ -27,7 +33,12 @@ fn row0_render(app: &App, width: u16) -> (String, ratatui::buffer::Buffer) {
     .expect("draw");
     let buf = term.backend().buffer().clone();
     let rows = crate::testutil::buffer_rows(&buf);
-    (rows[0].chars().skip(10).collect(), buf)
+    let row = if art {
+        rows[0].chars().skip(10).collect()
+    } else {
+        rows[0].clone()
+    };
+    (row, buf)
 }
 
 /// The two chips together, two cells apart, shunt first.
@@ -212,7 +223,13 @@ fn row0_sheds_the_tag_then_the_shunt_chip_then_the_daemon_chip_never_the_version
     assert_eq!(shunt_at_seam, expected_row0(true, shunt_seam - 10));
     assert_eq!(shunt_shed, expected_row0(true, shunt_seam - 11));
     assert_eq!(daemon_at_seam, expected_row0(true, daemon_seam - 10));
-    assert_eq!(daemon_shed, expected_row0(true, daemon_seam - 11));
+    // One column under the daemon seam is also one under the art header's fit
+    // width, so the header drops the art and the tabs ride the brand row.
+    assert_eq!(
+        daemon_shed.trim_end(),
+        format!("clauth v{VERSION}  •  ‹  services"),
+        "below the art's fit width the no-art row carries the tabs and no chip"
+    );
 }
 
 /// The same seams without herdr mode: a plain launch sheds each chip at the
@@ -249,7 +266,13 @@ fn the_plain_launch_chip_seams_hold_the_same_content_gap() {
         !shed.contains("[ daemon ]"),
         "one column narrower it sheds: {shed:?}"
     );
-    assert_eq!(shed, expected_row0(false, daemon_seam - 11));
+    // That width is also under the art header's fit width: the tabs take the
+    // brand row instead, and a plain launch lands on Overview.
+    assert_eq!(
+        shed.trim_end(),
+        format!("clauth v{VERSION}  •  overview  ›"),
+        "below the art's fit width the no-art row carries the tabs and no chip"
+    );
 }
 
 /// With the daemon absent both chips are faint, never gone: a plain launch's

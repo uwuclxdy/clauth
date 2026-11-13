@@ -1,19 +1,24 @@
-//! Pure profile/usage → display-string formatters, plus the cross-surface
-//! diagnostic messages. No UI dependencies, so the TUI, the CLI subcommands
-//! (e.g. `clauth which`), and the headless daemon all share one spelling.
-//!
-//! Deliberately the ratatui-free tier only. Helpers that emit `Span`/`Style`
-//! live in `tui/render/format.rs`; single-screen or domain-local display glue
-//! stays with its owner. Folding those in would force ratatui into this shared
-//! module or mint one-caller abstractions, so the split stands over a single
-//! grab-bag `format.rs` (surveyed 2026-07-16).
+//! Profile/usage → display-string formatters (pure but for
+//! [`credit_refused_label`]'s clock read), plus the cross-surface diagnostic
+//! messages, so the TUI, the CLI subcommands (e.g. `clauth which`), and the
+//! headless daemon all share one spelling. No entry emits a `Span`/`Style`; its
+//! ratatui use is measurement only — [`grapheme_cells`] sums the grapheme widths
+//! a terminal draws (via [`CellWidth`]) so a CLI table pads by the same measure.
+//! Helpers that emit `Span`/`Style` live in `tui/render/format.rs`, beside the
+//! theme they style with, so this tier never carries TUI styling; single-screen
+//! or domain-local display glue stays with its owner, since folding it in would
+//! mint one-caller abstractions, so the split stands over a single grab-bag
+//! `format.rs`.
 
 use chrono::{DateTime, Datelike, Local, Timelike};
+use ratatui::buffer::CellWidth;
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use crate::fallback::{NoPollReason, StartBlock, StartCandidate};
 use crate::profile::{Profile, ProfileName};
 use crate::profile_json::OauthAge;
-use crate::usage::{PlanTier, UsageInfo, humanize_duration};
+use crate::usage::{PlanInfo, PlanTier, UsageInfo, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -81,7 +86,7 @@ pub(crate) enum Retry {
     Stated,
     /// There is nothing left to retry in-process: `PendingLogin::run` has no
     /// retry path around its code exchange, so whatever the status, the only
-    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// action available is starting the login again (CLI or TUI). Stated as the ABSENCE
     /// of a retry loop rather than as a fact about the code or the listener,
     /// because this correctly stops being true the moment someone adds one.
     Restart,
@@ -305,6 +310,7 @@ impl Cause {
 /// The status is deliberately separable: CLI stderr and the daemon log show it
 /// (neither has a companion log to read it out of) while a toast and the MCP
 /// payload do not.
+#[derive(Debug)]
 pub(crate) struct Transient {
     cause: Cause,
     status: Option<u16>,
@@ -354,7 +360,7 @@ impl Transient {
             Retry::Connection => ": check your connection and retry",
             Retry::Wait => ": retry in a moment",
             Retry::Stated => "",
-            Retry::Restart => ": run `clauth login` again for a fresh code",
+            Retry::Restart => ": start the login again for a fresh code",
         }
     }
 
@@ -401,13 +407,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
-/// pre-flight's quarantine arm, and — through
-/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
-/// the quarantine's own log line, wherever the profile neither serves its own
-/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
-/// same `None` case but words its own sentence, since it also has to say the
-/// arming did not happen.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, and —
+/// through `oauth::third_party_dead_chain_copy`'s `None` case — the MCP
+/// pre-flight's quarantine arm, the rotate toast and the quarantine's own log
+/// line, wherever the profile neither serves its own inference nor is keyless
+/// (`Profile::is_keyless`, or a proxy account with no key). `clauth
+/// rolling-token`'s dead-chain bail takes that same `None` case but words its
+/// own sentence, since it also has to say the arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -426,9 +432,30 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
 /// line, so the surfaces cannot spell one state two ways. A key the provider
-/// refused renders [`api_key_rejected`] on those surfaces instead.
-pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
-    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+/// refused renders [`api_key_rejected`] on those surfaces instead. A proxy
+/// account (`proxy` is its runtime claim's service) takes its key only from a
+/// login through its proxy, so the fix names that login instead.
+pub(crate) fn third_party_keyless(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "profile has no api key: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
+}
+
+/// The command that re-captures `name`'s inference key: `--api-key`, or the
+/// login through its proxy for a proxy account, the only login clauth takes
+/// for one.
+fn key_fix_command(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    match proxy {
+        Some(service) => crate::actions::proxy_login_command(name.as_str(), service),
+        None => format!("clauth login {name} --api-key <key>"),
+    }
 }
 
 /// A third-party api key the provider's dead-key record names rejected
@@ -437,9 +464,16 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// `--api-key`, the command that also lifts a keyless profile — a bare
 /// `clauth login <name>` runs the browser flow and leaves the key untouched.
 /// Rendered by the MCP pre-flight's key-rejected arm and by
-/// `oauth::third_party_dead_chain_copy`'s callers.
-pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
-    format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
+/// `oauth::third_party_dead_chain_copy`'s callers. A proxy account's fix is
+/// the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn api_key_rejected(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "api key rejected: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
 }
 
 /// An OAuth account's setup token that the usage probe found refused
@@ -472,19 +506,26 @@ pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String
 /// matches lands on this sentence instead, since "expired" would be false.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
-/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
-/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
-/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
-/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
-/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// the shared arm's up-front quarantine bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line.
+/// `RollingArmRefusal::sentence`'s `DeadChainKeptMint` arm carries a fourth
+/// dead-chain sentence and is deliberately NOT routed: `classify_armed_sidecar`'s
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach
+/// `Broken` for a profile with a `base_url`, so a third-party branch there is
+/// dead code.
 /// The MCP pre-flight admits that target instead of refusing it, so it renders
 /// nothing (owner ruling 2026-08-30).
 /// The command is backticked to match [`third_party_keyless`], which renders
-/// beside it on the same surfaces (owner ruling: house style).
-pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+/// beside it on the same surfaces. A proxy
+/// account's fix is the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn third_party_dead_chain(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
-         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+         (run `{}` to clear the quarantine)",
+        key_fix_command(name, proxy)
     )
 }
 
@@ -576,6 +617,17 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
+/// A switch over an unsaved live login whose outgoing account runs on a
+/// long-lived token: that account's store cannot take an OAuth login, so the
+/// CLI switch does not offer to save it there and the headless switch's
+/// `Overwrite` default (the plugin, the API) refuses before capturing.
+pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
+    format!(
+        "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
+    )
+}
+
 /// `clauth __oauth-token` on an expired token it will not refresh itself (the
 /// active profile, or a live session's own chain): the chain is usually fine,
 /// so the fix is the `claude` run that refreshes it, not a re-login.
@@ -588,7 +640,14 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 
 /// The one spelling for "go fix this in the app". The surface is the `clauth`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
-pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
+pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the `clauth` TUI";
+
+/// `message` without its closing `; {RESOLVE_IN_TUI} first` pointer, for a
+/// surface where that pointer leads nowhere or is said elsewhere. `None` on a
+/// message that does not close with it, which each caller answers its own way.
+pub(crate) fn without_resolve_pointer(message: &str) -> Option<&str> {
+    message.strip_suffix(&format!("; {RESOLVE_IN_TUI} first"))
+}
 
 /// The one spelling for a stored login that exists but cannot be read.
 pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
@@ -616,19 +675,195 @@ pub(crate) fn humanize_span(secs: u64) -> String {
     humanize_duration(secs as i64)
 }
 
-/// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
+/// One grapheme's cells as the buffer lays them down
+/// ([`CellWidth::cell_width`]): `unicode-width` plus one cell per halfwidth
+/// katakana sound mark (`U+FF9E`/`U+FF9F`), a mark `Span::width` reports zero
+/// where the buffer lays one down, so `ｶﾞ` draws 2.
+pub(crate) fn grapheme_cell_width(symbol: &str) -> usize {
+    usize::from(symbol.cell_width())
+}
+
+/// The terminal cells `s` occupies: each grapheme's [`grapheme_cell_width`]
+/// summed over `styled_graphemes`, the measure the buffer draws by (control
+/// graphemes dropped). The whole-string [`Span::width`] folds an Arabic
+/// lam-alef ligature to one cell while the buffer draws it per grapheme as two,
+/// and `chars().count()` spends one cell on a two-cell CJK glyph, so a value
+/// sized by either overruns its budget.
+pub(crate) fn grapheme_cells(s: &str) -> usize {
+    Span::raw(s)
+        .styled_graphemes(Style::default())
+        .map(|g| grapheme_cell_width(g.symbol))
+        .sum()
+}
+
+/// The width of one table column: the header or the widest cell under it,
+/// counted in drawn cells, so a wide-script cell widens its own column instead
+/// of shifting the ones after it.
+pub(crate) fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
+    cells
+        .map(grapheme_cells)
+        .chain(std::iter::once(grapheme_cells(header)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// `value` plus the spaces that bring it to `width` drawn cells: trailing for a
+/// left-aligned column, leading for a right-aligned one. `format!`'s own width
+/// pads by `char` count, which leaves a wide-script cell short by the extra
+/// cells its glyphs draw.
+pub(crate) fn pad_cells(value: &str, width: usize, right_align: bool) -> String {
+    let fill = " ".repeat(width.saturating_sub(grapheme_cells(value)));
+    if right_align {
+        format!("{fill}{value}")
+    } else {
+        format!("{value}{fill}")
+    }
+}
+
+/// Whether `s` fits a cap of `max` on both measures a cap bounds: the cells
+/// [`grapheme_cells`] draws, and the characters — a char is at most four bytes,
+/// so a character cap also bounds the bytes one grapheme can carry. The
+/// characters are counted first: a string over the cap stops there, and the
+/// cell walk then sees at most `max` characters.
+fn cap_fits(s: &str, max: usize) -> bool {
+    s.chars().nth(max).is_none() && grapheme_cells(s) <= max
+}
+
+/// The byte length of the longest prefix of `s` that fits `budget` on both
+/// measures [`cap_fits`] bounds, every grapheme kept whole. A control
+/// character is one piece that spends its character and no cell, so a caller's
+/// line structure survives the cut and a run of controls stops at the char
+/// budget; keeping control characters off a terminal stays the caller's job
+/// ([`terminal_safe`], or the preview seam's own mapping). A control character
+/// breaks a grapheme cluster wherever it sits, except that a carriage return
+/// and the line feed right behind it are one cluster (UAX #29 GB3), so the two
+/// go as one piece and no piece straddles a cluster.
+fn cap_prefix_len(s: &str, budget: usize) -> usize {
+    let (mut cells, mut chars, mut len) = (0, 0, 0);
+    let mut segments = s.split_inclusive(char::is_control).peekable();
+    while let Some(segment) = segments.next() {
+        let control = segment.chars().next_back().filter(|c| c.is_control());
+        let head = &segment[..segment.len() - control.map_or(0, char::len_utf8)];
+        let mut head_len = 0;
+        for grapheme in Span::raw(head).styled_graphemes(Style::default()) {
+            let (w, n) = (
+                grapheme_cell_width(grapheme.symbol),
+                grapheme.symbol.chars().count(),
+            );
+            if cells + w > budget || chars + n > budget {
+                return len + head_len;
+            }
+            cells += w;
+            chars += n;
+            head_len += grapheme.symbol.len();
+        }
+        len += head_len;
+        if let Some(c) = control {
+            let line_feed = c == '\r' && segments.peek().is_some_and(|next| *next == "\n");
+            let cost = if line_feed { 2 } else { 1 };
+            if chars + cost > budget {
+                return len;
+            }
+            chars += cost;
+            len += c.len_utf8();
+            if line_feed {
+                segments.next();
+                len += '\n'.len_utf8();
+            }
+        }
+    }
+    len
+}
+
+/// Trailing-ellipsis truncation to a cap of `max` on both measures a terminal
+/// lays text out by ([`cap_fits`]): the cells [`grapheme_cells`] draws, and the
+/// characters, which also bound the bytes. A grapheme the content budget
+/// (`max` less the 3-cell, 3-character `...`) cannot hold whole is left out,
+/// and the cut stops at the first grapheme either measure cannot take. Control
+/// characters are kept, spending their characters and no cell, so an over-cap
+/// multi-line input keeps its line structure and a run of controls stops at
+/// the char budget; keeping control characters off a terminal stays the
+/// caller's job. At or under the cap the whole text comes back unchanged, and
+/// a cap under 3 renders dots alone.
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cap_fits(s, max) {
         return s.to_string();
     }
-    // Three ASCII dots stand in for the ellipsis, so the content budget shrinks
-    // by three to keep the total at `max` columns.
     if max < 3 {
-        return "...".chars().take(max).collect();
+        return ".".repeat(max);
     }
-    let mut out: String = s.chars().take(max - 3).collect();
-    out.push_str("...");
-    out
+    format!("{}...", &s[..cap_prefix_len(s, max - 3)])
+}
+
+/// `text` with each character rendered by `piece`, cut at whole pieces to a cap
+/// of `max` on the escaped body. The body is measured by [`cap_fits`] — the
+/// cells a terminal draws it in and its characters — and a piece the content
+/// budget (`max` less the 3-cell `...`) cannot hold is left out, never split,
+/// so an escape never loses its tail and a control character survives the cut
+/// as its escape. The body stops being built at the first piece that would
+/// carry it past `max` characters, that piece included so the cut sees the
+/// grapheme it joins; nothing after it is built, which already proves the rest
+/// of the text over the cap, so no body far over it is ever built whole, and
+/// the fit and the cut both lie inside what was built. The kept text is
+/// wrapped in a pair of double quotes when `quoted` (the two quote cells sit
+/// outside `max`), `...` appended outside the quotes (at the end, bare) when
+/// anything was cut; at or under the cap the whole text comes back, and a bound
+/// under 3 cells renders dots alone.
+pub(crate) fn truncate_escaped(
+    text: &str,
+    max: usize,
+    piece: impl Fn(char) -> String,
+    quoted: bool,
+) -> String {
+    let mut body = String::new();
+    let mut ends = Vec::new();
+    let mut chars = 0;
+    let mut cut_short = false;
+    for c in text.chars() {
+        let escaped = piece(c);
+        let escaped_chars = escaped.chars().count();
+        if chars + escaped_chars > max {
+            cut_short = true;
+            body.push_str(&escaped);
+            ends.push(body.len());
+            break;
+        }
+        chars += escaped_chars;
+        body.push_str(&escaped);
+        ends.push(body.len());
+    }
+    let wrap = |s: &str| {
+        if quoted {
+            format!("\"{s}\"")
+        } else {
+            s.to_string()
+        }
+    };
+    if !cut_short && cap_fits(&body, max) {
+        return wrap(&body);
+    }
+    if max < 3 {
+        return ".".repeat(max);
+    }
+    // Both callers' `piece` escapes every control character, so every character
+    // of `body` reaches the grapheme walk and the cut lands on one of its
+    // boundaries; backing off to the last whole piece keeps an escape intact.
+    let fit = cap_prefix_len(&body, max - 3);
+    let cut = ends
+        .iter()
+        .copied()
+        .take_while(|&end| end <= fit)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", wrap(&body[..cut]))
+}
+
+/// Whether a character must not reach a terminal as itself: a control
+/// character or a display-reordering one. The one predicate set
+/// [`terminal_safe`] drops, the preview seam maps to a space and a delegate
+/// reply escapes, so none of them can drift apart.
+pub(crate) fn unsafe_on_terminal(c: char) -> bool {
+    c.is_control() || reorders_display(c)
 }
 
 /// Untrusted text with its control and bidi formatting characters dropped: it
@@ -636,9 +871,39 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// line, and a bidi override could reorder the line to read as something it is
 /// not.
 pub(crate) fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !reorders_display(*c))
-        .collect()
+    s.chars().filter(|c| !unsafe_on_terminal(*c)).collect()
+}
+
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so a reader gets the
+/// text, not CSI bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+pub(crate) fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
@@ -662,6 +927,47 @@ pub(crate) fn reorders_display(c: char) -> bool {
     )
 }
 
+/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
+/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
+/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
+/// Asian Width calls them wide and halfwidth), so they count as blank: a text
+/// holding only them shows nothing.
+pub(crate) fn is_blank(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
+/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
+/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
+pub(crate) fn draws_nothing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
+/// soft hyphen included. Callers pass `terminal_safe` output.
+pub(crate) fn shows_nothing(text: &str) -> bool {
+    text.chars().all(|c| is_blank(c) || draws_nothing(c))
+}
+
 /// `text` with every character `keep` rejects written as its `\u{..}` escape.
 pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
     text.chars()
@@ -675,18 +981,19 @@ pub(crate) fn escape_unless(text: &str, keep: impl Fn(char) -> bool) -> String {
         .collect()
 }
 
-/// The account's tier: a fetched plan wins when classified, else the OAuth
-/// token's `subscription_type` claim, else `None` when neither names one. A
-/// surface renders its own no-data form on `None` rather than a bare "Claude"
-/// that reads as a real plan.
-pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanTier> {
-    // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
-    // the way `profile_json::tier_label` does, or this surface reads "no data"
-    // while that one shows the token's tier for the very same account.
+/// The account's plan: a fetched plan wins when it names one (a classified
+/// tier or the server's own plan name), else the OAuth token's
+/// `subscription_type` claim, else `None` when neither names one. A surface
+/// renders its own no-data form on `None` rather than a bare "Claude" that
+/// reads as a real plan.
+pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanInfo> {
+    // A fetched plan wins, but an UNCLASSIFIED one is not an answer: fall
+    // through the way `profile_json::tier_label` does, or this surface reads
+    // "no data" while that one shows the token's tier for the very same account.
     let fetched = usage
         .and_then(|u| u.plan.as_ref())
-        .map(|p| p.tier.clone())
-        .filter(|t| *t != PlanTier::Unknown);
+        .filter(|p| p.is_classified())
+        .cloned();
     fetched.or_else(|| {
         // No fetched plan yet — fall back to the OAuth token's subscription_type.
         let sub = profile
@@ -696,7 +1003,10 @@ pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Opti
             .and_then(|o| o.subscription_type.as_deref());
         match PlanTier::from_subscription_type(sub) {
             PlanTier::Unknown => None,
-            tier => Some(tier),
+            tier => Some(PlanInfo {
+                tier,
+                ..PlanInfo::default()
+            }),
         }
     })
 }
@@ -817,8 +1127,9 @@ pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
 /// never stored one reaches this state too (a working api key does not
 /// authenticate the usage gateway), and telling that operator something expired
 /// sends them hunting for what to renew instead of to the login they have not
-/// run. A non-Alibaba profile has no session at all, so its verdict can only
-/// mean the api key itself was rejected.
+/// run. Past a refused setup token and a captured console, a non-Alibaba
+/// profile has no session at all, so its verdict can only mean the api key
+/// itself was rejected.
 pub(crate) fn auth_expired_label(profile: &Profile) -> &'static str {
     if crate::usage::dead_login_is_setup_token(profile) {
         DIAG_TOKEN_REJECTED
@@ -987,17 +1298,17 @@ fn start_age_cell(row: &StartCandidate) -> String {
 
 /// The member rows of a `--explain` start walk, one line per chain member in
 /// chain order: `*` for the pick, then the name and verdict each padded to the
-/// column's widest, then the cache-age cell. Pure, so the byte layout is pinned
-/// without capturing stdout.
+/// column's widest in terminal cells (a CJK name keeps its column), then the
+/// cache-age cell. Pure, so the byte layout is pinned without capturing stdout.
 pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
     let name_w = rows
         .iter()
-        .map(|r| r.name.as_str().len())
+        .map(|r| grapheme_cells(r.name.as_str()))
         .max()
         .unwrap_or(0);
     let verdict_w = rows
         .iter()
-        .map(|r| start_verdict(r).len())
+        .map(|r| grapheme_cells(&start_verdict(r)))
         .max()
         .unwrap_or(0);
     rows.iter()
@@ -1005,9 +1316,9 @@ pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) ->
         .map(|(i, r)| {
             let marker = if Some(i) == pick { '*' } else { ' ' };
             format!(
-                "{marker} {:<name_w$}  {:<verdict_w$}   {}",
-                r.name.as_str(),
-                start_verdict(r),
+                "{marker} {}  {}   {}",
+                pad_cells(r.name.as_str(), name_w, false),
+                pad_cells(&start_verdict(r), verdict_w, false),
                 start_age_cell(r),
             )
         })

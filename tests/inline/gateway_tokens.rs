@@ -169,7 +169,7 @@ fn a_store_clauth_cannot_use_refuses_naming_the_file_never_a_value() {
     let mut want = vec![(
         "unparseable",
         Err(format!(
-            "clauth's client-token store {} does not parse; delete it and add the tokens again",
+            "clauth's client-token store does not parse; delete it and add the tokens again; store: {}",
             path.display()
         )),
     )];
@@ -185,7 +185,7 @@ fn a_store_clauth_cannot_use_refuses_naming_the_file_never_a_value() {
         want.push((
             token,
             Err(format!(
-                "clauth's client-token store {} holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again",
+                "clauth's client-token store holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again; store: {}",
                 path.display()
             )),
         ));
@@ -591,7 +591,7 @@ fn an_unreadable_store_refuses_the_add_naming_the_file() {
             .map(|_| ())
             .map_err(|e| format!("{e:#}")),
         Err(format!(
-            "cannot add a client token for profile \"kerry\": clauth's client-token store {} cannot be read (Permission denied (os error 13)); repair its permissions or remove it",
+            "cannot add a client token for profile \"kerry\": clauth's client-token store cannot be read (Permission denied (os error 13)); repair its permissions or remove it; store: {}",
             path.display()
         ))
     );
@@ -621,7 +621,7 @@ fn an_unreadable_store_refuses_require_on_its_op() {
     assert_eq!(
         outcome,
         Err(format!(
-            "cannot require client tokens: clauth's client-token store {} cannot be read (Permission denied (os error 13)); repair its permissions or remove it",
+            "cannot require client tokens: clauth's client-token store cannot be read (Permission denied (os error 13)); repair its permissions or remove it; store: {}",
             path.display()
         ))
     );
@@ -645,4 +645,145 @@ fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
         Err("cannot rename profile \"old\" to \"new\": the profile gained a client token while the rename was being prepared; run the rename again".to_string())
     );
     assert_eq!(stored_names(), ["old"]);
+}
+
+/// Every [`ClientTokenRefusal`] variant's own sentence, pinned by equality:
+/// the outcome leads every sentence and a store path never sits between the
+/// outcome and its cause, where a full path eats the toast's wrap budget and
+/// clips the cause — the store path rides last, the way the TUI's
+/// `admin_refusal_line` builds a typed refusal's compact line.
+#[test]
+fn a_client_token_refusal_sentence_leads_with_the_outcome_and_holds_its_path_last() {
+    let env_path = std::path::PathBuf::from("/home/u/.clauth/shunt.env");
+    let store = std::path::PathBuf::from("/home/u/.clauth/gateway-client-tokens.toml");
+    let source = BaseSource::EnvFile(env_path.clone());
+    let expectations: Vec<(ClientTokenRefusal, String)> = vec![
+        (
+            ClientTokenRefusal::BadName {
+                profile: "bad name".to_string(),
+            },
+            "cannot add a client token for profile \"bad name\": shunt cannot carry that as a client name, which must not be empty, hold ':' or ',', or start or end with whitespace"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::Unmanaged {
+                op: "cannot point kerry at the gateway".to_string(),
+                name: "kerry".to_string(),
+                variable: "SHUNT_CLIENT_TOKENS".to_string(),
+                source: source.clone(),
+            },
+            format!(
+                "cannot point kerry at the gateway: the gateway's env file {} already names a client \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file first",
+                env_path.display()
+            ),
+        ),
+        (
+            ClientTokenRefusal::UnmanagedUnparsed {
+                op: Some("cannot add a client token".to_string()),
+                variable: "SHUNT_CLIENT_TOKENS".to_string(),
+                source: BaseSource::Inherited,
+            },
+            "cannot add a client token: the environment the gateway inherits holds a SHUNT_CLIENT_TOKENS value shunt cannot parse, and shunt refuses to start on it; fix that value first"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::OpFailed {
+                op: "cannot delete profile \"kerry\"".to_string(),
+                cause: "boom".to_string(),
+            },
+            "cannot delete profile \"kerry\": boom".to_string(),
+        ),
+        (
+            ClientTokenRefusal::OpRefused {
+                op: "cannot delete profile \"kerry\"".to_string(),
+                refusal: Box::new(ClientTokenRefusal::LastToken),
+            },
+            "cannot delete profile \"kerry\": cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::GatewayUnread {
+                op: "cannot delete profile \"kerry\"".to_string(),
+                what: "the gateway",
+                fix: "restart shunt",
+                cause: "boom".to_string(),
+            },
+            "cannot delete profile \"kerry\": clauth cannot tell the gateway (boom); restart shunt"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::Raced {
+                op: "cannot delete profile \"kerry\"".to_string(),
+                what: "delete",
+            },
+            "cannot delete profile \"kerry\": its client token became the gateway's last while the delete was being prepared; run the delete again"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::Gained {
+                op: "cannot rename profile \"old\" to \"new\"".to_string(),
+                what: "rename",
+            },
+            "cannot rename profile \"old\" to \"new\": the profile gained a client token while the rename was being prepared; run the rename again"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::NameHeld {
+                op: "cannot add a client token for profile \"kerry\"".to_string(),
+                name: "kerry".to_string(),
+            },
+            "cannot add a client token for profile \"kerry\": clauth's client-token store already holds a token for \"kerry\"; remove that token first"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::NoToken,
+            "cannot require client tokens: no client token exists yet; add one first".to_string(),
+        ),
+        (
+            ClientTokenRefusal::LastToken,
+            "cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first"
+                .to_string(),
+        ),
+        (
+            ClientTokenRefusal::Collision {
+                names: vec!["bob".to_string(), "kerry".to_string()],
+                variable: "SHUNT_CLIENT_TOKENS".to_string(),
+                source: source.clone(),
+            },
+            format!(
+                "the gateway's env file {} and clauth's client-token store both name clients \"bob\", \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove those entries from the env file, or remove clauth's token for those profiles",
+                env_path.display()
+            ),
+        ),
+        (
+            ClientTokenRefusal::BadEntry {
+                profile: "kerry".to_string(),
+                path: store.clone(),
+            },
+            format!(
+                "clauth's client-token store holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again; store: {}",
+                store.display()
+            ),
+        ),
+        (
+            ClientTokenRefusal::StoreUnread {
+                path: store.clone(),
+                cause: "Permission denied (os error 13)".to_string(),
+            },
+            format!(
+                "clauth's client-token store cannot be read (Permission denied (os error 13)); repair its permissions or remove it; store: {}",
+                store.display()
+            ),
+        ),
+        (
+            ClientTokenRefusal::StoreUnreadable { path: store.clone() },
+            format!(
+                "clauth's client-token store does not parse; delete it and add the tokens again; store: {}",
+                store.display()
+            ),
+        ),
+    ];
+    for (refusal, expected) in &expectations {
+        assert_eq!(&refusal.to_string(), expected, "{refusal:?} by equality");
+    }
 }

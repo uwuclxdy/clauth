@@ -53,6 +53,7 @@ fn canceled_usage() -> UsageInfo {
         five_hour: Some(window(5.0, Some(live_reset()))),
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -94,6 +95,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: threshold,
             weekly_threshold: None,
             last_resort: false,
@@ -112,6 +114,9 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         usage,
         fresh: false,
@@ -1842,14 +1847,28 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(1), "soonest-reset: alpha (+2h) beats beta (+3d)");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
@@ -1864,7 +1883,14 @@ fn start_walk_soonest_reset_picks_by_weekly_reset_with_the_freshness_pass_intact
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(0),
@@ -2245,14 +2271,28 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
         vec![start_walk_profile("beta"), start_walk_profile("alpha")],
         "beta",
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(0),
         "default: chain order takes beta, the first clear"
     );
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(1),
@@ -2270,7 +2310,14 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
             ..Default::default()
         },
     );
-    let (_rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(0),
@@ -4265,7 +4312,7 @@ fn walk_skips_broken_last_resort_member() {
     );
 }
 
-// ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
+// ── burn-aware auto-switch (opt-in, default off) ────────────────────────────
 //
 // `is_exhausted_projected` and the ACTIVE-side check
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
@@ -7747,7 +7794,14 @@ fn start_walk_takes_chain_order_over_headroom() {
     start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
     let (config, _readings) =
         config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0), "chain order, not headroom, is the pick");
     assert_eq!(rows[0].block, None);
     assert_eq!(rows[1].block, None);
@@ -7786,7 +7840,14 @@ fn a_refused_setup_token_stays_a_dead_login_beside_a_stored_pair() {
     );
     let (config, _readings) =
         config_with_chain(vec![refused, start_walk_profile("next")], "refused");
-    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, picked) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(picked, Some(1));
     assert_eq!(rows[0].block, Some(StartBlock::AuthBroken));
     let key_rejected: HashSet<ProfileName> = [ProfileName::from("refused")].into();
@@ -7827,7 +7888,14 @@ fn start_walk_on_a_member_with_a_credit_refusal(
             uuid: None,
         },
     );
-    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, picked) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     (
         picked,
         rows[0].block.as_ref().map(crate::format::start_block_label),
@@ -7917,7 +7985,14 @@ fn start_walk_takes_a_recent_probe_reading_as_fresh_for_any_launch() {
         let mut polled = start_walk_profile("polled");
         polled.profile.models.default = Some(model.to_owned());
         let (config, _readings) = config_with_chain(vec![probed, polled], "probed");
-        let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+        let (rows, picked) = start_walk(
+            &config,
+            Isolation::Shared,
+            &[],
+            [None, None, None],
+            false,
+            None,
+        );
         assert_eq!(
             crate::format::render_start_walk(&rows, picked),
             expected,
@@ -7950,11 +8025,65 @@ fn start_walk_takes_a_probe_reading_as_fresh_when_the_model_is_unknown() {
         crate::testutil::make_probed_account(&mut probed.profile);
         let (config, _readings) =
             config_with_chain(vec![probed, start_walk_profile("polled")], "probed");
-        let (rows, picked) =
-            start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+        let (rows, picked) = start_walk(
+            &config,
+            Isolation::Shared,
+            &args,
+            [None, None, None],
+            false,
+            None,
+        );
         assert_eq!(picked, Some(0), "{args:?}");
         assert!(rows[0].fresh, "{args:?}");
     }
+}
+
+/// A member's row names the families its own session runs, the advisor's among
+/// them: the member's `[models] advisor` row and the `--advisor` flag join the
+/// demand beside the headline, and a truthy kill switch in the process-env
+/// triple the walk was handed takes the advisor out again.
+#[test]
+fn start_walk_demand_lists_the_advisors_family() {
+    let _sb = start_walk_sandbox(&["adv", "plain"]);
+    start_walk_write_usage("adv", &start_walk_usage(240, 10.0, 10.0));
+    start_walk_write_usage("plain", &start_walk_usage(240, 10.0, 10.0));
+    let mut adv = start_walk_profile("adv");
+    adv.profile.models.advisor = Some("fable".to_owned());
+    let (config, _readings) = config_with_chain(vec![adv, start_walk_profile("plain")], "adv");
+    let walk = |args: &[&str], env: [Option<String>; 3]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        start_walk(&config, Isolation::Shared, &args, env, false, None).0
+    };
+
+    let rows = walk(&["--model", "sonnet"], [None, None, None]);
+    assert_eq!(rows[0].demand, ["sonnet", "fable"], "the member's own row");
+    assert_eq!(
+        rows[1].demand,
+        ["sonnet"],
+        "a member with no row names none"
+    );
+
+    let rows = walk(
+        &["--model", "sonnet", "--advisor", "opus"],
+        [None, None, None],
+    );
+    assert_eq!(
+        rows[0].demand,
+        ["sonnet", "opus"],
+        "the flag outranks the row"
+    );
+    assert_eq!(
+        rows[1].demand,
+        ["sonnet", "opus"],
+        "and reaches every member"
+    );
+
+    let rows = walk(
+        &["--model", "sonnet", "--advisor", "opus"],
+        [None, None, Some("1".to_owned())],
+    );
+    assert_eq!(rows[0].demand, ["sonnet"], "the kill switch turns it off");
+    assert_eq!(rows[1].demand, ["sonnet"]);
 }
 
 /// A probe switched off leaves its last reading in `usage_cache.json`, and
@@ -7973,7 +8102,14 @@ fn start_walk_takes_no_reading_from_a_cache_a_switched_off_probe_left() {
     let mut polled = start_walk_profile("polled");
     polled.profile.models.default = Some("fable".to_owned());
     let (config, _readings) = config_with_chain(vec![lapsed, polled], "lapsed");
-    let (rows, picked) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, picked) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(picked, Some(1));
     assert_eq!(
         crate::format::render_start_walk(&rows, picked)
@@ -7995,7 +8131,14 @@ fn start_walk_skips_a_member_capped_on_a_demanded_family() {
     let mut capped = start_walk_profile("capped");
     capped.profile.models.default = Some("opus".to_owned());
     let (config, _readings) = config_with_chain(vec![capped], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None);
     assert_eq!(
         rows[0].block,
@@ -8018,7 +8161,14 @@ fn start_walk_keeps_a_member_capped_on_another_family() {
     let mut capped = start_walk_profile("capped");
     capped.profile.models.default = Some("sonnet".to_owned());
     let (config, _readings) = config_with_chain(vec![capped], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -8049,7 +8199,7 @@ fn start_walk_reads_a_project_settings_model_and_skips_a_capped_member() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8070,7 +8220,7 @@ fn start_walk_reads_a_project_settings_model_and_skips_a_capped_member() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(sb.home()),
     );
@@ -8093,7 +8243,14 @@ fn start_refuses_an_unplaceable_model_with_the_gate_off() {
     capped.profile.check_credit_cap = false;
     let (config, _readings) = config_with_chain(vec![capped], "capped");
     let args = vec!["--model".to_owned(), "glm-4.6".to_owned()];
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &args, [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &args,
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick, None,
         "an unknown demand refuses a capped member whatever the gate says"
@@ -8126,7 +8283,7 @@ fn start_ignores_a_project_model_under_a_setting_sources_user_flag() {
         &config,
         Isolation::Shared,
         &args,
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8166,7 +8323,7 @@ fn start_setting_sources_reads_only_the_named_project_tier() {
         &config,
         Isolation::Shared,
         &project_args,
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8182,7 +8339,7 @@ fn start_setting_sources_reads_only_the_named_project_tier() {
         &config,
         Isolation::Shared,
         &local_args,
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8224,7 +8381,7 @@ fn start_the_last_setting_sources_flag_governs() {
         &config,
         Isolation::Shared,
         &args,
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8260,7 +8417,7 @@ fn start_walk_ignores_a_project_dir_outside_the_sandbox_home() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(outside.path()),
     );
@@ -8282,7 +8439,7 @@ fn start_walk_ignores_a_project_dir_outside_the_sandbox_home() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8307,7 +8464,7 @@ fn start_walk_reads_a_project_local_settings_model_over_the_project_one() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8327,7 +8484,7 @@ fn start_walk_reads_a_project_local_settings_model_over_the_project_one() {
         &config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         Some(&cwd),
     );
@@ -8355,7 +8512,7 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
         &gated_config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
@@ -8372,7 +8529,7 @@ fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
         &ungated_config,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
@@ -8393,7 +8550,14 @@ fn start_walk_a_known_demand_overrides_check_scoped_off() {
     profile.profile.check_scoped = false;
     profile.profile.models.default = Some("opus".to_owned());
     let (config, _readings) = config_with_chain(vec![profile], "capped");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None, "a known demand supersedes the blanket gate");
     assert!(matches!(
         rows[0].block,
@@ -8419,6 +8583,7 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     let mut canceled_usage = start_walk_usage(240, 5.0, 10.0);
     canceled_usage.plan = Some(PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_owned()),
         codex_plan: None,
         email: None,
@@ -8447,7 +8612,14 @@ fn start_walk_skips_what_the_switch_walk_skips() {
     );
     config.state.auth_broken.push("authbroken".into());
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None);
     assert_eq!(rows[0].block, Some(StartBlock::Disabled));
     assert_eq!(rows[1].block, Some(StartBlock::AuthBroken));
@@ -8480,6 +8652,7 @@ fn start_walk_blocks_an_organizations_refusal_apart_from_a_canceled_plan() {
         let mut usage = start_walk_usage(240, 5.0, 10.0);
         usage.plan = Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some(status.to_owned()),
             codex_plan: None,
             email: None,
@@ -8493,7 +8666,14 @@ fn start_walk_blocks_an_organizations_refusal_apart_from_a_canceled_plan() {
         ],
         "refused",
     );
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None);
     assert_eq!(rows[0].block, Some(StartBlock::OrgRefused));
     assert_eq!(rows[1].block, Some(StartBlock::Canceled));
@@ -8506,11 +8686,25 @@ fn start_walk_refuses_a_non_oauth_member_only_under_with_fallback() {
     third_party.profile.base_url = Some("https://api.example.com".to_owned());
     let (config, _readings) = config_with_chain(vec![third_party], "thirdparty");
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], true, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        true,
+        None,
+    );
     assert_eq!(pick, None, "--with-fallback refuses a non-OAuth member");
     assert_eq!(rows[0].block, Some(StartBlock::NotOauth));
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0));
     assert_eq!(rows[0].block, None);
 }
@@ -8524,7 +8718,14 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
 
     let (two, _readings) =
         config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
-    let (rows, pick) = start_walk(&two, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &two,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         pick,
         Some(1),
@@ -8533,7 +8734,14 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
     assert!(rows[0].stale && !rows[1].stale);
 
     let (one, _readings) = config_with_chain(vec![start_walk_profile("c")], "c");
-    let (rows, pick) = start_walk(&one, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &one,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, Some(0), "the only clear member still launches stale");
     assert!(rows[0].stale);
 
@@ -8545,7 +8753,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
         &stale_then_unread.0,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
@@ -8561,7 +8769,7 @@ fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
         &only_unread,
         Isolation::Shared,
         &[],
-        [None, None],
+        [None, None, None],
         false,
         None,
     );
@@ -8580,7 +8788,14 @@ fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
         vec![a, start_walk_profile("b"), start_walk_profile("c")],
         "a",
     );
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None);
     assert_eq!(rows.len(), 3);
     assert!(
@@ -8617,9 +8832,15 @@ fn start_pick_returns_the_picked_member_and_its_demand() {
     b.profile.models.default = Some("opus".to_owned());
 
     let (config, _readings) = config_with_chain(vec![a, b], "a");
-    let (name, rows, pick, demand) =
-        start_pick(&config, Isolation::Shared, &[], [None, None], false, None)
-            .expect("`b` is clear and is the walk's pick");
+    let (name, rows, pick, demand) = start_pick(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    )
+    .expect("`b` is clear and is the walk's pick");
 
     assert_eq!(name, ProfileName::from("b"));
     assert_eq!(demand, vec!["opus".to_owned()], "b's demand, not a's fable");
@@ -9816,7 +10037,7 @@ fn a_monthly_only_active_walks_off_past_the_weekly_line() {
 
 /// A hybrid active under burn-aware switching never pairs
 /// its OAuth burn history with its provider window — the static threshold
-/// decides (maintainer ruling 2026-09-10). Gamma (third-party) at 92% with a 600 %/h OAuth
+/// decides. Gamma (third-party) at 92% with a 600 %/h OAuth
 /// climb must NOT be walked off, where the burn branch would project past 100.
 #[test]
 fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
@@ -10983,7 +11204,14 @@ fn the_start_walk_skips_a_member_holding_no_login() {
     let c = start_walk_profile("c");
     let (config, _readings) = config_with_chain(vec![no_login(start_walk_profile("x")), c], "x");
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         rows[0].block,
         Some(StartBlock::LoggedOut),
@@ -11014,7 +11242,14 @@ fn the_start_walk_marks_a_member_clauth_cannot_measure() {
         "work",
     );
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         crate::format::render_start_walk(&rows, pick),
         "  blind  ok   can't read usage\n* work   ok   usage 4m ago",
@@ -11025,7 +11260,14 @@ fn the_start_walk_marks_a_member_clauth_cannot_measure() {
     let mut blind = with_long_lived_sidecar(start_walk_profile("blind"));
     blind.profile.disabled = true;
     let (config, _readings) = config_with_chain(vec![blind, start_walk_profile("work")], "work");
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(pick, None);
     assert_eq!(
         crate::format::start_refusal(&[], &rows),
@@ -11045,7 +11287,14 @@ fn the_start_walk_says_an_api_key_member_has_no_usage_windows() {
     api.profile.api_key = Some("sk-ant-api-key".to_string());
     let (config, _readings) = config_with_chain(vec![api, start_walk_profile("work")], "work");
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         crate::format::render_start_walk(&rows, pick),
         "  api   ok   api key, no usage windows\n* work  ok   usage 4m ago",
@@ -11072,7 +11321,14 @@ fn the_api_key_cell_skips_a_routed_key_and_a_key_beside_a_sidecar() {
     let (config, _readings) =
         config_with_chain(vec![routed, beside, start_walk_profile("work")], "work");
 
-    let (rows, pick) = start_walk(&config, Isolation::Shared, &[], [None, None], false, None);
+    let (rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
     assert_eq!(
         crate::format::render_start_walk(&rows, pick),
         "  envkey  ok   no usage yet\n  keysc   ok   no usage yet\n* work    ok   usage 4m ago",

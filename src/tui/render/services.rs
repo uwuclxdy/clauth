@@ -1,7 +1,7 @@
 //! Services tab — the shunt gateway, the running delegates, the Claude Code
-//! plugin and herdr on one selector, each row's readout on the right. The
-//! master-detail mirrors the Status tab's two-pane machinery and counts as 2 of
-//! the 3-panel budget.
+//! plugin, herdr and Rex's experimental `rex` row on one selector, each row's
+//! readout on the right. The master-detail mirrors the Status tab's two-pane
+//! machinery and counts as 2 of the 3-panel budget.
 //!
 //! The left panel is one cursor-driven selector over the service rows. Each row
 //! is a status dot + label, the verdict in the detail pane, plus a trailing
@@ -43,10 +43,10 @@ use super::modals::danger_button;
 use super::panes::{
     MIN_VALUE_W, bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
-    follow_scroll_offset, footnote_lines, footnote_split, head_cols, help_tooltip_lines,
-    help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell, label_style,
-    master_detail, place_caret, section_box, select_line, toggle_value, value_caret, with_bg,
-    wrap_words,
+    follow_scroll_offset, footnote_height, footnote_lines, footnote_split, head_cols,
+    help_tooltip_lines, help_tooltip_lines_at, highlight_row, invalid_tooltip_lines, key_cell,
+    label_style, master_detail, place_caret, scroll_offset, section_box, select_line, toggle_value,
+    value_caret, with_bg, wrap_words,
 };
 use super::prose;
 use crate::gateway_edit::{
@@ -77,12 +77,11 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.services.selector.starts.replace(Vec::new());
         app.services.selector.block_ends.replace(Vec::new());
         app.services.selector.total.set(0);
-        let widget = if app.services.error.is_some() {
-            empty_state("check failed", "r", "to retry")
+        if app.services.error.is_some() {
+            empty_state(frame, inner, "check failed", "r", "to retry")
         } else {
-            empty_state("no services yet", "r", "to run")
+            empty_state(frame, inner, "no services yet", "r", "to run")
         };
-        frame.render_widget(widget, inner);
         return;
     }
 
@@ -145,7 +144,7 @@ fn selector_row(
 
     let caret = if selected && focused {
         Span::styled(
-            "❯ ",
+            format!("{} ", theme::CARET),
             with_bg(
                 Style::default()
                     .fg(theme::accent_color())
@@ -157,7 +156,7 @@ fn selector_row(
         Span::styled("  ", with_bg(Style::default(), tint))
     };
     let dot = Span::styled(
-        "● ",
+        format!("{} ", theme::DOT_ON),
         with_bg(Style::default().fg(health_color(health)), tint),
     );
     let label_style = if selected && focused {
@@ -278,43 +277,57 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
         .min(18);
 
     // The plugin detail walks its fixable problems while descended, and the
-    // herdr detail's heal line is a walk stop; the focused fix line carries
-    // the caret + hover tint.
-    let problem_focus = if !focused || app.services.diagnostic_focus || check.problems.is_empty() {
+    // herdr detail's heal line is a walk stop; the cursor's fix line carries
+    // the hover tint, and the caret while the detail holds focus.
+    let problem_focus = if app.services.diagnostic_focus || check.problems.is_empty() {
         None
     } else if check.label == "plugin" {
-        Some(app.services.problem_cursor)
+        (!app.services.plugin_on_option()).then_some(app.services.problem_cursor)
     } else if check.label == "herdr" && app.services.herdr_fix_focus {
         Some(0)
     } else {
         None
     };
-    let lines: Vec<Line<'static>> = check
-        .detail
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, line)| match problem_index(check, idx) {
+    // The rex row's health colours its `plugin` value, so the text follows the
+    // dot (an idle row keeps body text); every other row keeps `value_tone`'s lookup.
+    let rex_plugin_tone = (check.label == "rex").then(|| health_tone(check.health));
+    // The walk panes' remembered tint shows only once the pane was entered:
+    // a blurred detail nobody descended shades nothing.
+    let detail_entered = match check.label {
+        "plugin" => app.services.problem_entered,
+        "herdr" => app.services.herdr_options_entered,
+        _ => true,
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (idx, line) in check.detail.iter().enumerate() {
+        match problem_index(check, idx) {
             Some(pidx) => {
-                let selected = problem_focus == Some(pidx);
-                let line = problem_line(line, selected);
-                vec![if selected {
-                    highlight_row(line, inner.width as usize)
+                let cursor_row = problem_focus == Some(pidx);
+                let line = problem_line(line, focused && cursor_row);
+                if cursor_row && (focused || detail_entered) {
+                    lines.push(highlight_row(line, inner.width as usize));
                 } else {
-                    line
-                }]
+                    lines.push(line);
+                }
             }
             // Wrapped, never cut: its tail is the command that clears it.
-            None if Some(line.as_str()) == daemon_line => prose::wrap(
-                &prose::mark_commands(line),
+            None if Some(line.as_str()) == daemon_line => lines.extend(
+                prose::wrap(
+                    &prose::mark_commands(line),
+                    inner.width as usize,
+                    theme::warning(),
+                )
+                .into_iter()
+                .map(Line::from),
+            ),
+            None => lines.push(detail_line(
+                line,
+                key_w,
                 inner.width as usize,
-                theme::warning(),
-            )
-            .into_iter()
-            .map(Line::from)
-            .collect(),
-            None => vec![detail_line(line, key_w, inner.width as usize)],
-        })
-        .collect();
+                rex_plugin_tone,
+            )),
+        }
+    }
 
     // The herdr detail appends its options section and takes per-row focus;
     // every other detail keeps the scroll-only path below.
@@ -326,8 +339,78 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
         return;
     }
 
+    // The plugin detail closes on its OPTIONS section, the walk's last stop.
+    let option_block = if check.label == "plugin" {
+        let on_row = app.services.plugin_on_option() && !app.services.diagnostic_focus;
+        let selected = focused && on_row;
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "OPTIONS",
+            if selected {
+                theme::label_active()
+            } else {
+                theme::label()
+            },
+        )));
+        let row = plugin_option_row(app.config().state.plugin.idle_wake, selected);
+        lines.push(if on_row && (focused || detail_entered) {
+            highlight_row(row, inner.width as usize)
+        } else {
+            row
+        });
+        let row_idx = lines.len() - 1;
+        // While the cursor rests on the row, its explanation follows as the
+        // house tooltip.
+        if selected && let Some(tooltip) = app.services.plugin_idle_wake_tooltip.as_deref() {
+            lines.extend(help_tooltip_lines(tooltip, inner.width as usize));
+        }
+        let span = (row_idx, lines.len());
+        app.services.plugin_option_row.set(Some(row_idx));
+        // What the next replacement's clamp reads as its "before" side: the
+        // frame the user saw. A card with no problem publishes `false`, so a
+        // plain refresh of it never arms the one-shot below.
+        app.services
+            .plugin_problem_shown
+            .set(!check.problems.is_empty());
+        // The one-shot scroll into view: armed by a list `↵` descend whose
+        // walk rests on the row, or by the cursor clamp after a replacement
+        // clears the last problem the previous frame showed; consumed here by
+        // the first render that knows the pane height. The problem card's
+        // follow below already brings the block in while focused, so only the
+        // free-scroll path consumes the offset.
+        let pending = app.services.plugin_option_scroll_pending.replace(false);
+        if pending && on_row && check.problems.is_empty() {
+            let offset = scroll_offset(lines.len(), inner.height as usize, span);
+            app.services
+                .plugin_option_scroll_adopt
+                .set(Some(offset.min(u16::MAX as usize) as u16));
+        }
+        Some(span)
+    } else {
+        None
+    };
+
     if check.label == "plugin" && app.services.diagnostic_focus {
         draw_diagnostic_lines(frame, inner, app, lines);
+        return;
+    }
+
+    // A walked-to option row keeps its block (the row and its explanation) on
+    // screen; a no-problem card scrolls freely through the path below.
+    if let Some((row, end)) = option_block
+        && focused
+        && app.services.plugin_on_option()
+        && !check.problems.is_empty()
+    {
+        app.services.detail_viewport.set(inner.height);
+        app.services.detail_max_scroll.set(
+            lines
+                .len()
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+        let offset = draw_scrolled_lines(frame, inner, lines, (row, end), None);
+        app.services.displayed_scroll.set(offset as u16);
         return;
     }
 
@@ -336,6 +419,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     // than an index: a fix landing under the focused cursor can shrink the
     // problem set, and the render must never panic on a stale cursor.
     if check.label == "plugin"
+        && focused
         && problem_focus.is_some()
         && let Some(problem) = check.problems.get(app.services.problem_cursor)
     {
@@ -358,7 +442,19 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[Rect
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.services.detail_viewport.set(inner.height);
     app.services.detail_max_scroll.set(max_scroll);
-    let scroll = app.services.detail_scroll.min(max_scroll);
+    // While a one-shot offset stands unadopted by a key, the plugin free path
+    // keeps drawing it, so no frame between the scroll and the next key jumps.
+    // A generic detail never reads it.
+    let scroll = if check.label == "plugin" {
+        app.services
+            .plugin_option_scroll_adopt
+            .get()
+            .map(usize::from)
+            .unwrap_or_else(|| usize::from(app.services.detail_scroll.min(max_scroll)))
+            .min(usize::from(max_scroll)) as u16
+    } else {
+        app.services.detail_scroll.min(max_scroll)
+    };
     app.services.displayed_scroll.set(scroll);
 
     frame.render_widget(
@@ -438,7 +534,7 @@ fn draw_shunt_detail(
     let mut move_plan_line: Option<usize> = None;
     for (idx, text) in check.detail.iter().enumerate() {
         if idx < action_start {
-            lines.push(detail_line(text, key_w, width));
+            lines.push(detail_line(text, key_w, width, None));
             continue;
         }
         if let Some(focus) = check.shunt_focus.iter().find(|f| f.line() == Some(idx)) {
@@ -1022,14 +1118,14 @@ fn token_row_lines(name: &str, selected: bool, app: &App, width: usize) -> Vec<L
             && at.elapsed().as_millis() < SHUNT_OK_MS as u128
     });
     let caret = if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if saving {
         Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
@@ -1071,7 +1167,7 @@ fn add_token_line(selected: bool, app: &App) -> Line<'static> {
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
@@ -1237,13 +1333,17 @@ pub(super) fn route_label(r: &RouteView, room: usize) -> String {
 /// success, `SHUNT_OK_MS`) replaces the caret the way a field row's does.
 fn entry_lead(expanded: bool, selected: bool, ok: bool) -> Vec<Span<'static>> {
     let caret = if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     };
-    let glyph = if expanded { "▼" } else { "▶" };
+    let glyph = if expanded {
+        theme::DISCLOSURE_OPEN
+    } else {
+        theme::DISCLOSURE_SHUT
+    };
     let glyph_style = if expanded {
         theme::accent()
     } else {
@@ -1262,7 +1362,7 @@ fn action_lead(saving: bool, selected: bool, app: &App) -> Span<'static> {
             theme::accent(),
         )
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     }
@@ -1466,7 +1566,7 @@ fn typed_field_label(label: &str, indent: usize, lead_w: usize) -> (String, usiz
             CONFIG_KEY_GUTTER
         )
     );
-    let width = Span::raw(&text).width();
+    let width = grapheme_cells(&text);
     (text, width)
 }
 
@@ -1578,11 +1678,11 @@ fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
             theme::accent(),
         )
     } else if editing {
-        Span::styled("✎ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if ok {
-        Span::styled("✓ ", theme::success())
+        Span::styled(format!("{} ", theme::DONE), theme::success())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
     }
@@ -1624,9 +1724,9 @@ fn bind_suffix(server: &ServerView) -> Option<String> {
 }
 
 /// One field row (plus, under an edited field, its refusal `└` line): the caret
-/// slot, the label, then the value — the typed buffer on `bg_sunken` while its
-/// editor is open, a cycle run at rest or over a pending pick, and while the
-/// save runs a shimmer crest over the value with a dim `checking` trail.
+/// slot, the label, then the value — the typed buffer while its editor is
+/// open, a cycle run at rest or over a pending pick, and while the save runs a
+/// shimmer crest over the value with a dim `checking` trail.
 fn field_row_lines(
     view: &ConfigView,
     key: &ShuntFieldKey,
@@ -1695,9 +1795,9 @@ fn field_row_lines(
         return vec![Line::from(spans)];
     }
 
-    // The typed editor: the buffer on `bg_sunken` (the shared Setup editor
-    // body, `DANGER` while a refusal shows), the native cursor owns the caret
-    // glyph (no simulated block). The refusal line trails under it.
+    // The typed editor: the buffer (the shared Setup editor body, `DANGER`
+    // while a refusal shows), the native cursor owns the caret glyph (no
+    // simulated block). The refusal line trails under it.
     if let Some(edit) = edit_state {
         match &edit.edit {
             ShuntFieldEdit::Typed { input, .. } => {
@@ -1880,7 +1980,14 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
         ShuntFocus::Fix { .. } => {
             if inert {
                 Line::from(vec![
-                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled(
+                        if selected {
+                            format!("{} ", theme::CARET)
+                        } else {
+                            "  ".to_string()
+                        },
+                        theme::faint(),
+                    ),
                     Span::styled(text.to_string(), theme::faint()),
                 ])
             } else {
@@ -1896,12 +2003,19 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
                 .unwrap_or(false);
             let (arrow, label) = if inert {
                 (
-                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled(
+                        if selected {
+                            format!("{} ", theme::CARET)
+                        } else {
+                            "  ".to_string()
+                        },
+                        theme::faint(),
+                    ),
                     Span::styled("enabled  ", theme::faint()),
                 )
             } else if selected {
                 (
-                    Span::styled("❯ ", theme::accent().bold()),
+                    Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
                     Span::styled("enabled  ", label_style(true)),
                 )
             } else {
@@ -2062,7 +2176,7 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
             .unwrap_or(0)
             .min(18);
         frame.render_widget(
-            Paragraph::new(detail_line(&line, key_w, warn_area.width as usize))
+            Paragraph::new(detail_line(&line, key_w, warn_area.width as usize, None))
                 .style(theme::base()),
             warn_area,
         );
@@ -2107,12 +2221,13 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
 /// through the shared helper.
 fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
     let foot = footnote_lines(DELEGATES_STEER, body.width as usize);
-    let (scroll_area, foot_area) = footnote_split(body, foot.len());
+    let (scroll_area, foot_area) =
+        footnote_split(body, footnote_height(DELEGATES_STEER, body.width as usize));
     // The framed empty state needs its 4 rows (2 borders + 2 lines).
     if let Some(area) = foot_area
         && scroll_area.height >= 4
     {
-        frame.render_widget(empty_state("no delegates", "r", "to refresh"), scroll_area);
+        empty_state(frame, scroll_area, "no delegates", "r", "to refresh");
         frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
     } else {
         let lines = empty_state_lines("no delegates", "r", "to refresh");
@@ -2154,14 +2269,17 @@ fn draw_herdr_detail(
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.
-    let mut focus = fix_focus.map_or((0usize, 1usize), |line| (line, line + 1));
+    let mut focus = fix_focus
+        .filter(|_| focused)
+        .map_or((0usize, 1usize), |line| (line, line + 1));
     let mut caret: Option<(u16, usize)> = None;
 
     for (i, row) in HERDR_OPTIONS.iter().enumerate() {
-        let selected = focused
-            && fix_focus.is_none()
+        let cursor_row = fix_focus.is_none()
             && !app.services.diagnostic_focus
-            && i == app.services.herdr_options_cursor;
+            && i == app.services.herdr_options_cursor
+            && (focused || app.services.herdr_options_entered);
+        let selected = focused && cursor_row;
         let row_editing = if *row == HerdrOption::TagRefresh {
             editing
         } else {
@@ -2190,7 +2308,7 @@ fn draw_herdr_detail(
                 );
                 caret = Some((cx, lines.len()));
                 for line in row_lines {
-                    lines.push(if selected {
+                    lines.push(if cursor_row {
                         highlight_row(line, inner.width as usize)
                     } else {
                         line
@@ -2200,7 +2318,7 @@ fn draw_herdr_detail(
             }
             None => {
                 for line in row_lines {
-                    lines.push(if selected {
+                    lines.push(if cursor_row {
                         highlight_row(line, inner.width as usize)
                     } else {
                         line
@@ -2265,9 +2383,9 @@ fn option_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected && inert {
-        Span::styled("❯ ", theme::faint())
+        Span::styled(format!("{} ", theme::CARET), theme::faint())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -2325,8 +2443,22 @@ fn option_row(
         HerdrOption::DelegateRowText => {
             spans.extend(toggle_value(settings.delegate_row_text, inert))
         }
+        HerdrOption::RestoreNotice => spans.extend(toggle_value(settings.restore_notice, inert)),
     }
     vec![Line::from(spans)]
+}
+
+/// The plugin detail's `idle wake` option row, in [`option_row`]'s caret
+/// gutter + label + 2-space gap + toggle layout.
+fn plugin_option_row(idle_wake: bool, selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let mut spans = vec![arrow, Span::styled("idle wake  ", label_style(selected))];
+    spans.extend(toggle_value(idle_wake, false));
+    Line::from(spans)
 }
 
 /// Sub-line under the tag-refresh field while typing: the floor, DANGER when
@@ -2362,7 +2494,8 @@ fn option_unit(row: HerdrOption) -> &'static str {
         | HerdrOption::PaneTag
         | HerdrOption::BorderLabel
         | HerdrOption::DelegateDot
-        | HerdrOption::DelegateRowText => "",
+        | HerdrOption::DelegateRowText
+        | HerdrOption::RestoreNotice => "",
     }
 }
 
@@ -2387,7 +2520,14 @@ fn herdr_row_text_tooltip(app: &App) -> &'static str {
 /// value (colon dropped, gap-aligned to `key_w`), everything else body text.
 /// Values and prose truncate to the pane (`width` cells) instead of clipping at
 /// the border: path values keep both ends (middle ellipsis), prose trails.
-fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
+/// `plugin_value_tone`, when given, replaces [`value_tone`] for a `plugin`
+/// value: a row whose own health decides that line's colour passes it.
+fn detail_line(
+    text: &str,
+    key_w: usize,
+    width: usize,
+    plugin_value_tone: Option<Style>,
+) -> Line<'static> {
     if text.is_empty() {
         return Line::from("");
     }
@@ -2397,7 +2537,10 @@ fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
     if let Some((key, value)) = text.split_once(": ") {
         let pad = key_w.saturating_sub(key.chars().count()) + 2;
         let value_w = width.saturating_sub(key_w + 2);
-        let tone = value_tone(key, value);
+        let tone = match plugin_value_tone {
+            Some(tone) if key == "plugin" => tone,
+            _ => value_tone(key, value),
+        };
         let mut spans = vec![Span::styled(
             format!("{key}{}", " ".repeat(pad)),
             theme::label(),
@@ -2428,7 +2571,7 @@ fn is_path_key(key: &str) -> bool {
 fn problem_line(text: &str, selected: bool) -> Line<'static> {
     let (lead, base) = if selected {
         (
-            Span::styled("❯ ", theme::accent().bold()),
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold()),
             label_style(true),
         )
     } else {
@@ -2441,6 +2584,16 @@ fn problem_line(text: &str, selected: bool) -> Line<'static> {
     let mut spans = vec![lead];
     spans.extend(prose::spans(&marked, base));
     Line::from(spans)
+}
+
+/// The tone a row's health gives its `plugin` value: the dot's own colour, so
+/// text and dot cannot drift apart, except an idle row, whose text stays body
+/// beside its dim dot.
+fn health_tone(health: Health) -> Style {
+    match health {
+        Health::Idle => theme::body(),
+        Health::Ok | Health::Warn | Health::Danger => Style::default().fg(health_color(health)),
+    }
 }
 
 /// Tone the value of a `key: value` row by health-bearing (key, value-head) pairs.
@@ -2457,6 +2610,9 @@ fn value_tone(key: &str, value: &str) -> Style {
             theme::success()
         }
         ("installed", "no") | ("mcp entry", "not") => theme::warning(),
+        // A stale completion script is a problem; a missing one is an
+        // invitation and stays body text.
+        ("completions", "stale") => theme::warning(),
         ("mcp server", "won't") => theme::danger(),
         ("plugin", "linked") => theme::success(),
         ("plugin", "installed") => theme::success(),
@@ -2559,7 +2715,10 @@ fn delegate_row_line(
     focused: bool,
 ) -> Line<'static> {
     let caret = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled(
+            format!("{} ", theme::CARET),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     };
@@ -2597,19 +2756,20 @@ fn delegate_row_line(
 // How a delegate row reads: `JobPhase`, the crate's one classification of a
 // stored record, plus the two things a TERMINAL adds to it.
 //
-// The four situations, the word for each, and the band a row sits in all live on
+// The five situations, the word for each, and the band a row sits in all live on
 // `JobPhase` in `src/mcp/jobs.rs`, because `clauth jobs` and `monitor`'s listing
 // answer the same questions and three copies of one rule is how they drift. What
 // stays here is presentation and only presentation: the glyph and the hue. The
-// word is mandatory beside the mark either way — three of the four share the `●`
+// word is mandatory beside the mark either way — three of the five share the `●`
 // glyph, so hue alone cannot carry the state.
 
 /// `●` for a run that is or was doing something, `○` for one whose server is
 /// gone: the contract's active / disconnected dot pair.
 fn state_mark(phase: JobPhase) -> &'static str {
     match phase {
-        JobPhase::Running | JobPhase::Blocking | JobPhase::Done => "●",
-        JobPhase::Orphaned => "○",
+        JobPhase::Running | JobPhase::Blocking | JobPhase::Done => theme::DOT_ON,
+        // One whose server is gone, stopped or orphaned alike.
+        JobPhase::Orphaned | JobPhase::Stopped => theme::DOT_OFF,
     }
 }
 
@@ -2618,7 +2778,7 @@ fn state_color(phase: JobPhase) -> Color {
         JobPhase::Running | JobPhase::Blocking => theme::accent_color(),
         JobPhase::Done => theme::success_color(),
         // Disconnected carries no semantic charge of its own; the word does.
-        JobPhase::Orphaned => theme::text_dim_color(),
+        JobPhase::Orphaned | JobPhase::Stopped => theme::text_dim_color(),
     }
 }
 
@@ -2657,12 +2817,13 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
     // decides how long it survives.
     let since = job.age_secs(now);
     // Through `phase()` rather than by re-matching `(liveness, kind)` here: the
-    // four situations and any later fifth live on `JobPhase`, so this pane
+    // five situations and any later sixth live on `JobPhase`, so this pane
     // cannot drift its own classification.
     let state = job.phase();
     let (mut facts, live) = match state {
         JobPhase::Done => (vec![format!("finished {}", age_phrase(since))], None),
         JobPhase::Orphaned => (vec![format!("last seen {}", age_phrase(since))], None),
+        JobPhase::Stopped => (vec![format!("stopped {}", age_phrase(since))], None),
         JobPhase::Running | JobPhase::Blocking => {
             let live = jobs::running_liveness(record, now);
             let elapsed = format!("elapsed {}", humanize_duration(live.elapsed_secs as i64));
@@ -2700,7 +2861,7 @@ fn delegate_speed_fact(job: &StoredJob, app: &App) -> Option<String> {
             Some(speed_fact(speed))
         }
         JobPhase::Done => finished_speed_fact(job, app),
-        JobPhase::Orphaned => None,
+        JobPhase::Orphaned | JobPhase::Stopped => None,
     }
 }
 
