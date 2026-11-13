@@ -2120,7 +2120,9 @@ impl Daemon {
                     }
                 }
             };
-            let _ = link_profile_credentials(&active);
+            if let Err(e) = link_profile_credentials(&active) {
+                logline!("clauth daemon: {e:#}; .credentials.json was not relinked to '{active}'");
+            }
         }
 
         let interval = self.refresh_interval.load(Ordering::Relaxed);

@@ -9486,3 +9486,153 @@ fn a_proxy_claim_landing_before_the_stamps_hold_stamps_no_sidecar() {
         "(account, the stamp's answer, sidecar and preserved mint kept byte for byte)"
     );
 }
+
+#[cfg(unix)]
+/// Two stores stamped with one mtime, the case a global switch used to lose:
+/// the link moved and every running session stayed on the account it had left.
+fn seed_two_stores_with_equal_mtime() -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::time::SystemTime,
+) {
+    let store = |name: &str| {
+        let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds(
+            &format!("login-{name}"),
+            Some(&format!("refresh-{name}")),
+        ));
+        crate::profile::save_profile(&p).expect("save");
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("credentials.json")
+    };
+    let (a, b) = (store("a"), store("b"));
+    // On the roster, as any switch target is: a touch receipt is only written
+    // for a rostered account.
+    let state = crate::profile::AppState {
+        profiles: vec!["a".into(), "b".into()],
+        ..Default::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist roster");
+    let same = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for path in [&a, &b] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open store")
+            .set_times(fs::FileTimes::new().set_modified(same))
+            .expect("stamp store");
+    }
+    (a, b, same)
+}
+
+#[cfg(unix)]
+fn live_mtime() -> std::time::SystemTime {
+    fs::metadata(claude_credentials_path().expect("creds path"))
+        .expect("live metadata")
+        .modified()
+        .expect("live mtime")
+}
+
+#[cfg(unix)]
+#[test]
+fn global_switch_between_equal_mtime_stores_stays_visible_to_running_sessions() {
+    let _home = HomeSandbox::new();
+    let (_a, b, same) = seed_two_stores_with_equal_mtime();
+    let name = crate::profile::ProfileName::from;
+
+    force_link_profile_credentials(&name("a")).expect("link a");
+    let on_a = live_mtime();
+    assert_eq!(
+        on_a, same,
+        "the first link has nothing to differ from and must not stamp"
+    );
+
+    force_link_profile_credentials(&name("b")).expect("switch to b");
+    let on_b = live_mtime();
+    assert_ne!(
+        on_b, on_a,
+        "a running session memoized a's mtime; b must not resolve to the same one"
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&b),
+        Some(same),
+        "the swap's stamp, receipt included: b still reads as last written at `same`"
+    );
+
+    force_link_profile_credentials(&name("a")).expect("switch back to a");
+    assert_ne!(live_mtime(), on_b, "the swap back must be visible too");
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_relink_between_equal_mtime_stores_stays_visible_to_running_sessions() {
+    let _home = HomeSandbox::new();
+    let (a, b, same) = seed_two_stores_with_equal_mtime();
+    let name = crate::profile::ProfileName::from;
+
+    link_profile_credentials(&name("a")).expect("link a");
+    let on_a = live_mtime();
+    link_profile_credentials(&name("b")).expect("relink to b");
+    let on_b = live_mtime();
+    assert_ne!(on_b, on_a, "the guarded relink repoints the same slot");
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&b),
+        Some(same),
+        "the swap's stamp, receipt included: b still reads as last written at `same`"
+    );
+
+    link_profile_credentials(&name("a")).expect("relink back to a");
+    assert_ne!(live_mtime(), on_b, "the relink back must be visible too");
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&a),
+        Some(same),
+        "a's stamp, receipt included: a still reads as last written at `same`"
+    );
+}
+
+/// The case the current mtimes miss: a session idle on `a` since before a's
+/// last write memoized the value `a` carried then, which `b` still carries.
+/// The two stores' current mtimes differ, and the switch must stamp anyway.
+#[cfg(unix)]
+#[test]
+fn global_switch_stamps_a_store_whose_mtime_already_differs() {
+    let _home = HomeSandbox::new();
+    let (a, b, same) = seed_two_stores_with_equal_mtime();
+    let earlier = same - std::time::Duration::from_secs(60);
+    let set_mtime = |path: &std::path::Path, at: std::time::SystemTime| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open store")
+            .set_times(fs::FileTimes::new().set_modified(at))
+            .expect("stamp store");
+    };
+    set_mtime(&a, earlier);
+    set_mtime(&b, earlier);
+    let name = crate::profile::ProfileName::from;
+
+    force_link_profile_credentials(&name("a")).expect("link a");
+    assert_eq!(live_mtime(), earlier, "what the idle session memoized");
+    // A write to `a` the idle session never saw.
+    set_mtime(&a, same);
+
+    force_link_profile_credentials(&name("b")).expect("switch to b");
+    let on_b = live_mtime();
+    assert_ne!(
+        on_b, earlier,
+        "the idle session memoized `earlier`; b must not resolve to it"
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&b),
+        Some(earlier),
+        "the swap's stamp, receipt included: b still reads as last written at `earlier`"
+    );
+
+    force_link_profile_credentials(&name("b")).expect("relink b onto itself");
+    assert_eq!(
+        live_mtime(),
+        on_b,
+        "a relink onto the same store is not a swap"
+    );
+}

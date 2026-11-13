@@ -7293,7 +7293,7 @@ impl App {
                             *boot = Some(settled.placed);
                         }
                         let _placed = enter_bare_item_placement(settled.placed);
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                     Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
@@ -7303,7 +7303,7 @@ impl App {
                     }
                     Err(e) => {
                         crate::logline::logline!("clauth: {e:#}");
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                 }
@@ -19661,6 +19661,14 @@ fn toast_bare_item_notice(app: &mut App, notice: crate::claude::BareItemNotice) 
     }
 }
 
+/// The boot relink of the active account, which nobody is waiting on: a failure
+/// (the guard's refusal, a failed stamp) is logged instead of dropped.
+fn relink_at_boot(name: &crate::profile::ProfileName) {
+    if let Err(e) = link_profile_credentials(name) {
+        crate::logline::logline!("clauth: {e:#}; .credentials.json was not relinked to '{name}'");
+    }
+}
+
 /// Run a held write again: its gate takes `placed` instead of settling.
 fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u8; 32]>) {
     app.bare_item_ready = Some(placed);
@@ -19669,7 +19677,7 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
             if app.config().is_active(&name)
                 && let Some(_placed) = bare_item_gate(app, BareItemWrite::BootRelink(name.clone()))
             {
-                let _ = link_profile_credentials(&name);
+                relink_at_boot(&name);
                 app.refresh_unsaved_live_login();
             }
         }
