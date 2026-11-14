@@ -346,11 +346,14 @@ pub(crate) fn live_runtime_files_under(base: &Path, file: &str) -> Vec<PathBuf> 
 
 /// Stat-only fast path around `body`: skip the tick when the stat snapshot of
 /// `paths` — one `(mtime, size)` per stattable member — is unchanged from what
-/// `cache` records from the last sync that did work (no reads, parses, or
-/// writes), and advance `cache` only when `body` reports it ran — so a paused
-/// (`Ok(false)`) or failed tick retries next time. A changed member set or any
-/// member's size or mtime change is a change, so a member appearing at the
-/// floor stamp still wakes the pass.
+/// `cache` records from the last pass that settled (no reads, parses, or
+/// writes). `body` returns `Ok(true)` for a settled pass, one that ran and
+/// wrote no file and failed to write none: `cache` then holds the snapshot,
+/// provided every stat still reads as it did before the body.
+/// Any other pass (`Ok(false)`, or an error) leaves `cache` as it was, so the
+/// next tick whose stats differ from it runs the body again. A changed member
+/// set or any member's size or mtime change is a change, so a member appearing
+/// at the floor stamp still wakes the pass.
 pub(crate) fn run_with_cache(
     cache: &Mutex<Option<Vec<MemberSnapshot>>>,
     paths: &[PathBuf],
@@ -369,8 +372,14 @@ pub(crate) fn run_with_cache(
     if !body()? {
         return Ok(());
     }
-    // The snapshot was stated before the body, so it can only lag what the body
-    // actually saw — costing at most one redundant tick, never a skipped one.
+    // The snapshot was statted before the body, which can wait on a lock while
+    // another process rewrites a member: a pass whose inputs moved under it
+    // keys nothing, or that member restored at the snapshot's stat would read
+    // as settled. A member rewritten and then restored to its exact earlier
+    // stat before this re-stat still reads as unmoved, and the pass keys it.
+    if stat_snapshot(paths) != snapshot {
+        return Ok(());
+    }
     *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot);
     Ok(())
 }
@@ -491,6 +500,20 @@ pub(crate) fn sync_paths(
     protected_keys: &[&str],
     rule: impl Fn(KeyPath<'_>) -> KeyRule,
 ) -> Result<()> {
+    sync_paths_reporting_writes(paths, operator_file, record, protected_keys, rule).map(drop)
+}
+
+/// [`sync_paths`], returning whether the pass wrote a file or failed to: a
+/// member, the written-copy record, or a refusal's backup. A fast path keyed
+/// on stats taken before such a pass must not keep them: they describe bytes
+/// the pass replaced, or a write it still owes.
+pub(crate) fn sync_paths_reporting_writes(
+    paths: &[PathBuf],
+    operator_file: Option<&Path>,
+    record: Option<&Path>,
+    protected_keys: &[&str],
+    rule: impl Fn(KeyPath<'_>) -> KeyRule,
+) -> Result<bool> {
     let mut members: Vec<Member> = Vec::new();
     for path in paths {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -539,16 +562,16 @@ pub(crate) fn sync_paths(
         protected_keys,
         &rule,
     );
-    if let Some(record) = record {
-        persist_record(record, paths, &recorded);
-    }
-    result
+    let record_attempted_write =
+        record.is_some_and(|record| persist_record(record, paths, &recorded));
+    result.map(|merge_attempted_write| merge_attempted_write || record_attempted_write)
 }
 
 /// [`sync_paths`]'s merge over the members it read: pick the winner, apply
 /// the delete bound, then rewrite or record each other member, pushing each
 /// recorded entry into `recorded`. `recording` is whether the pass has a
-/// record to persist into.
+/// record to persist into. Returns whether it wrote a file or failed to: a
+/// member, or a refusal's backup.
 fn merge_members(
     members: &[Member],
     written: &[WrittenEntry],
@@ -557,9 +580,9 @@ fn merge_members(
     recording: bool,
     protected_keys: &[&str],
     rule: &impl Fn(KeyPath<'_>) -> KeyRule,
-) -> Result<()> {
+) -> Result<bool> {
     if members.len() < 2 {
-        return Ok(());
+        return Ok(false);
     }
 
     // Every member ranks by the mtime of the Claude Code write its bytes carry:
@@ -602,7 +625,7 @@ fn merge_members(
         })
         .map(|(i, _)| i);
     let Some(winner) = winner else {
-        return Ok(());
+        return Ok(false);
     };
     let winner_rank = rank(&members[winner]);
 
@@ -612,7 +635,7 @@ fn merge_members(
     if let Some(operator) = operator_file
         && let Some(home_idx) = members.iter().position(|m| m.path.as_path() == operator)
         && home_idx != winner
-        && refuse_destructive_pass(
+        && let Refusal::Stop { attempted_write } = refuse_destructive_pass(
             &members[home_idx],
             &members[winner],
             operator
@@ -623,9 +646,10 @@ fn merge_members(
             rule,
         )?
     {
-        return Ok(());
+        return Ok(attempted_write);
     }
 
+    let mut attempted_write = false;
     for i in 0..members.len() {
         if i == winner {
             continue;
@@ -646,7 +670,7 @@ fn merge_members(
             members[winner].mtime,
             members[winner].size,
         ) {
-            return Ok(());
+            return Ok(attempted_write);
         }
         // A member CC rewrote between our read and now keeps its newer bytes:
         // skip it this pass; the next pass re-reads and re-merges it.
@@ -698,8 +722,9 @@ fn merge_members(
         {
             recorded.push(entry);
         }
+        attempted_write = true;
     }
-    Ok(())
+    Ok(attempted_write)
 }
 
 /// Overlay the winner's shared state onto one target: start from the target so
@@ -775,22 +800,22 @@ fn is_runtime_copy(path: &Path) -> bool {
 /// keys, or any key in `protected` that `home` holds. The count is exactly what
 /// [`merge_member`]'s top-level `retain` would remove from the operator file; a
 /// protected key refuses at any count because its absence alone is destructive.
-/// A refusal writes nothing: the file is backed up first, and the one log line
+/// A refusal writes no member: the file is backed up first, and the one log line
 /// is raised once per distinct winner so the watchdog's repeated ticks do not
 /// fill the log with copies. A refusal whose backup write fails logs that
 /// failure, with the io error, once per distinct winner and latches nothing
 /// else, so every later pass retries the backup and logs the saved copy once it
 /// lands. A refusal that cannot re-read home for the backup refuses with no
 /// backup and no line, and the next pass retries.
-/// Returns whether the pass must stop; an unresolvable `~/.clauth` (where the
-/// backups dir lives) is an error, and the pass writes nothing either way.
+/// An unresolvable `~/.clauth` (where the backups dir lives) is an error, and
+/// the pass writes no member either way.
 fn refuse_destructive_pass(
     home: &Member,
     winner: &Member,
     file: &str,
     protected: &[&str],
     rule: &impl Fn(KeyPath<'_>) -> KeyRule,
-) -> Result<bool> {
+) -> Result<Refusal> {
     let dropped = home
         .obj
         .keys()
@@ -801,7 +826,7 @@ fn refuse_destructive_pass(
         .iter()
         .any(|key| home.obj.contains_key(*key) && !winner.obj.contains_key(*key));
     if dropped <= MAX_SHARED_DELETIONS && !missing_protected {
-        return Ok(false);
+        return Ok(Refusal::Merge);
     }
     let key = (
         home.path.clone(),
@@ -810,14 +835,19 @@ fn refuse_destructive_pass(
         winner.size,
     );
     if latched(&LAST_REFUSAL, &key) {
-        return Ok(true);
+        return Ok(Refusal::Stop {
+            attempted_write: false,
+        });
     }
     let dir = crate::profile::clauth_dir()?.join("backups");
-    // Home moved under the pass since its read: there is nothing to back up
-    // yet and nothing was written, so refuse quietly and let the next pass,
-    // which re-reads home, decide again.
+    // Home moved or became unreadable under the pass since its read: refuse
+    // quietly with the backup still owed, and let the next pass, which
+    // re-reads home, decide again. The owed backup keeps this pass uncached,
+    // or an unreadable home whose stat held still would never be retried.
     let Ok(bytes) = std::fs::read(&home.path) else {
-        return Ok(true);
+        return Ok(Refusal::Stop {
+            attempted_write: true,
+        });
     };
     // `<n>` is what the merge would really drop; only a protected key refuses
     // with n = 1.
@@ -835,7 +865,9 @@ fn refuse_destructive_pass(
                     shorten_home(&dir)
                 );
             }
-            return Ok(true);
+            return Ok(Refusal::Stop {
+                attempted_write: true,
+            });
         }
     };
     latch(&LAST_REFUSAL, key);
@@ -846,7 +878,18 @@ fn refuse_destructive_pass(
         shorten_home(&home.path),
         shorten_home(&backup)
     );
-    Ok(true)
+    Ok(Refusal::Stop {
+        attempted_write: true,
+    })
+}
+
+/// What [`refuse_destructive_pass`] decided for one pass.
+enum Refusal {
+    /// The winner deletes nothing the bound protects: the pass merges.
+    Merge,
+    /// The pass stops before writing any member. `attempted_write` is whether
+    /// it wrote a backup, failed to, or still owes one.
+    Stop { attempted_write: bool },
 }
 
 /// Save `bytes`, the operator file's own read before a refused pass could have
@@ -1163,8 +1206,8 @@ fn read_record(path: &Path) -> Vec<WrittenEntry> {
 /// in that tree afterwards from winning once the tree is live again. A tree
 /// that reads unknown on every pass until it is live again keeps its entry, so
 /// an edit made in it meanwhile can still win. The record is rewritten only
-/// when this changes it.
-fn persist_record(record_path: &Path, paths: &[PathBuf], written: &[WrittenEntry]) {
+/// when this changes it; returns whether it wrote the record or failed to.
+fn persist_record(record_path: &Path, paths: &[PathBuf], written: &[WrittenEntry]) -> bool {
     let mut liveness = crate::runtime::TreeLivenessReader::default();
     let read = read_record(record_path);
     let read_len = read.len();
@@ -1184,10 +1227,11 @@ fn persist_record(record_path: &Path, paths: &[PathBuf], written: &[WrittenEntry
     // The filter only drops, so an unchanged length with nothing written is the
     // record as read.
     if written.is_empty() && entries.len() == read_len {
-        return;
+        return false;
     }
     entries.extend(written.iter().cloned());
     write_record_file(record_path, &entries);
+    true
 }
 
 /// Merge one written entry into `record_path` (replace its path's old entry,
@@ -1223,6 +1267,15 @@ pub(crate) fn carried_rank_of(
         .map(|e| (e.rank_secs, e.rank_nanos))
         .or_else(|| mtime_parts(mtime))
         .unwrap_or((i64::MIN, 0))
+}
+
+/// Whether the written-copy record at `record_path` holds an entry for `path`:
+/// the question `can_win` asks of a runtime copy. A missing, unreadable or
+/// corrupt record holds none, like every reader of it.
+pub(crate) fn is_recorded(record_path: &Path, path: &Path) -> bool {
+    read_record(record_path)
+        .iter()
+        .any(|e| Path::new(&e.path) == path)
 }
 
 /// Write `path` and record the write into `record_path` when it is `Some`,

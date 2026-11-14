@@ -4653,6 +4653,168 @@ fn runtime_settings_retightens_a_loose_file_with_current_bytes() {
     });
 }
 
+fn read_settings_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read settings")).expect("parse settings")
+}
+
+/// Build one shared tree from an operator file holding `days`, so the build
+/// remembers it the way production learns it.
+fn remember_through_a_build(root: &Path, claude_home: &Path, days: u64) {
+    fs::write(
+        claude_home.join("settings.json"),
+        serde_json::to_vec(&serde_json::json!({"cleanupPeriodDays": days})).expect("serialize"),
+    )
+    .expect("write operator settings");
+    let runtime = root.join("runtime-remember");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    write_merged_settings(
+        &runtime,
+        claude_home,
+        &make_profile("p"),
+        Isolation::Shared,
+        &[],
+    )
+    .expect("write_merged_settings");
+    assert_eq!(
+        crate::retention::load().expect("load").days,
+        Some(days),
+        "the build remembers the number"
+    );
+}
+
+#[test]
+fn a_shared_build_from_a_keyless_operator_file_puts_the_remembered_number_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let operator = claude_home.join("settings.json");
+        fs::write(&operator, br#"{"theme":"light"}"#).expect("drop the key");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650),
+            "the copy carries the number"
+        );
+        assert_eq!(
+            read_settings_json(&operator),
+            serde_json::json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+            "the operator file gets it back"
+        );
+        assert_eq!(
+            crate::retention::load().expect("load"),
+            crate::retention::Retention {
+                days: Some(3650),
+                question_open: true
+            }
+        );
+    });
+}
+
+#[test]
+fn a_shared_build_with_no_operator_file_carries_the_remembered_number_in_the_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let operator = claude_home.join("settings.json");
+        fs::remove_file(&operator).expect("remove the operator file");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650)
+        );
+        assert!(!operator.exists(), "clauth never creates the operator file");
+        assert!(!crate::retention::load().expect("load").question_open);
+    });
+}
+
+#[test]
+fn an_isolated_build_carries_no_retention_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Isolated,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert!(
+            read_settings_json(&runtime.join("settings.json"))
+                .get("cleanupPeriodDays")
+                .is_none()
+        );
+    });
+}
+
+/// A retention-record fault (the record path is a directory) never refuses a
+/// shared build: the operator file's own number still reaches the copy. The
+/// sync half of this fault lives in
+/// `a_retention_record_fault_never_stops_the_merge_or_a_build` (settings-sync
+/// tests).
+#[test]
+fn a_retention_record_fault_never_refuses_a_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"cleanupPeriodDays":3650,"theme":"light","env":{}}"#,
+        )
+        .expect("write operator settings");
+        let record = crate::retention::record_path().expect("record path");
+        fs::create_dir_all(record.parent().expect("record dir")).expect("mkdir ~/.clauth");
+        fs::create_dir_all(&record).expect("make the record path a directory");
+        let runtime = tmp.path().join("runtime-build");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p1"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("a retention fault never refuses the build");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650),
+            "the build still writes its copy"
+        );
+    });
+}
+
 /// Issue #17 systemic finding: a raw copy is born carrying whichever account
 /// was active at seed time, wrong for every non-active profile. Seeding must
 /// strip it so the fresh runtime starts identity-less and Claude Code

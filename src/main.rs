@@ -59,6 +59,7 @@ mod proxy_check;
 mod proxy_list;
 mod proxy_tokens;
 mod push;
+mod retention;
 mod rex;
 mod runtime;
 mod session_record;

@@ -29,11 +29,15 @@
 //!   fields, so those must neither propagate outward nor be overwritten by a
 //!   sibling's — which the symmetric [`key_role`] rule gives for free.
 //!
-//! With no live `clauth start` session there is nothing to reconcile and nothing
-//! to lose: teardown discards each session's runtime tree, so the base is the
-//! only surviving member and the engine's `members.len() < 2` short-circuit makes
-//! a sync a no-op. That is why this runs on the session watchdog and needs no
-//! daemon tick — a headless box has no runtime copy that could diverge.
+//! With no live `clauth start` session there is no copy to merge: teardown
+//! discards each session's runtime tree, so the base is the only surviving
+//! member and the engine's `members.len() < 2` short-circuit makes the merge a
+//! no-op. That is why the merge runs on the session watchdog alone. The
+//! remembered transcript retention ([`crate::retention`]) is the exception: a
+//! bare `claude` sweeps the operator's store off the operator file alone, so
+//! every pass here puts a lost `cleanupPeriodDays` back first, inside the same
+//! hold and before the merge, and the daemon runs that same check on its own
+//! with no session live.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -81,7 +85,7 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "advisorModel",
 ];
 
-/// The stat snapshot from the last [`sync_once`] that did work; the key for
+/// The stat snapshot from the last [`sync_once`] pass that settled; the key for
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<Vec<crate::jsonsync::MemberSnapshot>>> = Mutex::new(None);
 
@@ -146,7 +150,7 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
 /// Every `settings.json` a reconcile pass may join: the operator's own
 /// `~/.claude/settings.json` plus each LIVE shared per-session runtime copy,
 /// via [`crate::jsonsync::live_runtime_files_under`].
-fn known_paths() -> Result<Vec<PathBuf>> {
+pub(crate) fn known_paths() -> Result<Vec<PathBuf>> {
     Ok(crate::jsonsync::live_runtime_files_under(
         &claude_dir()?,
         "settings.json",
@@ -302,10 +306,16 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
 
 /// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` stat
 /// fast path in [`crate::jsonsync::run_with_cache`]. The member list is the
-/// fast path's stat key only: the merge re-reads it inside the lock.
+/// fast path's stat key only: the merge re-reads it inside the lock. The key
+/// also holds the retention record the settle reads, which another process (a
+/// build, the daemon) can change while every member holds still. Only a
+/// [`SyncPass::cacheable`] pass keys it.
 pub(crate) fn sync_once() -> Result<()> {
-    let paths = known_paths()?;
-    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, sync_members)
+    let mut paths = known_paths()?;
+    paths.push(crate::retention::record_path()?);
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || {
+        sync_members().map(SyncPass::cacheable)
+    })
 }
 
 /// The written-copy record for `settings.json`, persisted under the same state
@@ -320,8 +330,28 @@ pub(crate) fn written_record_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join(SETTINGS_SYNC_WRITTEN_FILENAME))
 }
 
-/// Merge the members under the cross-process state flock. Returns whether the
-/// merge ran (`false` = paused on an unreadable `config.toml`).
+/// What one [`sync_members`] pass did.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SyncPass {
+    /// Whether the merge ran: `false` when a failed operator put-back skipped
+    /// it, or an unreadable `config.toml` paused it.
+    pub(crate) merged: bool,
+    /// Whether the pass wrote a file or failed to: a retention put-back or
+    /// record write, a merge write.
+    pub(crate) attempted_write: bool,
+}
+
+impl SyncPass {
+    /// Whether the fast path may key this pass: the merge ran, and the pass
+    /// wrote no file and failed to write none. A stat key taken before a pass
+    /// that wrote describes bytes the pass replaced, so the same bytes
+    /// restored at the same stat would read as settled.
+    pub(crate) fn cacheable(self) -> bool {
+        self.merged && !self.attempted_write
+    }
+}
+
+/// Merge the members under the cross-process state flock.
 ///
 /// The lock is what makes this safe against the switch writer.
 /// `claude::apply_profile_to_claude_settings` rewrites the ACTIVE profile's
@@ -346,29 +376,47 @@ pub(crate) fn written_record_path() -> Result<PathBuf> {
 /// open per marker until a held one, and a job-store read when some candidate's
 /// marker probe found nothing — inside a hold that already does N
 /// `settings.json` reads, parses, and writes.
-fn sync_members() -> Result<bool> {
+fn sync_members() -> Result<SyncPass> {
     let operator_file = claude_dir()?.join("settings.json");
     let record = written_record_path()?;
     #[cfg(test)]
     run_pre_lock_hook();
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
         // The member list is read INSIDE the hold: a pass that listed it before
         // a just-started session's marker was held would run with that session
         // missing, prune its record entry, and let its first in-session edit be
         // reverted. The list and `per_profile_env_keys` are read inside the
         // same hold, so neither predates the merge.
         let paths = known_paths()?;
-        let Some(custom_env) = per_profile_env_keys() else {
-            return Ok(false);
+        // Before the env-key pause and whatever the member count: a paused
+        // sync or a lone operator file must still get the number back, and the
+        // merge below must read the members the put-back left.
+        let retention = crate::retention::settle(held, &operator_file, &paths, &record)?;
+        let skipped = SyncPass {
+            merged: false,
+            attempted_write: retention.attempted_write,
         };
-        crate::jsonsync::sync_paths(
+        // A failed operator put-back skips this pass's merge while it stands:
+        // a merge after it could strip the key from the copies that already
+        // got it back. The skipped pass never keys the `sync_once` fast path,
+        // so the next wake retries the put-back.
+        if !retention.merge_ok {
+            return Ok(skipped);
+        }
+        let Some(custom_env) = per_profile_env_keys() else {
+            return Ok(skipped);
+        };
+        let merge_attempted_write = crate::jsonsync::sync_paths_reporting_writes(
             &paths,
             Some(&operator_file),
             Some(&record),
             crate::jsonsync::SETTINGS_PROTECTED_KEYS,
             |path| key_role(path, &custom_env),
         )?;
-        Ok(true)
+        Ok(SyncPass {
+            merged: true,
+            attempted_write: retention.attempted_write || merge_attempted_write,
+        })
     })
 }
 
