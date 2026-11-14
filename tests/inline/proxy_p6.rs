@@ -626,6 +626,7 @@ fn leg_state() -> SchedulerState {
         last_history_prune: AtomicU64::new(now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         claude_resets_memo: new_claude_resets_memo(),
+        codex_resets_memo: new_codex_resets_memo(),
         fetcher: crate::providers::fetch_third_party_usage,
         // No reload compare has seen a name yet, so every entry reads as
         // fresh (a name with no snapshot half is never stale): the pins drive
@@ -10110,7 +10111,8 @@ fn limit_reset_on_a_proxy_account_refuses_before_any_request() {
     let (listener, base) = crate::testutil::deaf_listener();
     let urls = crate::usage::codex_reset::ResetUrls::under(&base);
     let refuse = |name: &str, list: bool, yes: bool| {
-        let err = crate::limit_reset_with(name, list, yes, false, &urls, |prompt| {
+        let id = (!list).then_some("g");
+        let err = crate::limit_reset_with(name, id, yes, false, &urls, |prompt| {
             panic!("this path must not prompt, asked: {prompt}")
         })
         .expect_err("refused");

@@ -7008,20 +7008,10 @@ fn claude_resets_rows(detail: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `ends` as the resets line dates it: the local month and day.
-fn local_day(ends_secs: i64) -> String {
-    use chrono::TimeZone as _;
-    chrono::Local
-        .timestamp_opt(ends_secs, 0)
-        .single()
-        .expect("a local instant")
-        .format("%b %-d")
-        .to_string()
-}
-
 /// A claude account's pane carries its banked resets off the hourly side
-/// read: the usable count, the windows the next grant clears and its end;
-/// a reading under 75 min old carries no age.
+/// read; a reading an older clauth stored (a count and the next grant's
+/// windows and end, no grant) shows its count alone, and a reading under
+/// 75 min old carries no age.
 #[test]
 fn the_usage_claude_pane_shows_its_banked_resets() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -7040,32 +7030,36 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        [format!(
-            "resets 1 available · resets 5h, 7d · expires {}",
-            local_day(ends)
-        )],
+        ["resets 1 available"],
         "{detail:?}"
+    );
+    assert!(
+        !detail
+            .iter()
+            .any(|r| r.starts_with('├') || r.starts_with('└')),
+        "no grant stored, no rail: {detail:?}"
     );
 }
 
-/// The window Fable counts into reads `7d fable` in the resets row, as the
+/// The window Fable counts into reads `7d fable` on the resets rail, as the
 /// pane's own bar names it.
 #[test]
 fn the_claude_resets_row_names_the_fable_weekly_7d_fable() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let now = crate::usage::now_ms();
-    crate::testutil::write_claude_limit_resets_banked(
-        "cl1",
-        1,
-        1,
-        &["seven_day_overage_included"],
-        now,
-    );
-    let (_, detail) = t6_panes(&t6_app());
+    let reading = crate::usage::LimitResets {
+        usable: 1,
+        banked: Some(1),
+        grants: vec![stored_grant(serde_json::json!({
+            "id": "g", "resets_total": 1, "resets_left": 1,
+            "clears": ["seven_day_overage_included"], "usable_now": true}))],
+        ..crate::usage::LimitResets::default()
+    };
     assert_eq!(
-        claude_resets_rows(&detail),
-        ["resets 1 available · resets 7d fable"],
-        "{detail:?}"
+        line_texts(&claude_resets_block(&reading, 60)),
+        [
+            "resets    1 available",
+            "└ limit reset",
+            "  resets 7d fable"
+        ]
     );
 }
 
@@ -7079,7 +7073,7 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2/3 available · resets 5h"],
+        ["resets 2/3 available"],
         "{detail:?}"
     );
 
@@ -7097,7 +7091,7 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 available · resets 5h"],
+        ["resets 2 available"],
         "{detail:?}"
     );
 
@@ -7121,7 +7115,7 @@ fn a_stale_claude_resets_reading_says_its_age() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 available · resets 5h · read 3h ago"],
+        ["resets 2 available · read 3h ago"],
         "{detail:?}"
     );
 }
@@ -7688,7 +7682,7 @@ fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 available · resets 5h"],
+        ["resets 1 available"],
         "{detail:?}"
     );
 }
@@ -7754,52 +7748,30 @@ fn the_resets_row_says_its_age_only_past_75_minutes() {
     );
 }
 
-/// A row too wide for its pane ends on `…`: a bare clip turned `expires Nov 26`
-/// into a false `expires Nov 2`. At 57 columns the pane holds 53 cells, 43 of
-/// them after the key, one short of this 44-cell value. A row that fits keeps
+/// A count line too wide for its pane ends on `…`, so a cut figure never
+/// reads as another: `0/1 available · cooldown (4h 46m)` is 33 cells, and a
+/// 42-cell pane leaves 32 after the key, one short. A line that fits keeps
 /// every part, the exact fit included.
 #[test]
 fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
-    use chrono::TimeZone as _;
-
-    fn row_at(app: &App, width: u16) -> String {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
-            .expect("terminal");
-        term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
-            .expect("draw");
-        let rows = crate::testutil::buffer_rows(term.backend().buffer());
-        let at = rows
-            .iter()
-            .find(|r| r.contains("resets  "))
-            .unwrap_or_else(|| panic!("a resets row at {width}: {rows:?}"));
-        let tail = &at[at.find("resets  ").expect("the row")..];
-        let end = tail.find(['│', '┊', '┃']).unwrap_or(tail.len());
-        tail[..end].split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    let _home = crate::testutil::HomeSandbox::new();
-    let ends = chrono::Local
-        .with_ymd_and_hms(2099, 11, 26, 12, 0, 0)
-        .single()
-        .expect("a local instant")
-        .to_rfc3339();
-    crate::testutil::write_claude_limit_resets(
-        "cl1",
-        1,
-        &["five_hour", "seven_day"],
-        Some(&ends),
-        crate::usage::now_ms() - 10 * 60_000,
-    );
-    let app = t6_app();
-
+    let now = crate::usage::now_epoch_secs();
+    let reading = crate::usage::LimitResets {
+        usable: 0,
+        banked: Some(1),
+        grants: vec![stored_grant(serde_json::json!({
+            "id": "g", "label": "Held", "resets_total": 1, "resets_left": 1,
+            "usable_now": false}))],
+        cooldown_until: Some(rfc3339(now + 4 * 3600 + 46 * 60 + 30)),
+        ..crate::usage::LimitResets::default()
+    };
     assert_eq!(
-        row_at(&app, 57),
-        "resets 1 available · resets 5h, 7d · expires Nov …"
+        line_texts(&claude_resets_block(&reading, 42))[0],
+        "resets    0/1 available · cooldown (4h 46…"
     );
     assert_eq!(
-        row_at(&app, 58),
-        "resets 1 available · resets 5h, 7d · expires Nov 26",
-        "44 cells in a 44-cell budget fit"
+        line_texts(&claude_resets_block(&reading, 43))[0],
+        "resets    0/1 available · cooldown (4h 46m)",
+        "33 cells in a 33-cell budget fit"
     );
 }
 
@@ -8999,5 +8971,312 @@ fn a_single_part_value_ends_on_an_ellipsis() {
         lines,
         vec![format!("  {:<13}{}…", "summary", &long[..25])],
         "one over-wide part keeps 25 cells and ends on the ellipsis in a 26-cell column"
+    );
+}
+
+/// The claude pane's `resets` row counts the banked resets, then names each
+/// one on the rail beneath it: its label, then what it resets and the local
+/// day it stays valid until, the year added once it differs from this one.
+#[test]
+fn the_claude_resets_row_names_each_reset_on_the_rail() {
+    use chrono::{Datelike as _, TimeZone as _};
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let later = now + 400 * 86_400;
+    let iso = |secs: i64| {
+        chrono::DateTime::from_timestamp(secs, 0)
+            .expect("instant")
+            .to_rfc3339()
+    };
+    let valid_until = |secs: i64| {
+        let local = chrono::Local
+            .timestamp_opt(secs, 0)
+            .single()
+            .expect("a local instant");
+        if local.year() == chrono::Local::now().year() {
+            local.format("%b %-d").to_string()
+        } else {
+            local.format("%b %-d, %Y").to_string()
+        }
+    };
+    let body = include_str!("../fixtures/cedar-ember-three-banked.json")
+        .replace("2026-12-10T22:00:00+00:00", &iso(soon))
+        .replace("2027-03-09T07:59:00+00:00", &iso(later));
+    let status = crate::usage::claude_reset::read_status(&body).expect("a cedar_ember block");
+    crate::testutil::register_names(&["cl1"]);
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cl1"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    crate::profile_cache::write_profile_cache_for(
+        crate::harness::Harness::Claude,
+        &crate::profile::ProfileName::from("cl1"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+        &crate::usage::claude_reset::status_reading(&status),
+    );
+    let app = t6_app();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let split = rows[0]
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    let detail: Vec<String> = rows[1..rows.len() - 1]
+        .iter()
+        .map(|row| {
+            // Only the pane's own border and scrollbar go: the rail's `│`
+            // inside the padding is content.
+            let pane: String = row.chars().skip(split).collect();
+            let pane = pane
+                .trim_end_matches(|c: char| c == '│' || c == '┊' || c == '┃' || c.is_whitespace());
+            pane.strip_prefix('│')
+                .unwrap_or(pane)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let at = detail
+        .iter()
+        .position(|r| r.starts_with("resets "))
+        .unwrap_or_else(|| panic!("a resets row: {detail:#?}"));
+    let block: Vec<&str> = detail[at..].iter().take(7).map(String::as_str).collect();
+    assert_eq!(
+        block,
+        [
+            "resets 3 available".to_string(),
+            "├ One full limit reset (November 2026)".to_string(),
+            format!("│ resets 7d, 7d fable · valid until {}", valid_until(soon)),
+            "├ New model launch: one Fable reset for Max, Team Premium and Enterprise Premium"
+                .to_string(),
+            format!("│ resets 7d fable · valid until {}", valid_until(later)),
+            "└ New model launch: one more Fable reset at 6 months' tenure".to_string(),
+            format!("resets 7d fable · valid until {}", valid_until(later)),
+        ],
+        "{detail:#?}"
+    );
+}
+
+/// Each line's text, its spans joined.
+fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+/// A stored grant off its wire shape, so a test names only what it varies.
+fn stored_grant(fields: serde_json::Value) -> crate::usage::claude_reset::Grant {
+    serde_json::from_value(fields).expect("a grant")
+}
+
+/// `valid until <day>` as the rail spells a local instant, the year added off
+/// this one — computed here from chrono, not by the renderer.
+fn rail_day(secs: i64) -> String {
+    use chrono::{Datelike as _, TimeZone as _};
+    let local = chrono::Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .expect("a local instant");
+    if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d").to_string()
+    } else {
+        local.format("%b %-d, %Y").to_string()
+    }
+}
+
+fn rfc3339(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .expect("instant")
+        .to_rfc3339()
+}
+
+/// The claude `resets` block whole, row by row at a fixed width: the count
+/// line counts the usable resets against the held ones and names the block's
+/// cooldown while it holds a reset back; the rail names each reset still held
+/// (a used grant names nothing to spend and is left off), its label then its
+/// windows and day, the rail glyph in the hairline colour and the text faint.
+#[test]
+fn the_resets_rail_names_each_held_reset_and_the_cooldown() {
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let later = now + 400 * 86_400;
+    let reading = crate::usage::LimitResets {
+        usable: 1,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "g-1", "label": "First reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(soon), "clears": ["seven_day"], "usable_now": true})),
+            stored_grant(serde_json::json!({
+                "id": "g-2", "label": "Second reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(later), "clears": ["seven_day_overage_included"],
+                "usable_now": false})),
+            stored_grant(serde_json::json!({
+                "id": "g-3", "label": "Spent reset", "resets_total": 1, "resets_left": 0,
+                "clears": ["five_hour"], "usable_now": false})),
+        ],
+        cooldown_until: Some(rfc3339(now + 4 * 3600 + 46 * 60 + 30)),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..crate::usage::LimitResets::default()
+    };
+    let lines = claude_resets_block(&reading, 60);
+    assert_eq!(
+        line_texts(&lines),
+        [
+            "resets    1/2 available · cooldown (4h 46m)".to_string(),
+            "├ First reset".to_string(),
+            format!("│ resets 7d · valid until {}", rail_day(soon)),
+            "└ Second reset".to_string(),
+            format!("  resets 7d fable · valid until {}", rail_day(later)),
+        ]
+    );
+    for line in &lines[1..] {
+        assert_eq!(line.spans[0].style, theme::line(), "{line:?}");
+        assert_eq!(line.spans[1].style, theme::faint(), "{line:?}");
+    }
+
+    let calm = crate::usage::LimitResets {
+        cooldown_until: Some(rfc3339(now - 60)),
+        ..reading.clone()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&calm, 60))[0],
+        "resets    1/2 available",
+        "a cooldown behind now names nothing"
+    );
+
+    // A grant the server paused, and one it will only use at a limit the
+    // account sits under, name their STATE word on the tail, so the rail
+    // never reads them as spendable.
+    let held_back = crate::usage::LimitResets {
+        usable: 0,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "p-1", "label": "Paused reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(soon), "clears": ["seven_day"],
+                "usable_now": false, "paused": true})),
+            stored_grant(serde_json::json!({
+                "id": "l-1", "label": "At-limit reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(now + 41 * 86_400), "clears": ["seven_day"],
+                "usable_now": false, "use_requires_limit": true})),
+        ],
+        fetched_at: Some(crate::usage::now_ms()),
+        ..crate::usage::LimitResets::default()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&held_back, 60)),
+        [
+            "resets    0/2 available".to_string(),
+            "├ Paused reset".to_string(),
+            format!("│ resets 7d · valid until {} · paused", rail_day(soon)),
+            "└ At-limit reset".to_string(),
+            format!(
+                "  resets 7d · valid until {} · at limit only",
+                rail_day(now + 41 * 86_400)
+            ),
+        ]
+    );
+}
+
+/// A label too long for the pane wraps on the rail with the `│ `
+/// continuation, never cut, and its detail follows on the rail; a stale
+/// reading keeps its age on the count line.
+#[test]
+fn a_long_reset_label_wraps_on_the_rail() {
+    let reading = crate::usage::LimitResets {
+        usable: 2,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "g-1",
+                "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+                "resets_total": 1, "resets_left": 1, "clears": ["seven_day_overage_included"],
+                "usable_now": true})),
+            stored_grant(serde_json::json!({
+                "id": "g-2", "label": "Short", "resets_total": 1, "resets_left": 1,
+                "usable_now": true})),
+        ],
+        fetched_at: Some(crate::usage::now_ms() - 3 * 3_600_000),
+        ..crate::usage::LimitResets::default()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&reading, 40)),
+        [
+            "resets    2 available · read 3h ago",
+            "├ New model launch: one Fable reset for",
+            "│ Max, Team Premium and Enterprise",
+            "│ Premium",
+            "│ resets 7d fable",
+            "└ Short",
+        ]
+    );
+}
+
+/// The codex `resets` block: off a stored list read, the credits that read
+/// available on the rail (a redeemed one left off) with what each resets and
+/// its day or `no expiry`; with no list read, the usage poll's count alone.
+#[test]
+fn the_codex_resets_rail_names_each_available_credit() {
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let credit = |id: &str, status: &str, expires: Option<String>, title: Option<&str>| {
+        crate::usage::codex_reset::ResetCredit {
+            id: id.to_string(),
+            reset_type: "codex_rate_limits".to_string(),
+            status: status.to_string(),
+            granted_at: None,
+            expires_at: expires,
+            title: title.map(str::to_string),
+        }
+    };
+    let list =
+        crate::usage::codex_reset::credits_reading(&crate::usage::codex_reset::ResetCredits {
+            credits: vec![
+                credit(
+                    "c-1",
+                    "available",
+                    Some(rfc3339(soon)),
+                    Some("Full reset (Weekly + 5 hr)"),
+                ),
+                credit("c-2", "redeemed", None, None),
+                credit("c-3", "available", None, None),
+            ],
+            available_count: 2,
+        });
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: Some(5),
+        fetched_at: None,
+    };
+    assert_eq!(
+        line_texts(&codex_resets_block(&row, Some(&list), 60)),
+        [
+            "resets    2 available".to_string(),
+            "├ Full reset (Weekly + 5 hr)".to_string(),
+            format!("│ resets usage windows · valid until {}", rail_day(soon)),
+            "└ usage-limit reset".to_string(),
+            "  resets usage windows · no expiry".to_string(),
+        ]
+    );
+    assert_eq!(
+        line_texts(&codex_resets_block(&row, None, 60)),
+        ["resets    5 available"],
+        "no list read: the poll's count, no rail"
     );
 }

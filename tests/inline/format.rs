@@ -465,7 +465,7 @@ fn threshold_tokens_formats_m_k_and_plain() {
     assert_eq!(format_threshold_tokens(1_500_000), "1500000");
 }
 
-/// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
+/// `local_stamp` is the prose-stamp formatter: epoch seconds → `YYYY-MM-DD
 /// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
 /// independently of the operator's zone — the wall-clock digits shift with the
 /// zone, the separators do not.
@@ -478,6 +478,22 @@ fn local_stamp_renders_the_local_wall_clock_shape() {
             4 | 7 => assert_eq!(c, '-', "{stamp}"),
             10 => assert_eq!(c, ' ', "{stamp}"),
             13 | 16 => assert_eq!(c, ':', "{stamp}"),
+            _ => assert!(c.is_ascii_digit(), "non-digit at {i} in {stamp}"),
+        }
+    }
+}
+
+/// The listing cell's minute form is the same wall clock without the seconds.
+/// Same fixed-epoch shape pin, so only the separators are asserted.
+#[test]
+fn local_minute_stamp_renders_the_local_wall_clock_shape_without_seconds() {
+    let stamp = local_minute_stamp(0).unwrap();
+    assert_eq!(stamp.len(), 16, "{stamp}");
+    for (i, c) in stamp.chars().enumerate() {
+        match i {
+            4 | 7 => assert_eq!(c, '-', "{stamp}"),
+            10 => assert_eq!(c, ' ', "{stamp}"),
+            13 => assert_eq!(c, ':', "{stamp}"),
             _ => assert!(c.is_ascii_digit(), "non-digit at {i} in {stamp}"),
         }
     }

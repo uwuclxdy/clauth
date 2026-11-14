@@ -731,26 +731,38 @@ impl PlanInfo {
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
 /// One provider-neutral banked limit-reset reading. A codex poll fills
-/// `usable` alone (its body names no windows, no end and no `banked`); the
-/// claude scheduler's hourly side read and the CLI's post-spend refresh fill
-/// every field, read `usable` as 0 while the server's next reset cannot be
-/// spent, and count every grant in `banked`. The enclosing `None` means the
-/// harness carried no reading, never that the count was zero.
+/// `usable` alone (its body lists no reset); a read of the resets themselves
+/// (the claude scheduler's hourly side read, the post-spend refresh, the codex
+/// listing) fills every field, keeping each reset the server lists so every
+/// surface names them all. The enclosing `None` means the harness carried no
+/// reading, never that the count was zero. Every field past `usable` is
+/// skipped while empty, so a codex poll's cache bytes and an older file's
+/// load do not change.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct LimitResets {
     pub(crate) usable: u32,
-    /// Every grant's resets left, usable or not: the Usage row counts `usable`
-    /// against this total. Absent from a reading that never carried it (a
-    /// codex poll, an older file), so those cache bytes do not change.
+    /// Every reset left, usable or not: the Usage row counts `usable` against
+    /// this total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) banked: Option<u32>,
+    /// Every claude grant the read listed, in the server's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) clears: Vec<String>,
+    pub(crate) grants: Vec<super::claude_reset::Grant>,
+    /// Every codex credit the list read named, in the server's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) credits: Vec<super::codex_reset::ResetCredit>,
+    /// The claude block's one cooldown stamp, raw server spelling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) ends_at: Option<String>,
+    pub(crate) cooldown_until: Option<String>,
+    /// The claude block's weekly reset, raw server spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_resets_at: Option<String>,
+    /// Whether the claude account sat at a limit a reset covers when read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) at_limit: bool,
     /// Epoch ms of the read that produced this reading, the reading's own
-    /// stamp. `None` on a codex reading (its poll stamps the surrounding
-    /// [`UsageInfo`] instead), so codex cache bytes do not change.
+    /// stamp. `None` on a codex poll's reading (its poll stamps the surrounding
+    /// [`UsageInfo`] instead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
 }

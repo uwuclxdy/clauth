@@ -1123,11 +1123,12 @@ pub(crate) fn local_date(epoch: i64) -> Option<String> {
     ))
 }
 
-/// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
-/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
-/// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
-/// --json`'s `updated` — do not route through here.
+/// The LOCAL prose-stamp formatter: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock.
+/// [`local_minute_stamp`] is the listing-cell spelling beside it; any other
+/// spelling of a LOCAL stamp is a bug in its caller, not a new helper. Machine
+/// timestamps that stay UTC by design — the daemon `logline!` prefix and
+/// `clauth sessions --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
     let naive = DateTime::from_timestamp(epoch, 0)?
@@ -1139,6 +1140,22 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.hour(),
         naive.minute(),
         naive.second(),
+    ))
+}
+
+/// [`local_stamp`] without the seconds: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM` in the operator's local wall clock, the shape a listing
+/// cell shows. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_minute_stamp(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{} {:02}:{:02}",
+        local_date(epoch)?,
+        naive.hour(),
+        naive.minute(),
     ))
 }
 

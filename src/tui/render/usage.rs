@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus, escape_control,
-    pool_auth_label,
+    App, CodexRow, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus,
+    escape_control, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{
@@ -485,12 +485,11 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .concat(),
         ));
     }
-    if let Some(resets) = row.resets.filter(|n| *n > 0) {
-        lines.push(Line::from(vec![
-            key_span("resets"),
-            Span::styled(format!("{resets} available"), theme::accent()),
-        ]));
-    }
+    lines.extend(codex_resets_block(
+        row,
+        app.codex_resets.get(row.name.as_str()),
+        inner.width,
+    ));
     lines.push(Line::from(vec![
         key_span("status"),
         match row.fetched_at {
@@ -700,10 +699,8 @@ fn build_usage_lines(
     // `limit_resets.json` is written only under a profile with a claude OAuth
     // pair (a hybrid with a pair included), so a pane without a reading
     // draws no row.
-    if let Some(resets) = app.claude_resets.get(profile.name.as_str())
-        && let Some(row) = claude_resets_line(resets, inner_w)
-    {
-        lines.insert(1, row);
+    if let Some(resets) = app.claude_resets.get(profile.name.as_str()) {
+        lines.splice(1..1, claude_resets_block(resets, inner_w));
     }
     // The live speed/rate rows sit under the header, ahead of the usage bars:
     // they are the account's current figures, read off a fresh producer, and
@@ -823,60 +820,159 @@ fn build_usage_lines(
 /// read missed a slot.
 const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
-/// The claude pane's `resets` row off the account's limit-reset reading (the
-/// scheduler's hourly side read or the CLI's post-spend refresh): `N available`,
-/// or `N/M available` against a banked total the count falls short of;
-/// the windows the next grant resets, its end as the local month/day, and the
-/// reading's age once it passes 75 min. Each `· …` part drops when its field
-/// is absent; a zero count draws no row unless the reading carries a banked
-/// total above zero. A row past `inner_w` ends on `…`, so a cut date never
-/// reads as a different date.
-fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Option<Line<'static>> {
+/// The claude pane's `resets` block off the account's limit-reset reading
+/// (the scheduler's hourly side read or the post-spend refresh): the count
+/// line, `N available`, or `N/M available` against a banked total the count
+/// falls short of, `· cooldown (<dur>)` while the block's cooldown holds a
+/// reset back, and the reading's age once it passes 75 min; then one rail
+/// entry per grant still holding a reset (a used grant names nothing to
+/// spend): its label, then `resets <windows> · valid until <day>`, the
+/// grant's STATE word on the tail once it is not `ready` (a cooling grant's
+/// word sits on the count line instead). A zero count draws nothing unless
+/// the reading carries a banked total above zero.
+fn claude_resets_block(resets: &crate::usage::LimitResets, inner_w: u16) -> Vec<Line<'static>> {
+    use crate::usage::claude_reset::{available_of, cooldown_left, grant_state, windows_cell};
     let banked = resets.banked;
     if resets.usable == 0 && banked.unwrap_or(0) == 0 {
-        return None;
+        return Vec::new();
     }
-    let mut parts = vec![crate::usage::claude_reset::available_of(
-        resets.usable,
-        banked.unwrap_or(resets.usable),
-    )];
-    if !resets.clears.is_empty() {
-        let labels = resets
-            .clears
-            .iter()
-            .map(|w| crate::usage::claude_reset::window_label(w))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("resets {labels}"));
-    }
-    if let Some(ends) = local_day(&resets.ends_at) {
-        parts.push(format!("expires {ends}"));
-    }
-    if let Some(stamp) = resets
-        .fetched_at
-        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
-    {
-        parts.push(format!("read {}", relative_age(stamp)));
-    }
-    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
-    Some(Line::from(vec![
-        key_span("resets"),
-        Span::styled(truncate(&parts.join(" · "), value_width), theme::accent()),
-    ]))
+    let mut parts = vec![available_of(resets.usable, banked.unwrap_or(resets.usable))];
+    let held: Vec<&crate::usage::claude_reset::Grant> = resets
+        .grants
+        .iter()
+        .filter(|g| g.resets_left() > 0)
+        .collect();
+    let cooldown_part = cooldown_left(resets.cooldown_until.as_deref(), now_epoch_secs())
+        .filter(|_| held.iter().any(|g| !g.is_usable_now()))
+        .map(|left| {
+            format!(
+                "cooldown ({})",
+                crate::usage::humanize_duration(left as i64)
+            )
+        });
+    parts.extend(cooldown_part.clone());
+    parts.extend(stale_read(resets.fetched_at));
+    let entries = held
+        .iter()
+        .map(|g| {
+            let state = grant_state(
+                g,
+                resets.cooldown_until.as_deref(),
+                resets.at_limit,
+                now_epoch_secs(),
+            );
+            let detail = [
+                Some(windows_cell(g.clears()))
+                    .filter(|w| !w.is_empty())
+                    .map(|w| format!("resets {w}")),
+                g.ends_at().and_then(valid_until_day),
+                // The STATE word rides the tail of every grant a spend would
+                // not send now, so the rail never offers it as if spendable;
+                // a cooling grant's word is already on the count line.
+                (state != "ready" && !(state.starts_with("cooldown ") && cooldown_part.is_some()))
+                    .then_some(state),
+            ];
+            (g.label(), detail.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
+    resets_block(&parts.join(" · "), entries, inner_w)
 }
 
-/// The next grant's end as the line dates it: the local month and day
-/// (`Oct 30`). `None` for an absent or unparseable stamp — the server's
-/// spelling rides through, and a shape clauth cannot date omits the part.
-fn local_day(ends_at: &Option<String>) -> Option<String> {
-    let raw = ends_at.as_deref()?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-    Some(
-        parsed
-            .with_timezone(&chrono::Local)
-            .format("%b %-d")
-            .to_string(),
-    )
+/// The codex pane's `resets` block. Off the account's last reset-list read
+/// when it names a credit that reads available: the count of those, the
+/// read's age past the stale cut, and one rail entry per such credit (its
+/// title, then `resets <what> · valid until <day>` or `no expiry`). Else the
+/// usage poll's count alone, the only figure its body carries.
+fn codex_resets_block(
+    row: &CodexRow,
+    reset_list: Option<&crate::usage::LimitResets>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let listed = reset_list.map(|reading| {
+        let held: Vec<_> = reading
+            .credits
+            .iter()
+            .filter(|c| c.is_available())
+            .collect();
+        (reading, held)
+    });
+    if let Some((reading, held)) = listed.filter(|(_, held)| !held.is_empty()) {
+        let mut parts = vec![format!("{} available", held.len())];
+        parts.extend(stale_read(reading.fetched_at));
+        let entries = held
+            .iter()
+            .map(|c| {
+                let valid = match c.expires_at.as_deref() {
+                    Some(raw) if !crate::format::shows_nothing(raw) => valid_until_day(raw),
+                    Some(_) | None => Some("no expiry".to_string()),
+                };
+                let detail = std::iter::once(format!("resets {}", c.resets()))
+                    .chain(valid)
+                    .collect();
+                (c.label(), detail)
+            })
+            .collect();
+        return resets_block(&parts.join(" · "), entries, inner_w);
+    }
+    match row.resets.filter(|n| *n > 0) {
+        Some(n) => resets_block(&format!("{n} available"), Vec::new(), inner_w),
+        None => Vec::new(),
+    }
+}
+
+/// `read <age>` once a resets reading passes the 75-min stale cut.
+fn stale_read(fetched_at: Option<u64>) -> Option<String> {
+    fetched_at
+        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
+        .map(|stamp| format!("read {}", relative_age(stamp)))
+}
+
+/// `valid until <day>` off a reset's end: the local month and day (`Dec 10`),
+/// the year added when it is not this one (`Mar 9, 2027`). `None` for a stamp
+/// clauth cannot date.
+fn valid_until_day(raw: &str) -> Option<String> {
+    use chrono::Datelike as _;
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let day = if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d")
+    } else {
+        local.format("%b %-d, %Y")
+    };
+    Some(format!("valid until {day}"))
+}
+
+/// The `resets` block both panes draw: the count line, its value cut with `…`
+/// at the pane's edge, then one entry per reset on the stacked-hints rail at
+/// col 0 — the label's rows, then the detail parts joined by ` · ` — the
+/// label and detail wrapping between words, never cut.
+fn resets_block(
+    count: &str,
+    entries: Vec<(String, Vec<String>)>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+    let mut lines = vec![Line::from(vec![
+        key_span("resets"),
+        Span::styled(truncate(count, value_width), theme::accent()),
+    ])];
+    let width = super::panes::rail_text_width(inner_w as usize);
+    let last = entries.len().saturating_sub(1);
+    for (i, (label, detail)) in entries.into_iter().enumerate() {
+        // Server text: wrapped plain, so a backtick in a label never reads as
+        // a typed command.
+        let mut rows = prose::plain_wrap(&label, width);
+        if !detail.is_empty() {
+            rows.extend(prose::plain_wrap(&detail.join(" · "), width));
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| vec![Span::styled(row, theme::faint())])
+            .collect();
+        lines.extend(super::panes::rail_lines(rows, i < last));
+    }
+    lines
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
