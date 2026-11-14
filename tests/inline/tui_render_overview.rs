@@ -9830,6 +9830,172 @@ fn each_providers_first_row_crests_apart_from_the_others() {
     }
 }
 
+/// Three claude rows, each with a 35% 7d window: `ultra` on a plan with no 5h
+/// limit (its reading carries the mark, plus a 40% 5h window when
+/// `stored_five` is set), `max` with a 1% 5h bar, and `unread` with no 5h
+/// reading.
+fn no_five_hour_limit_app(stored_five: bool) -> (App, ReadingsSnapshot) {
+    let row = |name: &str, five: Option<f64>, marked: bool| {
+        let (p, mut r) = polled(name, 95.0, five.unwrap_or(0.0), 3 * 3600);
+        let usage = r.usage.get_mut(name).expect("polled seeds a reading");
+        if five.is_none() {
+            usage.five_hour = None;
+        }
+        usage.seven_day = Some(UsageWindow {
+            utilization: 35.0,
+            resets_at: Some(countdown_reset_in(5 * 86_400)),
+        });
+        usage.no_five_hour_limit = marked;
+        (p, r)
+    };
+    let (config, readings) = config_with(
+        vec![
+            row("ultra", stored_five.then_some(40.0), true),
+            row("max", Some(1.0), false),
+            row("unread", None, false),
+        ],
+        Some("ultra"),
+        vec![],
+    );
+    (App::new(config), readings)
+}
+
+/// The panel's rows at `w` columns as the panel lays them out, keyed by
+/// account name, with the 5h cell's char range.
+fn no_five_hour_limit_rows(
+    app: &App,
+    readings: &ReadingsSnapshot,
+    w: u16,
+) -> (BTreeMap<&'static str, Vec<char>>, (usize, usize)) {
+    let list = w - 4;
+    let widths = if list > OVERVIEW_MAX_W {
+        OverviewWidths::new(OVERVIEW_MAX_W, app, readings).filled(usize::from(list))
+    } else {
+        OverviewWidths::new(list, app, readings)
+    };
+    let rows = band_rows(app, readings, w, 7);
+    let by_name = ["ultra", "max", "unread"]
+        .into_iter()
+        .map(|name| {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(&format!(" {name} ")))
+                .unwrap_or_else(|| panic!("fixture control: {name} draws a row at {w}"));
+            (name, row.chars().collect())
+        })
+        .collect();
+    (by_name, cell_spans(&widths).0)
+}
+
+fn slice(row: &[char], (start, end): (usize, usize)) -> String {
+    row[start..end].iter().collect()
+}
+
+fn bracket_cols(row: &[char]) -> Vec<usize> {
+    row.iter()
+        .enumerate()
+        .filter_map(|(i, c)| (*c == '[').then_some(i))
+        .collect()
+}
+
+/// The 5h cell's text for a row whose dash sits on the reading rail: the `%`
+/// of `max`'s 5h reading, the first `%` in its row.
+fn dash_on_rail(max: &[char], (start, end): (usize, usize)) -> String {
+    let pct = max
+        .iter()
+        .position(|c| *c == '%')
+        .expect("fixture control: max draws its 5h reading");
+    cell(&format!("{NO_DATA:>w$}", w = pct + 1 - start), end - start)
+}
+
+/// A plan with no 5h limit reads `no limit` from the 5h cell's first column,
+/// where another row's bar draws `[`, and the row pad fills the rest of the
+/// cell, so the 7d bar starts where it does on a row with a 5h bar. An
+/// account with no 5h reading keeps the dash on the reading rail. Pinned at
+/// a laid-out width and a filled wide one.
+#[test]
+fn a_plan_with_no_five_hour_limit_reads_no_limit_in_the_five_hour_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, readings) = no_five_hour_limit_app(false);
+    for w in [124, 200] {
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        let (ultra, max, unread) = (&rows["ultra"], &rows["max"], &rows["unread"]);
+        assert_eq!(
+            max[five.0], '[',
+            "fixture control: the 5h cell opens where the bar draws at {w}"
+        );
+        assert_eq!(
+            slice(ultra, five),
+            cell("no limit", five.1 - five.0),
+            "the note opens the 5h cell at {w}"
+        );
+        assert_eq!(
+            bracket_cols(ultra),
+            vec![bracket_cols(max)[1]],
+            "the no-limit row's 7d bar starts where the bar row's does at {w}"
+        );
+        assert_eq!(
+            slice(unread, five),
+            dash_on_rail(max, five),
+            "an unread 5h cell keeps its dash on the rail at {w}"
+        );
+        assert_eq!(
+            bracket_cols(unread),
+            vec![bracket_cols(max)[1]],
+            "the unread row's 7d bar starts where the bar row's does at {w}"
+        );
+    }
+}
+
+/// A 5h cell under the note's 8 cells draws the no-data dash on the reading
+/// rail for a no-limit plan, a stored 5h window under the mark included.
+#[test]
+fn a_no_limit_plan_in_a_narrow_five_hour_cell_draws_the_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for stored_five in [false, true] {
+        let (app, readings) = no_five_hour_limit_app(stored_five);
+        let w = 40;
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        assert!(
+            five.1 - five.0 < 8,
+            "fixture control: a {w}-column pane's 5h cell is under 8 cells"
+        );
+        assert_eq!(
+            slice(&rows["ultra"], five),
+            dash_on_rail(&rows["max"], five),
+            "a narrow no-limit cell draws the dash (stored 5h window: {stored_five})"
+        );
+    }
+}
+
+/// The mark alone decides the cell, as on the Usage tab: a reading holding
+/// both a 5h window and the mark reads `no limit`, the hidden window moves no
+/// other row's reading, and a reading without the mark keeps its bar.
+#[test]
+fn a_no_limit_mark_hides_a_stored_five_hour_window() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (plain_app, plain_readings) = no_five_hour_limit_app(false);
+    let (app, readings) = no_five_hour_limit_app(true);
+    for w in [124, 200] {
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        let (plain_rows, plain_five) = no_five_hour_limit_rows(&plain_app, &plain_readings, w);
+        assert_eq!(
+            slice(&rows["ultra"], five),
+            cell("no limit", five.1 - five.0),
+            "the mark outranks a stored 5h window at {w}"
+        );
+        assert_eq!(
+            slice(&rows["max"], five),
+            slice(&plain_rows["max"], plain_five),
+            "the hidden window leaves the bar row's 5h cell as it is at {w}"
+        );
+        assert_eq!(
+            rows["max"][five.0], '[',
+            "a reading without the mark keeps its bar at {w}"
+        );
+    }
+}
+
 /// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
 /// reading shows the chip: the chip reads the same file the leg wrote, the
 /// same predicate the pane now uses, never a profile-kind filter.
