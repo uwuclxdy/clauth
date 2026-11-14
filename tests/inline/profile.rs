@@ -5072,6 +5072,83 @@ fn an_origin_entry_counts_only_as_a_browser_would_send_it() {
     }
 }
 
+/// `[serve] app_url` takes an absolute https page a pairing link can carry:
+/// a page with a path counts, and a plain-http scheme, a fragment, userinfo,
+/// a wildcard host or a port-less, uppercase or default-port origin does not.
+#[test]
+fn an_app_url_counts_only_an_https_page_the_link_can_carry() {
+    use crate::profile::app_url_fault as fault;
+
+    for url in [
+        "https://app.example.net",
+        "https://example.net/clauth/",
+        "https://app.example.net:8443/page?q=1",
+    ] {
+        assert_eq!(fault(url), None, "{url:?}");
+    }
+    for (url, reason) in [
+        ("http://app.example.net", "its scheme is not https"),
+        (
+            "https://app.example.net/#x",
+            "it has a fragment, which the link's own fragment replaces",
+        ),
+        (
+            "https:///page",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        ("app.example.net", "it is not an absolute https:// URL"),
+        (
+            "https://App.example.net",
+            "its host is empty, not lowercase, or malformed",
+        ),
+        (
+            "https://app.example.net:443",
+            "it names its scheme's default port",
+        ),
+        ("https://user@app.example.net", "it has userinfo"),
+        ("https://*.example.net", "it holds a wildcard"),
+        (
+            "https://app example.net",
+            "it holds whitespace or a control character",
+        ),
+    ] {
+        assert_eq!(fault(url), Some(reason), "{url:?}");
+    }
+}
+
+/// `[serve] public_address` is exactly a `host:port` as a browser would send
+/// it: a scheme, no port, port zero, a leading zero, a non-number and an
+/// uppercase or empty host are each refused with their own reason.
+#[test]
+fn a_public_address_is_exactly_a_host_and_a_sendable_port() {
+    use crate::profile::public_address_fault as fault;
+
+    for address in [
+        "clauth.example.net:443",
+        "box.tail1234.ts.net:8443",
+        "127.0.0.1:5173",
+        "[::1]:5173",
+    ] {
+        assert_eq!(fault(address), None, "{address:?}");
+    }
+    for (address, reason) in [
+        (
+            "https://host:443",
+            "it has a scheme; it takes host:port alone",
+        ),
+        ("host", "it is not host:port"),
+        ("host:0", "its port is not a number from 1 to 65535"),
+        ("host:65536", "its port is not a number from 1 to 65535"),
+        ("host:0443", "its port is not a number from 1 to 65535"),
+        ("host:84a3", "its port is not a number from 1 to 65535"),
+        ("host:", "its port is not a number from 1 to 65535"),
+        (":443", "its host is empty, not lowercase, or malformed"),
+        ("Host:443", "its host is empty, not lowercase, or malformed"),
+    ] {
+        assert_eq!(fault(address), Some(reason), "{address:?}");
+    }
+}
+
 /// A hand-set list survives every other writer's save, in order and verbatim,
 /// an entry that does not count included, and names its key exactly once: a
 /// duplicate key would stop the file parsing.

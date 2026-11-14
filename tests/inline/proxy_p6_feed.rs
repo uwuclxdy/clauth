@@ -500,6 +500,7 @@ fn the_live_feed_promises_no_refresh_for_a_keyless_proxy_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
 
     let body = build_status(&config, 90_000, Some(&live), false);
@@ -582,6 +583,7 @@ fn the_feed_promises_no_oauth_refresh_for_a_proxy_profile_holding_an_oauth_login
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let body = build_status(&config, 90_000, Some(&live), false);
     let next = body
@@ -671,6 +673,7 @@ fn the_feed_promises_no_refresh_for_a_profile_with_an_unreadable_proxy_record() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let body = build_status(&config, 90_000, Some(&live), false);
     let next = body

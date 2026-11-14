@@ -1127,6 +1127,15 @@ pub(crate) struct ServeSettings {
         skip_serializing_if = "AppOrigins::is_empty"
     )]
     pub(crate) app_origins: AppOrigins,
+    /// The app page a pairing link opens (default unset: the single
+    /// `app_origins` entry, else no link).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) app_url: Option<String>,
+    /// The `host:port` a pairing link names for this daemon, for a reverse
+    /// proxy or another name (default unset: the address a `--listen` daemon
+    /// publishes in `status.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) public_address: Option<String>,
 }
 
 /// `[serve] app_origins` as the file holds it. A hand edit of the wrong type
@@ -1232,6 +1241,51 @@ pub(crate) fn origin_entry_fault(entry: &str) -> Option<&'static str> {
     }
     if scheme == "http" && !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
         return Some("it is plain http on a host other than loopback");
+    }
+    None
+}
+
+/// Why `url` cannot be the app page a pairing link opens (`[serve] app_url`),
+/// or `None` when it can: an absolute `https://` URL whose origin passes
+/// [`origin_entry_fault`], with no fragment, since the link's own fragment
+/// carries the address and the code.
+pub(crate) fn app_url_fault(url: &str) -> Option<&'static str> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("it holds whitespace or a control character");
+    }
+    if url.contains('#') {
+        return Some("it has a fragment, which the link's own fragment replaces");
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Some("it is not an absolute https:// URL");
+    };
+    if scheme != "https" {
+        return Some("its scheme is not https");
+    }
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    origin_entry_fault(&format!("{scheme}://{authority}"))
+}
+
+/// Why `address` cannot name the daemon in a pairing link (`[serve]
+/// public_address`), or `None` when it can: exactly `host:port`, the host as an
+/// origin's and the port a number a browser would send.
+pub(crate) fn public_address_fault(address: &str) -> Option<&'static str> {
+    if address.contains("://") {
+        return Some("it has a scheme; it takes host:port alone");
+    }
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return Some("it is not host:port");
+    };
+    if !origin_host_is_lowercase_name(host) {
+        return Some("its host is empty, not lowercase, or malformed");
+    }
+    let as_sent = port.bytes().all(|b| b.is_ascii_digit())
+        && !port.starts_with('0')
+        && port.parse::<u16>().is_ok();
+    if !as_sent {
+        return Some("its port is not a number from 1 to 65535");
     }
     None
 }

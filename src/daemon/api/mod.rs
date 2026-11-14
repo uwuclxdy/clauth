@@ -243,6 +243,8 @@ fn claim_slot() -> Option<ConnectionSlot> {
 pub(crate) struct Prepared {
     listen: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+    /// The name the certificate serves ([`tls::Identity::name`]).
+    served_name: Option<String>,
 }
 
 impl Prepared {
@@ -256,8 +258,10 @@ impl Prepared {
     /// while every client's trust in it expired. Nothing else calls this — a
     /// start that did not park read the certificate moments before serving.
     pub(crate) fn reload_certificate(&mut self, certs: &tls::CertSource) -> Result<()> {
-        self.tls_config = tls::server_config(certs, self.listen.ip())
+        let identity = tls::server_config(certs, self.listen.ip())
             .context("failed to reload the TLS certificate after the standby promotion")?;
+        self.tls_config = identity.config;
+        self.served_name = identity.name;
         Ok(())
     }
 }
@@ -281,8 +285,12 @@ impl Prepared {
 /// a standby's promotion, so a start that dies on this certificate or yields
 /// as redundant imports nothing.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
-    let tls_config = tls::server_config(certs, listen.ip())?;
-    Ok(Prepared { listen, tls_config })
+    let identity = tls::server_config(certs, listen.ip())?;
+    Ok(Prepared {
+        listen,
+        tls_config: identity.config,
+        served_name: identity.name,
+    })
 }
 
 /// Build the mod bridge and the API context together (unix): a bridge bind or
@@ -331,9 +339,33 @@ pub(crate) fn serve_prepared(
     live: super::LiveStores,
     memory_stores: crate::usage::MemoryStores,
 ) -> Result<Arc<ApiContext>> {
-    let Prepared { listen, tls_config } = prepared;
+    let Prepared {
+        listen,
+        tls_config,
+        served_name,
+    } = prepared;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
+    // The port the kernel picked when `:0` was asked, not the asked-for one.
+    let bound = listener
+        .local_addr()
+        .context("failed to read the REST API's bound address")?;
+    match served_name {
+        Some(host) => {
+            let slot = crate::daemon::status_json::ListenSlot {
+                host,
+                port: bound.port(),
+            };
+            if live.listen.set(slot).is_err() {
+                logline!("clauth daemon: a listen address was already published; keeping it");
+            }
+        }
+        None => logline!(
+            "clauth daemon: the REST API's certificate does not cover the name its file is \
+             named for and carries no non-wildcard DNS name, so status.json publishes no listen \
+             address; pairing links need [serve] public_address"
+        ),
+    }
     devices::import_legacy()?;
     devices::note_at_start();
     let ctx = {
@@ -362,7 +394,7 @@ pub(crate) fn serve_prepared(
         .spawn(move || accept_loop(&listener, &tls_config, &accept_ctx));
     spawned.context("failed to spawn the REST API accept thread")?;
 
-    logline!("clauth daemon: REST API listening on https://{listen}");
+    logline!("clauth daemon: REST API listening on https://{bound}");
     Ok(ctx)
 }
 

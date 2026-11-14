@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1126,6 +1126,19 @@ fn prior_generated_at() -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `listen` slot the running daemon last published in `status.json`, for
+/// `clauth devices pair`'s link. `None` when no feed is on disk, it does not
+/// parse, or its writer serves no `--listen` API.
+pub(crate) fn published_listen() -> Option<status_json::ListenSlot> {
+    #[derive(serde::Deserialize)]
+    struct Feed {
+        #[serde(default)]
+        listen: Option<status_json::ListenSlot>,
+    }
+    let body = std::fs::read(clauth_dir().ok()?.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice::<Feed>(&body).ok()?.listen
+}
+
 /// Rewrite `status.json` from `config`, unconditionally.
 ///
 /// [`publish_status`]'s core, split out for the one caller that must NOT defer
@@ -1308,7 +1321,14 @@ pub(crate) struct LiveStores {
     /// THIS daemon runs the fetches: a stood-down daemon publishes
     /// `next_refresh_at: null` rather than the mirror's derived stamps.
     pub(crate) fetch_lease: Arc<FetchLease>,
+    /// Where the `--listen` API serves, set once by its bind and read by every
+    /// status write as the `listen` slot. Unset without `--listen`.
+    pub(crate) listen: ListenHandle,
 }
+
+/// The `listen` slot's one writer is the API's bind, once per daemon, so a
+/// set-once cell needs no lock rank.
+pub(crate) type ListenHandle = Arc<OnceLock<status_json::ListenSlot>>;
 
 #[cfg(test)]
 impl Default for LiveStores {
@@ -1330,6 +1350,7 @@ impl Default for LiveStores {
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             fetch_lease: Arc::new(FetchLease::new()),
+            listen: ListenHandle::default(),
         }
     }
 }
@@ -1352,6 +1373,7 @@ pub(crate) struct LiveSnapshot {
     /// taken — the flag every feed writer reads to null a stood-down
     /// daemon's countdowns.
     fetches_here: bool,
+    listen: Option<status_json::ListenSlot>,
 }
 
 impl LiveStores {
@@ -1427,6 +1449,7 @@ impl LiveStores {
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
             fetches_here: self.fetch_lease.fetches_here(),
+            listen: self.listen.get().cloned(),
         }
     }
 }
@@ -1446,6 +1469,7 @@ impl LiveSnapshot {
             usage: &self.usage,
             gateway: self.gateway.as_ref(),
             proxies: Some(&self.proxies),
+            listen: self.listen.as_ref(),
         }
     }
 }
@@ -2079,6 +2103,8 @@ struct Daemon {
     /// The per-proxy slots every proxy supervisor publishes into, read by
     /// every status write as the `proxies` array.
     proxies: proxies::ProxySlots,
+    /// Where the `--listen` API serves once bound, read by every status write.
+    listen: ListenHandle,
     /// The daemon's holds on the per-account background trees.
     background: BackgroundHolds,
     /// Ticks since boot, for the bare-item leg's cadence
@@ -2167,6 +2193,7 @@ impl Daemon {
             status_path,
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
+            listen: ListenHandle::default(),
             background: BackgroundHolds::new(),
             #[cfg(target_os = "macos")]
             bare_item_scan_ticks: 0,
@@ -2427,6 +2454,7 @@ impl Daemon {
             activity: Arc::clone(&self.activity),
             shutting_down: Arc::clone(&self.shutting_down),
             fetch_lease: Arc::clone(&self.fetch_lease),
+            listen: Arc::clone(&self.listen),
         }
     }
 

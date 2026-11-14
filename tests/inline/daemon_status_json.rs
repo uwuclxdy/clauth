@@ -79,6 +79,9 @@ fn build_status_top_level_shape_and_active() {
             "credit_billed_families",
             "gateway",
             "generated_at",
+            // Additive: the address a `--listen` daemon serves on, for the
+            // pairing link.
+            "listen",
             "pending_switch",
             "profiles",
             "proxies",
@@ -88,6 +91,8 @@ fn build_status_top_level_shape_and_active() {
             "wrap_off",
         ],
     );
+    // A body built with no live daemon signals vouches for no listener.
+    assert_eq!(v["listen"], serde_json::Value::Null);
     let profiles = v["profiles"].as_array().unwrap();
     let mut per: Vec<&str> = profiles[0]
         .as_object()
@@ -511,6 +516,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -559,6 +565,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
         v["profiles"]
@@ -680,6 +687,7 @@ fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() 
         usage: &usage,
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -777,6 +785,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -1063,6 +1072,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -1136,6 +1146,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1166,6 +1177,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1353,6 +1365,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
@@ -1401,6 +1414,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1427,6 +1441,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -1461,6 +1476,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -1495,6 +1511,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     status_value(&config, 300_000, Some(&live), false)["profiles"][0]["fetch_status"].clone()
 }
@@ -2026,6 +2043,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -2262,6 +2280,10 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
         binary_replaced: true,
         binary_removed: true,
+        listen: Some(ListenSlot {
+            host: "box.example.net".to_string(),
+            port: 8443,
+        }),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2384,7 +2406,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"profiles":["#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"listen":{"host":"box.example.net","port":8443},"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2429,6 +2451,7 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: Vec::new(),
         binary_replaced: false,
         binary_removed: false,
+        listen: None,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2436,7 +2459,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"profiles":[]}"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"listen":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2764,6 +2787,7 @@ fn status_body_never_leaks_a_credential() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let body_live = build_status(&config, 300_000, Some(&live), true);
     let body_live_str =
@@ -3343,6 +3367,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3366,6 +3391,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3391,6 +3417,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3487,6 +3514,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
         usage: &Default::default(),
         gateway: None,
         proxies: Some(&proxies),
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let proxies = v["proxies"].as_array().expect("a proxies array");
@@ -4510,6 +4538,7 @@ fn build_status_nulls_next_refresh_for_a_stood_down_daemons_live_stamp() {
         usage: &usage,
         gateway: None,
         proxies: None,
+        listen: None,
     };
 
     let held = status_value(&config, interval_ms, Some(&signals(true)), false);
@@ -4573,6 +4602,7 @@ fn build_status_nulls_next_refresh_for_a_stood_down_daemons_codex_stamp() {
         usage: &usage,
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let codex_entry = |v: &serde_json::Value| {
         v["profiles"]

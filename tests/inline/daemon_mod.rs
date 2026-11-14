@@ -199,6 +199,27 @@ fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     );
 }
 
+/// The API's bind writes the `listen` slot through the stores one
+/// `live_stores` call hands `serve_prepared`, and each tick's status write
+/// reads it through another call: a fresh slot per call would leave every
+/// `--listen` feed without `listen`, so `pair` would build no link, with every
+/// feed test still green.
+#[test]
+fn the_api_bind_writes_the_same_listen_slot_the_status_write_reads() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    let daemon = daemon_for(config);
+
+    assert!(
+        std::sync::Arc::ptr_eq(&daemon.live_stores().listen, &daemon.listen),
+        "the bind's handle must be the slot every status write reads"
+    );
+}
+
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes

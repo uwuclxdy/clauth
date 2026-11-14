@@ -127,6 +127,26 @@ fn no_tls_fixture() {
 pub(crate) fn generate_chain(
     dir: &Path,
 ) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
+    generate_chain_covering(dir, SERVER_NAME)
+}
+
+/// [`generate_chain`] for a leaf whose DNS name is `name` instead of
+/// `localhost`. The files keep the `localhost` names, so a test can drive the
+/// name a certificate carries apart from the name the file carrying it has.
+fn generate_chain_covering(
+    dir: &Path,
+    name: &str,
+) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
+    generate_chain_covering_names(dir, &[name])
+}
+
+/// [`generate_chain_covering`] for a leaf carrying every name in `names`, in
+/// the order given and no others, so a test can make the certificate's own
+/// names disagree with the name its file carries.
+fn generate_chain_covering_names(
+    dir: &Path,
+    names: &[&str],
+) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
     // Checked up front and separately from the generation below, so "no openssl
     // here" (a skip) is never confused with "openssl is present and failing" (a
     // broken fixture, which errors below).
@@ -134,6 +154,10 @@ pub(crate) fn generate_chain(
         no_tls_fixture();
         return Ok(None);
     }
+    let cn = names
+        .first()
+        .copied()
+        .ok_or_else(|| "a certificate fixture needs at least one DNS name".to_string())?;
 
     let ca_key = dir.join("ca.key");
     let ca_crt = dir.join("ca.crt");
@@ -141,9 +165,14 @@ pub(crate) fn generate_chain(
     let ext = dir.join("leaf.ext");
     let paths = crate::daemon::api::tls::lego_paths_in(dir, SERVER_NAME);
 
+    let alt_names = names
+        .iter()
+        .map(|name| format!("DNS:{name}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let write_ext = std::fs::write(
         &ext,
-        format!("subjectAltName=DNS:{SERVER_NAME}\nbasicConstraints=critical,CA:FALSE\n"),
+        format!("subjectAltName={alt_names}\nbasicConstraints=critical,CA:FALSE\n"),
     );
     if let Err(e) = write_ext {
         return Err(format!("failed to write the leaf extension file: {e}"));
@@ -221,7 +250,7 @@ pub(crate) fn generate_chain(
         "-out",
         csr.to_str().ok_or("csr path is not UTF-8")?,
         "-subj",
-        &format!("/CN={SERVER_NAME}"),
+        &format!("/CN={cn}"),
     ];
     let sign_args = [
         "x509",
@@ -4291,5 +4320,203 @@ fn a_follower_probe_failure_pushes_as_base_did() {
         Ok(Trigger::Blocked {
             pane_id: "p1".to_string()
         })
+    );
+}
+
+/// The `listen` slot the feed built off `live` publishes.
+fn published_listen(
+    live: &crate::daemon::LiveStores,
+) -> Option<crate::daemon::status_json::ListenSlot> {
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    let snapshot = live.snapshot();
+    crate::daemon::status_json::build_status(&config, 60_000, Some(&snapshot.signals()), false)
+        .listen
+}
+
+/// Serve `paths` on a port the kernel picks, under `live`. The accept thread
+/// outlives the test, as in [`a_start_that_serves_imports_the_legacy_token`].
+fn serve_on_any_port(paths: crate::daemon::api::tls::CertPaths, live: &crate::daemon::LiveStores) {
+    let prepared = super::prepare(
+        "127.0.0.1:0".parse().expect("addr"),
+        &crate::daemon::api::tls::CertSource::Explicit(paths),
+    )
+    .expect("prepare reads the valid certificate");
+    super::serve_prepared(
+        prepared,
+        empty_config(),
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("status.json"),
+        live.clone(),
+        crate::usage::MemoryStores::empty_for_test(),
+    )
+    .expect("the listener serves");
+}
+
+/// A serving daemon's own feed names the certificate's name and the port the
+/// listener bound, the kernel's pick when `:0` was asked; stores no listener
+/// bound publish `null`.
+#[test]
+fn a_serving_listener_publishes_its_certificate_name_and_bound_port() {
+    let home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_serving_listener_publishes_its_certificate_name_and_bound_port: openssl \
+             is not usable here"
+        );
+        return;
+    };
+    let live = crate::daemon::LiveStores::default();
+    serve_on_any_port(paths, &live);
+
+    let listen = published_listen(&live).expect("the serving daemon's feed names its listener");
+    assert_eq!(listen.host, "localhost", "the name the certificate serves");
+    assert_ne!(listen.port, 0, "the bound port, never the asked-for 0");
+    std::net::TcpStream::connect(("127.0.0.1", listen.port))
+        .expect("the published port is the one the listener accepts on");
+    assert_eq!(
+        published_listen(&crate::daemon::LiveStores::default()),
+        None,
+        "a daemon with no listener publishes null"
+    );
+}
+
+/// A `--cert` file whose name its certificate does not cover publishes the
+/// certificate's own first DNS name instead.
+#[test]
+fn a_cert_file_named_for_no_name_publishes_the_certificates_own_name() {
+    let home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_cert_file_named_for_no_name_publishes_the_certificates_own_name: openssl \
+             is not usable here"
+        );
+        return;
+    };
+    let renamed = certdir.path().join("elsewhere.example.net.crt");
+    std::fs::copy(&paths.cert, &renamed).expect("copy the certificate");
+    let paths = crate::daemon::api::tls::CertPaths {
+        cert: renamed,
+        issuer: None,
+        key: paths.key,
+    };
+    let live = crate::daemon::LiveStores::default();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    serve_on_any_port(paths, &live);
+    drop(capture);
+
+    let listen = published_listen(&live).expect("the certificate's own name is published");
+    assert_eq!(
+        listen.host, "localhost",
+        "the fixture certificate's DNS name"
+    );
+}
+
+/// A certificate whose only DNS name is a wildcard publishes no listener
+/// address: a wildcard is a pattern, not a host a pairing link can carry.
+#[test]
+fn a_wildcard_only_certificate_publishes_no_listen_address() {
+    let home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) =
+        generate_chain_covering(certdir.path(), "*.example.net").expect("fixture")
+    else {
+        eprintln!(
+            "SKIPPED a_wildcard_only_certificate_publishes_no_listen_address: openssl is not \
+             usable here"
+        );
+        return;
+    };
+    let live = crate::daemon::LiveStores::default();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    serve_on_any_port(paths, &live);
+    drop(capture);
+
+    assert_eq!(
+        published_listen(&live),
+        None,
+        "a wildcard names no host a pairing link can carry"
+    );
+    let logged = lines.snapshot().join("\n");
+    assert!(
+        logged.contains("no non-wildcard DNS name") && logged.contains("[serve] public_address"),
+        "the line says why and names the key that fixes it: {logged:?}"
+    );
+}
+
+/// Today's file-name check wins over the certificate's own names: a leaf
+/// covering `alpha` then `beta`, served from `beta.example.net.crt`, publishes
+/// `beta`, never the leaf's first name.
+#[test]
+fn the_cert_files_own_name_wins_over_the_leaves_first_name() {
+    let home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) =
+        generate_chain_covering_names(certdir.path(), &["alpha.example.net", "beta.example.net"])
+            .expect("fixture")
+    else {
+        eprintln!(
+            "SKIPPED the_cert_files_own_name_wins_over_the_leaves_first_name: openssl is not \
+             usable here"
+        );
+        return;
+    };
+    let renamed = certdir.path().join("beta.example.net.crt");
+    std::fs::copy(&paths.cert, &renamed).expect("copy the certificate");
+    let paths = crate::daemon::api::tls::CertPaths {
+        cert: renamed,
+        issuer: None,
+        key: paths.key,
+    };
+    let live = crate::daemon::LiveStores::default();
+    serve_on_any_port(paths, &live);
+
+    let listen = published_listen(&live).expect("the certificate's covered name is published");
+    assert_eq!(
+        listen.host, "beta.example.net",
+        "the file-name candidate the leaf covers, not its first DNS name"
+    );
+}
+
+/// A cert file named for nothing it covers publishes the certificate's own
+/// first NON-wildcard DNS name: a wildcard is a pattern, not the host a pairing
+/// link can carry.
+#[test]
+fn a_cert_file_named_for_no_covered_host_publishes_the_first_non_wildcard_name() {
+    let home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain_covering_names(
+        certdir.path(),
+        &["*.example.net", "gamma.example.net", "delta.example.net"],
+    )
+    .expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_cert_file_named_for_no_covered_host_publishes_the_first_non_wildcard_\
+             name: openssl is not usable here"
+        );
+        return;
+    };
+    let renamed = certdir.path().join("unrelated.example.org.crt");
+    std::fs::copy(&paths.cert, &renamed).expect("copy the certificate");
+    let paths = crate::daemon::api::tls::CertPaths {
+        cert: renamed,
+        issuer: None,
+        key: paths.key,
+    };
+    let live = crate::daemon::LiveStores::default();
+    serve_on_any_port(paths, &live);
+
+    let listen = published_listen(&live).expect("the certificate's own name is published");
+    assert_eq!(
+        listen.host, "gamma.example.net",
+        "the first non-wildcard DNS name: the wildcard before it skipped, the name after it not \
+         taken"
     );
 }
