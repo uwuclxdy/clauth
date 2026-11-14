@@ -261,6 +261,14 @@ fn every_transient_cause_renders_its_own_copy() {
             names_next_step: true,
         },
         Row {
+            cause: Cause::UnreadableJobDirOnRotatingChain {
+                profile: "work".to_string(),
+                dir: "~/.claude/jobs/0123abcd".to_string(),
+            },
+            bare: "can't read claude code's background job (~/.claude/jobs/0123abcd), so 'work' is not rotated; delete that dir to rotate",
+            names_next_step: true,
+        },
+        Row {
             cause: Cause::RotationLockHeld("work".to_string()),
             bare: "'work' has a token rotation in progress, retry in a moment",
             names_next_step: true,
@@ -343,6 +351,13 @@ fn only_the_relogin_causes_read_as_permanent() {
             Cause::UnreadableJobStoreOnRotatingChain {
                 profile: "work".to_string(),
                 store: "~/.claude/jobs".to_string(),
+            },
+            false,
+        ),
+        (
+            Cause::UnreadableJobDirOnRotatingChain {
+                profile: "work".to_string(),
+                dir: "~/.claude/jobs/0123abcd".to_string(),
             },
             false,
         ),

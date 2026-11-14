@@ -11018,6 +11018,10 @@ fn the_rotate_refusal_titles_name_their_cause() {
             crate::runtime::RotationBlock::UnreadableJobStore("~/.claude/jobs".into()),
             "'busy' can't be checked for background sessions",
         ),
+        (
+            crate::runtime::RotationBlock::UnreadableJobDir("~/.claude/jobs/0123abcd".into()),
+            "'busy' can't be checked for background sessions",
+        ),
     ] {
         assert_eq!(super::rotate_blocked_message("busy", block), want);
     }

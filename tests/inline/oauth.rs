@@ -4682,9 +4682,14 @@ fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_co
 fn the_job_store_rotation_refusals_name_their_own_causes() {
     let home = HomeSandbox::new();
     let name = "test-roll-refuse";
+    let sep = std::path::MAIN_SEPARATOR;
     let tree_jobs = home
         .home()
-        .join(".clauth/profiles/test-roll-refuse/runtime-4242-53/jobs");
+        .join(".clauth")
+        .join("profiles")
+        .join("test-roll-refuse")
+        .join("runtime-4242-53")
+        .join("jobs");
     for (block, want) in [
         (
             crate::runtime::RotationBlock::BackgroundJob,
@@ -4695,9 +4700,9 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
         (
             crate::runtime::RotationBlock::UnreadableJobStore(tree_jobs.clone()),
             format!(
-                "can't read claude code's background job list ({}), so \
-                 'test-roll-refuse' is not rotated; retry in a moment",
-                tree_jobs.display()
+                "can't read claude code's background job list (~{sep}.clauth{sep}profiles{sep}\
+                 test-roll-refuse{sep}runtime-4242-53{sep}jobs), so 'test-roll-refuse' is not \
+                 rotated; retry in a moment"
             ),
         ),
     ] {
@@ -4720,6 +4725,168 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
         assert_eq!(e.text(), want);
         assert_eq!(e.text_with_status(), e.text());
     }
+}
+
+/// Asserts the macOS rotation of `name` is refused and that the refusal renders
+/// `want` through the production leg (`rotation_block_on` into
+/// `rotation_block_transient`). The profile dir is created first: a profile
+/// with no dir reads idle and is never blocked.
+fn assert_job_store_refusal(name: &str, want: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    std::fs::create_dir_all(profile_dir(&name).expect("profile dir")).expect("mkdir profile");
+    let block = crate::runtime::rotation_block_on(&name, true)
+        .expect("a job store that cannot be judged refuses the rotation");
+    assert_eq!(rotation_block_transient(&name, block).text(), want);
+}
+
+/// A job id the refusal tests name.
+const STUCK_JOB: &str = "0123abcd";
+
+/// The sentence a refusal that names no stuck dir renders for the global store.
+fn retry_refusal(name: &str) -> String {
+    format!(
+        "can't read claude code's background job list (~/.claude/jobs), so '{name}' is not \
+         rotated; retry in a moment"
+    )
+}
+
+/// A record-less global job dir holding only a `.DS_Store` is neither a
+/// leftover nor a creation: it never clears on its own, so the refusal names
+/// the dir to delete instead of a retry that cannot help.
+#[test]
+fn a_stuck_global_job_dir_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::write(job.join(".DS_Store"), b"").expect("write .DS_Store");
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-ds",
+        &format!(
+            "can't read claude code's background job (~{sep}.claude{sep}jobs{sep}{STUCK_JOB}), \
+             so 'stuck-ds' is not rotated; delete that dir to rotate"
+        ),
+    );
+}
+
+/// The same stuck dir inside a per-session tree's own `jobs/` is named too.
+#[test]
+fn a_stuck_tree_local_job_dir_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let job = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("stuck-tree")
+        .join("runtime-4242-53")
+        .join("jobs")
+        .join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::write(job.join(".DS_Store"), b"").expect("write .DS_Store");
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-tree",
+        &format!(
+            "can't read claude code's background job (~{sep}.clauth{sep}profiles{sep}stuck-tree{sep}\
+             runtime-4242-53{sep}jobs{sep}{STUCK_JOB}), so 'stuck-tree' is not rotated; delete \
+             that dir to rotate"
+        ),
+    );
+}
+
+/// Write `contents` as the global job `STUCK_JOB`'s `state.json` and return its path.
+fn write_global_record(home: &HomeSandbox, contents: &[u8]) -> std::path::PathBuf {
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    let record = job.join("state.json");
+    std::fs::write(&record, contents).expect("write record");
+    record
+}
+
+/// A record that fails both parses and is older than the mid-create grace is
+/// not a write in progress, so the refusal names its dir.
+#[test]
+fn an_old_unparseable_job_record_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let record = write_global_record(&home, b"{\"state\":");
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60),
+    );
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-old",
+        &format!(
+            "can't read claude code's background job (~{sep}.claude{sep}jobs{sep}{STUCK_JOB}), \
+             so 'stuck-old' is not rotated; delete that dir to rotate"
+        ),
+    );
+}
+
+/// A fresh unparseable record can be a write in progress: the retry sentence stays.
+#[test]
+fn a_fresh_unparseable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    write_global_record(&home, b"{\"state\":");
+    assert_job_store_refusal("fresh-parse", &retry_refusal("fresh-parse"));
+}
+
+/// A record dated ahead cannot prove its age, so it reads young.
+#[test]
+fn a_future_dated_unparseable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let record = write_global_record(&home, b"{\"state\":");
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(20 * 60),
+    );
+    assert_job_store_refusal("future-parse", &retry_refusal("future-parse"));
+}
+
+/// A young empty job dir is a creation in flight and clears on its own.
+#[test]
+fn a_young_empty_job_dir_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    assert_job_store_refusal("mid-create", &retry_refusal("mid-create"));
+}
+
+/// A record that cannot be read (a FIFO) is a store fault, not a stuck dir.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    crate::testutil::mkfifo(&job.join("state.json"));
+    assert_job_store_refusal("fifo-record", &retry_refusal("fifo-record"));
+}
+
+/// A job dir that cannot be listed is a store fault, not a stuck dir. Mode
+/// `0o300` lets the `state.json` lookup see no file while the listing fails.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_job_dir_keeps_the_retry_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    if std::fs::read_dir(&job).is_ok() {
+        // Running as root: the mode does not bind, so the fault cannot be posed.
+        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        return;
+    }
+    let name = crate::profile::ProfileName::from("unlistable");
+    std::fs::create_dir_all(profile_dir(&name).expect("profile dir")).expect("mkdir profile");
+    let block = crate::runtime::rotation_block_on(&name, true);
+    std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let block = block.expect("an unlistable job dir refuses the rotation");
+    assert_eq!(
+        rotation_block_transient(&name, block).text(),
+        retry_refusal("unlistable")
+    );
 }
 
 /// The refusal guards a SPEND: a comfortable stored chain stamps the sidecar
