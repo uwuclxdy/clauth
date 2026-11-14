@@ -19,10 +19,11 @@
 //! and Windows.
 //!
 //! The directory is a default, not a rule: `~/.clauth/tls.json` carries it, is
-//! written with this platform's default on first use, and is read back on every
-//! start ([`cert_dir`]). That is what lets a Windows box whose lego lives
-//! somewhere other than `%AppData%` — or a Linux one behind a packaging
-//! convention of its own — serve TLS without a rebuild.
+//! written with this platform's default on a start's first use
+//! ([`create_default_tls_config`]), and is read back on every start
+//! ([`cert_dir`]). That is what lets a Windows box whose lego lives somewhere
+//! other than `%AppData%` — or a Linux one behind a packaging convention of its
+//! own — serve TLS without a rebuild.
 //!
 //! The derivation itself can be wrong, though, and no directory setting fixes
 //! that: on a tailnet node `hostname -f` answers a name no certificate covers,
@@ -117,45 +118,62 @@ fn tls_config_path() -> Result<PathBuf> {
     Ok(crate::profile::clauth_dir()?.join(TLS_FILE))
 }
 
-/// The configured certificate directory, writing the platform default on first
-/// use so the operator has a file to edit rather than a documented path to
-/// retype. Only [`server_config`] calls this, so `tls.json` appears when a
-/// `--listen` daemon first starts.
+/// The configured certificate directory, read from `tls.json` where a start
+/// left one.
 ///
-/// Runs under the cross-process state flock, so two instances starting
-/// together cannot both decide they are the one creating it.
+/// Read-only and lock-free: the restart-handover probe's answer runs this same
+/// read, so it can neither wait on the state flock nor write the home. An
+/// absent file reads as [`default_cert_dir`]; [`create_default_tls_config`] is
+/// the start's write that leaves one for the operator to edit.
 ///
-/// A malformed file is a hard error, NOT a silent fall back to the default:
-/// quietly ignoring an edited `cert_dir` would serve certificates from a
-/// directory the operator believes they moved away from, and the only symptom
-/// would be a confusing "no such file" naming a path they never configured.
+/// A malformed or unreadable file is a hard error, NOT a silent fall back to
+/// the default: quietly ignoring an edited `cert_dir` would serve certificates
+/// from a directory the operator believes they moved away from, and the only
+/// symptom would be a confusing "no such file" naming a path they never
+/// configured.
 pub(crate) fn cert_dir() -> Result<PathBuf> {
     let path = tls_config_path()?;
-    crate::lock::with_state_lock(|_| {
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            let dir = default_cert_dir()?;
-            write_tls_config(&path, &dir)?;
-            return Ok(dir);
-        };
-        let parsed: TlsConfigFile = serde_json::from_str(&body).map_err(|e| {
-            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
-        })?;
-        if parsed.schema > TLS_SCHEMA {
-            // Written by a newer clauth. The one field this build reads is a
-            // path either way, so take it and let the newer field set be.
-            logline!(
-                "clauth daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
-                parsed.schema
-            );
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return default_cert_dir(),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let parsed: TlsConfigFile = serde_json::from_str(&body).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })?;
+    if parsed.schema > TLS_SCHEMA {
+        // Written by a newer clauth. The one field this build reads is a
+        // path either way, so take it and let the newer field set be.
+        logline!(
+            "clauth daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
+            parsed.schema
+        );
+    }
+    if parsed.cert_dir.trim().is_empty() {
+        bail!(
+            "{} has an empty cert_dir; set it to the directory holding \
+             <fqdn>.crt, or delete the file to get this platform's default",
+            path.display()
+        );
+    }
+    Ok(PathBuf::from(parsed.cert_dir))
+}
+
+/// Write the platform default `tls.json` when the start finds none, so the
+/// operator has a file to edit rather than a documented path to retype.
+///
+/// The start's write alone, under the cross-process state flock so two starts
+/// landing together cannot both decide they are the one creating it;
+/// [`cert_dir`]'s read never takes that flock. An existing file is left
+/// exactly as it is.
+pub(crate) fn create_default_tls_config() -> Result<()> {
+    let path = tls_config_path()?;
+    crate::lock::with_state_lock(|_| match std::fs::read_to_string(&path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_tls_config(&path, &default_cert_dir()?)
         }
-        if parsed.cert_dir.trim().is_empty() {
-            bail!(
-                "{} has an empty cert_dir; set it to the directory holding \
-                 <fqdn>.crt, or delete the file to get this platform's default",
-                path.display()
-            );
-        }
-        Ok(PathBuf::from(parsed.cert_dir))
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     })
 }
 

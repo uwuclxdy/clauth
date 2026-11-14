@@ -786,6 +786,16 @@ pub(crate) fn self_exe_change() -> Option<ExeChange> {
     }
 }
 
+/// The path this process's executable was recorded from at start: the only
+/// path a re-exec can use, because after a replacement `current_exe()` reads
+/// `<path> (deleted)` on linux. `None` when the record failed (the same
+/// fail-open as [`self_exe_change`]) or the caller is unpinned. The one
+/// caller is the daemon's unix re-exec path, so the windows build has none.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn recorded_self_exe_path() -> Option<PathBuf> {
+    self_exe_read()?.map(|record| record.path)
+}
+
 /// Whether the heal-leg stand-down was already reported this process, one flag
 /// per kind, so each kind's line is said once, not once per caller (a daemon
 /// tick would otherwise repeat it every tick). Per kind because a removal can

@@ -885,17 +885,133 @@ impl ProcTable for SystemProcs {
     }
 }
 
-/// The parent from `<root>/<pid>/stat`. The comm sits in parentheses and may
-/// hold `) ` itself, so the split runs from the LAST one: what follows is the
-/// state letter, then the ppid.
+impl SystemProcs {
+    /// The children of `pid`, each with its start time in the spelling
+    /// [`crate::daemon::gateway::process_start_time`] and its zombie read
+    /// use: `/proc/<pid>/stat` scans on linux, one
+    /// `ps -o pid=,ppid=,lstart= -ax` elsewhere on unix. The daemon's boot
+    /// capture lists a replaced image's inherited children through this (the
+    /// exec keeps the pid, so the children the old image spawned are this
+    /// image's too), and the start token each entry carries is what the
+    /// zombie reap matches, so a recycled pid is never reaped. A failed
+    /// listing returns the error, so the capture can say it failed rather
+    /// than read an empty set as "no children".
+    #[cfg(unix)]
+    pub(crate) fn children_of(&self, pid: u32) -> anyhow::Result<Vec<(u32, String)>> {
+        #[cfg(target_os = "linux")]
+        {
+            let entries = std::fs::read_dir("/proc")?;
+            let mut children = Vec::new();
+            for entry in entries {
+                // A per-entry error is a listing failure like the read_dir
+                // one: the caller's Err arm logs it, so a listing that
+                // fails partway never reads as "no children".
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Ok(child) = name.parse::<u32>() else {
+                    continue;
+                };
+                if let Some((ppid, Some(start))) = stat_ppid_start_at(Path::new("/proc"), child)
+                    && ppid == pid
+                {
+                    children.push((child, start));
+                }
+            }
+            Ok(children)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let lister = std::process::Command::new("ps")
+                .args(["-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-ax"])
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC0")
+                .stdin(std::process::Stdio::null())
+                // Piped, so `wait_with_output` reads the table: an
+                // unpiped stdout goes to the daemon's own stdout and the
+                // capture reads nothing.
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            // The lister lists itself (`ps -ax` shows its own row, whose
+            // ppid is this process): its pid is filtered out below, or the
+            // capture would hold an entry the reap can never finish, and
+            // every tick would re-list it.
+            let lister_pid = lister.id();
+            let output = lister.wait_with_output()?;
+            if !output.status.success() {
+                anyhow::bail!("ps failed while listing the children: {}", output.status);
+            }
+            let text = String::from_utf8(output.stdout)?;
+            Ok(parse_ps_children_rows(&text, lister_pid, pid))
+        }
+    }
+}
+
+/// One `ps -o pid=,ppid=,lstart=` row, parsed so the start token keeps the
+/// column's own spelling: the remainder after the pid and ppid fields, as
+/// one substring, trimmed, never split apart and rejoined. The readers
+/// compare start tokens as exact strings, and `ps` pads a single-digit day
+/// ("Nov  3"), so collapsing the padding would change the stored token and
+/// break a marker written by a released binary after an update.
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn parse_ps_children_row(line: &str, parent: u32) -> Option<(u32, String)> {
+    let line = line.trim_start();
+    let (child, rest) = line.split_once(char::is_whitespace)?;
+    let child: u32 = child.parse().ok()?;
+    let (ppid, lstart) = rest.trim_start().split_once(char::is_whitespace)?;
+    let ppid: u32 = ppid.parse().ok()?;
+    (ppid == parent).then(|| (child, lstart.trim().to_string()))
+}
+
+/// The rows of one `ps -o pid=,ppid=,lstart= -ax` output for `parent`,
+/// without the lister's own row (`ps -ax` lists the lister itself).
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn parse_ps_children_rows(text: &str, lister: u32, parent: u32) -> Vec<(u32, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (child, start) = parse_ps_children_row(line, parent)?;
+            (child != lister).then_some((child, start))
+        })
+        .collect()
+}
+
+/// The stat and lstart columns of one `ps -o stat=,lstart=` output, the
+/// lstart kept in the column's own spelling, trimmed: the token the
+/// daemon's readers store and compare, so a marker written by a released
+/// binary still matches after an update.
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+pub(crate) fn split_stat_lstart(text: &str) -> Option<(&str, &str)> {
+    let (stat, lstart) = text.trim().split_once(char::is_whitespace)?;
+    Some((stat, lstart.trim()))
+}
+
+/// The parent and start time from `<root>/<pid>/stat` — the one stat
+/// parser behind [`parent_at`] and the inherited-children listing. The
+/// comm sits in parentheses and may hold `) ` itself, so the fields are
+/// counted from the last one: the state letter, then the ppid, then the
+/// start time (field 22 of the full stat). The start is `None` when the
+/// line ends before field 22 (a real `/proc` stat always carries it; only
+/// a short test line does not).
 #[cfg(target_os = "linux")]
-fn parent_at(root: &Path, pid: u32) -> Option<u32> {
+fn stat_ppid_start_at(root: &Path, pid: u32) -> Option<(u32, Option<String>)> {
     let path = root.join(pid.to_string()).join("stat");
     let bytes =
         crate::runtime::read_regular_capped(&path, crate::runtime::RECORD_READ_CAP).ok()??;
     let stat = String::from_utf8_lossy(&bytes);
     let rest = stat.rsplit_once(") ")?.1;
-    rest.split_whitespace().nth(1)?.parse().ok()
+    let mut fields = rest.split_whitespace().skip(1);
+    let ppid = fields.next()?.parse().ok()?;
+    Some((ppid, fields.nth(17).map(str::to_string)))
+}
+
+/// The parent from `<root>/<pid>/stat` — [`stat_ppid_start_at`]'s ppid
+/// half.
+#[cfg(target_os = "linux")]
+fn parent_at(root: &Path, pid: u32) -> Option<u32> {
+    stat_ppid_start_at(root, pid).map(|(ppid, _)| ppid)
 }
 
 /// The NUL-separated argv from `<root>/<pid>/cmdline`, without the trailing

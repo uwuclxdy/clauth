@@ -1923,3 +1923,26 @@ fn the_replaced_query_reports_nothing() {
         "the query logs nothing"
     );
 }
+
+/// The re-exec path's exec source: the path recorded at start. After a
+/// replacement `current_exe()` reads `<path> (deleted)` on linux, so the
+/// recorded path is the only one that can be exec'd.
+#[cfg(unix)]
+#[test]
+fn the_recorded_path_is_the_record_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    {
+        let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+        assert_eq!(
+            super::recorded_self_exe_path().as_deref(),
+            Some(recorded.as_path()),
+            "a pinned record yields its path"
+        );
+    }
+    assert_eq!(
+        super::recorded_self_exe_path(),
+        None,
+        "an unpinned caller has no record to exec"
+    );
+}

@@ -6033,6 +6033,13 @@ pub(crate) struct App {
     /// holds exactly while it is set, and each change into `Some` tints the
     /// Services tab. Starts `None`, so a first changed reading counts.
     pub(crate) daemon_binary_change: Option<ExeChange>,
+    /// When the daemon feed first read `binary_replaced` true this run, as
+    /// wall-clock ms: the Replaced toast and card line wait until the feed
+    /// has said so continuously for [`DAEMON_BINARY_REPLACED_GRACE_MS`] — a
+    /// daemon that re-execs itself flips the feed back to false inside its
+    /// two-tick detection window and must never trip the advice. `None`
+    /// while no grace runs. UI-thread-only.
+    pub(crate) daemon_binary_replaced_since_ms: Option<u64>,
     /// The kinds of daemon binary change whose toast was raised; each kind
     /// toasts once per run.
     pub(crate) daemon_toasted_kinds: ToastedKinds,
@@ -6167,6 +6174,12 @@ pub(crate) struct App {
     /// freshness is still judged per call. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) tps_now_override: Option<u64>,
+    /// Pinned wall clock for tests that must advance the daemon
+    /// binary-replaced grace without sleeping; [`App::daemon_now_ms`] reads
+    /// this when set, the same shape [`App::tps_now_ms`] uses. Never compiled
+    /// into the binary.
+    #[cfg(test)]
+    pub(crate) daemon_now_override: Option<u64>,
     /// The day-list notices last surfaced, empty while the lists are ordinary.
     /// Holding the MESSAGES rather than a flag is what makes the gate right on
     /// both axes `AppConfig::day_claim_collision` documents: each string
@@ -7048,6 +7061,7 @@ impl App {
             gateway_unrun: false,
             left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
             daemon_binary_change: None,
+            daemon_binary_replaced_since_ms: None,
             daemon_toasted_kinds: ToastedKinds::default(),
             own_toasted_kinds: ToastedKinds::default(),
             last_daemon_probe: Instant::now(),
@@ -7112,6 +7126,8 @@ impl App {
             anim_phase_ms: None,
             #[cfg(test)]
             tps_now_override: None,
+            #[cfg(test)]
+            daemon_now_override: None,
             day_claim_notices: Vec::new(),
             name_notices: Vec::new(),
             tick_count: 0,
@@ -7402,6 +7418,17 @@ impl App {
     pub(crate) fn tps_now_ms(&self) -> u64 {
         #[cfg(test)]
         if let Some(ms) = self.tps_now_override {
+            return ms;
+        }
+        crate::usage::now_ms()
+    }
+
+    /// The wall clock the daemon binary-replaced grace reads: the test
+    /// override when pinned, else the real clock — the same clock and
+    /// override shape [`App::tps_now_ms`] gives the tps cache's age.
+    pub(crate) fn daemon_now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = self.daemon_now_override {
             return ms;
         }
         crate::usage::now_ms()
@@ -33766,12 +33793,38 @@ fn own_binary_completions_refusal(change: ExeChange, stale: bool) -> String {
     }
 }
 
+/// How long the daemon feed must read `binary_replaced` true, continuously,
+/// before the Replaced toast and card line raise: a daemon that re-execs
+/// itself flips the feed back to false inside its two-tick detection window
+/// (a second or two), so the grace spares it the advice; an old daemon holds
+/// the flag until it is restarted and raises after the grace. `Removed`
+/// raises at once — a removed binary never re-execs.
+const DAEMON_BINARY_REPLACED_GRACE_MS: u64 = 10_000;
+
 /// Apply how a fresh daemon's binary changed, from the probe the caller already
-/// read. A change into `Some` tints the Services tab and raises its kind's
-/// toast, once per kind per run; any change rebuilds the plugin card, so its
-/// line follows the feed on this cadence rather than waiting for a Services
-/// recompute.
+/// read. A Replaced reading waits out its grace: nothing applies (no tint, no
+/// toast, no card line) until the feed has read `binary_replaced` true
+/// continuously for [`DAEMON_BINARY_REPLACED_GRACE_MS`], so a daemon
+/// mid-re-exec never trips it; a grace that ends because the daemon went away
+/// raises nothing — a dead daemon already reads as not running — and clearing
+/// it here restarts the wait if a fresh Replaced reading follows. A change
+/// into `Some` tints the Services tab and raises its kind's toast, once per
+/// kind per run; any change rebuilds the plugin card, so its line follows the
+/// feed on this cadence rather than waiting for a Services recompute.
 fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
+    match change {
+        Some(ExeChange::Replaced) => {
+            let now = app.daemon_now_ms();
+            let since = *app.daemon_binary_replaced_since_ms.get_or_insert(now);
+            if app.daemon_now_ms().saturating_sub(since) < DAEMON_BINARY_REPLACED_GRACE_MS {
+                return;
+            }
+            app.daemon_binary_replaced_since_ms = None;
+        }
+        _ => {
+            app.daemon_binary_replaced_since_ms = None;
+        }
+    }
     if change == app.daemon_binary_change {
         return;
     }

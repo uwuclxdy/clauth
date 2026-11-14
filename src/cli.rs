@@ -429,6 +429,15 @@ pub(crate) enum Command {
             ]
         )]
         dump_openapi: bool,
+        /// The restart-handover probe's answer, before anything else runs: a
+        /// replacement that will serve the API (`--listen` given and
+        /// `CLAUTH_NO_API` unset) loads its certificate first, then prints the
+        /// handover token and exits 0, or the cert-refused marker with the
+        /// reason and exits 1. Hidden: it is the daemon's probe protocol, never
+        /// a user flag, so it stays out of --help and the hand-written
+        /// completions.
+        #[arg(long = "__exec-handover", hide = true)]
+        exec_handover: bool,
     },
 
     /// Pair, list, grant sessions to, and revoke the devices that may call the

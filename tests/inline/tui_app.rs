@@ -60929,9 +60929,9 @@ fn plugin_card_carries_daemon_line(app: &App) -> bool {
 
 /// A fresh daemon feed saying `binary_replaced: true` raises one warning toast
 /// per run, tints the Services tab until it is visited, and puts a line on the
-/// plugin card that holds exactly while the feed says so. The daemon probe's
-/// own cadence drives all three: the test never recomputes the card itself
-/// after the first seed.
+/// plugin card that holds exactly while the feed says so — each after the
+/// replaced grace. The daemon probe's own cadence drives all of it: the test
+/// never recomputes the card itself after the first seed.
 #[test]
 fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     use crate::daemon::DaemonHealth;
@@ -60957,12 +60957,25 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     );
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace the first true reading raises nothing"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     assert_eq!(
         daemon_replaced_toasts(&app),
         vec![super::ToastKind::Warning],
-        "the first true reading toasts once, in the warning tone"
+        "the grace end toasts once, in the warning tone"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61004,8 +61017,14 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
         "the toast is once per run, never once per entry"
     );
     assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "a re-rise holds the line until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
+    poll_and_land(&mut app);
+    assert!(
         plugin_card_carries_daemon_line(&app),
-        "the line returns with the flag"
+        "the line returns with the flag once the grace ends"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61052,6 +61071,8 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     write_binary_feed(&now(), false, false);
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
 
     write_binary_feed(&now(), true, true);
     poll_and_land(&mut app);
@@ -61085,8 +61106,15 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a replaced read after a removal holds until its grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
         Some(super::ToastKind::Warning),
-        "a kind flip re-tints the Services tab"
+        "the kind flip re-tints the Services tab once its grace ends"
     );
     let detail = plugin_card_detail(&app);
     assert!(
@@ -61124,6 +61152,219 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
         ),
         (1, 1),
         "each kind toasts at most once per run"
+    );
+}
+
+/// A fresh daemon read as replaced only briefly — a daemon mid-re-exec —
+/// raises nothing: the toast and card line wait out a grace of continuous
+/// replaced reads, so the advice is not shouted over the daemon's own
+/// restart.
+#[test]
+fn a_daemon_read_replaced_briefly_raises_nothing() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "the quiet was not a failed probe: the feed reads live"
+    );
+}
+
+/// A daemon that died while the grace ran — the re-exec failed and nothing
+/// restarts it — raises nothing: a dead daemon already shows as not running,
+/// so no toast, no card line and no Services tint, on the death read and on
+/// the read after it.
+#[test]
+fn a_daemon_that_died_under_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the grace still holds the advice while the daemon lives"
+    );
+
+    drop(lock);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the death under the grace raises no toast"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "no card line for a dead daemon"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "no Services tint for a dead daemon"
+    );
+
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the read after the death stays quiet too"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "and no card line appears later"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "and no Services tint appears later"
+    );
+}
+
+/// A daemon that flipped the feed back to false within the grace — the
+/// re-exec happened — raises nothing, and a later replaced read restarts the
+/// full grace rather than continuing the old one.
+#[test]
+fn a_daemon_that_flipped_back_within_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the re-exec'd daemon raises nothing"
+    );
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "a fresh replaced read restarts the full grace"
+    );
+}
+
+/// A flip back to false inside the grace restarts it in full: the old
+/// grace's end raises nothing, and the advice waits a whole grace from the
+/// next replaced read.
+#[test]
+fn a_flip_back_within_the_grace_restarts_it_in_full() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 5_000);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 6_000);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the old grace's end raises nothing once a flip back restarted it"
+    );
+    app.daemon_now_override = Some(t0 + 16_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the advice raises a whole grace after the next replaced read"
+    );
+}
+
+/// A feed held at `binary_replaced` true continuously for the grace raises
+/// today's exact toast and card line and tints the Services tab. The grace
+/// clock is the TUI's own wall-clock read — the `tps` cache-age precedent's
+/// override — so the test advances it without sleeping; the feed's own
+/// freshness still reads the real clock.
+#[test]
+fn a_daemon_held_on_a_replaced_binary_past_the_grace_raises_the_advice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "still nothing one ms before the grace ends"
+    );
+
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the grace end raises today's exact toast, in the warning tone"
+    );
+    assert!(plugin_card_carries_daemon_line(&app), "and the card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "and the Services tab takes the warning tint"
     );
 }
 
@@ -61538,9 +61779,9 @@ fn a_stale_daemons_replaced_flag_raises_nothing() {
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 }
 
-/// Each rise of the daemon's flag tints the Services tab again, though the
-/// toast stays once per run: a daemon replaced, restarted, then replaced
-/// again is news each time.
+/// Each rise of the daemon's flag tints the Services tab again once its own
+/// grace ends, though the toast stays once per run: a daemon replaced,
+/// restarted, then replaced again is news each time.
 #[test]
 fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -61554,7 +61795,11 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     super::switch_tab(&mut app, super::Tab::Services);
     super::switch_tab(&mut app, super::Tab::Overview);
@@ -61567,6 +61812,13 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     );
 
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the second rise holds its tint until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -75552,12 +75804,62 @@ fn a_daemon_on_a_replaced_binary_makes_the_mascot_peek() {
         None,
         "a plain feed moved the mascot"
     );
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
     poll_and_land(&mut app);
     assert_eq!(
         app.mascot.playing_anim(),
-        Some(crate::tui::clawd::Anim::Peek)
+        None,
+        "the first replaced read moved the mascot inside the grace"
     );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the mascot moved one ms before the grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Peek),
+        "a daemon held on a replaced binary for the whole grace never made the mascot peek"
+    );
+}
+
+#[test]
+fn a_daemon_that_re_execs_inside_the_grace_never_makes_the_mascot_peek() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    mascot_idle_at(&mut app, 30_000);
+    feed(false);
+    poll_and_land(&mut app);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the replaced read before the re-exec moved the mascot"
+    );
+    app.daemon_now_override = Some(t0 + 2_000);
+    feed(false);
+    for at in [2_000, 9_999, 10_000, 12_000, 20_000] {
+        app.daemon_now_override = Some(t0 + at);
+        poll_and_land(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "the mascot moved {at} ms after a replaced read its daemon re-exec cleared"
+        );
+    }
 }
 
 #[test]
