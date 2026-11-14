@@ -22391,6 +22391,25 @@ fn rolling_profile_config(
         .map(|n| {
             let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
             p.rolling_token = true;
+            // A rolling profile is a logged-in one: the scan reads a sidecar
+            // as due only beside a stored chain. Its access token has expired,
+            // so a rolling sidecar never reads as behind it. A chain the test
+            // already wrote is its own and stays.
+            let dir = crate::profile::profile_dir(&p.name).expect("profile dir");
+            if dir.join("credentials.json").exists() {
+                return p;
+            }
+            p.credentials = Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: format!("at-chain-{n}"),
+                    refresh_token: Some(format!("rt-chain-{n}")),
+                    expires_at: Some(crate::usage::now_ms() as i64 - 3_600_000),
+                    scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+                    subscription_type: Some("max".into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            });
+            crate::profile::save_profile(&p).expect("save rolling profile");
             p
         })
         .chain(
@@ -41689,5 +41708,124 @@ fn the_usage_probe_never_sends_a_proxy_accounts_setup_token() {
             [true, false, false],
         ),
         "(probes sent, their bearers, a reading stored for plain, px, pu)"
+    );
+}
+
+/// Drives `claude_rolling_tick` over four scans one transient hold apart and
+/// counts the gate runs, for a rolling profile whose sidecar holds a mint.
+/// `after_mint` runs with the mint in the sidecar and before the first scan,
+/// for a case whose store or profile changes at that point.
+fn rolling_mint_gate_runs(
+    mut profile: crate::profile::Profile,
+    after_mint: impl FnOnce(&mut crate::profile::Profile),
+) -> (bool, usize) {
+    let name = profile.name.clone();
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    after_mint(&mut profile);
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec![name.clone()],
+            ..Default::default()
+        },
+        profiles: vec![profile],
+    }));
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    let due = crate::oauth::rolling_sidecar_restamp_due(&config, &name, now as i64);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let gate = |n: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::restamp_rolling_token(&config, n, |_: &str, _: Option<&str>| {
+            panic!("no stored chain clauth can stamp from may spend a refresh")
+        })
+    };
+    for k in 0..4u64 {
+        pacing.lock().unwrap().next_scan_ms = 0;
+        super::claude_rolling_tick(
+            &config,
+            &pacing,
+            now + k * (super::ROLLING_RETRY_MS + 1),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &std::sync::atomic::AtomicBool::new(false),
+            &gate,
+        );
+    }
+    (due, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A logged-out rolling profile keeps its sidecar, and a mint there has no
+/// stored chain to be re-stamped from: only a re-login changes that, so the
+/// scan never reads it as due and never re-runs the gate on the 15-minute hold.
+#[test]
+fn a_logged_out_rolling_profile_holding_a_mint_is_not_regated() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-logged-out");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = None;
+
+    assert_eq!(
+        rolling_mint_gate_runs(profile, |_| {}),
+        (false, 0),
+        "(mint read as due, gate runs over four scans one hold apart)"
+    );
+}
+
+/// The proxy claim the due predicate reads is the `[proxy]` record in
+/// `config.toml`, the one the gate's stamp refuses on. A mint written while
+/// the account still spent its own chain stays in the sidecar when that record
+/// lands; beside a comfortable stored chain it is not due, and the scan never
+/// re-runs the gate.
+#[test]
+fn a_mint_armed_before_a_proxy_record_lands_stays_off_the_scan() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-proxy-record");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-live".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 6 * 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let runs = rolling_mint_gate_runs(profile, |profile| {
+        crate::profile::write_proxy_record(&profile.name, &record).expect("proxy record");
+        profile.proxy = Some(record.clone());
+    });
+
+    assert_eq!(
+        (
+            crate::profile::stored_proxy_claim_failing_closed(&name),
+            crate::oauth::read_raw_store(&name)
+                .expect("store")
+                .and_then(|store| store.claude_ai_oauth)
+                .map(|oauth| oauth.access_token),
+            crate::claude::sidecar_summary(&name).map(|(kind, _)| kind),
+        ),
+        (
+            crate::profile::ProxyClaim::Account(record),
+            Some("at-live".to_string()),
+            Some(crate::claude::SidecarKind::Mint),
+        ),
+        "fixture control: (the claim on disk, the stored chain, the sidecar)"
+    );
+    assert_eq!(
+        runs,
+        (false, 0),
+        "(mint read as due, gate runs over four scans one hold apart)"
     );
 }

@@ -4191,36 +4191,92 @@ fn rolling_bearer_dying(name: &ProfileName) -> bool {
 pub(crate) const ROLLING_RESTAMP_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
 
 /// CLA-ROLL due predicate for the scheduler's re-stamp leg: an armed,
-/// exp-carrying sidecar inside [`ROLLING_RESTAMP_HORIZON_MS`] of death — or a
-/// mis-fill, which is due NOW: its clock is irrelevant because the CONTENT is
-/// the defect, switches refuse to install it, and the gate behind this
-/// predicate is the only leg a running daemon has that can repair it (heal
-/// from the preserved mint, or report the no-backup state on its own cause —
-/// on which the scheduler's credential-file watch then makes the operator's
-/// re-mint the release). Without this arm a mis-filled sidecar beside a
-/// healthy backup sat unrepaired forever on any profile nobody switched to.
-/// A static MINT in the sidecar is due too (the scheduler asks only for
-/// rolling-token profiles): it is the fallback a dead or unreachable chain
-/// degraded to, and this leg brings the rolling bearer back once the chain
-/// answers without waiting for a rotation (the gate supersedes a mint whenever
-/// it can stamp; a rotation that lands re-stamps it too). A mint beside a
-/// grant that can never stamp stays due as well, and the gate answers the
-/// scan with the re-login cause, so the scheduler paces it on the re-login
-/// hold. Absent sidecars (arming is switch/rotation work) and exp-less claims
-/// stay not-due.
-pub(crate) fn rolling_sidecar_restamp_due(name: &ProfileName, now: i64) -> bool {
+/// exp-carrying sidecar inside [`ROLLING_RESTAMP_HORIZON_MS`] of death, one
+/// whose bearer the chain has rotated past, or one holding a static MINT (the
+/// scheduler asks only for rolling-token profiles) — each due while the profile
+/// stores a chain clauth can stamp from ([`stored_chain_stamps`]). A mis-fill
+/// is due NOW, whatever the profile stores: its clock is irrelevant because the
+/// CONTENT is the defect, switches refuse to install it, and the gate behind
+/// this predicate is the only leg a running daemon has that can repair it (heal
+/// from the preserved mint, or report the no-backup state on its own cause — on
+/// which the scheduler's credential-file watch then makes the operator's
+/// re-mint the release). Without that arm a mis-filled sidecar beside a healthy
+/// backup sat unrepaired forever on any profile nobody switched to. A
+/// proxy-claimed account is the one profile that arm spares: the heal refuses
+/// it, and the gate it would re-run answers `Ready` without repairing
+/// anything, so the sidecar would stay due on every retry hold for good.
+///
+/// The mint is the fallback a dead or unreachable chain degraded to, and this
+/// leg brings the rolling bearer back once the chain answers without waiting
+/// for a rotation (the gate supersedes a mint whenever it can stamp; a
+/// rotation that lands re-stamps it too). A behind-chain bearer is revoked
+/// already, and only a stamp from that chain replaces it. With no stored chain
+/// (a logged-out store, a proxy account) nothing can stamp the sidecar, so none
+/// of these arms reads it as due: a due sidecar there would re-run the gate on
+/// every retry hold for good. A mint beside a stored grant whose shape cannot
+/// mint a rolling bearer stays due, and the gate answers the scan with the
+/// re-login cause, so the scheduler paces it on the re-login hold. Absent
+/// sidecars (arming is switch/rotation work) and exp-less claims stay not-due.
+pub(crate) fn rolling_sidecar_restamp_due(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    now: i64,
+) -> bool {
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {
-            exp <= now + ROLLING_RESTAMP_HORIZON_MS
+            (exp <= now + ROLLING_RESTAMP_HORIZON_MS
                 || crate::claude::rolling_sidecar_behind_chain(name)
                 || matches!(
                     crate::claude::sidecar_summary(name),
                     Some((crate::claude::SidecarKind::Mint, _))
-                )
+                ))
+                && stored_chain_stamps(config, name)
         }
-        Some(crate::claude::SessionTokenStatus::NotLongLived) => true,
+        Some(crate::claude::SessionTokenStatus::NotLongLived) => {
+            crate::profile::stored_proxy_claim_failing_closed(name)
+                == crate::profile::ProxyClaim::None
+        }
         _ => false,
     }
+}
+
+/// CLA-ROLL: whether the store holds an OAuth chain clauth can stamp a rolling
+/// bearer from: no proxy claim on disk — the claim [`roll_from_stored_chain`]
+/// answers `NeverSpent` on — and a login in `credentials.json`, or, when that
+/// store cannot be read, the in-memory chain the gate stamps from (a login the
+/// loaded profile spends). A hybrid profile (a `base_url` beside its chain, so
+/// [`crate::profile::Profile::is_oauth`] is false) has no refresh leg to fall
+/// back on, so its chain must also pass the stamp's own [`horizon_expiring`]
+/// test at [`ROLLING_RESTAMP_HORIZON_MS`]. Answers false on every absent or
+/// unreadable input: no store, no login, no readable in-memory chain, a
+/// `config.toml` no reading can classify, a poisoned config lock, or any claim
+/// but a readable `None`.
+fn stored_chain_stamps(config: &crate::profile::ConfigHandle, name: &ProfileName) -> bool {
+    if crate::profile::stored_proxy_claim_failing_closed(name) != crate::profile::ProxyClaim::None {
+        return false;
+    }
+    // Read before the config lock, so no file IO runs under it.
+    let store = read_raw_store(name);
+    let Ok(cfg) = config.lock() else {
+        return false;
+    };
+    let profile = cfg.find(name);
+    let chain = match store {
+        Ok(store) => store.and_then(|store| store.claude_ai_oauth),
+        // The gate stamps from the in-memory chain, so an unreadable store
+        // falls back to it rather than skipping a stamp the gate can make.
+        Err(_) => profile
+            .filter(|p| p.spends_oauth_chain())
+            .and_then(|p| p.credentials.as_ref())
+            .and_then(|c| c.claude_ai_oauth.clone()),
+    };
+    let hybrid = profile.is_some_and(|p| !p.is_oauth());
+    let flagged = cfg.is_auth_broken(name);
+    drop(cfg);
+    let Some(chain) = chain else {
+        return false;
+    };
+    !hybrid || !horizon_expiring(chain.expires_at, flagged, ROLLING_RESTAMP_HORIZON_MS)
 }
 
 /// CLA-ROLL: the scheduler-leg re-stamp for one rolling-token profile — the

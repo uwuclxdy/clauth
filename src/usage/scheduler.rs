@@ -11978,7 +11978,7 @@ pub(super) fn claude_rolling_tick<'g>(
             }
             logline!("clauth: '{name}' credentials changed under a re-stamp hold. Re-checking now");
         }
-        if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+        if !crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64) {
             continue;
         }
         let Some(claim) = claim_scheduler_spend_unless_shutting_down(activity, &name, spend_gate)
@@ -12012,7 +12012,8 @@ pub(super) fn claude_rolling_tick<'g>(
                 // The due re-read (a file read) runs BEFORE the pacing lock is
                 // taken — the rank is a leaf precisely because nothing else,
                 // locks or IO, ever happens under it.
-                let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
+                let still_due =
+                    crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64);
                 let hold = still_due.then(|| retry_hold(&name, now, kind));
                 if let Ok(mut p) = pacing.lock() {
                     match hold {
