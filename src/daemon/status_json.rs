@@ -109,6 +109,17 @@ pub(crate) struct LiveSignals<'a> {
     /// first publish, where each slot reads its row alone
     /// ([`super::proxies::unsupervised_slot`]).
     pub(crate) proxies: Option<&'a [ProxySlot]>,
+    /// Where this daemon's `--listen` API serves, once it has bound. `None`
+    /// single-shot, daemonless, without `--listen`, and before the bind.
+    pub(crate) listen: Option<&'a ListenSlot>,
+}
+
+/// The `listen` slot: the name the REST API's certificate serves and the port
+/// it is bound to, the address a pairing link names. No secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub(crate) struct ListenSlot {
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -897,6 +908,10 @@ fn run_codex_entry_load_hook(name: &ProfileName) {
 /// The full `status.json` body. Field order is the published key order, and
 /// each `Option` field emits a present key holding `null` when absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the status feed's wire shape: each bool is a published field whose serde key keeps its name"
+)]
 pub(crate) struct StatusBody {
     pub(crate) schema: u64,
     pub(crate) generated_at: String,
@@ -957,6 +972,11 @@ pub(crate) struct StatusBody {
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) binary_removed: bool,
+    /// Additive: where the writer's `--listen` API serves ([`ListenSlot`]),
+    /// `null` from any writer but a daemon serving one. `default` so a reader
+    /// stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) listen: Option<ListenSlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -1107,6 +1127,7 @@ pub(crate) fn build_status_impl(
         credit_billed_families: crate::claude_json::credit_billed_families(),
         binary_replaced: exe_change.is_some(),
         binary_removed: exe_change == Some(crate::plugin_host::ExeChange::Removed),
+        listen: live.and_then(|s| s.listen).cloned(),
         profiles,
     };
     (body, codex)

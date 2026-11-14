@@ -148,6 +148,11 @@ type HoldOutcome =
   | { type: 'allow' | 'deny'; from: 'desk' | 'device' }
   | { type: 'answers'; answers: Record<string, string>; notes: Record<string, string> }
   | { type: 'loss' }
+  // The daemon's clean release of a held ask to the desk: the daemon keeps
+  // listing the ask, read-only, until its close. A call's ask closes once the
+  // call settles, after the desk's dialog and its run; a bare query opens no
+  // dialog and closes at once.
+  | { type: 'released' }
 
 // The stored prompt's one contract lives in `types/index.d.ts`.
 type QueuedPrompt = ClauthQueuedPrompt
@@ -197,8 +202,9 @@ let drainEpoch: number | null = null
 // one more when it releases the flag and the session is still idle.
 let drainAgain = false
 let helds = new Map<string, HeldEntry>()
-// Asks the daemon took but did not hold, by ask id, each with the session it
-// opened in and the tool call (`tool_use_id`) whose settling closes it.
+// Permission asks the daemon took but does not hold — taken unheld, or released
+// back to the desk — by ask id, each with the session it opened in and the tool
+// call (`tool_use_id`) whose settling closes it.
 let unheldAsks = new Map<string, { session: string; call: string }>()
 let interruptedTurn: string | null = null
 let askCounter = 0
@@ -472,10 +478,11 @@ function holdAnswer(reply: string): boolean {
   }
 }
 
-// An ask the daemon took but did not hold goes to Claude Code's own dialog, so
-// only the desk settles it, and the daemon lists it until it is closed or the
-// session ends. A query opens no dialog and closes at once; a real call's ask
-// closes once that call settles (`closeUnheldAsks`).
+// An ask the daemon lists but does not hold — taken unheld, or a held one it
+// released to the desk — goes to Claude Code's own dialog, so only the desk
+// settles it, and the daemon lists it until it is closed or the session ends.
+// A query opens no dialog and closes at once; a real call's ask closes once
+// that call settles (`closeUnheldAsks`).
 function closeUnheldAskWhenSettled(
   $: EngineInterface,
   ask: string,
@@ -802,12 +809,21 @@ function pollOnce($: EngineInterface): Promise<void> {
   return pollInFlight
 }
 
+// The daemon released a held ask to the desk: it keeps listing the ask,
+// read-only, until its close, so the close waits for the call's settle. The
+// hook that held the ask owns the close: a bare check query opens no dialog and
+// closes at once, and a call's ask once the call settles, after its run.
+function takeDaemonRelease($: EngineInterface, ask: string): Promise<void> {
+  return resolveHold($, ask, { type: 'released' }, false)
+}
+
 // One wait on one ask: a single `/wait` fetch under the session the ask opened
 // in, parked at the daemon until that ask settles. The module's own id may have
 // moved on (a `/clear` keeps the process under another), and the ask still
 // belongs to the session that opened it. The awaited fetch pauses the hook
-// budget, so a hold outlives the 10 s bound. Every non-settle reads as a loss
-// for this ask alone.
+// budget, so a hold outlives the 10 s bound. Every failed wait reads as a loss
+// for this ask alone; the daemon's clean release hands the ask to the desk,
+// whose settle closes it (`takeDaemonRelease`).
 async function waitOnce($: EngineInterface, ask: string, session: string): Promise<void> {
   let res
   try {
@@ -832,7 +848,16 @@ async function waitOnce($: EngineInterface, ask: string, session: string): Promi
     return
   }
   if (reply.remote !== true) {
-    await resolveHold($, ask, { type: 'loss' }, true)
+    // Only the clean release of a still-open ask defers the close; a closed
+    // ask or a queued answer beside `remote: false` is no release and closes
+    // at once, as every non-settle does. This daemon sends an answer only
+    // beside `closed: true`, so the answer half guards against another
+    // version's bare answer, not this daemon's.
+    if (reply.closed === true || (reply.answer !== null && reply.answer !== undefined)) {
+      await resolveHold($, ask, { type: 'loss' }, true)
+      return
+    }
+    await takeDaemonRelease($, ask)
     return
   }
   if (reply.answer !== null && reply.answer !== undefined) {
@@ -1805,6 +1830,12 @@ export const register: Register = on => {
         turn,
         next.signal,
       )
+      if (outcome.type === 'released') {
+        // The desk's settle of the call closes it, after the engine's dialog
+        // and the call's run; a bare query has no call and closes here.
+        closeUnheldAskWhenSettled($, ask, opened.session, e.tool_use_id)
+        return v
+      }
       if (outcome.type === 'loss') return v
       if (outcome.type === 'allow') return { decision: 'allow' }
       if (outcome.type === 'deny') return { decision: 'deny' }
@@ -1844,6 +1875,11 @@ export const register: Register = on => {
         if (noted.length === 0) return { result }
         const annotations = Object.fromEntries(noted.map(([q, notes]) => [q, { notes }]))
         return { result: { ...result, annotations } }
+      }
+      if (outcome.type === 'released') {
+        // Released to the desk: the engine's own question dialog runs inside
+        // `next`, and the ask closes once it returns, as an unheld one does.
+        return next(e).finally(() => closeUnheldAsk($, ask, opened.session))
       }
       return next(e)
     },

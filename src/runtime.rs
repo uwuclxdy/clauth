@@ -10966,6 +10966,11 @@ pub(crate) fn settings_base(claude_home: &Path, isolation: Isolation) -> Option<
 /// the base and every sibling runtime for the session's lifetime. The two agree
 /// by construction: the syncer writes shared fields back into the base, so this
 /// recompute reproduces the same bytes on the next start instead of undoing it.
+///
+/// A shared copy links the operator's transcript store, so it never launches
+/// without the remembered `cleanupPeriodDays` ([`crate::retention`]): the
+/// number goes back into a keyless operator file before the build reads it,
+/// and into the copy itself when the operator file is missing.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
@@ -10974,15 +10979,6 @@ fn write_merged_settings(
     stale_env_keys: &[String],
 ) -> Result<()> {
     let base = settings_base(claude_home, isolation);
-    let merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
-    let settings_dst = runtime.join("settings.json");
-    // This file carries the api-key profile's top-level `apiKeyHelper` command
-    // string (plus the base_url/model env keys), so it must land 0o600 like
-    // every other clauth-owned write. The raw key itself lives in `config.toml`
-    // (minted per request by the helper); the runtime settings.json is still
-    // operator-sensitive. The write gate also fires when only the mode is wrong
-    // (a byte-identical file an older build left at the umask never self-heals
-    // otherwise).
     // The reconciler only lets a copy it recorded win a pass, so every shared
     // copy this build produces is recorded too: a write here, and an existing
     // byte-identical copy recorded in place. The record lands under the state
@@ -10993,6 +10989,25 @@ fn write_merged_settings(
         Isolation::Shared => crate::settings_sync::written_record_path().ok(),
         Isolation::Isolated => None,
     };
+    let carried_days = match (base.as_deref(), record.as_deref()) {
+        (Some(base), Some(record)) => {
+            crate::lock::with_state_lock(|held| crate::retention::settle(held, base, &[], record))
+                .map(|outcome| outcome.days)?
+        }
+        _ => None,
+    };
+    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    if let Some(days) = carried_days {
+        merged = crate::retention::carry_into(merged, days)?;
+    }
+    let settings_dst = runtime.join("settings.json");
+    // This file carries the api-key profile's top-level `apiKeyHelper` command
+    // string (plus the base_url/model env keys), so it must land 0o600 like
+    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // (minted per request by the helper); the runtime settings.json is still
+    // operator-sensitive. The write gate also fires when only the mode is wrong
+    // (a byte-identical file an older build left at the umask never self-heals
+    // otherwise).
     let carried_rank = record.as_deref().map_or((i64::MIN, 0), |record| {
         settings_carried_rank(record, base.as_deref())
     });

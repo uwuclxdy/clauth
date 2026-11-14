@@ -437,10 +437,10 @@ pub(crate) enum Command {
     /// the API while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
-    #[command(args_conflicts_with_subcommands = true)]
     Devices {
-        /// Emit a JSON array instead of the table.
-        #[arg(long)]
+        /// Emit a JSON array instead of the table; with `pair`, a
+        /// {"code","link"} object instead of the bare code.
+        #[arg(long, global = true)]
         json: bool,
         #[command(subcommand)]
         cmd: Option<DevicesCommand>,
@@ -944,8 +944,12 @@ pub(crate) enum DevicesCommand {
     /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
     /// device posts it to `POST /api/v1/pair` on this host's
     /// `clauth daemon --listen` and gets its token in the answer. The code
-    /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
-    /// the code if it is still waiting.
+    /// prints alone on stdout (`clauth devices --json pair` prints
+    /// {"code","link"}) and the wait reports on stderr; Ctrl-C withdraws the
+    /// code if it is still waiting. When stderr is a terminal, a pairing link
+    /// for the app and its QR code print there too: the app's page is
+    /// [serve] app_url (else the one [serve] app_origins entry), the address
+    /// [serve] public_address (else the one a `--listen` daemon publishes).
     Pair {
         /// Name for the device: letters, digits and - _ . @ +.
         name: String,
@@ -957,6 +961,9 @@ pub(crate) enum DevicesCommand {
         /// --control: a view device cannot mint sessions.
         #[arg(long, requires = "control")]
         sessions: bool,
+        /// Print the pairing link without its QR code.
+        #[arg(long)]
+        no_qr: bool,
     },
 
     /// Mint a token for a device on this machine and print it once

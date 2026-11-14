@@ -1073,3 +1073,833 @@ fn a_pre_sessions_pairing_file_redeems_ungranted() {
         .expect("the minted token verifies");
     assert!(!device.sessions, "a missing key reads as the grant off");
 }
+
+fn origins(entries: &[&str]) -> Vec<String> {
+    entries.iter().map(|entry| (*entry).to_owned()).collect()
+}
+
+#[test]
+fn a_pairing_link_joins_the_app_page_the_published_address_and_the_code() {
+    let link = pair_link(
+        Some("https://app.example.net"),
+        &origins(&["https://other.example.org"]),
+        None,
+        Some(("box.tail1234.ts.net", 8443)),
+        "K7QM-2XPA",
+    );
+    assert_eq!(
+        link,
+        PairLink::Link(
+            "https://app.example.net/#daemon=box.tail1234.ts.net:8443&code=K7QM-2XPA".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_pairing_link_keeps_the_app_pages_own_path_and_one_slash() {
+    for (app_url, expected) in [
+        (
+            "https://app.example.net/",
+            "https://app.example.net/#daemon=box.example.net:9443&code=K7QM-2XPA",
+        ),
+        (
+            "https://example.net/clauth/",
+            "https://example.net/clauth/#daemon=box.example.net:9443&code=K7QM-2XPA",
+        ),
+    ] {
+        let link = pair_link(
+            Some(app_url),
+            &[],
+            None,
+            Some(("box.example.net", 9443)),
+            "K7QM-2XPA",
+        );
+        assert_eq!(
+            link,
+            PairLink::Link(expected.to_owned()),
+            "app_url {app_url:?}"
+        );
+    }
+}
+
+#[test]
+fn a_public_address_outranks_the_address_the_daemon_published() {
+    let link = pair_link(
+        Some("https://app.example.net"),
+        &[],
+        Some("clauth.example.net:443"),
+        Some(("box.tail1234.ts.net", 8443)),
+        "K7QM-2XPA",
+    );
+    assert_eq!(
+        link,
+        PairLink::Link(
+            "https://app.example.net/#daemon=clauth.example.net:443&code=K7QM-2XPA".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_public_address_alone_builds_the_link_with_no_daemon_listening() {
+    let link = pair_link(
+        Some("https://app.example.net"),
+        &[],
+        Some("clauth.example.net:443"),
+        None,
+        "K7QM-2XPA",
+    );
+    assert_eq!(
+        link,
+        PairLink::Link(
+            "https://app.example.net/#daemon=clauth.example.net:443&code=K7QM-2XPA".to_owned()
+        )
+    );
+}
+
+#[test]
+fn no_published_address_and_no_public_address_builds_no_link() {
+    let link = pair_link(
+        Some("https://app.example.net"),
+        &[],
+        None,
+        None,
+        "K7QM-2XPA",
+    );
+    assert_eq!(link, PairLink::NoAddress);
+}
+
+#[test]
+fn an_unset_app_url_takes_the_single_app_origins_entry() {
+    let link = pair_link(
+        None,
+        &origins(&["https://pwa.example.net"]),
+        None,
+        Some(("box.example.net", 8443)),
+        "K7QM-2XPA",
+    );
+    assert_eq!(
+        link,
+        PairLink::Link(
+            "https://pwa.example.net/#daemon=box.example.net:8443&code=K7QM-2XPA".to_owned()
+        )
+    );
+}
+
+#[test]
+fn an_unset_app_url_with_several_origins_builds_no_link() {
+    let link = pair_link(
+        None,
+        &origins(&["https://pwa.example.net", "https://other.example.org"]),
+        None,
+        Some(("box.example.net", 8443)),
+        "K7QM-2XPA",
+    );
+    assert_eq!(link, PairLink::SeveralOrigins);
+}
+
+#[test]
+fn an_unset_app_url_with_no_origins_builds_no_link() {
+    let link = pair_link(
+        None,
+        &[],
+        None,
+        Some(("box.example.net", 8443)),
+        "K7QM-2XPA",
+    );
+    assert_eq!(link, PairLink::NoAppUrl);
+}
+
+#[test]
+fn the_serve_table_reads_app_url_and_public_address() {
+    let serve: crate::profile::ServeSettings = toml::from_str(
+        "app_url = \"https://app.example.net\"\npublic_address = \"clauth.example.net:443\"\n",
+    )
+    .expect("the table parses");
+    assert_eq!(serve.app_url.as_deref(), Some("https://app.example.net"));
+    assert_eq!(
+        serve.public_address.as_deref(),
+        Some("clauth.example.net:443")
+    );
+    let unset: crate::profile::ServeSettings = toml::from_str("").expect("an empty table parses");
+    assert_eq!(unset.app_url, None);
+    assert_eq!(unset.public_address, None);
+}
+
+/// `[serve]` with the two pairing keys and `app_origins` set as given.
+fn serve(
+    app_url: Option<&str>,
+    app_origins: &[&str],
+    public_address: Option<&str>,
+) -> ServeSettings {
+    ServeSettings {
+        app_url: app_url.map(str::to_owned),
+        app_origins: crate::profile::AppOrigins {
+            entries: origins(app_origins),
+            unreadable: Vec::new(),
+        },
+        public_address: public_address.map(str::to_owned),
+        ..ServeSettings::default()
+    }
+}
+
+/// A running daemon whose `--listen` API published `box.tail1234.ts.net:8443`.
+fn around(serve: ServeSettings) -> Surroundings {
+    Surroundings {
+        daemon_absent: false,
+        serve: Ok(serve),
+        listen: Some(ListenSlot {
+            host: "box.tail1234.ts.net".to_owned(),
+            port: 8443,
+        }),
+    }
+}
+
+/// What [`announce`] wrote for a view code minted for `phone`: its stdout,
+/// its stderr, and the code itself.
+fn announced(show: Show, around: &Surroundings) -> (String, String, String) {
+    let pending = begin(&name("phone"), Tier::View, false).expect("mint");
+    let mut out = Vec::new();
+    let err = crate::out::ErrCapture::new();
+    {
+        let _capture = err.capture_here();
+        announce(&mut out, &pending, false, show, around).expect("announce");
+    }
+    (
+        String::from_utf8(out).expect("utf-8 stdout"),
+        String::from_utf8(err.snapshot()).expect("utf-8 stderr"),
+        pending.code().to_string(),
+    )
+}
+
+const TTL_LINE: &str = "clauth: enter the code on the device within 5 minutes to pair 'phone' \
+                        (view); Ctrl-C withdraws it\n";
+
+fn link_for(code: &str) -> String {
+    format!("https://app.example.net/#daemon=box.tail1234.ts.net:8443&code={code}")
+}
+
+#[test]
+fn a_piped_pair_prints_the_code_alone_and_no_link() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(Some("https://app.example.net"), &[], None)),
+    );
+    assert_eq!(out, format!("{code}\n"), "stdout carries the code alone");
+    assert_eq!(err, TTL_LINE, "a stderr that is no terminal gets no link");
+}
+
+#[test]
+fn a_terminal_pair_prints_the_qr_code_and_the_link_on_stderr() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(Some("https://app.example.net"), &[], None)),
+    );
+    let link = link_for(&code);
+    let qr = render_qr(&link).expect("the link fits a QR code");
+    assert!(!qr.is_empty(), "the QR code draws something");
+    assert_eq!(out, format!("{code}\n"), "stdout carries the code alone");
+    assert_eq!(
+        err,
+        format!("{qr}\nclauth: pairing link: {link}\n{TTL_LINE}"),
+    );
+}
+
+#[test]
+fn no_qr_keeps_the_link_and_drops_the_qr_code() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: false,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(Some("https://app.example.net"), &[], None)),
+    );
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(
+        err,
+        format!("clauth: pairing link: {}\n{TTL_LINE}", link_for(&code)),
+    );
+}
+
+/// `pair`'s flags land in [`Show`] field by field: `--no-qr` inverts into the
+/// QR switch and `--json` stays its own. A flipped mapping would print the QR
+/// code under `--no-qr` with every rendering test still green.
+#[test]
+fn show_maps_the_json_and_no_qr_flags_onto_its_fields() {
+    for (json, no_qr, terminal, columns, want) in [
+        (
+            false,
+            false,
+            true,
+            Some(80),
+            Show {
+                json: false,
+                qr: true,
+                terminal: true,
+                columns: Some(80),
+            },
+        ),
+        (
+            true,
+            false,
+            false,
+            None,
+            Show {
+                json: true,
+                qr: true,
+                terminal: false,
+                columns: None,
+            },
+        ),
+        (
+            false,
+            true,
+            true,
+            Some(120),
+            Show {
+                json: false,
+                qr: false,
+                terminal: true,
+                columns: Some(120),
+            },
+        ),
+        (
+            true,
+            true,
+            false,
+            None,
+            Show {
+                json: true,
+                qr: false,
+                terminal: false,
+                columns: None,
+            },
+        ),
+    ] {
+        assert_eq!(
+            Show::from_flags(json, no_qr, terminal, columns),
+            want,
+            "json {json}, no_qr {no_qr}, terminal {terminal}, columns {columns:?}"
+        );
+    }
+}
+
+#[test]
+fn json_prints_the_code_and_the_link_and_a_null_link_when_there_is_none() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: true,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, _, code) = announced(
+        show,
+        &around(serve(Some("https://app.example.net"), &[], None)),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(
+        parsed,
+        serde_json::json!({"code": code, "link": link_for(&code)}),
+    );
+    assert!(out.ends_with("}\n"), "one line: {out:?}");
+
+    let unlinked = Surroundings {
+        listen: None,
+        ..around(serve(Some("https://app.example.net"), &[], None))
+    };
+    let (out, _, code) = announced(show, &unlinked);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(parsed, serde_json::json!({"code": code, "link": null}));
+}
+
+#[test]
+fn with_no_daemon_there_is_no_link_and_the_no_daemon_line_prints() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let absent = Surroundings {
+        daemon_absent: true,
+        serve: Ok(serve(Some("https://app.example.net"), &[], None)),
+        listen: None,
+    };
+    let (out, err, code) = announced(show, &absent);
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(
+        err,
+        format!(
+            "{TTL_LINE}clauth: no clauth daemon is running here, so nothing can redeem the \
+             code; start one with `clauth daemon --listen`\n"
+        ),
+    );
+}
+
+#[test]
+fn with_no_daemon_a_public_address_still_builds_no_link() {
+    let _home = HomeSandbox::new();
+    let absent = Surroundings {
+        daemon_absent: true,
+        serve: Ok(serve(
+            Some("https://app.example.net"),
+            &[],
+            Some("clauth.example.net:443"),
+        )),
+        listen: None,
+    };
+    let terminal = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(terminal, &absent);
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(
+        err,
+        format!(
+            "{TTL_LINE}clauth: no clauth daemon is running here, so nothing can redeem the \
+             code; start one with `clauth daemon --listen`\n"
+        ),
+    );
+    let json = Show {
+        json: true,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, _, code) = announced(json, &absent);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(parsed, serde_json::json!({"code": code, "link": null}));
+}
+
+#[test]
+fn several_origins_and_no_app_url_print_the_line_naming_app_url() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(
+            None,
+            &["https://pwa.example.net", "https://other.example.org"],
+            None,
+        )),
+    );
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: [serve] app_origins lists several origins; set \
+             [serve] app_url to the one that is the app's page\n{TTL_LINE}"
+        ),
+    );
+}
+
+/// `--json` carries the link where a script reads it, so a `null` link there
+/// gets the same line naming the key as a terminal run, though stderr is no
+/// terminal; a plain run with no terminal shows no link either way, so it
+/// prints no such line.
+#[test]
+fn a_json_run_without_a_terminal_still_names_the_key_its_null_link_needs() {
+    let _home = HomeSandbox::new();
+    let several = around(serve(
+        None,
+        &["https://pwa.example.net", "https://other.example.org"],
+        None,
+    ));
+    let json = Show {
+        json: true,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, err, code) = announced(json, &several);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(parsed, serde_json::json!({"code": code, "link": null}));
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: [serve] app_origins lists several origins; set \
+             [serve] app_url to the one that is the app's page\n{TTL_LINE}"
+        ),
+    );
+
+    let piped = Show {
+        json: false,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, err, code) = announced(piped, &several);
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(err, TTL_LINE);
+}
+
+/// Under `--json` with no terminal the link rides the stdout object alone: its
+/// stderr line and its QR carry the live code, so they stay terminal-only even
+/// where the reason line for a missing link now prints.
+#[test]
+fn a_json_run_without_a_terminal_prints_the_link_only_in_its_stdout_object() {
+    let _home = HomeSandbox::new();
+    let json = Show {
+        json: true,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        json,
+        &around(serve(Some("https://app.example.net"), &[], None)),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(
+        parsed,
+        serde_json::json!({"code": code, "link": link_for(&code)}),
+    );
+    assert_eq!(err, TTL_LINE);
+}
+
+/// A `profiles.toml` that does not read leaves the link `null`, and a `--json`
+/// run with no terminal names that cause as a terminal run does.
+#[test]
+fn a_json_run_without_a_terminal_names_an_unreadable_profiles_file() {
+    let _home = HomeSandbox::new();
+    let unreadable = Surroundings {
+        daemon_absent: false,
+        serve: Err("expected `=`, found newline at line 3".to_owned()),
+        listen: None,
+    };
+    let json = Show {
+        json: true,
+        qr: true,
+        terminal: false,
+        columns: None,
+    };
+    let (out, err, code) = announced(json, &unreadable);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout is one JSON object");
+    assert_eq!(parsed, serde_json::json!({"code": code, "link": null}));
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: profiles.toml does not read: expected `=`, found newline \
+             at line 3\n{TTL_LINE}"
+        ),
+    );
+}
+
+/// A pairing link holds the live code, so its `Debug` redacts it as `Code`'s
+/// does: a formatter is how a credential reaches a log line or an assert
+/// message.
+#[test]
+fn a_pairing_link_never_formats_its_code() {
+    let link = PairLink::Link(link_for("K7QM-2XPA"));
+    assert_eq!(format!("{link:?}"), "Link(<redacted>)");
+    assert_eq!(format!("{:?}", PairLink::NoAddress), "NoAddress");
+}
+
+/// The QR code read back module by module: a light quiet zone of four modules
+/// around exactly the symbol that encodes the link. Two modules per character
+/// cell, light drawn as block: `█` both light, ` ` both dark, `▀` the top
+/// light, `▄` the bottom light.
+#[test]
+fn the_qr_code_draws_the_links_own_symbol_inside_a_light_quiet_zone() {
+    let link = "https://app.example.net/#daemon=box.tail1234.ts.net:8443&code=K7QM-2XPA";
+    let drawn = render_qr(link).expect("the link fits a QR code");
+    let symbol = qrcode::QrCode::new(link.as_bytes()).expect("the oracle encodes the link");
+    let width = symbol.width();
+    let side = width + 8;
+    let mut rows: Vec<Vec<bool>> = Vec::new();
+    for line in drawn.lines() {
+        let (mut top, mut bottom) = (Vec::new(), Vec::new());
+        for cell in line.chars() {
+            let (up, down) = match cell {
+                '█' => (true, true),
+                ' ' => (false, false),
+                '▀' => (true, false),
+                '▄' => (false, true),
+                other => panic!("{other:?} is no half-block cell"),
+            };
+            top.push(up);
+            bottom.push(down);
+        }
+        rows.push(top);
+        rows.push(bottom);
+    }
+    // An odd side leaves the last cell row's bottom half unused.
+    rows.truncate(side);
+    assert_eq!(rows.len(), side, "one row per module, quiet zone included");
+    let colors = symbol.to_colors();
+    for (y, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            side,
+            "row {y} spans the symbol and its quiet zone"
+        );
+        for (x, light) in row.iter().enumerate() {
+            let inside = (4..4 + width).contains(&x) && (4..4 + width).contains(&y);
+            let want_light = !inside || colors[(y - 4) * width + (x - 4)] == qrcode::Color::Light;
+            assert_eq!(*light, want_light, "module ({x}, {y})");
+        }
+    }
+}
+
+// ── the read side of the published listen slot ─────────────────────────────
+
+/// Write the feed a daemon writes, built from `live` through the same
+/// [`crate::daemon::status_json::build_status`] its tick calls, into the
+/// sandbox's `status.json`.
+fn write_feed(live: &crate::daemon::LiveStores) {
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    let body = crate::daemon::status_json::build_status(
+        &config,
+        60_000,
+        Some(&live.snapshot().signals()),
+        false,
+    );
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("create the clauth dir");
+    std::fs::write(
+        dir.join("status.json"),
+        serde_json::to_vec_pretty(&body).expect("the writer's encoding"),
+    )
+    .expect("write the feed");
+}
+
+/// `pair` reads the slot back off the feed: the field name and shape the
+/// writer emits, `null` when the writer served no listener, and nothing when
+/// no feed is on disk.
+#[test]
+fn published_listen_reads_the_slot_the_daemon_wrote() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        crate::daemon::published_listen(),
+        None,
+        "no feed on disk publishes nothing"
+    );
+
+    let live = crate::daemon::LiveStores::default();
+    write_feed(&live);
+    assert_eq!(
+        crate::daemon::published_listen(),
+        None,
+        "the writer's `listen: null` reads as no address"
+    );
+
+    live.listen
+        .set(ListenSlot {
+            host: "box.tail1234.ts.net".to_owned(),
+            port: 8443,
+        })
+        .expect("the first listen slot");
+    write_feed(&live);
+    assert_eq!(
+        crate::daemon::published_listen(),
+        Some(ListenSlot {
+            host: "box.tail1234.ts.net".to_owned(),
+            port: 8443,
+        }),
+        "the slot the daemon published, read back field for field"
+    );
+}
+
+/// With no daemon holding the singleton, a feed left behind names a listener
+/// nobody runs: [`Surroundings::read`] drops it, so `pair` builds no link and
+/// says no daemon is running.
+#[test]
+fn surroundings_read_drops_a_feed_with_no_daemon_to_serve_it() {
+    let _home = HomeSandbox::new();
+    let live = crate::daemon::LiveStores::default();
+    live.listen
+        .set(ListenSlot {
+            host: "stale.example.net".to_owned(),
+            port: 8443,
+        })
+        .expect("the first listen slot");
+    write_feed(&live);
+
+    let around = Surroundings::read();
+    assert!(
+        around.daemon_absent,
+        "no lock file in the sandbox is positively no daemon"
+    );
+    assert_eq!(
+        around.listen, None,
+        "a feed a gone daemon wrote names no live listener"
+    );
+}
+
+// ── the no-link arms and the QR's width on a terminal ──────────────────────
+
+/// What [`announce`] wrote for `pending` under `show`: its stdout and stderr.
+fn announce_pending(pending: &Pending, show: Show, around: &Surroundings) -> (String, String) {
+    let mut out = Vec::new();
+    let err = crate::out::ErrCapture::new();
+    {
+        let _capture = err.capture_here();
+        announce(&mut out, pending, false, show, around).expect("announce");
+    }
+    (
+        String::from_utf8(out).expect("utf-8 stdout"),
+        String::from_utf8(err.snapshot()).expect("utf-8 stderr"),
+    )
+}
+
+/// A `[serve] app_url` the link cannot carry prints the one line naming it and
+/// names the reason, never a half-built link.
+#[test]
+fn a_bad_app_url_prints_the_line_naming_app_url() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(Some("http://app.example.net"), &[], None)),
+    );
+    assert_eq!(out, format!("{code}\n"), "stdout carries the code alone");
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: [serve] app_url \"http://app.example.net\" does not \
+             count: its scheme is not https\n{TTL_LINE}"
+        ),
+    );
+}
+
+/// A `[serve] public_address` that is no `host:port` prints the one line
+/// naming it and its reason.
+#[test]
+fn a_bad_public_address_prints_the_line_naming_public_address() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(
+        show,
+        &around(serve(
+            Some("https://app.example.net"),
+            &[],
+            Some("https://host:443"),
+        )),
+    );
+    assert_eq!(out, format!("{code}\n"), "stdout carries the code alone");
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: [serve] public_address \"https://host:443\" does not \
+             count: it has a scheme; it takes host:port alone\n{TTL_LINE}"
+        ),
+    );
+}
+
+/// The one counted `app_origins` entry being plain http (loopback, which the
+/// API accepts) prints the line naming `app_url` as the page to set.
+#[test]
+fn a_plain_http_app_origin_prints_the_line_naming_app_url() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let (out, err, code) = announced(show, &around(serve(None, &["http://127.0.0.1:8080"], None)));
+    assert_eq!(out, format!("{code}\n"), "stdout carries the code alone");
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: the one [serve] app_origins entry \
+             \"http://127.0.0.1:8080\" is plain http, which a phone cannot open; set [serve] \
+             app_url to the app's https page\n{TTL_LINE}"
+        ),
+    );
+}
+
+/// A terminal narrower than the symbol skips the QR with one line saying so,
+/// and the link still prints; a terminal exactly the symbol's width draws it.
+#[test]
+fn a_terminal_narrower_than_the_qr_skips_it_and_says_so() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("phone"), Tier::View, false).expect("mint");
+    let around = around(serve(Some("https://app.example.net"), &[], None));
+    let link = link_for(&pending.code().to_string());
+    let qr = render_qr(&link).expect("the link fits a QR code");
+    // One column per module, the four-module quiet zone included: the
+    // oracle's own geometry, never the renderer's output measured back.
+    let columns = u16::try_from(
+        qrcode::QrCode::new(link.as_bytes())
+            .expect("the oracle encodes the link")
+            .width()
+            + 8,
+    )
+    .expect("a QR symbol fits u16 columns");
+
+    let narrow = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: Some(columns - 1),
+    };
+    let (out, err) = announce_pending(&pending, narrow, &around);
+    assert_eq!(
+        out,
+        format!("{}\n", pending.code()),
+        "stdout carries the code alone"
+    );
+    assert_eq!(
+        err,
+        format!(
+            "clauth: the terminal is too narrow for the QR code: it needs {columns} columns \
+             and this one has {}; pass --no-qr to drop it\nclauth: pairing link: {link}\n\
+             {TTL_LINE}",
+            columns - 1
+        ),
+    );
+
+    let exact = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: Some(columns),
+    };
+    let (_, err) = announce_pending(&pending, exact, &around);
+    assert_eq!(
+        err,
+        format!("{qr}\nclauth: pairing link: {link}\n{TTL_LINE}"),
+        "a terminal exactly as wide as the symbol draws it"
+    );
+}

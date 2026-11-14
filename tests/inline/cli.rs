@@ -1174,6 +1174,7 @@ fn devices_parses_its_five_verbs() {
                     name,
                     control,
                     sessions,
+                    ..
                 }),
             ..
         } = command(args)
@@ -1183,6 +1184,42 @@ fn devices_parses_its_five_verbs() {
         assert_eq!(
             (name.as_str(), control, sessions),
             ("phone", want_control, want_sessions),
+            "{args:?}"
+        );
+    }
+    // `--json` reads the same before or after the verb; `--no-qr` is pair's own.
+    for (args, want_json, want_no_qr) in [
+        (
+            ["devices", "--json", "pair", "phone"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "phone", "--json"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "phone", "--no-qr"].as_slice(),
+            false,
+            true,
+        ),
+        (
+            ["devices", "pair", "--json", "--no-qr", "phone"].as_slice(),
+            true,
+            true,
+        ),
+    ] {
+        let Command::Devices {
+            json,
+            cmd: Some(DevicesCommand::Pair { name, no_qr, .. }),
+        } = command(args)
+        else {
+            panic!("{args:?} must parse as pair");
+        };
+        assert_eq!(
+            (name.as_str(), json, no_qr),
+            ("phone", want_json, want_no_qr),
             "{args:?}"
         );
     }
@@ -1242,13 +1279,54 @@ fn devices_parses_its_five_verbs() {
         ["devices", "allow-sessions"].as_slice(),
         ["devices", "revoke", "phone", "--control"].as_slice(),
         ["devices", "pair", "phone", "extra"].as_slice(),
-        ["devices", "--json", "pair", "phone"].as_slice(),
-        ["devices", "pair", "phone", "--json"].as_slice(),
         ["devices", "list"].as_slice(),
         ["devices", "pair", "phone", "--sessions"].as_slice(),
         ["devices", "add", "tray", "--sessions"].as_slice(),
     ] {
         assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+}
+
+/// `--json` serves the listing and `pair` alone: on the three other verbs it
+/// is a usage error naming where it applies, never a flag that parses and
+/// does nothing (which would leave a script reading a bare token as JSON).
+#[test]
+fn devices_json_is_refused_on_the_verbs_it_does_not_serve() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (args, verb) in [
+        (["devices", "add", "tray", "--json"].as_slice(), "add"),
+        (["devices", "--json", "add", "tray"].as_slice(), "add"),
+        (
+            ["devices", "revoke", "phone", "--json"].as_slice(),
+            "revoke",
+        ),
+        (
+            ["devices", "--json", "revoke", "phone"].as_slice(),
+            "revoke",
+        ),
+        (
+            ["devices", "allow-sessions", "phone", "--json"].as_slice(),
+            "allow-sessions",
+        ),
+        (
+            ["devices", "--json", "allow-sessions", "phone"].as_slice(),
+            "allow-sessions",
+        ),
+    ] {
+        // The refusal is the command's own usage error, so the grammar
+        // accepts the argv (clap's own code stays 0 here).
+        let cli = parse(args)
+            .unwrap_or_else(|e| panic!("{args:?} must parse; the refusal comes after: {e}"));
+        let mut line = Vec::new();
+        let code = crate::exit_code_to(crate::dispatch(cli), &mut line);
+        assert_eq!(code, 2, "{args:?} must be a usage error");
+        assert_eq!(
+            String::from_utf8_lossy(&line),
+            format!(
+                "Error: `--json` applies to the listing and to `pair`, not to `devices {verb}`\n"
+            ),
+            "{args:?}"
+        );
     }
 }
 
