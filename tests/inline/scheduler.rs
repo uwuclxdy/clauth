@@ -902,6 +902,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail,
+                last_fetch_failed: false,
             },
         )])
     };
@@ -985,6 +986,7 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1027,6 +1029,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     );
 
@@ -1038,6 +1041,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -1120,6 +1124,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1162,6 +1167,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
         super::StreakCounts {
             rate_limit: 5,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1211,6 +1217,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1236,6 +1243,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
             super::StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 2,
+                last_fetch_failed: false,
             },
         )]),
     );
@@ -1266,6 +1274,7 @@ fn partition_due_clamp_leaves_third_party_untouched() {
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
+            last_fetch_failed: false,
         },
     )]);
 
@@ -1495,7 +1504,7 @@ fn a_panicking_oauth_worker_strands_neither_slot() {
         );
     }
 
-    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None);
+    super::fetch_oauth_due(&state, vec![entry], REFRESH_INTERVAL_MS, None, None);
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -1657,6 +1666,7 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
         ProfileActivity::Fetching,
     );
     let before = super::now_ms();
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
     let after = super::now_ms();
     {
@@ -1678,42 +1688,46 @@ fn oauth_and_provider_completions_clear_only_their_own_activity() {
 /// The two streak axes must move independently, because every other reader
 /// means only one of them: `rate_limit` feeds `is_stuck_rate_limited`, the
 /// auto-switch freshness bypass and `status.json`'s `stale` — none of which a
-/// refresh failure may ever claim. A live body clears both.
+/// refresh failure may ever claim. The `last_fetch_failed` mark is not an axis:
+/// a failed attempt sets it without touching either ladder, a no-op outcome
+/// holds it, and a live body clears all of it.
 #[test]
 fn streak_axes_move_independently_and_a_live_body_clears_both() {
     use super::FetchStatus;
 
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
-    let update = |status: FetchStatus, refresh_failed: bool| {
+    let update = |status: FetchStatus, refresh_failed: bool, fetch_failed: bool| {
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("a"),
             status,
             refresh_failed,
+            fetch_failed,
         )
     };
 
     // A transient refresh failure bails to `Cached` — it must NOT touch the 429
     // axis, or a client-side bug would report a stuck throttle and let the
     // auto-switch rotate the chain away on it.
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 1));
-    let counts = update(FetchStatus::Cached, true);
+    let counts = update(FetchStatus::Cached, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 2));
 
     // A 429 bumps only its own axis and leaves the refresh count standing.
-    let counts = update(FetchStatus::RateLimited, false);
+    let counts = update(FetchStatus::RateLimited, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
 
     // A status that says nothing about either axis holds both — and must not
     // conjure an entry for a profile that has none.
-    let counts = update(FetchStatus::Failed, false);
+    let counts = update(FetchStatus::Failed, false, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
     assert_eq!(
         super::update_streaks(
             &streaks,
             &crate::profile::ProfileName::from("never-seen"),
             FetchStatus::Failed,
+            false,
             false
         ),
         super::StreakCounts::default(),
@@ -1726,9 +1740,481 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
     // A live body clears both: whatever went wrong, the profile is serving. This
     // is also the preemptive-rotation case — a refresh can fail while the still
     // valid access token fetches fine, and nothing is degraded yet.
-    let counts = update(FetchStatus::Fresh, true);
+    let counts = update(FetchStatus::Fresh, true, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 0));
     assert!(!streaks.lock().unwrap().contains_key("a"));
+
+    // A failed fetch attempt sets the mark without touching either ladder
+    // axis, and a later no-op outcome (a seeded reading) holds it until a
+    // live body clears it.
+    let counts = update(FetchStatus::Cached, false, true);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, true),
+        "a failed attempt sets the mark and bumps neither axis"
+    );
+    let counts = update(FetchStatus::Failed, false, false);
+    assert!(
+        counts.last_fetch_failed,
+        "a no-op outcome holds the mark, never clears it"
+    );
+    let counts = update(FetchStatus::Fresh, false, false);
+    assert_eq!(
+        (
+            counts.rate_limit,
+            counts.refresh_fail,
+            counts.last_fetch_failed
+        ),
+        (0, 0, false),
+        "a live body clears the mark with the entry"
+    );
+}
+
+/// A `/usage` fetch that errors lands the per-account failure mark: the
+/// fail-serving outcome carries it to `update_streaks`, which sets it without
+/// bumping either ladder axis. A live body clears it with the entry.
+#[test]
+fn a_failed_fetch_lands_a_per_account_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-fetch-fail";
+    let (base, server) = crate::testutil::serve_endpoints(1, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the failed fetch must attempt /usage: {seen:?}"
+    );
+    assert_eq!(
+        outcome.status,
+        super::FetchStatus::Cached,
+        "a failed fetch with a cache on disk serves Cached"
+    );
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("a failed fetch lands a per-account failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "the mark is the last-fetch-failed signal, never a ladder axis: {mark:?}"
+    );
+    assert_eq!(
+        (mark.rate_limit, mark.refresh_fail),
+        (0, 0),
+        "a plain failed fetch bumps neither ladder axis: {mark:?}"
+    );
+
+    // The account's next live read clears the mark with the rest of the entry.
+    land_outcome_onto(
+        &store,
+        fresh_outcome(name, crate::usage::UsageInfo::default()),
+        &streaks,
+    );
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "a live body clears the failure mark"
+    );
+}
+
+/// The reactive rotation bail: a 401 sends the plain fetch into the rotation
+/// leg, and an entry holding no refresh token has nothing to spend there, so
+/// the refusal is the tick's only request. The failed attempt lands the mark.
+#[test]
+fn a_reactive_rotation_bail_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "reactive-bail-mark";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        refresh_token: None,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 must come from the plain fetch: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "no refresh token, so the leg must spend nothing: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive bail lands the failure mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive rotation bail is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive arm's plain-fetch failure: an account inside the rotation
+/// lead runs the plain usage poll instead of spending the chain (a standing
+/// quarantine refuses the refresh), and that poll's error is a failed attempt.
+#[test]
+fn a_proactive_plain_fetch_error_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-plain-fail";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window (floor 15 min), so the leg takes the
+        // proactive arm: no plain fetch runs before the rotation leg.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        auth_broken: true,
+        ..rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000))
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the proactive arm's live poll must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the quarantined refresh must not be spent: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive plain fetch's error lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a proactive plain-fetch error is a failed attempt: {mark:?}"
+    );
+}
+
+/// The proactive rotation's retry dying: inside the lead window the leg spends
+/// the rotation first and only then polls, so the retry's error is a failed
+/// attempt of a tick that sent the rotation. The mark lands with the pair.
+#[test]
+fn a_proactive_rotation_whose_retry_fails_lands_the_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "proactive-retry-fail";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            (500, r#"{"error":"server_error"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the proactive arm must spend the rotation first: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the rotated token's retry must still run: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the minted pair survives a failed retry"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the proactive rotation's failed retry lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a failed retry after a sent rotation is a failed attempt: {mark:?}"
+    );
+}
+
+/// Every probe answer that served no usage body marks the account (a failed
+/// request, a 429, a rejected token), while the organization refusal — a live
+/// verdict whose plan the row shows — leaves the mark alone.
+#[test]
+fn a_failed_probe_lands_the_failure_mark_and_an_org_refusal_does_not() {
+    use super::{UsageStore, probe_outcome};
+    use crate::usage::inference::anthropic::ProbeAnswer;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed-failed-mark");
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    for (answer, label) in [
+        (ProbeAnswer::Failed, "a failed probe"),
+        (
+            ProbeAnswer::RateLimited { retry_after: None },
+            "a rate-limited probe",
+        ),
+        (ProbeAnswer::Rejected, "a rejected probe"),
+    ] {
+        let streaks = land_outcome_with_streaks(&store, probe_outcome(&name, answer));
+        let mark = streaks
+            .lock()
+            .unwrap()
+            .get(name.as_str())
+            .copied()
+            .unwrap_or_else(|| panic!("{label} lands a streak entry"));
+        assert!(
+            mark.last_fetch_failed,
+            "{label} served no usage body, so it is a failed attempt: {mark:?}"
+        );
+    }
+
+    let refused = land_outcome_with_streaks(
+        &store,
+        probe_outcome(&name, ProbeAnswer::OrgRefused { canceled: false }),
+    );
+    assert!(
+        !refused.lock().unwrap().contains_key(name.as_str()),
+        "an org refusal is a live verdict, never a failed attempt"
+    );
+}
+
+/// The failed-fetch mark records this instance's own attempt. Once the
+/// instance stands down it sends nothing, and the instance that fetches may
+/// have served the account since, so a stand-down tick drops the mark: a
+/// skipped spent account the hydrate seeds `Cached` then reads `[ spent ]`, not
+/// a failure that is no longer the last attempt.
+#[test]
+fn a_stand_down_tick_drops_the_instances_own_failed_fetch_mark() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    crate::testutil::register_names(&["kitty"]);
+    // The fetching instance's last live body: the week spent, dated two
+    // intervals back, so the hydrate seeds `Cached`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 2 * REFRESH_INTERVAL_MS),
+            ..UsageInfo::default()
+        },
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: crate::testutil::fresh_activity(),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+        skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::new(RankedMutex::new(HashMap::new())),
+    };
+    // This instance's own failed attempt, landed while it held the lease.
+    let mut failed = cached_outcome("kitty");
+    failed.fetch_failed = true;
+    super::apply_outcome_to(&state, failed);
+    assert!(
+        state
+            .poll_streaks
+            .lock()
+            .unwrap()
+            .get("kitty")
+            .is_some_and(|c| c.last_fetch_failed),
+        "the landing set the mark"
+    );
+    // A second account carrying a refresh streak beside its mark: the tick
+    // drops the mark only, never the counts the mirror's cadence reads.
+    state.poll_streaks.lock().unwrap().insert(
+        "tabby".to_string(),
+        super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: true,
+        },
+    );
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let status = state.status.lock().unwrap().get("kitty").copied();
+    let mark = state.poll_streaks.lock().unwrap().get("kitty").copied();
+    let next = state
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .get(&oauth_key("kitty"))
+        .copied();
+    assert_eq!(
+        status,
+        Some(super::FetchStatus::Cached),
+        "the hydrate seeds Cached"
+    );
+    assert_eq!(next, None, "the spent skip blanks the countdown");
+    assert!(
+        !mark.is_some_and(|c| c.last_fetch_failed),
+        "a stood-down instance holds no failed-fetch mark of its own: {mark:?}"
+    );
+    assert_eq!(
+        state.poll_streaks.lock().unwrap().get("tabby").copied(),
+        Some(super::StreakCounts {
+            rate_limit: 0,
+            refresh_fail: 2,
+            last_fetch_failed: false,
+        }),
+        "a stand-down tick keeps every count and drops only the mark"
+    );
 }
 
 /// Forced (manual `r`) refetches skip a mid-switch profile for the same
@@ -1809,6 +2295,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -1998,6 +2485,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2040,6 +2528,7 @@ fn cached_fallback_does_not_clobber_store() {
             from_fetch: false,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2389,6 +2878,7 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             from_fetch: true,
             from_headers: false,
             refresh_failed: false,
+            fetch_failed: false,
             login_gone: false,
             plan_override: None,
             retry_after: None,
@@ -2600,17 +3090,38 @@ fn fresh_outcome(name: &str, info: crate::usage::UsageInfo) -> super::FetchOutco
 /// Land one outcome through the real landing (`apply_outcome`) with empty
 /// status/cadence stores, so a test reads only what the store then holds.
 fn land_outcome(store: &super::UsageStore, outcome: super::FetchOutcome) {
+    land_outcome_with_streaks(store, outcome);
+}
+
+/// [`land_outcome`] handing back the per-profile streak map the landing wrote,
+/// for a test that reads the failed-fetch mark.
+fn land_outcome_with_streaks(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+) -> super::PollStreaks {
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    land_outcome_onto(store, outcome, &streaks);
+    streaks
+}
+
+/// [`land_outcome_with_streaks`] landing into a caller-held streak map, so a
+/// test can land a second outcome over the first and read what the map then
+/// holds.
+fn land_outcome_onto(
+    store: &super::UsageStore,
+    outcome: super::FetchOutcome,
+    streaks: &super::PollStreaks,
+) {
     use super::{StatusStore, apply_outcome};
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
     apply_outcome(
         outcome,
         store,
         &status,
         &last_fetched,
-        &streaks,
+        streaks,
         REFRESH_INTERVAL_MS,
         false,
         false,
@@ -2998,6 +3509,7 @@ fn reading_dead_names_never_flags_a_plan_with_no_five_hour_limit() {
         StreakCounts {
             rate_limit: ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -3282,6 +3794,7 @@ fn midstorm_kick_fires_for_a_member_hosting_a_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     // The persistent-429 shape: a plan-only, windowless store entry.
@@ -3323,6 +3836,7 @@ fn midstorm_kick_stays_gated_for_a_member_hosting_no_live_chain_session() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3362,6 +3876,7 @@ fn midstorm_kick_keeps_the_block_ladder_for_a_hosting_member() {
         super::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
@@ -3423,6 +3938,7 @@ fn chain_session_hosts_reads_rows_the_decision_leg_would_move() {
             super::StreakCounts {
                 rate_limit: 2,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])))
     };
@@ -3600,6 +4116,7 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -3791,6 +4308,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         StreakCounts {
             rate_limit: 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
     let _ = super::run_fetch(
@@ -3995,6 +4513,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         from_fetch: true,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -4023,6 +4542,254 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
     assert!(
         state.weekly_reset_kicks.lock().unwrap().is_empty(),
         "an opted-out profile arms no mark"
+    );
+}
+
+/// The drain's weekly-reset mark reads the effective opt-in: a proxy account
+/// carrying `auto_start`, its `[proxy]` table readable or not, arms no mark on
+/// a rolled-over body, where the same profile without a record arms one
+/// (`drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles`).
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_for_a_proxy_account() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        fetch_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let marked = |profile: crate::profile::Profile| {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![profile];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w"))
+    };
+    let mut proxied = auto_start_queue_profile("w");
+    proxied.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let mut unreadable = auto_start_queue_profile("w");
+    unreadable.has_unreadable_proxy_record = true;
+
+    assert_eq!(
+        (marked(proxied), marked(unreadable)),
+        (false, false),
+        "the weekly-reset mark armed for: a proxy account, an unreadable proxy record"
+    );
+}
+
+/// The weekly-reset mark is confirmed against the record on disk: a `[proxy]`
+/// record that landed while the in-memory config still reads the account as
+/// plain and opted in (readable, then unreadable) arms no mark, where the same
+/// memory with no record on disk arms one.
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_for_a_record_the_memory_lags() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        fetch_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let marked = || {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w"))
+    };
+
+    let plain = marked();
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("w")).unwrap(),
+    )
+    .unwrap();
+    crate::profile::write_proxy_record(
+        &crate::profile::ProfileName::from("w"),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .unwrap();
+    let readable = marked();
+    crate::claude::tests::break_proxy_record("w");
+    let unreadable = marked();
+
+    assert_eq!(
+        (plain, readable, unreadable),
+        (true, false, false),
+        "the weekly-reset mark armed with, on disk: no record, a proxy record, an unreadable one"
+    );
+}
+
+/// A `config.toml` the in-memory opt-in outlived that cannot say whether it
+/// holds a `[proxy]` record (a directory in its place, a `[proxy] # note`
+/// header that fails to parse) arms no weekly-reset mark, where the same
+/// memory over a plain config arms one; the store and the stage are never
+/// written either way.
+#[test]
+fn the_drain_arms_no_weekly_reset_mark_over_a_config_it_cannot_classify() {
+    use super::FetchOutcome;
+    use crate::claude::tests::Unclassifiable;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+    let pn = crate::profile::ProfileName::from("w");
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    let run = move |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        from_headers: false,
+        refresh_failed: false,
+        fetch_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: 0,
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    let chain = || {
+        ["credentials.json", "credentials.json.staged"]
+            .map(|file| std::fs::read(crate::profile::profile_subpath(&pn, file).unwrap()).ok())
+    };
+    let marked = || {
+        state.weekly_reset_kicks.lock().unwrap().clear();
+        state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+        state.store.lock().unwrap().insert("w".to_string(), spent());
+        super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run.clone());
+        state.weekly_reset_kicks.lock().unwrap().contains(&pn)
+    };
+
+    let before = chain();
+    let plain = marked();
+    let shapes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            shape.pose("w");
+            marked()
+        })
+        .collect();
+
+    assert_eq!(
+        (plain, shapes, chain() == before),
+        (true, vec![false, false], true),
+        "(the mark over a plain config, over a directory and a noted header, the store and \
+         stage kept)"
     );
 }
 
@@ -4685,6 +5452,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         let activity = crate::testutil::fresh_activity();
@@ -4959,6 +5727,7 @@ fn scan_sessions_with_streaks(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
         None,
+        None,
     );
 }
 
@@ -4981,6 +5750,7 @@ fn scan_sessions_skipped(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         skipped,
+        None,
         None,
     );
 }
@@ -5005,6 +5775,7 @@ fn scan_sessions_tp(
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
         None,
     );
 }
@@ -8232,6 +9003,7 @@ fn a_scan_after_a_timed_out_flock_wait_records_no_refusal() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &Arc::new(RankedMutex::new(HashSet::new())),
             Some(&flag),
+            None,
         );
     };
     append_and_tail(&home, "conv-f", &[spend_cap_row(120_000)]);
@@ -12125,6 +12897,7 @@ fn a_session_on_a_distrusted_member_gets_no_decision_unless_that_member_is_broke
             super::StreakCounts {
                 rate_limit: streak,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
         )])));
         scan_sessions_with_streaks(&config, &frozen_store(), &frozen_status(), &streaks);
@@ -12820,6 +13593,7 @@ fn retry_after_defers_next_fetch_slot() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after,
@@ -12991,6 +13765,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         name: crate::profile::ProfileName::from("a"),
@@ -13108,6 +13883,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
@@ -13178,6 +13954,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -13634,7 +14411,8 @@ fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
 
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
-/// map (the steady state for healthy profiles) is a no-op fast path.
+/// map (the steady state for healthy profiles) is a no-op fast path. The
+/// dropped entries' leg keys come back for the blanked-countdown publish.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
     let suppressed_auth_expired: SuppressedAuthExpiredStore =
@@ -13646,14 +14424,21 @@ fn filter_suppressed_drops_only_named_entries() {
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed_auth_expired, snap);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
+    assert_eq!(
+        blanked,
+        HashSet::from([tp_key("no-data")]),
+        "the dropped entry's third-party leg key is the blanked publish's input",
+    );
 
-    // Empty map → identity (the fast path).
+    // Empty map → identity (the fast path), nothing blanked.
     let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
-    assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+    let (out, blanked) = filter_suppressed(&empty, snap2);
+    assert_eq!(out.len(), 2);
+    assert!(blanked.is_empty());
 }
 
 /// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
@@ -13672,15 +14457,23 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
+    assert!(
+        filter_suppressed(&suppressed_auth_expired, vec![expired])
+            .0
+            .is_empty()
+    );
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
         "a re-login must re-admit the profile without a restart or a timer",
+    );
+    assert!(
+        blanked.is_empty(),
+        "a re-admitted credential blanks nothing",
     );
 }
 
@@ -13698,7 +14491,9 @@ fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
     assert_eq!(
-        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        filter_suppressed(&suppressed_auth_expired, vec![rotated])
+            .0
+            .len(),
         1
     );
 }
@@ -13963,6 +14758,7 @@ fn third_party_state_at_interval(
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15322,6 +16118,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         ],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -15398,6 +16196,8 @@ fn standdown_hydrate_removes_a_cacheless_third_party_name() {
         &[],
         &["tp-cacheless".to_string()],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -15440,6 +16240,8 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
             &tp_status,
             &last_fetched,
             seed_names,
+            &[],
+            &[],
             &[],
             &[],
             REFRESH_INTERVAL_MS,
@@ -15517,6 +16319,8 @@ fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
         &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -15568,6 +16372,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15665,6 +16470,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -15710,6 +16516,533 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
+}
+
+/// A stood-down mirror's only channel for the fetching instance's third-party
+/// verdict is the durable record a refused endpoint credential leaves: the
+/// cache seed derives `Fresh`/`Cached` off the cache clock and this instance
+/// runs no fetch, so nothing else publishes `AuthExpired`. The tick seeds the
+/// verdict from the record, and the Overview row reads it off the app's own
+/// snapshot — the suppressed account's timer cell is blank, as the holder's
+/// is. A cleared record (the holder re-keyed or re-logged the account) drops
+/// the seed at the next tick and the row returns to its derived overdue age.
+#[test]
+fn a_stood_down_mirror_blanks_a_suppressed_endpoint_row_from_its_durable_record() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    // A disabled endpoint of the same credential shape: the seed's scope is
+    // the work list, which never holds a disabled account.
+    let off_name = "off";
+    let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from(off_name));
+    off.base_url = Some("https://disabled.example.com".to_string());
+    off.api_key = Some("off-key".to_string());
+    off.disabled = true;
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::profile::save_profile(&off).expect("save the disabled profile");
+    crate::testutil::register_names(&[name, off_name]);
+    // The holder's last reading, dated far past its refresh so the derived
+    // deadline sits far past the grace and its age form is deterministic.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), off.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The durable verdict, through its own writer.
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(name),
+            fingerprint,
+        ),
+        "the durable record landed"
+    );
+    // The same durable verdict for the disabled endpoint: the record lands,
+    // and only the work-list scope keeps it from seeding a status.
+    let off_fingerprint = crate::usage::profile_credential_fingerprint(&off)
+        .expect("a disabled endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(
+        &crate::profile::ProfileName::from(off_name),
+        off_fingerprint,
+    );
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(off_name),
+            off_fingerprint,
+        ),
+        "the disabled endpoint's durable record landed"
+    );
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::AuthExpired),
+        "the durable verdict reaches the snapshot the Overview renders from"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        !row.split_whitespace().any(|w| w.starts_with('+')),
+        "the suppressed row's timer cell is blank, never an overdue age:\n{row}"
+    );
+    assert_eq!(
+        readings.status_of(off_name),
+        None,
+        "the seed is scoped to the work list: a disabled endpoint's record seeds nothing"
+    );
+    assert!(
+        !app.third_party_status
+            .lock()
+            .unwrap()
+            .contains_key(off_name),
+        "the disabled endpoint's store entry stays unseeded"
+    );
+
+    // The holder re-keyed the account: the record clears, and the next
+    // stand-down tick drops the seed — the row returns to its derived form.
+    crate::profile_cache::clear_auth_expired(&crate::profile::ProfileName::from(name));
+    super::tick(&state);
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::Cached),
+        "a cleared record reverts the seed to the cache-derived status"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        row.split_whitespace().any(|w| w == "+4m"),
+        "the row returns to its derived overdue age:\n{row}"
+    );
+}
+
+/// A stood-down daemon has no display surface, so its feed reads the same
+/// third-party store a TUI mirror does: the tick seeds the durable verdict
+/// there, and `status.json` publishes `AuthExpired` for the suppressed account
+/// rather than the `Cached` the hydrate derived from the cache clock.
+#[test]
+fn a_stood_down_daemon_publishes_the_durable_auth_expired_verdict() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    // A warm cache older than the interval: the hydrate derives `Cached` from
+    // it, and that live entry outranks the durable record in the feed, so only
+    // the seed turns the published verdict into `AuthExpired`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+
+    // The daemon shape: no display reader, and a competing instance holds the
+    // lease, so the public `tick` routes to the stand-down pass.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    assert_eq!(
+        published_fetch_status(&app, name),
+        Some("AuthExpired".to_string()),
+        "a stood-down daemon's feed publishes the durable verdict, not the hydrated cache's form"
+    );
+}
+
+/// A reader sampling the status stores (and the published feed) across many
+/// stand-down ticks never observes a refused name as anything but
+/// `AuthExpired`: the cache-derived hydrate write and the durable-verdict
+/// seed land in one pass, so a frame or a `status.json` write landing
+/// between them cannot show the dead account as fresh or cached.
+#[test]
+fn no_reader_observes_a_refused_name_as_fresh_or_cached_across_standdown_ticks() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // The refused endpoint: a warm cache dated far past its refresh, so the
+    // hydrate derives a status for it each tick.
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    write_profile_cache(
+        &ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(name), THIRD_PARTY_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(name), fingerprint),
+        "the durable record landed"
+    );
+
+    // The refused setup token, the probe seed's own shape, with a usage
+    // cache dated far past its refresh so the OAuth hydrate derives a
+    // status for it too.
+    let probe_name = "probed";
+    let mut probe = crate::testutil::blank_profile(&ProfileName::from(probe_name));
+    probe.usage_probe = true;
+    probe.has_long_lived_sidecar = true;
+    probe.setup_token_digest =
+        crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    crate::profile::save_profile(&probe).expect("save the probed profile");
+    crate::testutil::register_names(&[probe_name]);
+    write_profile_cache(
+        &ProfileName::from(probe_name),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    let probe_cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(probe_name), USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &probe_cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let probe_fp = probe.setup_token_digest.expect("a digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(probe_name), probe_fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(probe_name), probe_fp),
+        "the probe verdict landed"
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), probe.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let iterations = Arc::new(AtomicU64::new(0));
+    let verdict_seen = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // The reader signals one full sampling pass before the ticks and the first
+    // verdict sighting before the window closes: the bounded-work pin below
+    // then holds by construction, never by a scheduling race.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (sampled_tx, sampled_rx) = std::sync::mpsc::channel::<()>();
+    let tp_status = Arc::clone(&app.third_party_status);
+    let oauth_status = Arc::clone(&app.usage_status);
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let config = app.config().clone();
+    let reader = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let iterations = Arc::clone(&iterations);
+        let verdict_seen = Arc::clone(&verdict_seen);
+        let violations = Arc::clone(&violations);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let first_pass = iterations.fetch_add(1, Ordering::Relaxed) == 0;
+                if let Ok(st) = tp_status.lock()
+                    && let Some(seen) = st.get(name).copied()
+                {
+                    if seen == super::FetchStatus::AuthExpired {
+                        if verdict_seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let _ = sampled_tx.send(());
+                        }
+                    } else {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("third-party store: {seen:?}"));
+                    }
+                }
+                if let Ok(st) = oauth_status.lock()
+                    && let Some(seen) = st.get(probe_name).copied()
+                    && seen != super::FetchStatus::AuthExpired
+                {
+                    violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("oauth store: {seen:?}"));
+                }
+                if iterations.load(Ordering::Relaxed).is_multiple_of(16) {
+                    let snapshot = live.snapshot();
+                    let signals = snapshot.signals();
+                    let body = crate::daemon::build_status(
+                        &config,
+                        REFRESH_INTERVAL_MS,
+                        Some(&signals),
+                        false,
+                    );
+                    if let Some(entry) = body.profiles.iter().find(|e| e.name.as_str() == name)
+                        && entry.fetch_status.as_deref() != Some("AuthExpired")
+                    {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("published feed: {:?}", entry.fetch_status));
+                    }
+                }
+                if first_pass {
+                    let _ = started_tx.send(());
+                }
+            }
+        }
+    });
+
+    // The reader proves it sampled before the window opens and that it saw the
+    // verdict before the window closes: both pins below hold by construction
+    // under any scheduling, and a starved reader fails the handshake instead of
+    // this test's own invariant. The reader is stopped and joined on the
+    // failure path too, so a red never leaves it spinning past the test.
+    let wait = std::time::Duration::from_secs(30);
+    let started = started_rx.recv_timeout(wait);
+    if started.is_ok() {
+        for _ in 0..60 {
+            super::tick(&state);
+        }
+    }
+    let sampled = started.is_ok().then(|| sampled_rx.recv_timeout(wait));
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("the reader joins");
+    started.expect("the reader thread sampled the stores before the ticks");
+    sampled
+        .expect("the tick window ran")
+        .expect("the reader saw the refused verdict before the stop");
+    assert!(
+        iterations.load(Ordering::Relaxed) > 0 && verdict_seen.load(Ordering::Relaxed) > 0,
+        "the reader sampled the refused name as AuthExpired across the ticks"
+    );
+    let violations = violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "a refused name never reads as anything but AuthExpired during a tick: {violations:?}"
+    );
+}
+
+/// `name`'s published `fetch_status`, built the way the daemon's own tick
+/// builds it: the live stores' snapshot, then `status.json`'s body.
+fn published_fetch_status(app: &crate::tui::App, name: &str) -> Option<String> {
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let snapshot = live.snapshot();
+    let signals = snapshot.signals();
+    let config = app.config().clone();
+    crate::daemon::build_status(&config, REFRESH_INTERVAL_MS, Some(&signals), false)
+        .profiles
+        .into_iter()
+        .find(|entry| entry.name.as_str() == name)
+        .expect("the profile is published in the feed")
+        .fetch_status
+}
+
+/// The Overview row holding `needle`, as the full frame draws it off the
+/// app's own snapshot.
+fn row_of(app: &crate::tui::App, needle: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("a test terminal");
+    term.draw(|f| crate::tui::draw(f, app))
+        .expect("draw the frame");
+    let buf = term.backend().buffer().clone();
+    crate::testutil::buffer_rows(&buf)
+        .into_iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row holds {needle:?}:\n{}",
+                crate::testutil::buffer_rows(&buf).join("\n")
+            )
+        })
 }
 
 /// A stood-down TUI hydrates the third-party display superset off the daemon's
@@ -15891,6 +17224,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16004,6 +17338,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16125,6 +17460,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16224,6 +17560,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16291,10 +17628,12 @@ fn auto_start_queue_election_is_wired_into_tick() {
         epoch_secs_to_iso(now_before + 5 * 3600),
         epoch_secs_to_iso(now_before + 7 * 24 * 3600),
     );
-    // A correct run makes five requests (one kick, two usage, two profile).
-    // Six leaves room to record the second kick when the election wiring is
-    // removed: the listener, rather than a refused socket, then catches it.
-    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+    // A correct run makes six requests: one kick, two usage, two profile, and
+    // the one claude banked-reset side read `tick` fires for the two accounts
+    // on their first pass (one account a tick). Eight leaves room to record
+    // the second kick when the election wiring is removed: the listener,
+    // rather than a refused socket, then catches it.
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
         if path.starts_with("/v1/messages") {
             (200, "{}".to_string())
         } else if path.starts_with("/api/oauth/usage") {
@@ -16343,6 +17682,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: auto_start_queue.clone(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16854,6 +18194,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
     let at_five = super::StreakCounts {
         rate_limit: 5,
         refresh_fail: 0,
+        last_fetch_failed: false,
     };
     streaks.lock().unwrap().insert("act".to_string(), at_five);
     streaks.lock().unwrap().insert("idle".to_string(), at_five);
@@ -16866,6 +18207,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -16956,6 +18298,7 @@ fn completion_order_state() -> super::SchedulerState {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16989,6 +18332,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         from_fetch: false,
         from_headers: false,
         refresh_failed: false,
+        fetch_failed: false,
         login_gone: false,
         plan_override: None,
         retry_after: None,
@@ -17807,9 +19151,10 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
 }
 
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
-/// inside the spawned tick worker: nothing joins that worker, so a home-
-/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
-/// the operator's real home — live the moment the seed grows a write leg.
+/// inside the spawned tick worker: only a clean stop waits for that thread,
+/// up to its bound, so a home-derived path resolved on it could outlive a
+/// test's `HOME_OVERRIDE` and read the operator's real home — live the moment
+/// the seed grows a write leg.
 /// Entering through
 /// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
 /// the only way to pin WHERE the seed runs; asserting immediately after return,
@@ -17856,6 +19201,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -17971,6 +19317,7 @@ fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
         Arc::clone(&kick_blocks),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -18566,6 +19913,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -18617,7 +19965,12 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
     // Startup pass just ran, so the log is left alone on the ticks in between.
     let last_prune = AtomicU64::new(now);
     assert!(
-        !prune_histories_if_due(&last_prune, &config, now + HISTORY_PRUNE_INTERVAL_MS - 1),
+        !prune_histories_if_due(
+            &last_prune,
+            &config,
+            now + HISTORY_PRUNE_INTERVAL_MS - 1,
+            None
+        ),
         "a tick inside the cadence must not pay for a full read + rewrite"
     );
     assert_eq!(
@@ -18630,7 +19983,7 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
     // having restarted.
     let due_at = now + HISTORY_PRUNE_INTERVAL_MS;
     assert!(
-        prune_histories_if_due(&last_prune, &config, due_at),
+        prune_histories_if_due(&last_prune, &config, due_at, None),
         "the trim must run once the cadence has elapsed"
     );
     assert_eq!(
@@ -18641,7 +19994,7 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
 
     // The window is claimed, so the next tick is inside the cadence again.
     assert!(
-        !prune_histories_if_due(&last_prune, &config, due_at + 1),
+        !prune_histories_if_due(&last_prune, &config, due_at + 1, None),
         "the run must reset the clock, not re-trim every tick from here on"
     );
 }
@@ -19223,7 +20576,7 @@ fn a_shutting_down_kick_refuses_without_sending_or_marking() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -19275,7 +20628,7 @@ fn a_kick_runs_beside_a_tui_marker_and_leaves_it() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -19472,6 +20825,82 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
     );
     assert_eq!(outcome.status, super::FetchStatus::Fresh);
     assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// A fetch tick that lost the lease sends no request of any kind on the
+/// PROACTIVE rotation arm: the plain usage poll a live bail runs is a request
+/// too, so the spent-ticket bail serves the cache instead. The live arm's own
+/// fetch is pinned by `a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm`.
+#[test]
+fn a_spent_ticket_on_the_proactive_arm_sends_no_usage_poll() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-spent-proactive";
+    // A request of any kind is the failure, so the stub takes both a buggy
+    // poll and a buggy refresh before it exits.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"object":"list","data":[],"plan":{"tier":"max5"}}"#.to_string(),
+            )
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .expect("oauth credentials");
+        if let Some(token) = oauth.claude_ai_oauth.as_mut() {
+            // Inside the lead window (floor 15 min): the poll takes the
+            // PROACTIVE arm.
+            token.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+        }
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 300_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let lease = crate::daemon::FetchLease::new();
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(spent)),
+    );
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "a spent-ticket bail on the proactive arm sent a request: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
 }
 
 /// A NON-active flagged profile whose on-disk pair moved past the entry's token
@@ -20559,6 +21988,20 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
         vec![&name.to_string()],
         "this tick serves cache; the next one polls with the adopted token"
     );
+    // The 401 that drove the adopt was this tick's own request, so the
+    // fail-serving outcome lands the mark with the adopted pair.
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    let mark = streaks
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .expect("the reactive adopt's tick sent the 401, so it lands the mark");
+    assert!(
+        mark.last_fetch_failed,
+        "a reactive adopt still followed a failed fetch: {mark:?}"
+    );
 }
 
 /// The retry adopt, after the refresh comes back terminally rejected. The
@@ -20630,6 +22073,259 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
     assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// A proactive adopt that sends nothing is no failed attempt: the rotation lead
+/// only queues the adopt, and once the mirror token's identity is memoized the
+/// adopt sends no request at all, so the tick's outcome carries no failure
+/// mark.
+#[test]
+fn a_proactive_adopt_that_sends_nothing_lands_no_failure_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-proactive-mute";
+    // The other replies only make a request the leg must not send visible to
+    // the assertion below.
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/api/oauth/profile") {
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (200, r#"{"object":"list","data":[]}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        // Inside the lead window: the leg takes the proactive arm, where no
+        // usage fetch runs before the adopt.
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+    }
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror("at-mirror-mute", crate::usage::now_ms() as i64 + 90_000_000);
+    let identity =
+        super::memoized_identity(&|_| Some(crate::profile::AccountId::from("uuid-anchor")));
+    assert_eq!(
+        identity("at-mirror-mute").as_deref(),
+        Some("uuid-anchor"),
+        "fixture control: the mirror token's identity is memoized without HTTP"
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 300_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "an adopt that sends nothing must make no request: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-mirror-mute".to_string(),
+            Some("at-mirror-mute-refresh".to_string())
+        )),
+        "the proactive adopt must carry the mirror's pair"
+    );
+    assert!(!outcome.from_fetch);
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = land_outcome_with_streaks(&store, outcome);
+    assert!(
+        !streaks.lock().unwrap().contains_key(name),
+        "an adopt that sent nothing lands no failure mark"
+    );
+}
+
+/// A stored pair the adopt-race install fixture moves in under the identity
+/// probe: its own refresh token, so the store differs from the adopt's
+/// pre-probe snapshot — the store-moved stand-down's input.
+fn adopt_race_store(access: &str, expires_at: i64) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: Some(expires_at),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// A peer's install landing inside the adopt's identity probe. The adopt must
+/// write nothing (the store moved under it), and the caller's carry leg hands
+/// the installed pair back with no token request — the tick spends no refresh
+/// token on a chain another writer just advanced. Deleting the adopt's
+/// store-moved stand-down makes it overwrite the install and this test reds.
+#[test]
+fn an_install_landing_inside_the_adopts_identity_probe_is_carried_with_no_token_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-install-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    let installed_expiry = crate::usage::now_ms() as i64 + 95_000_000;
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // install lands as it is served) → anything else would be the token request
+    // this tick must never make.
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::write(
+                &store_for_server,
+                serde_json::to_vec(&adopt_race_store("at-installed", installed_expiry))
+                    .expect("serialize the install"),
+            )
+            .expect("land the install");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-probe",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the install the adopt stood down for is carried, never spent against: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-installed".to_string(),
+            Some("at-installed-refresh".to_string())
+        )),
+        "the peer's install must reach the TokenList, or the next poll spends the superseded token"
+    );
+    let on_disk: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        on_disk.refresh_token(),
+        Some("at-installed-refresh"),
+        "the adopt overwrote the peer's install"
+    );
+    assert_eq!(
+        refetch.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec![&name.to_string()],
+        "the next tick polls with the carried pair"
+    );
+}
+
+/// A peer's log-out landing inside the adopt's identity probe. The deleted
+/// store stays deleted (the adopt writes nothing into it), and the leg spends
+/// the dead chain once and quarantines the profile until a new login. Deleting
+/// the adopt's store-moved stand-down makes it resurrect the store and this
+/// test reds.
+#[test]
+fn a_peer_log_out_inside_the_adopts_identity_probe_leaves_the_store_deleted() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-logout-probe";
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json");
+    let store_for_server = store.clone();
+    // usage 401 → profile 200 (the live token's identity probe; the peer's
+    // log-out deletes the store as it is served) → the spent chain's terminal
+    // 400.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            std::fs::remove_file(&store_for_server).expect("log the account out");
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    write_live_mirror(
+        "at-mirror-logout",
+        crate::usage::now_ms() as i64 + 90_000_000,
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        None,
+        &refetch,
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let seen = server.join().expect("listener");
+
+    let token_requests = seen
+        .iter()
+        .filter(|p| p.starts_with("/v1/oauth/token"))
+        .count();
+    assert_eq!(
+        token_requests, 1,
+        "the logged-out chain is spent once, then quarantined: {seen:?}"
+    );
+    assert!(
+        !store.exists(),
+        "the adopt recreated a store a peer logged out"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "a terminally rejected chain quarantines the profile until a new login"
+    );
+    assert_eq!(outcome.rotated, None, "nothing was adopted");
 }
 
 /// CLA-ROLL: a rolling-token profile forces the preemptive leg regardless of the global
@@ -21971,6 +23667,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22226,6 +23923,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22364,6 +24062,7 @@ fn auto_start_queue_election_leaves_out_a_plan_with_no_five_hour_limit() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -22517,6 +24216,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -23329,6 +25029,7 @@ fn issue83_inputs(
         super::StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     (store, status, streaks)
@@ -24061,6 +25762,7 @@ fn a_windowless_provider_hybrid_with_a_fresh_provider_leg_is_not_reading_dead() 
         super::StreakCounts {
             rate_limit: super::ACTIVE_CAP_MAX_STREAK + 1,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )])));
     let tp_status = tp_status_with("a", super::FetchStatus::Fresh);
@@ -25477,6 +27179,9 @@ fn the_catch_up_runs_the_hooks_a_landed_stage_never_ran() {
     .expect("record P1");
     write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
     let state = chain_state(&config, Vec::new());
+    // The tick's claude reset side read for the pair's account dies on the
+    // refused port; only its failure matters here.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -25505,6 +27210,9 @@ fn the_catch_up_runs_no_hook_for_a_stage_whose_pair_is_spent() {
     .expect("record P1 and the staged pair");
     write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
     let state = chain_state(&config, Vec::new());
+    // The tick's claude reset side read for the pair's account dies on the
+    // refused port; only its failure matters here.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -25535,6 +27243,9 @@ fn the_catch_up_restamps_a_rolling_profiles_session_token() {
     // The rolling scan would stamp from memory on its own: hold it off, so the
     // stamp under test is the catch-up landing's.
     state.claude_rolling.lock().unwrap().next_scan_ms = u64::MAX;
+    // The tick's claude reset side read (and the re-stamp's refresh) die on
+    // the refused port; the chain token still lands.
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, "http://127.0.0.1:9");
 
     super::tick(&state);
 
@@ -26187,6 +27898,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -26362,6 +28074,7 @@ fn a_wedged_flock_stalls_one_drain_batch_once_not_once_per_landing() {
         vec![token("a"), token("b"), token("c")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
 
@@ -26440,6 +28153,7 @@ fn a_brief_contention_then_a_later_uncontended_landing_both_land() {
         vec![token("a"), token("b")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
     peer.join().expect("peer");
@@ -26965,6 +28679,7 @@ fn a_slow_batch_spends_no_window_without_any_wait() {
         vec![token("a")],
         REFRESH_INTERVAL_MS,
         Some(&timed_out),
+        None,
         run,
     );
     peer.join().unwrap();
@@ -27247,7 +28962,7 @@ fn a_wedged_flock_stalls_one_third_party_batch_once() {
     crate::usage::reset_request_slots();
     crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
     let timed_out = AtomicBool::new(false);
-    super::fetch_third_party_due_flagged(&state, entries, Some(&timed_out));
+    super::fetch_third_party_due_flagged(&state, entries, Some(&timed_out), None);
 
     assert_eq!(
         crate::lock::WAITED_ACQUISITIONS.load(std::sync::atomic::Ordering::Relaxed),
@@ -27687,7 +29402,7 @@ fn a_wedged_flock_stalls_one_codex_batch_once() {
     let state = completion_order_state();
     crate::lock::WAITED_ACQUISITIONS.store(0, std::sync::atomic::Ordering::Relaxed);
     let timed_out = AtomicBool::new(false);
-    super::codex_usage_tick_flagged(&state, Some(&timed_out));
+    super::codex_usage_tick_flagged(&state, Some(&timed_out), None);
 
     crate::usage::clear_codex_usage_url_override();
     let _ = server.join().expect("listener");
@@ -27741,6 +29456,64 @@ fn write_codex_due(base: &str) {
     }
     crate::usage::set_codex_usage_url_override(base);
     crate::usage::reset_request_slots();
+}
+
+/// The catch-up leaves a proxy account's live stage where it is, its `[proxy]`
+/// table readable or not: the stage and the store stay byte for byte, and the
+/// tick logs nothing about a pair it could not save.
+#[test]
+fn the_catch_up_lands_nothing_into_a_proxy_accounts_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let catch_up = |name: &str, unreadable: bool| {
+        let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+        std::fs::write(
+            chain_dir(name).join("auth.spent.json"),
+            r#"["068bfce5d78d07ac"]"#,
+        )
+        .expect("record P1");
+        write_chain_stage(name);
+        crate::profile::write_proxy_record(
+            &chain_pn(name),
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+        if unreadable {
+            crate::claude::tests::break_proxy_record(name);
+        }
+        let files = || {
+            (
+                std::fs::read(chain_dir(name).join("credentials.json.staged")).ok(),
+                std::fs::read(chain_dir(name).join("credentials.json")).ok(),
+            )
+        };
+        let before = files();
+        super::catch_up_staged_pairs(&config);
+        (
+            before.0.is_some() && before.1.is_some(),
+            chain_store_refresh(name),
+            files() == before,
+        )
+    };
+
+    assert_eq!(
+        (
+            catch_up("chain-catch-up-px", false),
+            catch_up("chain-catch-up-pu", true),
+            lines.snapshot(),
+        ),
+        (
+            (true, Some("rt-old".to_string()), true),
+            (true, Some("rt-old".to_string()), true),
+            Vec::<String>::new(),
+        ),
+        "(the stage and store were there, the store's refresh token, both kept byte for \
+         byte) for a readable proxy record, an unreadable one; the lines logged"
+    );
 }
 
 /// P3/Q4 (rewritten): a tick with codex due and no third-party due under a
@@ -27899,6 +29672,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -28057,6 +29831,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        claude_resets_memo: super::new_claude_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -29373,7 +31148,10 @@ fn a_kick_holds_its_claim_until_its_pair_lands() {
                 "at-old",
                 Some("rt-old"),
                 None,
-                Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+                Some((
+                    &activity,
+                    (&std::sync::atomic::AtomicBool::new(false)).into(),
+                )),
                 crate::oauth::LockWait::NoWait,
             )
         })
@@ -29444,7 +31222,10 @@ fn a_kick_whose_refresh_fails_leaves_the_oauth_leg_fetching() {
         "at-old",
         Some("rt-old"),
         None,
-        Some((&activity, &std::sync::atomic::AtomicBool::new(false))),
+        Some((
+            &activity,
+            (&std::sync::atomic::AtomicBool::new(false)).into(),
+        )),
         crate::oauth::LockWait::NoWait,
     );
     let seen = server.join().expect("listener");
@@ -29989,7 +31770,7 @@ fn probe_tick_answering_with(
     status: u16,
     body: &'static str,
 ) -> usize {
-    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, move |_, _| {
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |_, _| {
         (status, Vec::new(), body.into())
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
@@ -29997,12 +31778,75 @@ fn probe_tick_answering_with(
     server.join().expect("listener").len()
 }
 
-/// One tick against a listener nothing may reach.
-fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super::SchedulerState) {
-    let (listener, base) = crate::testutil::deaf_listener();
+/// One tick against a listener only the claude banked-reset side read may
+/// reach: a state whose OAuth pair is due sends its own side read and nothing
+/// else may land. `side_reads` is how many reads the caller's state has due
+/// (0 while no paired account's read is due, 1 for one pair on its first
+/// pass); the record's
+/// length is pinned by equality, so a forbidden poll or probe reds too, and
+/// every recorded path must be the read's. The stub ANSWERS every request it
+/// records, so a forbidden request shows up in the record instead of stalling
+/// the tick on the read's timeout and being refused at a closed port.
+fn probe_tick_expecting_none(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    side_reads: usize,
+) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let base = format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("addr").port()
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut seen: Vec<String> = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                        // Read the head before answering: a close with request
+                        // bytes unread RSTs the client on Windows.
+                        let raw = crate::testutil::drain_http_request(&mut sock);
+                        seen.push(crate::testutil::request_path(&String::from_utf8_lossy(
+                            &raw,
+                        )));
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                        let _ = sock.shutdown(std::net::Shutdown::Write);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        })
+    };
     let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
     super::tick(state);
-    crate::testutil::assert_nothing_sent(&listener);
+    // Every request the tick made was answered before it returned, so the
+    // record is complete here: stop the listener and read it back.
+    stop.store(true, Ordering::SeqCst);
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.len(),
+        side_reads,
+        "the tick sent more than its expected side reads: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|path| path == CEDAR_EMBER_READ),
+        "only the side read may reach the endpoint: {seen:?}"
+    );
 }
 
 /// A refused setup token beside a stored pair is never probed on the cadence,
@@ -30027,7 +31871,7 @@ fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
         .lock()
         .unwrap()
         .insert("paired".to_string(), fingerprint);
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 1);
 
     let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, |_, _| {
         (200, probe_headers(), "{}".into())
@@ -30039,6 +31883,8 @@ fn a_manual_refresh_retries_a_refused_token_beside_a_pair_for_its_verdict() {
         .unwrap()
         .insert("paired".to_string());
     super::tick(&state);
+    // The probe tick above already spent the pair's once-an-hour side read, so
+    // this tick sends the retry alone.
     assert_eq!(server.join().expect("listener").len(), 1, "one retry");
     assert!(!crate::profile_cache::auth_expired_matches(
         &name,
@@ -30091,7 +31937,7 @@ fn a_verdict_only_retry_leaves_the_pairs_activity_mark_alone() {
         assert_eq!(entries.len(), 1, "fixture: one verdict-only retry");
         let key = entries[0].key();
         super::mark_fetch_activity(&state.activity, &key, held);
-        super::fetch_probe_due_flagged(&state, entries, None);
+        super::fetch_probe_due_flagged(&state, entries, None, None);
         assert_eq!(
             state
                 .activity
@@ -30256,7 +32102,7 @@ fn status_after_a_probe_leg_panic(
     let state = probe_state("probed", 60_000, true);
     let config = state.config.clone();
     let _armed = super::probe_panic::arm_panic(move || hook(&config));
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert_eq!(
         oauth_fetch_mark(&state.activity, "probed"),
         None,
@@ -30346,7 +32192,7 @@ fn a_refused_setup_token_reads_auth_expired_and_rests() {
         );
         // Due again on cadence, still refused: nothing goes out.
         state.last_fetched.lock().unwrap().clear();
-        probe_tick_expecting_none(&home, &state);
+        probe_tick_expecting_none(&home, &state, 0);
         // The verdict stays and no countdown is published for the rest, so
         // the Overview's countdown slot stays blank beside the `⊘`.
         assert_eq!(
@@ -30375,7 +32221,7 @@ fn a_remint_re_admits_a_refused_setup_token() {
     let name = crate::profile::ProfileName::from("reminted-after-401");
     assert_eq!(probe_tick_answering(&home, &state, 401), 1);
     state.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
 
     crate::claude::write_session_token(&name, "sk-ant-oat01-fresh", crate::usage::now_ms() as i64)
         .expect("re-mint");
@@ -30414,7 +32260,7 @@ fn a_manual_refresh_retries_a_refused_setup_token_once() {
         "`r` retries it"
     );
     state.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
 }
 
 /// A chain of `a` (a stored pair, active) and `b`, an account the usage probe
@@ -30464,8 +32310,8 @@ fn a_refused_setup_token_is_no_walk_target() {
 
     assert_eq!(
         probe_tick_answering(&home, &state, 401),
-        1,
-        "the tick probes b"
+        2,
+        "the tick probes b and reads a's banked resets"
     );
     let queued: Vec<String> = state
         .pending_switch
@@ -30603,7 +32449,11 @@ fn start_auto_passes_over_a_refused_setup_token() {
             },
         );
     }
-    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        2,
+        "the probe of b, plus a's once-an-hour reset side read"
+    );
 
     let cfg = config.lock().unwrap().clone();
     let (rows, pick) = crate::fallback::start_walk(
@@ -30739,7 +32589,7 @@ fn a_probe_entry_the_snapshot_has_not_seen_waits() {
             },
         );
         if probes == 0 {
-            probe_tick_expecting_none(&home, &state);
+            probe_tick_expecting_none(&home, &state, 0);
         } else {
             assert_eq!(probe_tick_answering(&home, &state, 200), probes);
         }
@@ -30775,7 +32625,7 @@ fn spent_probe_state(refresh_spent: bool) -> super::SchedulerState {
 fn a_spent_probed_account_is_not_probed_with_refresh_spent_off() {
     let home = crate::testutil::HomeSandbox::new();
     let state = spent_probe_state(false);
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(
         !state
             .next_refresh_per_profile
@@ -30797,7 +32647,7 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
         &oauth_key("spent"),
         ProfileActivity::Queued,
     );
-    probe_tick_expecting_none(&home, &state);
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(
         state
             .activity
@@ -30806,6 +32656,265 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
             .get("spent")
             .is_none_or(|a| a.oauth.is_none()),
         "the Queued mark is gone"
+    );
+}
+
+/// The spent skip publishes the deliberate-blank fact beside the blanked
+/// countdown: the leg's activity state carries the flag the renderer reads,
+/// so a past-due reading clock never dates the absent deadline as overdue.
+#[test]
+fn a_spent_skipped_leg_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the spent skip publishes the OAuth leg's blanked flag",
+    );
+}
+
+/// A session-suppressed credential publishes the same blanked flag: the tick
+/// drops the suppressed entry from its work list (no fetch, no countdown) and
+/// flags the leg, so the renderer keeps the row's slot blank.
+#[test]
+fn a_suppressed_credential_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    let fingerprint = state
+        .config
+        .lock()
+        .unwrap()
+        .profiles
+        .first()
+        .and_then(|p| p.setup_token_digest)
+        .expect("the fixture mints a setup token");
+    state
+        .suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the suppressed probe's OAuth leg is flagged blanked",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "the suppressed entry publishes no countdown",
+    );
+}
+
+/// A spent OAuth account that also carries a third-party credential keeps its
+/// third-party countdown: the skip blanks the OAuth leg alone, so a hybrid
+/// row whose figures the third-party cache supplies keeps counting down.
+#[test]
+fn a_spent_hybrid_keeps_its_third_party_countdown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut state = spent_probe_state(false);
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![tp_entry("spent")]));
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("spent"),
+        FetchStamp::at(EpochMs::from_millis(crate::usage::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        next.contains_key(&tp_key("spent")),
+        "the third-party leg's countdown survives the OAuth skip",
+    );
+    assert!(
+        !next.contains_key(&oauth_key("spent")),
+        "the OAuth leg's countdown is blanked",
+    );
+    drop(next);
+    let activity = state.activity.lock().unwrap();
+    assert!(super::countdown_blanked(&activity, &oauth_key("spent")));
+    assert!(
+        !super::countdown_blanked(&activity, &tp_key("spent")),
+        "the third-party leg is not blanked",
+    );
+}
+
+/// The stood-down mirror's spent skip publishes the same blanked flag, so a
+/// stood-down TUI shows a spent row blank exactly as the armed one does, and
+/// nothing else is flagged (the mirror runs no worker, so no leg is late).
+#[test]
+fn a_stood_down_spent_row_publishes_its_blanked_countdown_flag() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    // The hydration seeds the store from the disk cache, so the spent reading
+    // must live there — a store-seeded entry with no cache file is dropped as
+    // stale by the same pass.
+    crate::testutil::register_names(&["kitty"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent_reading(),
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    config.lock().unwrap().state.refresh_spent_accounts = false;
+    let state = chain_state(&config, vec![token("kitty")]);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("kitty")),
+        "the mirror's spent skip publishes the OAuth leg's blanked flag",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("kitty")),
+        "the mirror blanks the spent countdown",
+    );
+}
+
+/// One DeepSeek provider profile, `keyless`, holding no api key: its
+/// selected leg is the third-party one and no work list carries it.
+fn keyless_provider_config() -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState};
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyless"));
+    profile.provider = Some(crate::providers::Provider::DeepSeek);
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            profiles: vec![crate::profile::ProfileName::from("keyless")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    }))
+}
+
+/// A keyless provider profile still displays its cached figures (the
+/// third-party display seed) while nothing polls its selected leg: the tick
+/// publishes the deliberate blank for that leg, so the renderer never dates
+/// the fossil cache as a late worker's overdue refresh.
+#[test]
+fn a_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the unpolled selected leg's blanked flag is published",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("keyless")),
+        "nothing polls the leg, so no countdown",
+    );
+}
+
+/// A leg blanked as unpolled while the account had no key stops reading blank
+/// once the key is back and the account joins the third-party work list: the
+/// publish clears the flag in the same pass, so a worker left running on that
+/// leg later is still dated overdue.
+#[test]
+fn a_keyless_leg_that_gains_its_key_drops_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "control: the keyless selected leg is blanked",
+    );
+    // The key comes back: the account joins the work list, and a fresh stamp
+    // keeps the leg off this tick's fetch.
+    state.config.lock().unwrap().profiles[0].api_key = Some("sk-keyless".to_string());
+    let entries = super::collect_third_party_entries(&state.config.lock().unwrap().profiles);
+    *state.third_party_tokens.lock().unwrap() = entries;
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("keyless"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "the restored key takes the leg off the blank set",
+    );
+}
+
+/// The stood-down mirror publishes the same blank for a selected leg on no
+/// work list, so a stood-down TUI's row keeps the blank slot too.
+#[test]
+fn a_stood_down_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the mirror's publish blanks the unpolled selected leg",
+    );
+}
+
+/// An entry the blanked flag alone keeps alive is dropped in the same pass
+/// that clears it: an account blanked one tick and gone the next leaves no
+/// inert entry behind (the fetching tick has no general idle sweep).
+#[test]
+fn an_account_blanked_one_tick_and_removed_the_next_leaves_no_activity_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &oauth_key("spent")),
+        "control: the first tick blanked the spent probe",
+    );
+    // The profile is gone before the next tick: nothing re-raises its flag.
+    state.config.lock().unwrap().profiles.clear();
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !state.activity.lock().unwrap().contains_key("spent"),
+        "the cleared entry is dropped in the same publish pass",
+    );
+}
+
+/// A polled OAuth leg that is merely not due stays off the blank set: the
+/// blank's work list is the tick's whole snapshot, never the due subset, so
+/// an idle-but-pending leg keeps its published countdown.
+#[test]
+fn a_polled_not_due_oauth_leg_is_not_blanked_after_a_real_tick() {
+    use crate::profile::{AppConfig, AppState};
+    let home = crate::testutil::HomeSandbox::new();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("polled", false)],
+    }));
+    let state = chain_state(&config, vec![token("polled")]);
+    // Just-fetched: the leg falls due a whole interval out, so the armed tick
+    // fetches nothing and the blank decision reads a real, not-due member.
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key("polled"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    // The endpoint stub answers the claude-resets side read (the tick's one
+    // network leg, unrelated to the blank) and records any fetch leak.
+    probe_tick_expecting_none(&home, &state, 1);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        !super::countdown_blanked(&activity, &oauth_key("polled")),
+        "the not-due leg stays off the blank set",
+    );
+    assert!(
+        state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("polled")),
+        "its countdown publishes",
     );
 }
 
@@ -31130,6 +33239,138 @@ fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
     }
 }
 
+/// A refused setup token whose cache holds a plan-only body (a login-plan seed)
+/// still reads as the refusal it is: the plan-only arm leaves the OAuth cadence
+/// unstamped, so the verdict rides its own status insert there.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_a_plan_only_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
+    );
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the plan-only arm carries the verdict with no cadence stamp"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "the plan-only body still fills the reading store"
+    );
+}
+
+/// A refused setup token whose usage cache will not parse keeps the verdict:
+/// the cache seed's no-body arm writes it in the same pass, where the name
+/// would otherwise carry no status at all.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no reading"
+    );
+}
+
+/// A stood-down scheduler state over one refused endpoint `name`: its work
+/// list holds the credential `tp_entry` builds, and the durable record keys
+/// that entry's fingerprint, so the tick's hydrate sees the name as refused.
+fn refused_endpoint_state(name: &str) -> super::SchedulerState {
+    crate::testutil::register_names(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let entry = tp_entry(name);
+    let fingerprint = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&pn, fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&pn, fingerprint),
+        "the durable refusal record landed"
+    );
+    let mut state = completion_order_state();
+    state.tokens = Arc::new(RankedMutex::new(Vec::new()));
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![entry]));
+    state
+}
+
+/// A refused endpoint whose third-party cache will not parse keeps the
+/// verdict: the third-party no-body arm writes it where the cache yields no
+/// copy to seed.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no copy"
+    );
+}
+
+/// A refused endpoint with no cache at all drops its stale reading and keeps
+/// the verdict: the cache-gone arm removes the store entries and writes
+/// `AuthExpired` where the removal alone would leave no status behind.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    state.third_party_usage_store.lock().unwrap().insert(
+        name.to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    state
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), super::FetchStatus::Cached);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the cache-gone arm keeps the verdict"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key(name),
+        "and drops the stale reading whose cache is gone"
+    );
+}
+
 /// A stood-down TUI beside the process that fetches usage, whose probe finds
 /// the setup token refused and rests it: the TUI reads the verdict off the
 /// durable record, and its Overview leaves the countdown slot blank, as the
@@ -31156,7 +33397,7 @@ fn a_stood_down_tui_leaves_a_refused_setup_tokens_countdown_blank() {
     );
     assert_eq!(probe_tick_answering(&home, &fetching, 401), 1);
     fetching.last_fetched.lock().unwrap().clear();
-    probe_tick_expecting_none(&home, &fetching);
+    probe_tick_expecting_none(&home, &fetching, 0);
     assert!(
         !fetching
             .next_refresh_per_profile
@@ -31325,7 +33566,9 @@ fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
     let state = chain_state(&config, Vec::new());
     let seed = crate::fallback::durable_key_rejected_seed(&config.lock().unwrap().profiles);
     state.third_party_broken.lock().unwrap().extend(seed);
-    probe_tick_expecting_none(&home, &state);
+    // The old holder holds the usage-fetch lease, so this tick stands down and
+    // reads nothing.
+    probe_tick_expecting_none(&home, &state, 0);
     assert!(state.pending_switch.lock().unwrap().is_empty());
 
     // While it stands down the old holder records `dead` refused and lifts
@@ -31352,7 +33595,9 @@ fn a_lease_takeover_seeds_a_dead_login_the_old_holder_recorded() {
             .unwrap()
             .insert(name.to_string(), super::FetchStatus::Fresh);
     }
-    probe_tick_expecting_none(&home, &state);
+    // The old holder is gone: this tick wins the lease and reads the pair's
+    // resets, alongside the switch it takes off the seeded verdicts.
+    probe_tick_expecting_none(&home, &state, 1);
     let queued: Vec<String> = state
         .pending_switch
         .lock()
@@ -31745,53 +33990,6 @@ fn reset_info(five: f64, five_reset: Option<i64>) -> crate::usage::UsageInfo {
         }),
         ..Default::default()
     }
-}
-
-/// Land `reading` of `name` through the landing section, `fresh` off the live
-/// API or a cached fallback, with the reading the store held before it at a 5h
-/// reset ten minutes ago, judged as [`reset_member`].
-fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
-    let pn = crate::profile::ProfileName::from(name);
-    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
-    store
-        .lock()
-        .unwrap()
-        .insert(name.to_string(), reset_info(60.0, Some(-600)));
-    let outcome = super::FetchOutcome {
-        name: pn.clone(),
-        info: Some(reading),
-        status: if fresh {
-            super::FetchStatus::Fresh
-        } else {
-            super::FetchStatus::Cached
-        },
-        rotated: None,
-        from_fetch: fresh,
-        from_headers: false,
-        refresh_failed: false,
-        login_gone: false,
-        plan_override: None,
-        retry_after: None,
-        oauth_identity: crate::usage::OAuthIdentity::default(),
-        sent_access_token: String::new(),
-        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
-        profile_wanted: false,
-        profile_attempt_at: None,
-        reanchored: false,
-    };
-    super::apply_outcome_flagged(
-        outcome,
-        &store,
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        &Arc::new(RankedMutex::new(HashMap::new())),
-        REFRESH_INTERVAL_MS,
-        false,
-        false,
-        &Arc::new(RankedMutex::new(HashSet::new())),
-        None,
-        Some(&reset_member(name)),
-    );
 }
 
 /// `land_reading_after_a_reset` with a reading under every line that shows no
@@ -32992,7 +35190,7 @@ fn a_held_lock_kick_under_a_state_flock_timeout_keeps_the_weekly_reset_retest() 
         &queue,
         REFRESH_INTERVAL_MS,
         Some(&tick_timed_out),
-        &AtomicBool::new(false),
+        (&AtomicBool::new(false)).into(),
     );
     drop(holder);
     let seen = server.join().expect("listener");
@@ -33189,6 +35387,10 @@ struct SilentEndpoint {
     gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     listener: Option<std::thread::JoinHandle<()>>,
     handlers: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// A lease to release the watchdog's way on the first accepted connection:
+    /// the handler-side seam a test uses to spend a ticket while a worker is
+    /// out on the wire, at the one deterministic point a stalled fetch exposes.
+    release_on_accept: Arc<std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>>>,
 }
 
 /// How long a handler waits for the release before closing its socket anyway.
@@ -33209,11 +35411,14 @@ impl SilentEndpoint {
         let stop = Arc::new(AtomicBool::new(false));
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let handlers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release_on_accept: Arc<std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let listener = {
             let accepted = Arc::clone(&accepted);
             let stop = Arc::clone(&stop);
             let gate = Arc::clone(&gate);
             let handlers = Arc::clone(&handlers);
+            let release_on_accept = Arc::clone(&release_on_accept);
             std::thread::spawn(move || {
                 loop {
                     if stop.load(Ordering::SeqCst) {
@@ -33222,6 +35427,17 @@ impl SilentEndpoint {
                     match listener.accept() {
                         Ok((sock, _)) => {
                             accepted.fetch_add(1, Ordering::SeqCst);
+                            if let Some(lease) = release_on_accept.lock().unwrap().take() {
+                                assert!(
+                                    lease.release_if_stale(
+                                        crate::usage::now_ms()
+                                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis()
+                                                as u64,
+                                        crate::daemon::LEASE_STALE_BOUND,
+                                    ),
+                                    "the watchdog releases the holder"
+                                );
+                            }
                             let gate = Arc::clone(&gate);
                             let handle = std::thread::spawn(move || {
                                 let mut sock = sock;
@@ -33250,11 +35466,16 @@ impl SilentEndpoint {
             gate,
             listener: Some(listener),
             handlers,
+            release_on_accept,
         }
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release_lease_on_accept(&self, lease: Arc<crate::daemon::FetchLease>) {
+        *self.release_on_accept.lock().unwrap() = Some(lease);
     }
 }
 
@@ -33633,7 +35854,7 @@ fn a_hung_probe_worker_is_left_running_and_its_account_marked_failed() {
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
     let started = Instant::now();
-    super::fetch_probe_due_flagged(&state, entries, None);
+    super::fetch_probe_due_flagged(&state, entries, None, None);
     let took = started.elapsed();
 
     assert!(
@@ -33671,6 +35892,309 @@ fn a_hung_probe_worker_is_left_running_and_its_account_marked_failed() {
     assert!(
         due.is_empty(),
         "a due partition started a second probe beside the one still running"
+    );
+}
+
+/// A hung OAuth worker the drain leaves running past its deadline, whose tick
+/// lost the lease while it was out, records no Failed: the reap's strand
+/// re-checks the ticket before writing the status. The lease is released from
+/// the run closure's entry — the one deterministic point the fan-out's fake
+/// worker exposes — before it parks on the hung gate. Control: the same hung
+/// worker under a re-taken ticket is marked Failed.
+#[test]
+fn an_oauth_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["oauth-lease-late"]);
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    let state = completion_order_state();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    let releaser = Arc::clone(&state.fetch_lease);
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("oauth-lease-late")],
+        REFRESH_INTERVAL_MS,
+        None,
+        Some(ticket),
+        move |entry: TokenEntry| -> super::FetchOutcome {
+            if entry.name == "oauth-lease-late" {
+                assert!(
+                    releaser.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+                wait_on_hung_gate();
+            }
+            cached_outcome(&entry.name)
+        },
+    );
+
+    assert!(
+        state
+            .status
+            .lock()
+            .unwrap()
+            .get("oauth-lease-late")
+            .is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("oauth-lease-late")
+            .and_then(|a| a.fetch(FetchLeg::OAuth))
+            .is_none(),
+        "the hung account's fetch mark is still cleared"
+    );
+
+    // Control: the same hung worker under a re-taken ticket is marked Failed.
+    *HUNG_GATE.0.lock().unwrap() = true;
+    HUNG_GATE.1.notify_all();
+    wait_for_no_activity(&state, "oauth-lease-late");
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_oauth_due_with_flagged(
+        &state,
+        vec![token("oauth-lease-late")],
+        REFRESH_INTERVAL_MS,
+        None,
+        Some(ticket),
+        |entry: TokenEntry| -> super::FetchOutcome {
+            if entry.name == "oauth-lease-late" {
+                wait_on_hung_gate();
+            }
+            cached_outcome(&entry.name)
+        },
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("oauth-lease-late"),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// The lease [`lease_spending_hung_fetcher`] releases the watchdog's way before
+/// it parks on the hung gate: a `fn` fetcher cannot capture, so the test
+/// registers the lease here.
+static LEASE_TO_SPEND: std::sync::Mutex<Option<Arc<crate::daemon::FetchLease>>> =
+    std::sync::Mutex::new(None);
+
+fn lease_spending_hung_fetcher(
+    target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    if matches!(
+        target,
+        crate::providers::ThirdPartyTarget::Generic { base_url } if base_url.contains("hung")
+    ) {
+        // A registered lease is released on entry; no registration (the test's
+        // control run) leaves the ticket live.
+        if let Some(lease) = LEASE_TO_SPEND.lock().unwrap().take() {
+            assert!(
+                lease.release_if_stale(
+                    crate::usage::now_ms()
+                        + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                    crate::daemon::LEASE_STALE_BOUND,
+                ),
+                "the watchdog releases the holder"
+            );
+        }
+        wait_on_hung_gate();
+    }
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// The third-party arm of the strand re-check: a hung worker abandoned after
+/// the tick lost the lease records no Failed, and the fetch mark still clears.
+/// Control: under a re-taken ticket the late account is marked Failed.
+#[test]
+fn a_third_party_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let _release = HungRelease;
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    let mut state = hung_third_party_state(&[("tp-lease-late", HUNG_URL)]);
+    state.fetcher = lease_spending_hung_fetcher;
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("tp-lease-late", HUNG_URL)];
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    *LEASE_TO_SPEND.lock().unwrap() = Some(Arc::clone(&state.fetch_lease));
+    super::fetch_third_party_due_flagged(
+        &state,
+        vec![join_order_entry("tp-lease-late", HUNG_URL)],
+        None,
+        Some(ticket),
+    );
+
+    assert!(
+        state
+            .third_party_status
+            .lock()
+            .unwrap()
+            .get("tp-lease-late")
+            .is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("tp-lease-late")
+            .and_then(|a| a.fetch(FetchLeg::ThirdParty))
+            .is_none(),
+        "the hung account's fetch mark is still cleared"
+    );
+
+    // Control: the same hung worker under a re-taken ticket is marked Failed.
+    *HUNG_GATE.0.lock().unwrap() = true;
+    HUNG_GATE.1.notify_all();
+    wait_for_no_activity(&state, "tp-lease-late");
+    *HUNG_GATE.0.lock().unwrap() = false;
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_third_party_due_flagged(
+        &state,
+        vec![join_order_entry("tp-lease-late", HUNG_URL)],
+        None,
+        Some(ticket),
+    );
+    assert_eq!(
+        state
+            .third_party_status
+            .lock()
+            .unwrap()
+            .get("tp-lease-late"),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// A hung codex poll the drain leaves running past its deadline, whose tick
+/// lost the lease while the poll was out on the wire, records no Failed: the
+/// reap's strand re-checks the ticket before writing the status. The release
+/// rides the loopback's first accepted connection — the one deterministic
+/// point a stalled fetch exposes. Control: the same hung poll under a
+/// re-taken ticket is marked Failed.
+#[test]
+fn a_codex_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "cx-lease-late";
+    let silent = SilentEndpoint::new();
+    crate::testutil::write_codex_roster(&[name]);
+    write_codex_account(name);
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    crate::usage::reset_request_slots();
+    let state = hung_third_party_state(&[("landed", OK_URL)]);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("landed", OK_URL)];
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    silent.release_lease_on_accept(Arc::clone(&state.fetch_lease));
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+
+    assert!(
+        state.status.lock().unwrap().get(name).is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+
+    // Control: the same hung poll under a re-taken ticket is marked Failed.
+    drop(silent);
+    wait_for_no_activity(&state, name);
+    let silent = SilentEndpoint::new();
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
+    );
+}
+
+/// A hung probe the drain leaves running past its deadline, whose tick lost
+/// the lease while the probe was out on the wire, records no Failed: the
+/// reap's strand re-checks the ticket before writing the status. The release
+/// rides the loopback's first accepted connection. Control: the same hung
+/// probe under a re-taken ticket is marked Failed.
+#[test]
+fn a_probe_worker_abandoned_after_the_lease_was_spent_records_no_failed() {
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "probe-lease-late";
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let state = probe_state(name, 60_000, true);
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    assert_eq!(entries.len(), 1, "fixture: one due probe");
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(400)));
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    silent.release_lease_on_accept(Arc::clone(&state.fetch_lease));
+    super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+
+    assert!(
+        state.status.lock().unwrap().get(name).is_none(),
+        "a worker abandoned after the lease was spent records no Failed"
+    );
+
+    // Control: the same hung probe under a re-taken ticket is marked Failed.
+    drop(silent);
+    drop(_endpoints);
+    wait_for_no_activity(&state, name);
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &silent.base);
+    let entries = {
+        let config = state.config.lock().unwrap();
+        super::build_probe_entries(super::collect_probe_seeds(&config))
+    };
+    crate::usage::reset_request_slots();
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+    assert_eq!(
+        state.status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::Failed),
+        "control: a live ticket marks the late account Failed"
     );
 }
 
@@ -33815,7 +36339,7 @@ fn a_late_probe_withdraws_its_countdown_and_a_verdict_only_retry_keeps_the_pairs
 
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
-    super::fetch_probe_due_flagged(&state, vec![normal, retry], None);
+    super::fetch_probe_due_flagged(&state, vec![normal, retry], None, None);
     drop(capture);
 
     let next = state.next_refresh_per_profile.lock().unwrap();
@@ -33888,7 +36412,7 @@ fn an_abandoned_verdict_only_retry_keeps_the_pairs_fetch_mark() {
     crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
     crate::usage::reset_request_slots();
 
-    super::fetch_probe_due_flagged(&state, vec![retry], None);
+    super::fetch_probe_due_flagged(&state, vec![retry], None, None);
 
     assert_eq!(
         state
@@ -33938,6 +36462,7 @@ fn a_failed_probe_spawn_keeps_each_workers_verdict_only_flag() {
             retry,
             probe_entry_for("probe-normal", false),
         ],
+        None,
         None,
     );
     drop(arm);
@@ -34005,5 +36530,5073 @@ fn a_due_codex_account_with_no_stored_token_resolves_no_usage_url() {
     assert!(
         state.activity.lock().unwrap().get(name).is_none(),
         "a tokenless account started no worker"
+    );
+}
+
+/// The scheduler state for the claude reset side read: `profiles` in the
+/// config and their tokens collected, the way `due_oauth_state` builds one.
+fn resets_state(profiles: Vec<crate::profile::Profile>) -> super::SchedulerState {
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles,
+    };
+    let tokens = collect_tokens(&config);
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.config.lock().unwrap() = config;
+    *state.tokens.lock().unwrap() = tokens;
+    state
+}
+
+/// The side read's request target, as Claude Code sends it.
+const CEDAR_EMBER_READ: &str = "/api/oauth/usage?cedar_ember=1&skip_spend=1";
+
+/// Two banked grants usable now (`g-old`, `g-week`) and a third in cooldown;
+/// the server's next grant is `g-week`, which resets 5h and 7d and names no end.
+const CEDAR_EMBER_THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
+
+/// The reset side read runs once an hour per claude OAuth account and never
+/// for an api-key account; each read lands in that account's own
+/// `limit_resets.json` (the usable count, the banked total, the next grant's
+/// windows and end, the read's own stamp) and leaves the plain usage cache
+/// untouched.
+#[test]
+fn a_claude_reset_read_runs_once_an_hour_per_oauth_account() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let a = save_unanchored_login("lr2a", "lr2a-tok");
+    let b = save_unanchored_login("lr2b", "lr2b-tok");
+    let mut key = oauth_profile_disabled("lr2k", false);
+    key.credentials = None;
+    key.api_key = Some("sk-lr2k".to_string());
+    crate::testutil::register_names(&["lr2a", "lr2b", "lr2k"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(5, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![a, b, key]);
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+
+    let before = crate::usage::now_ms();
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "one read per OAuth account, none for the key"
+    );
+    super::claude_resets_tick_at(&state, t + hour - 60_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "nothing inside the hour");
+    super::claude_resets_tick_at(&state, t + hour);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "each account again once the hour is up"
+    );
+
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        [
+            "Bearer lr2a-tok",
+            "Bearer lr2a-tok",
+            "Bearer lr2b-tok",
+            "Bearer lr2b-tok"
+        ],
+        "each read carries its own account's token"
+    );
+    for name in ["lr2a", "lr2b"] {
+        let profile = crate::profile::ProfileName::from(name);
+        let path = crate::profile::profile_subpath(&profile, "limit_resets.json").expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(
+            body["usable"], 2,
+            "{name}: g-old + g-week, not the cooling g-cool"
+        );
+        assert_eq!(
+            body["clears"],
+            serde_json::json!(["five_hour", "seven_day"]),
+            "{name}: the next grant's windows"
+        );
+        assert!(
+            body["ends_at"].is_null(),
+            "{name}: the next grant names no end"
+        );
+        let stamped = body["fetched_at"].as_u64().expect("stamped");
+        assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
+        let usage =
+            crate::profile::profile_subpath(&profile, super::USAGE_CACHE_FILE).expect("path");
+        assert!(
+            !usage.exists(),
+            "{name}: the side read writes no usage cache"
+        );
+    }
+    let key_file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr2k"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(!key_file.exists(), "an api-key account gets no reset read");
+}
+
+/// Lands one fresh `/usage` body for `name` whose 5h window sits at `util`%,
+/// into `state`'s own stores (the reset-read memo the tick reads included).
+fn land_five_hour(state: &super::SchedulerState, name: &str, util: f64, token: &str) {
+    use super::{FetchOutcome, FetchStatus, apply_outcome_to};
+    let profile = crate::profile::ProfileName::from(name);
+    apply_outcome_to(
+        state,
+        FetchOutcome {
+            name: profile.clone(),
+            info: Some(crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: util,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            }),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            from_headers: false,
+            refresh_failed: false,
+            fetch_failed: false,
+            login_gone: false,
+            plan_override: None,
+            retry_after: None,
+            // The identity a real spawn takes off the stored login, so the
+            // landing reads no login change and writes the store.
+            oauth_identity: crate::usage::spawn_oauth_identity(&profile, token),
+            sent_access_token: token.to_string(),
+            epoch_at_spawn: crate::usage::epoch_value(&profile, crate::usage::Half::OAuth),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
+        },
+    );
+    assert_eq!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|info| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(util),
+        "the fixture's landing wrote the store"
+    );
+}
+
+/// A window that reaches 100% between two landings brings the reset read
+/// forward once, inside the hour; a landing that stays at 100%, or one that
+/// rises short of it, brings nothing.
+#[test]
+fn a_window_reaching_full_reads_the_resets_once_inside_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2t", "lr2t-tok");
+    crate::testutil::register_names(&["lr2t"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_five_hour(&state, "lr2t", 90.0, "lr2t-tok");
+    land_five_hour(&state, "lr2t", 95.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a rise short of 100% reads nothing"
+    );
+
+    land_five_hour(&state, "lr2t", 100.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "reaching 100% reads once, inside the hour"
+    );
+
+    land_five_hour(&state, "lr2t", 100.0, "lr2t-tok");
+    super::claude_resets_tick_at(&state, t + 15 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "staying at 100% reads nothing more"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// The reset-read memo belongs to one scheduler: a second, fresh scheduler for
+/// the same account reads on its first pass, whatever another scheduler in
+/// the same process read inside the hour. A process-wide memo would let one
+/// test's reads decide another test's request count under a one-process run.
+/// The name stays off the claude roster, so the first read writes no
+/// `limit_resets.json` for the second scheduler to seed its hour from.
+#[test]
+fn a_fresh_scheduler_reads_the_resets_whatever_another_one_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2s", "lr2s-tok");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let first = resets_state(vec![p.clone()]);
+    let second = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&first, t);
+    super::claude_resets_tick_at(&second, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "each scheduler reads on its own first pass"
+    );
+    super::claude_resets_tick_at(&first, t + 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the first scheduler keeps its own hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// Production wiring pin for the claude side read: `tick` runs the leg, so a
+/// due OAuth account's `limit_resets.json` lands on a real tick (the cadence
+/// tests drive `claude_resets_tick_at` directly and never reach it).
+#[test]
+fn tick_runs_the_claude_resets_side_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr2tk", "lr2tk-tok");
+    crate::testutil::register_names(&["lr2tk"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![p],
+    };
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    *state.config.lock().unwrap() = config;
+    super::tick(&state);
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the tick ran the leg");
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr2tk"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(file.exists(), "the read landed its file");
+}
+
+/// A read whose next grant the spend path would refuse lands an available
+/// count of 0. Two usable grants sit in the fixture; only `next_grant_id`
+/// moves between the three accounts, one read each.
+#[test]
+fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
+    let home = crate::testutil::HomeSandbox::new();
+    let none = save_unanchored_login("lr4n", "lr4n-tok");
+    let cooling = save_unanchored_login("lr4c", "lr4c-tok");
+    let usable = save_unanchored_login("lr4u", "lr4u-tok");
+    crate::testutil::register_names(&["lr4n", "lr4c", "lr4u"]);
+    let (base, server) = crate::testutil::serve_endpoints_by_request(4, |raw, _| {
+        let next = match crate::testutil::request_header(raw, "authorization").as_deref() {
+            Some("Bearer lr4n-tok") => r#""next_grant_id": null"#,
+            Some("Bearer lr4c-tok") => r#""next_grant_id": "g-cool""#,
+            _ => r#""next_grant_id": "g-week""#,
+        };
+        let body = CEDAR_EMBER_THREE_GRANTS.replacen(r#""next_grant_id": "g-week""#, next, 1);
+        (200, Vec::new(), body)
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![none, cooling, usable]);
+
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    for (name, want) in [("lr4n", 0), ("lr4c", 0), ("lr4u", 2)] {
+        let path = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(body["usable"], want, "{name}");
+        assert_eq!(body["banked"], 3, "{name}: every grant left, usable or not");
+    }
+}
+
+/// The leg's eligibility: an `auth_broken` account, a disabled account and a
+/// pair with an empty access token each get no reset read, beside one healthy
+/// pair that must read — the live counter proves the three exclusions, not a
+/// dead listener.
+#[test]
+fn an_auth_broken_a_disabled_and_an_empty_token_account_get_no_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let good = save_unanchored_login("lr3ok", "lr3ok-tok");
+    let broken = save_unanchored_login("lr3br", "lr3br-tok");
+    let disabled = oauth_profile_disabled("lr3ds", true);
+    let mut empty = oauth_profile_disabled("lr3em", false);
+    if let Some(oauth) = empty
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.access_token = String::new();
+    }
+    crate::testutil::register_names(&["lr3ok", "lr3br", "lr3ds", "lr3em"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![good, broken, disabled, empty]);
+    state
+        .config
+        .lock()
+        .unwrap()
+        .state
+        .auth_broken
+        .push("lr3br".into());
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "only the healthy enabled pair with a token reads"
+    );
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        ["Bearer lr3ok-tok".to_string()],
+        "the one read carries the healthy account's token"
+    );
+}
+
+/// Lands one fresh `/usage` body for `name` whose 7d window sits at `util`%
+/// and whose per-model `weekly_scoped` set is `scoped` (label, util).
+fn land_windows(
+    state: &super::SchedulerState,
+    name: &str,
+    token: &str,
+    seven_day: Option<f64>,
+    scoped: Option<(&str, f64)>,
+) {
+    land_windows_resetting(
+        state,
+        name,
+        token,
+        seven_day,
+        scoped,
+        Some("2999-01-01T00:00:00+00:00"),
+    );
+}
+
+/// [`land_windows`] whose 7d window names `resets_at`.
+fn land_windows_resetting(
+    state: &super::SchedulerState,
+    name: &str,
+    token: &str,
+    seven_day: Option<f64>,
+    scoped: Option<(&str, f64)>,
+    resets_at: Option<&str>,
+) {
+    use super::{FetchOutcome, FetchStatus, apply_outcome_to};
+    let profile = crate::profile::ProfileName::from(name);
+    let usage = crate::usage::UsageInfo {
+        seven_day: seven_day.map(|util| crate::usage::UsageWindow {
+            utilization: util,
+            resets_at: resets_at.map(str::to_string),
+        }),
+        weekly_scoped: scoped
+            .map(|(label, util)| {
+                vec![crate::usage::ScopedWindow {
+                    label: label.to_string(),
+                    window: crate::usage::UsageWindow {
+                        utilization: util,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    },
+                }]
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    apply_outcome_to(
+        state,
+        FetchOutcome {
+            name: profile.clone(),
+            info: Some(usage),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            from_headers: false,
+            refresh_failed: false,
+            fetch_failed: false,
+            login_gone: false,
+            plan_override: None,
+            retry_after: None,
+            oauth_identity: crate::usage::spawn_oauth_identity(&profile, token),
+            sent_access_token: token.to_string(),
+            epoch_at_spawn: crate::usage::epoch_value(&profile, crate::usage::Half::OAuth),
+            profile_wanted: false,
+            profile_attempt_at: None,
+            reanchored: false,
+        },
+    );
+    assert!(
+        state.store.lock().unwrap().get(name).is_some(),
+        "the fixture's landing wrote the store"
+    );
+}
+
+/// A 7d window — and a per-model scoped one — crossing to 100% between two
+/// landings marks the account due, so the read comes forward inside the hour
+/// for those too, not the 5h window alone.
+#[test]
+fn a_seven_day_or_scoped_window_reaching_full_marks_the_account_due() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3w", "lr3w-tok");
+    crate::testutil::register_names(&["lr3w"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr3w", "lr3w-tok", Some(90.0), None);
+    land_windows(&state, "lr3w", "lr3w-tok", Some(100.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the 7d crossing reads once, inside the hour"
+    );
+
+    land_windows(&state, "lr3w", "lr3w-tok", None, Some(("7d opus", 50.0)));
+    land_windows(&state, "lr3w", "lr3w-tok", None, Some(("7d opus", 100.0)));
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the per-model scoped crossing reads once, inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window's use falling before its reset means a reset was spent, from
+/// Claude Code or by a clauth run whose own re-read failed: the count is
+/// stale, so the read comes forward inside the hour, once per fall. Its use
+/// holding or rising after that reads nothing.
+#[test]
+fn a_window_falling_before_its_reset_marks_the_account_due() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5w", "lr5w-tok");
+    crate::testutil::register_names(&["lr5w"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr5w", "lr5w-tok", Some(90.0), None);
+    land_windows(&state, "lr5w", "lr5w-tok", Some(10.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the fall reads once, inside the hour"
+    );
+
+    land_windows(&state, "lr5w", "lr5w-tok", Some(10.0), None);
+    land_windows(&state, "lr5w", "lr5w-tok", Some(20.0), None);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "no fall, no read before the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window that fell because its reset passed, or names no reset to judge by,
+/// spends nothing: only the hourly read runs.
+#[test]
+fn a_window_falling_past_or_without_its_reset_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5p", "lr5p-tok");
+    crate::testutil::register_names(&["lr5p"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    let passed = Some("2000-01-01T00:00:00+00:00");
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(90.0), None, passed);
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(10.0), None, passed);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "its reset had passed");
+
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(90.0), None, None);
+    land_windows_resetting(&state, "lr5p", "lr5p-tok", Some(10.0), None, None);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "no reset to judge by");
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A window that reset on time opens a new one whose reset lies ahead: the
+/// fall is judged by the reset the PREVIOUS reading named, which had passed,
+/// so it reads nothing, whatever the fresh reading's reset says.
+#[test]
+fn a_window_that_reset_on_time_into_a_new_one_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr5n", "lr5n-tok");
+    crate::testutil::register_names(&["lr5n"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    let passed = Some("2000-01-01T00:00:00+00:00");
+    let ahead = Some("2100-01-01T00:00:00+00:00");
+    land_windows_resetting(&state, "lr5n", "lr5n-tok", Some(90.0), None, passed);
+    land_windows_resetting(&state, "lr5n", "lr5n-tok", Some(10.0), None, ahead);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the previous reset had passed"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A FIRST landing already at 100% (no previous stored reading) marks nothing:
+/// with nothing known about what the window read before, there is no crossing
+/// to act on, and the hourly read covers the account.
+#[test]
+fn a_first_landing_already_at_full_marks_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3f", "lr3f-tok");
+    crate::testutil::register_names(&["lr3f"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    land_windows(&state, "lr3f", "lr3f-tok", Some(100.0), None);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a first landing at 100% reads nothing more"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A re-login removes the old login's reading (`forget_disk`'s OAuth arm) and
+/// drops its hour from the memo, so the account reads inside the hour instead
+/// of seeding the old reading's hour under the new login. The reading's stamp
+/// is on the test's own clock, so a seeded hour would really hold the second
+/// pass.
+#[test]
+fn a_relogin_drops_the_reading_and_the_name_so_the_account_reads_inside_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3cm", "lr3cm-tok");
+    crate::testutil::register_names(&["lr3cm"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr3cm");
+    let minute = 60_000;
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    // The re-login's change site: the old login's reading goes, and the memo
+    // drops the name.
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    crate::usage::forget_memory(&state.memory_stores(), &name, crate::usage::Half::OAuth);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the re-logged account reads again inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A rename moves the whole profile directory (as `rename_profile` does), so
+/// the reading inside it rides along and dates the account's hour under the
+/// new name: the memo's drop of the old name reads nothing while the moved
+/// file is inside the hour. A name that lands with no reading under it — the
+/// fixture poses the rename back that way — reads on the next pass, so the
+/// drop is no hour of its own.
+#[test]
+fn a_rename_keeps_the_moved_readings_hour_under_the_new_name() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3rn", "lr3rn-tok");
+    crate::testutil::register_names(&["lr3rn", "lr3rn2"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let minute = 60_000;
+    let t = crate::usage::now_ms();
+    crate::usage::register_memory_stores();
+    let old = crate::profile::ProfileName::from("lr3rn");
+    let new = crate::profile::ProfileName::from("lr3rn2");
+    let rename = |from: &crate::profile::ProfileName, to: &crate::profile::ProfileName| {
+        state.config.lock().unwrap().profiles[0].name = to.as_str().into();
+        crate::usage::note_rename(from, to);
+        crate::usage::apply_pending_forgets(&state.memory_stores());
+    };
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+
+    // The production rename moves the profile directory itself, so the
+    // reading it holds (the first read's, stamped on the real clock) rides
+    // to the new name; the seed dates the hour there.
+    std::fs::rename(
+        crate::profile::profile_dir(&old).expect("old dir"),
+        crate::profile::profile_dir(&new).expect("new dir"),
+    )
+    .expect("the profile directory moves");
+    rename(&old, &new);
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the moved reading keeps the account's hour under its new name"
+    );
+
+    // The rename back lands on a name with no reading under it: the outbound
+    // rename dropped the old name's hour, so it reads again inside it
+    // instead of holding the stamp.
+    std::fs::remove_file(crate::profile::profile_subpath(&new, "limit_resets.json").expect("path"))
+        .expect("pose a name with no reading");
+    rename(&new, &old);
+    super::claude_resets_tick_at(&state, t + 10 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the rename back reads again: the memo's drop left it no hour to hold"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A forget landing while the side read is in flight — a re-login's
+/// `clear_memory` — leaves the read's file unwritten and the memo unstamped,
+/// so the account reads again under the new login on the next pass inside the
+/// hour instead of waiting out the old login's hour with the old count in its
+/// file.
+#[test]
+fn a_forget_in_flight_skips_the_reset_write_and_the_stamp() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3fg", "lr3fg-tok");
+    crate::testutil::register_names(&["lr3fg"]);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr3fg");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let forgot = Arc::new(AtomicBool::new(false));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let stores = state.memory_stores();
+        let name = name.clone();
+        let reads = Arc::clone(&reads);
+        let forgot = Arc::clone(&forgot);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                // The re-login lands while the read it races is on the wire:
+                // its forget runs before the answer that read waits for.
+                if !forgot.swap(true, Ordering::SeqCst) {
+                    crate::usage::forget_memory(&stores, &name, crate::usage::Half::OAuth);
+                }
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+
+    let t = 1_900_000_000_000;
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read went out");
+    assert!(!file.exists(), "a read whose login moved lands no file");
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .last_read_at
+            .contains_key("lr3fg"),
+        "a read whose login moved stamps no memo"
+    );
+
+    // The forget's drop stands: the next pass inside the hour reads again and
+    // lands under the login the account holds now.
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the unstamped account reads again inside the hour"
+    );
+    assert!(file.exists(), "the second pass lands its file");
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A tick that polls a paired account whose fresh body takes a window from
+/// under 100% to 100% reads the resets in the SAME tick: the due mark the
+/// landing sets sits in the memo the leg reads once the fan-out has joined,
+/// and the plain `/usage` poll precedes that read in the stub's record.
+#[test]
+fn a_tick_that_lands_a_full_window_reads_the_resets_in_the_same_tick() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr3tk", "lr3tk-tok");
+    crate::testutil::register_names(&["lr3tk"]);
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    let under = format!(r#"{{"five_hour":{{"utilization":90.0,"resets_at":"{resets_at}"}}}}"#);
+    let full = format!(r#"{{"five_hour":{{"utilization":100.0,"resets_at":"{resets_at}"}}}}"#);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(6, {
+        let polls = Arc::clone(&polls);
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/usage" {
+                let nth = polls.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    if nth == 0 {
+                        under.clone()
+                    } else {
+                        full.clone()
+                    },
+                )
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    // The second tick must poll again at once, or the crossing landing it
+    // needs would wait out a whole interval.
+    state.refresh_interval.store(0, Ordering::Relaxed);
+    // Neither tick spends a request on `/profile`: this test is about the poll
+    // and the side read.
+    crate::usage::take_profile_fetch(
+        &crate::profile::ProfileName::from("lr3tk"),
+        false,
+        crate::usage::now_ms(),
+    );
+
+    super::tick(&state);
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "the first tick polls");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the first tick's hourly read"
+    );
+
+    // The seam's own purpose: don't sleep out the per-host spacing window the
+    // first tick reserved.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the crossing landing's due mark is read in the same tick"
+    );
+
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+    let asked: Vec<String> = seen
+        .iter()
+        .map(|raw| crate::testutil::request_path(raw))
+        .filter(|path| path.as_str() == "/api/oauth/usage" || path.as_str() == CEDAR_EMBER_READ)
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "/api/oauth/usage",
+            CEDAR_EMBER_READ,
+            "/api/oauth/usage",
+            CEDAR_EMBER_READ,
+        ],
+        "each tick polls first, then reads the resets the landing marked due"
+    );
+}
+
+/// A login change's OAuth-half forget drops the banked-reset reading with the
+/// usage cache: the count belongs to the login that was read, so the Overview
+/// chip and the Usage row draw nothing until the new login's own side read.
+#[test]
+fn an_oauth_forget_drops_the_banked_resets_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("a");
+    crate::testutil::write_claude_limit_resets("a", 3, &[], None, 1_700_000_000_000);
+    let path = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    assert!(path.exists(), "fixture control: the reading is on disk");
+    crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+    assert!(!path.exists(), "the old login's reading is gone");
+}
+
+/// A scheduler that starts within the hour of a reading on disk (a daemon
+/// restart, a lease takeover, a TUI with no daemon) keeps that reading's hour
+/// instead of re-reading every account on its first tick; a reading an hour
+/// old or more, or none at all, reads on the first pass.
+#[test]
+fn a_new_scheduler_keeps_the_hour_of_the_reading_on_disk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let fresh = save_unanchored_login("lrf", "lrf-tok");
+    let stale = save_unanchored_login("lrs", "lrs-tok");
+    let unread = save_unanchored_login("lru", "lru-tok");
+    crate::testutil::register_names(&["lrf", "lrs", "lru"]);
+    let t: u64 = 1_900_000_000_000;
+    let minute: u64 = 60_000;
+    crate::testutil::write_claude_limit_resets("lrf", 2, &[], None, t - 30 * minute);
+    crate::testutil::write_claude_limit_resets("lrs", 2, &[], None, t - 61 * minute);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![fresh, stale, unread]);
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "only the accounts read an hour ago or never read on the first pass"
+    );
+    super::claude_resets_tick_at(&state, t + 31 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the fresh reading's hour runs out on its own clock"
+    );
+
+    drop(endpoints);
+    let bearers: Vec<String> = server
+        .join()
+        .expect("listener")
+        .iter()
+        .filter(|raw| crate::testutil::request_path(raw) == CEDAR_EMBER_READ)
+        .map(|raw| crate::testutil::request_header(raw, "authorization").unwrap_or_default())
+        .collect();
+    let mut first_pass = bearers[..2].to_vec();
+    first_pass.sort();
+    assert_eq!(
+        first_pass,
+        vec!["Bearer lrs-tok".to_string(), "Bearer lru-tok".to_string()],
+        "the first pass reads the stale and the unread account"
+    );
+    assert_eq!(
+        bearers[2], "Bearer lrf-tok",
+        "then the fresh one, past its hour"
+    );
+}
+
+/// A tick whose landing takes a chain member to 100% queues the switch before
+/// the side read goes out: the scans decide off the stores the landings just
+/// wrote and must not wait behind the reads. The stub's side-read handler
+/// reads the switch queue as the request arrives. The queue it observes is
+/// `scan_auto_switch`'s `pending_switch` alone; the session switch and
+/// recovery scans leave no store this test reads, so their order against the
+/// side read is not observed here.
+#[test]
+fn a_tick_reads_the_resets_after_the_switch_scan_queued_its_decision() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config(&["a", "b"], Some("a"));
+    let mut tokens = collect_tokens(&config.lock().unwrap());
+    tokens.retain(|t| t.name.as_str() == "a");
+    assert_eq!(
+        tokens.len(),
+        1,
+        "the active member is on the poll's token list"
+    );
+    let state = chain_state(&config, tokens);
+    let resets_at = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    // The active member starts under 100% with headroom on the other, so the
+    // tick's landing is the crossing the switch scan acts on. The landing's
+    // own cadence stamp would defer the poll; this test drives it now.
+    land_five_hour(&state, "a", 90.0, "a");
+    state.last_fetched.lock().unwrap().clear();
+    state.store.lock().unwrap().insert(
+        "b".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(resets_at.clone()),
+            }),
+            ..Default::default()
+        },
+    );
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Fresh);
+    // Neither the poll nor this test spends a request on `/profile`.
+    crate::usage::take_profile_fetch(
+        &crate::profile::ProfileName::from("a"),
+        false,
+        crate::usage::now_ms(),
+    );
+
+    let full = format!(r#"{{"five_hour":{{"utilization":100.0,"resets_at":"{resets_at}"}}}}"#);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let side_reads = Arc::new(AtomicUsize::new(0));
+    let queued_at_read = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pending = state.pending_switch.clone();
+    let (base, server) = crate::testutil::serve_endpoints_raw(8, {
+        let polls = Arc::clone(&polls);
+        let side_reads = Arc::clone(&side_reads);
+        let queued_at_read = Arc::clone(&queued_at_read);
+        let pending = Arc::clone(&pending);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                side_reads.fetch_add(1, Ordering::SeqCst);
+                queued_at_read
+                    .lock()
+                    .unwrap()
+                    .push(!pending.lock().unwrap().is_empty());
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/usage" {
+                polls.fetch_add(1, Ordering::SeqCst);
+                (200, full.clone())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "the active member polls once"
+    );
+    assert_eq!(
+        state
+            .store
+            .lock()
+            .unwrap()
+            .get("a")
+            .and_then(|info| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(100.0),
+        "the poll's landing crossed the window to full"
+    );
+    assert_eq!(
+        side_reads.load(Ordering::SeqCst),
+        1,
+        "the tick reads one due member: the crossing's"
+    );
+    assert_eq!(
+        *queued_at_read.lock().unwrap(),
+        vec![true],
+        "the side read went out after the switch scan had queued its decision"
+    );
+    // The other paired member's hourly read waits for a later tick.
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert_eq!(
+        side_reads.load(Ordering::SeqCst),
+        2,
+        "the next tick reads the other paired member"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "the next tick's poll is inside the active member's interval"
+    );
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    let targets: Vec<String> = state
+        .pending_switch
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.target.clone())
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["b".to_string()],
+        "the crossing queued the switch onto the other member"
+    );
+}
+
+/// An account whose last poll answered 429 gets no side read and no memo stamp
+/// while the Retry-After deferral stands, so once the poll clears it the read
+/// happens at once instead of waiting out an hour stamped inside the backoff.
+#[test]
+fn a_rate_limited_account_sends_no_resets_read_until_its_deferral_clears() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr4rl", "lr4rl-tok");
+    crate::testutil::register_names(&["lr4rl"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("lr4rl".to_string(), super::FetchStatus::RateLimited);
+    let t = 1_900_000_000_000;
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "a rate-limited account sends no side read inside its deferral"
+    );
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("lr4rl".to_string(), super::FetchStatus::Fresh);
+    // The same instant: a stamp taken under the deferral would hold the hour.
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "clear of the deferral, the account reads at once"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// The third-party half's forget leaves the banked-reset reading alone: the
+/// count belongs to the claude login, which an api-key change does not touch.
+#[test]
+fn a_third_party_forget_keeps_the_banked_resets_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("kept");
+    crate::testutil::write_claude_limit_resets("kept", 3, &[], None, 1_700_000_000_000);
+    let path = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    assert!(path.exists(), "fixture control: the reading is on disk");
+    crate::usage::forget_disk(&name, crate::usage::Half::ThirdParty);
+    assert!(
+        path.exists(),
+        "the third-party forget keeps the claude login's reading"
+    );
+}
+
+/// The seed's guards: a reading whose stamp is absent (a file written before
+/// the stamp existed), one stamped after the scheduler's clock (the clock
+/// stepped back), and one whose bytes do not parse each read on the first
+/// pass. The within-the-hour control beside them keeps its hour, so the
+/// three reads are the guards' doing, not a fixture that wrote no files.
+#[test]
+fn a_stamp_less_future_or_corrupt_reading_reads_on_the_first_pass() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let kept = save_unanchored_login("lr4k", "lr4k-tok");
+    let stamp_less = save_unanchored_login("lr40", "lr40-tok");
+    let future = save_unanchored_login("lr4f", "lr4f-tok");
+    let corrupt = save_unanchored_login("lr4c", "lr4c-tok");
+    crate::testutil::register_names(&["lr4k", "lr40", "lr4f", "lr4c"]);
+    let t = crate::usage::now_ms();
+    let hour = 60 * 60 * 1000;
+    let minute = 60_000;
+    crate::testutil::write_claude_limit_resets("lr4k", 2, &[], None, t - 10 * minute);
+    crate::testutil::write_claude_limit_resets("lr4f", 2, &[], None, t + hour);
+    // Both irregular files are written over a valid reading, so the fixture
+    // proves the leg's own path rather than a missing directory.
+    crate::testutil::write_claude_limit_resets("lr40", 2, &[], None, t);
+    let stamp_less_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr40"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &stamp_less_path,
+        r#"{"usable":2,"clears":[],"ends_at":null}"#,
+    )
+    .expect("write a stamp-less reading");
+    crate::testutil::write_claude_limit_resets("lr4c", 2, &[], None, t);
+    let corrupt_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr4c"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(&corrupt_path, "{\"usable\":").expect("write a corrupt reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![kept, stamp_less, future, corrupt]);
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        3,
+        "the stamp-less, the future-stamped and the corrupt readings each read on the first pass"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A stored login another process replaces while the side read is in flight
+/// (a CLI `clauth login`) owns the account: this process's epoch does not
+/// move, so only the stored-identity compare under the state flock keeps the
+/// old login's count out of a file re-created under a fresh hour. The
+/// unstamped account is considered again inside the hour.
+#[test]
+fn a_login_change_in_flight_keeps_the_old_count_out_of_the_file() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr4id", "lr4id-tok");
+    crate::testutil::register_names(&["lr4id"]);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let replaced = Arc::new(AtomicBool::new(false));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        let replaced = Arc::clone(&replaced);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+                // The re-login lands while the read it races is on the wire.
+                if !replaced.swap(true, Ordering::SeqCst) {
+                    save_unanchored_login("lr4id", "lr4id-new-tok");
+                }
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let name = crate::profile::ProfileName::from("lr4id");
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the read went out under the stored token"
+    );
+    assert!(
+        !file.exists(),
+        "a read whose stored login changed lands no reading"
+    );
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .last_read_at
+            .contains_key("lr4id"),
+        "a read whose stored login changed stamps no hour"
+    );
+
+    // The skip left no hour behind: the account is considered again inside it.
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the unstamped account reads again inside the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A credentials store that cannot be read at the write's compare blocks the
+/// file write but keeps the hour: the reload compare never forgets an
+/// unreadable half, so an unstamped account would re-read at the request
+/// spacing, not once an hour. Only a READABLE moved login drops the stamp.
+#[test]
+fn an_unreadable_credentials_store_blocks_the_write_but_keeps_the_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr8u", "lr8u-tok");
+    crate::testutil::register_names(&["lr8u"]);
+    let name = crate::profile::ProfileName::from("lr8u");
+    let store = crate::profile::profile_subpath(&name, "credentials.json").expect("path");
+    std::fs::write(&store, "{\"claude_ai_oauth\":").expect("write an unreadable store");
+    let file = crate::profile::profile_subpath(&name, "limit_resets.json").expect("path");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let t = crate::usage::now_ms();
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the read goes out");
+    assert!(
+        !file.exists(),
+        "an unreadable store blocks the reading's write"
+    );
+    super::claude_resets_tick_at(&state, t + 5 * 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the unreadable store's attempt still stamps the hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A forget landing between the seed's file read and its memo apply must not
+/// date the new login's hour from the old reading: the epoch captured at the
+/// snapshot no longer matches, so the seed is skipped and the account reads on
+/// the next pass instead of waiting out the old file's hour.
+#[test]
+fn a_forget_between_the_seed_read_and_its_apply_leaves_the_name_unseeded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lr8s", "lr8s-tok");
+    crate::testutil::register_names(&["lr8s"]);
+    let name = crate::profile::ProfileName::from("lr8s");
+    let t = crate::usage::now_ms();
+    let minute = 60_000;
+    crate::testutil::write_claude_limit_resets("lr8s", 2, &[], None, t - 10 * minute);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(3, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    // The re-login's forget: the disk removal plus the memory drop.
+    super::set_claude_resets_seed_apply_hook("lr8s", {
+        let stores = state.memory_stores();
+        let name = name.clone();
+        move || {
+            crate::usage::forget_disk(&name, crate::usage::Half::OAuth);
+            crate::usage::forget_memory(&stores, &name, crate::usage::Half::OAuth);
+        }
+    });
+
+    super::claude_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the moved name is skipped, so it sends no read under the old login"
+    );
+    super::claude_resets_tick_at(&state, t + 5 * minute);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the next pass reads under the new login instead of the old file's hour"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A tick reads at most one due account: with two due and one marked due by a
+/// landing, the tick reads the marked one and the next tick reads the other.
+/// The bound is the tick path's alone — a direct `claude_resets_tick_at` pass
+/// still reads every due account.
+#[test]
+fn a_tick_reads_one_due_account_and_the_next_tick_reads_the_other() {
+    let home = crate::testutil::HomeSandbox::new();
+    let a = save_unanchored_login("lr9a", "lr9a-tok");
+    let b = save_unanchored_login("lr9b", "lr9b-tok");
+    crate::testutil::register_names(&["lr9a", "lr9b"]);
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, |path, _| {
+        if path == CEDAR_EMBER_READ {
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        } else {
+            (200, "{}".to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![a, b]);
+    // Neither account polls inside these ticks, so every request the stub
+    // records is a side read.
+    let deferred = FetchStamp::at(EpochMs::from_millis(
+        crate::usage::now_ms() + 2 * REFRESH_INTERVAL_MS,
+    ));
+    for name in ["lr9a", "lr9b"] {
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .insert(oauth_key(name), deferred);
+    }
+    // A landing's due mark leads even though `lr9a` comes first off the
+    // config walk.
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lr9b".to_string());
+    let file = |name: &str| {
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path")
+    };
+
+    super::tick(&state);
+    assert!(
+        file("lr9b").exists(),
+        "the tick reads the due-marked account"
+    );
+    assert!(
+        !file("lr9a").exists(),
+        "the tick leaves the other due account for a later tick"
+    );
+
+    crate::usage::reset_request_slots();
+    super::tick(&state);
+    assert!(
+        file("lr9a").exists(),
+        "the next tick reads the account left over"
+    );
+
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+}
+
+/// A side-read stub that parks every request on its own thread until
+/// [`ParkedResets::release`], then answers it with three grants, so a parked
+/// read holds no listener. Drop releases and stops it, and never asserts.
+struct ParkedResets {
+    base: String,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParkedResets {
+    fn new() -> Self {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let (reads, gate, stop) = (Arc::clone(&reads), Arc::clone(&gate), Arc::clone(&stop));
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    let (reads, gate) = (Arc::clone(&reads), Arc::clone(&gate));
+                    std::thread::spawn(move || {
+                        let _ = sock.set_nonblocking(false);
+                        let _ = crate::testutil::read_request_head(&mut sock);
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        let (open, cvar) = &*gate;
+                        let guard = open.lock().unwrap_or_else(|e| e.into_inner());
+                        let _open = cvar
+                            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| {
+                                !*open
+                            })
+                            .unwrap_or_else(|e| e.into_inner());
+                        let body = CEDAR_EMBER_THREE_GRANTS;
+                        let _ = write!(
+                            sock,
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            }
+        });
+        Self {
+            base,
+            reads,
+            gate,
+            stop,
+            listener: Some(handle),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        let (open, cvar) = &*self.gate;
+        *open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for ParkedResets {
+    fn drop(&mut self) {
+        self.release();
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Land `reading` of `name` through the landing section, `fresh` off the live
+/// API or a cached fallback, with the reading the store held before it at a 5h
+/// reset ten minutes ago, judged as [`reset_member`].
+fn land_reading_after_a_reset(name: &str, reading: crate::usage::UsageInfo, fresh: bool) {
+    land_reading_after_a_reset_under(name, reading, fresh, None);
+}
+
+/// [`land_reading_after_a_reset`] landing under a fetch tick's lease ticket.
+fn land_reading_after_a_reset_under(
+    name: &str,
+    reading: crate::usage::UsageInfo,
+    fresh: bool,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    let pn = crate::profile::ProfileName::from(name);
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), reset_info(60.0, Some(-600)));
+    let outcome = super::FetchOutcome {
+        name: pn.clone(),
+        info: Some(reading),
+        status: if fresh {
+            super::FetchStatus::Fresh
+        } else {
+            super::FetchStatus::Cached
+        },
+        rotated: None,
+        from_fetch: fresh,
+        from_headers: false,
+        refresh_failed: false,
+        fetch_failed: false,
+        login_gone: false,
+        plan_override: None,
+        retry_after: None,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        sent_access_token: String::new(),
+        epoch_at_spawn: crate::usage::epoch_value(&pn, crate::usage::Half::OAuth),
+        profile_wanted: false,
+        profile_attempt_at: None,
+        reanchored: false,
+    };
+    super::apply_outcome_flagged(
+        outcome,
+        &store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &super::new_claude_resets_memo(),
+        None,
+        lease,
+        Some(&reset_member(name)),
+    );
+}
+
+/// Wait out a left-running worker: its exit clears the account's activity row.
+fn wait_for_no_activity(state: &super::SchedulerState, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while state.activity.lock().unwrap().contains_key(name) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the left-running read of {name} never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_reads(stub: &ParkedResets, count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while stub.reads() < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of {count} reads arrived",
+            stub.reads()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A side read that never answers leaves the pass at the tick's fetch deadline,
+/// well inside the read's own 15 s bound. The account's poll row owes it
+/// nothing: no status, no fetch mark, no held-off poll. Giving up on the read
+/// counts as a failed read, so it dates the hour and its late answer lands
+/// nothing.
+#[test]
+fn a_hung_resets_read_is_left_running_and_its_late_answer_lands_nothing() {
+    use std::time::{Duration, Instant};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh1", "lrh1-tok");
+    crate::testutil::register_names(&["lrh1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lrh1"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let started = Instant::now();
+    super::claude_resets_tick_at(&state, t);
+    let took = started.elapsed();
+    drop(capture);
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the pass waited {took:?} on a hung read past a 300 ms deadline"
+    );
+    wait_for_reads(&stub, 1);
+    let logged = lines.snapshot();
+    let named: Vec<&String> = logged.iter().filter(|l| l.contains("'lrh1'")).collect();
+    assert_eq!(named.len(), 1, "one line names the account: {logged:?}");
+    assert!(
+        !named[0].contains("marked failed"),
+        "the side read marks no account failed: {named:?}"
+    );
+    assert!(
+        !state.status.lock().unwrap().contains_key("lrh1"),
+        "the side read owns no status row"
+    );
+    {
+        let activity = state.activity.lock().unwrap();
+        let row = activity.get("lrh1").expect("the left-running read's row");
+        assert!(row.fetch(FetchLeg::OAuth).is_none(), "no poll mark");
+        assert!(!row.late(FetchLeg::OAuth), "the poll is not held off");
+    }
+
+    stub.release();
+    wait_for_no_activity(&state, "lrh1");
+    assert!(!file.exists(), "a late answer lands nothing");
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 1);
+    assert_eq!(stub.reads(), 1, "the given-up read dates the hour");
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + hour);
+    assert_eq!(stub.reads(), 2, "the next hour reads again");
+    assert!(file.exists(), "a read that answers in time lands");
+
+    drop(endpoints);
+}
+
+/// A claude reset side read that lost the lease on the wire writes no
+/// `limit_resets.json`: the landing's flock hold re-checks the ticket before
+/// the cache write, and the hour stays unstamped for the next holder. The
+/// release rides the stub's answer — the same on-the-wire seam the codex
+/// post-fetch test uses. Control: the same read under a re-taken ticket
+/// writes the file.
+#[test]
+fn a_resets_read_under_a_spent_ticket_writes_no_limit_resets_file() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = save_unanchored_login("lr-lease", "lr-lease-tok");
+    crate::testutil::register_names(&["lr-lease"]);
+    let state = resets_state(vec![profile]);
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("lr-lease"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    let released = Arc::new(AtomicBool::new(false));
+    let lease = Arc::clone(&state.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let released = Arc::clone(&released);
+        let lease = Arc::clone(&lease);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ && !released.swap(true, Ordering::SeqCst) {
+                assert!(
+                    lease.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+            }
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    super::claude_resets_tick_flagged(&state, crate::usage::now_ms(), None, None, Some(ticket));
+
+    assert!(
+        !file.exists(),
+        "a read that lost the lease on the wire writes no limit_resets file"
+    );
+
+    // Control: the same read under a re-taken ticket writes the file.
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    super::claude_resets_tick_flagged(&state, crate::usage::now_ms(), None, None, Some(ticket));
+    assert!(file.exists(), "control: a current ticket writes the file");
+    let _ = server.join().expect("listener");
+}
+
+/// A refused side read whose tick lost the lease on the wire raises no line,
+/// since only the holder speaks, yet still stamps its retry on the ladder's
+/// first rung (90 s interval + 10 s). Control: the retry under a re-taken
+/// ticket says so, on the second rung.
+#[test]
+fn a_refused_resets_read_under_a_spent_ticket_stamps_its_retry_without_a_line() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = save_unanchored_login("lr-lease2", "lr-lease2-tok");
+    crate::testutil::register_names(&["lr-lease2"]);
+    let state = resets_state(vec![profile]);
+    let released = Arc::new(AtomicBool::new(false));
+    let lease = Arc::clone(&state.fetch_lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, {
+        let released = Arc::clone(&released);
+        let lease = Arc::clone(&lease);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ && !released.swap(true, Ordering::SeqCst) {
+                assert!(
+                    lease.release_if_stale(
+                        crate::usage::now_ms()
+                            + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                        crate::daemon::LEASE_STALE_BOUND,
+                    ),
+                    "the watchdog releases the holder"
+                );
+            }
+            resets_429(Some(0))
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let t = RESETS_T;
+    let named = |lines: &crate::logline::LogLines| -> Vec<String> {
+        lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains("'lr-lease2'"))
+            .collect()
+    };
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("the test thread takes the fetch lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        Vec::<String>::new(),
+        "a tick that lost the lease says nothing"
+    );
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert_eq!(memo.last_read_at.get("lr-lease2"), Some(&t));
+        assert_eq!(
+            memo.retry.get("lr-lease2"),
+            Some(&(t + 100_000, 1)),
+            "the refusal still stamps its retry on the first rung"
+        );
+    }
+
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the released lease");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, t + 100_000, None, None, Some(ticket));
+    drop(capture);
+    assert_eq!(
+        named(&lines),
+        vec![refused_line("lr-lease2", 429, Some(0), 120)],
+        "control: the holder's retry says so, on the second rung"
+    );
+    let _ = server.join().expect("listener");
+}
+
+/// While a read is left running its account gets no second one, whatever marks
+/// it due; the mark waits and fires once the read has exited.
+#[test]
+fn a_left_running_resets_read_gets_no_second_read_until_it_exits() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh2", "lrh2-tok");
+    crate::testutil::register_names(&["lrh2"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    let started = std::time::Instant::now();
+    super::claude_resets_tick_at(&state, t);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the pass waited {took:?} on a hung read past a 300 ms deadline"
+    );
+    wait_for_reads(&stub, 1);
+
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrh2".to_string());
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        stub.reads(),
+        1,
+        "no second read beside the left-running one"
+    );
+
+    stub.release();
+    wait_for_no_activity(&state, "lrh2");
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, t + 2);
+    assert_eq!(stub.reads(), 2, "the due mark fires once the read exited");
+    assert!(
+        !state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .due
+            .contains("lrh2"),
+        "the read consumed the mark"
+    );
+
+    drop(endpoints);
+}
+
+/// A due mark sorts first, so a marked account with a read left running would
+/// take the pass's one read if it left the due set after the limit.
+#[test]
+fn a_left_running_resets_read_leaves_the_passes_one_read_to_the_next_account() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let first = save_unanchored_login("lrl1", "lrl1-tok");
+    let second = save_unanchored_login("lrl2", "lrl2-tok");
+    crate::testutil::register_names(&["lrl1", "lrl2"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![first, second]);
+    let t = 1_900_000_000_000;
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
+    wait_for_reads(&stub, 1);
+
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrl1".to_string());
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
+    wait_for_reads(&stub, 2);
+    assert!(
+        state
+            .claude_resets_memo
+            .lock()
+            .unwrap()
+            .due
+            .contains("lrl1"),
+        "the mark waits for the left-running read"
+    );
+
+    stub.release();
+    wait_for_no_activity(&state, "lrl1");
+    wait_for_no_activity(&state, "lrl2");
+    drop(endpoints);
+}
+
+/// A poll left running keeps its account's side read waiting without spending
+/// it: the skip stamps no hour, keeps the due mark and leaves the pass's one
+/// read to the next account, and the account reads once the poll has exited.
+#[test]
+fn a_poll_left_running_holds_the_resets_read_unstamped() {
+    let home = crate::testutil::HomeSandbox::new();
+    let held = save_unanchored_login("lrp1", "lrp1-tok");
+    let next = save_unanchored_login("lrp2", "lrp2-tok");
+    crate::testutil::register_names(&["lrp1", "lrp2"]);
+    let stub = ParkedResets::new();
+    stub.release();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![held, next]);
+    let file = |name: &str| {
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path")
+    };
+    let t = 1_900_000_000_000;
+    state
+        .activity
+        .lock()
+        .unwrap()
+        .entry("lrp1".to_string())
+        .or_default()
+        .oauth_late = 1;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrp1".to_string());
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
+    assert_eq!(
+        stub.reads(),
+        1,
+        "the pass's one read goes to the next account"
+    );
+    assert!(file("lrp2").exists(), "the next account landed");
+    assert!(!file("lrp1").exists(), "the held account sent no read");
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert!(memo.due.contains("lrp1"), "the skip keeps the due mark");
+        assert!(
+            !memo.last_read_at.contains_key("lrp1"),
+            "the skip stamps no hour"
+        );
+    }
+
+    state.activity.lock().unwrap().remove("lrp1");
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
+    assert_eq!(
+        stub.reads(),
+        2,
+        "the account reads once its poll has exited"
+    );
+    assert!(file("lrp1").exists(), "its reading landed");
+
+    drop(endpoints);
+}
+
+/// A token spend on the account keeps its side read waiting without spending
+/// it: the read would send the token the spend is replacing. The skip stamps no
+/// hour and keeps the due mark, and the account reads once the spend has ended.
+#[test]
+fn a_token_spend_holds_the_resets_read_unstamped() {
+    let home = crate::testutil::HomeSandbox::new();
+    let held = save_unanchored_login("lrt1", "lrt1-tok");
+    crate::testutil::register_names(&["lrt1"]);
+    let stub = ParkedResets::new();
+    stub.release();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![held]);
+    let name = crate::profile::ProfileName::from("lrt1");
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrt1".to_string());
+    super::mark_activity(&state.activity, &name, ProfileActivity::Refreshing);
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t, None, Some(1), None);
+    assert_eq!(stub.reads(), 0, "no read beside the spend");
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert!(memo.due.contains("lrt1"), "the skip keeps the due mark");
+        assert!(
+            !memo.last_read_at.contains_key("lrt1"),
+            "the skip stamps no hour"
+        );
+    }
+
+    super::clear_activity(&state.activity, &name);
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_flagged(&state, t + 1, None, Some(1), None);
+    assert_eq!(
+        stub.reads(),
+        1,
+        "the account reads once the spend has ended"
+    );
+
+    drop(endpoints);
+}
+
+/// The side read spends no token and lands nothing, so what a switch or a
+/// rotate-all waits on does not wait on it.
+#[test]
+fn a_left_running_resets_read_leaves_the_account_free_to_switch() {
+    use std::time::Duration;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrf1", "lrf1-tok");
+    crate::testutil::register_names(&["lrf1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+
+    crate::usage::reset_request_slots();
+    super::claude_resets_tick_at(&state, 1_900_000_000_000);
+    wait_for_reads(&stub, 1);
+
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("lrf1")
+            .is_some_and(|row| row.late(FetchLeg::ClaudeResets)),
+        "the read is left running"
+    );
+    assert!(super::is_idle(
+        &state.activity,
+        &crate::profile::ProfileName::from("lrf1")
+    ));
+    assert!(!super::any_busy(&state.activity));
+
+    stub.release();
+    wait_for_no_activity(&state, "lrf1");
+    drop(endpoints);
+}
+
+/// What a read that never ran leaves behind: its attempt dates the hour and
+/// consumes the due mark, and nothing of the poll's or the file moves.
+fn assert_resets_attempt_dated(
+    state: &super::SchedulerState,
+    name: &str,
+    at: u64,
+    lines: &crate::logline::LogLines,
+    stub: &ParkedResets,
+) {
+    {
+        let memo = state.claude_resets_memo.lock().unwrap();
+        assert_eq!(memo.last_read_at.get(name), Some(&at), "the attempt's hour");
+        assert!(!memo.due.contains(name), "the attempt consumed the mark");
+    }
+    let logged = lines.snapshot();
+    let quoted = format!("'{name}'");
+    let named: Vec<&String> = logged.iter().filter(|l| l.contains(&quoted)).collect();
+    assert_eq!(named.len(), 1, "one line names the account: {logged:?}");
+    assert_eq!(stub.reads(), 0, "no request went out");
+    assert!(!state.status.lock().unwrap().contains_key(name));
+    assert!(!state.activity.lock().unwrap().contains_key(name));
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(!file.exists(), "no reading landed");
+}
+
+/// A worker that panics counts as a failed read, on the reap's panic arm.
+#[test]
+fn a_panicked_resets_read_dates_the_hour_with_one_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lrk1", "lrk1-tok");
+    crate::testutil::register_names(&["lrk1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrk1".to_string());
+
+    let _armed = super::probe_panic::arm_panic_at("lrk1", || {});
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_at(&state, t);
+    drop(capture);
+
+    assert_resets_attempt_dated(&state, "lrk1", t, &lines, &stub);
+    drop(endpoints);
+}
+
+/// A worker that could not start counts as a failed read too, on the spawn's
+/// `Err` arm.
+#[test]
+fn a_resets_read_that_cannot_start_dates_the_hour_with_one_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let p = save_unanchored_login("lrs1", "lrs1-tok");
+    crate::testutil::register_names(&["lrs1"]);
+    let stub = ParkedResets::new();
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let t = 1_900_000_000_000;
+    state
+        .claude_resets_memo
+        .lock()
+        .unwrap()
+        .due
+        .insert("lrs1".to_string());
+
+    let _armed = super::probe_spawn_fail::arm_at("lrs1");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_at(&state, t);
+    drop(capture);
+
+    assert_resets_attempt_dated(&state, "lrs1", t, &lines, &stub);
+    drop(endpoints);
+}
+
+// ── a failed side read says so once; a refusal retries on the poll's ladder ──
+
+/// One side-read reply: status, response headers, body.
+type ResetsReply = (u16, Vec<(String, String)>, String);
+
+/// The edge refusal's shape: a 429 carrying `retry-after` (seconds) when set.
+fn resets_429(retry_after: Option<u64>) -> ResetsReply {
+    let headers = retry_after
+        .map(|secs| vec![("retry-after".to_string(), secs.to_string())])
+        .unwrap_or_default();
+    (
+        429,
+        headers,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}"#
+            .to_string(),
+    )
+}
+
+/// What [`drive_resets_reads`] saw: per tick, the side reads sent so far and
+/// the lines naming the account that pass raised; then whether a reading
+/// landed.
+type ResetsRun = (Vec<(usize, Vec<String>)>, bool);
+
+/// Drives `name`'s side read at each instant of `ticks` (virtual epoch ms)
+/// against `base`, each pass under its own log capture.
+fn drive_resets_ticks(
+    home: &crate::testutil::HomeSandbox,
+    name: &str,
+    base: &str,
+    ticks: &[u64],
+    reads: impl Fn() -> usize,
+) -> ResetsRun {
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(home, base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for &at in ticks {
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads(), named));
+    }
+    let landed = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("path")
+    .exists();
+    drop(endpoints);
+    (seen, landed)
+}
+
+/// [`drive_resets_ticks`] against a stub answering the `i`-th side read with
+/// `reply(i)`. The stub's budget sits one above the reads the ticks can send,
+/// so a read past the expected ones is counted rather than refused.
+fn drive_resets_reads(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+) -> ResetsRun {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let run = drive_resets_ticks(&home, name, &base, ticks, || reads.load(Ordering::SeqCst));
+    let _ = server.join().expect("listener");
+    run
+}
+
+/// The line a side read refused on the poll's ladder raises.
+fn refused_line(name: &str, status: u16, retry_after: Option<u64>, next_secs: u64) -> String {
+    let hint = retry_after.map_or_else(
+        || "no Retry-After".to_string(),
+        |s| format!("Retry-After {s}s"),
+    );
+    format!(
+        "clauth: '{name}': the limit reset read got HTTP {status} ({hint}); next read in {next_secs}s"
+    )
+}
+
+const RESETS_T: u64 = 1_900_000_000_000;
+
+/// A 429 on the side read says so in one line naming the account, the status
+/// and the server's Retry-After, lands no reading, and its next read waits
+/// out that Retry-After (754 s, above the ladder's first 100 s rung).
+#[test]
+fn a_refused_side_read_names_the_account_status_and_retry_after_once() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf1", &[t, t + 753_999, t + 754_000], |_| {
+        resets_429(Some(754))
+    });
+    assert_eq!(
+        seen,
+        vec![
+            (1, vec![refused_line("lrf1", 429, Some(754), 754)]),
+            (1, vec![]),
+            (2, vec![refused_line("lrf1", 429, Some(754), 754)]),
+        ]
+    );
+    assert!(!landed, "a refused read lands no reading");
+}
+
+/// A 429 whose Retry-After names no wait (`/usage` sends `0` on every 429)
+/// retries on the poll's own ladder at the poll's 90 s interval, never the
+/// hour: `next_slot_deferral` gives a gap of interval + 10 s, 30 s, 90 s, then
+/// the #74 floor's 300 s, rung by consecutive refusal.
+#[test]
+fn a_refused_side_read_retries_on_the_polls_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,
+        t + 99_999,
+        t + 100_000,
+        t + 219_999,
+        t + 220_000,
+        t + 399_999,
+        t + 400_000,
+        t + 699_999,
+        t + 700_000,
+    ];
+    let (seen, landed) = drive_resets_reads("lrf2", &ticks, |_| resets_429(Some(0)));
+    let line = |next| vec![refused_line("lrf2", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(100)),
+            (1, vec![]),
+            (2, line(120)),
+            (2, vec![]),
+            (3, line(180)),
+            (3, vec![]),
+            (4, line(300)),
+            (4, vec![]),
+            (5, line(300)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// A Retry-After longer than the ladder's rung sets the gap, up to the poll's
+/// 15-minute `MAX_RETRY_AFTER_MS` cap. The line prints the hint as the poll's
+/// parser reads it, so a header past the cap prints the cap.
+#[test]
+fn a_long_retry_after_sets_the_next_side_read_up_to_the_cap() {
+    let t = RESETS_T;
+    let (seen, _) = drive_resets_reads("lrf3", &[t, t + 599_999, t + 600_000], |_| {
+        resets_429(Some(600))
+    });
+    let line = vec![refused_line("lrf3", 429, Some(600), 600)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+
+    let (seen, _) = drive_resets_reads("lrf4", &[t, t + 899_999, t + 900_000], |_| {
+        resets_429(Some(3600))
+    });
+    let line = vec![refused_line("lrf4", 429, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+}
+
+/// A 5xx is a refusal too: it retries on the same ladder, and its line says
+/// when the server named no Retry-After.
+#[test]
+fn a_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lrf5", &[t, t + 99_999, t + 100_000], |_| {
+        (503, Vec::new(), "upstream unavailable".to_string())
+    });
+    let line = vec![refused_line("lrf5", 503, None, 100)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A side read that gets no answer (here a refused connect) retries on the
+/// ladder like a 429, naming no status.
+#[test]
+fn an_unanswered_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lrf6", &base, &[t, t + 99_999, t + 100_000], || 0);
+    let line =
+        vec!["clauth: 'lrf6': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(
+        seen,
+        vec![(0, line.clone()), (0, vec![]), (0, line)],
+        "one line per attempt, the second on the ladder's first rung"
+    );
+    assert!(!landed);
+}
+
+/// A 401, any other 4xx and a body clauth cannot read are no refusal: each
+/// says so in one line and keeps the full hour.
+#[test]
+fn a_rejected_or_unreadable_side_read_keeps_the_hour_with_one_line() {
+    let t = RESETS_T;
+    let ticks = [t, t + 3_599_999, t + 3_600_000];
+    let cases: [(&str, ResetsReply, &str); 3] = [
+        (
+            "lrh1",
+            (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+            "the limit reset read got HTTP 401",
+        ),
+        (
+            "lrh2",
+            (
+                403,
+                vec![("retry-after".to_string(), "5".to_string())],
+                String::new(),
+            ),
+            "the limit reset read got HTTP 403",
+        ),
+        (
+            "lrh3",
+            (200, Vec::new(), "not json".to_string()),
+            "the limit reset read answered in a shape clauth does not read",
+        ),
+    ];
+    for (name, reply, what) in cases {
+        let (seen, landed) = drive_resets_reads(name, &ticks, move |_| reply.clone());
+        let line = vec![format!("clauth: '{name}': {what}; next read in 3600s")];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// The ladder's rung counts consecutive refusals: a landed read, or a failure
+/// that keeps the hour, starts the next refusal back on the first rung.
+#[test]
+fn a_landed_or_hour_keeping_read_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let ticks = [
+        t,             // 429: rung 1, 100 s
+        t + 100_000,   // 429: rung 2, 120 s
+        t + 220_000,   // 200: lands, the hour
+        t + 3_820_000, // 429: rung 1 again
+        t + 3_920_000, // 429: rung 2
+        t + 4_040_000, // 401: the hour
+        t + 7_640_000, // 429: rung 1 again
+        t + 7_739_999,
+        t + 7_740_000, // 429: rung 2
+    ];
+    let (seen, landed) = drive_resets_reads("lrl1", &ticks, |i| match i {
+        2 => (200, Vec::new(), CEDAR_EMBER_THREE_GRANTS.to_string()),
+        5 => (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string()),
+        _ => resets_429(Some(0)),
+    });
+    let refused = |next| vec![refused_line("lrl1", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![]),
+            (4, refused(100)),
+            (5, refused(120)),
+            (
+                6,
+                vec![
+                    "clauth: 'lrl1': the limit reset read got HTTP 401; next read in 3600s"
+                        .to_string()
+                ]
+            ),
+            (7, refused(100)),
+            (7, vec![]),
+            (8, refused(120)),
+        ]
+    );
+    assert!(landed, "the 200 landed its reading");
+}
+
+// ── a refusal's retry: the cases the ladder's own rules leave open ──
+
+/// [`drive_resets_reads`] with `before(state, i)` run ahead of the `i`-th
+/// tick, so a case can set or forget the memo between passes.
+fn drive_resets_reads_with(
+    name: &str,
+    ticks: &[u64],
+    reply: impl Fn(usize) -> ResetsReply + Send + 'static,
+    before: impl Fn(&super::SchedulerState, usize),
+) -> Vec<(usize, Vec<String>)> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(ticks.len() + 1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path == CEDAR_EMBER_READ {
+                reply(reads.fetch_add(1, Ordering::SeqCst))
+            } else {
+                (404, Vec::new(), String::new())
+            }
+        }
+    });
+    let p = save_unanchored_login(name, &format!("{name}-tok"));
+    crate::testutil::register_names(&[name]);
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = resets_state(vec![p]);
+    let quoted = format!("'{name}'");
+    let mut seen = Vec::new();
+    for (i, &at) in ticks.iter().enumerate() {
+        before(&state, i);
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+        super::claude_resets_tick_at(&state, at);
+        drop(capture);
+        let named: Vec<String> = lines
+            .snapshot()
+            .into_iter()
+            .filter(|l| l.contains(&quoted))
+            .collect();
+        seen.push((reads.load(Ordering::SeqCst), named));
+    }
+    drop(endpoints);
+    let _ = server.join().expect("listener");
+    seen
+}
+
+/// A 401's Retry-After is no refusal's hint: the hour holds, and the line
+/// names no Retry-After.
+#[test]
+fn a_401_carrying_a_retry_after_still_keeps_the_hour() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro1", &[t, t + 3_599_999, t + 3_600_000], |_| {
+        (
+            401,
+            vec![("retry-after".to_string(), "5".to_string())],
+            r#"{"error":"unauthorized"}"#.to_string(),
+        )
+    });
+    let line =
+        vec!["clauth: 'lro1': the limit reset read got HTTP 401; next read in 3600s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A 5xx whose Retry-After asks past the poll's 15-minute cap retries at the
+/// cap, its line printing the hint as the poll's parser reads it.
+#[test]
+fn a_server_error_asking_past_the_cap_retries_at_the_cap() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads("lro2", &[t, t + 899_999, t + 900_000], |_| {
+        (
+            503,
+            vec![("retry-after".to_string(), "3600".to_string())],
+            "upstream unavailable".to_string(),
+        )
+    });
+    let line = vec![refused_line("lro2", 503, Some(900), 900)];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+}
+
+/// A refused read a due mark brought forward consumes the mark like any
+/// attempt, and its retry waits for the ladder's rung, not the next pass.
+#[test]
+fn a_refused_due_marked_read_consumes_the_mark_and_waits_for_its_rung() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro3",
+        &[t, t + 99_999, t + 100_000],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 0 {
+                let mut memo = state.claude_resets_memo.lock().unwrap();
+                memo.last_read_at.insert("lro3".to_string(), t - 60_000);
+                memo.due.insert("lro3".to_string());
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro3", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (1, vec![]), (2, line(120))]);
+}
+
+/// A memo forget drops a pending retry with its rung: the account reads on
+/// the next pass, and a refusal there starts on the ladder's first rung.
+#[test]
+fn a_forget_restarts_the_side_reads_ladder() {
+    let t = RESETS_T;
+    let seen = drive_resets_reads_with(
+        "lro4",
+        &[t, t + 100_000, t + 100_001],
+        |_| resets_429(Some(0)),
+        |state, i| {
+            if i == 2 {
+                state.claude_resets_memo.lock().unwrap().forget("lro4");
+            }
+        },
+    );
+    let line = |next| vec![refused_line("lro4", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(100)), (2, line(120)), (3, line(100))]);
+}
+
+/// Only a 429 moves the side read up a rung, as only a 429 moves the poll's:
+/// a 5xx between two 429s retries on the rung as it stands, and the 429 after
+/// it climbs from there.
+#[test]
+fn a_server_error_between_429s_holds_the_rung() {
+    let t = RESETS_T;
+    let (seen, landed) = drive_resets_reads(
+        "lro5",
+        &[t, t + 100_000, t + 220_000, t + 339_999, t + 340_000],
+        |i| match i {
+            2 => (503, Vec::new(), "upstream unavailable".to_string()),
+            _ => resets_429(Some(0)),
+        },
+    );
+    let refused = |next| vec![refused_line("lro5", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, refused(100)),
+            (2, refused(120)),
+            (3, vec![refused_line("lro5", 503, None, 120)]),
+            (3, vec![]),
+            (4, refused(180)),
+        ]
+    );
+    assert!(!landed);
+}
+
+/// Every 5xx is a refusal: the range's ends and the edge's own 502 retry on
+/// the ladder's first rung like the 503 above.
+#[test]
+fn every_server_error_on_the_side_read_retries_on_the_ladder() {
+    let t = RESETS_T;
+    for (name, status) in [("lro6", 500u16), ("lro7", 502), ("lro8", 599)] {
+        let (seen, landed) = drive_resets_reads(name, &[t, t + 99_999, t + 100_000], move |_| {
+            (status, Vec::new(), String::new())
+        });
+        let line = vec![refused_line(name, status, None, 100)];
+        assert_eq!(
+            seen,
+            vec![(1, line.clone()), (1, vec![]), (2, line)],
+            "{name}"
+        );
+        assert!(!landed, "{name}");
+    }
+}
+
+/// A 200 whose body is cut off mid-read got no whole answer: it retries on
+/// the ladder like a refused connect.
+#[test]
+fn a_side_read_cut_off_mid_body_retries_on_the_ladder() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let t = RESETS_T;
+    let home = crate::testutil::HomeSandbox::new();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server = std::thread::spawn({
+        let reads = Arc::clone(&reads);
+        move || {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                crate::testutil::read_request_head(&mut sock);
+                reads.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"cedar",
+                );
+            }
+        }
+    });
+    let (seen, landed) =
+        drive_resets_ticks(&home, "lro9", &base, &[t, t + 99_999, t + 100_000], || {
+            reads.load(Ordering::SeqCst)
+        });
+    let line =
+        vec!["clauth: 'lro9': the limit reset read got no answer; next read in 100s".to_string()];
+    assert_eq!(seen, vec![(1, line.clone()), (1, vec![]), (2, line)]);
+    assert!(!landed);
+    server.join().expect("listener");
+}
+
+/// The ladder rides the poll's own `refresh_interval`, never the default: at
+/// 10 s the rungs are 20 s, 40 s, 100 s and 280 s (interval + 10 s, 30 s,
+/// 90 s, 270 s, under the #74 floor's 300 s); at 30 min, past the 15-minute
+/// cap, a refusal waits exactly one interval.
+#[test]
+fn a_refused_side_read_rides_the_polls_own_refresh_interval() {
+    use std::sync::atomic::Ordering;
+    let t = RESETS_T;
+    let at = |interval: u64| {
+        move |state: &super::SchedulerState, i: usize| {
+            if i == 0 {
+                state.refresh_interval.store(interval, Ordering::Relaxed);
+            }
+        }
+    };
+
+    let seen = drive_resets_reads_with(
+        "lro10",
+        &[t, t + 19_999, t + 20_000, t + 60_000, t + 160_000],
+        |_| resets_429(Some(0)),
+        at(10_000),
+    );
+    let line = |next| vec![refused_line("lro10", 429, Some(0), next)];
+    assert_eq!(
+        seen,
+        vec![
+            (1, line(20)),
+            (1, vec![]),
+            (2, line(40)),
+            (3, line(100)),
+            (4, line(280))
+        ]
+    );
+
+    let seen = drive_resets_reads_with(
+        "lro11",
+        &[t, t + 1_799_999, t + 1_800_000],
+        |_| resets_429(Some(0)),
+        at(1_800_000),
+    );
+    let line = |next| vec![refused_line("lro11", 429, Some(0), next)];
+    assert_eq!(seen, vec![(1, line(1800)), (1, vec![]), (2, line(1800))]);
+}
+
+// ── a tick that resumes after its instance lost the lease applies nothing ────
+
+static LEASE_LOSS_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static LEASE_LOSS_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn lease_loss_fetcher(
+    _target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    LEASE_LOSS_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (lock, cvar) = &LEASE_LOSS_GATE;
+    let guard = lock.lock().unwrap();
+    let _released = cvar
+        .wait_timeout_while(guard, std::time::Duration::from_secs(30), |open| !*open)
+        .unwrap();
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// A scheduler state whose one third-party profile, `stalled`, is persisted
+/// to `config.toml` and registered, so the landing's section-1 identity
+/// compare matches and its cache write is not a no-op: a reading from
+/// `fetcher` lands unless a lease check refuses it.
+fn lease_loss_state(fetcher: ThirdPartyFetcher, url: &str) -> super::SchedulerState {
+    let state = third_party_state(fetcher);
+    let profile = crate::profile::Profile::new(
+        "stalled".to_string(),
+        Some(url.to_string()),
+        Some("key".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("persist the stalled profile");
+    crate::testutil::register_names(&["stalled"]);
+    state.config.lock().unwrap().profiles.push(profile);
+    *state.third_party_tokens.lock().unwrap() = vec![join_order_entry("stalled", url)];
+    state
+}
+
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_lands_nothing() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *LEASE_LOSS_GATE.0.lock().unwrap() = false;
+    LEASE_LOSS_ENTERED.store(false, Ordering::SeqCst);
+
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (lock, cvar) = &LEASE_LOSS_GATE;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    let url = "https://stalled.lease-loss.example";
+    let state = lease_loss_state(lease_loss_fetcher, url);
+
+    std::thread::scope(|scope| {
+        let release = Release;
+        let ticking = scope.spawn(|| super::tick(&state));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !LEASE_LOSS_ENTERED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the tick never reached the fetch"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The tick is stalled inside the fetch; its instance loses the lease.
+        assert!(
+            state.fetch_lease.release_if_stale(
+                crate::usage::now_ms() + 10 * 60 * 1000,
+                Duration::from_secs(5 * 60)
+            ),
+            "the stalled holder drops the lease"
+        );
+        let waiter = crate::daemon::FetchLease::new();
+        assert!(waiter.acquire(), "a standby takes the dropped lease");
+
+        drop(release);
+        ticking.join().expect("the tick thread returns");
+    });
+
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("stalled"),
+        "a tick resumed after losing the lease writes no reading"
+    );
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("stalled"))
+            .expect("profile dir")
+            .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE)
+            .exists(),
+        "a tick resumed after losing the lease writes no cache"
+    );
+}
+
+/// Opens [`LEASE_LOSS_GATE`] on drop, so a failed assertion never leaves the
+/// stalled fetch parked.
+struct OpenLeaseLossGate;
+
+impl Drop for OpenLeaseLossGate {
+    fn drop(&mut self) {
+        let (lock, cvar) = &LEASE_LOSS_GATE;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+}
+
+/// Park the test thread until `entered` reads true: the tick under test has
+/// reached the request it stalls in.
+fn await_stall(entered: &std::sync::atomic::AtomicBool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tick never reached the stalled request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// [`lease_loss_state`] with the chain's one member `b` reading recovered after
+/// a switch-off: a tick that keeps the lease queues a relink onto it.
+fn recovery_lease_loss_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    let state = lease_loss_state(fetcher, "https://stalled.lease-loss.example");
+    {
+        let mut config = state.config.lock().unwrap();
+        config.state.fallback_chain = vec!["b".into()];
+        config.profiles.push(logged_in("b"));
+    }
+    let recovered = recoverable_store().lock().unwrap().clone();
+    *state.store.lock().unwrap() = recovered;
+    state
+        .status
+        .lock()
+        .unwrap()
+        .insert("b".to_string(), super::FetchStatus::Fresh);
+    state
+}
+
+/// The chain's one member reads recovered after a switch-off, so a tick that
+/// keeps the lease queues a relink onto it; the same tick resumed after its
+/// instance lost the lease must queue nothing.
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_queues_no_switch() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    *LEASE_LOSS_GATE.0.lock().unwrap() = false;
+    LEASE_LOSS_ENTERED.store(false, Ordering::SeqCst);
+    // A tick that ran past its guards reaches the resets side read for the due
+    // account `b`; the stub answers it, so such a tick ends at the assertion.
+    let (base, _server) =
+        crate::testutil::serve_endpoints(4, |_, _| (200, CEDAR_EMBER_THREE_GRANTS.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+
+    let state = recovery_lease_loss_state(lease_loss_fetcher);
+
+    std::thread::scope(|scope| {
+        let open = OpenLeaseLossGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&LEASE_LOSS_ENTERED);
+        // The tick is stalled inside the fetch; its instance loses the lease.
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        );
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+
+    assert!(
+        state.pending_switch.lock().unwrap().is_empty(),
+        "a tick resumed after losing the lease queues no switch"
+    );
+}
+
+static ROTATION_STALL_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static ROTATION_STALL_ENTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Opens [`ROTATION_STALL_GATE`] on drop.
+struct OpenRotationStallGate;
+
+impl Drop for OpenRotationStallGate {
+    fn drop(&mut self) {
+        let (lock, cvar) = &ROTATION_STALL_GATE;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+}
+
+/// The `/usage` poll stalls, then answers 401: a tick that kept the lease
+/// claims a rotation spend on that answer; the same tick resumed after its
+/// instance lost the lease must claim none and send no refresh token.
+#[test]
+fn a_tick_that_resumes_after_losing_the_lease_starts_no_rotation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-rotation";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+    let claimed = Arc::new(AtomicBool::new(false));
+    {
+        let claimed = Arc::clone(&claimed);
+        super::set_claimed_rotation_hook(
+            name,
+            Arc::new(move || claimed.store(true, Ordering::SeqCst)),
+        );
+    }
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        // The poll is stalled on the wire; its instance loses the lease.
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        );
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !claimed.load(Ordering::SeqCst),
+        "a tick resumed after losing the lease claims no rotation spend"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a tick resumed after losing the lease sends no refresh token: {seen:?}"
+    );
+}
+
+// ── every guard a lost lease reaches is bound on its own ─────────────────────
+
+/// Release `lease` the way the watchdog does for a holder whose last tick is
+/// past its bound.
+fn release_as_the_watchdog(lease: &crate::daemon::FetchLease) {
+    let bound = std::time::Duration::from_secs(5 * 60);
+    assert!(
+        lease.release_if_stale(crate::usage::now_ms() + 2 * bound.as_millis() as u64, bound),
+        "fixture control: the watchdog releases the holder"
+    );
+}
+
+/// A third-party fetcher that answers at once with an empty reading.
+fn lease_kept_fetcher(
+    _target: &crate::providers::ThirdPartyTarget,
+    _key: &str,
+    _hint: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(crate::testutil::stats_with_bars(Vec::new()))
+}
+
+/// The stalled fixture of the lands-nothing test, with the lease kept: the
+/// reading lands in the store and the cache. This is what makes the
+/// lands-nothing test's absences mean the lease, not the fixture.
+#[test]
+fn a_tick_that_keeps_the_lease_lands_the_stalled_third_party_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = lease_loss_state(lease_kept_fetcher, "https://stalled.lease-loss.example");
+
+    super::tick(&state);
+
+    assert!(
+        state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key("stalled"),
+        "a tick that keeps the lease writes the reading"
+    );
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("stalled"))
+            .expect("profile dir")
+            .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE)
+            .exists(),
+        "a tick that keeps the lease writes the cache"
+    );
+}
+
+/// The recovery fixture of the queues-no-switch test, with the lease kept: the
+/// relink onto `b` is queued.
+#[test]
+fn a_tick_that_keeps_the_lease_queues_the_recovery_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // The merged tick's resets side read resolves the usage endpoint on a pass
+    // with a due OAuth account (the recovered member `b`); the stub answers it
+    // so the tick completes.
+    let (base, server) =
+        crate::testutil::serve_endpoints(4, |_, _| (200, CEDAR_EMBER_THREE_GRANTS.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let state = recovery_lease_loss_state(lease_kept_fetcher);
+
+    super::tick(&state);
+    let _ = server.join().expect("listener");
+
+    assert!(
+        state
+            .pending_switch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.target == "b"),
+        "a tick that keeps the lease queues the relink onto b"
+    );
+}
+
+/// The OAuth landing's own hold: a ticket spent before the landing starts must
+/// write no usage cache, whatever the check after the hold says.
+#[test]
+fn an_oauth_landing_under_a_spent_ticket_writes_no_usage_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let pn = crate::profile::ProfileName::from("a");
+    let lease = crate::daemon::FetchLease::new();
+
+    land_reading_after_a_reset_under(
+        "a",
+        reset_info(0.0, None),
+        true,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &pn,
+            crate::profile_cache::USAGE_CACHE_FILE
+        )
+        .is_none(),
+        "a landing under a spent ticket wrote the usage cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    land_reading_after_a_reset_under("a", reset_info(0.0, None), true, Some(current));
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &pn,
+            crate::profile_cache::USAGE_CACHE_FILE
+        )
+        .is_some(),
+        "control: the same landing under a current ticket writes the cache"
+    );
+}
+
+/// A landing that loses the lease after its last check still must not clear a
+/// credit refusal: the clear takes the state flock on its own and re-checks.
+#[test]
+fn an_oauth_landing_that_loses_the_lease_after_its_check_clears_no_credit_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a", "c"]);
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+
+    record_refusal("a", 3 * 3_600_000);
+    let current = lease.acquire_ticket().expect("take the fetch lease");
+    land_reading_after_a_reset_under("a", reset_info(0.0, None), true, Some(current));
+    assert!(
+        refusal_on("a").is_none(),
+        "control: a landing that keeps the lease clears the refusal"
+    );
+
+    // A clear floors its member's record, so the lost-lease landing runs on a
+    // member the control left alone.
+    record_refusal("c", 3 * 3_600_000);
+    let ticket = lease.acquire_ticket().expect("hold the fetch lease");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::AfterLanding, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+    land_reading_after_a_reset_under("c", reset_info(0.0, None), true, Some(ticket));
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the landing reached the seam"
+    );
+    assert!(
+        refusal_on("c").is_some(),
+        "a landing that lost the lease cleared the credit refusal"
+    );
+}
+
+/// [`scan_sessions`] under a fetch tick's lease ticket.
+fn scan_sessions_leased(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        None,
+        lease,
+    );
+}
+
+/// The batch that points a session at a member runs under the state flock, and
+/// checks the ticket there: a scan with a spent ticket writes no decision.
+#[test]
+fn a_session_scan_under_a_spent_ticket_points_no_session_at_a_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let config = session_config(&["a", "b"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+    let lease = crate::daemon::FetchLease::new();
+
+    scan_sessions_leased(
+        &config,
+        &store,
+        &status,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a scan under a spent ticket pointed the session at a member"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    scan_sessions_leased(&config, &store, &status, Some(current));
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "control: the same scan under a current ticket points the session at b"
+    );
+}
+
+/// The credit refusal a session's spend-cap 429 earns is a shared record: a
+/// scan with a spent ticket writes none, a current one records it on `a`.
+#[test]
+fn a_session_scan_under_a_spent_ticket_records_no_credit_refusal() {
+    let now = crate::usage::now_ms();
+    let home = crate::testutil::HomeSandbox::new();
+    let config = session_config_models(&["a", "b"], &[], &[]);
+    let store = credit_store(&["a", "b"], &["a", "b"]);
+    let status = all_fresh(&["a", "b"]);
+    let _marker = spend_cap_order_row(&home);
+    let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
+    write_conv(&home, "conv-a", std::slice::from_ref(&cap));
+    super::tps_producer_tick(now);
+    let lease = crate::daemon::FetchLease::new();
+
+    scan_sessions_leased(
+        &config,
+        &store,
+        &status,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert!(
+        refusal_on("a").is_none(),
+        "a scan under a spent ticket recorded a credit refusal"
+    );
+
+    write_conv(
+        &home,
+        "conv-a",
+        &[cap, spend_cap_row_uuid_at(now - 590_000, "cap-2")],
+    );
+    super::tps_producer_tick(now + 1_000);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    scan_sessions_leased(&config, &store, &status, Some(current));
+    assert!(
+        refusal_on("a").is_some(),
+        "control: the same 429 under a current ticket goes on record"
+    );
+}
+
+/// The recovery scan queues its relink under the `pending_switch` lock and
+/// checks the ticket there.
+#[test]
+fn a_recovery_scan_under_a_spent_ticket_queues_no_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lease = crate::daemon::FetchLease::new();
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+            "b".to_string(),
+            super::FetchStatus::Fresh,
+        )])));
+        let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        super::scan_recovery_leased(
+            &recovery_config(None, &["b"]),
+            &recoverable_store(),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            Some(ticket),
+        );
+        pending.lock().unwrap().clone()
+    };
+
+    assert!(
+        scan(crate::testutil::spent_lease_ticket(&lease)).is_empty(),
+        "a recovery scan under a spent ticket queued a switch"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert_eq!(
+        scan(current),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
+        "control: the same scan under a current ticket queues the relink onto b"
+    );
+}
+
+/// The re-stamp leg spends a refresh token: a tick that loses the lease just
+/// before it leaves the due sidecar alone.
+#[test]
+fn a_tick_that_loses_the_lease_before_the_rolling_leg_restamps_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, "http://127.0.0.1:9");
+    let state = rolling_tick_state("cl-tick-lost");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    super::tick(&state);
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the tick reached the seam"
+    );
+    assert_eq!(
+        sidecar_access_token("cl-tick-lost").as_deref(),
+        Some("cl-tick-lost-rolled"),
+        "a tick that lost the lease re-stamped the sidecar"
+    );
+}
+
+/// The codex standby leg spends a single-use refresh token: a tick that loses
+/// the lease just before it writes no attempt memo and sends no refresh.
+#[test]
+fn a_tick_that_loses_the_lease_before_the_standby_leg_refreshes_no_codex_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| {
+        (
+            200,
+            r#"{"id_token":"id.n","access_token":"at.n","refresh_token":"rt.new"}"#.to_string(),
+        )
+    });
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-tick-lost");
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let reached = Arc::clone(&reached);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst),
+        "fixture control: the tick reached the seam"
+    );
+    let seen = handle.join().expect("join stub");
+    assert!(
+        seen.is_empty(),
+        "a tick that lost the lease sent a codex refresh: {seen:?}"
+    );
+    assert!(
+        !codex_attempt_memo_exists("cx-tick-lost"),
+        "a tick that lost the lease wrote the codex attempt memo"
+    );
+}
+
+/// The tps leg publishes the shared cache only while the ticket is current.
+#[test]
+fn a_tps_leg_under_a_spent_ticket_publishes_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let cache = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join(crate::tps::TPS_CACHE_FILE);
+    let lease = crate::daemon::FetchLease::new();
+    let now = crate::usage::now_ms();
+
+    super::tps_producer_tick_leased(now, Some(crate::testutil::spent_lease_ticket(&lease)));
+    assert!(
+        !cache.exists(),
+        "a tps leg under a spent ticket published the cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::tps_producer_tick_leased(now + 1_000, Some(current));
+    assert!(
+        cache.exists(),
+        "control: the same leg under a current ticket publishes the cache"
+    );
+}
+
+/// The scheduler thread stamps the lease clock after each tick it completed,
+/// never before: the watchdog ages a tick thread that stops completing.
+#[test]
+fn the_scheduler_thread_stamps_the_lease_after_a_completed_tick() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    assert!(state.fetch_lease.acquire(), "take the fetch lease");
+    state.fetch_lease.stamp_tick(1);
+    let mid_tick = Arc::new(AtomicU64::new(0));
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        let mid_tick = Arc::clone(&mid_tick);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            mid_tick.store(lease.last_tick_ms(), Ordering::SeqCst);
+        });
+    }
+    let before = crate::usage::now_ms();
+
+    super::tick_and_stamp(&state);
+
+    assert_eq!(
+        mid_tick.load(Ordering::SeqCst),
+        1,
+        "the stamp is not moved before the tick completes"
+    );
+    assert!(
+        state.fetch_lease.last_tick_ms() >= before,
+        "a completed tick stamps the lease clock"
+    );
+}
+
+/// Run one kick against a 401-then-200 `/v1/messages` and a token endpoint that
+/// answers a fresh pair, under a gate holding `lease`'s ticket. The token
+/// handler releases the lease first when `lose_at_token` is set, standing for a
+/// watchdog release while the refresh was on the wire. Returns the endpoint
+/// paths the kick reached and its result.
+fn kick_under_lease(
+    home: &crate::testutil::HomeSandbox,
+    name: &str,
+    lease: &Arc<crate::daemon::FetchLease>,
+    ticket: crate::daemon::LeaseTicket<'_>,
+    lose_at_token: bool,
+) -> (Vec<String>, crate::oauth::KickResult) {
+    let handler_lease = Arc::clone(lease);
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, i| {
+        if path.starts_with("/v1/messages") {
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else if path.starts_with("/v1/oauth/token") {
+            if lose_at_token {
+                release_as_the_watchdog(&handler_lease);
+            }
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    (server.join().expect("listener"), result)
+}
+
+/// A kick opens a window on the account: a fetch tick that already lost the
+/// lease sends none, and one that keeps it does.
+#[test]
+fn a_kick_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+    let (seen, result) = kick_under_lease(&home, "kick-spent", &lease, spent, false);
+    assert!(
+        seen.is_empty(),
+        "a kick under a spent ticket reached the wire: {seen:?}"
+    );
+    assert!(!result.opened, "a refused kick opens nothing");
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let (seen, _) = kick_under_lease(&home, "kick-current", &lease, current, false);
+    assert!(
+        seen.first().is_some_and(|p| p.starts_with("/v1/messages")),
+        "control: a kick under a current ticket sends its POST: {seen:?}"
+    );
+}
+
+/// A tick that loses the lease while its refresh is on the wire keeps the
+/// minted pair (it is already landed and rides back) but sends no retry kick.
+#[test]
+fn a_kick_whose_tick_loses_the_lease_during_the_refresh_sends_no_retry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let (seen, result) = kick_under_lease(&home, "kick-lost", &lease, ticket, true);
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "a tick that lost the lease sent the retry kick: {seen:?}"
+    );
+    assert!(
+        result.rotated.is_some(),
+        "the minted pair is kept and returned"
+    );
+    assert!(!result.opened, "no retry kick, so no window opened");
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let (seen, result) = kick_under_lease(&home, "kick-kept", &lease, current, false);
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        2,
+        "control: a tick that keeps the lease sends the retry kick: {seen:?}"
+    );
+    assert!(result.opened, "control: the retry kick opens the window");
+}
+
+// ── every last-line lease guard refuses a spent ticket ─────────────────────
+
+/// The kick's section-1 write: a 429 that comes back while the tick's lease is
+/// spent leaves no durable block. The block is a shared file the next holder
+/// reads as a live limiter verdict, so the stale tick writes neither it nor the
+/// memory copy that rides the same landing.
+#[test]
+fn a_kick_whose_429_arrives_after_the_lease_is_spent_writes_no_kick_block() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::AtomicBool;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["k"]);
+    let now_before = crate::usage::now_epoch_secs();
+    let reset = now_before + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, now_before + 383_473);
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let handler_lease = Arc::clone(&lease);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(8, move |path, i| {
+        if path.starts_with("/v1/messages") {
+            if i == 0 {
+                // The watchdog releases the lease while the 429 is on the wire.
+                release_as_the_watchdog(&handler_lease);
+            }
+            (429, limiter.clone(), String::new())
+        } else if path.starts_with("/api/oauth/") {
+            (200, Vec::new(), "{}".to_string())
+        } else {
+            (404, Vec::new(), "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("k")],
+    };
+    crate::profile::save_profile(&app_config.profiles[0]).expect("save profile");
+    let entry = collect_one_token_for_landing(&app_config);
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "k".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(reset)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = crate::testutil::fresh_activity();
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([ProfileName::from("k")])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let shutting_down = AtomicBool::new(false);
+    let hosts: HashSet<String> = HashSet::new();
+    let run = |entry: super::TokenEntry, ticket: crate::daemon::LeaseTicket<'_>| {
+        let _ = super::run_fetch_flagged(
+            &config,
+            entry,
+            &store,
+            &refetch,
+            &activity,
+            &streaks,
+            &blocks,
+            &weekly_reset_kicks,
+            &hosts,
+            &queue,
+            REFRESH_INTERVAL_MS,
+            None,
+            crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+        );
+    };
+    let block_path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("k"),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+    );
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    run(entry.clone(), ticket);
+    assert!(
+        block_path.as_ref().is_some_and(|p| !p.exists()),
+        "a kick that lost the lease on its 429 wrote kick_block.json"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    run(entry, current);
+    assert!(
+        block_path.as_ref().is_some_and(|p| p.exists()),
+        "control: a kick that kept the lease writes kick_block.json"
+    );
+    let _ = server.join().expect("listener");
+}
+
+/// The codex usage leg's loop-top check: a ticket spent before the first account
+/// polls sends no request at all.
+#[test]
+fn a_codex_poll_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-spent-request";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = crate::daemon::FetchLease::new();
+    let state = completion_order_state();
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        crate::usage::set_codex_usage_url_override(&base);
+        crate::usage::reset_request_slots();
+        super::codex_usage_tick_flagged(
+            &state,
+            None,
+            Some(crate::testutil::spent_lease_ticket(&lease)),
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) =
+        crate::testutil::serve_endpoints(1, |_path, _| (200, r#"{"plan_type":"pro"}"#.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    crate::usage::clear_codex_usage_url_override();
+    let seen = server.join().expect("listener");
+    assert!(
+        !seen.is_empty(),
+        "control: a poll under a current ticket sends its request"
+    );
+}
+
+/// The codex usage leg's post-fetch check: a poll that loses the lease while its
+/// request is on the wire stops before section 1's compare, so the account's
+/// reading is not applied by a tick the new holder has replaced.
+#[test]
+fn a_codex_poll_that_loses_the_lease_on_the_wire_stops_before_the_compare() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-stops-before-compare";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let handler_lease = Arc::clone(&lease);
+    let (base, server) = crate::testutil::serve_endpoints(2, move |_path, i| {
+        if i == 0 {
+            release_as_the_watchdog(&handler_lease);
+        }
+        (200, r#"{"plan_type":"pro"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let reached = Arc::new(AtomicBool::new(false));
+    {
+        let reached = Arc::clone(&reached);
+        super::set_codex_compare_hook(name, move |_| {
+            reached.store(true, Ordering::SeqCst);
+        });
+    }
+    let state = completion_order_state();
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "a poll that lost the lease on the wire went on to the section-1 compare"
+    );
+
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "control: a poll that kept the lease reaches the compare"
+    );
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+}
+
+/// The codex usage leg's in-flock cache write: a ticket spent after the fetch
+/// and before the hold writes no `usage_cache.json` for the account.
+#[test]
+fn a_codex_poll_that_loses_the_lease_before_the_cache_write_writes_no_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "cx-lost-before-cache";
+    crate::testutil::write_codex_roster(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let auth_path = crate::profile::profile_subpath(&pn, "auth.json").expect("path");
+    crate::profile::mkdir_700(auth_path.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(
+        &auth_path,
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    )
+    .expect("auth.json");
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let (base, server) =
+        crate::testutil::serve_endpoints(2, |_path, _| (200, r#"{"plan_type":"pro"}"#.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    {
+        let lease = Arc::clone(&lease);
+        super::set_codex_compare_hook(name, move |_| release_as_the_watchdog(&lease));
+    }
+    let state = completion_order_state();
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&pn, crate::profile_cache::USAGE_CACHE_FILE);
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    assert!(
+        cache_path.as_ref().is_some_and(|p| !p.exists()),
+        "a poll that lost the lease before the cache write wrote usage_cache.json"
+    );
+
+    crate::usage::reset_request_slots();
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(current));
+    assert!(
+        cache_path.as_ref().is_some_and(|p| p.exists()),
+        "control: a poll that kept the lease writes usage_cache.json"
+    );
+    crate::usage::clear_codex_usage_url_override();
+    let _ = server.join().expect("listener");
+}
+
+/// The codex walk's slot move: a ticket spent before the state-flock hold leaves
+/// the active slot where it was.
+#[test]
+fn a_codex_switch_under_a_spent_ticket_moves_no_active_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    let lease = crate::daemon::FetchLease::new();
+
+    super::apply_codex_switch_leased(
+        &state,
+        &codex,
+        REFRESH_INTERVAL_MS,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "a switch under a spent ticket moved the codex active slot"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::apply_codex_switch_leased(&state, &codex, REFRESH_INTERVAL_MS, Some(current));
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "control: a switch under a current ticket moves the slot onto the fresh member"
+    );
+}
+
+/// The codex walk's switch-off: a ticket spent before `CodexState::update`'s hold
+/// clears no active slot.
+#[test]
+fn a_codex_switch_off_under_a_spent_ticket_clears_no_active_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    let lease = crate::daemon::FetchLease::new();
+
+    super::apply_codex_switch_leased(
+        &state,
+        &codex,
+        REFRESH_INTERVAL_MS,
+        Some(crate::testutil::spent_lease_ticket(&lease)),
+    );
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "a switch-off under a spent ticket cleared the codex active slot"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::apply_codex_switch_leased(&state, &codex, REFRESH_INTERVAL_MS, Some(current));
+    assert_eq!(
+        codex_active(),
+        None,
+        "control: a switch-off under a current ticket clears the slot"
+    );
+}
+
+/// The global chain scan's queue insert: with the active at its cap and a fresh
+/// sibling available, a ticket spent before the queue's own lock queues nothing.
+#[test]
+fn an_auto_switch_scan_under_a_spent_ticket_queues_no_switch() {
+    use super::{FetchStatus, PendingSwitch, StatusStore};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(10.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![logged_in("a"), logged_in("b")],
+    }));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    let lease = crate::daemon::FetchLease::new();
+
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::scan_auto_switch_leased(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+            Some(ticket),
+        );
+        pending.lock().unwrap().clone()
+    };
+
+    assert!(
+        scan(crate::testutil::spent_lease_ticket(&lease)).is_empty(),
+        "a scan under a spent ticket queued a switch"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        scan(current).iter().any(|d| d.target == "b"),
+        "control: a scan under a current ticket queues the switch onto b"
+    );
+}
+
+/// The global chain scan's switch-off: with wrap-off on and every member spent, a
+/// ticket spent before the queue's own lock queues no switch-off.
+#[test]
+fn an_auto_switch_off_under_a_spent_ticket_queues_no_switch_off() {
+    use super::{FetchStatus, StatusStore};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(100.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            switch_off_when_spent: true,
+            ..AppState::default()
+        },
+        profiles: vec![logged_in("a"), logged_in("b")],
+    }));
+    let pending: super::PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: super::PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    let lease = crate::daemon::FetchLease::new();
+
+    let scan = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::scan_auto_switch_leased(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+            Some(ticket),
+        );
+        *pending_off.lock().unwrap()
+    };
+
+    assert!(
+        !scan(crate::testutil::spent_lease_ticket(&lease)),
+        "a scan under a spent ticket queued a switch-off"
+    );
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        scan(current),
+        "control: a scan under a current ticket queues the switch-off"
+    );
+}
+
+/// A fetch worker that starts after the tick lost the lease sends no `/usage`
+/// poll: the fan-out spawns `run_fetch_flagged` per entry, and the worker's own
+/// start is where a tick that lost the lease is caught.
+#[test]
+fn a_fetch_worker_that_starts_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = due_oauth_state();
+    let entry = state.tokens.lock().unwrap()[0].clone();
+    let lease = crate::daemon::FetchLease::new();
+    let hosts: HashSet<String> = HashSet::new();
+    let run = |ticket: crate::daemon::LeaseTicket<'_>| {
+        super::run_fetch_flagged(
+            &state.config,
+            entry.clone(),
+            &state.store,
+            &state.refetch_queue,
+            &state.activity,
+            &state.poll_streaks,
+            &state.kick_blocks,
+            &state.weekly_reset_kicks,
+            &hosts,
+            &state.auto_start_queue,
+            REFRESH_INTERVAL_MS,
+            None,
+            crate::usage::SpendGate::new(&state.shutting_down, Some(ticket)),
+        )
+    };
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        let _ = run(crate::testutil::spent_lease_ticket(&lease));
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (200, r#"{"five_hour":{"utilization":0.1}}"#.to_string())
+        } else {
+            (200, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    let _ = run(current);
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "control: a worker under a current ticket sends its /usage poll: {seen:?}"
+    );
+}
+
+/// The probe leg's entry check: a ticket spent before an entry is probed sends
+/// no request for it, so a stale tick spends no inference on the account.
+#[test]
+fn a_probe_under_a_spent_ticket_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed-spent", 60_000, true);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    assert_eq!(entries.len(), 1, "fixture: one probe entry");
+    // The worker's slot re-check derives its ticket from the state's lease,
+    // so the test's ticket comes from the same lease.
+    let lease = Arc::clone(&state.fetch_lease);
+
+    {
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        super::fetch_probe_due_flagged(
+            &state,
+            entries.clone(),
+            None,
+            Some(crate::testutil::spent_lease_ticket(&lease)),
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(current));
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a probe under a current ticket sends its request"
+    );
+}
+
+/// The retention trim's per-profile check: a tick stalled in the loop past its
+/// watchdog release prunes no profile after the ticket is spent, so it cannot
+/// rename a history file over the new holder's in-flock append.
+#[test]
+fn a_history_prune_past_a_spent_ticket_prunes_no_later_profile() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let p1 = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ph1"));
+    let p2 = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ph2"));
+    crate::testutil::persist_profiles(&[p1.clone(), p2.clone()]);
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: vec![p1, p2],
+        }));
+    let now = crate::usage::now_ms();
+    let usage_line =
+        |ts: u64, name: &str| serde_json::json!({"ts": ts, "name": name, "usage": {}}).to_string();
+    let wallet_line = |ts: u64| {
+        serde_json::json!({"ts": ts, "label": "l", "amount": 1.0, "currency": "USD"}).to_string()
+    };
+    for name in ["ph1", "ph2"] {
+        let pn = crate::profile::ProfileName::from(name);
+        std::fs::write(
+            crate::profile::profile_history_path(&pn).expect("usage history path"),
+            format!("{}\n{}\n", usage_line(0, name), usage_line(now, name)),
+        )
+        .expect("write usage history");
+        std::fs::write(
+            crate::profile::profile_wallet_history_path(&pn).expect("wallet history path"),
+            format!("{}\n{}\n", wallet_line(0), wallet_line(now)),
+        )
+        .expect("write wallet history");
+    }
+    let lines = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .expect("read history")
+            .lines()
+            .count()
+    };
+    let usage_path = |name: &str| {
+        crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
+            .expect("usage history path")
+    };
+    let wallet_path = |name: &str| {
+        crate::profile::profile_wallet_history_path(&crate::profile::ProfileName::from(name))
+            .expect("wallet history path")
+    };
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let released = Arc::new(AtomicBool::new(false));
+    {
+        let lease = Arc::clone(&lease);
+        let released = Arc::clone(&released);
+        super::at_tick_seam(super::TickSeam::AfterHistoryPrune, move || {
+            released.store(true, Ordering::SeqCst);
+            release_as_the_watchdog(&lease);
+        });
+    }
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    assert!(
+        super::prune_histories_if_due(&AtomicU64::new(0), &config, now, Some(ticket)),
+        "fixture control: the trim is due"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "fixture control: the trim reached the seam between two profiles"
+    );
+    assert_eq!(
+        lines(&usage_path("ph1")),
+        1,
+        "the first profile's history is pruned before the release"
+    );
+    assert_eq!(
+        lines(&usage_path("ph2")),
+        2,
+        "a prune past the spent ticket trimmed a later profile's history"
+    );
+    assert_eq!(
+        lines(&wallet_path("ph2")),
+        2,
+        "a prune past the spent ticket trimmed a later profile's wallet history"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(super::prune_histories_if_due(
+        &AtomicU64::new(0),
+        &config,
+        now,
+        Some(current)
+    ));
+    assert_eq!(
+        lines(&usage_path("ph2")),
+        1,
+        "control: a prune under a current ticket trims the later profile"
+    );
+    assert_eq!(
+        lines(&wallet_path("ph2")),
+        1,
+        "control: a prune under a current ticket trims the later profile's wallet history"
+    );
+}
+
+/// The refresher's start wires the two workers from the state it built: the lease
+/// watchdog watches the SAME `FetchLease` the tick acquires from, and the tick
+/// thread's loop body is `tick_and_stamp`, so every completed tick stamps the
+/// clock the watchdog ages. Neither thread may outlive a test's sandbox, so the
+/// pin reads the pair the start hands them.
+#[test]
+fn the_refresher_starts_the_watchdog_on_the_states_lease_and_stamps_each_tick() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+
+    super::spawn_refresher(
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        super::new_claude_resets_memo(),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        // Pre-armed, so a thread the start ever does launch in-process breaks at
+        // its loop-top check instead of running past this sandbox.
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&lease),
+        false,
+        Arc::new(RankedMutex::new(HashMap::new())),
+    );
+
+    let (watchdog_lease, tick_body) = super::LAST_REFRESHER_START
+        .with(|slot| slot.borrow().clone())
+        .expect("a refresher start records the wiring it hands its workers");
+    assert!(
+        Arc::ptr_eq(&watchdog_lease, &lease),
+        "the lease watchdog must watch the same lease the state's tick acquires from"
+    );
+    assert!(
+        std::ptr::fn_addr_eq(
+            tick_body,
+            super::tick_and_stamp as fn(&super::SchedulerState)
+        ),
+        "the tick thread's loop body must stamp each completed tick"
+    );
+    assert!(
+        !std::ptr::fn_addr_eq(tick_body, super::tick as fn(&super::SchedulerState)),
+        "control: the loop body is not the unstamped tick"
+    );
+}
+
+// ── the re-taken tps producer ────────────────────────────────────────────────
+
+/// A tick that re-takes the lease re-joins the tps producer's files: the
+/// producer re-walks the shared speed ledger on the first leg under the new
+/// hold instead of keeping this process's pre-stand-down memory.
+#[test]
+fn a_retaking_tick_reloads_the_producers_files() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let before = crate::tps::ledger_walks::taken();
+    super::tick(&state);
+    // The watchdog releases the held lease; the next tick re-takes it.
+    assert!(
+        state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    super::tick(&state);
+    assert_eq!(
+        crate::tps::ledger_walks::taken() - before,
+        2,
+        "a re-taken tick re-walked the ledger (once per tick)"
+    );
+}
+
+// ── the pre-claim credential path of a spent worker ──────────────────────────
+
+/// The tick stalls on /usage, the watchdog releases, the 401 lands: the
+/// carry leg sits before the spend claim, so a worker that lost the lease
+/// must lift no quarantine (the pre-claim credential path runs nothing).
+#[test]
+fn a_fetch_worker_whose_lease_was_spent_lifts_no_quarantine() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-carry";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    // The store moved past the entry's token, and the account stands quarantined.
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.set_auth_broken(&profile, true);
+        let p = cfg.profiles.iter_mut().find(|p| p.name == profile).unwrap();
+        p.credentials
+            .as_mut()
+            .unwrap()
+            .claude_ai_oauth
+            .as_mut()
+            .unwrap()
+            .refresh_token = Some("rt-moved".into());
+        crate::profile::save_profile(p).expect("save moved store");
+    }
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        assert!(state.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 10 * 60 * 1000,
+            Duration::from_secs(5 * 60),
+        ));
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let _ = server.join().expect("listener");
+
+    let broken = state.config.lock().unwrap().is_auth_broken(&profile);
+    assert!(broken, "a worker that lost the lease lifted the quarantine");
+}
+
+/// The same fixture under a live ticket: the carry leg lifts the stale
+/// quarantine once the on-disk pair moved — the control that makes the
+/// spent-ticket test's assertion mean the lease.
+#[test]
+fn a_fetch_worker_under_a_live_ticket_lifts_the_quarantine() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    *ROTATION_STALL_GATE.0.lock().unwrap() = false;
+    ROTATION_STALL_ENTERED.store(false, Ordering::SeqCst);
+    let name = "stalled-carry-live";
+    let profile = crate::profile::ProfileName::from(name);
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            ROTATION_STALL_ENTERED.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &ROTATION_STALL_GATE;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = cvar.wait_timeout_while(guard, Duration::from_secs(30), |open| !*open);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut state = completion_order_state();
+    state.config = crate::testutil::rotation_fixture_config(&profile);
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.set_auth_broken(&profile, true);
+        let p = cfg.profiles.iter_mut().find(|p| p.name == profile).unwrap();
+        p.credentials
+            .as_mut()
+            .unwrap()
+            .claude_ai_oauth
+            .as_mut()
+            .unwrap()
+            .refresh_token = Some("rt-moved".into());
+        crate::profile::save_profile(p).expect("save moved store");
+    }
+    seed_usage_cache(name);
+    *state.tokens.lock().unwrap() = vec![super::TokenEntry {
+        name: profile.clone(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+        oauth_identity: crate::usage::OAuthIdentity::default(),
+        epoch_at_spawn: 0,
+    }];
+
+    std::thread::scope(|scope| {
+        let open = OpenRotationStallGate;
+        let ticking = scope.spawn(|| super::tick(&state));
+        await_stall(&ROTATION_STALL_ENTERED);
+        drop(open);
+        ticking.join().expect("the tick thread returns");
+    });
+    let _ = server.join().expect("listener");
+
+    let broken = state.config.lock().unwrap().is_auth_broken(&profile);
+    assert!(
+        !broken,
+        "control: a worker that kept the lease lifted the quarantine"
+    );
+}
+
+// ── the codex belt under a spent ticket ──────────────────────────────────────
+
+/// The standby leg's pre-claim belt write under a spent ticket.
+#[test]
+fn a_tick_that_lost_the_lease_writes_no_codex_belt() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    write_due_codex_chain("cx-belt-lost");
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        super::at_tick_seam(super::TickSeam::BeforeSpendLegs, move || {
+            release_as_the_watchdog(&lease);
+        });
+    }
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+    let _ = handle.join();
+    let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-lost"))
+        .expect("dir")
+        .join("auth.lkg.json");
+    assert!(
+        !belt.exists(),
+        "a tick that lost the lease wrote the codex belt"
+    );
+}
+
+/// The same pass under a live ticket writes the belt: the control that makes
+/// the spent-ticket test's assertion mean the lease.
+#[test]
+fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(stub_ok_stats);
+    let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::testutil::write_codex_roster(&["cx-belt-kept"]);
+    crate::testutil::write_codex_store(
+        "cx-belt-kept",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 86_400),
+            "rt.old",
+        ),
+    );
+    super::tick(&state);
+    crate::usage::clear_codex_usage_url_override();
+    let _ = handle.join();
+    let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-kept"))
+        .expect("dir")
+        .join("auth.lkg.json");
+    assert!(belt.exists(), "control: a live tick wrote the codex belt");
+}
+
+/// The belt restore in a standby pass's pre-claim half: a store that read bad
+/// for 30 s is restored under a live ticket, and the same pass under a spent
+/// ticket restores nothing.
+#[test]
+fn a_tick_that_lost_the_lease_restores_no_codex_store() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cx-restore-lost");
+    crate::testutil::write_codex_roster(&["cx-restore-lost"]);
+    let body = crate::testutil::codex_auth_body(
+        &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 86_400),
+        "rt.good",
+    );
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("make the profile dir");
+    std::fs::write(dir.join("auth.lkg.json"), body.as_bytes()).expect("write the belt");
+    std::fs::write(dir.join("auth.json"), b"not json").expect("corrupt the store");
+
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let activity = crate::testutil::fresh_activity();
+    let rfc = chrono::Utc::now().to_rfc3339();
+    let first = crate::usage::now_ms() as i64;
+    let lease = crate::daemon::FetchLease::new();
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    crate::codex_auth::standby_tick(
+        first,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+    );
+    // The watchdog releases the lease between the two passes.
+    assert!(
+        lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    let spent = lease.ticket_at(ticket.generation());
+    assert!(!spent.is_current(), "the release spends the ticket");
+    crate::codex_auth::standby_tick(
+        first + 31_000,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(spent)),
+    );
+    let store = std::fs::read(dir.join("auth.json")).expect("read the store");
+    assert_eq!(
+        store,
+        b"not json".to_vec(),
+        "a tick that lost the lease restored the corrupt store"
+    );
+
+    // Control: the same second pass under a re-taken ticket restores it.
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    crate::codex_auth::standby_tick(
+        first + 31_000,
+        &rfc,
+        &activity,
+        crate::usage::SpendGate::new(&shutting_down, Some(current)),
+    );
+    let store = std::fs::read(dir.join("auth.json")).expect("read the store");
+    assert_eq!(
+        store,
+        body.into_bytes(),
+        "control: a live second pass restored the store"
+    );
+}
+
+// ── the slot-queued probe and kick re-read the ticket ────────────────────────
+
+/// Wait until the anthropic slot reservation advances past `first`: the
+/// request under test has reserved its own slot (past its entry check) and is
+/// waiting on the spacing.
+fn await_slot_advance(first: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .is_none_or(|v| v <= first)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the request never reserved its slot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A probe whose request queued behind the host spacing slot while its tick
+/// lost the lease sends nothing: the ticket is re-read after the slot wait,
+/// before the POST, so a stale tick spends no inference beside the new
+/// holder's own.
+#[test]
+fn a_probe_queued_behind_the_slot_whose_lease_dies_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_request_slots();
+    let state = probe_state("probed-queued", 60_000, true);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    assert_eq!(entries.len(), 1, "fixture: one probe entry");
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    // Hold the first slot on this thread so the worker queues behind it.
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    let first = crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .expect("the reserved slot");
+
+    std::thread::scope(|scope| {
+        let ticking = scope.spawn(|| {
+            super::fetch_probe_due_flagged(&state, entries, None, Some(ticket));
+        });
+        // The worker has passed its spawn check once its slot reservation
+        // lands: this release is a watchdog release during the slot wait.
+        await_slot_advance(first);
+        assert!(
+            state.fetch_lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder"
+        );
+        ticking.join().expect("the leg returns");
+    });
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.is_empty(),
+        "a probe queued behind the slot sent its POST after the release: {seen:?}"
+    );
+
+    // Control: the same leg under a live ticket sends the request.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let entries =
+        super::build_probe_entries(super::collect_probe_seeds(&state.config.lock().unwrap()));
+    let current = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    super::fetch_probe_due_flagged(&state, entries, None, Some(current));
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a probe under a current ticket sends its request"
+    );
+}
+
+/// A kick whose POST queued behind the host spacing slot while its tick lost
+/// the lease sends nothing and opens no window: the ticket is re-read after
+/// the slot wait, before the POST.
+#[test]
+fn a_kick_queued_behind_the_slot_whose_lease_dies_sends_no_request() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_request_slots();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let name = crate::profile::ProfileName::from("kick-queued");
+    let config = crate::testutil::rotation_fixture_config(&name);
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, Vec::new(), "{}".to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::await_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    let first = crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN)
+        .expect("the reserved slot");
+
+    let (seen, result) = std::thread::scope(|scope| {
+        let kicking = scope.spawn(|| {
+            crate::oauth::auto_start_kick(
+                &config,
+                &name,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((
+                    &activity,
+                    crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+                )),
+                crate::oauth::LockWait::NoWait,
+            )
+        });
+        await_slot_advance(first);
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder"
+        );
+        (
+            server.join().expect("listener"),
+            kicking.join().expect("the kick returns"),
+        )
+    });
+    assert!(
+        seen.is_empty(),
+        "a kick queued behind the slot sent its POST after the release: {seen:?}"
+    );
+    assert!(!result.opened, "a skipped kick opens no window");
+
+    // Control: the same kick under a live ticket sends the POST and opens.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, Vec::new(), "{}".to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &name,
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(current)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    let seen = server.join().expect("listener");
+    assert!(
+        seen.iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/messages")),
+        "control: a kick under a current ticket sends its POST: {seen:?}"
+    );
+    assert!(result.opened, "control: the live kick opens the window");
+}
+
+/// A kick whose first POST answered 401 and whose lease the watchdog released
+/// during the paced recovery writes neither an adopted pair nor a quarantine:
+/// the new holder decides. The store moved past the entry's token, so a live
+/// ticket adopts it (the control proving the fixture writes).
+#[test]
+fn a_kick_whose_lease_died_before_its_rotation_writes_nothing() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let lease = Arc::new(crate::daemon::FetchLease::new());
+    let name = crate::profile::ProfileName::from("kick-lost-span");
+    let config = crate::testutil::rotation_fixture_config(&name);
+    // The store moved past the entry's token (a peer's advance), and the entry's
+    // token is on the spent record: a rotation past it ADOPTS the stored pair.
+    crate::oauth::record_spent(&name, "rt-old");
+    {
+        let mut moved = crate::profile::load_profile(&name).expect("load the fixture store");
+        let oauth = moved
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture's pair");
+        oauth.access_token = "at-moved".to_string();
+        oauth.refresh_token = Some("rt-moved".to_string());
+        crate::profile::save_profile(&moved).expect("save the moved store");
+        config.lock().unwrap().set_auth_broken(&name, true);
+    }
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = AtomicBool::new(false);
+
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    let (kick_tx, kick_rx) = std::sync::mpsc::channel();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+        let _ = kick_tx.send(());
+        (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string())
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let result = std::thread::scope(|scope| {
+        let kicking = scope.spawn(|| {
+            crate::oauth::auto_start_kick(
+                &config,
+                &name,
+                "at-old",
+                Some("rt-old"),
+                None,
+                Some((
+                    &activity,
+                    crate::usage::SpendGate::new(&shutting_down, Some(ticket)),
+                )),
+                crate::oauth::LockWait::NoWait,
+            )
+        });
+        kick_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first kick reaches the stub");
+        assert!(
+            lease.release_if_stale(
+                crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+                crate::daemon::LEASE_STALE_BOUND,
+            ),
+            "the watchdog releases the holder during the paced recovery"
+        );
+        kicking.join().expect("the kick returns")
+    });
+    drop(endpoints);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        result.rotated.is_none(),
+        "a stood-down kick carried an adopted pair back"
+    );
+    assert_eq!(
+        config
+            .lock()
+            .unwrap()
+            .find(&name)
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-old"),
+        "a stood-down kick adopted the newer disk pair"
+    );
+    assert!(
+        config.lock().unwrap().is_auth_broken(&name),
+        "a stood-down kick lifted the quarantine"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|raw| crate::testutil::request_path(raw).starts_with("/v1/oauth/token")),
+        "a stood-down kick spent its refresh: {seen:?}"
+    );
+
+    // Control: the same fixture under a current ticket adopts the stored pair
+    // and lifts the quarantine, so the assertions above mean the lease.
+    crate::usage::reset_request_slots();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (401, Vec::new(), r#"{"error":"unauthorized"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let current = lease.acquire_ticket().expect("re-take the fetch lease");
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &name,
+        "at-old",
+        Some("rt-old"),
+        None,
+        Some((
+            &activity,
+            crate::usage::SpendGate::new(&shutting_down, Some(current)),
+        )),
+        crate::oauth::LockWait::NoWait,
+    );
+    let _ = server.join().expect("listener");
+    assert_eq!(
+        result.rotated,
+        Some(("at-moved".to_string(), Some("rt-moved".to_string()))),
+        "control: a live-ticket kick adopts the moved store"
+    );
+    assert!(
+        !config.lock().unwrap().is_auth_broken(&name),
+        "control: the adopt lifts the quarantine"
+    );
+}
+
+// ── the codex spawn loop breaks, not returns ─────────────────────────────────
+
+/// The codex leg's spawn loop breaks (not returns) on a ticket spent between
+/// two spawns, so the first worker still reaches the drain and its late
+/// count: the re-take starts no second worker for that account.
+#[test]
+fn a_codex_leg_that_loses_the_lease_between_spawns_starts_no_second_worker_on_the_retake() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let silent = SilentEndpoint::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &silent.base);
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    let state = third_party_state(stub_ok_stats);
+    crate::testutil::write_codex_roster(&["cx-lost-a", "cx-lost-b"]);
+    for name in ["cx-lost-a", "cx-lost-b"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(
+                &crate::testutil::jwt_with_exp(crate::usage::now_ms() as i64 / 1000 + 60),
+                "rt.old",
+            ),
+        );
+    }
+    {
+        let lease = Arc::clone(&state.fetch_lease);
+        super::at_tick_seam(super::TickSeam::AfterCodexSpawn, move || {
+            release_as_the_watchdog(&lease);
+        });
+    }
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    // The first worker's poll gets out (it spawned before the release); wait
+    // for its connection, then assert no second worker followed it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while silent.accepted() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first worker never connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        silent.accepted(),
+        1,
+        "only the first account's worker got out"
+    );
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("cx-lost-a")
+            .is_some_and(|s| s.late(FetchLeg::Codex)),
+        "the first worker is left running and counted late"
+    );
+
+    // The re-take: the late account gets no second worker, the not-yet-spawned
+    // account's first poll goes out.
+    crate::usage::set_codex_usage_url_override(&silent.base);
+    let ticket = state
+        .fetch_lease
+        .acquire_ticket()
+        .expect("re-take the fetch lease");
+    super::codex_usage_tick_flagged(&state, None, Some(ticket));
+    crate::usage::clear_codex_usage_url_override();
+    assert_eq!(
+        silent.accepted(),
+        2,
+        "a second worker started for the late account on the re-take"
+    );
+}
+
+// ── the resets reap's log under a spent ticket ───────────────────────────────
+
+/// The resets reap logs a left-running read only under a live ticket, like
+/// the other reaps: a spent one still dates the attempt but stays silent.
+#[test]
+fn a_resets_reap_under_a_spent_ticket_logs_no_left_running() {
+    use std::time::Duration;
+
+    let home = crate::testutil::HomeSandbox::new();
+    crate::usage::set_tick_fetch_deadline_override(Some(Duration::from_millis(300)));
+    let p = save_unanchored_login("lrh-lease", "lrh-lease-tok");
+    crate::testutil::register_names(&["lrh-lease"]);
+    let stub = ParkedResets::new();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &stub.base);
+    let state = resets_state(vec![p]);
+    let ticket = crate::testutil::spent_lease_ticket(&state.fetch_lease);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::claude_resets_tick_flagged(&state, 1_900_000_000_000, None, None, Some(ticket));
+    drop(capture);
+    wait_for_reads(&stub, 1);
+    let logged = lines.snapshot();
+    let named: Vec<&String> = logged
+        .iter()
+        .filter(|l| l.contains("'lrh-lease'"))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "a spent ticket logs no left-running line: {named:?}"
+    );
+    stub.release();
+    wait_for_no_activity(&state, "lrh-lease");
+}
+
+/// The usage probe never sends a proxy account's setup token, its `[proxy]`
+/// table readable or not, though the switch is on, the token is stored and a
+/// pair sits beside the record: a proxy account has no Claude Code login. A
+/// plain setup-token account on the same tick is probed.
+#[test]
+fn the_usage_probe_never_sends_a_proxy_accounts_setup_token() {
+    let home = crate::testutil::HomeSandbox::new();
+    // One probe is the right answer; a probe per account would be three.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(4, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state_over(&["plain", "px", "pu"], 300_000, true);
+    {
+        let mut config = state.config.lock().unwrap();
+        for name in ["px", "pu"] {
+            let profile = config
+                .find_mut(&crate::profile::ProfileName::from(name))
+                .expect("the profile");
+            profile.credentials = Some(crate::testutil::oauth_pair(name));
+            if name == "px" {
+                profile.proxy = Some(crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-1".to_string(),
+                });
+            } else {
+                profile.has_unreadable_proxy_record = true;
+            }
+        }
+    }
+
+    super::tick(&state);
+    let raw = server.join().expect("listener");
+
+    let stored = state.store.lock().unwrap();
+    assert_eq!(
+        (
+            raw.len(),
+            raw.iter()
+                .map(|r| crate::testutil::request_header(r, "authorization"))
+                .collect::<Vec<_>>(),
+            ["plain", "px", "pu"].map(|name| stored.contains_key(name)),
+        ),
+        (
+            1,
+            vec![Some(format!("Bearer {SETUP_TOKEN}"))],
+            [true, false, false],
+        ),
+        "(probes sent, their bearers, a reading stored for plain, px, pu)"
     );
 }

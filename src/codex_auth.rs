@@ -42,7 +42,6 @@
 use crate::profile::ProfileName;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
@@ -820,16 +819,17 @@ pub(crate) enum StandbyOutcome {
 /// POST and the store write run under a scheduler spend claim in `activity`,
 /// the store a TUI quit waits on, taken only once the pass is about to spend
 /// (a not-due pass taking it would flash the save cue every tick) and released
-/// on every return and on unwind. Once `shutting_down` is set the claim
-/// refuses BEFORE the memo is written: a memo for a token nothing sent would
-/// idle the next process on a chain that was never spent.
-pub(crate) fn standby_pass(
+/// on every return and on unwind. Once `spend_gate` refuses (the shutdown flag
+/// set, or the fetch tick's lease ticket spent) the claim refuses BEFORE the
+/// memo is written: a memo for a token nothing sent would idle the next
+/// process on a chain that was never spent.
+pub(crate) fn standby_pass<'g>(
     name: &str,
     now_ms: i64,
     now_rfc3339: String,
     refresher: &dyn Fn(&str) -> std::result::Result<CodexTokenResponse, CodexRefreshError>,
     activity: &crate::usage::ActivityStore,
-    shutting_down: &AtomicBool,
+    spend_gate: impl Into<crate::usage::SpendGate<'g>>,
 ) -> StandbyOutcome {
     let Ok(store) = profile_subpath(&ProfileName::from(name), "auth.json") else {
         return StandbyOutcome::Idle;
@@ -984,7 +984,7 @@ pub(crate) fn standby_pass(
     // A refusal spends nothing, so a forced attempt it took is still owed.
     let profile = ProfileName::from(name);
     let Some(_claim) =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(activity, &profile, shutting_down)
+        crate::usage::claim_scheduler_spend_unless_shutting_down(activity, &profile, spend_gate)
     else {
         if forced {
             restore_kick(name);
@@ -1110,26 +1110,35 @@ fn run_standby_hook(point: StandbyHookPoint, name: &str) {
 
 /// The daemon's codex leg: one standby pass per codex profile. Self-contained
 /// — reads the codex roster itself, so the claude scheduler's state stays
-/// untouched (per-harness independence, decision 4). `activity` and
-/// `shutting_down` are the caller's own, so a TUI quit waits on the same
-/// markers its exit wait reads.
-pub(crate) fn standby_tick(
+/// untouched (per-harness independence, decision 4). `activity` and the
+/// shutdown flag in `spend_gate` are the caller's own, so a TUI quit waits on
+/// the same markers its exit wait reads; its lease ticket stops a tick that
+/// lost the lease from spending.
+pub(crate) fn standby_tick<'g>(
     now_ms: i64,
     now_rfc3339: &str,
     activity: &crate::usage::ActivityStore,
-    shutting_down: &AtomicBool,
+    spend_gate: impl Into<crate::usage::SpendGate<'g>>,
 ) {
+    let spend_gate = spend_gate.into();
     let Ok(state) = crate::codex_profiles::CodexState::load() else {
         return;
     };
     for name in state.profiles() {
+        // The pre-claim half of a pass writes the belt (`record_lkg`) and can
+        // restore `auth.json` from it: a tick that lost the lease writes
+        // neither. Checked per profile, so a release between two passes
+        // stops the rest too.
+        if spend_gate.lease_spent() {
+            return;
+        }
         let _ = standby_pass(
             name.as_str(),
             now_ms,
             now_rfc3339.to_string(),
             &refresh_codex_chain,
             activity,
-            shutting_down,
+            spend_gate,
         );
     }
 }

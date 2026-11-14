@@ -16,18 +16,20 @@
 //!   * `usage-fetch.lock` — the **single-fetcher lease** ([`FetchLease`]).
 //!     Exactly one instance (daemon OR a TUI) holds it at a time and does all
 //!     usage fetching / rotation / switch decisions while it does; every other
-//!     instance hydrates from the shared disk cache. First-come, held for life,
-//!     released only on process exit — no preemption, so the switch-decider
-//!     never thrashes between processes.
+//!     instance hydrates from the shared disk cache. First-come, held while the
+//!     holder's ticks keep completing, and never taken from a live holder, so
+//!     the switch-decider never thrashes between processes. Released on process
+//!     exit, or by the holder's own lease watchdog once no tick has completed
+//!     for [`LEASE_STALE_BOUND`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -414,13 +416,14 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
 /// How long `--replace` (and the TUI's `stop daemon`) waits for a terminated
 /// holder's flock to auto-release on death before it escalates (SIGTERM →
-/// SIGKILL on unix, another `/F` on Windows). A holder signalled mid token
-/// spend waits that spend out ([`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND))
-/// while its children stop inside `DAEMON_STOP_BUDGET` plus their answer
-/// grace, so the force kill must wait past the longer of the two plus one
-/// poll, or it lands between the token endpoint's answer and the save. This
-/// derives that longer term (the drain) plus five seconds of headroom; the
-/// children's side is pinned beside its own constants.
+/// SIGKILL on unix, another `/F` on Windows). A signalled holder's drain
+/// waits out its token spend and its tick thread's exit save, together
+/// inside [`SPEND_DRAIN_BOUND`](super::SPEND_DRAIN_BOUND), while its children
+/// stop inside `DAEMON_STOP_BUDGET` plus their answer grace, so the force
+/// kill must wait past the longer of the two plus one poll, or it lands
+/// between the token endpoint's answer and the save. This derives that
+/// longer term (the drain) plus five seconds of headroom; the children's
+/// side is pinned beside its own constants.
 pub(super) const REPLACE_WAIT: Duration =
     super::SPEND_DRAIN_BOUND.saturating_add(Duration::from_secs(5));
 const _: () = assert!(
@@ -950,27 +953,61 @@ fn standdown_transition_log(msg: &str) {
 }
 
 /// The single-fetcher lease over `usage-fetch.lock` (#27). Once acquired the
-/// [`File`] is retained for the process lifetime, so the flock is held for life
-/// and released only on exit — deliberately NOT re-acquired per tick, which
-/// would bounce the switch-decider between processes (the #27 switch thrash).
+/// [`File`] is retained while this instance's ticks keep completing, so the
+/// flock is NOT re-acquired per tick, which would bounce the switch-decider
+/// between processes (the #27 switch thrash). It is released on exit, or by
+/// [`Self::release_if_stale`] once no tick has completed for
+/// [`LEASE_STALE_BOUND`], so a wedged tick thread frees it for a standby.
 ///
-/// The inner [`Mutex`] is a pure leaf: locked only inside [`acquire`](Self::acquire)
-/// and released before it returns, so it carries no lock rank. The flock itself
-/// sits outside the compile-time rank system and must be taken OUTERMOST of the
-/// tick's ranked locks (`acquire` runs at the very top of the tick).
-#[derive(Default)]
+/// The inner [`Mutex`] is a pure leaf: locked only inside
+/// [`acquire_ticket`](Self::acquire_ticket) and [`Self::release_if_stale`],
+/// and released before either returns, so it carries no lock rank. The flock
+/// itself sits outside the compile-time rank system and must be taken
+/// OUTERMOST of the tick's ranked locks (`acquire_ticket` runs at the very top
+/// of the tick).
+#[derive(Default, Debug)]
 pub(crate) struct FetchLease {
     held: Mutex<Option<File>>,
-    /// Whether the last [`acquire`](Self::acquire) stood down. The one record of
-    /// who fetches: a display surface reads it to tell a row of its own due
-    /// schedule from a mirror's cache-mtime estimate, and its two edges are the
-    /// only places the stand-down / acquired lines are logged, so a UI-thread
-    /// acquire and a tick acquire can never disagree about either.
+    /// Whether this instance does not fetch: the last
+    /// [`acquire`](Self::acquire) stood down, or the watchdog released the
+    /// lease since. The one record of who fetches: a display surface reads it
+    /// to tell a row of its own due schedule from a mirror's cache-mtime
+    /// estimate, and an acquire's two edges on it are the only places the
+    /// stand-down / acquired lines are logged, so a UI-thread acquire and a
+    /// tick acquire can never disagree about either.
     stood_down: AtomicBool,
     /// Set when THIS instance takes the lease, wherever the take happened (a
     /// TUI's bootstrap acquires on the UI thread before the first tick), and
     /// taken once by [`Self::take_new_hold`].
     new_hold: AtomicBool,
+    /// Moved by every watchdog release, before the flock drops. A tick holds
+    /// the generation it acquired under ([`LeaseTicket`]), so one that resumes
+    /// after losing the lease sees it moved and applies nothing.
+    generation: AtomicU64,
+    /// Epoch ms of the last completed tick, or of the take when no tick has
+    /// completed since: what [`Self::release_if_stale`] ages.
+    last_tick_ms: AtomicU64,
+}
+
+/// A fetch tick's hold on the lease: the generation the lease was held under
+/// when the tick began. Copy, so every leg and worker of the tick carries it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LeaseTicket<'a> {
+    lease: &'a FetchLease,
+    generation: u64,
+}
+
+impl LeaseTicket<'_> {
+    /// Whether the lease is still held under this ticket: no watchdog release
+    /// has moved the generation since the tick acquired it.
+    pub(crate) fn is_current(self) -> bool {
+        self.lease.generation() == self.generation
+    }
+
+    /// The generation the ticket was taken under.
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
 }
 
 impl FetchLease {
@@ -996,19 +1033,31 @@ impl FetchLease {
     /// lines can reach the log in either order: the log's order across threads
     /// is not the edge order, and `stood_down` alone says which edge came last.
     pub(crate) fn acquire(&self) -> bool {
+        self.acquire_ticket().is_some()
+    }
+
+    /// [`Self::acquire`] for a fetch tick: the ticket carries the generation
+    /// read under the same `held` guard a watchdog release moves it under, so
+    /// no release can fall between the hold and the read. A take stamps the
+    /// tick clock, so a holder that has completed no tick yet ages from its
+    /// take.
+    pub(crate) fn acquire_ticket(&self) -> Option<LeaseTicket<'_>> {
         let mut held = match self.held.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         if held.is_some() {
-            return true;
+            return Some(self.ticket());
         }
         let taken = self.try_take_lease();
         let fetched = taken.is_some();
         if let Some(file) = taken {
             *held = Some(file);
+            self.last_tick_ms
+                .store(crate::usage::now_ms(), Ordering::Relaxed);
             self.new_hold.store(true, Ordering::Relaxed);
         }
+        let ticket = fetched.then(|| self.ticket());
         let transition = if fetched {
             self.mark_acquired()
         } else {
@@ -1018,7 +1067,24 @@ impl FetchLease {
         if let Some(line) = transition {
             standdown_transition_log(line);
         }
-        fetched
+        ticket
+    }
+
+    fn ticket(&self) -> LeaseTicket<'_> {
+        LeaseTicket {
+            lease: self,
+            generation: self.generation(),
+        }
+    }
+
+    /// A ticket re-derived under a generation captured at spawn: what a spawned
+    /// worker carries, so a worker that outlives its tick still checks against
+    /// the generation the tick acquired under.
+    pub(crate) fn ticket_at(&self, generation: u64) -> LeaseTicket<'_> {
+        LeaseTicket {
+            lease: self,
+            generation,
+        }
     }
 
     /// Take the lease file, or `None` when the attempt cannot yield one. Every
@@ -1067,6 +1133,134 @@ impl FetchLease {
     /// instance can read what the old holder recorded.
     pub(crate) fn take_new_hold(&self) -> bool {
         self.new_hold.swap(false, Ordering::Relaxed)
+    }
+
+    /// Record a completed tick at `now_ms`, the clock
+    /// [`Self::release_if_stale`] ages.
+    pub(crate) fn stamp_tick(&self, now_ms: u64) {
+        self.last_tick_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Give the lease up when this instance holds it and its last completed
+    /// tick is more than `bound` older than `now_ms`. The generation moves
+    /// BEFORE the flock drops, so a tick that reads the old generation inside a
+    /// state-flock hold proves no standby has taken the lease yet. The lock
+    /// file is never unlinked: a racer would split across two inodes. Returns
+    /// whether it released.
+    pub(crate) fn release_if_stale(&self, now_ms: u64, bound: Duration) -> bool {
+        let mut held = match self.held.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let age_ms = now_ms.saturating_sub(self.last_tick_ms());
+        if held.is_none() || age_ms <= bound.as_millis() as u64 {
+            return false;
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        *held = None;
+        self.stood_down.store(true, Ordering::Relaxed);
+        drop(held);
+        logline!(
+            "clauth: pid {} completed no usage tick in {}s: released the usage-fetch lease for \
+             another instance to take",
+            std::process::id(),
+            bound.as_secs()
+        );
+        true
+    }
+
+    /// How many times the watchdog has released the lease.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Epoch ms of the last completed tick, or of the take when none has
+    /// completed since.
+    pub(crate) fn last_tick_ms(&self) -> u64 {
+        self.last_tick_ms.load(Ordering::Relaxed)
+    }
+}
+
+/// How long a lease holder may go without completing a tick before its
+/// watchdog gives the lease up for a standby to take.
+pub(crate) const LEASE_STALE_BOUND: Duration = Duration::from_secs(5 * 60);
+
+/// What the lease watchdog carries from one poll to the next: the tick stamp it
+/// last read, and the wall time since that stamp a suspend or a clock jump
+/// explains. The total restarts whenever the stamp moves, so a sleep before the
+/// last completed tick never stretches the bound on a stall after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LeaseWatch {
+    stamp_ms: u64,
+    unaccounted_ms: u64,
+}
+
+/// One lease-watchdog poll: fold this poll's unaccounted wall time
+/// ([`super::watchdog_unaccounted`], the daemon watchdog's suspend rule) into
+/// the total since the last completed tick, then judge the stamp on the time
+/// the tick thread actually had. Pure but for the lease it may release, so the
+/// drop decision is pinned with an injected clock.
+///
+/// The total never exceeds the wall time since the stamp: a poll that holds
+/// both a suspend and the first tick after the wake would otherwise charge the
+/// whole suspend, though only the part after the stamp is time the stamp could
+/// have aged. Both clocks are wall time, so a backward step during a wedge
+/// stretches the bound by the step.
+pub(crate) fn lease_watchdog_step(
+    lease: &FetchLease,
+    watch: LeaseWatch,
+    slept_from_ms: u64,
+    now_ms: u64,
+    poll: Duration,
+    bound: Duration,
+) -> LeaseWatch {
+    let stamp_ms = lease.last_tick_ms();
+    let carried = if stamp_ms == watch.stamp_ms {
+        watch.unaccounted_ms
+    } else {
+        0
+    };
+    let unaccounted_ms = carried
+        .saturating_add(super::watchdog_unaccounted(
+            now_ms.saturating_sub(slept_from_ms),
+            poll.as_millis() as u64,
+        ))
+        .min(now_ms.saturating_sub(stamp_ms));
+    lease.release_if_stale(now_ms.saturating_sub(unaccounted_ms), bound);
+    LeaseWatch {
+        stamp_ms,
+        unaccounted_ms,
+    }
+}
+
+/// Spawn the lease watchdog beside a scheduler's tick thread: every
+/// [`super::WATCHDOG_POLL`] it runs [`lease_watchdog_step`] against
+/// [`LEASE_STALE_BOUND`], so a holder whose tick thread wedges gives the lease
+/// up and a standby takes it at its next 1 s retry. Ends once `shutting_down`
+/// is set, as the tick thread does.
+pub(crate) fn spawn_lease_watchdog(lease: Arc<FetchLease>, shutting_down: Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new()
+        .name("clauth-lease-watchdog".into())
+        .spawn(move || {
+            let mut watch = LeaseWatch::default();
+            while !shutting_down.load(Ordering::SeqCst) {
+                let slept_from = crate::usage::now_ms();
+                std::thread::sleep(super::WATCHDOG_POLL);
+                watch = lease_watchdog_step(
+                    &lease,
+                    watch,
+                    slept_from,
+                    crate::usage::now_ms(),
+                    super::WATCHDOG_POLL,
+                    LEASE_STALE_BOUND,
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        logline!(
+            "clauth: failed to spawn the usage-fetch lease watchdog: {e}. A stalled usage tick \
+             will keep the lease until this process exits"
+        );
     }
 }
 

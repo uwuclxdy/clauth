@@ -768,6 +768,41 @@ fn a_rescan_wakes_the_loop_but_never_counts_as_a_match() {
     );
 }
 
+/// An open changes nothing (a write also raises a modify or close-write), so it
+/// never wakes the loop: waking on one lets any reader of a watched child —
+/// clauth's own job-store walk over `~/.claude/jobs` included — schedule the
+/// next reconcile forever. It still counts as a match, so the dead-filter
+/// check keeps reading a healthy watcher.
+#[test]
+fn an_open_matches_but_never_wakes_the_loop() {
+    let specs = vec![WatchSpec::new("/home/u/.claude", Interest::AnyChild)];
+    let jobs = PathBuf::from("/home/u/.claude/jobs");
+
+    let open = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Open(
+        notify::event::AccessMode::Any,
+    )))
+    .add_path(jobs.clone());
+    let verdict = classify(&specs, &open);
+    assert!(
+        verdict.matched,
+        "an open of a watched child is still a match"
+    );
+    assert!(!verdict.wake, "an open must not wake the loop");
+
+    for kind in [
+        notify::EventKind::Access(notify::event::AccessKind::Close(
+            notify::event::AccessMode::Write,
+        )),
+        notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )),
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    ] {
+        let event = notify::Event::new(kind).add_path(jobs.clone());
+        assert!(classify(&specs, &event).wake, "{kind:?} must wake the loop");
+    }
+}
+
 /// One spec whose spelling is wrong while its siblings match is the shape a
 /// dotfiles-managed `~/.claude` takes in production, and an aggregate match
 /// count cannot see it: the healthy siblings keep `matched` above zero forever.

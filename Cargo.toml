@@ -9,32 +9,36 @@ homepage = "https://github.com/uwuclxdy/clauth"
 readme = "README.md"
 keywords = ["claude-code", "account-switcher", "usage-monitor", "mcp", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
-utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
-toml = "1.1.6"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+utoipa = { version = "6.0", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
+toml = "1.2.1"
 # Format-preserving edits of the user's own `shunt.toml` (the gateway's admin
 # key entry): `toml` re-renders a document and drops its comments and layout.
 # Its deps (toml_parser, toml_writer, toml_datetime, winnow, indexmap) are
 # already in the tree via `toml`.
-toml_edit = "0.25.15"
+toml_edit = "0.25.19"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 # Windows `std::fs::canonicalize` returns a `\\?\` verbatim path; `dunce`
 # strips that prefix wherever a plain form exists, so the adopted shunt config
 # is stored and shown as its plain drive path (a no-op elsewhere).
 dunce = "1.0.5"
-ureq = "3.4.2"
-self-replace = "1.5.0"
-signal-hook = "0.4.4"
+# `platform-verifier` trusts the OS root store instead of ureq's bundled
+# Mozilla roots, and `SSL_CERT_FILE` (curl/OpenSSL semantics) replaces it:
+# `src/tls_roots.rs` holds the one decision every agent build site takes.
+ureq = { version = "3.5.1", features = ["platform-verifier"] }
+self-replace = "1.5.1"
+signal-hook = "0.4.6"
 shlex = "2.0.1"
 tempfile = "3.27.0"
-libc = "0.2.189"
-sha2 = "0.11.0"
-minisign-verify = "0.2.5"
+libc = "0.2.191"
+sha2 = "0.11.1"
+minisign-verify = "0.3.0"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
@@ -51,7 +55,7 @@ rpassword = "7.5.4"
 # tree via rmcp → schemars; only the `clock` feature is new, which adds
 # `iana-time-zone` for the zone lookup. Its `unsafe` stays inside chrono.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-rmcp = { version = "3.4.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io"] }
 # Filesystem event watcher — drives credential/config reconcile off inotify /
 # FSEvents instead of wall-clock polling. Non-recursive watches only.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
@@ -63,14 +67,14 @@ crossbeam-channel = "0.5.17"
 # starts — without it the MCP server panics right after its first reply. It
 # reaches the graph transitively via rmcp's own tokio dependency today; pinned
 # here so a dependency dropping it fails the build instead of the stdio session.
-tokio = { version = "1.53.1", features = ["rt", "io-std", "time"] }
+tokio = { version = "1.54.1", features = ["rt", "io-std", "time"] }
 # `CancellationToken` — the type rmcp puts on `RequestContext.ct` and fires when
 # a client sends `notifications/cancelled`. rmcp awaits the tool handler bare
 # rather than racing it against that token, so `monitor`'s wait loops have to
 # read it themselves or an abandoned call runs out its full hour. Already in the
 # tree via rmcp → tokio-util; named here because the type is now in clauth's own
 # signatures. No default features: `sync` is unconditional.
-tokio-util = { version = "0.7.19", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false }
 regex = "1.13.1"
 # CLI grammar + generated help. `wrap_help` is what keeps the command table and
 # the per-subcommand prose wrapping to the real terminal width instead of the
@@ -92,7 +96,7 @@ agentgear = "0.1.5"
 # aws-lc-rs provider, which would add a second crypto backend, a C toolchain to
 # every build, and a license that is not on deny.toml's allowlist. `ring` is the
 # provider ureq already builds, so pinning it keeps exactly one in the tree.
-rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 # PEM decoding for the lego certificate and key. Its `pem` module is
 # unconditional, so this covers what rustls-pemfile would otherwise be needed
 # for; `std` is what adds the read-from-file half of it.
@@ -109,7 +113,7 @@ hex = "0.4"
 # other surface does: SHA-1 over `Sec-WebSocket-Key` + the RFC 6455 GUID, then
 # base64. base64 0.23 is already in the lock graph; sha1 is a new (pure-Rust)
 # entry, pinned to the sha2-compatible RustCrypto line already compiled here.
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.23"
 # Web Push: the VAPID signing key (ECDSA P-256) and, for the sender, the RFC
 # 8291 ECDH + HKDF + AES-128-GCM steps. The same `ring` rustls already builds
@@ -129,7 +133,7 @@ agentgear = "0.1.5"
 # scheduler for an exact tick count; a paused clock makes the same assertion
 # exact and instant. No new crate — tokio is already a dependency above — and
 # resolver 3 keeps a dev-dependency's features out of the normal build.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
@@ -156,9 +160,11 @@ strip = true
 # is shared with the bridge's `parent_pid`); `stderr_file_mode`'s
 # `fcntl`/`fstat` in `daemon/log_rotate.rs`;
 # the inherited signal disposition read in `daemon/gateway.rs`; the test
-# sandbox's env mutation, which Rust 2024 made unsafe; and the mod bridge's
-# socket and process reads in `daemon/bridge.rs` (`SO_PEERCRED` on linux;
-# `LOCAL_PEERPID` and `proc_pidpath` on macOS).
+# sandbox's env mutation, which Rust 2024 made unsafe, and the tests' other
+# raw calls (a held flock, a pty's setup, an euid read, raw sockets, a raw
+# pointer write); and the mod bridge's socket and process reads in
+# `daemon/bridge.rs` (`SO_PEERCRED` on linux; `LOCAL_PEERPID` and
+# `proc_pidpath` on macOS).
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

@@ -4738,7 +4738,7 @@ fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
             let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
                 &activity,
                 &name,
-                &shutting_down,
+                shutting_down.as_ref(),
             )
             .expect("an unset flag admits the spend");
             claimed_tx.send(()).expect("the test waits for the claim");
@@ -4765,8 +4765,12 @@ fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
     );
     let late = crate::profile::ProfileName::from("late");
     assert!(
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
-            .is_none(),
+        crate::usage::claim_scheduler_spend_unless_shutting_down(
+            &activity,
+            &late,
+            shutting_down.as_ref()
+        )
+        .is_none(),
         "a spend starting after the stop signal is refused"
     );
     spender.join().expect("the spender ran to its save");
@@ -4783,9 +4787,12 @@ fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
     let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let name = crate::profile::ProfileName::from("stuck-spend");
-    let held =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, &shutting_down)
-            .expect("an unset flag admits the spend");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &name,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
     let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
 
     let started = std::time::Instant::now();
@@ -4838,9 +4845,12 @@ fn a_spend_starting_while_the_drain_waits_is_refused() {
     let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let first = crate::profile::ProfileName::from("first");
-    let held =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &first, &shutting_down)
-            .expect("an unset flag admits the spend");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &first,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
     let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
     let drainer = std::thread::spawn(move || spends.drain(Duration::from_secs(5)));
     // Wait until the drain has actually raised the flag, not a fixed sleep: a
@@ -4854,9 +4864,12 @@ fn a_spend_starting_while_the_drain_waits_is_refused() {
     }
 
     let late = crate::profile::ProfileName::from("late");
-    let refused =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
-            .is_none();
+    let refused = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &late,
+        shutting_down.as_ref(),
+    )
+    .is_none();
     drop(held);
     let cleared = drainer.join().expect("the drain returns");
 

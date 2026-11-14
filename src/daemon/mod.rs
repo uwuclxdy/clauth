@@ -20,9 +20,15 @@ pub(crate) mod log_rotate;
 mod probe;
 pub(crate) mod proxies;
 mod status_json;
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6_feed.rs"]
+pub(crate) mod proxy_p6_feed_tests;
 mod tick;
 mod types;
 
+#[cfg(test)]
+pub(crate) use probe::LEASE_STALE_BOUND;
 /// The running daemon's pid sidecar reader, shared by the gateway hold writer
 /// in `crate::gateway`.
 pub(crate) use probe::holder_pid;
@@ -30,8 +36,8 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{
-    DaemonHealth, FetchLease, daemon_health, gateway_slot, probe_daemon, proxy_slots,
-    singleton_held,
+    DaemonHealth, FetchLease, LeaseTicket, daemon_health, gateway_slot, probe_daemon, proxy_slots,
+    singleton_held, spawn_lease_watchdog,
 };
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};
@@ -44,8 +50,8 @@ pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -59,12 +65,12 @@ use crate::profile::{
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
-    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, SkippedUnreadable, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
-    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    ActivityStore, ClaudeResetsMemoLock, FetchStatus, KickBlocks, LastFetchedAt, LegKey,
+    NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue,
+    SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
+    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo,
+    UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, new_claude_resets_memo, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -108,12 +114,91 @@ const PID_FILE: &str = "clauthd.pid";
 /// instance allowed to park on the singleton lock. See [`probe::Claim`].
 const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
-/// held for life by whichever instance (daemon or a TUI) is the current usage
-/// fetcher. See [`FetchLease`](probe::FetchLease).
+/// held by whichever instance (daemon or a TUI) is the current usage fetcher
+/// while its ticks keep completing. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// The daemon's log beside `status.json`: its stderr and stdout when the TUI
 /// starts it. The run loop caps it by this name.
 const LOG_FILE: &str = "daemon.log";
+
+/// Latch for the retention leg's check-failed line, so a standing failure is
+/// reported once per failure run rather than on every tick. Cleared by the
+/// next clean check, so a recurrence is reported again.
+static RETENTION_CHECK_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The retention leg's cadence: a change event under `~/.claude` drives the
+/// check, and the 30 s fallback (the polling cadence too, when no watch arms)
+/// covers an event the watcher never delivered.
+const RETENTION_TIMINGS: crate::watchdog::Timings = crate::watchdog::Timings {
+    debounce: Duration::from_millis(200),
+    cooldown: Duration::from_millis(500),
+    fallback: Duration::from_secs(30),
+    config_poll: Duration::from_secs(30),
+    credential_poll: Duration::from_secs(30),
+    swap_poll: Duration::from_secs(30),
+};
+
+/// One retention check for the leg: run [`crate::retention::reconcile`] and
+/// latch its failure line, so a standing failure is reported once per failure
+/// run. Cleared by the next clean check, so a recurrence is reported again.
+/// Extracted from the `serve` wiring so the latch has a test.
+fn retention_check() {
+    if let Err(e) = crate::retention::reconcile() {
+        if !RETENTION_CHECK_FAILED.swap(true, Ordering::Relaxed) {
+            logline!("clauth daemon: cleanupPeriodDays check failed: {e:#}");
+        }
+    } else {
+        RETENTION_CHECK_FAILED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The retention leg as a watchdog reconcile: `check` is its config leg, and
+/// it has no credential or swap leg.
+struct RetentionCheck<F>(F);
+
+impl<F: Fn()> crate::watchdog::Reconcile for RetentionCheck<F> {
+    fn config(&self) {
+        (self.0)();
+    }
+    fn credentials(&self) {}
+    fn swap_poll(&self) {}
+}
+
+/// Run `check` once now, then on every change under `claude_home`, on the
+/// watchdog's event loop with its polling fallback, until `shutdown` fires or
+/// disconnects. The session watchdogs put a lost `cleanupPeriodDays` back only
+/// while a `clauth start` session runs; this leg covers a bare `claude` with
+/// no session live. The watch arms before the thread spawns, so a write
+/// landing right after the spawn still raises its event.
+///
+/// Every child counts as a match rather than just `settings.json`: the file is
+/// legitimately absent, and a name-only interest would read every other
+/// `~/.claude` write as an unmatched event, so the dead-filter check would
+/// report a healthy watcher. An open of a child wakes nothing.
+fn spawn_retention_watch(
+    claude_home: &std::path::Path,
+    timings: crate::watchdog::Timings,
+    shutdown: crossbeam_channel::Receiver<()>,
+    check: impl Fn() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let specs = [crate::watchdog::WatchSpec::new(
+        claude_home,
+        crate::watchdog::Interest::AnyChild,
+    )];
+    let watcher = crate::watchdog::try_start(&specs, timings.debounce);
+    std::thread::Builder::new()
+        .name("clauth-retention".into())
+        .spawn(move || {
+            check();
+            crate::watchdog::run_with_watcher(
+                watcher,
+                specs.len(),
+                &shutdown,
+                &timings,
+                &RetentionCheck(check),
+            );
+        })
+}
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
 /// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
@@ -123,11 +208,13 @@ const LOG_FILE: &str = "daemon.log";
 /// `KeepAlive{SuccessfulExit=false}` restart the daemon (boot()'s relink +
 /// atomic writes make restart safe).
 ///
-/// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
-/// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
-/// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
-/// did. TENSION: a legit switch's keychain shell-outs can block inside the
-/// `StateLock`, leaving only ~10s of slack. Twice now the count of those
+/// Tightened 60s→30s for the single-fetcher lease (#27): a main loop wedged alive
+/// would otherwise delay every other instance's fetch for as long as the process
+/// lives — the scheduler thread may still be completing ticks, so its lease
+/// watchdog cannot see this wedge — 30s frees the lease about as fast as the
+/// retired TUI freshness re-arm did. A wedged SCHEDULER thread is that watchdog's
+/// to break (SCOPE below). TENSION: a legit switch's keychain shell-outs can block
+/// inside the `StateLock`, leaving only ~10s of slack. Twice now the count of those
 /// shell-outs grew under this deadline (a read-modify-write made one mirror two
 /// calls; a first-login adopt makes one switch two mirrors), so the bound is no
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
@@ -142,10 +229,11 @@ const LOG_FILE: &str = "daemon.log";
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
-/// keeps the main loop ticking and the feed fresh, so it trips nothing and the
-/// lease is never freed — pre-existing (the retired probe keyed on the same
-/// main-loop freshness). Do not read this deadline as
-/// covering the fetch path itself.
+/// keeps the main loop ticking and the feed fresh, so it trips nothing here; the
+/// scheduler's own lease watchdog ([`probe::spawn_lease_watchdog`]) releases
+/// the lease once its tick has completed nothing for
+/// [`probe::LEASE_STALE_BOUND`]. Do not read this deadline as covering the
+/// fetch path itself.
 ///
 /// A SUSPENDED process (Modern Standby/S0ix, S3, a VM pause, SIGSTOP) freezes
 /// the loop but not the wall clock, so a freeze reads as a wedge on wall time
@@ -385,18 +473,100 @@ pub(crate) fn await_start(
 pub(crate) const SPEND_DRAIN_BOUND: Duration =
     crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(Duration::from_secs(1));
 
+/// The scheduler's tick thread as a clean stop sees it: what
+/// `usage::spawn_refresher` returns. The thread saves the tps producer's
+/// unsaved attribution (applied proxy token records included) as its last act,
+/// and the producer lives on that thread alone, so a stop wakes it and waits
+/// for it to end.
+#[derive(Clone, Debug)]
+pub(crate) struct TickThread {
+    /// `None` where no thread was spawned (a test build's skip). The join
+    /// handle sits in a shared slot so a finished thread can be taken out and
+    /// joined: the join is the only reader of a panic, which ends the thread
+    /// without running its exit save.
+    thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl TickThread {
+    pub(crate) fn new(
+        thread: Option<std::thread::JoinHandle<()>>,
+        shutting_down: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            thread: thread.map(|handle| Arc::new(Mutex::new(Some(handle)))),
+            shutting_down,
+        }
+    }
+
+    /// Raise the stop flag and cut the thread's sleep short. Returns at once:
+    /// a tick in flight finishes first, then the thread saves and ends.
+    pub(crate) fn stop(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(thread) = &self.thread
+            && let Ok(guard) = thread.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.thread().unpark();
+        }
+    }
+
+    /// Wait until the thread ended, or `bound` past `started` — `true` when
+    /// it ended. A tick still running then is abandoned with its unsaved
+    /// records, as a crash would lose them, and says so once. A panic ends
+    /// the thread but skips the exit save; the join reads it and says so
+    /// once.
+    pub(crate) fn wait_stopped(&self, started: Instant, bound: Duration) -> bool {
+        let Some(thread) = &self.thread else {
+            return true;
+        };
+        while !thread
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(std::thread::JoinHandle::is_finished))
+            .unwrap_or(true)
+        {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                logline!(
+                    "clauth: the usage tick was still running after {} s; exiting without its last tps save",
+                    bound.as_secs()
+                );
+                return false;
+            }
+            std::thread::sleep(gateway::stop_sleep(remaining));
+        }
+        if let Ok(mut guard) = thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            drop(guard);
+            if handle.join().is_err() {
+                logline!(
+                    "clauth: the usage tick thread panicked; exiting without its last tps save"
+                );
+            }
+        }
+        true
+    }
+}
+
 /// The daemon's stop gate for a token spend: the store the scheduler claims
-/// spends in and the flag that refuses new ones. [`serve`] builds it once and
-/// every signal watcher carries it, the `(Err, Err)` start arm included, so a
-/// stop signal waits the spend in flight out before the process exits. What it
-/// does not cover: a stop that lands before that watcher is installed (the
-/// scheduler starts in `boot()`), and a process left with no watcher at all
-/// because signal registration failed.
+/// spends in and the flag that refuses new ones, plus the tick thread whose
+/// exit save the stop waits for. [`serve`] builds it once and every signal
+/// watcher carries it, the `(Err, Err)` start arm included, so a stop signal
+/// waits the spend in flight out before the process exits. What it does not
+/// cover: a stop that lands before that watcher is installed — the scheduler
+/// starts in `boot()`, and until the watcher exists a SIGTERM keeps the
+/// default action, so the process dies and the span is lost like a crash —
+/// and a process left with no watcher at all because signal registration
+/// failed.
 pub(crate) struct SpendDrain {
     #[cfg(unix)]
     activity: ActivityStore,
     #[cfg(unix)]
     shutting_down: Arc<AtomicBool>,
+    #[cfg(unix)]
+    scheduler: Option<TickThread>,
 }
 
 impl SpendDrain {
@@ -408,18 +578,57 @@ impl SpendDrain {
             activity,
             #[cfg(unix)]
             shutting_down,
+            #[cfg(unix)]
+            scheduler: None,
         }
     }
 
-    /// Refuse every scheduler token spend that has not started, then wait until
-    /// the one already in flight saves, or `bound` elapses — `true` when it
-    /// cleared. The flag goes up FIRST: a spend claiming the gap before a
-    /// check could otherwise run past the drain and die unsaved, so the claim
-    /// re-tests the flag under the store's lock. One log line when it actually
-    /// waited, one when it gives up, none when nothing ran.
+    /// The same gate, also stopping `scheduler` and waiting for its exit save.
+    pub(crate) fn with_scheduler(self, scheduler: TickThread) -> Self {
+        #[cfg(not(unix))]
+        let _ = scheduler;
+        Self {
+            #[cfg(unix)]
+            activity: self.activity,
+            #[cfg(unix)]
+            shutting_down: self.shutting_down,
+            #[cfg(unix)]
+            scheduler: Some(scheduler),
+        }
+    }
+
+    /// Refuse every scheduler token spend that has not started and wake the
+    /// tick thread, then wait until the spend already in flight saves or
+    /// `bound` elapses — `true` when it cleared — and then for the tick
+    /// thread's exit save. The flag goes up FIRST: a spend claiming the gap
+    /// before a check could otherwise run past the drain and die unsaved, so
+    /// the claim re-tests the flag under the store's lock. One log line when
+    /// the spend wait actually waited, one when it gives up, none when nothing
+    /// ran.
+    ///
+    /// The tick thread gets until `bound` past the drain's start — the same
+    /// window as the spend wait, so the two waits never add. The drain ends
+    /// within `SPEND_DRAIN_BOUND` (20 s) whatever the tick does, and
+    /// `REPLACE_WAIT` (that plus 5 s) still lets the stop finish before
+    /// `--replace` force-kills it. A clean stop loses the unsaved records
+    /// only when the last tick outruns that window.
     #[cfg(unix)]
     pub(crate) fn drain(&self, bound: Duration) -> bool {
         self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.stop();
+        }
+        let started = Instant::now();
+        let cleared = self.wait_spend(started, bound);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wait_stopped(started, bound);
+        }
+        cleared
+    }
+
+    /// The spend half of [`Self::drain`], its flag already raised.
+    #[cfg(unix)]
+    fn wait_spend(&self, started: Instant, bound: Duration) -> bool {
         if !crate::usage::token_spend_in_flight(&self.activity) {
             return true;
         }
@@ -433,7 +642,6 @@ impl SpendDrain {
                 bound.as_secs()
             ),
         }
-        let started = Instant::now();
         while crate::usage::token_spend_in_flight(&self.activity) {
             let remaining = bound.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -555,13 +763,26 @@ pub(crate) fn serve(
         logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
     }
     if let Some(prepared) = prepared {
-        let ctx = api::serve_prepared(
+        let ctx = match api::serve_prepared(
             prepared,
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
             daemon.memory_stores(),
-        )?;
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // `boot` started the tick thread before this last start step
+                // that can fail; stop it and wait for its exit save, as the
+                // signal path would, or the records applied since the last
+                // save are lost like a crash.
+                if let Some(scheduler) = daemon.scheduler.get() {
+                    scheduler.stop();
+                    let _ = scheduler.wait_stopped(Instant::now(), SPEND_DRAIN_BOUND);
+                }
+                return Err(e);
+            }
+        };
         daemon.push = api::start_push(&ctx);
     }
 
@@ -591,6 +812,22 @@ pub(crate) fn serve(
             gateway::stop_on_signal(spends, None, proxies::ProxySupervision::idle())
         }
     };
+
+    // Under the singleton's holder alone, like the supervisors above. Detached:
+    // it lives as long as the process, and every write it makes is one atomic
+    // rename under the state flock.
+    let retention = crate::profile::claude_dir().and_then(|claude_home| {
+        spawn_retention_watch(
+            &claude_home,
+            RETENTION_TIMINGS,
+            crossbeam_channel::never(),
+            retention_check,
+        )
+        .context("failed to start the cleanupPeriodDays check")
+    });
+    if let Err(e) = retention {
+        logline!("clauth daemon: {e:#}");
+    }
 
     logline!(
         "clauth daemon: running (status → {})",
@@ -787,8 +1024,8 @@ pub(crate) fn status_probe() -> Result<()> {
 
 /// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads
 /// the on-disk caches and prints the same shape the daemon writes, then
-/// exits. No scheduler; freshness and next-refresh are derived from cache
-/// mtimes. `include_disabled` mirrors `build_status`'s flag of the same name
+/// exits. No scheduler; freshness and next-refresh are derived from each
+/// account's cache. `include_disabled` mirrors `build_status`'s flag of the same name
 /// (hidden by default; `dispatch`'s `--all`/`--disabled` flips it).
 pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
@@ -1067,6 +1304,10 @@ pub(crate) struct LiveStores {
     /// The daemon's shutdown flag, which the same claim refuses once a stop
     /// signal has raised it.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The usage-fetch lease, so every feed writer's snapshot carries whether
+    /// THIS daemon runs the fetches: a stood-down daemon publishes
+    /// `next_refresh_at: null` rather than the mirror's derived stamps.
+    pub(crate) fetch_lease: Arc<FetchLease>,
 }
 
 #[cfg(test)]
@@ -1088,6 +1329,7 @@ impl Default for LiveStores {
             proxies: proxies::new_slots(),
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
         }
     }
 }
@@ -1106,6 +1348,10 @@ pub(crate) struct LiveSnapshot {
     usage: HashMap<String, UsageInfo>,
     gateway: Option<gateway::GatewaySlot>,
     proxies: Vec<proxies::ProxySlot>,
+    /// Whether this daemon held the usage-fetch lease when the snapshot was
+    /// taken — the flag every feed writer reads to null a stood-down
+    /// daemon's countdowns.
+    fetches_here: bool,
 }
 
 impl LiveStores {
@@ -1180,6 +1426,7 @@ impl LiveStores {
             usage,
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
+            fetches_here: self.fetch_lease.fetches_here(),
         }
     }
 }
@@ -1187,6 +1434,7 @@ impl LiveStores {
 impl LiveSnapshot {
     pub(crate) fn signals(&self) -> LiveSignals<'_> {
         LiveSignals {
+            fetches_here: self.fetches_here,
             status: &self.status,
             third_party_status: &self.third_party_status,
             third_party_streaks: &self.third_party_streaks,
@@ -1207,6 +1455,13 @@ impl LiveSnapshot {
 fn entry_fresh(entry: &status_json::ProfileEntry) -> bool {
     let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
     !entry.stale && entry.fetch_status.as_deref() == Some(fresh)
+}
+
+/// [`entry_fresh`] as the 5h bell and the window push judge it: a proxy
+/// member's freshness is its chain windows' (`alert_stale`).
+fn entry_alert_fresh(entry: &status_json::ProfileEntry) -> bool {
+    let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+    !entry.alert_stale && entry.fetch_status.as_deref() == Some(fresh)
 }
 
 /// What a background hold keys on: the account's fixed pair, or one handed-off
@@ -1748,8 +2003,19 @@ struct Daemon {
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
     /// whole process's name-keyed state.
     weekly_reset_kicks: WeeklyResetKicks,
+    /// The claude banked-reset side read's cadence memo, shared with the
+    /// scheduler the same way [`Self::weekly_reset_kicks`] is.
+    claude_resets_memo: ClaudeResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
+    /// The fetch lease the scheduler tick holds: the main-loop drains read it
+    /// to tell whether this instance still fetches, so a queued switch or
+    /// switch-off does not execute once the watchdog released the lease (the
+    /// holder that took over decides).
+    fetch_lease: Arc<FetchLease>,
+    /// The scheduler's tick thread once `boot` started it: the stop gate
+    /// ([`Self::spend_drain`]) carries it, so a stop waits for its exit save.
+    scheduler: std::sync::OnceLock<TickThread>,
     /// Last-seen reload fingerprint — drives external-change reload. Set only
     /// by a successful reload (which re-read disk); a self-initiated write
     /// never moves it, so the next tick re-reads, rebuilds and logs.
@@ -1870,13 +2136,17 @@ impl Daemon {
             third_party_broken,
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+            claude_resets_memo: new_claude_resets_memo(),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
-            // Raised by [`SpendDrain::drain`] when a stop signal arrives: from
-            // then on the scheduler refuses every new token spend
+            // Raised by [`SpendDrain::drain`] when a stop signal arrives, and
+            // by `serve` when its API fails to start after `boot`: from then
+            // on the scheduler refuses every new token spend
             // (`spawn_refresher` and the rotation gate read it), while the
             // spend already in flight saves. The TUI's quit path is the flag's
             // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
+            scheduler: std::sync::OnceLock::new(),
             last_reload_fp,
             last_reload_error: None,
             snapshot,
@@ -1945,7 +2215,9 @@ impl Daemon {
                     }
                 }
             };
-            let _ = link_profile_credentials(&active);
+            if let Err(e) = link_profile_credentials(&active) {
+                logline!("clauth daemon: {e:#}; .credentials.json was not relinked to '{active}'");
+            }
         }
 
         let interval = self.refresh_interval.load(Ordering::Relaxed);
@@ -1991,13 +2263,17 @@ impl Daemon {
     /// what a signal watcher carries, so the drain sees exactly the token
     /// spends claimed in this store and refuses the ones that have not started.
     fn spend_drain(&self) -> SpendDrain {
-        SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down))
+        let drain = SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down));
+        match self.scheduler.get() {
+            Some(scheduler) => drain.with_scheduler(scheduler.clone()),
+            None => drain,
+        }
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
-        spawn_refresher(
+        let scheduler = spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
@@ -2010,6 +2286,7 @@ impl Daemon {
             Arc::clone(&self.kick_blocks),
             Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.weekly_reset_kicks),
+            Arc::clone(&self.claude_resets_memo),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -2023,12 +2300,13 @@ impl Daemon {
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
-            // lease for life, but if a TUI is already fetching, the daemon stands
-            // its refresher down and hydrates instead — the main loop still writes
-            // `status.json` every tick regardless of who fetches. A fresh lease per
-            // scheduler; the tick thread's clone keeps the flock held for the
-            // process lifetime.
-            Arc::new(FetchLease::new()),
+            // lease, but if a TUI is already fetching, the daemon stands its
+            // refresher down and hydrates instead — the main loop still writes
+            // `status.json` every tick regardless of who fetches. The daemon's
+            // own clone feeds the main-loop drains' stand-down check; the tick
+            // thread's clone keeps the flock held while its ticks complete, and
+            // its lease watchdog releases it when they stop.
+            Arc::clone(&self.fetch_lease),
             // The daemon has no display reader of its provider store
             // (`status.json` reads provider figures off disk), so its stand-down
             // hydration seeds the work list, never the display superset.
@@ -2038,6 +2316,8 @@ impl Daemon {
             false,
             Arc::clone(&self.snapshot),
         );
+        // `boot` runs once per daemon, so the cell is empty here.
+        let _ = self.scheduler.set(scheduler);
     }
 
     /// Main loop. Writes an initial `status.json` immediately (so a reader that
@@ -2146,6 +2426,7 @@ impl Daemon {
             proxies: Arc::clone(&self.proxies),
             activity: Arc::clone(&self.activity),
             shutting_down: Arc::clone(&self.shutting_down),
+            fetch_lease: Arc::clone(&self.fetch_lease),
         }
     }
 
@@ -2159,6 +2440,7 @@ impl Daemon {
             poll_streaks: Arc::clone(&self.poll_streaks),
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            claude_resets_memo: Arc::clone(&self.claude_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -2378,7 +2660,7 @@ impl Daemon {
                 // follows that line too").
                 util: long_util(entry),
             },
-            fresh: entry_fresh(entry),
+            fresh: entry_alert_fresh(entry),
         });
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its latches must
@@ -2401,16 +2683,17 @@ impl Daemon {
     }
 
     /// The headless half of the 5h bell, judged on the figures this tick just
-    /// published so the bell and the feed never disagree. With no
-    /// `bell_command` the latch is left as it is,
-    /// so setting one mid-crossing does not re-announce a bell already rung.
+    /// published so the bell and the feed never disagree about a figure; a
+    /// proxy member's freshness is its chain windows' (`alert_stale`). With no
+    /// `bell_command` a present account keeps its latch as it is, so setting
+    /// one mid-crossing does not re-announce a bell already rung; a deleted
+    /// account is forgotten either way.
     fn ring_bells(
         &mut self,
         roster: &[crate::profile::Profile],
         entries: &[status_json::ProfileEntry],
         command: Option<&str>,
     ) {
-        let Some(command) = command else { return };
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its standing bell
         // must not re-arm when it comes back into view. Only a deleted account
@@ -2418,8 +2701,9 @@ impl Daemon {
         // whole bell population.
         let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
         self.bells.forget_absent(&present);
+        let Some(command) = command else { return };
         for entry in entries {
-            let fresh = entry_fresh(entry);
+            let fresh = entry_alert_fresh(entry);
             let util = entry
                 .windows
                 .iter()

@@ -2,8 +2,8 @@
 //! that the report names only what the clear removed. The postscripts' own
 //! gating is pinned in-process (`tests/inline/cli.rs`,
 //! `the_clear_postscripts_ride_exactly_what_moved`); the headline and the
-//! failure path print from `cmd_static_token_clear` itself, which only a
-//! spawned binary's stdout can show.
+//! failure path print from `cmd_static_token_clear` itself, pinned here on the
+//! real binary's stdout.
 //!
 //! Unix only, for the reason `tests/closed_reader.rs` gives: the child resolves
 //! its home through `$HOME`, which only Unix lets a test point at a sandbox.
@@ -28,8 +28,13 @@ fn seed(home: &Path, name: &str, config: &str) -> PathBuf {
 }
 
 fn run_clear(home: &Path, name: &str) -> Output {
+    run_clear_with(home, name, &["--yes"])
+}
+
+fn run_clear_with(home: &Path, name: &str, extra: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clauth"))
-        .args(["static-token", name, "--clear", "--yes"])
+        .args(["static-token", name, "--clear"])
+        .args(extra)
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
@@ -38,6 +43,33 @@ fn run_clear(home: &Path, name: &str) -> Output {
         .stdin(Stdio::null())
         .output()
         .expect("run clauth static-token --clear")
+}
+
+/// Only the real binary runs the terminal check: a test build reads the
+/// confirm seam instead.
+#[test]
+fn a_clear_off_a_terminal_without_yes_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = seed(
+        home.path(),
+        "acme",
+        "api_key = \"sk-acme-fixture\"\nrolling_token = true\n",
+    );
+    let sidecar = dir.join("session-token.json");
+    std::fs::write(
+        &sidecar,
+        r#"{"claudeAiOauth":{"accessToken":"mint-access","refreshToken":null,"expiresAt":null}}"#,
+    )
+    .unwrap();
+
+    let out = run_clear_with(home.path(), "acme", &[]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Error: pass --yes to clear the long-lived token for 'acme' non-interactively\n"
+    );
+    assert!(sidecar.exists(), "a refused clear leaves the token on disk");
 }
 
 /// A flag-only account: no sidecar, no preserved mint, only `rolling_token`.

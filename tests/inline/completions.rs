@@ -219,6 +219,81 @@ fn every_shell_completes_switchs_both_positions() {
     );
 }
 
+/// `clauth rename` takes the profile to rename at its first position and the
+/// new name is free text, so each shell must offer the subcommand, then the
+/// claude roster alone, then nothing. Unlike `start`/`delete`, `rename` is
+/// claude-only, so the codex roster must stay out of its profile position.
+#[test]
+fn every_shell_completes_renames_profile_position_only() {
+    let bash_pos1 = guarded_arms(&BASH, |guard| guard.contains(r#"[ "$COMP_CWORD" -eq 1 ]"#))
+        .expect("bash must offer its subcommands at the first position");
+    assert!(
+        offers_token(&bash_pos1, "rename"),
+        "bash must offer rename among its subcommands",
+    );
+    let bash_pos2 = guarded_arms(&BASH, |guard| guard.contains(r#"[ "$prev" = "rename" ]"#))
+        .expect("bash must have a rename profile arm");
+    assert!(
+        bash_pos2.contains(r#"[ "$COMP_CWORD" -eq 2 ]"#)
+            && bash_pos2.contains(r#"profiles=$(clauth __complete 2>/dev/null)"#),
+        "bash must offer profiles at rename's first position (word 3)",
+    );
+    assert!(
+        bash_pos2.contains(r#"[ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex="#),
+        "bash must gate its codex offer to start/delete, never rename",
+    );
+    assert!(
+        guarded_arms(&BASH, |guard| guard.contains(r#""rename""#)
+            && guard.contains("-eq 3 ]"))
+        .is_none(),
+        "bash must offer nothing at rename's second position (word 4)",
+    );
+
+    let zsh_pos1 = guarded_arms(&ZSH, |guard| guard.contains("(( CURRENT == 2 ))"))
+        .expect("zsh must offer its subcommands at the first position");
+    assert!(
+        zsh_pos1.contains("'rename[rename a profile]'"),
+        "zsh must offer rename among its subcommands",
+    );
+    let zsh_pos2 = guarded_arms(&ZSH, |guard| {
+        zsh_word_matches(guard, 2, "rename") && guard.contains("CURRENT == 3")
+    })
+    .expect("zsh must have a rename profile arm");
+    assert!(
+        zsh_pos2.contains(r#"_describe 'profile' profiles"#),
+        "zsh must offer profiles at rename's first position (word 3)",
+    );
+    assert!(
+        zsh_pos2.contains(r#"[[ "${words[2]}" == (start|delete) ]] && codex="#),
+        "zsh must gate its codex offer to start/delete, never rename",
+    );
+    assert!(
+        guarded_arms(&ZSH, |guard| {
+            zsh_word_matches(guard, 2, "rename") && guard.contains("CURRENT == 4")
+        })
+        .is_none(),
+        "zsh must offer nothing at rename's second position (word 4)",
+    );
+
+    assert!(
+        FISH.contains(
+            r#"complete -c clauth -f -n __fish_is_first_token -a rename -d "Rename a profile""#
+        ),
+        "fish must offer rename among its subcommands",
+    );
+    let rename_lines: Vec<&str> = FISH
+        .lines()
+        .filter(|line| line.contains("__fish_seen_subcommand_from rename"))
+        .collect();
+    assert_eq!(
+        rename_lines.as_slice(),
+        &[
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from rename; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile"#
+        ],
+        "fish must offer the claude roster alone at rename's first position, then nothing",
+    );
+}
+
 /// After `clauth switch --list` fish offers neither a profile (the CLI refuses
 /// `switch --list <profile>`) nor a second `--json`.
 #[test]

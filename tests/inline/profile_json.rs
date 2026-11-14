@@ -663,7 +663,7 @@ fn tier_label_shows_the_server_name_of_an_unclassified_tier() {
     assert_eq!(tier_label(&profile), Some("Ultra Lite".to_string()));
 }
 
-/// `tier_label` reads the same OAuth cache `published_windows` does, so it
+/// `tier_label` reads the same OAuth cache `published_windows_with_label` does, so it
 /// inherits the same leftover: a CONVERTED profile — a `base_url` + key saved on
 /// disk, the `edit_profile_endpoint` shape — publishes no tier even with a
 /// plan-bearing `usage_cache.json` from its earlier OAuth life still on disk:
@@ -837,7 +837,9 @@ fn published_windows_is_empty_for_a_converted_profile() {
     seed_usage_cache("litellm", &five_hour_at(100.0), Duration::from_secs(100));
 
     assert!(
-        published_windows(&crate::profile::ProfileName::from("litellm")).is_empty(),
+        published_windows_with_label(&crate::profile::ProfileName::from("litellm"))
+            .0
+            .is_empty(),
         "a converted account publishes no Anthropic window"
     );
 }
@@ -849,7 +851,7 @@ fn published_windows_carries_an_oauth_accounts_windows() {
     let _home = HomeSandbox::new();
     seed_usage_cache("kerry", &five_hour_at(42.0), Duration::from_secs(100));
 
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(windows.len(), 1);
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 42.0);
@@ -889,7 +891,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         Duration::from_secs(100),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(
         windows.len(),
         2,
@@ -919,7 +921,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         },
         Duration::from_secs(100),
     );
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert_eq!(
         windows.len(),
         1,
@@ -955,7 +957,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         },
         Duration::from_secs(100),
     );
-    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("kerry")).0;
     assert!(
         windows.is_empty(),
         "every lapsed row drops, 7d and weekly and 5h alike: {windows:?}"
@@ -987,7 +989,7 @@ fn published_windows_carries_a_third_party_accounts_provider_windows() {
         ]),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("zai-keyed"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("zai-keyed")).0;
     assert_eq!(windows.len(), 2, "both provider windows publish");
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 62.0);
@@ -1018,7 +1020,7 @@ fn published_windows_drops_a_lapsed_provider_bar() {
         ]),
     );
 
-    let windows = published_windows(&crate::profile::ProfileName::from("zai-old"));
+    let windows = published_windows_with_label(&crate::profile::ProfileName::from("zai-old")).0;
     assert_eq!(
         windows.len(),
         1,

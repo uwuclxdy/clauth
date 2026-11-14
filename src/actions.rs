@@ -79,7 +79,8 @@ pub(crate) fn validate_new_name_chars(name: &str) -> Result<&str> {
 /// [`validate_profile_name`] a creation flow can take alone when it
 /// deliberately tolerates an own-roster collision (the capture-name prompt
 /// routes that case into capture-into-existing) but must still refuse to
-/// shadow the other harness, which no flow can adopt across.
+/// shadow the other harness, which no flow can adopt across. `rename_profile`
+/// takes it alone under its hold, its own-roster check being the fresh one.
 pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
     let foreign = match harness {
         Harness::Claude => Harness::Codex,
@@ -119,6 +120,18 @@ fn validate_new_name(name: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+/// Whether any name in `names` folds onto `query` under the rule creation
+/// uses, with `exclude` sparing the account being renamed.
+fn folds_onto<'a>(
+    names: impl Iterator<Item = &'a str>,
+    query: &str,
+    exclude: Option<&str>,
+) -> bool {
+    names
+        .into_iter()
+        .any(|n| n.eq_ignore_ascii_case(query) && Some(n) != exclude)
+}
+
 /// The full gate for creating or renaming a profile on `harness`: the
 /// roster-free creation rules ([`validate_new_name`]), then the other
 /// harness's roster (refused by name), then this harness's own duplicate
@@ -146,10 +159,7 @@ pub(crate) fn validate_profile_name(
             .map(|n| n.as_str().to_string())
             .collect(),
     };
-    if own
-        .iter()
-        .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)
-    {
+    if folds_onto(own.iter().map(String::as_str), trimmed, exclude) {
         bail!("a profile named '{trimmed}' already exists");
     }
     Ok(())
@@ -205,6 +215,55 @@ impl std::fmt::Display for GateNeeded {
 }
 
 impl std::error::Error for GateNeeded {}
+
+/// The refusal of a login landing in an account whose `config.toml` cannot say
+/// whether it is an account on a proxy ([`refuse_capture_into_unclassifiable`],
+/// [`overwrite_captured_profile_held`]), typed so a caller that frames its
+/// failures by operation can give it the login's head.
+#[derive(Debug)]
+pub(crate) struct CaptureRefused(pub(crate) ProfileName);
+
+impl std::fmt::Display for CaptureRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&unclassifiable_login_refusal(
+            &self.0,
+            "then save the login again",
+        ))
+    }
+}
+
+impl std::error::Error for CaptureRefused {}
+
+/// [`switch_off_locked`]'s refusal over an unclassifiable account holding a
+/// first login: it carries the login so the printing surface can say the line
+/// once per login ([`switch_off_hold_said`]).
+#[derive(Debug)]
+pub(crate) struct SwitchOffHeld {
+    account: ProfileName,
+    login: crate::claude::UnsavedLogin,
+}
+
+impl std::fmt::Display for SwitchOffHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&unclassifiable_login_refusal(
+            &self.account,
+            "and clauth switches off at its next check",
+        ))
+    }
+}
+
+impl std::error::Error for SwitchOffHeld {}
+
+/// Whether `failure` is a [`SwitchOffHeld`] already said for its login, so the
+/// surface stays quiet: the scheduler queues the switch-off again on every
+/// scan while the chain stays spent. Asked by the surface that prints, never
+/// in the hold: the startup one-shot swallows the error, and a memo taken
+/// there would silence the first drain that can say it.
+pub(crate) fn switch_off_hold_said(failure: &anyhow::Error) -> bool {
+    failure.downcast_ref::<SwitchOffHeld>().is_some_and(|held| {
+        !crate::claude::first_switch_off_hold(&held.account, held.login.clone())
+    })
+}
 
 /// The closed set of refusals a chain-edit action can raise. An enum rather
 /// than a wire string so the route's match is exhaustive: a fifth refusal added
@@ -361,7 +420,7 @@ fn switch_profile_synced_gated(
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = switch_profile_locked_gated(&mut guard, name, gated)?;
+    let changed = switch_profile_locked_with(&mut guard, name, gated, true)?;
     drop(guard);
     strip_stale_identity_after_switch(changed);
     if changed {
@@ -406,14 +465,30 @@ pub(crate) fn switch_profile_locked_gated(
     name: &ProfileName,
     gated: bool,
 ) -> Result<bool> {
+    switch_profile_locked_with(config, name, gated, false)
+}
+
+/// [`switch_profile_locked_gated`]; a `manual` switch (the TUI, CLI, MCP and
+/// REST ones, through [`switch_profile_gated`]) also refuses under the hold
+/// to leave an account whose config is unclassifiable behind an unsaved
+/// login ([`refuse_switch_off_unclassifiable`]).
+fn switch_profile_locked_with(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    gated: bool,
+    manual: bool,
+) -> Result<bool> {
     with_state_lock(|held| {
         let target = ensure_switch_target_ok(config, name, held)?;
-        mirror_active_on_disk(config, held)?;
+        let outgoing = mirror_active_on_disk(config, held)?;
         if already_active(config, name, held)? {
             if !gated && crate::claude::live_login_saved_elsewhere(name) {
                 bail!(GateNeeded);
             }
             return relink_login_saved_elsewhere(name);
+        }
+        if manual {
+            refuse_switch_off_unclassifiable(outgoing.as_ref(), name)?;
         }
         if !gated {
             bail!(GateNeeded);
@@ -496,6 +571,67 @@ fn refuse_unanswered_outgoing(
     Ok(true)
 }
 
+/// Refuse a manual switch from `outgoing` onto `target` while `outgoing`'s
+/// `config.toml` cannot say whether it is an account on a proxy
+/// ([`crate::profile::ProxyClaim::Unclassifiable`]) and Claude Code holds a
+/// live login clauth has not saved: a diverged unsaved login
+/// ([`live_diverged_and_unsaved`]) or a first login the adopt skipped
+/// ([`crate::claude::is_first_login`]). A proxy account's would be dropped
+/// and any other account's saved into it, and clauth cannot tell which this
+/// is, so the switch changes nothing. A switch onto `outgoing` itself is no
+/// switch away. The unattended legs (the daemon's drains, the startup
+/// one-shot, a session's swap) never ask this.
+pub(crate) fn refuse_switch_off_unclassifiable(
+    outgoing: Option<&ProfileName>,
+    target: &ProfileName,
+) -> Result<()> {
+    let Some(out) = outgoing.filter(|out| *out != target) else {
+        return Ok(());
+    };
+    if unsaved_login_over_unclassifiable(out)? {
+        bail!(DeepRefusal(unclassifiable_login_refusal(
+            out,
+            "then switch again"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse saving Claude Code's live login into `name` while its `config.toml`
+/// cannot say whether it is an account on a proxy
+/// ([`crate::profile::ProxyClaim::Unclassifiable`]): the login would land in
+/// an account that may be its proxy's. A live login another account stores is
+/// no unsaved login, and a capture lands none of it, so it passes. Changes
+/// nothing.
+pub(crate) fn refuse_capture_into_unclassifiable(name: &ProfileName) -> Result<()> {
+    if unsaved_login_over_unclassifiable(name)? {
+        bail!(CaptureRefused(name.clone()));
+    }
+    Ok(())
+}
+
+/// Whether `name`'s `config.toml` is unclassifiable while Claude Code holds a
+/// live login clauth has not saved: a diverged unsaved login
+/// ([`live_diverged_and_unsaved`]) or a first login
+/// ([`crate::claude::is_first_login`]).
+fn unsaved_login_over_unclassifiable(name: &ProfileName) -> Result<bool> {
+    if crate::profile::stored_proxy_claim_failing_closed(name)
+        != crate::profile::ProxyClaim::Unclassifiable
+    {
+        return Ok(false);
+    }
+    Ok(live_diverged_and_unsaved(name)? || crate::claude::is_first_login(name)?)
+}
+
+/// The sentence every refusal over an unclassifiable `config.toml` holding
+/// Claude Code's unsaved login says, `next` naming what the fix leads to.
+fn unclassifiable_login_refusal(name: &ProfileName, next: &str) -> String {
+    format!(
+        "can't read the config of '{name}', so clauth can't tell whether Claude Code's current \
+         login belongs in it; fix its config.toml, {next}"
+    )
+}
+
 /// Test-only: [`switch_profile_discard_gated`] with `gated: true`.
 #[cfg(test)]
 pub(crate) fn switch_profile_discard(
@@ -536,6 +672,7 @@ pub(crate) fn switch_profile_discard_gated(
             }
             return relink_login_saved_elsewhere(target);
         }
+        refuse_switch_off_unclassifiable(outgoing.as_ref(), target)?;
         if !gated {
             bail!(GateNeeded);
         }
@@ -554,9 +691,23 @@ pub(crate) fn switch_profile_discard_gated(
 
 /// Force-capture the live login into the account disk names active (mirrored
 /// into `config` under the caller's hold), then require that it landed: a
-/// relink after a capture that wrote nothing would drop the login. Returns
+/// relink after a capture that wrote nothing would drop the login. A diverged
+/// unsaved login on an account running on a long-lived token refuses before
+/// the capture with the long-lived line — that account's store cannot hold an
+/// OAuth login. The capture itself writes nothing for an unsaved login (the
+/// sink's sync matches only a store the login already belongs to), so the
+/// pre-check only picks which refusal sentence appears: without it the
+/// post-check below refuses with the generic unsaved-login text. Returns
 /// whether the OAuth half's stored identity changed.
 pub(crate) fn force_capture_live_login(config: &mut AppConfig) -> Result<bool> {
+    if let Some(active) = config.state.active_profile.as_ref()
+        && live_diverged_and_unsaved(active)?
+        && crate::claude::has_session_token(active)
+    {
+        bail!(DeepRefusal(crate::format::long_lived_cannot_hold_login(
+            active
+        )));
+    }
     let oauth_changed = force_snapshot_active_credentials(config)?;
     if let Some(active) = config.state.active_profile.as_ref()
         && live_diverged_and_unsaved(active)?
@@ -600,7 +751,14 @@ pub(crate) fn switch_profile_reconciled(
 /// already names active switches nothing; when the answer was about that
 /// account's own unsaved login, the login is saved into it and relinked, and
 /// a live login another account stores is relinked away from, capturing
-/// nothing ([`Reconciled::Relinked`]).
+/// nothing ([`Reconciled::Relinked`]). The CLI switch ([`switch_profile_cli`])
+/// and the `Overwrite` default of the MCP/REST switch
+/// ([`switch_profile_noninteractive`]) land here. An outgoing proxy account
+/// ([`crate::claude::adopt_skips_proxy_account`]) is never snapshotted into:
+/// the live login is dropped, as [`switch_profile_discard_gated`] drops it;
+/// and a target proxy account disk already names active takes no save arm.
+/// An outgoing account whose config is unclassifiable refuses instead
+/// ([`refuse_switch_off_unclassifiable`]).
 ///
 /// Same lock shape as [`switch_profile_gated`]: guard first, dropped before the
 /// gated republish. A default no prompt read covers whatever login is live
@@ -650,7 +808,12 @@ pub(crate) fn switch_profile_reconciled_for_gated(
         let target = ensure_switch_target_ok(config, name, held)?;
         let outgoing = mirror_active_on_disk(config, held)?;
         if already_active(config, name, held)? {
-            if answered == Some(name) && live_diverged_and_unsaved(name)? {
+            // A proxy account's login is its proxy's: never saved into it, so
+            // the switch onto it is the plain one onto the active account.
+            if answered == Some(name)
+                && !crate::claude::adopt_skips_proxy_account(name)
+                && live_diverged_and_unsaved(name)?
+            {
                 if !login.covers_live() {
                     bail!(DeepRefusal(crate::format::unsaved_live_login(name)));
                 }
@@ -666,11 +829,17 @@ pub(crate) fn switch_profile_reconciled_for_gated(
             }
             return Ok((Reconciled::AlreadyActive, None, false));
         }
+        refuse_switch_off_unclassifiable(outgoing.as_ref(), name)?;
         if !gated {
             bail!(GateNeeded);
         }
         let oauth_changed = if refuse_unanswered_outgoing(outgoing.as_ref(), answered, login)? {
             snapshot_active_credentials(config)?;
+            false
+        } else if outgoing
+            .as_ref()
+            .is_some_and(crate::claude::adopt_skips_proxy_account)
+        {
             false
         } else {
             force_capture_live_login(config)?
@@ -846,7 +1015,7 @@ fn save_bare_keychain_item(
         BareItemSave::Nothing => Ok(None),
         BareItemSave::Owner(owner) => {
             let account = crate::claude::claim_bare_item_owner(&owner)?;
-            crate::claude::save_bare_item_into(&owner, &account, &item, writer)
+            crate::claude::save_bare_item_into_claimed(&owner, account.as_ref(), &item, writer)
         }
         BareItemSave::Owners(first, second) => {
             // Claimed before the question: the pick lands only on the account
@@ -865,7 +1034,12 @@ fn save_bare_keychain_item(
                     } else {
                         &accounts[1]
                     };
-                    crate::claude::save_bare_item_into(owner, account, &item, writer)
+                    crate::claude::save_bare_item_into_claimed(
+                        owner,
+                        account.as_ref(),
+                        &item,
+                        writer,
+                    )
                 }
                 None => {
                     crate::out::errln!("clauth: aborted, no changes made");
@@ -943,16 +1117,21 @@ pub(crate) fn save_bare_item_as_profile(
 
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt read
 /// off `input`, the locked stdin in production), then prime the 5h window. No
-/// token rotation — stale chains rotate lazily on first use.
+/// token rotation — stale chains rotate lazily on first use. A diverged live
+/// file is dropped without asking when the outgoing account is a proxy
+/// account, and refused when the outgoing account's config is unclassifiable
+/// ([`refuse_switch_off_unclassifiable`]).
 pub(crate) fn switch_profile_cli(
     mut config: AppConfig,
     canonical: &ProfileName,
     mut input: impl std::io::BufRead,
 ) -> Result<()> {
     let mut outgoing = with_state_lock(|held| mirror_active_on_disk(&mut config, held))?;
+    refuse_switch_off_unclassifiable(outgoing.as_ref(), canonical)?;
 
-    // Diverged link = CC re-logged and wrote a regular file; must reconcile
-    // (capture into outgoing profile) rather than refuse. A logged-out shell is
+    // Diverged link = CC re-logged and wrote a regular file; the switch
+    // reconciles it rather than refuse: a plain outgoing account is asked to
+    // take the login, a proxy account's is dropped. A logged-out shell is
     // exempt: capturing its blank tokens would destroy the outgoing profile's
     // stored login. An outgoing account running on a long-lived token cannot
     // take the login at all, so it is never offered.
@@ -972,6 +1151,14 @@ pub(crate) fn switch_profile_cli(
         };
         if !diverged {
             break None;
+        }
+        // A proxy account's login is its proxy's: the reconcile drops the live
+        // login rather than save it into one, so there is nothing to ask.
+        if outgoing
+            .as_ref()
+            .is_some_and(crate::claude::adopt_skips_proxy_account)
+        {
+            break (outgoing.as_ref() != Some(canonical)).then_some(AnsweredLogin::Live);
         }
         let seen = crate::claude::live_creds_fingerprint();
         let active = outgoing.as_deref().unwrap_or("");
@@ -1144,9 +1331,10 @@ pub(crate) fn switch_profile_cli(
 ///
 /// On credential divergence (the active link is a regular file CC re-logged into)
 /// the caller-supplied `on_divergence` decides: `Overwrite` captures the live
-/// tokens into the outgoing profile then relinks ([`switch_profile_reconciled_gated`]),
-/// `Discard` drops the foreign live login and force-relinks `target`'s stored
-/// tokens without capturing it into any profile ([`switch_profile_discard_gated`]),
+/// tokens into the outgoing profile then relinks ([`switch_profile_reconciled_gated`];
+/// an outgoing proxy account's live login is dropped instead), `Discard` drops
+/// the foreign live login and force-relinks `target`'s stored tokens without
+/// capturing it into any profile ([`switch_profile_discard_gated`]),
 /// `NewProfile` is interactive-only (would need a name prompt) so it errors, and
 /// `None` means no default is set so it errors. A non-diverged link
 /// (`LinkedTo`/`Missing`) always takes the plain [`switch_profile_gated`].
@@ -1282,6 +1470,9 @@ pub(crate) fn switch_profile_noninteractive(
             target,
         )));
     }
+    // Before the settle and the gate, each of which can write; the switch
+    // re-checks under its hold.
+    refuse_switch_off_unclassifiable(previous.as_deref().map(ProfileName::from).as_ref(), target)?;
 
     // Above the AUTH-1 gate, as in `switch_profile_cli`. Nobody can answer a
     // question here, so an item the settle cannot place refuses. The notice
@@ -1310,7 +1501,7 @@ pub(crate) fn switch_profile_noninteractive(
         }
         (
             Some(crate::claude::BareItemPlacement::enter(settled.placed)),
-            settled.notice,
+            settled.notice.as_ref().map(ToString::to_string),
         )
     };
     #[cfg(not(target_os = "macos"))]
@@ -1397,6 +1588,7 @@ pub(crate) fn switch_profile_noninteractive(
                         switch_profile_discard_gated(config, target, outgoing.as_ref(), gated)?;
                     }
                     Some(DivergenceChoice::NewProfile) | None => {
+                        refuse_switch_off_unclassifiable(outgoing.as_ref(), target)?;
                         return Err(SwitchError::Refused(crate::format::unsaved_live_login(
                             outgoing.as_deref().unwrap_or_default(),
                         )));
@@ -1440,7 +1632,8 @@ pub(crate) fn switch_profile_noninteractive(
 /// WITHOUT being snapshotted (`snapshot_active_credentials` skips it, keeping
 /// the stored identity), so a fresh `/login` is dropped: the TUI gates that on
 /// the divergence prompt, while the automatic wrap-off leg accepts the drop,
-/// unattended by design.
+/// unattended by design. A first login over an unclassifiable account is no
+/// such drop: the switch-off holds ([`switch_off_locked`]).
 pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
     #[allow(
         clippy::expect_used,
@@ -1458,7 +1651,8 @@ pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
 
 /// [`switch_off`]'s locked body: the caller holds the config guard (ranked
 /// outer of the state flock) and receives the did-anything-change answer so
-/// it can gate its own republish.
+/// it can gate its own republish. An unclassifiable active account holding a
+/// first login refuses with [`SwitchOffHeld`], changing nothing.
 pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
     with_state_lock(|held| {
         // Off already in the caller's copy AND on disk: memory alone misses a
@@ -1468,6 +1662,17 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
         let Some(departed) = mirror_active_on_disk(config, held)? else {
             return Ok(false);
         };
+        // The snapshot would skip this login and the clear would delete the
+        // only copy of it, so usage goes on until the config is fixed.
+        if crate::profile::stored_proxy_claim_failing_closed(&departed)
+            == crate::profile::ProxyClaim::Unclassifiable
+            && crate::claude::is_first_login(&departed)?
+        {
+            bail!(SwitchOffHeld {
+                account: departed.clone(),
+                login: crate::claude::UnsavedLogin::live(),
+            });
+        }
         // The outgoing account's covered keys are read while the marker still
         // names it; the put-back itself runs last (below).
         let state = load_fresh_state(held)?;
@@ -1740,6 +1945,7 @@ pub(crate) fn store_console_login(
     console: ConsoleCredential,
 ) -> Result<()> {
     with_state_lock(|held| {
+        refuse_relogin_off_proxy(name)?;
         require_profile_id(name, account, held)?;
         let before = read_before_identities(name);
         let (fresh, plan) = update_profile_config(name, |fresh| {
@@ -2160,6 +2366,35 @@ pub(crate) fn rotation_guard_for_mutation(name: &ProfileName) -> Result<Rotation
     }
 }
 
+/// A rename whose record landed before the active account's relink failed:
+/// the account now goes by `new`, so a caller that downcasts this follows the
+/// new name instead of treating the rename as undone. `relink` is the source.
+#[derive(Debug)]
+pub(crate) struct RenamedButNotRelinked {
+    pub(crate) old: ProfileName,
+    pub(crate) new: ProfileName,
+    pub(crate) relink: anyhow::Error,
+}
+
+impl std::fmt::Display for RenamedButNotRelinked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A stored roster name is not re-validated on load, so a hand edit can
+        // leave a control byte in it.
+        let old = crate::format::escape_unless(self.old.as_str(), is_name_char);
+        let new = crate::format::escape_unless(self.new.as_str(), is_name_char);
+        write!(
+            f,
+            "renamed '{old}' to '{new}', but the live credentials were not relinked"
+        )
+    }
+}
+
+impl std::error::Error for RenamedButNotRelinked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.relink)
+    }
+}
+
 /// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `old`: a second
 /// acquisition at the same rank is a lock-order violation whichever profile it
 /// names, so `new` cannot carry one of its own.
@@ -2212,6 +2447,47 @@ pub(crate) fn rename_profile(
     with_state_lock(|held| {
         let old_dir = profile_dir(old)?;
         let new_dir = profile_dir(new)?;
+        // Read the fresh roster BEFORE the first write (`rename_profile_token`
+        // and the dir move): a read failure after the dir moved would strand a
+        // moved-but-unrecorded dir, so it must land while every step before the
+        // first fallible write is still reversible.
+        let mut state = load_fresh_state(held)?;
+        // The rosters that decide are the ones read under this hold: a peer
+        // rename or delete landing after the caller loaded its config leaves
+        // `old` gone (this run would move nothing and report success), or
+        // leaves `new` taken (both names would resolve to one account), a codex
+        // create included (its directory holds a single-use login). Ahead of
+        // the directory check: a taken name's directory is that account's,
+        // never the orphan that check describes.
+        if !state.profiles.iter().any(|n| n == old) {
+            bail!("{}", profile_not_found_head(old.as_str()));
+        }
+        if folds_onto(
+            state.profiles.iter().map(|n| n.as_str()),
+            new.as_str(),
+            Some(old.as_str()),
+        ) {
+            bail!("a profile named '{new}' already exists");
+        }
+        validate_foreign_harness_free(new.as_str(), Harness::Claude)?;
+        // A case-only rename (`d3` -> `D3`) resolves to ONE directory on a
+        // case-insensitive filesystem (the macOS default), so same-inode pairs
+        // are exempt.
+        let same_dir = crate::canonical::identity(&old_dir)
+            .ok()
+            .zip(crate::canonical::identity(&new_dir).ok())
+            .is_some_and(|(a, b)| a == b);
+        // A codex create's directory holds its single-use login, so it is no
+        // orphan, and with `old_dir` gone the retry below must not adopt it:
+        // `symlink_metadata` alone counts a dangling link as held, where
+        // `exists` follows it and reads one as absent.
+        if !same_dir && std::fs::symlink_metadata(new_dir.join("auth.json")).is_ok() {
+            bail!(
+                "'{new}' has a directory at {} holding a codex login with no account \
+                 behind it, keep the directory and pick another name",
+                new_dir.display()
+            );
+        }
         // The name validation above checked the RECORD; a directory can outlive
         // its record — a per-profile cache a stale-config fetch leg wrote after
         // the account was deleted re-creates the dir (the writer is gated now,
@@ -2219,32 +2495,19 @@ pub(crate) fn rename_profile(
         // fails ENOTEMPTY, which reads as an internal failure; refuse here with
         // the actionable shape instead. Gated on `old_dir` existing: that is
         // the only branch that renames, so it is the only one ENOTEMPTY can
-        // fire in — and with `old` absent, `new` present is the OTHER half of a
-        // rename this process (or a dead one) moved the dir for but never
-        // recorded: a SIGKILL or a failing save between the move and
-        // `save_app_state` below. That directory holds this profile's own
-        // content, so its retry must complete the record rename (the pre-gate
-        // recovery), never send the operator to delete it. A case-only rename
-        // (`d3` -> `D3`) resolves to ONE directory on a case-insensitive
-        // filesystem (the macOS default), so same-inode pairs are exempt.
-        if old_dir.exists() && new_dir.exists() {
-            let same_dir = crate::canonical::identity(&old_dir)
-                .ok()
-                .zip(crate::canonical::identity(&new_dir).ok())
-                .is_some_and(|(a, b)| a == b);
-            if !same_dir {
-                bail!(
-                    "'{new}' already has a directory at {} with no account behind it, \
-                     delete the directory or pick another name",
-                    new_dir.display()
-                );
-            }
+        // fire in — and with `old` absent, a `new` directory past the codex
+        // refusal reads as the OTHER half of a rename this process (or a dead
+        // one) moved the dir for but never recorded: a SIGKILL or a failing
+        // save between the move and `save_app_state` below. That directory is
+        // taken for this profile's own content, so its retry must complete the
+        // record rename, never send the operator to delete it.
+        if old_dir.exists() && new_dir.exists() && !same_dir {
+            bail!(
+                "'{new}' already has a directory at {} with no account behind it, \
+                 delete the directory or pick another name",
+                new_dir.display()
+            );
         }
-        // Read the fresh roster BEFORE the first write (`rename_profile_token`
-        // and the dir move): a read failure after the dir moved would strand a
-        // moved-but-unrecorded dir, so it must land while every step before the
-        // first fallible write is still reversible.
-        let mut state = load_fresh_state(held)?;
         // Before the first move: a failed store write leaves everything as it
         // was, and a retry after a later failure finds the token already moved.
         crate::gateway_tokens::rename_profile_token(
@@ -2276,7 +2539,13 @@ pub(crate) fn rename_profile(
         note_rename(old, new);
 
         if was_active {
-            link_profile_credentials(new)?;
+            // The record has landed, so a bare refusal here would read as a
+            // failed rename, and its retry as `'old' not found`.
+            link_profile_credentials(new).map_err(|relink| RenamedButNotRelinked {
+                old: old.clone(),
+                new: new.clone(),
+                relink,
+            })?;
         }
         Ok(())
     })?;
@@ -2337,6 +2606,13 @@ pub(crate) fn delete_profile_offering(
 /// threads (the TUI's delete worker): `config` is called only for the final
 /// unwire-and-remove hold, so the config lock is never held across the
 /// guards' waits or the rescue's tree-sized IO.
+///
+/// A proxy account is refused here, deleting nothing: its account on the
+/// proxy is clauth's to delete with it, which only `clauth delete` does
+/// ([`delete_proxy_profile`]), so removing the profile alone would orphan
+/// that account. So is a profile whose `config.toml` cannot say whether it is
+/// one ([`unclassifiable_proxy_config`]). The read here is lock-free, so the
+/// hold the profile is removed under reads the claim again.
 pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppConfig>>(
     config: impl FnOnce() -> C,
     name: &ProfileName,
@@ -2344,28 +2620,227 @@ pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppCon
     offers_force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
+    refuse_delete_of_proxy_claim(name)?;
     // The gateway reads the last-token guard needs happen outside the flock.
     let token = crate::gateway_tokens::plan_profile_delete(name.as_str())?;
-    #[cfg(test)]
-    crate::gateway_tokens::run_pre_hold_hook(name.as_str());
-    with_state_lock(|held| {
-        // Refuse to pull an account out from under a running `clauth start`
-        // session (either flavor), checked before any removal so a refused
-        // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
-        // override this; only `force` does. A Claude Code background job naming
-        // any tree under this profile's dir is a live session for this refusal
-        // too — `has_live_session` unions both sources.
-        if !force && crate::runtime::has_live_session(name) {
-            if offers_force {
-                bail!("'{name}' has a live session, pass --force to delete it anyway");
-            }
-            bail!("'{name}' has a live session");
+    delete_profile_inner(
+        config,
+        name,
+        force,
+        offers_force,
+        _rotation,
+        token.as_ref(),
+        ProxyAccountAtRemoval::Refused,
+    )
+}
+
+/// Refuse a delete of the profile alone when its `config.toml` claims an
+/// account on a proxy, or cannot say; see [`delete_profile_taking_config`].
+fn refuse_delete_of_proxy_claim(name: &ProfileName) -> Result<()> {
+    match crate::profile::stored_proxy_claim_failing_closed(name) {
+        crate::profile::ProxyClaim::None => Ok(()),
+        crate::profile::ProxyClaim::Account(record) => Err(crate::usage_error(format!(
+            "'{name}' is an account on proxy {:?}: delete it with `clauth delete {name}`, \
+             which also deletes it on the proxy",
+            record.service.as_str()
+        ))),
+        crate::profile::ProxyClaim::Unreadable => Err(unreadable_proxy_record(name)),
+        crate::profile::ProxyClaim::Unclassifiable => Err(unclassifiable_proxy_config(name)),
+    }
+}
+
+/// The refusal for a profile whose `[proxy]` table clauth cannot read: the
+/// table still names an account on some proxy, which a delete of the profile
+/// alone would orphan, so nothing is deleted.
+pub(crate) fn unreadable_proxy_record(name: &ProfileName) -> anyhow::Error {
+    match crate::profile::profile_subpath(name, "config.toml") {
+        Ok(path) => crate::usage_error(format!(
+            "profile '{name}' has a [proxy] table in {path:?} that clauth cannot read, so its \
+             account on the proxy cannot be deleted; nothing was deleted. Give the table a \
+             valid `service` and `account`, or remove it to delete the profile alone"
+        )),
+        Err(e) => e,
+    }
+}
+
+/// The refusal of a delete of a profile whose `config.toml` cannot say whether
+/// it is an account on a proxy ([`crate::profile::ProxyClaim::Unclassifiable`]):
+/// if it is one, deleting the profile alone would orphan that account, so
+/// nothing is deleted.
+pub(crate) fn unclassifiable_proxy_config(name: &ProfileName) -> anyhow::Error {
+    crate::usage_error(format!(
+        "can't read the config of '{name}', so clauth can't tell whether it is an account on a \
+         proxy; fix its config.toml, then delete it again"
+    ))
+}
+
+/// The refusal for a re-login of a profile whose `[proxy]` table clauth
+/// cannot read: the table still names an account on some proxy, so nothing
+/// is changed.
+pub(crate) fn unreadable_proxy_login(name: &ProfileName) -> anyhow::Error {
+    match crate::profile::profile_subpath(name, "config.toml") {
+        Ok(path) => crate::usage_error(format!(
+            "profile '{name}' has a [proxy] table in {path:?} that clauth cannot read; nothing \
+             was changed. Give the table a valid `service` and `account`, then log in again"
+        )),
+        Err(e) => e,
+    }
+}
+
+/// Refuse a re-login of `name` that does not go through its proxy: a proxy
+/// account's login is the proxy's, so any other login (browser, api key,
+/// setup token, console, a capture of the live login) would take the profile
+/// off the account the proxy still holds for it. Every entry a user starts
+/// asks this before it opens a browser, a prompt or a modal, and every landing
+/// asks it again under the state flock before its write
+/// ([`overwrite_captured_profile`], [`store_console_login`],
+/// [`crate::claude::write_session_token`] and its backup twin), so a name
+/// re-created as a proxy account while the entry waited is refused there too;
+/// it changes nothing on a refusal, and a profile with no `[proxy]` table
+/// passes. The paths that would save Claude Code's own login
+/// without asking skip a proxy account instead
+/// ([`crate::claude::adopt_skips_proxy_account`]).
+pub(crate) fn refuse_relogin_off_proxy(name: &ProfileName) -> Result<()> {
+    match crate::profile::stored_proxy_claim(name) {
+        crate::profile::ProxyClaim::None => Ok(()),
+        crate::profile::ProxyClaim::Account(record) => Err(crate::usage_error(format!(
+            "'{name}' is an account on proxy {:?}: log in to it again with `{}`, or delete it \
+             with `clauth delete {name}` first",
+            record.service.as_str(),
+            proxy_login_command(name.as_str(), &record.service)
+        ))),
+        // `stored_proxy_claim` never answers `Unclassifiable`.
+        crate::profile::ProxyClaim::Unreadable | crate::profile::ProxyClaim::Unclassifiable => {
+            Err(unreadable_proxy_login(name))
         }
-        // Same discipline: the gateway's last client token refuses here,
-        // before anything is removed; `force` waives the session gate alone.
+    }
+}
+
+/// `name`'s [`ProfileId`] for a login, capture or save landing on it
+/// ([`crate::profile::claim_profile_id`]), claimed under one state-flock hold
+/// unless `name` is a proxy account by then: a claim may mint an id into its
+/// `config.toml`. The outer `Err` is a failed claim, the inner one
+/// [`refuse_relogin_off_proxy`]'s refusal, which wrote nothing.
+pub(crate) fn claim_off_proxy(name: &ProfileName) -> Result<Result<ProfileId>> {
+    with_state_lock(|_held| {
+        if let Err(refusal) = refuse_relogin_off_proxy(name) {
+            return Ok(Err(refusal));
+        }
+        crate::profile::claim_profile_id(name).map(Ok)
+    })
+}
+
+/// The one login clauth takes for proxy account `name` on `service`
+/// ([`refuse_relogin_off_proxy`] refuses every other).
+pub(crate) fn proxy_login_command(name: &str, service: &crate::proxy::Service) -> String {
+    format!("clauth login {name} --proxy {}", service.as_str())
+}
+
+/// Refuse `clauth static-token` (its `--clear` included) and `clauth
+/// rolling-token` on a proxy account ([`Profile::proxy`]): it signs in through
+/// its proxy, so it has no Claude Code login whose session token any of them
+/// could roll, restore or clear. Each asks it first, before any side effect,
+/// so a refusal changes nothing.
+pub(crate) fn refuse_token_mode_on_proxy(profile: &Profile) -> Result<()> {
+    refuse_use_of_claude_login(profile, "roll or restore")
+}
+
+/// Refuse `clauth limit-reset` on a proxy account ([`Profile::proxy`]): a chain
+/// stored beside its key is never spent, and a plain account's `clauth login`
+/// advice would itself be refused ([`refuse_relogin_off_proxy`]).
+pub(crate) fn refuse_limit_reset_on_proxy(profile: &Profile) -> Result<()> {
+    refuse_use_of_claude_login(profile, "use a reset with")
+}
+
+/// The refusal of a verb that needs a Claude Code login on a profile that signs
+/// in through a proxy; `ending` closes the sentence with what the verb would do.
+/// A profile whose `[proxy]` table clauth cannot read
+/// ([`Profile::has_unreadable_proxy_record`]) is refused with
+/// [`unreadable_proxy_login`]: its chain is never spent either, and the table
+/// names no service to print. [`Profile::spends_oauth_chain`] decides which
+/// profiles have such a login; this only picks the sentence.
+fn refuse_use_of_claude_login(profile: &Profile, ending: &str) -> Result<()> {
+    if profile.spends_oauth_chain() {
+        return Ok(());
+    }
+    match &profile.proxy {
+        None => Err(unreadable_proxy_login(&profile.name)),
+        Some(record) => Err(crate::usage_error(format!(
+            "'{}' is an account on proxy {:?}: it signs in through its proxy and has no Claude \
+             Code login to {ending}",
+            profile.name,
+            record.service.as_str()
+        ))),
+    }
+}
+
+/// Delete a PROXY account: its account on the proxy (`DELETE /accounts/{id}`,
+/// which drops its upstream login), then the profile. Every local refusal
+/// that can be decided before that irreversible request is decided first —
+/// the gateway token's plan and its last-token guard, the live-session gate,
+/// the `settings.json` unwire an active profile needs, the supervisor stop
+/// and the tree rescue — so a refusal deletes
+/// nothing anywhere. What only the removal itself can hit after the proxy
+/// deleted the account (a session that started in between, a failed write)
+/// says the account is gone and that a rerun finishes: the proxy reads the
+/// account back as `not_found`, which [`crate::proxy_account::delete_account`]
+/// takes as deleted.
+///
+/// The local removal is [`delete_profile`]'s: the whole profile dir goes, its
+/// usage and wallet series included, and the account's token and cost counts
+/// stay in the global token ledger, as after any delete.
+pub(crate) fn delete_proxy_profile(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    force: bool,
+    rotation: &RotationGuard,
+    record: &crate::profile::ProxyAccount,
+) -> Result<()> {
+    let token = crate::gateway_tokens::plan_profile_delete(name.as_str())?;
+    with_state_lock(|held| {
+        if !force && crate::runtime::has_live_session(name) {
+            bail!("'{name}' has a live session, pass --force to delete it anyway");
+        }
         crate::gateway_tokens::refuse_profile_delete(token.as_ref(), name.as_str(), held)?;
+        if config.is_active(name) {
+            let blank = Profile::new(name.to_string(), None, None);
+            let env_keys: Vec<String> = config
+                .find(name)
+                .map(|p| p.env.keys().cloned().collect())
+                .unwrap_or_default();
+            let settings = crate::claude::claude_settings_path()?;
+            crate::claude::build_claude_settings_json(Some(&settings), &blank, &env_keys)?;
+        }
         Ok(())
     })?;
+    stop_and_rescue_profile_trees(name, force, true)?;
+    crate::proxy_account::delete_account(&record.service, &record.account)?;
+    delete_profile_inner(
+        move || config,
+        name,
+        force,
+        true,
+        rotation,
+        token.as_ref(),
+        ProxyAccountAtRemoval::DeletedOnProxy,
+    )
+    .map_err(|e| {
+        crate::usage_error(format!(
+            "proxy {:?} deleted account {:?}, but clauth could not remove profile '{name}': \
+             {e:#}. Run `clauth delete {name}` again to finish",
+            record.service.as_str(),
+            record.account
+        ))
+    })
+}
+
+/// A delete's supervisor stop and tree rescue, each refusing what it cannot
+/// settle before any unwire or removal.
+fn stop_and_rescue_profile_trees(
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
+) -> Result<()> {
     // Stop every runtime tree's supervisor before any unwire or removal,
     // with the flock dropped (a signal or wait never spans it). A tree whose
     // supervisor cannot be verified or stopped refuses the delete, naming the
@@ -2385,7 +2860,7 @@ pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppCon
         },
     )?;
     // Lift what the profile's dead runtime trees alone hold before the removal
-    // below takes them, with the flock dropped (the rescue is tree-sized IO).
+    // takes them, with the flock dropped (the rescue is tree-sized IO).
     // Anything left refuses before the unwire: a refused delete keeps the
     // record, the credentials link, the settings and the profile dir, while
     // the supervisors stopped above stay stopped and whatever the rescue
@@ -2401,8 +2876,59 @@ pub(crate) fn delete_profile_taking_config<C: std::ops::DerefMut<Target = AppCon
         }
         bail!("'{name}' has unrescued session files in {}", tree.display());
     }
+    Ok(())
+}
+
+/// What [`delete_profile_inner`] does with a proxy claim in the hold it removes
+/// the profile under.
+#[derive(Clone, Copy)]
+enum ProxyAccountAtRemoval {
+    /// Refuse it ([`refuse_delete_of_proxy_claim`]): a record that landed since
+    /// the caller's read would be orphaned, with any stored chain deleted.
+    Refused,
+    /// The profile's `[proxy]` table goes with it: the caller resolved the
+    /// account and deleted it on the proxy ([`delete_proxy_profile`]).
+    DeletedOnProxy,
+}
+
+fn delete_profile_inner<C: std::ops::DerefMut<Target = AppConfig>>(
+    config: impl FnOnce() -> C,
+    name: &ProfileName,
+    force: bool,
+    offers_force: bool,
+    _rotation: &RotationGuard,
+    token: Option<&crate::gateway_tokens::ProfileTokenPlan>,
+    proxy_account: ProxyAccountAtRemoval,
+) -> Result<()> {
+    #[cfg(test)]
+    crate::gateway_tokens::run_pre_hold_hook(name.as_str());
+    with_state_lock(|held| {
+        // Refuse to pull an account out from under a running `clauth start`
+        // session (either flavor), checked before any removal so a refused
+        // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
+        // override this; only `force` does. A Claude Code background job naming
+        // any tree under this profile's dir is a live session for this refusal
+        // too — `has_live_session` unions both sources.
+        if !force && crate::runtime::has_live_session(name) {
+            if offers_force {
+                bail!("'{name}' has a live session, pass --force to delete it anyway");
+            }
+            bail!("'{name}' has a live session");
+        }
+        // Same discipline: the gateway's last client token refuses here,
+        // before anything is removed; `force` waives the session gate alone.
+        crate::gateway_tokens::refuse_profile_delete(token, name.as_str(), held)?;
+        Ok(())
+    })?;
+    stop_and_rescue_profile_trees(name, force, offers_force)?;
     let mut config = config();
     with_state_lock(|held| {
+        // Before the unwire, so a refusal leaves the live link and settings too.
+        // The record's writers hold this flock, so none lands past this read.
+        match proxy_account {
+            ProxyAccountAtRemoval::Refused => refuse_delete_of_proxy_claim(name)?,
+            ProxyAccountAtRemoval::DeletedOnProxy => {}
+        }
         // The supervisor stop and tree rescue above ran with the flock dropped,
         // so the caller's config may be stale. Read the fresh state once and use
         // it for BOTH the unwire decision and the final save, so a concurrent
@@ -3771,6 +4297,161 @@ impl Drop for FailCreateUndo<'_> {
     }
 }
 
+/// The profile of `roster` whose `[proxy]` record names `account`, read fresh
+/// and lock-free.
+pub(crate) fn proxy_account_holder(
+    roster: &[ProfileName],
+    account: &crate::profile::ProxyAccount,
+) -> Option<ProfileName> {
+    roster
+        .iter()
+        .find(|name| crate::profile::stored_proxy_record(name).as_ref() == Some(account))
+        .cloned()
+}
+
+/// `clauth login <name> --proxy <service>`'s create: a profile whose
+/// `base_url` is the proxy's bind, whose api key is the proxy-local inference
+/// key the login returned, plus the `[proxy]` record (service + account id)
+/// the delete, settings and usage arms key off — written once here and
+/// carried by every later rewrite as an unmodelled config key.
+///
+/// The login can wait minutes on the browser, so this reads the roster again
+/// under the flock ([`edit_profile_preferred_days`]'s fresh-state shape): a
+/// profile another clauth created under the name meanwhile is refused, never
+/// overwritten, and the roster saved is the one on disk plus this name, so a
+/// meanwhile active-marker or chain change stands.
+///
+/// It is a create like every other ([`CreateFootprint`]): an off-roster dir
+/// holding a `credentials.json` refuses it before any write, and a failed save
+/// takes back what it made ([`undo_unregistered_create`]), so no `[proxy]`
+/// record of an account the caller then deletes on the proxy is left for a
+/// later profile of the name to carry.
+///
+/// An account a roster profile holds refuses it with
+/// [`crate::proxy_account::AccountHeld`], ahead of every other refusal: the
+/// caller deletes the account on any other failure, and this one is not the
+/// login's to delete.
+pub(crate) fn create_proxy_profile(
+    config: &mut AppConfig,
+    name: String,
+    proxy: crate::profile::ProxyAccount,
+    base_url: String,
+    api_key: String,
+    model: Option<String>,
+) -> Result<()> {
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
+        if let Some(holder) = proxy_account_holder(&state.profiles, &proxy) {
+            return Err(crate::proxy_account::AccountHeld { holder }.into());
+        }
+        validate_profile_name(&name, Harness::Claude, None)?;
+        let mut profile = Profile::new(name, Some(base_url), Some(api_key));
+        profile.models.default = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        let footprint = CreateFootprint::read(&profile.name)?;
+        let saved = save_new_profile(&profile)
+            .and_then(|()| crate::profile::write_proxy_record(&profile.name, &proxy))
+            .and_then(|()| {
+                state.profiles.push(profile.name.clone());
+                save_app_state(&state)
+            });
+        if let Err(e) = saved {
+            return Err(undo_unregistered_create(&footprint, false, e));
+        }
+        profile.proxy = Some(proxy);
+        config.add(profile);
+        Ok(())
+    })
+}
+
+/// What a proxy re-login's save did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyRelogin {
+    Saved,
+    /// The login brought no key and the profile stores none now (cleared
+    /// since the flow read `done`): nothing was written.
+    Keyless,
+}
+
+/// `clauth login <name> --proxy <service>`'s re-authenticate arm: replace the
+/// profile's `[proxy]` record with the login's own verdict (a re-bind may land
+/// on the same account id), its api key when the flow re-minted one, and its
+/// default model when `--model` names one, and lift its `auth_broken`
+/// quarantine. Nothing else about the profile moves — the same
+/// replace-the-key-and-nothing-else shape the Alibaba console re-login takes;
+/// its stored OAuth chain, if any, stays as it is. A key the save carries also
+/// drops the dead-key verdict; a login that kept its key has proved nothing
+/// about it, so the verdict stands.
+///
+/// [`edit_profile_preferred_days`]'s fresh-state shape: the roster and the
+/// profile are read again under the flock, so a field another writer changed
+/// during the login (a key another clauth stored, a threshold) is kept rather
+/// than rewound by the copy loaded before it, and the in-memory copy becomes
+/// that fresh one once the save landed. The key decision is taken there too:
+/// a login that brought no key over a profile storing none saves nothing and
+/// answers [`ProxyRelogin::Keyless`], so no success line follows a keyless
+/// save. A new key or model on the profile the fresh roster marks active is
+/// re-applied to the live Claude settings, as [`edit_profile_endpoint`] does,
+/// so the global session gets the key helper a keyless profile was wired
+/// without and the model the login set.
+pub(crate) fn update_proxy_login(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    proxy: &crate::profile::ProxyAccount,
+    api_key: Option<String>,
+    model: Option<&str>,
+) -> Result<ProxyRelogin> {
+    with_state_lock(|_held| {
+        let state = load_app_state()?;
+        if !state.profiles.iter().any(|n| n == name) {
+            bail!("profile not found");
+        }
+        let minted = api_key.is_some();
+        let (mut fresh, relogin) = update_profile_config(name, |fresh| {
+            match api_key {
+                Some(key) => fresh.api_key = Some(key),
+                None if crate::usage::profile_key_fingerprint(fresh).is_none() => {
+                    return Ok(ProxyRelogin::Keyless);
+                }
+                None => {}
+            }
+            if let Some(model) = model {
+                let trimmed = model.trim();
+                fresh.models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            Ok(ProxyRelogin::Saved)
+        })?
+        .context("profile not found")?;
+        if relogin == ProxyRelogin::Keyless {
+            return Ok(ProxyRelogin::Keyless);
+        }
+        crate::profile::write_proxy_record(name, proxy)?;
+        fresh.proxy = Some(proxy.clone());
+        fresh.has_unreadable_proxy_record = false;
+        if (minted || model.is_some()) && state.active_profile.as_ref() == Some(name) {
+            let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+        }
+        if minted {
+            crate::profile_cache::clear_auth_expired(name);
+        }
+        // AUTH-1: a re-login through the proxy is this account's recovery, as
+        // `clauth login <name>` is every other account's: clear its quarantine
+        // on the state read fresh inside this hold, so no edit another process
+        // landed is rewound.
+        crate::profile::set_auth_broken_persisted(name, false)?;
+        config.state.set_auth_broken(name, false);
+        match config.find_mut(name) {
+            Some(profile) => *profile = fresh,
+            None => config.add(fresh),
+        }
+        Ok(ProxyRelogin::Saved)
+    })
+}
+
 /// Copy every configured setting of `source` onto a new profile named `name`.
 ///
 /// What is DELIBERATELY not copied:
@@ -4294,7 +4975,7 @@ fn save_into_id_matched_owner(
                 capture_owner_checked(config, snapshot.credentials.as_ref())
             && matched.owner == existing
         {
-            let account = crate::profile::claim_profile_id(&existing)?;
+            let account = claim_off_proxy(&existing)??;
             let snapshot = CaptureSnapshot {
                 anchor: AnchorAction::Kept(matched.account),
                 ..snapshot
@@ -4308,8 +4989,14 @@ fn save_into_id_matched_owner(
 
 /// The refusal a capture under a name a profile already holds gets.
 fn existing_capture_name_refusal(existing: &str) -> anyhow::Error {
+    // A proxy account re-authenticates through its proxy alone
+    // ([`refuse_relogin_off_proxy`]'s command).
+    let login = match crate::profile::stored_proxy_record(&ProfileName::from(existing)) {
+        Some(record) => proxy_login_command(existing, &record.service),
+        None => format!("clauth login {existing}"),
+    };
     anyhow::anyhow!(
-        "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
+        "a profile named '{existing}' already exists; re-authenticate it with:  {login}"
     )
 }
 
@@ -4692,10 +5379,7 @@ fn rollback_first_account_create(
     // refusal is unmasked, and the two real actions replace the pointer in the
     // outer message. A link failure that is NOT the guard (a publish error)
     // keeps its original chain untouched.
-    match link_err
-        .to_string()
-        .strip_suffix(&format!("; {} first", crate::format::RESOLVE_IN_TUI))
-    {
+    match crate::format::without_resolve_pointer(&link_err.to_string()) {
         Some(trimmed) => anyhow::anyhow!(trimmed.to_string()).context(outer),
         None => link_err.context(outer),
     }
@@ -4725,21 +5409,27 @@ pub(crate) fn overwrite_captured_profile(
     account: &ProfileId,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
-    overwrite_captured_profile_with(config, name, account, snapshot, false)
+    overwrite_captured_profile_with(config, name, account, snapshot, false)?
 }
 
 /// [`overwrite_captured_profile`], first disowning the active account when
 /// `deactivate` (the divergence capture): the live link detached and the
 /// marker cleared, inside the same hold and after the id check, so a refused
-/// overwrite leaves both as they were.
+/// overwrite leaves both as they were. Answers its proxy refusal apart from
+/// its other failures: the outer `Err` is a failed landing, the inner one
+/// [`overwrite_captured_profile_held`]'s refusal, which wrote nothing.
 pub(crate) fn overwrite_captured_profile_with(
     config: &mut AppConfig,
     name: &ProfileName,
     account: &ProfileId,
     snapshot: CaptureSnapshot,
     deactivate: bool,
-) -> Result<()> {
-    let oauth_moved = overwrite_captured_profile_held(config, name, account, snapshot, deactivate)?;
+) -> Result<Result<()>> {
+    let oauth_moved =
+        match overwrite_captured_profile_held(config, name, account, snapshot, deactivate)? {
+            Ok(oauth_moved) => oauth_moved,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
     // Outside the hold — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
     // `update_profile` leaves the new credentials on disk under the old account's
@@ -4748,20 +5438,26 @@ pub(crate) fn overwrite_captured_profile_with(
     if oauth_moved {
         crate::usage::expire_profile_ttl(name);
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 /// [`overwrite_captured_profile_with`]'s write, for a caller that runs it
-/// inside a state flock hold of its own: returns whether the OAuth half
+/// inside a state flock hold of its own: answers whether the OAuth half
 /// moved, and the caller expires `name`'s `/profile` clock once its hold
-/// releases (the TTL store ranks below the flock).
+/// releases (the TTL store ranks below the flock). The inner `Err` is
+/// [`refuse_relogin_off_proxy`]'s refusal, or [`CaptureRefused`] for a
+/// `config.toml` that cannot say whether `name` is an account on a proxy; each
+/// wrote nothing. With `deactivate` (a capture out of a divergence), the live
+/// link is detached and the active marker cleared once the refusal passed and
+/// `config`'s roster still holds the name, in the same hold as the overwrite,
+/// so a refusal or a name that roster no longer holds leaves both in place.
 pub(crate) fn overwrite_captured_profile_held(
     config: &mut AppConfig,
     name: &ProfileName,
     account: &ProfileId,
     snapshot: CaptureSnapshot,
     deactivate: bool,
-) -> Result<bool> {
+) -> Result<Result<bool>> {
     let CaptureSnapshot {
         credentials,
         base_url,
@@ -4774,7 +5470,18 @@ pub(crate) fn overwrite_captured_profile_held(
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
     let mut oauth_moved = false;
+    let mut refusal = Ok(());
     with_state_lock(|held| {
+        refusal = refuse_relogin_off_proxy(name);
+        if refusal.is_ok()
+            && crate::profile::stored_proxy_claim_failing_closed(name)
+                == crate::profile::ProxyClaim::Unclassifiable
+        {
+            refusal = Err(CaptureRefused(name.clone()).into());
+        }
+        if refusal.is_err() {
+            return Ok(());
+        }
         // Fresh state first: the delete gate must see a peer's delete.
         let state = load_app_state()?;
         // The `config.find` check below reads the caller's stale list; gate
@@ -4789,7 +5496,10 @@ pub(crate) fn overwrite_captured_profile_held(
         if installs_login {
             crate::profile::refuse_login_held_elsewhere(name, credentials.as_ref(), held)?;
         }
-        if deactivate {
+        // A name missing from `config`'s roster skips the deactivate: the
+        // `config.find` bail below fails that overwrite, which must leave the
+        // active account in place.
+        if deactivate && config.find(name).is_some() {
             // Best effort, as the divergence capture always was: the overwrite
             // below decides the outcome.
             let _ = crate::claude::detach_credentials_link();
@@ -5021,7 +5731,7 @@ pub(crate) fn overwrite_captured_profile_held(
         }
         saved
     })?;
-    Ok(oauth_moved)
+    Ok(refusal.map(|()| oauth_moved))
 }
 
 /// Blank a profile's OAuth login: drop its stored credentials and per-account
@@ -5029,8 +5739,20 @@ pub(crate) fn overwrite_captured_profile_held(
 /// produces. Keeps name, model, env, and chain slot. When it's the active
 /// profile, clear the live `~/.claude` link and deactivate — a credential-less
 /// profile can't be meaningfully active, and the honest state is "no active".
+///
+/// An account with a proxy claim keeps its stored chain: the log out blanks its
+/// api key instead ([`clear_profile_api_key`]), the claim read under this hold
+/// because the record's writers take the same flock, so a record landing after
+/// the caller picked this arm is seen. A key blank needs no refusal sentence,
+/// and a config it cannot load fails it with that load's own error.
 pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|held| {
+    let blanked_login = with_state_lock(|held| {
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            clear_profile_api_key(config, name)?;
+            return Ok(false);
+        }
         let before = read_before_identities(name);
         // The deactivate decision is off the fresh state, not the caller's: a
         // concurrent switch away means this profile is no longer the active one,
@@ -5089,14 +5811,16 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
             save_app_state(&state)?;
             config.state = state.into_inner();
         }
-        Ok(())
+        Ok(true)
     })?;
     // The dropped login's TTL clock is the old account's; a re-login into this
     // shell must pull its own tier now, not an hour from now. Outside the closure
     // — see `rename_profile` on the rank order. The durable stamp is already
     // gone (`forget_disk`), so this clears the memo the CLI (which never drains
     // `forget_memory`) would otherwise leave behind.
-    crate::usage::expire_profile_ttl(name);
+    if blanked_login {
+        crate::usage::expire_profile_ttl(name);
+    }
     Ok(())
 }
 
@@ -5112,13 +5836,15 @@ pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) 
         edit_profile_endpoint(config, name, |_, api_key| *api_key = None)?;
         // The torn store is re-read under this hold too: a login a peer landed
         // since the caller's read repaired it, and that store is not this
-        // log-out's to delete.
+        // log-out's to delete. Nor is a proxy account's, torn or not.
         if config
             .find(name)
             .is_some_and(|p| p.unreadable_credentials_store.is_some())
             && crate::profile::read_profile(name)?
                 .unreadable_credentials_store
                 .is_some()
+            && crate::profile::stored_proxy_claim_failing_closed(name)
+                == crate::profile::ProxyClaim::None
         {
             // Disk first: the flag clears only once the store is gone, so a
             // failed delete leaves the log-out row up to retry.
@@ -5288,6 +6014,481 @@ pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<()> {
         save_app_state(&state)?;
         config.state.switch_off_when_spent = on;
         Ok(())
+    })
+}
+
+/// What arming `name`'s rolling token did, read back off disk rather than
+/// assumed: the gate reports `Ready` on paths that armed NOTHING and left a
+/// static mint in place, so a flat "armed from the usage chain" outcome is a
+/// lie exactly when the operator most needs the truth. The sidecar's own
+/// classification separates them.
+#[derive(Debug)]
+pub(crate) enum RollingArmOutcome {
+    /// The sidecar holds a rolling bearer stamped from the usage chain:
+    /// its scope list, its plan stamp (absent when unstamped), and the
+    /// daemon state the re-stamp promise closes on.
+    Armed {
+        scopes: Vec<String>,
+        plan: Option<String>,
+        daemon: crate::daemon::DaemonHealth,
+    },
+    /// The gate was ready but the sidecar still holds a static mint (a chain
+    /// the gate could not read, or one too degraded to stamp from): the flag
+    /// is on, the mint stays in place, and the daemon re-stamps on its next
+    /// rotation.
+    MintKept,
+}
+
+/// A finished arm: its outcome plus the facts every surface composes its
+/// report from — whether the plan-scope warning fired, whether a mis-filled
+/// sidecar was quarantined first, and whether the account is the active one
+/// (the live install ran, or installs on the next switch).
+#[derive(Debug)]
+pub(crate) struct RollingArmReport {
+    pub(crate) outcome: RollingArmOutcome,
+    pub(crate) plan_incapable: bool,
+    pub(crate) quarantined_misfill: bool,
+    pub(crate) active: bool,
+}
+
+/// A refusal of the arm, typed so the CLI and the TUI classify by variant
+/// and compose the sentence themselves: neither matches an error message to
+/// pick an outcome.
+#[derive(Debug)]
+pub(crate) enum RollingArmRefusal {
+    /// The account is user-disabled: `'{name}': account is disabled`.
+    Disabled,
+    /// No usage chain on an api-key (third-party endpoint) account: the bail
+    /// names the why-not and prescribes nothing.
+    NoChainThirdParty,
+    /// No usage chain on an OAuth account: the bail carries the re-login fix.
+    NoChainOauth,
+    /// A standing quarantine, carrying the composed sentence (the
+    /// third-party split copy, or the generic dead-chain sentence).
+    Quarantined(String),
+    /// The arm reported success but no readable sidecar exists to verify.
+    NoReadableSidecar,
+    /// Report-time: the chain is dead, the static mint stays, the flag was
+    /// left as found.
+    DeadChainKeptMint,
+    /// Report-time: a rotating pair raced back into the sidecar mid-arm.
+    RefilledMisfill,
+    /// Arm-time: the gate was ready but nothing was armed.
+    NothingArmed,
+    /// Arm-time: the chain is terminally dead.
+    Broken,
+    /// Arm-time: a transient failure (the CLI sentence names its HTTP status
+    /// when it had one; the TUI toast drops it).
+    Transient(crate::format::Transient),
+    /// Arm-time: the daemon is stopping and refused the spend.
+    Stopping,
+    /// The account left the roster between the pre-arm read and the flag
+    /// write: the write silently wrote nothing, so the arm must not run
+    /// for it.
+    GoneFromRoster,
+    /// Anything outside the table (a load, save or install error): the CLI
+    /// prints the error as it came, the TUI toasts it as its detail.
+    Open(anyhow::Error),
+}
+
+impl RollingArmRefusal {
+    /// The sentence the CLI prints for this refusal, without any
+    /// `Error: ` prefix. The TUI's danger toast carries it too, except an
+    /// `Open` error (escaped for a toast) and a `Transient` (its `text()`,
+    /// no HTTP status).
+    pub(crate) fn sentence(&self, name: &ProfileName) -> String {
+        match self {
+            Self::Disabled => crate::disabled_account_refusal(name),
+            Self::NoChainThirdParty => {
+                format!("'{name}' has no usage OAuth chain to roll from")
+            }
+            Self::NoChainOauth => format!(
+                "'{name}' has no usage OAuth chain to roll from; run \
+                 `clauth login {name}` first"
+            ),
+            Self::Quarantined(sentence) => sentence.clone(),
+            Self::NoReadableSidecar => format!(
+                "arming reported success but '{name}' has no readable sidecar to verify, \
+                 so nothing was confirmed. Check permissions on ~/.clauth and re-run"
+            ),
+            Self::DeadChainKeptMint => format!(
+                "'{name}' usage chain is dead, so sessions stay on the static mint and \
+                 nothing would re-stamp a rolling token. Run `clauth login {name}` to \
+                 revive the chain, then re-run. The rolling-token flag was left as it was."
+            ),
+            Self::RefilledMisfill => format!(
+                "'{name}' sidecar was re-filled with a rotating pair while arming, so \
+                 the split is disengaged and nothing was armed. Re-run, and if it \
+                 repeats find what is writing session-token.json"
+            ),
+            Self::NothingArmed => format!(
+                "'{name}' could not arm the rolling sidecar (a mis-filled sidecar with no \
+                 backup?). Re-capture with `clauth login {name} --setup-token`, or clear \
+                 the sidecar, then re-run"
+            ),
+            Self::Broken => crate::oauth::dead_chain_sentence(None, name),
+            Self::Transient(t) => t.text_with_status(),
+            Self::Stopping => crate::format::DAEMON_STOPPING.to_string(),
+            // The same head the CLI's not-found wording prints; the account
+            // leaving mid-run is the same fact for the operator.
+            Self::GoneFromRoster => profile_not_found_head(name.as_str()),
+            Self::Open(e) => format!("{e:#}"),
+        }
+    }
+}
+
+/// The head both the CLI's not-found wording and the arm's off-roster refusal
+/// print for a name no roster holds, so the two cannot drift.
+pub(crate) fn profile_not_found_head(name: &str) -> String {
+    format!("profile '{name}' not found")
+}
+
+/// A failed arm: its refusal, plus the facts every surface composes its
+/// report from. `rollback_stranded` carries the rollback's own save error
+/// when the flag rollback itself could not save; each surface formats its
+/// own copy of the warning from it (the CLI the full `clauth: warning: `
+/// line, the TUI the body).
+#[derive(Debug)]
+pub(crate) struct RollingArmFailure {
+    pub(crate) refusal: RollingArmRefusal,
+    pub(crate) rollback_stranded: Option<anyhow::Error>,
+    pub(crate) plan_incapable: bool,
+    pub(crate) quarantined_misfill: bool,
+}
+
+impl RollingArmFailure {
+    pub(crate) fn new(
+        refusal: RollingArmRefusal,
+        plan_incapable: bool,
+        quarantined_misfill: bool,
+    ) -> Self {
+        Self {
+            refusal,
+            rollback_stranded: None,
+            plan_incapable,
+            quarantined_misfill,
+        }
+    }
+
+    /// A failure outside the typed table (a load, save or install error).
+    pub(crate) fn open(e: anyhow::Error, plan_incapable: bool, quarantined_misfill: bool) -> Self {
+        Self::new(
+            RollingArmRefusal::Open(e),
+            plan_incapable,
+            quarantined_misfill,
+        )
+    }
+}
+
+/// The report-time classification of the sidecar an arm left behind — the
+/// one step the CLI's printer and the TUI's toast both need, off the same
+/// disk read. `chain_is_broken` separates "the daemon will get it" (a mint
+/// kept while the chain recovers) from "nothing to retry" (a terminally dead
+/// chain).
+pub(crate) fn classify_armed_sidecar(
+    canonical: &ProfileName,
+    chain_is_broken: bool,
+) -> std::result::Result<RollingArmOutcome, RollingArmRefusal> {
+    let Some((kind, token)) = crate::claude::sidecar_summary(canonical) else {
+        return Err(RollingArmRefusal::NoReadableSidecar);
+    };
+    match kind {
+        crate::claude::SidecarKind::Mint if chain_is_broken => {
+            Err(RollingArmRefusal::DeadChainKeptMint)
+        }
+        crate::claude::SidecarKind::Mint => Ok(RollingArmOutcome::MintKept),
+        crate::claude::SidecarKind::Misfilled => Err(RollingArmRefusal::RefilledMisfill),
+        crate::claude::SidecarKind::Rolling => Ok(RollingArmOutcome::Armed {
+            scopes: token.scopes.clone().unwrap_or_default(),
+            plan: token.subscription_type.clone().filter(|p| !p.is_empty()),
+            daemon: crate::daemon::daemon_health(),
+        }),
+    }
+}
+
+/// The stranded-rollback warning body (the CLI prefixes `clauth: warning: `):
+/// a failed arm whose rollback ALSO failed to save leaves the flag durably
+/// on with nothing armed, and this line is the only thing telling the
+/// operator that state exists and how to leave it. A save the writer
+/// REFUSED over a line's shape is the file's problem, not the directory's,
+/// so it names the line instead of pointing at write permission.
+pub(crate) fn rollback_stranded_warning_body(canonical: &str, save_err: &anyhow::Error) -> String {
+    if let Some(refusal) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::profile::ConfigEditRefusal>())
+    {
+        let key = refusal.key();
+        return format!(
+            "could not roll the rolling-token flag back for \
+             '{canonical}': config.toml has `{key}` in a shape clauth cannot read. \
+             Fix or remove that line, then run `clauth static-token {canonical}` to clear it"
+        );
+    }
+    if let Some(parse) = save_err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::profile::ConfigParseRefusal>())
+        && let Some(position) = crate::format::parse_position(parse.position())
+    {
+        return format!(
+            "could not roll the rolling-token flag back for \
+             '{canonical}': config.toml does not parse ({position}). Fix that line, then run \
+             `clauth static-token {canonical}` to clear it"
+        );
+    }
+    format!(
+        "could not roll the rolling-token flag back for \
+         '{canonical}' ({save_err:#}). Once ~/.clauth is writable, run \
+         `clauth static-token {canonical}` to clear it"
+    )
+}
+
+/// The body of the CLI's mis-fill quarantine line (its `clauth: ` prefix
+/// dropped): shared with the TUI's warning, so an edit on either surface
+/// cannot drift from the other.
+pub(crate) fn misfill_quarantined_body(canonical: &ProfileName) -> String {
+    format!(
+        "'{canonical}' had a mis-filled sidecar (a rotating pair). It was quarantined \
+         under the profile's quarantine/ dir before arming."
+    )
+}
+
+/// The pre-arm half of the shared rolling-token switch: everything the base
+/// CLI did BEFORE its macOS bare-item settle — the fresh disk read, the
+/// proxy/disabled/no-chain/quarantine refusals, the plan-capability warning
+/// fact and the mis-fill quarantine. Both callers run it first, so a refused
+/// switch settles nothing; [`arm_rolling_token`] takes what it returns.
+pub(crate) struct RollingPreArm {
+    /// The chain lacks the plan scope or subscription stamp: the warning
+    /// fact every surface composes its line from.
+    pub(crate) plan_incapable: bool,
+    /// A mis-filled sidecar was quarantined as evidence before arming.
+    pub(crate) quarantined_misfill: bool,
+    /// The account is the active one: the live install follows the report.
+    pub(crate) active: bool,
+    handle: ConfigHandle,
+    was_rolling: bool,
+    name: ProfileName,
+}
+
+/// The shared arm's pre-arm half (see [`RollingPreArm`]): every refusal, the
+/// warning facts and the mis-fill quarantine, off a FRESH disk read — the
+/// TUI's render snapshot is a tick old, and a peer's edit may have landed
+/// since any caller's own read.
+pub(crate) fn precheck_rolling_token(
+    name: &ProfileName,
+) -> std::result::Result<RollingPreArm, RollingArmFailure> {
+    // `load_profile` reads the profile dir directly, so the arm judges the
+    // account that is really there, never the roster the caller resolved nor
+    // the TUI's tick-stale snapshot.
+    let state =
+        crate::profile::load_app_state().map_err(|e| RollingArmFailure::open(e, false, false))?;
+    let profile =
+        crate::profile::load_profile(name).map_err(|e| RollingArmFailure::open(e, false, false))?;
+    refuse_token_mode_on_proxy(&profile).map_err(|e| RollingArmFailure::open(e, false, false))?;
+    // Same gate `switch` and `start` take: a disabled profile is off every
+    // operational surface, the re-stamp timer included, so arming one
+    // produces a bearer that dies in hours with nothing behind it.
+    if profile.is_disabled() {
+        return Err(RollingArmFailure::new(
+            RollingArmRefusal::Disabled,
+            false,
+            false,
+        ));
+    }
+    let Some(oauth) = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+    else {
+        // Third-party names the why-not and stops; an OAuth account keeps the
+        // re-login tail, where the same login IS the recovery.
+        let refusal = if crate::claude::has_own_inference_endpoint(&profile) {
+            RollingArmRefusal::NoChainThirdParty
+        } else {
+            RollingArmRefusal::NoChainOauth
+        };
+        return Err(RollingArmFailure::new(refusal, false, false));
+    };
+    // A standing quarantine is checked BEFORE anything destructive runs: the
+    // arm below would only degrade-and-bail on a dead chain, and by then the
+    // mis-fill pre-clear would have removed the sidecar — leaving the profile
+    // with nothing at all, which is worse than the disengaged mis-fill it
+    // started in.
+    if state.is_auth_broken(name) {
+        return Err(RollingArmFailure::new(
+            RollingArmRefusal::Quarantined(crate::oauth::dead_chain_sentence(Some(&profile), name)),
+            false,
+            false,
+        ));
+    }
+    // A chain captured without `user:profile`/`subscriptionType` mints bearers
+    // that still authenticate but may not unlock plan-gated models — warn
+    // rather than refuse, since the roll is otherwise correct.
+    let plan_capable = oauth
+        .scopes
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
+        && oauth.subscription_type.is_some();
+    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
+    // operator intent — the evidence still goes to quarantine first.
+    let quarantined_misfill = crate::claude::quarantine_misfilled_sidecar(name)
+        .map_err(|e| RollingArmFailure::open(e, !plan_capable, false))?;
+    let is_active = state.active_profile.as_ref() == Some(name);
+    let was_rolling = profile.rolling_token;
+    let handle: ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    }));
+    Ok(RollingPreArm {
+        plan_incapable: !plan_capable,
+        quarantined_misfill,
+        active: is_active,
+        handle,
+        was_rolling,
+        name: name.clone(),
+    })
+}
+
+/// The arm half of the shared rolling-token switch: everything the base CLI
+/// did AFTER its macOS bare-item settle — the flag persist, the arm, the
+/// report-time classification and the rollback on failure. Takes the
+/// pre-arm half's fresh read ([`RollingPreArm`]); the caller settles the
+/// bare item BETWEEN the halves (the placement is thread-local and guards
+/// the live install's write, which each caller runs after the report).
+pub(crate) fn arm_rolling_token(
+    pre: RollingPreArm,
+    refresher: impl Fn(
+        &str,
+        Option<&str>,
+    )
+        -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError>,
+) -> std::result::Result<RollingArmReport, RollingArmFailure> {
+    let RollingPreArm {
+        plan_incapable,
+        quarantined_misfill,
+        active,
+        handle,
+        was_rolling,
+        name,
+    } = pre;
+    // One rotation guard from here through the arm, which runs under it: the
+    // pre-arm half's refusal read a snapshot from before this wait, so a
+    // record that landed since is refused on a read under the guard, and
+    // again after the landing, before anything of the account moves.
+    let refuse_on_disk = || {
+        crate::profile::load_profile(&name)
+            .and_then(|on_disk| refuse_token_mode_on_proxy(&on_disk))
+            .map_err(|e| RollingArmFailure::open(e, plan_incapable, quarantined_misfill))
+    };
+    let transient = |t| {
+        RollingArmFailure::new(
+            RollingArmRefusal::Transient(t),
+            plan_incapable,
+            quarantined_misfill,
+        )
+    };
+    #[cfg(test)]
+    crate::run_before_token_mode_guard();
+    let guard = RotationGuard::acquire(&name)
+        .map_err(|_| transient(crate::oauth::rotation_lock_unavailable(&name)))?;
+    refuse_on_disk()?;
+    #[cfg(test)]
+    crate::run_before_token_mode_landing();
+    crate::oauth::land_stage_for_install(&name, &guard).map_err(transient)?;
+    refuse_on_disk()?;
+    // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
+    // a failed report. Persist-after was wrong twice over: the gate's refresh
+    // leg stamps the sidecar through the rotation hook, and that hook is
+    // FLAG-GATED — arming with the flag still false made the very refresh the
+    // arm triggered stamp nothing — and a CLI reader walking away at the
+    // report would leave an armed rolling bearer with no flag and nothing
+    // ever re-stamping it. Rollback-on-failure keeps both invariants: the arm
+    // runs with the flag it needs, and a non-zero exit from the arm leaves
+    // the flag exactly as it was found. The in-memory mirror flips only AFTER
+    // the write lands: flipped first, a failed save leaves the handle lying
+    // until an unrelated save makes the lie durable.
+    match crate::profile::update_profile_config(&name, |p| {
+        p.rolling_token = true;
+        Ok(())
+    }) {
+        Ok(Some(_)) => {
+            if let Ok(mut cfg) = handle.lock()
+                && let Some(profile) = cfg.find_mut(&name)
+            {
+                profile.rolling_token = true;
+            }
+        }
+        // The account left the roster between the pre-arm read and the write:
+        // the flag never landed, so there is nothing for the arm to run on —
+        // a typed refusal, never a success that nothing will re-stamp.
+        Ok(None) => {
+            return Err(RollingArmFailure::new(
+                RollingArmRefusal::GoneFromRoster,
+                plan_incapable,
+                quarantined_misfill,
+            ));
+        }
+        Err(e) => {
+            return Err(RollingArmFailure::open(
+                e,
+                plan_incapable,
+                quarantined_misfill,
+            ));
+        }
+    }
+    let outcome = crate::oauth::arm_rolling_token(&handle, &name, refresher, guard)
+        .map_err(|e| match e {
+            crate::oauth::RollingArmError::NothingArmed => RollingArmRefusal::NothingArmed,
+            crate::oauth::RollingArmError::Broken => RollingArmRefusal::Broken,
+            crate::oauth::RollingArmError::Transient(t) => RollingArmRefusal::Transient(t),
+            crate::oauth::RollingArmError::Stopping => RollingArmRefusal::Stopping,
+        })
+        .and_then(|()| {
+            // Re-read under the handle: the gate marks a terminally dead chain
+            // `auth_broken` on its way to degrading, and that is what separates
+            // "nothing to retry" from "the daemon will get it".
+            let chain_is_broken = handle
+                .lock()
+                .ok()
+                .is_some_and(|c| c.state.auth_broken.contains(&name));
+            classify_armed_sidecar(&name, chain_is_broken)
+        });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            let rollback_stranded = if !was_rolling {
+                match crate::profile::update_profile_config(&name, |p| {
+                    p.rolling_token = false;
+                    Ok(())
+                }) {
+                    // `Ok(None)`: the account left the roster, so there is
+                    // nothing left to roll back — the flag is gone with it.
+                    Ok(Some(_)) | Ok(None) => {
+                        if let Ok(mut cfg) = handle.lock()
+                            && let Some(profile) = cfg.find_mut(&name)
+                        {
+                            profile.rolling_token = false;
+                        }
+                        None
+                    }
+                    Err(save_err) => Some(save_err),
+                }
+            } else {
+                None
+            };
+            return Err(RollingArmFailure {
+                refusal,
+                rollback_stranded,
+                plan_incapable,
+                quarantined_misfill,
+            });
+        }
+    };
+    Ok(RollingArmReport {
+        outcome,
+        plan_incapable,
+        quarantined_misfill,
+        active,
     })
 }
 

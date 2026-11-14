@@ -12,7 +12,7 @@
 //! itself decides: which files it reads, how it merges the issuer chain, and
 //! what it does when one is missing. Whether the resulting chain and key
 //! actually make a working handshake is a property of the operator's lego
-//! output, checked in the end-to-end run in wiki/Daemon.md, not here.
+//! output, which no test here checks.
 
 use super::*;
 

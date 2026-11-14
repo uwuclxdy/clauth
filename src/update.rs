@@ -468,6 +468,11 @@ fn metadata_agent(bound: Duration) -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_global(Some(bound))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into()
 }
@@ -508,11 +513,12 @@ fn fetch_asset(url: &str, size: u64, budget: Duration) -> anyhow::Result<Vec<u8>
         .map_err(|e| anyhow::anyhow!("asset download failed: {e}"))?
         .body_mut()
         .with_config()
-        // ureq 3.4.2's `limit(n)` errors the moment a read starts with `n` bytes
-        // already consumed, and `read_to_end` probes once more for EOF — so an
-        // exactly-`n`-byte body trips `limit(n)`. Bound at `size + 1`: `size`
-        // bytes read cleanly, anything larger is refused. Saturating so the
-        // bound can never overflow for an extreme listed size.
+        // ureq's `limit(n)` (3.4.2; unchanged through 3.5.1) errors the moment
+        // a read starts with `n` bytes already consumed, and `read_to_end`
+        // probes once more for EOF — so an exactly-`n`-byte body trips
+        // `limit(n)`. Bound at `size + 1`: `size` bytes read cleanly, anything
+        // larger is refused. Saturating so the bound can never overflow for an
+        // extreme listed size.
         .limit(size.saturating_add(1))
         .read_to_vec()
         .map_err(|e| anyhow::anyhow!("asset read failed: {e}"))

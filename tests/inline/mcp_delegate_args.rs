@@ -2288,3 +2288,42 @@ fn args_carry_flag_stops_at_the_separator() {
     assert!(!args_carry_flag(&svec(&["--", "--agent", "x"]), "--agent"));
     assert!(!args_carry_flag(&svec(&["--", "--agent=x"]), "--agent"));
 }
+
+/// A quarantined proxy account holding no key and no bind (a stored pair the
+/// load read as an OAuth login) is told the login through its proxy, the only
+/// login clauth takes for it; the same account with no proxy record keeps the
+/// browser-login sentence, byte for byte.
+#[test]
+fn a_quarantined_proxy_target_is_told_the_login_through_its_proxy() {
+    let _home = HomeSandbox::new();
+    let mut px = crate::profile::Profile::new("px".to_string(), None, None);
+    px.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let plain = crate::profile::Profile::new("pn".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            auth_broken: vec!["px".into(), "pn".into()],
+            ..AppState::default()
+        },
+        profiles: vec![px, plain],
+    };
+    let refusal = |name: &str| {
+        let pn = crate::profile::ProfileName::from(name);
+        let profile = config.find(&pn).unwrap();
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[])
+    };
+    assert_eq!(
+        (refusal("px"), refusal("pn")),
+        (
+            Err("profile has no api key: px (run `clauth login px --proxy stub`)".to_string()),
+            Err(
+                "login for 'pn' has expired: refresh token revoked or invalid: run \
+                 `clauth login pn`"
+                    .to_string()
+            ),
+        ),
+        "(the proxy account's refusal, the plain account's)"
+    );
+}

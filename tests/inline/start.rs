@@ -879,8 +879,14 @@ fn start_prints_one_line_per_store_it_cannot_create() {
             ),
             format!(
                 "clauth: could not create {}: {refused}; this session's transcripts \
-                 stay in its own tree and are lost when it ends\n",
+                 stay in its own tree until ~/.claude can take them and no job still holds \
+                 that tree\n",
                 claude.join("projects").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's background sessions \
+                 stay in its own tree, where the clauth app cannot reach them\n",
+                claude.join("sessions").display()
             ),
         ];
         assert_eq!(
@@ -890,12 +896,13 @@ fn start_prints_one_line_per_store_it_cannot_create() {
         );
     }
 
-    // Only `jobs` fails: `projects` pre-exists as a real dir before arming, so
-    // the run names only the store whose records stay in the tree.
+    // Only `jobs` fails: `projects` and `sessions` pre-exist as real dirs before
+    // arming, so the run names only the store whose records stay in the tree.
     {
         let sb = HomeSandbox::new();
         let claude = sb.home().join(".claude");
         std::fs::create_dir_all(claude.join("projects")).expect("~/.claude/projects");
+        std::fs::create_dir_all(claude.join("sessions")).expect("~/.claude/sessions");
         let _config = ConfigDirSandbox::new(&sb, &claude);
         let fake = FakeClaude::new(&sb);
         let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
@@ -1797,7 +1804,10 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
 /// tree without a `jobs` link would keep the record where no clauth reader
 /// looks and lose the tree under the running session. The transcript store is
 /// the same case: with no `~/.claude/projects`, a transcript written through
-/// the tree is unindexed and dies with it.
+/// the tree stays unindexed until the tree's rescue. The live session record
+/// matters for the mod bridge, which reads a peer no `live_sessions` row joins
+/// from `~/.claude/sessions`: with no link, the record stays in the tree and
+/// the bridge cannot find it while the session runs.
 ///
 /// The red-first pin: on the base it places no store link.
 #[cfg(unix)]
@@ -1855,6 +1865,20 @@ fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
         transcripts.len(),
         1,
         "the transcript is in the global store the session index reads"
+    );
+    // The mod bridge reads a peer no `live_sessions` row joins from
+    // `~/.claude/sessions`, so a background session's record must land there.
+    assert_eq!(
+        fs::read_link(tree.join("sessions")).expect("the tree links its sessions store"),
+        claude.join("sessions"),
+        "the tree's live records land in the global store the bridge reads"
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &fs::metadata(claude.join("sessions")).expect("the global sessions store exists")
+        ) & 0o777,
+        0o700,
+        "the created store is owner-only"
     );
 }
 

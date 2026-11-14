@@ -19,6 +19,10 @@ use crate::profile::ProfileName;
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
 pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
+/// Filename of the claude banked-reset side read's cache, relative to the
+/// per-profile dir. Written by the scheduler's hourly side read and the CLI's
+/// post-spend refresh; the plain poll never touches it.
+pub(crate) const LIMIT_RESETS_FILE: &str = "limit_resets.json";
 
 /// The account uuid this profile's login last authenticated as (a bare JSON
 /// string). Derived data, backfilled on login and on every successful mirror
@@ -81,11 +85,12 @@ struct AuthVerdict {
 /// sessions and delegates spend — recorded against
 /// [`crate::usage::inference_key_fingerprint`], a digest of that key alone.
 /// Written by a delegate's 401 on the key and by a usage fetch that
-/// authenticated with the key and got `AuthExpired`; cleared only by a live
-/// body from a fetch that authenticated with the same key
-/// ([`clear_auth_expired`]). A console re-login, a console lapse and an
-/// endpoint edit never touch it, and a re-keyed profile leaves it inert. Read
-/// by [`crate::fallback::third_party_key_rejected`].
+/// authenticated with the key and got `AuthExpired`; cleared by a live body
+/// from a fetch that authenticated with the same key, by a proxy re-login
+/// saving a new key, or by a live setup-token probe ([`clear_auth_expired`]).
+/// A console re-login, a console lapse and an endpoint edit never touch it,
+/// and a re-keyed profile leaves it inert. Read by
+/// [`crate::fallback::third_party_key_rejected`].
 pub(crate) const DEAD_KEY_FILE: &str = "dead_key.json";
 
 /// Body of [`DEAD_KEY_FILE`].
@@ -108,8 +113,10 @@ pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
 }
 
 /// Drop both records — a live body from a fetch that authenticated with the
-/// api key proves the usage credential AND the key alive. Cheap and
-/// unconditional: the files are usually absent.
+/// api key proves the usage credential AND the key alive, and a proxy
+/// re-login's minted key replaces the key they judged; a live setup-token
+/// probe drops them too. Cheap and unconditional: the files are usually
+/// absent.
 pub(crate) fn clear_auth_expired(name: &ProfileName) {
     clear_usage_verdict(name);
     remove_profile_cache(name, DEAD_KEY_FILE);
@@ -211,6 +218,21 @@ fn anchored_account(name: &ProfileName) -> Option<crate::profile::AccountId> {
         .filter(|u| !u.trim().is_empty())
 }
 
+/// The banked usage-limit reset count of `name`'s claude `limit_resets.json`,
+/// `None` with no readable reading. A roster row reads it here and the status
+/// feed through [`claude_limit_resets_reading`], so neither can answer
+/// differently about the same file.
+pub(crate) fn claude_limit_resets(name: &ProfileName) -> Option<u32> {
+    claude_limit_resets_reading(name).map(|r| r.usable)
+}
+
+/// The whole reading behind [`claude_limit_resets`], loaded once so a caller
+/// publishing both the count and its read stamp cannot pair a new count with
+/// an old date.
+pub(crate) fn claude_limit_resets_reading(name: &ProfileName) -> Option<crate::usage::LimitResets> {
+    load_profile_cache::<crate::usage::LimitResets>(name, LIMIT_RESETS_FILE)
+}
+
 /// The credit refusal on record for `name`, if any: the one gate every reader
 /// goes through.
 pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
@@ -227,13 +249,18 @@ pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
 /// records nothing and logs it: the 429 is lost, and the member's next one
 /// places it again. The hold shares the tick's `timed_out` flag: once any
 /// landing or kick hold of the tick has timed out, it takes that path at once
-/// rather than wait out the flock again.
+/// rather than wait out the flock again. A spent `lease` ticket (the tick's
+/// instance lost the fetch lease) records nothing, checked inside the hold.
 pub(crate) fn write_credit_refusal_flagged(
     name: &ProfileName,
     refusal: &CreditRefusal,
     timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
         let mut record = credit_refusal_record(name);
         #[cfg(test)]
         credit_refusal_park::park_if_armed();
@@ -250,7 +277,7 @@ pub(crate) fn write_credit_refusal_flagged(
 /// [`write_credit_refusal_flagged`] outside a tick.
 #[cfg(test)]
 pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
-    write_credit_refusal_flagged(name, refusal, None);
+    write_credit_refusal_flagged(name, refusal, None, None);
 }
 
 /// Drop `name`'s credit refusal, a later successful turn on the member or a
@@ -262,13 +289,17 @@ pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) 
 /// higher floor on record stays, and so does a refusal past `floor_ms`, which
 /// another session recorded after the caller read the one the turn cleared.
 /// Held under the state flock like [`write_credit_refusal_flagged`], and a
-/// timed-out wait clears nothing.
+/// timed-out wait clears nothing; neither does a spent `lease` ticket.
 pub(crate) fn clear_credit_refusal_flagged(
     name: &ProfileName,
     floor_ms: u64,
     timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
 ) {
     let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
         let mut record = credit_refusal_record(name);
         record.clear(floor_ms);
         write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
@@ -282,7 +313,7 @@ pub(crate) fn clear_credit_refusal_flagged(
 /// [`clear_credit_refusal_flagged`] outside a tick.
 #[cfg(test)]
 pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
-    clear_credit_refusal_flagged(name, floor_ms, None);
+    clear_credit_refusal_flagged(name, floor_ms, None, None);
 }
 
 /// Record `refusal` for `name` as [`write_credit_refusal_flagged`] does, then
@@ -516,18 +547,21 @@ pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
 
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
 
-/// A store mtime clauth moved without writing the store.
+/// A store mtime clauth moved without writing the store's login.
 ///
 /// The per-session swap executor must move the mtime of the store it repoints to
 /// — Claude Code re-reads credentials only when that value changes, so an
 /// mtime-preserving repoint is a silent no-op — but every OTHER reader of that
-/// mtime is asking when the bytes were last WRITTEN, and answers a bare stamp as
-/// "just now". This is what separates the two.
+/// mtime is asking when the login was last WRITTEN, and answers a bare stamp as
+/// "just now". The MCP login sync's write is the other such move: it rewrites
+/// the store's `mcpOAuth` and leaves the login as it was. This is what separates
+/// them from a login write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TouchReceipt {
     /// File name of the stamped store. A profile can hold both a
-    /// `credentials.json` and a `session-token.json` and only ever one of them
-    /// is stamped, so a receipt for one must not resolve the other.
+    /// `credentials.json` and a `session-token.json`, and one sync pass writes
+    /// both, so the receipt file holds one receipt per store: a receipt for one
+    /// never resolves the other, and a stamp of one never replaces the other's.
     store: String,
     /// The mtime the stamp actually landed on, read back rather than predicted —
     /// a coarse filesystem truncates the value asked for. A store whose mtime has
@@ -540,30 +574,48 @@ pub(crate) struct TouchReceipt {
 
 /// Record that `name`'s `store` carries a bare stamp. Best-effort like every
 /// other per-profile cache — a receipt that never lands leaves the readers on the
-/// raw mtime, which is the pre-receipt answer rather than a worse one.
+/// raw mtime, which is the pre-receipt answer rather than a worse one. Returns
+/// whether the receipt landed, for a caller that says so when it did not.
 pub(crate) fn write_touch_receipt(
     name: &ProfileName,
     store: &Path,
     stamped: SystemTime,
     prev: Option<SystemTime>,
-) {
+) -> bool {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
-        return;
+        return false;
     };
     debug_assert!(
         crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
         "the receipt is read back from the store's own directory, so it has to be written there",
     );
-    write_profile_cache_for(
-        Harness::Claude,
-        name,
-        TOUCH_RECEIPT_FILE,
-        &TouchReceipt {
-            store: file.to_string(),
-            stamped,
-            prev,
-        },
-    );
+    let mut receipts = read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE));
+    receipts.retain(|receipt| receipt.store != file);
+    receipts.push(TouchReceipt {
+        store: file.to_string(),
+        stamped,
+        prev,
+    });
+    write_profile_cache_reported_for(Harness::Claude, name, TOUCH_RECEIPT_FILE, &receipts)
+}
+
+/// The receipts in `receipt_file`, one per store: a file an older clauth wrote
+/// holds a single receipt, read as one. An absent, unreadable or unparseable file
+/// holds none.
+///
+/// The list form is not readable by an older clauth, which reads it as no
+/// receipt and falls back to the store's mtime, and whose single-receipt write
+/// replaces the file and drops the other store's receipt. While older and newer
+/// clauths share one machine that costs, at worst, one stray session reload or
+/// one store kept over a session's own file, until every clauth on the machine
+/// runs this version.
+fn read_touch_receipts(receipt_file: &Path) -> Vec<TouchReceipt> {
+    let Ok(text) = std::fs::read_to_string(receipt_file) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<TouchReceipt>>(&text)
+        .or_else(|_| serde_json::from_str::<TouchReceipt>(&text).map(|receipt| vec![receipt]))
+        .unwrap_or_default()
 }
 
 /// When `store`'s bytes were last written: its mtime, unless a [`TouchReceipt`]
@@ -584,11 +636,83 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
         return Some(mtime);
     };
-    std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
-        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+    read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE))
+        .into_iter()
+        .find(|receipt| receipt.store == file && mtime == receipt.stamped)
         .map_or(Some(mtime), |receipt| receipt.prev)
+}
+
+/// A third-party usage copy as [`THIRD_PARTY_CACHE_FILE`] holds it: the stats,
+/// plus, for a proxy reading, when its chain windows were read — epoch ms of
+/// the oldest `read_at` among its declared 5h/7d windows, clamped to the write
+/// instant — and the epoch ms clauth wrote it at. Both are absent on an older
+/// copy or a non-proxy copy, and the chain date on a reading with no chain
+/// window. The file's mtime stays the reading's stalest figure, the age every
+/// surface shows; the chain date is what a freshness DECISION about the chain
+/// reads (the walk, the 5h bell, the window push, the seed's status), and the
+/// write instant is the leg's own poll clock, which that dated-back mtime no
+/// longer carries.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThirdPartyCopy {
+    #[serde(flatten)]
+    pub(crate) stats: crate::providers::ThirdPartyStats,
+    #[serde(default)]
+    pub(crate) chain_read_at: Option<u64>,
+    #[serde(default)]
+    pub(crate) written_at: Option<u64>,
+}
+
+/// The borrowed write side of [`ThirdPartyCopy`]: a copy with no chain date
+/// carries no `chain_read_at` key.
+#[derive(Serialize)]
+struct ThirdPartyCopyRef<'a> {
+    #[serde(flatten)]
+    stats: &'a crate::providers::ThirdPartyStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_read_at: Option<u64>,
+    written_at: u64,
+}
+
+impl ThirdPartyCopy {
+    /// The instant clauth wrote this copy, whose file reads `mtime`: the
+    /// write instant it records, which only the proxy leg writes, never after
+    /// `now` nor before the mtime. A copy recording none is any other
+    /// writer's, and none of those dates its file back, so its mtime is that
+    /// instant.
+    pub(crate) fn written_ms(&self, mtime: u64, now: u64) -> u64 {
+        self.written_at
+            .map_or(mtime, |written| written.min(now).max(mtime))
+    }
+}
+
+/// Write `name`'s third-party copy stamped `written_at` (epoch ms), its chain
+/// windows' read date beside it when the reading carries one, landing with
+/// the mtime `dated` ([`crate::profile::atomic_write_600_dated`]). Best-effort
+/// like [`write_profile_cache_for`]; whether the copy landed.
+pub(crate) fn write_third_party_copy(
+    name: &ProfileName,
+    stats: &crate::providers::ThirdPartyStats,
+    chain_read_at: Option<u64>,
+    written_at: u64,
+    dated: SystemTime,
+) -> bool {
+    write_profile_cache_at(
+        Harness::Claude,
+        name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyCopyRef {
+            stats,
+            chain_read_at,
+            written_at,
+        },
+        Some(dated),
+    )
+}
+
+/// Read `name`'s third-party copy with its chain date; `None` as
+/// [`load_profile_cache`] answers it.
+pub(crate) fn load_third_party_copy(name: &ProfileName) -> Option<ThirdPartyCopy> {
+    load_profile_cache(name, THIRD_PARTY_CACHE_FILE)
 }
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
@@ -617,6 +741,8 @@ fn expected_cache_file<T: 'static>() -> Option<&'static str> {
     match TypeId::of::<T>() {
         t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
         t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
+        t if t == TypeId::of::<crate::usage::LimitResets>() => Some(LIMIT_RESETS_FILE),
+        t if t == TypeId::of::<ThirdPartyCopy>() => Some(THIRD_PARTY_CACHE_FILE),
         _ => None,
     }
 }
@@ -683,10 +809,22 @@ pub(crate) fn write_profile_cache_reported_for<T: Serialize>(
     file: &str,
     value: &T,
 ) -> bool {
+    write_profile_cache_at(harness, name, file, value, None)
+}
+
+/// [`write_profile_cache_reported_for`] landing with the mtime `dated` when
+/// given.
+fn write_profile_cache_at<T: Serialize>(
+    harness: Harness,
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
     if !roster_holds(harness, name) {
         return false;
     }
-    write_cache_file(name, file, value)
+    write_cache_file(name, file, value, dated)
 }
 
 /// Whether `harness`'s own roster holds `name`: `profiles.toml` for claude
@@ -706,14 +844,19 @@ fn codex_roster_holds(name: &ProfileName) -> bool {
     crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()))
 }
 
-fn write_cache_file<T: Serialize>(name: &ProfileName, file: &str, value: &T) -> bool {
+fn write_cache_file<T: Serialize>(
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
         return false;
     };
     let Ok(json) = serde_json::to_string(value) else {
         return false;
     };
-    crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+    crate::profile::atomic_write_600_dated(&path, json.as_bytes(), dated).is_ok()
 }
 
 /// Test-only either-roster writer: a fixture poses a cache under whichever
@@ -730,24 +873,39 @@ fn write_profile_cache_reported<T: Serialize>(name: &ProfileName, file: &str, va
     if !(claude_roster_holds(name) || codex_roster_holds(name)) {
         return false;
     }
-    write_cache_file(name, file, value)
+    write_cache_file(name, file, value, None)
 }
 
 /// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the
 /// intended post-state, and every other removal error is logged (never surfaced
 /// as a failure) — a stale cache is worse than the log line that names it.
 pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
+    let _ = remove_profile_cache_reported(name, file);
+}
+
+/// [`remove_profile_cache`] that reports whether the file is gone: `true`
+/// when it was removed, was already absent, or the profile dir cannot be
+/// resolved; `false` only on a removal error, which it also logs. A caller
+/// whose surface must show the count is gone prints its own line on `false`.
+pub(crate) fn remove_profile_cache_reported(name: &ProfileName, file: &str) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
-        return;
+        return true;
     };
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+            false
+        }
     }
 }
 
-/// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
+/// Epoch-ms of `<profile_dir>/<file>`'s mtime, or `None` when it's absent. For
+/// most files that is its last write; a proxy copy whose figures carry their
+/// read dates ([`write_third_party_copy`]) lands carrying its stalest figure's
+/// read, never its write, so when that copy was written reads the write
+/// instant it records ([`ThirdPartyCopy::written_ms`]).
 pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u64> {
     let modified = std::fs::metadata(profile_cache_path(name, file)?)
         .ok()?

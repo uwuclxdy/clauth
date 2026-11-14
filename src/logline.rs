@@ -8,7 +8,10 @@
 //! - **interactive TUI / CLI on a terminal**: `~/.clauth/clauth.log`. Here stderr
 //!   IS the ratatui alternate screen, so a bare line from a background scheduler
 //!   thread paints straight over the accounts pane (the 2026-07-14 corruption
-//!   report). The line is stamped and diverted to the log file instead.
+//!   report). The line is stamped and diverted to the log file instead. The
+//!   TUI pins this sink at its start when its stderr is a terminal
+//!   ([`divert_to_logfile`]), so its lines keep landing in the file after
+//!   that terminal hangs up.
 //! - **piped / redirected stderr** (CI, `2>file`): stderr, bare — the caller
 //!   already chose where those bytes land.
 //!
@@ -24,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::daemon::log_rotate;
 
 static STAMP: AtomicBool = AtomicBool::new(false);
+static DIVERTED: AtomicBool = AtomicBool::new(false);
 static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Turn on timestamp prefixes for [`logline!`] — called once at the top of
@@ -32,6 +36,16 @@ static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Sticky for the process lifetime; never flipped back.
 pub(crate) fn enable_timestamps() {
     STAMP.store(true, Ordering::Relaxed);
+}
+
+/// Send every later unstamped line to the log file, as a terminal stderr
+/// does — called by `tui::run` when its stderr is its terminal, so a line
+/// raised after that terminal hung up (stderr then no longer reads as a
+/// terminal, and a write to it fails; measured 2026-11-10 on a closed pty:
+/// `isatty` reads false, the write fails `Input/output error`) still lands in
+/// the file. Sticky for the process lifetime; never flipped back.
+pub(crate) fn divert_to_logfile() {
+    DIVERTED.store(true, Ordering::Relaxed);
 }
 
 /// Whether stamping is on: the daemon flips it once at `serve()`, so this is
@@ -67,7 +81,8 @@ pub(crate) fn render(stamped: bool, now_secs: i64, msg: &str) -> String {
 
 /// Where a rendered line goes. The daemon always writes stderr (its redirected
 /// log); an interactive stderr that IS a terminal diverts to the log file so a
-/// background thread's line can never paint over the TUI's alternate screen.
+/// background thread's line can never paint over the TUI's alternate screen,
+/// and so does every line after [`divert_to_logfile`].
 ///
 /// **A diagnostic reached once per CALL from a hook or an MCP process must take
 /// [`to_logfile`], never [`line`].** [`route`] sends a process whose stderr is
@@ -82,8 +97,8 @@ enum Sink {
     LogFile,
 }
 
-fn route(stamped: bool, stderr_is_tty: bool) -> Sink {
-    if !stamped && stderr_is_tty {
+fn route(stamped: bool, diverted: bool, stderr_is_tty: bool) -> Sink {
+    if !stamped && (diverted || stderr_is_tty) {
         Sink::LogFile
     } else {
         Sink::Stderr
@@ -99,7 +114,11 @@ pub(crate) fn line(args: std::fmt::Arguments<'_>) {
     }
     let now = crate::usage::now_epoch_secs();
     let stamped = STAMP.load(Ordering::Relaxed);
-    match route(stamped, std::io::stderr().is_terminal()) {
+    match route(
+        stamped,
+        DIVERTED.load(Ordering::Relaxed),
+        std::io::stderr().is_terminal(),
+    ) {
         Sink::Stderr => write_stderr_line(&render(stamped, now, &raw)),
         // Always stamp in the file — a bare diagnostic log is useless for the
         // forensics this exists for.

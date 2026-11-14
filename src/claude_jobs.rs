@@ -22,14 +22,16 @@
 //! session can re-enter, where only an UNFINISHED job spares. A job dir with no
 //! record is either a removed job's leftover — an empty `tmp/` and/or an
 //! `exit-cause` file — or caught mid-create (an empty dir, or only staged
-//! `state.json.tmp.*` records); neither names a job. A leftover is no job to
-//! any reader. A mid-create dir names no tree yet either, so the live-session
-//! count skips it and keeps counting the store's real records, while every gate
-//! that must not collect a tree a job reads fails closed for it — the tree
-//! itself for a tree-local dir, every tree for the global one, since the record
-//! about to land can name any of them. Any other record-less dir is unreadable
-//! and spares. The settings term ([`JobTrees::spares_settings`]) spares a
-//! spawn-settings file a job's `respawnFlags` name. The rotation term
+//! `state.json.tmp.*` records, newest mtime within [`MID_CREATE_GRACE`];
+//! older reads as a leftover, an unreadable or future mtime stays mid-create);
+//! neither names a job. A leftover is no job to any reader. A mid-create dir
+//! names no tree yet either, so the live-session count skips it and keeps
+//! counting the store's real records, while every gate that must not collect
+//! a tree a job reads fails closed for it — the tree itself for a tree-local
+//! dir, every tree for the global one, since the record about to land can name
+//! any of them. Any other record-less dir is unreadable and spares. The
+//! settings term ([`JobTrees::spares_settings`]) spares a spawn-settings file
+//! a job's `respawnFlags` name. The rotation term
 //! ([`JobTrees::unfinished_under`]) and the live-session term
 //! ([`JobTrees::unfinished_jobs`]) count only UNFINISHED jobs: a
 //! `stopped`/`done`/`failed` job must not freeze the chain and holds no
@@ -41,6 +43,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -685,8 +688,9 @@ impl<'de> serde::de::Visitor<'de> for RespawnFlagsVisitor {
 /// dir's trees. Any job dir whose `state.json` is missing, unreadable, or
 /// unparseable makes its STORE unreadable — EXCEPT a missing record whose dir
 /// is a removed job's leftover or a creation caught mid-create
-/// ([`recordless_job_dir`]): a leftover reads as no job, and a mid-create dir
-/// is skipped while the gates fail closed for it.
+/// ([`recordless_job_dir`]; only while its newest mtime is within
+/// [`MID_CREATE_GRACE`], older reads as a leftover): a leftover reads as no
+/// job, and a mid-create dir is skipped while the gates fail closed for it.
 pub(crate) fn job_trees() -> JobTrees {
     #[cfg(test)]
     JOB_TREES_READS.with(|c| c.set(c.get() + 1));
@@ -808,7 +812,8 @@ fn record_unreadable(
 /// maps to a global or scoped unreadable. The record rules are [`job_trees`]'s:
 /// a plain file is no job, a job naming no config dir contributes nothing, and
 /// a record-less dir is a removed job's leftover or a creation caught
-/// mid-create ([`recordless_job_dir`]), both skipped, or unreadable. `Ok(true)`
+/// mid-create (newest mtime within [`MID_CREATE_GRACE`]; older reads as a
+/// leftover; [`recordless_job_dir`]), both skipped, or unreadable. `Ok(true)`
 /// says the store held a mid-create dir, which the caller records so the gates
 /// fail closed for it while the count still reads the store's other records.
 fn read_jobs_dir(
@@ -942,21 +947,44 @@ enum RecordlessJobDir {
     /// empty directory, `exit-cause` = a regular file}. `claude rm` can leave
     /// the job's supervisor running, and that supervisor recreates the dir this
     /// way (an empty `tmp/`, then `exit-cause` once signalled); a lone bare
-    /// job's supervisor exits instead. No reader counts it as a job.
+    /// job's supervisor exits instead. A mid-create shape past
+    /// [`MID_CREATE_GRACE`] reads as this too. No reader counts it as a job.
     Removed,
     /// Caught mid-create: an empty dir, or one holding only staged
     /// `state.json.tmp.*` records. Claude Code creates the dir, stages the
     /// record, renames it, and only then creates `tmp/` (measured 5/5, 2.1.308),
     /// so a creation never makes the leftover shape and a `tmp/` holding
     /// anything is neither.
+    ///
+    /// Only while the shape is YOUNG: once its newest mtime is older than
+    /// [`MID_CREATE_GRACE`] by the wall clock it reads as an abandoned creation,
+    /// [`RecordlessJobDir::Removed`]. Without the bound one leftover dir in the
+    /// global store holds every gate closed for good: no macOS rotation, no
+    /// tree collection, no background-session adoption, no MCP-login sync
+    /// write, and every account reads live. The bound's residuals: a creation
+    /// frozen across the grace (a suspended machine) reads abandoned until its
+    /// rename lands; an mtime ahead of this host's clock (a stepped-back clock,
+    /// a network home whose server runs ahead) cannot prove its age and stays
+    /// mid-create until the clock passes it, and a server running behind
+    /// shortens the grace by its skew.
     MidCreate,
     /// Any other record-less dir: unreadable, fail closed.
     Unknown,
 }
 
+/// How long a record-less job dir may keep the mid-create shape before it is
+/// read as an abandoned creation, so a leftover cannot hold the gates closed
+/// for good.
+const MID_CREATE_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// Classify a record-less job dir. A list that cannot be read is `Err`, which
 /// the caller reads as unreadable (fail closed).
 fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
+    // The newest mtime across the dir and its entries: a staged record being
+    // written keeps the shape young even inside an older dir.
+    let mut newest = std::fs::metadata(job_dir)
+        .and_then(|meta| meta.modified())
+        .ok();
     let mut seen = false;
     let mut leftover = true;
     let mut mid_create = true;
@@ -982,11 +1010,24 @@ fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
         if !(staged && file_type.is_file()) {
             mid_create = false;
         }
+        // An entry whose mtime cannot be read could be the young one: `None`
+        // keeps the shape young (fail closed).
+        newest = newest
+            .zip(entry.metadata().and_then(|meta| meta.modified()).ok())
+            .map(|(a, b)| a.max(b));
     }
     if seen && leftover {
         return Ok(RecordlessJobDir::Removed);
     }
     if mid_create {
+        // An unreadable mtime, or one in the future, cannot prove the shape is
+        // old: it stays mid-create (fail closed).
+        let abandoned = newest
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > MID_CREATE_GRACE);
+        if abandoned {
+            return Ok(RecordlessJobDir::Removed);
+        }
         return Ok(RecordlessJobDir::MidCreate);
     }
     Ok(RecordlessJobDir::Unknown)

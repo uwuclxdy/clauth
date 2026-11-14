@@ -600,20 +600,37 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
 /// ladder has no notion of), so bridging the two just to share strings would
 /// couple two ladders that are allowed to diverge. Same register: short,
 /// lowercase, names the concrete next action.
-fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active: bool) -> String {
+///
+/// `proxy` is the member's proxy service off its runtime claim: a proxy
+/// account's key is the proxy's to mint, so its dead-credential and quarantine
+/// fixes name the one login clauth takes for it.
+fn reason_fix(
+    reason: &BlockedReason,
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+    active: bool,
+) -> String {
+    let proxy_login = |service| cmd(&crate::actions::proxy_login_command(name.as_str(), service));
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
         BlockedReason::OrgRefused => FIX_ORG_REFUSED.to_string(),
-        BlockedReason::AuthBroken => {
-            format!("re-login with {}", cmd(&format!("clauth login {name}")))
-        }
-        BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
+        BlockedReason::AuthBroken => match proxy {
+            Some(service) => format!("log in again with {}", proxy_login(service)),
+            None => format!("re-login with {}", cmd(&format!("clauth login {name}"))),
+        },
+        BlockedReason::KeyRejected => match proxy {
+            Some(service) => format!("log in again with {}", proxy_login(service)),
+            None => "re-enter the api key on the setup tab".to_string(),
+        },
         BlockedReason::TokenRejected => setup_token_remint_fix(name.as_str()),
-        BlockedReason::LoggedOut => format!(
-            "log in with {}, or add an api key on the setup tab",
-            cmd(&format!("clauth login {name}"))
-        ),
+        BlockedReason::LoggedOut => match proxy {
+            Some(service) => format!("log in with {}", proxy_login(service)),
+            None => format!(
+                "log in with {}, or add an api key on the setup tab",
+                cmd(&format!("clauth login {name}"))
+            ),
+        },
         BlockedReason::WeeklySpent { monthly, .. } => {
             if *monthly {
                 "monthly quota is spent".to_string()
@@ -1023,6 +1040,7 @@ fn member_detail(
     // onto has it NOW, and that is the card an operator is most likely looking
     // at when they go looking for it.
     let active = cfg.is_active(name);
+    let proxy = profile.proxy.as_ref().map(|record| &record.service);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
     if let Some(reason) = blocked_reason(
         cfg,
@@ -1035,7 +1053,7 @@ fn member_detail(
     ) {
         pills.push((
             reason_pill_spans(&reason, fmt),
-            reason_fix(&reason, name, active),
+            reason_fix(&reason, name, proxy, active),
         ));
         if reason == BlockedReason::Disabled
             && let Some(health) = health_blocked_reason(
@@ -1050,7 +1068,7 @@ fn member_detail(
         {
             pills.push((
                 reason_pill_spans(&health, fmt),
-                reason_fix(&health, name, active),
+                reason_fix(&health, name, proxy, active),
             ));
         }
     }

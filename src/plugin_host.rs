@@ -329,7 +329,8 @@ const HEAL_THROTTLE_MS: u64 = 30 * 60 * 1000;
 pub(crate) static HEAL_THROTTLE: HealThrottle = HealThrottle::new();
 
 /// One heal's attempt limiter: at most one attempt per process every
-/// [`HEAL_THROTTLE_MS`], success or failure, and never two in flight. Both
+/// [`HEAL_THROTTLE_MS`] ([`HealThrottle::new`]; another floor through
+/// [`HealThrottle::with_floor`]), success or failure, and never two in flight. Both
 /// detached callers (`clauth mcp` boot, daemon tick) can fire once per second
 /// on a box whose `claude` is missing, and an untried retry every tick would
 /// spawn + fail forever. The in-flight flag bounds overlap; the floor bounds
@@ -341,6 +342,7 @@ pub(crate) static HEAL_THROTTLE: HealThrottle = HealThrottle::new();
 pub(crate) struct HealThrottle {
     pub(crate) in_flight: AtomicBool,
     pub(crate) last_start_ms: AtomicU64,
+    floor_ms: u64,
 }
 
 /// A claimed in-flight flag. The caller builds it on the claiming thread and
@@ -357,25 +359,41 @@ impl Drop for HealClaim<'_> {
 
 impl HealThrottle {
     pub(crate) const fn new() -> Self {
+        Self::with_floor(HEAL_THROTTLE_MS)
+    }
+
+    /// A limiter whose floor between attempt starts is `floor_ms`.
+    pub(crate) const fn with_floor(floor_ms: u64) -> Self {
         Self {
             in_flight: AtomicBool::new(false),
             last_start_ms: AtomicU64::new(0),
+            floor_ms,
         }
     }
 
     /// Claim an attempt at `now_ms`: `None` when one is in flight or the last
     /// attempt started within the floor window. The floor stamps here, on the
     /// claiming thread, so the window between claim and spawn is covered too.
+    /// A clock stepped back past the last start is due at once: holding off
+    /// until the clock caught up would stall the limiter for the whole step,
+    /// and the stamp it then takes floors the next attempt from the new time.
     pub(crate) fn claim(&self, now_ms: u64) -> Option<HealClaim<'_>> {
         if self.in_flight.swap(true, Ordering::AcqRel) {
             return None;
         }
         let claim = HealClaim(&self.in_flight);
-        if now_ms.saturating_sub(self.last_start_ms.load(Ordering::Relaxed)) < HEAL_THROTTLE_MS {
+        let last = self.last_start_ms.load(Ordering::Relaxed);
+        if now_ms >= last && now_ms - last < self.floor_ms {
             return None;
         }
         self.last_start_ms.store(now_ms, Ordering::Relaxed);
         Some(claim)
+    }
+
+    /// The floor between attempt starts, for a test pinning a static's cadence.
+    #[cfg(test)]
+    pub(crate) const fn floor_ms(&self) -> u64 {
+        self.floor_ms
     }
 
     /// Clear both flags so a test can drive a heal fresh. The statics serialize
