@@ -2231,6 +2231,55 @@ pub(crate) fn seed_plan_cache(
     }
 }
 
+/// Replace the plan in `name`'s usage cache with the one a same-account re-login
+/// just read, when the two disagree on tier or subscription status. Resubscribing
+/// changes the plan without changing the account, so [`seed_plan_cache`] never
+/// runs for it, and a cached `canceled` would keep the account out of every walk
+/// until the next `/profile` read. A cache holding no plan has nothing to correct
+/// and is left to that read. Answers whether the two disagreed, the caller's cue
+/// to expire the `/profile` clock for processes holding the old plan in memory.
+///
+/// Only the plan moves, and the file keeps its mtime: the windows beside it are
+/// as old as they were, and a cache's age is read off its mtime.
+pub(crate) fn correct_cached_plan(
+    name: &ProfileName,
+    plan: PlanInfo,
+    account_uuid: &AccountId,
+) -> bool {
+    if plan
+        .email
+        .as_ref()
+        .is_some_and(|email| account_uuid.trim() != email.account.trim())
+    {
+        return false;
+    }
+    let Some(mut info) =
+        load_profile_cache::<UsageInfo>(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return false;
+    };
+    let agrees = info.plan.as_ref().is_none_or(|cached| {
+        cached.tier == plan.tier && cached.subscription_status == plan.subscription_status
+    });
+    if agrees {
+        return false;
+    }
+    let Some(path) =
+        crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return false;
+    };
+    let dated = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    info.plan = Some(plan);
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return false;
+    };
+    if let Err(e) = crate::profile::atomic_write_600_dated(&path, &json, dated) {
+        logline!("clauth: {name}: could not save the login's plan: {e}");
+    }
+    true
+}
+
 /// Whether `name`'s stored `/usage` body says its plan has no 5h limit. Reads
 /// the cache file, not an in-memory store: the CLI's one-shot paths
 /// (`clauth switch`'s window prime) have no scheduler behind them.
