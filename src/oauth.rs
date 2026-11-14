@@ -3797,7 +3797,11 @@ fn take_rotation_guard(
 ///     reads what each live session LAUNCHED on, so a session already running
 ///     on a refresh-less bearer never blocks — it holds nothing to strand;
 ///   * terminally dead chain → restore the static mint (Ready, degraded)
-///     else Broken.
+///     else Broken;
+///   * transient chain trouble beside a rolling bearer within
+///     [`ROLLING_DEGRADE_LEAD_MS`] of expiry → restore the static mint
+///     (Ready, degraded) — the re-stamp leg reads the mint as due and
+///     supersedes it once the chain answers.
 ///
 /// `held` is a rotation guard the caller already holds (the CLI arm), taken in
 /// place of the gate's own; it drops wherever the gate would release its own,
@@ -3812,6 +3816,10 @@ fn rolling_install_gate(
     held: Option<RotationGuard>,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
+    // Whether THIS call healed a mis-fill onto the mint: a scan that just
+    // wrote the sidecar answers Ready so its live-slot followers carry the
+    // write, even where the roll below then refuses.
+    let mut healed = false;
     // The heal writes the sidecar, so it runs only on an account that claims
     // no proxy account on disk; a claimed one falls to the table below, where
     // [`roll_from_stored_chain`] reads the same claim and stamps nothing. This
@@ -3824,10 +3832,13 @@ fn rolling_install_gate(
         == crate::profile::ProxyClaim::None
     {
         match crate::claude::heal_misfilled_sidecar(name) {
-            Ok(crate::claude::HealOutcome::Healed) => logline!(
-                "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
-                 (the rolling token re-arms on the next rotation)"
-            ),
+            Ok(crate::claude::HealOutcome::Healed) => {
+                healed = true;
+                logline!(
+                    "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
+                     (the rolling token re-arms on the next rotation)"
+                );
+            }
             // A concurrent repair — or whatever writes the sidecar — already
             // resolved the mis-fill. Fall through to the normal rolling table,
             // which re-reads the sidecar as it now is. (The old bool folded
@@ -3960,8 +3971,17 @@ fn rolling_install_gate(
         // chain shape reached `stamp_rolling_token`'s bail and the WriteFailed
         // arm's `sidecar_live` fallback served the mint; losing that turned a
         // profile with a perfectly installable mint into a hard switch refusal
-        // (verification fleet, round 3).
+        // (verification fleet, round 3). The scheduler's re-stamp leg
+        // (`NoWait`) has no install to make, and the live sidecar there is a
+        // mint the scan keeps reading as due: answering Ready would rerun this
+        // gate on the 15-minute hold until the re-login. It gets the
+        // re-login-shaped cause instead, which the scan paces on its long,
+        // credential-watched hold, unless this call healed a mis-fill, whose
+        // write the scan's Ready followers still have to carry.
         RollAttempt::GrantUnusable => {
+            if matches!(wait, LockWait::NoWait) && !healed {
+                return AuthGate::Transient(rolling_grant_unrecorded(name));
+            }
             return if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
                     "clauth: '{name}' usage chain's recorded grant cannot mint a rolling \
@@ -4039,6 +4059,32 @@ fn rolling_install_gate(
         // now (degraded but serving) rather than deferring a switch a healthy
         // static token could carry; the rolling token self-heals on a later rotation.
         AuthGate::Transient(e) => {
+            // A rolling bearer that dies before the next retry, while the chain
+            // cannot answer: hand the live slot back to the static mint NOW, or
+            // every session stops at the bearer's clock. A transient is not a
+            // dead chain, so nothing else ever restores the mint, and a long
+            // outage (a sleeping laptop, a network that cannot reach anthropic)
+            // ran the bearer out while the year-long mint sat in its backup.
+            // Not on a login change: the store just took a new login, whose
+            // own arming owns what the sidecar holds next.
+            if !e.is_login_change() && rolling_bearer_dying(name) {
+                match crate::claude::restore_static_mint(name) {
+                    Ok(true) if sidecar_live(crate::claude::session_token_status(name)) => {
+                        logline!(
+                            "clauth: '{name}' rolling token is about to expire and its chain \
+                             cannot be refreshed ({}); sessions degrade to {} until the \
+                             rolling token re-arms",
+                            e.text_with_status(),
+                            serving_desc(name)
+                        );
+                        return AuthGate::Ready;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        logline!("clauth: '{name}' static-mint restore failed ({err:#})");
+                    }
+                }
+            }
             if sidecar_live(crate::claude::session_token_status(name)) {
                 if e.is_login_change() {
                     logline!(
@@ -4119,6 +4165,23 @@ pub(crate) fn arm_rolling_token(
     }
 }
 
+/// CLA-ROLL: how close to its expiry a rolling bearer may run, while its chain
+/// refresh keeps failing transiently, before the gate hands the live slot back
+/// to the static mint. Wider than the scheduler's transient re-stamp retry, so
+/// the degrade lands on a retry that still precedes the bearer's death.
+pub(crate) const ROLLING_DEGRADE_LEAD_MS: i64 = 20 * 60 * 1000;
+
+/// The sidecar holds a ROLLING bearer within [`ROLLING_DEGRADE_LEAD_MS`] of its
+/// expiry (or past it). A mint, a mis-fill, or no sidecar is never "dying".
+fn rolling_bearer_dying(name: &ProfileName) -> bool {
+    let now = now_ms() as i64;
+    matches!(
+        crate::claude::sidecar_summary(name),
+        Some((crate::claude::SidecarKind::Rolling, oauth))
+            if oauth.expires_at.is_some_and(|exp| exp <= now + ROLLING_DEGRADE_LEAD_MS)
+    )
+}
+
 /// CLA-ROLL: how much life a rolling sidecar must keep before the daemon's
 /// re-stamp leg leaves it alone. Rolling bearers die in hours (they clone the
 /// usage chain's access-token expiry); re-stamping this far ahead keeps a
@@ -4136,13 +4199,24 @@ pub(crate) const ROLLING_RESTAMP_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
 /// on which the scheduler's credential-file watch then makes the operator's
 /// re-mint the release). Without this arm a mis-filled sidecar beside a
 /// healthy backup sat unrepaired forever on any profile nobody switched to.
-/// Absent sidecars (arming is switch/rotation work) and exp-less claims stay
-/// not-due.
+/// A static MINT in the sidecar is due too (the scheduler asks only for
+/// rolling-token profiles): it is the fallback a dead or unreachable chain
+/// degraded to, and this leg brings the rolling bearer back once the chain
+/// answers without waiting for a rotation (the gate supersedes a mint whenever
+/// it can stamp; a rotation that lands re-stamps it too). A mint beside a
+/// grant that can never stamp stays due as well, and the gate answers the
+/// scan with the re-login cause, so the scheduler paces it on the re-login
+/// hold. Absent sidecars (arming is switch/rotation work) and exp-less claims
+/// stay not-due.
 pub(crate) fn rolling_sidecar_restamp_due(name: &ProfileName, now: i64) -> bool {
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {
             exp <= now + ROLLING_RESTAMP_HORIZON_MS
                 || crate::claude::rolling_sidecar_behind_chain(name)
+                || matches!(
+                    crate::claude::sidecar_summary(name),
+                    Some((crate::claude::SidecarKind::Mint, _))
+                )
         }
         Some(crate::claude::SessionTokenStatus::NotLongLived) => true,
         _ => false,

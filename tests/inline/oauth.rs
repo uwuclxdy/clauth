@@ -6204,6 +6204,144 @@ fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
     );
 }
 
+/// A saved rolling-token profile whose live chain (beyond the re-stamp
+/// horizon) carries no recorded grant, the shape `stamp_rolling_token`
+/// refuses.
+fn unrecorded_grant_rolling_config(name: &str) -> crate::profile::ConfigHandle {
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    let mut profile = config.profiles[0].clone();
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = None;
+        oauth.subscription_type = None;
+    }
+    crate::profile::save_profile(&profile).expect("save profile");
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: config.state.clone(),
+        profiles: vec![profile],
+    }))
+}
+
+/// The same profile as the daemon's re-stamp scan sees it: the live mint
+/// reads as due, and no retry can stamp from the unrecorded grant, so the scan
+/// gets the re-login cause (paced on the re-login hold) rather than a Ready
+/// that reruns the gate on the 15-minute hold. A switch still installs the
+/// mint and says why the rolling token is not back.
+#[test]
+fn the_rescan_of_an_unrecorded_grant_beside_a_live_mint_answers_the_relogin_cause() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-scan";
+    let config = unrecorded_grant_rolling_config(name);
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    assert!(
+        rolling_sidecar_restamp_due(&pn(name), crate::usage::now_ms() as i64),
+        "a mint in a rolling profile's sidecar is due"
+    );
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let scan = restamp_rolling_token(&config, &pn(name), refresher);
+
+    drop(capture);
+    assert!(
+        matches!(&scan, AuthGate::Transient(e) if e.permanent_until_relogin()),
+        "{}",
+        gate_verdict(&scan)
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "the scan's own line is the scheduler's: {:?}",
+        lines.snapshot()
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-live-mint",
+        "mint untouched"
+    );
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let switch = ensure_installable(&config, &pn(name), refresher, None);
+    drop(capture);
+    assert_eq!(gate_verdict(&switch), "Ready");
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: 'test-grant-scan' usage chain's recorded grant cannot mint a rolling \
+             bearer (re-run `clauth login test-grant-scan` to record it); installing the \
+             static long-lived mint"
+                .to_string()
+        ]
+    );
+}
+
+/// A scan that heals a mis-fill onto the preserved mint beside the same
+/// unrecorded grant still answers Ready, so its live-slot followers carry the
+/// heal's write; the next scan, with nothing to heal, answers the re-login
+/// cause.
+#[test]
+fn a_scan_that_heals_a_misfill_beside_an_unrecorded_grant_answers_ready_once() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-heal";
+    let config = unrecorded_grant_rolling_config(name);
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    crate::claude::stamp_rolling_token(&pn(name), &fed_bearer("at-fed")).expect("feed");
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the stamp preserved the mint"
+    );
+    let dir = profile_dir(&pn(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+
+    let healed = restamp_rolling_token(&config, &pn(name), refresher);
+
+    assert_eq!(gate_verdict(&healed), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint",
+        "the heal restored the mint"
+    );
+    let next = restamp_rolling_token(&config, &pn(name), refresher);
+    assert!(
+        matches!(&next, AuthGate::Transient(e) if e.permanent_until_relogin()),
+        "{}",
+        gate_verdict(&next)
+    );
+}
+
 // ── stale-config persist gates (lock-race row 3) ─────────────────────────────
 //
 // A daemon leg persists a whole profile/state from an in-memory config that a
@@ -8300,6 +8438,180 @@ fn a_transient_refresh_beside_a_live_rolling_sidecar_installs_it() {
              until that expires, while the rolling token retries"
         )
     );
+}
+
+/// A rolling-token profile whose static mint was preserved as the backup, its
+/// sidecar now holding a rolling bearer that expires `bearer_left_ms` from now
+/// over a chain whose refresh is due.
+fn rolling_profile_with_dying_bearer(
+    name: &str,
+    bearer_left_ms: i64,
+) -> crate::profile::ConfigHandle {
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::profile::save_app_state(&config.state).expect("save state");
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let mut bearer = fed_bearer("at-fed-dying");
+    bearer.expires_at = Some(crate::usage::now_ms() as i64 + bearer_left_ms);
+    crate::claude::stamp_rolling_token(&pn(name), &bearer).expect("feed");
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the stamp preserved the mint"
+    );
+    Arc::new(RankedMutex::new(config))
+}
+
+/// The chain cannot be refreshed for hours (a sleeping laptop, a network that
+/// cannot reach anthropic) and the rolling bearer runs out while the
+/// year-long mint sits in its backup. Inside the degrade lead a transient
+/// re-stamp hands the sidecar back to the mint, so sessions keep a live
+/// bearer; the line names the failure and the mint.
+#[test]
+fn a_transient_refresh_beside_a_dying_rolling_bearer_degrades_to_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "roll-outage";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint",
+        "the mint serves again"
+    );
+    assert!(
+        !crate::claude::has_static_backup(&pn(name)),
+        "the backup is consumed by the restore"
+    );
+    assert_eq!(
+        lines.snapshot().last().map(String::as_str),
+        Some(
+            "clauth: 'roll-outage' rolling token is about to expire and its chain cannot be \
+             refreshed (could not reach anthropic: check your connection and retry); sessions \
+             degrade to the static long-lived mint until the rolling token re-arms"
+        )
+    );
+    assert!(
+        rolling_sidecar_restamp_due(&pn(name), crate::usage::now_ms() as i64),
+        "a degraded mint stays due, so the rolling token comes back once the chain answers"
+    );
+}
+
+/// Outside the degrade lead the same transient keeps the rolling bearer: it
+/// still has a retry's worth of life, and the mint stays in its backup.
+#[test]
+fn a_transient_refresh_beside_a_rolling_bearer_outside_the_lead_keeps_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-early";
+    let handle = rolling_profile_with_dying_bearer(name, ROLLING_DEGRADE_LEAD_MS + 5 * 60 * 1000);
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint stays preserved"
+    );
+}
+
+/// A login change during the refresh is not chain trouble: the store just
+/// took a new login, whose own arming decides what the sidecar holds next. A
+/// dying bearer beside it is left alone, and the mint stays in its backup.
+#[test]
+fn a_login_change_beside_a_dying_rolling_bearer_keeps_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-moved-dying";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old");
+        relogin_into(
+            "roll-moved-dying",
+            crate::usage::now_ms() as i64 + 30 * 60_000,
+        );
+        Ok(minted("at-new", "rt-new"))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        lines.snapshot().last().map(String::as_str),
+        Some(
+            "clauth: 'roll-moved-dying' login changed during its refresh; installing its last \
+             rolling bearer, until that expires, while the rolling token retries"
+        )
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying",
+        "the rolling bearer stays"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint stays preserved"
+    );
+}
+
+/// Once the chain answers again, the degraded mint is superseded by a fresh
+/// rolling bearer and goes back into its backup.
+#[test]
+fn a_degraded_mint_rolls_back_once_the_chain_answers() {
+    let _home = HomeSandbox::new();
+    let name = "roll-recover";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let _ = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint"
+    );
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-fed-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 8 * 3600,
+            scope: Some("user:profile user:inference".to_string()),
+        })
+    });
+
+    assert!(
+        matches!(gate, AuthGate::Ready | AuthGate::Refreshed),
+        "{}",
+        gate_verdict(&gate)
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-new"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint is preserved again"
+    );
+    assert!(!rolling_sidecar_restamp_due(
+        &pn(name),
+        crate::usage::now_ms() as i64
+    ));
 }
 
 /// A log out lands while the gate refreshes: the store stays empty, and the
