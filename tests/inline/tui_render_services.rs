@@ -11459,6 +11459,7 @@ fn a_rex_plugin_from_another_clauth_reads_stale() {
             ),
             rex_row("watcher", "running"),
             rex_row("experimental", REX_EXPERIMENTAL),
+            "clauth rex install".to_string(),
         ]
     );
     assert_dot(&check, Health::Warn);
@@ -11514,9 +11515,33 @@ fn an_absent_rex_plugin_reads_not_installed_and_idle() {
             rex_row("plugin", "not installed"),
             rex_row("watcher", "not running"),
             rex_row("experimental", REX_EXPERIMENTAL),
+            "clauth rex install".to_string(),
         ]
     );
     assert_dot(&check, Health::Idle);
+}
+
+/// The rex row's install hint names `clauth rex install` ACCENT, never bold,
+/// like the herdr row's: a missing and a stale install both carry it.
+#[test]
+fn a_missing_or_stale_rex_plugin_styles_its_install_command() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for plugin in [
+        crate::rex::PluginDir::Absent,
+        crate::rex::PluginDir::Managed {
+            version: "0.17.0".to_owned(),
+        },
+    ] {
+        let (_, buf) = render(&app_with(rex(plugin, false)));
+        crate::testutil::assert_prose_part(
+            &buf,
+            "clauth rex install",
+            "clauth rex install",
+            false,
+            crate::tui::theme::dim(),
+        );
+    }
 }
 
 #[test]

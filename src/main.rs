@@ -470,6 +470,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Restore { session_id } => hook_resume::run_restore(&session_id),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Rex { cmd } => match cmd {
+            cli::RexCommand::Install { yes } => rex::install(yes),
+            cli::RexCommand::Uninstall { yes } => rex::uninstall(yes),
+        },
         Command::Proxy { cmd } => cmd_proxy(cmd),
         Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
