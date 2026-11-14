@@ -475,6 +475,8 @@ fn build_settings_writes_model_knobs() {
 /// the one place a global `advisorModel` is dropped on a switch or start.
 #[test]
 fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
+    // The removal asks profiles.toml's `keep_unset_models` first.
+    let _home = crate::testutil::HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(
@@ -497,6 +499,143 @@ fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
     let json = build_claude_settings_json(Some(&base), &with_row, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
     assert_eq!(v["advisorModel"], "claude-opus-5-5");
+}
+
+/// Seeds the sandbox with profiles.toml as `state` (`None`: no file) and a
+/// settings file holding a value in every model slot a row-less profile can
+/// remove, plus a key no profile owns (outside `env`, so the custom-env
+/// record is never read); returns that file's path.
+fn held_models_base(home: &crate::testutil::HomeSandbox, state: Option<&str>) -> PathBuf {
+    let clauth = home.home().join(".clauth");
+    fs::create_dir_all(&clauth).expect("create .clauth");
+    let state_path = clauth.join("profiles.toml");
+    match state {
+        Some(body) => fs::write(&state_path, body).expect("write profiles.toml"),
+        None => {
+            let _ = fs::remove_file(&state_path);
+        }
+    }
+    let base = home.home().join("held-settings.json");
+    fs::write(
+        &base,
+        r#"{"model":"claude-fable-5-2","advisorModel":"opus","theme":"dark","env":{"CLAUDE_CODE_SUBAGENT_MODEL":"claude-opus-5-5","ANTHROPIC_DEFAULT_OPUS_MODEL":"claude-opus-5-5"}}"#,
+    )
+    .expect("seed base settings");
+    base
+}
+
+fn built_over(base: &Path, profile: &crate::profile::Profile) -> serde_json::Value {
+    let json = build_claude_settings_json(Some(base), profile, &[]).expect("build settings");
+    serde_json::from_str(&json).expect("parse settings")
+}
+
+/// `keep_unset_models` off is the build as it was before the key: no
+/// profiles.toml, the key spelled `false`, and a profiles.toml that does not
+/// load all remove every model slot a row-less profile leaves unset.
+#[test]
+fn keep_unset_models_off_removes_every_unset_model_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let rowless = crate::profile::Profile::new("p".to_string(), None, None);
+    for state in [
+        None,
+        Some("profiles = []\nkeep_unset_models = false\n"),
+        Some("profiles = [\nkeep_unset_models = true\n"),
+    ] {
+        let v = built_over(&held_models_base(&home, state), &rowless);
+        assert!(v.get("model").is_none(), "{state:?}: `model` removed");
+        assert!(
+            v.get("advisorModel").is_none(),
+            "{state:?}: `advisorModel` removed"
+        );
+        assert!(
+            v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none(),
+            "{state:?}: the subagent model removed"
+        );
+        assert!(
+            v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none(),
+            "{state:?}: the opus remap removed"
+        );
+        assert_eq!(v["theme"], "dark", "{state:?}: other keys stay");
+    }
+}
+
+/// `keep_unset_models` on: a model slot the profile leaves unset keeps the
+/// value the settings file holds (a model picked with `/model`, a hand-set
+/// subagent model), and a slot the profile sets still replaces it.
+#[test]
+fn keep_unset_models_on_keeps_the_settings_files_own_model_slots() {
+    let home = crate::testutil::HomeSandbox::new();
+    let base = held_models_base(&home, Some("profiles = []\nkeep_unset_models = true\n"));
+    let rowless = crate::profile::Profile::new("p".to_string(), None, None);
+    let v = built_over(&base, &rowless);
+    assert_eq!(v["model"], "claude-fable-5-2", "the file's own model stays");
+    assert_eq!(v["advisorModel"], "opus");
+    assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-opus-5-5");
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
+    assert!(
+        v["env"].get("ANTHROPIC_DEFAULT_FABLE_MODEL").is_none(),
+        "a slot neither side sets stays absent",
+    );
+
+    let mut with_rows = crate::profile::Profile::new("p".to_string(), None, None);
+    with_rows.models.default = Some("opusplan".to_string());
+    with_rows.models.subagent = Some("claude-haiku-4-5".to_string());
+    let v = built_over(&base, &with_rows);
+    assert_eq!(v["model"], "opusplan", "a set row still overwrites");
+    assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-haiku-4-5");
+    assert_eq!(v["advisorModel"], "opus", "the unset slots beside it stay");
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
+}
+
+/// The start walk's demand reads the same build, so with `keep_unset_models`
+/// on it sees the kept model, subagent model and advisor, and with it off none
+/// of them.
+#[test]
+fn runtime_model_sources_see_a_kept_model() {
+    let home = crate::testutil::HomeSandbox::new();
+    let rowless = crate::profile::Profile::new("p".to_string(), None, None);
+
+    let base = held_models_base(&home, None);
+    let off = runtime_model_sources(Some(&base), &rowless, &[]);
+    assert_eq!(off.model, None);
+    assert_eq!(off.env_subagent, None);
+    assert_eq!(off.advisor, None);
+
+    let base = held_models_base(&home, Some("profiles = []\nkeep_unset_models = true\n"));
+    let on = runtime_model_sources(Some(&base), &rowless, &[]);
+    assert_eq!(on.model.as_deref(), Some("claude-fable-5-2"));
+    assert_eq!(on.env_subagent.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(on.advisor.as_deref(), Some("opus"));
+    assert_eq!(on.env_opus.as_deref(), Some("claude-opus-5-5"));
+}
+
+/// The switch's live apply: with `keep_unset_models` on, a row-less account
+/// landing leaves the `model` Claude Code's `/model` saved in
+/// `~/.claude/settings.json`; off, the same apply removes it.
+#[test]
+fn a_live_apply_keeps_a_slash_model_choice_only_with_keep_unset_models() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir ~/.claude");
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth).expect("mkdir ~/.clauth");
+    let state = clauth.join("profiles.toml");
+    let rowless = crate::profile::Profile::new("p".to_string(), None, None);
+    let model_after = |state_body: &str| {
+        fs::write(&state, state_body).expect("write profiles.toml");
+        fs::write(&path, r#"{"model":"claude-fable-5-2"}"#).expect("seed live settings");
+        apply_profile_to_claude_settings(&rowless, &[]).expect("apply");
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read live settings"))
+                .expect("parse live settings");
+        v.get("model").cloned()
+    };
+    assert_eq!(model_after("profiles = []\n"), None, "off removes it");
+    assert_eq!(
+        model_after("profiles = []\nkeep_unset_models = true\n"),
+        Some(serde_json::json!("claude-fable-5-2")),
+        "on keeps it"
+    );
 }
 
 /// The advisor row alone is a non-empty model block, so a profile that sets
@@ -5862,6 +6001,8 @@ fn the_sign_out_skips_its_destructive_read_degrade_only_over_a_locked_keychain()
 /// follows the session, not the global live settings.
 #[test]
 fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
+    // The removal asks profiles.toml's `keep_unset_models` first.
+    let _home = crate::testutil::HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(

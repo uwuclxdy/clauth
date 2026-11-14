@@ -1373,6 +1373,18 @@ pub(crate) struct AppState {
     /// and no API route writes a program to run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bell_command: Option<String>,
+    /// On, a model slot the landing account leaves unset keeps the value the
+    /// settings file being built already holds (the top-level `model` and
+    /// `advisorModel`, the `ANTHROPIC_DEFAULT_*_MODEL` remaps and
+    /// `CLAUDE_CODE_SUBAGENT_MODEL`), so a model picked with Claude Code's own
+    /// `/model` survives a switch; a slot the account sets is still written.
+    /// Off (the default), an unset slot removes its key and a switch never
+    /// inherits the previous account's model. Read off disk where it is used
+    /// (`claude::keep_unset_models`), where an unreadable file counts as off.
+    /// Only a hand edit of profiles.toml sets it: no TUI row and no API route
+    /// writes it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) keep_unset_models: bool,
     /// Opt-in master switch for spending real money: when on, the auto-switch
     /// chain may pick a member whose subscription windows are spent but whose
     /// account still has pay-as-you-go budget, bounded by that member's
@@ -1864,6 +1876,7 @@ impl Default for AppState {
             burn_aware_switching: false,
             walk_order: None,
             bell_command: None,
+            keep_unset_models: false,
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
