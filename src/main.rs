@@ -39,6 +39,7 @@ mod login_page;
 mod logline;
 mod mcp;
 mod mcp_sync;
+mod model_effort;
 mod oauth;
 mod oauth_login;
 mod out;

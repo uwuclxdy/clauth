@@ -8997,10 +8997,10 @@ fn an_unparseable_saved_record_refuses_the_uncover_without_quoting_it() {
 /// file fails either way; which error text arrives depends on the order, so
 /// the pin reads it: the stat must come first.
 #[test]
-fn set_settings_env_key_stats_before_it_reads() {
+fn set_settings_effort_stats_before_it_reads() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let missing = tmp.path().join("no-such-settings.json");
-    let err = set_settings_env_key(&missing, None, "CLAUDE_CODE_EFFORT_LEVEL", "max")
+    let err = set_settings_effort(&missing, None, "CLAUDE_CODE_EFFORT_LEVEL", "max", None)
         .expect_err("a missing settings file fails the write");
     assert!(
         format!("{err:#}").contains("failed to stat"),

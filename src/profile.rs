@@ -361,11 +361,19 @@ pub(crate) struct Profile {
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
     pub(crate) models: ModelSettings,
-    /// Per-account Claude Code reasoning effort, written as
-    /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the carrier a
-    /// running CC 2.1.317 re-reads live; clauth never writes `effortLevel`.
+    /// Per-account Claude Code reasoning effort. While the `model` row names
+    /// no single model (unset or `opusplan`) it is written as
+    /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json`, the carrier a running
+    /// CC 2.1.317 re-reads live, and covers every model. Under a specific model
+    /// a value in [`MODEL_EFFORT_LEVELS`] counts as that model's level instead
+    /// ([`per_model_effort`]); `max` or a custom value keeps the env carrier.
     /// Unset = the key written empty.
     pub(crate) effort: Option<String>,
+    /// Per-model reasoning effort, keyed by a `model` row value (a tier alias
+    /// such as `sonnet`, or a model id). Written as
+    /// `modelSettings.<model>.effortLevel` in `settings.json`, so each model
+    /// keeps its own level across `/model` and `claude --model`.
+    pub(crate) model_effort: BTreeMap<String, String>,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     /// Per-account override of the chain-wide weekly (7d) switch line
@@ -535,6 +543,7 @@ impl Profile {
             env: BTreeMap::new(),
             models: ModelSettings::default(),
             effort: None,
+            model_effort: BTreeMap::new(),
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -2368,6 +2377,8 @@ struct ProfileConfig {
     models: ModelSettings,
     #[serde(default)]
     effort: Option<String>,
+    #[serde(default)]
+    model_effort: BTreeMap<String, String>,
     #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
@@ -5927,6 +5938,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         env: config.env,
         models: config.models,
         effort: config.effort,
+        model_effort: config.model_effort,
         fallback_threshold: finite_pct(config.fallback_threshold),
         // Reset-not-clamp, mirroring the chain-wide line this overrides
         // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
@@ -5987,6 +5999,7 @@ fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
         env: profile.env.clone(),
         models: profile.models.clone(),
         effort: profile.effort.clone(),
+        model_effort: profile.model_effort.clone(),
         fallback_threshold: profile.fallback_threshold,
         weekly_threshold: profile.weekly_threshold,
         last_resort: profile.last_resort,
@@ -7163,6 +7176,24 @@ fn env_doc() -> String {
 
 const ENV_EXAMPLE: &str = "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n";
 
+#[rustfmt::skip]
+fn push_model_effort_doc(out: &mut String) {
+    out.push_str("# Per-model reasoning effort, keyed by a `model` value: a tier (fable,\n");
+    out.push_str("# opus, sonnet, haiku) or a model id. Each is written as that model's\n");
+    out.push_str("# modelSettings effortLevel, so /model and `claude --model` keep it.\n");
+    out.push_str("# Takes low, medium, high or xhigh; Claude Code ignores any other value.\n");
+    out.push_str("# An account-wide effort (above, or CLAUDE_CODE_EFFORT_LEVEL in [env])\n");
+    out.push_str("# overrides every entry.\n");
+}
+
+fn model_effort_doc() -> String {
+    let mut out = String::new();
+    push_model_effort_doc(&mut out);
+    out
+}
+
+const MODEL_EFFORT_EXAMPLE: &str = "# [model_effort]\n# sonnet = \"xhigh\"\n";
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
@@ -7360,6 +7391,21 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
+    push_model_effort_doc(&mut out);
+    if profile.model_effort.is_empty() {
+        out.push_str(MODEL_EFFORT_EXAMPLE);
+    } else {
+        out.push_str("[model_effort]\n");
+        for (k, v) in &profile.model_effort {
+            out.push_str(&format!(
+                "{} = {}\n",
+                toml_edit::Key::new(k.as_str()),
+                toml_str(v)
+            ));
+        }
+    }
+    out.push('\n');
+
     push_env_doc(&mut out);
     if profile.env.is_empty() {
         out.push_str(ENV_EXAMPLE);
@@ -7518,6 +7564,7 @@ fn doc_block_for(key: &str) -> String {
     match key {
         "console" => console_doc(),
         "models" => models_doc(),
+        "model_effort" => model_effort_doc(),
         "env" => env_doc(),
         k => scalar_doc(k),
     }
@@ -8352,23 +8399,36 @@ fn edit_env(
     od: &BTreeMap<String, String>,
     ca: &BTreeMap<String, String>,
 ) {
+    edit_string_table(doc, "env", ENV_EXAMPLE, od, ca);
+}
+
+/// An all-string table whose every subkey is modelled (`[env]`,
+/// `[model_effort]`): drop the keys the canonical map lost, set the rest, and
+/// fall back to the commented example when the map empties.
+fn edit_string_table(
+    doc: &mut toml_edit::DocumentMut,
+    table: &str,
+    example: &str,
+    od: &BTreeMap<String, String>,
+    ca: &BTreeMap<String, String>,
+) {
     if od == ca {
         return;
     }
     if ca.is_empty() {
         let keys: Vec<&str> = od.keys().map(String::as_str).collect();
-        unset_table(doc, "env", &keys, &known_doc_blocks("env"), ENV_EXAMPLE);
-    } else if doc.contains_key("env") {
+        unset_table(doc, table, &keys, &known_doc_blocks(table), example);
+    } else if doc.contains_key(table) {
         for k in od.keys() {
             if !ca.contains_key(k) {
-                remove_subkey_keeping_comments(doc, "env", k);
+                remove_subkey_keeping_comments(doc, table, k);
             }
         }
         for (k, v) in ca {
-            set_subkey_string(doc, "env", k, v);
+            set_subkey_string(doc, table, k, v);
         }
     } else {
-        set_table(doc, "env", ENV_EXAMPLE, |t| {
+        set_table(doc, table, example, |t| {
             for (k, v) in ca {
                 set_subkey_string_in_table(t, k, v);
             }
@@ -8552,6 +8612,7 @@ fn key_shape(key: &str, item: &toml_edit::Item) -> Option<(KeyShape, &'static st
         "console" => (CONSOLE_FIELDS.as_slice(), false, "console"),
         "models" => (MODELS_FIELDS.as_slice(), false, "models"),
         "env" => (&[][..], true, "env"), // every env subkey is a modelled variable
+        "model_effort" => (&[][..], true, "model_effort"), // every subkey is a model
         _ => return None,
     };
     let inner = table_shape(item, subkeys, all);
@@ -8595,6 +8656,7 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
         "effort" => on_disk.effort != canonical.effort,
         "console" => on_disk.console != canonical.console,
         "models" => on_disk.models != canonical.models,
+        "model_effort" => on_disk.model_effort != canonical.model_effort,
         "env" => on_disk.env != canonical.env,
         _ => false,
     }
@@ -8761,6 +8823,13 @@ fn apply_config_edits(
     edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
     edit_string_scalar(doc, &od.effort, &canonical.effort, "effort");
     edit_models(doc, &od.models, &canonical.models);
+    edit_string_table(
+        doc,
+        "model_effort",
+        MODEL_EFFORT_EXAMPLE,
+        &od.model_effort,
+        &canonical.model_effort,
+    );
     edit_env(doc, &od.env, &canonical.env);
 }
 

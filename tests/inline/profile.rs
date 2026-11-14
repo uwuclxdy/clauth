@@ -2568,6 +2568,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -3138,6 +3139,41 @@ fn model_settings_round_trip_through_config_toml() {
             "`advisor` is the\n# server-side advisor model (the `advisorModel` setting)."
         ),
         "the generated comment block names the row"
+    );
+}
+
+/// Per-model effort is its own `[model_effort]` table, outside `[models]`
+/// (presets replace `[models]` whole), keyed by a tier or a model id, and
+/// survives a render→parse round-trip; an empty map writes only the commented
+/// example.
+#[test]
+fn model_effort_round_trips_as_its_own_table() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models.default = Some("opus".to_string());
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("# [model_effort]\n# sonnet = \"xhigh\"\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.model_effort.is_empty());
+
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.model_effort, profile.model_effort);
+    assert_eq!(
+        parsed.models, profile.models,
+        "per-model effort never lands in [models]"
+    );
+    assert!(
+        rendered.contains(
+            "[model_effort]\nclaude-opus-4-5-20251101 = \"medium\"\nsonnet = \"xhigh\"\n"
+        ),
+        "{rendered}"
     );
 }
 
@@ -8412,6 +8448,7 @@ fn every_profile_config_scalar_is_modelled() {
         env: BTreeMap::new(),
         models: ModelSettings::default(),
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8517,6 +8554,7 @@ fn every_profile_config_table_is_modelled() {
             advisor: Some("v".to_string()),
         },
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8543,7 +8581,7 @@ fn every_profile_config_table_is_modelled() {
         .map(|(k, _)| k.as_str())
         .collect();
     tables.sort_unstable();
-    assert_eq!(tables, ["console", "env", "models"]);
+    assert_eq!(tables, ["console", "env", "model_effort", "models"]);
 }
 
 /// Every field the writer's edit step handles is pinned behaviourally: an empty
@@ -8579,6 +8617,10 @@ fn a_save_writes_every_modelled_field_from_an_empty_file() {
         advisor: Some("v".to_string()),
     };
     profile.effort = Some("high".to_string());
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
     profile.fallback_threshold = Some(50.0);
     profile.weekly_threshold = Some(70.0);
     profile.last_resort = true;
