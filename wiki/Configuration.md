@@ -346,8 +346,8 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
       credentials.json     # OAuth snapshot
       credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
       auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
-      limit_reset_pending_claude.json # a limit-reset spend whose answer was lost; a re-run within 10 minutes re-sends it (0600)
-      limit_resets.json    # the account's banked usage-limit resets, read about once an hour, retried at the usage poll's own backoff when a read is refused or gets no answer (within minutes at the default refresh interval), sooner when a usage window fills or its use falls before its reset, and re-read right after a limit-reset spend that used a reset or found one already used (0600)
+      limit_reset_pending_claude.json # a limit-reset spend whose answer was lost; naming its grant again within 10 minutes re-sends it, and no other grant is spent until then (0600)
+      limit_resets.json    # the account's banked usage-limit resets, every grant with its label, windows, end and state, read about once an hour, retried at the usage poll's own backoff when a read is refused or gets no answer (within minutes at the default refresh interval), sooner when a usage window fills or its use falls before its reset, and re-read right after a limit-reset spend that used a reset or found one already used (0600)
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       note.txt             # the account's free-form note, edited from the Usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
@@ -381,7 +381,8 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
       auth.lkg.json        # last-known-good copy of auth.json
       auth.attempt         # no-replay memo: a fingerprint of the refresh token last sent
       auth.quarantine.json # the verdict that killed the chain, while its token is still in the store
-      limit_reset_pending_codex.json # the codex twin: a lost consume, re-sent with the same ids within 10 minutes (0600)
+      limit_reset_pending_codex.json # the codex twin: a lost consume, re-sent with the same ids within 10 minutes when its credit is named again (0600)
+      limit_resets.json    # every reset credit the account's last list read named (the daemon's about-hourly codex side read, a clauth limit-reset listing, or a spend's re-read from the CLI or the TUI), re-read after a reset or a no_credit answer; gone when the account logs in as another (0600)
       usage_cache.json     # last usage reading and plan
       codex-home/          # the durable store: sessions/, archived_sessions/, history.jsonl, the sqlite state stores
       codex-home-<sid>/    # one live session's CODEX_HOME, removed at exit
