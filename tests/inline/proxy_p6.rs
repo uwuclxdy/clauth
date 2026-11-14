@@ -11326,7 +11326,7 @@ fn a_bare_profile_targets_the_pool_on_its_bind() {
 }
 
 /// A negative and a fractional non-token amount group with the sign outside
-/// the digits: `-1,234.50 USD`, never `-,1234.50` or `-1234.50`.
+/// the digits: `-1,234.50 USD`, never `-1234.50`.
 #[test]
 fn a_pool_groups_a_negative_and_fractional_amount() {
     let stats = pool_stats_on(json!({"accounts": [
@@ -11340,6 +11340,20 @@ fn a_pool_groups_a_negative_and_fractional_amount() {
         stats.bars[0].label,
         "credit | -1,234.50 USD left of 2,000 USD"
     );
+}
+
+/// A negative amount whose integer digits fill whole groups keeps its sign
+/// ahead of the first group: `-123 USD`, never `-,123 USD`.
+#[test]
+fn a_pool_keeps_the_sign_ahead_of_a_whole_group_negative_amount() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": -123.0, "limit": 2000.0, "used": 2123.0,
+                "unit": "currency", "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | -123 USD left of 2,000 USD");
 }
 
 /// A zero-grant figure never fixes the pool's unit: the first figure carrying
@@ -11377,4 +11391,23 @@ fn a_pool_label_comes_from_a_counted_figure() {
         ])),
     ]}));
     assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// The first counted figure names the bar: a later counted figure of the same
+/// unit adds to its sums but never renames it.
+#[test]
+fn a_pool_bar_keeps_the_first_counted_figures_label() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "later label",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 10 USD left of 20 USD");
 }

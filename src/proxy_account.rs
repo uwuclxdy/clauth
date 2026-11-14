@@ -2063,7 +2063,8 @@ struct BalancePool {
     /// until a figure carries both a positive grant and a left.
     unit: Option<BalanceUnit>,
     granted: f64,
-    /// The summed `remaining` of the same figures that published a grant.
+    /// The summed `remaining` of the same figures that published a positive
+    /// grant.
     left: f64,
     spent: f64,
     expiry: Option<(i64, String)>,
@@ -2124,8 +2125,8 @@ fn balance_bars(
         }
         if pool.unit.is_none() {
             pool.label = balance_label(figure, text);
+            pool.unit = Some(unit);
         }
-        pool.unit.get_or_insert(unit);
         // The countdown comes from the same set as the sums.
         if let Some((epoch, stamp)) = figure
             .get("expires_at")

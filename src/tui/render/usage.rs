@@ -880,9 +880,9 @@ fn local_day(ends_at: &Option<String>) -> Option<String> {
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
-/// computing the column widths (`max_trailing`/`max_rate_w`/`max_amount_w`) once
-/// so the `%` column lines up across rows. A blank line separates rows. Used by
-/// both the OAuth window path and the third-party bars path.
+/// computing the column widths (`max_trailing`/`max_amount_w`) once so the `%`
+/// column lines up across rows. A blank line separates rows. Used by both the
+/// OAuth window path and the third-party bars path.
 fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let max_trailing = stats
         .iter()
@@ -892,14 +892,9 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let bar_width = bar_width_for(inner_w, max_trailing);
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-    let max_rate_w = stats
-        .iter()
-        .map(|s| s.rate_section_width())
-        .max()
-        .unwrap_or(0);
     let max_amount_w = stats
         .iter()
-        .map(|s| s.amount.chars().count())
+        .map(|s| Span::raw(&s.amount).width())
         .max()
         .unwrap_or(0);
 
@@ -908,7 +903,7 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width, pct_col, max_rate_w, max_amount_w));
+        lines.extend(stat.render(bar_width, pct_col, max_amount_w));
     }
     lines
 }
@@ -955,37 +950,22 @@ pub(super) fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64>
     (secs > 0).then_some(secs)
 }
 
-fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
-    eta_left_secs(rate, pct, rate_unit).map(crate::usage::humanize_duration)
-}
-
 impl Stat {
-    /// Width of the ` · rate` + optional ` · X left` section, for alignment.
-    fn rate_section_width(&self) -> usize {
-        let Some(rate) = self.burn_rate.filter(|r| *r > 0.0) else {
-            return 0;
-        };
-        let mut w =
-            " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
-        if let Some(pct) = self.pct
-            && let Some(dur) = eta_left(rate, pct, self.rate_unit)
-        {
-            w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
-        }
-        w
+    /// The `{dur} left` clause, drawn only while the window runs dry before it
+    /// resets: past the reset the figure never comes true, and at a low pace it
+    /// can spell a duration longer than the row.
+    fn eta_left_text(&self, rate: f64) -> Option<String> {
+        let eta_secs = eta_left_secs(rate, self.pct?, self.rate_unit)?;
+        self.reset_secs
+            .is_some_and(|reset| eta_secs < reset)
+            .then(|| format!("{} left", humanize_duration(eta_secs)))
     }
 
     /// Eyebrow (label · rate · `used / total` · %) then bar with trailing reset
     /// suffix. `bar_width` shared across rows; `pct_col` = far content edge for %
-    /// alignment. `max_rate_w` / `max_amount_w` keep the rate + amount columns
-    /// fixed across all rows so the `%` column never shifts.
-    fn render(
-        &self,
-        bar_width: usize,
-        pct_col: usize,
-        max_rate_w: usize,
-        max_amount_w: usize,
-    ) -> Vec<Line<'static>> {
+    /// alignment; `max_amount_w` keeps the amount column fixed across all rows
+    /// so the `%` column never shifts.
+    fn render(&self, bar_width: usize, pct_col: usize, max_amount_w: usize) -> Vec<Line<'static>> {
         if let Some(note) = self.note {
             return vec![Line::from(vec![
                 Span::styled(self.label.clone(), theme::faint()),
@@ -1009,33 +989,82 @@ impl Stat {
             0
         };
         let pct_cells = Span::raw(pct_str.as_ref()).width();
-        // The amount column carries its own two-cell gap; without one, the `%`
-        // needs its own or a label ending in a figure runs into it (`20M95%`).
-        let pct_gap = if max_amount_w > 0 { 0 } else { 2 };
-        // The room the label has on its own line, beside the rate section only.
-        let label_room = pct_col.saturating_sub(max_rate_w);
-        // What is left for the label on the `%`'s line, after the rate, amount
-        // and gap. A bar label carrying its own figures (`… | 205M left of
-        // 300M`) is cut to this, so its `%` stays beside it and the granted
-        // total cannot reach the pane edge as a smaller number; the cut ends
-        // on the house `…`, never flushed against the figure.
-        let full_room = label_room
-            .saturating_sub(amount_section_w)
-            .saturating_sub(pct_gap)
-            .saturating_sub(pct_cells);
-        // Under three cells the cut would leave dots where the label's name
-        // was; a row that tight drops the `%` pair to its own line (the fit
-        // fallback below) whenever the label cannot sit beside it, so there
-        // the label keeps the room the rate section leaves instead.
-        let cut_room = if full_room >= 3 {
-            full_room
+        let amount_cells = Span::raw(&self.amount).width();
+        // Two cells between the label and the first figure after it, so a label
+        // ending in a figure never runs into it (`20M95%`, `1001234 / 2000`).
+        // The amount column already supplies them: a row with no amount has its
+        // whole column blank before the `%`, and a shorter amount sits behind its
+        // own blank padding. Only a row filling the column needs a gap of its own.
+        let pct_gap = if max_amount_w == 0 {
+            2
+        } else if self.amount.is_empty() {
+            0
         } else {
-            label_room
+            2usize.saturating_sub(max_amount_w.saturating_sub(amount_cells))
         };
+        // The rate section and its `{dur} left` clause, built once per row: the
+        // widths, the cut decision and the spans all read the same strings.
+        let rate = self.burn_rate.filter(|r| *r > 0.0);
+        let rate_text = rate.map(|r| format!("{r:.1} %/{}", self.rate_unit));
+        let eta_text = rate.and_then(|r| self.eta_left_text(r));
+        let rate_only_w = rate_text
+            .as_ref()
+            .map_or(0, |t| " · ".chars().count() + grapheme_cells(t));
+        let eta_cells = eta_text.as_ref().map_or(0, |t| grapheme_cells(t));
+        let eta_w = if eta_text.is_some() {
+            " · ".chars().count() + eta_cells
+        } else {
+            0
+        };
+        let rate_w = rate_only_w + eta_w;
+        // The room the label has on its own line, beside this row's own rate
+        // section: another row's wider one leaves blank cells here, never room
+        // to borrow.
+        let label_room = pct_col.saturating_sub(rate_w);
+        // The row's whole content beside its `%`.
+        let content_w = grapheme_cells(&self.label) + rate_w + amount_section_w + pct_cells;
+        // On the `%` line a row without an amount leaves its amount column blank,
+        // so a moved estimate needs only the two-cell gap before the `%`.
+        let (dropped_amount_w, dropped_gap) = if self.amount.is_empty() {
+            (0, 2)
+        } else {
+            (amount_section_w, pct_gap)
+        };
+        // A row whose whole content cannot sit beside its `%` moves the estimate
+        // onto the `%`'s line rather than cut the name: the estimate is the part
+        // that travels, so the name stays whole. That line only takes it when the
+        // estimate, amount and `%` fit there together.
+        let moved_estimate = eta_text.is_some()
+            && content_w + pct_gap > pct_col
+            && eta_cells + dropped_gap + dropped_amount_w + pct_cells <= pct_col;
         // A label that fits its own line stays whole and the `%` drops a line;
-        // a wider one is cut, to `full_room` when that leaves a name and
-        // otherwise to its own line's room, so the eyebrow never overruns.
-        let label = if label_room > 0 && grapheme_cells(&self.label) > label_room {
+        // a wider one is cut. With the estimate moved, the first line carries
+        // the label and the rate alone, so the cut only bites once those two no
+        // longer fit. A rate section that alone fills the row leaves no room to
+        // cut to, and that eyebrow still overruns.
+        let label = if moved_estimate {
+            let room = pct_col.saturating_sub(rate_only_w);
+            if room > 0 && grapheme_cells(&self.label) > room {
+                truncate(&self.label, room)
+            } else {
+                self.label.clone()
+            }
+        } else if label_room > 0 && grapheme_cells(&self.label) > label_room {
+            // A bar label carrying its own figures (`… | 205M left of 300M`) is
+            // cut so the granted total cannot reach the pane edge as a smaller
+            // number: to `full_room` when that leaves a name, and otherwise to
+            // its own line's room, since under three cells the cut would leave
+            // dots where the name was. The cut ends on the house `…`, never
+            // flushed against the figure.
+            let full_room = label_room
+                .saturating_sub(amount_section_w)
+                .saturating_sub(pct_gap)
+                .saturating_sub(pct_cells);
+            let cut_room = if full_room >= 3 {
+                full_room
+            } else {
+                label_room
+            };
             truncate(&self.label, cut_room)
         } else {
             self.label.clone()
@@ -1043,7 +1072,7 @@ impl Stat {
         let label_cells = grapheme_cells(&label);
         let header_pad = pct_col
             .saturating_sub(label_cells)
-            .saturating_sub(max_rate_w)
+            .saturating_sub(rate_w)
             .saturating_sub(amount_section_w)
             .saturating_sub(pct_cells);
 
@@ -1088,79 +1117,63 @@ impl Stat {
             v
         };
 
-        let mut label_spans = vec![Span::styled(label.clone(), theme::label())];
-        if let Some(rate) = self.burn_rate
-            && rate > 0.0
-        {
+        let (eyebrow_eta, moved_eta) = if moved_estimate {
+            (None, eta_text)
+        } else {
+            (eta_text, None)
+        };
+        let mut label_spans = vec![Span::styled(label, theme::label())];
+        if let (Some(rate), Some(text)) = (rate, rate_text) {
             let rate_color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
             label_spans.push(Span::styled(" · ", theme::dim()));
-            let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
-            label_spans.push(Span::styled(rate_str.clone(), rate_color));
-
-            if let Some(pct) = self.pct
-                && let Some(eta_secs) = eta_left_secs(rate, pct, self.rate_unit)
-            {
-                let dur = crate::usage::humanize_duration(eta_secs);
-                // Warn when the window hits 100% before it resets: you run dry
-                // before the limit refreshes. Faint when the reset lands first.
-                let runs_dry_first = self.reset_secs.is_some_and(|r| eta_secs < r);
-                let style = if runs_dry_first {
-                    theme::warning()
-                } else {
-                    theme::faint()
-                };
-                label_spans.push(Span::styled(" · ", theme::faint()));
-                label_spans.push(Span::styled(format!("{dur} left"), style));
-            }
-
-            let my_rate_w = self.rate_section_width();
-            let extra = max_rate_w.saturating_sub(my_rate_w);
-            if extra > 0 {
-                label_spans.push(Span::raw(" ".repeat(extra)));
-            }
-        } else {
-            label_spans.push(Span::raw(" ".repeat(max_rate_w)));
+            label_spans.push(Span::styled(text, rate_color));
+        }
+        if let Some(eta) = eyebrow_eta {
+            label_spans.push(Span::styled(" · ", theme::faint()));
+            label_spans.push(Span::styled(eta, theme::warning()));
         }
 
-        let fits = label_cells + max_rate_w + amount_section_w + pct_gap + pct_cells <= pct_col;
+        let pct_span = Span::styled(pct_str, pct_style);
+        let mut amount_spans: Vec<Span<'static>> = Vec::new();
+        if max_amount_w > 0 {
+            // Right-align the amount in its fixed column, then a 2-space gap.
+            amount_spans.push(Span::raw(
+                " ".repeat(max_amount_w.saturating_sub(amount_cells)),
+            ));
+            if !self.amount.is_empty() {
+                amount_spans.push(Span::styled(self.amount.clone(), theme::faint()));
+            }
+            amount_spans.push(Span::raw("  "));
+        }
+
+        let fits = label_cells + rate_w + amount_section_w + pct_gap + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
         if fits {
-            out.push(Line::from({
-                let mut spans = label_spans;
-                spans.push(Span::raw(" ".repeat(header_pad)));
-                if max_amount_w > 0 {
-                    // Right-align the amount in its fixed column, then a 2-space gap.
-                    let pad = max_amount_w.saturating_sub(self.amount.chars().count());
-                    spans.push(Span::raw(" ".repeat(pad)));
-                    if !self.amount.is_empty() {
-                        spans.push(Span::styled(self.amount.clone(), theme::faint()));
-                    }
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(Span::styled(pct_str, pct_style));
-                spans
-            }));
+            let mut spans = label_spans;
+            spans.push(Span::raw(" ".repeat(header_pad)));
+            spans.extend(amount_spans);
+            spans.push(pct_span);
+            out.push(Line::from(spans));
         } else {
             // The eyebrow no longer holds the `%` figure: it drops to its own
             // line, right-aligned to the far edge, carrying the amount with it
-            // so no figure vanishes — the pair never hard-wraps apart.
+            // so no figure vanishes — the pair never hard-wraps apart. A moved
+            // estimate leads that line, in the colour that marks the run-dry.
             out.push(Line::from(label_spans));
             let mut dropped = Vec::new();
-            if max_amount_w > 0 {
-                let amount_cells = Span::raw(&self.amount).width();
-                let right = max_amount_w + 2 + pct_cells;
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(right))));
-                dropped.push(Span::raw(
-                    " ".repeat(max_amount_w.saturating_sub(amount_cells)),
-                ));
-                if !self.amount.is_empty() {
-                    dropped.push(Span::styled(self.amount.clone(), theme::faint()));
-                }
-                dropped.push(Span::raw("  "));
+            let lead_w = if let Some(eta) = moved_eta {
+                dropped.push(Span::styled(eta, theme::warning()));
+                eta_cells
             } else {
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(pct_cells))));
+                0
+            };
+            dropped.push(Span::raw(" ".repeat(
+                pct_col.saturating_sub(lead_w + dropped_amount_w + pct_cells),
+            )));
+            if !self.amount.is_empty() {
+                dropped.extend(amount_spans);
             }
-            dropped.push(Span::styled(pct_str, pct_style));
+            dropped.push(pct_span);
             out.push(Line::from(dropped));
         }
         if self.value.is_none() {

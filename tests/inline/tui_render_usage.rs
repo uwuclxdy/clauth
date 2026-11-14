@@ -54,7 +54,7 @@ fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
         note: None,
         value: None,
     };
-    let lines = stat.render(6, 20, 0, 0);
+    let lines = stat.render(6, 20, 0);
     assert_eq!(
         lines[0].spans.last().map(|s| s.content.as_ref()),
         Some("1%")
@@ -6043,13 +6043,12 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
         burn_rate: Some(12.2),
         rate_unit: "d",
         pace_pct: None,
-        reset_secs: None,
+        reset_secs: Some(7 * 86_400),
         trailing: String::new(),
         note: None,
         value: None,
     };
-    let max_rate_w = stat.rate_section_width();
-    let lines = stat.render(8, 20, max_rate_w, 5);
+    let lines = stat.render(8, 20, 5);
     let texts: Vec<String> = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -6061,6 +6060,475 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
             "         12.2  24.5%",
             "██░░░░░░"
         ]
+    );
+}
+
+/// A row's label is sized by its own rate section, never the block's widest:
+/// a `7d sonnet` row at 0% beside a burning 5h row keeps its whole name and
+/// its `%`, and the `%` stays at the far column. Where the burning row cannot
+/// sit beside its `%`, its run-dry estimate moves onto the line the `%` drops to.
+#[test]
+fn a_row_without_a_rate_keeps_its_whole_label_beside_a_burning_row() {
+    let burning = Stat {
+        label: "5h".to_string(),
+        pct: Some(50.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: Some(18_000),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let idle = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(0.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [burning, idle];
+    for (width, expected) in [
+        (
+            30u16,
+            vec![
+                "5h · 12.2 %/h".to_string(),
+                format!("4h 5m left{}50%", " ".repeat(17)),
+                "███████████████░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                   0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            32,
+            vec![
+                "5h · 12.2 %/h · 4h 5m left   50%".to_string(),
+                "████████████████░░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                     0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            36,
+            vec![
+                "5h · 12.2 %/h · 4h 5m left       50%".to_string(),
+                "██████████████████░░░░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                         0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+    ] {
+        let drawn: Vec<String> = render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        assert_eq!(
+            drawn, expected,
+            "each row is sized by its own rate section at a {width}-cell interior"
+        );
+    }
+}
+
+/// A run-dry estimate that lands after its window resets is not drawn: the
+/// window refills first, so the figure never comes true, and at a low pace it
+/// can spell a duration longer than the row. The rate section it leaves keeps
+/// the label's name whole.
+#[test]
+fn a_run_dry_estimate_past_the_reset_is_not_drawn() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(0.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(0.001),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    for (width, expected) in [
+        (
+            30u16,
+            vec![
+                "7d sonnet · 0.0 %/d         0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            60,
+            vec![
+                format!("7d sonnet · 0.0 %/d{}0%", " ".repeat(39)),
+                "░".repeat(60),
+            ],
+        ),
+    ] {
+        let drawn: Vec<String> = render_stat_block(std::slice::from_ref(&stat), width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        assert_eq!(
+            drawn, expected,
+            "the whole eyebrow at a {width}-cell interior carries no estimate past the reset"
+        );
+    }
+}
+
+/// A window with no reset stamp draws no run-dry estimate: with no reset to
+/// land before, the clause never gains its warning, and the eyebrow carries
+/// the rate alone.
+#[test]
+fn a_run_dry_estimate_without_a_reset_stamp_is_not_drawn() {
+    let stat = Stat {
+        label: "5h".to_string(),
+        pct: Some(50.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let drawn: Vec<String> = render_stat_block(std::slice::from_ref(&stat), 30)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        drawn,
+        vec![
+            format!("5h · 12.2 %/h{}50%", " ".repeat(14)),
+            format!("{}{}", "█".repeat(15), "░".repeat(15)),
+        ],
+        "a window with no reset stamp carries the rate alone"
+    );
+}
+
+/// A rate section that leaves one or two cells still never runs the eyebrow
+/// past `pct_col`: the label is cut to the room that is left, down to `…` alone
+/// at one cell. A produced window pace is capped (`window_avg_pace_per_day`),
+/// while an OAuth 5h rate is a least-squares slope with no cap; the hand-built
+/// rates here stand for either.
+#[test]
+fn a_label_beside_a_rate_section_leaving_under_three_cells_stays_inside_the_row() {
+    for rate in [1e18, 1e19] {
+        let stat = Stat {
+            label: "7d sonnet".to_string(),
+            pct: Some(0.0),
+            amount: String::new(),
+            color: theme::body(),
+            burn_rate: Some(rate),
+            rate_unit: "d",
+            pace_pct: None,
+            reset_secs: None,
+            trailing: String::new(),
+            note: None,
+            value: None,
+        };
+        let lines = stat.render(10, 30, 0);
+        for line in &lines {
+            let cells: usize = line.spans.iter().map(|s| grapheme_cells(&s.content)).sum();
+            assert!(cells <= 30, "the eyebrow overruns at rate {rate}: {line:?}");
+        }
+        let first = lines[0].spans.first().map(|s| s.content.as_ref());
+        assert!(
+            first.is_some_and(|label| label.ends_with('…')),
+            "the label is cut to the room left at rate {rate}: {first:?}"
+        );
+    }
+}
+
+/// With an amount column, two cells still separate the label from the figure
+/// after it: at its pre-gap exact fit the amount drops to its own line rather
+/// than run into the label's last digit.
+#[test]
+fn a_label_never_runs_into_the_amount_column() {
+    let stat = Stat {
+        label: "5h balance | 90 left of 1001".to_string(),
+        pct: Some(20.0),
+        amount: "234 / 2000".to_string(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let rows = |width: u16| -> Vec<String> {
+        render_stat_block(std::slice::from_ref(&stat), width)
+            .iter()
+            .map(|row| row.spans.iter().map(|span| span.content.clone()).collect())
+            .collect()
+    };
+    let bar = |width: usize| format!("{}{}", "█".repeat(9), "░".repeat(width - 9));
+    assert_eq!(
+        rows(43),
+        vec![
+            "5h balance | 90 left of 1001".to_string(),
+            format!("{}234 / 2000  20%", " ".repeat(28)),
+            bar(43),
+        ],
+        "at the pre-gap exact fit the amount drops to its own line"
+    );
+    assert_eq!(
+        rows(44),
+        vec![
+            "5h balance | 90 left of 1001".to_string(),
+            format!("{}234 / 2000  20%", " ".repeat(29)),
+            bar(44),
+        ],
+        "one cell of pad is not the two cells the label keeps before the amount"
+    );
+    assert_eq!(
+        rows(45),
+        vec![
+            "5h balance | 90 left of 1001  234 / 2000  20%".to_string(),
+            bar(45),
+        ],
+        "two cells separate the label from the amount once the line holds it"
+    );
+}
+
+/// A row with no amount in a block that has an amount column already stands
+/// `max_amount_w + 2` blank cells clear of its `%`, so it keeps the `%` on
+/// its line wherever the line holds it: a burning `5h` row beside two amount
+/// rows (a zai reply mixes a percentage-only bar with amount bars) fits whole
+/// at 42 and 43 cells, as it does at 44.
+#[test]
+fn a_row_without_an_amount_keeps_its_percent_beside_an_amount_column() {
+    let row = |label: &str, pct: f64, amount: &str, burn_rate: Option<f64>| Stat {
+        label: label.to_string(),
+        pct: Some(pct),
+        amount: amount.to_string(),
+        color: theme::body(),
+        burn_rate,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: burn_rate.map(|_| 5 * 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [
+        row("5h", 12.0, "", Some(30.0)),
+        row("mcp tools", 25.0, "250 / 1000", None),
+        row("1mo", 25.0, "5 / 20", None),
+    ];
+    let rows = |width: u16| -> Vec<String> {
+        render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect()
+    };
+    let at_44 = rows(44);
+    assert_eq!(
+        at_44[0],
+        format!("5h · 30.0 %/h · 2h 56m left{}12%", " ".repeat(14)),
+        "the fitting width this pin is anchored on"
+    );
+    for (width, gap) in [(42u16, 12usize), (43, 13)] {
+        let drawn = rows(width);
+        assert_eq!(
+            (drawn[0].clone(), drawn.len()),
+            (
+                format!("5h · 30.0 %/h · 2h 56m left{}12%", " ".repeat(gap)),
+                at_44.len()
+            ),
+            "the `5h` row keeps its `%` on its line at a {width}-cell interior"
+        );
+    }
+}
+
+/// An over-pace per-model row keeps its whole name: when the row with its
+/// run-dry estimate does not fit beside its `%`, the estimate moves onto the
+/// line the `%` drops to (in the warning colour), and the eyebrow carries the
+/// name and the rate alone. Where the whole row fits, it stays one line.
+#[test]
+fn a_warning_row_moves_its_estimate_to_the_percent_line_before_cutting_its_name() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let rows = |width: u16| render_stat_block(std::slice::from_ref(&stat), width);
+    let text = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|span| span.content.clone()).collect()
+    };
+    for width in [30u16, 34, 36, 37, 38, 39] {
+        let drawn = rows(width);
+        let pad = usize::from(width) - "23h 50m left".len() - "37%".len();
+        assert_eq!(
+            (text(&drawn[0]), text(&drawn[1])),
+            (
+                "7d sonnet · 63.4 %/d".to_string(),
+                format!("23h 50m left{}37%", " ".repeat(pad)),
+            ),
+            "the name stays whole and the estimate rides the `%` line at a {width}-cell interior"
+        );
+        let estimate = drawn[1]
+            .spans
+            .iter()
+            .find(|span| span.content == "23h 50m left")
+            .unwrap_or_else(|| panic!("the estimate is its own span at {width}"));
+        assert_eq!(
+            estimate.style.fg,
+            theme::warning().fg,
+            "the estimate keeps the warning colour at {width}"
+        );
+    }
+    assert_eq!(
+        text(&rows(40)[0]),
+        "7d sonnet · 63.4 %/d · 23h 50m left  37%",
+        "a row that fits whole stays on one line"
+    );
+    let one_line = rows(40);
+    let estimate = one_line[0]
+        .spans
+        .iter()
+        .find(|span| span.content == "23h 50m left")
+        .expect("the one-line estimate is its own span");
+    assert_eq!(
+        estimate.style.fg,
+        theme::warning().fg,
+        "the one-line estimate keeps the warning colour"
+    );
+}
+
+/// A warning row with no amount, in a block whose other row has one, counts
+/// no blank amount column on the line its `%` drops to: its estimate moves
+/// there and its name stays whole wherever `name · rate` fits its eyebrow.
+#[test]
+fn a_warning_row_beside_an_amount_column_moves_its_estimate_and_keeps_its_name() {
+    let warning = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let metered = Stat {
+        label: "mcp tools".to_string(),
+        pct: Some(25.0),
+        amount: "250 / 1000".to_string(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [warning, metered];
+    for width in [24u16, 27, 30, 31] {
+        let drawn: Vec<String> = render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        let pad = usize::from(width) - "23h 50m left".len() - "37%".len();
+        assert_eq!(
+            (drawn[0].clone(), drawn[1].clone()),
+            (
+                "7d sonnet · 63.4 %/d".to_string(),
+                format!("23h 50m left{}37%", " ".repeat(pad)),
+            ),
+            "the warning row keeps its name and moves its estimate at a {width}-cell interior"
+        );
+    }
+}
+
+/// A row whose amount is one cell shorter than the block's column fills that
+/// cell with the two-cell gap's own blank, so it keeps its `%` on its line at
+/// the width its label, rate, estimate, column and `%` exactly fill.
+#[test]
+fn a_one_cell_shorter_amount_keeps_its_percent_on_its_line() {
+    let row = |label: &str, pct: f64, amount: &str, burn_rate: Option<f64>| Stat {
+        label: label.to_string(),
+        pct: Some(pct),
+        amount: amount.to_string(),
+        color: theme::body(),
+        burn_rate,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: burn_rate.map(|_| 5 * 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [
+        row("5h", 12.0, "25 / 1000", Some(30.0)),
+        row("mcp tools", 25.0, "250 / 1000", None),
+    ];
+    let drawn: Vec<String> = render_stat_block(&stats, 43)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        drawn[0], "5h · 30.0 %/h · 2h 56m left  25 / 1000  12%",
+        "the shorter amount's one-cell gap keeps the `5h` row on one line at a 43-cell interior"
+    );
+}
+
+/// A moved estimate line that fills the row exactly still moves: at the width
+/// its estimate, the two-cell gap, the amount column and the `%` exactly fill,
+/// the `%` line carries the estimate and the label stays whole.
+#[test]
+fn a_moved_estimate_filling_the_row_exactly_stays_moved() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: "1.2M / 4M".to_string(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let texts: Vec<String> = render_stat_block(std::slice::from_ref(&stat), 28)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "7d sonnet · 63.4 %/d".to_string(),
+            "23h 50m left  1.2M / 4M  37%".to_string(),
+            format!("{}{}", "█".repeat(10), "░".repeat(18)),
+        ],
+        "a `%` line that fills a 28-cell interior exactly keeps the estimate moved"
     );
 }
 
@@ -8431,8 +8899,8 @@ fn a_pool_bar_label_fits_a_narrow_interior() {
         .expect("the pool body builds stats");
     let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
     let label = "campaign balance flash | 205M left of 300M";
-    for width in [41u16, 42, 44, 45] {
-        let lines: Vec<String> = build_tp_rows(
+    for width in [41u16, 42, 44, 45, 48, 49, 50] {
+        let rows = build_tp_rows(
             &profile,
             width,
             &readings,
@@ -8440,32 +8908,38 @@ fn a_pool_bar_label_fits_a_narrow_interior() {
             false,
             ResetFmt::default(),
             None,
-        )
-        .iter()
-        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
-        .collect();
+        );
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
         for line in &lines {
             assert!(
                 line.chars().count() <= width as usize,
                 "every drawn line stays inside the {width}-cell interior: {line:?}"
             );
         }
-        let label_line = lines
+        let at = lines
             .iter()
-            .find(|line| line.contains("campaign balance flash"))
+            .position(|line| line.contains("campaign balance flash"))
             .expect("the bar label is drawn");
-        let whole = label_line.contains(label);
-        let cut = label_line.contains('…');
+        let label_cell = rows[at]
+            .spans
+            .first()
+            .map_or("", |span| span.content.as_ref());
+        let whole = label_cell == label;
+        let cut = label_cell.ends_with('…');
         assert!(
             whole || cut,
-            "the label is drawn whole or cut with an ellipsis at {width}: {label_line:?}"
+            "the label is drawn whole or cut with an ellipsis at {width}: {label_cell:?}"
         );
-        if !whole {
+        if width >= 42 {
             assert!(
-                cut,
-                "a cut label ends on an ellipsis at {width}: {label_line:?}"
+                whole,
+                "a label that fits its own {width}-cell line stays whole: {label_cell:?}"
             );
         }
+        let label_line = &lines[at];
         if let Some(pct_at) = label_line.rfind('%') {
             // The percentage is one span (`31.67%`): the reserved gap sits
             // before the figure, never between its last digit and the `%`.
