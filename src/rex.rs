@@ -102,22 +102,6 @@ impl Paths {
             init,
         }
     }
-
-    fn from_env() -> Result<Self> {
-        Ok(Self::resolve(
-            std::env::var_os("REX_CONFIG"),
-            std::env::var_os("XDG_CONFIG_HOME"),
-            &crate::profile::home_dir()?,
-        ))
-    }
-}
-
-/// [`state_dir`] off this process's environment.
-fn state_dir_from_env() -> Result<PathBuf> {
-    Ok(state_dir(
-        std::env::var_os("XDG_STATE_HOME"),
-        &crate::profile::home_dir()?,
-    ))
 }
 
 /// What sits at the plugin dir.
@@ -744,47 +728,123 @@ pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result
     Ok(true)
 }
 
+/// What `clauth rex install|uninstall` read off the environment: Rex's
+/// config, the watcher state, and the Rex CLI that reloads the config. A test
+/// builds one over a temp dir and a stand-in `rex`.
+pub(crate) struct Setup {
+    pub(crate) paths: Paths,
+    pub(crate) state: PathBuf,
+    pub(crate) rex: PathBuf,
+}
+
+impl Setup {
+    fn from_env() -> Result<Self> {
+        let home = crate::profile::home_dir()?;
+        Ok(Self {
+            paths: Paths::resolve(
+                std::env::var_os("REX_CONFIG"),
+                std::env::var_os("XDG_CONFIG_HOME"),
+                &home,
+            ),
+            state: state_dir(std::env::var_os("XDG_STATE_HOME"), &home),
+            rex: rex_cli(std::env::var_os("REX_BIN_DIR")),
+        })
+    }
+}
+
+/// The Rex CLI to reload with. Rex sets `REX_BIN_DIR` in each of its panes to
+/// the directory holding its server's own `rex`, so a reload from a pane
+/// reaches that pane's server even when another Rex version's CLI comes first
+/// on `PATH`. Anywhere else, the `rex` on `PATH`.
+pub(crate) fn rex_cli(bin_dir: Option<OsString>) -> PathBuf {
+    bin_dir
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join("rex"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("rex"))
+}
+
 pub(crate) fn install(yes: bool) -> Result<()> {
-    if cfg!(windows) {
-        bail!("the Rex plugin runs POSIX sh scripts; it is not available on Windows");
-    }
-    let paths = Paths::from_env()?;
-    if install_at(&paths, &state_dir_from_env()?, yes)? {
-        outln!(
-            "clauth: installed the Rex plugin in {}",
-            paths.plugin.display()
-        );
-        reload();
-    }
-    Ok(())
+    install_with(&Setup::from_env()?, yes)
 }
 
 pub(crate) fn uninstall(yes: bool) -> Result<()> {
-    let paths = Paths::from_env()?;
-    if uninstall_at(&paths, &state_dir_from_env()?, yes)? {
-        outln!("clauth: removed the Rex plugin");
-        reload();
+    uninstall_with(&Setup::from_env()?, yes)
+}
+
+pub(crate) fn install_with(setup: &Setup, yes: bool) -> Result<()> {
+    if cfg!(windows) {
+        bail!("the Rex plugin runs POSIX sh scripts; it is not available on Windows");
+    }
+    if install_at(&setup.paths, &setup.state, yes)? {
+        outln!(
+            "clauth: installed the Rex plugin in {}",
+            setup.paths.plugin.display()
+        );
+        report_reload(&reload(&setup.rex, RELOAD_TIMEOUT));
     }
     Ok(())
 }
 
-/// Asks the local Rex server to read its config again. Best effort: outside a
-/// Rex terminal on macOS the CLI is usually not on PATH (it ships inside the
-/// app bundle), and the next server start reads the config anyway.
-fn reload() {
-    let bin = std::env::var_os("REX_BIN_DIR")
-        .map(|dir| PathBuf::from(dir).join("rex"))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("rex"));
-    match Command::new(&bin).args(["config", "reload"]).output() {
-        Ok(out) if out.status.success() => {
-            outln!("clauth: Rex reloaded its config")
+pub(crate) fn uninstall_with(setup: &Setup, yes: bool) -> Result<()> {
+    if uninstall_at(&setup.paths, &setup.state, yes)? {
+        outln!("clauth: removed the Rex plugin");
+        report_reload(&reload(&setup.rex, RELOAD_TIMEOUT));
+    }
+    Ok(())
+}
+
+/// How long `rex config reload` gets. The Rex CLI bounds each request at 10 s
+/// by default, so this only cuts off a CLI wedged past its own limit, and
+/// lets the CLI's own error win otherwise.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How `rex config reload` went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reload {
+    Done,
+    /// It ran and failed: its stderr.
+    Failed(String),
+    /// No Rex CLI to run.
+    NoCli,
+    /// It was still running at the deadline, and was killed.
+    TimedOut,
+}
+
+/// Asks the Rex server to read its config again, killing the CLI at
+/// `timeout`. Best effort: outside a Rex terminal on macOS the CLI is usually
+/// not on PATH (it ships inside the app bundle), and the next server start
+/// reads the config anyway.
+pub(crate) fn reload(bin: &Path, timeout: Duration) -> Reload {
+    let child = Command::new(bin)
+        .args(["config", "reload"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let Ok(child) = child else {
+        return Reload::NoCli;
+    };
+    match crate::herdr::run_bounded(child, timeout) {
+        Some(out) if out.status.success() => Reload::Done,
+        Some(out) => Reload::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        None => Reload::TimedOut,
+    }
+}
+
+fn report_reload(reload: &Reload) {
+    match reload {
+        Reload::Done => outln!("clauth: Rex reloaded its config"),
+        Reload::Failed(stderr) => {
+            errln!("clauth: `rex config reload` failed: {stderr}; run it in a Rex terminal")
         }
-        Ok(out) => errln!(
-            "clauth: `rex config reload` failed: {}; run it in a Rex terminal",
-            String::from_utf8_lossy(&out.stderr).trim()
+        Reload::NoCli => {
+            outln!("clauth: run `rex config reload` in a Rex terminal to load it now")
+        }
+        Reload::TimedOut => errln!(
+            "clauth: `rex config reload` did not finish in {} s; run it in a Rex terminal",
+            RELOAD_TIMEOUT.as_secs()
         ),
-        Err(_) => outln!("clauth: run `rex config reload` in a Rex terminal to load it now"),
     }
 }
 

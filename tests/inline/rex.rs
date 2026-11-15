@@ -917,6 +917,126 @@ fn only_a_pidfile_naming_the_stopped_watcher_is_removed() {
     assert!(!pidfile.exists(), "the stopped watcher's pidfile goes");
 }
 
+/// A stand-in `rex` CLI in `dir` running `body`.
+#[cfg(unix)]
+fn fake_rex(dir: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let rex = dir.join("rex");
+    std::fs::write(&rex, format!("#!/bin/sh\n{body}")).expect("fake rex");
+    std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    rex
+}
+
+/// A [`Setup`] over a temp config dir, reloading through `rex`.
+fn setup_in(dir: &Path, rex: PathBuf) -> Setup {
+    Setup {
+        paths: paths_in(dir),
+        state: state_in(dir),
+        rex,
+    }
+}
+
+/// The commands themselves, past `install_at`/`uninstall_at`: each reloads
+/// Rex's config through the setup's CLI once it changed something.
+#[cfg(unix)]
+#[test]
+fn install_and_uninstall_reload_rex() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let argv = bin.join("argv");
+    let rex = fake_rex(&bin, "printf '%s\\n' \"$@\" >>\"$(dirname \"$0\")/argv\"\n");
+    let setup = setup_in(tmp.path(), rex);
+
+    install_with(&setup, true).expect("install");
+    assert_eq!(
+        std::fs::read_to_string(&argv).expect("rex ran"),
+        "config\nreload\n"
+    );
+    uninstall_with(&setup, true).expect("uninstall");
+    assert_eq!(
+        std::fs::read_to_string(&argv).expect("rex ran"),
+        "config\nreload\nconfig\nreload\n"
+    );
+
+    // Nothing left to remove: nothing to reload either.
+    uninstall_with(&setup, true).expect("second uninstall");
+    assert_eq!(
+        std::fs::read_to_string(&argv)
+            .expect("rex ran")
+            .lines()
+            .count(),
+        4
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reload_reports_how_the_cli_went() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let timeout = Duration::from_secs(5);
+    assert_eq!(
+        reload(&fake_rex(tmp.path(), "exit 0\n"), timeout),
+        Reload::Done
+    );
+    assert_eq!(
+        reload(
+            &fake_rex(tmp.path(), "echo 'no server' >&2\nexit 1\n"),
+            timeout
+        ),
+        Reload::Failed("no server".to_owned())
+    );
+    assert_eq!(
+        reload(&tmp.path().join("missing").join("rex"), timeout),
+        Reload::NoCli
+    );
+}
+
+/// A CLI wedged past its own request limit is killed at the deadline rather
+/// than holding install open.
+#[cfg(unix)]
+#[test]
+fn a_reload_that_hangs_is_cut_off() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rex = fake_rex(tmp.path(), "exec sleep 30\n");
+    let started = Instant::now();
+    assert_eq!(reload(&rex, Duration::from_millis(200)), Reload::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// The scripts are POSIX sh, so install refuses on Windows before it writes
+/// anything.
+#[cfg(windows)]
+#[test]
+fn install_refuses_on_windows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let setup = setup_in(tmp.path(), PathBuf::from("rex"));
+    let err = install_with(&setup, true).expect_err("refused");
+    assert!(
+        err.to_string().contains("not available on Windows"),
+        "{err}"
+    );
+    assert!(!setup.paths.plugin.exists(), "nothing written");
+    assert!(!setup.paths.init.exists(), "init.lua untouched");
+}
+
+/// Inside a Rex pane, `REX_BIN_DIR` names the server's own binaries; a dir
+/// with no `rex` in it, or none at all, falls back to the one on `PATH`.
+#[test]
+fn the_reload_cli_comes_from_rex_bin_dir_then_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("rex"), "").expect("rex");
+    assert_eq!(
+        rex_cli(Some(tmp.path().as_os_str().to_owned())),
+        tmp.path().join("rex")
+    );
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("empty dir");
+    for dir in [Some(empty.into_os_string()), os(""), None] {
+        assert_eq!(rex_cli(dir.clone()), PathBuf::from("rex"), "{dir:?}");
+    }
+}
+
 #[test]
 fn the_cli_parses_both_subcommands() {
     let cli = Cli::try_parse_from(["clauth", "rex", "install", "--yes"]).expect("parse");
