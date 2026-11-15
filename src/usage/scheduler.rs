@@ -11817,6 +11817,11 @@ const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
 /// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
 /// nothing while avoiding per-scan log spam.
 const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
+// The gate's degrade-to-mint lead must outlast one transient retry, so the
+// degrade lands before the bearer dies. (A bearer that died between two failed
+// re-stamps would still degrade on the next one, but sessions would have sat
+// on an expired bearer in between.)
+const _: () = assert!(crate::oauth::ROLLING_DEGRADE_LEAD_MS as u64 > ROLLING_RETRY_MS);
 /// A Broken verdict (dead chain, no mint to degrade to) and the re-login-shaped
 /// transients change only when the operator acts, so retrying them on the
 /// minutes cadence is pure log noise — they pace on this long leash instead.
@@ -11973,7 +11978,7 @@ pub(super) fn claude_rolling_tick<'g>(
             }
             logline!("clauth: '{name}' credentials changed under a re-stamp hold. Re-checking now");
         }
-        if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+        if !crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64) {
             continue;
         }
         let Some(claim) = claim_scheduler_spend_unless_shutting_down(activity, &name, spend_gate)
@@ -12007,7 +12012,8 @@ pub(super) fn claude_rolling_tick<'g>(
                 // The due re-read (a file read) runs BEFORE the pacing lock is
                 // taken — the rank is a leaf precisely because nothing else,
                 // locks or IO, ever happens under it.
-                let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
+                let still_due =
+                    crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64);
                 let hold = still_due.then(|| retry_hold(&name, now, kind));
                 if let Ok(mut p) = pacing.lock() {
                     match hold {

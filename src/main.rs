@@ -523,13 +523,36 @@ fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
 
 /// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
 fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    // `--json` is global on `devices` so `pair` takes it on either side of its
+    // verb; the verbs it does not serve refuse it instead of silently ignoring
+    // it, which a script asking for JSON would read as the bare token.
+    let json_verb = match &cmd {
+        Some(cli::DevicesCommand::Add { .. }) => Some("add"),
+        Some(cli::DevicesCommand::Revoke { .. }) => Some("revoke"),
+        Some(cli::DevicesCommand::AllowSessions { .. }) => Some("allow-sessions"),
+        _ => None,
+    };
+    if json && let Some(verb) = json_verb {
+        return Err(usage_error(format!(
+            "`--json` applies to the listing and to `pair`, not to `devices {verb}`"
+        )));
+    }
     match cmd {
         None => daemon::api::devices::run_list(json),
         Some(cli::DevicesCommand::Pair {
             name,
             control,
             sessions,
-        }) => daemon::api::pairing::run_pair(&name, control, sessions),
+            no_qr,
+        }) => daemon::api::pairing::run_pair(
+            &name,
+            daemon::api::pairing::PairFlags {
+                control,
+                sessions,
+                json,
+                no_qr,
+            },
+        ),
         Some(cli::DevicesCommand::Add {
             name,
             control,

@@ -101,6 +101,10 @@ rustls = { version = "0.23.46", default-features = false, features = ["std", "ri
 # unconditional, so this covers what rustls-pemfile would otherwise be needed
 # for; `std` is what adds the read-from-file half of it.
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The leaf's own DNS names: a `--cert` file whose name its certificate does not
+# cover still publishes the first non-wildcard name the certificate carries.
+# Already in the lock graph via rustls, so this floor adds no download.
+rustls-webpki = "0.103"
 # Request-head parsing for that server. Hand-rolling this is where the bugs are;
 # httparse is in the tree via ureq-proto.
 httparse = "1"
@@ -120,6 +124,11 @@ base64 = "0.23"
 # as its provider, promoted to a direct dep: no new lock entry, still one
 # crypto backend.
 ring = "0.17.14"
+# The terminal QR code `clauth devices pair` prints beside its link. No default
+# features: they add the `image` crate and the svg/pic renderers, and the
+# unicode half-block renderer used here is unconditional. No dependencies of
+# its own with those off.
+qrcode = { version = "0.14.1", default-features = false }
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/

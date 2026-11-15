@@ -69,6 +69,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "pair add revoke allow-sessions --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
+        [ "${COMP_WORDS[2]}" = "pair" ] && COMPREPLY+=( $(compgen -W "--no-qr" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
@@ -236,6 +237,7 @@ _clauth() {
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
         _values 'flag' '--control[the device may switch accounts, not only read]' \
             '--sessions[the device may mint sessions through the API]'
+        [[ "${words[3]}" == pair ]] && _values 'flag' '--no-qr[print the pairing link without its QR code]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]' '--pid[resolve the account a running process spends]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -456,6 +458,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a allow-sessions
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --sessions -d "The device may mint sessions through the API"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair" -a --no-qr -d "Print the pairing link without its QR code"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the
