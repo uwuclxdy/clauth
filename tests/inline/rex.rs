@@ -341,10 +341,33 @@ fn state_in(dir: &Path) -> PathBuf {
     dir.join("state")
 }
 
+/// `text` read as `init.lua`, for a case that expects it to read.
+fn read(text: &str) -> InitLua<'_> {
+    InitLua::read(text).expect("reads")
+}
+
+fn wire(text: &str) -> Option<String> {
+    read(text).with_block()
+}
+
+fn unwire(text: &str) -> String {
+    read(text).without_blocks()
+}
+
+fn loads(text: &str) -> bool {
+    read(text).loads_plugin()
+}
+
+/// Why `text` does not read, and the 1-based line it names.
+fn refused(text: &str) -> (Why, usize) {
+    let refusal = InitLua::read(text).expect_err("refused");
+    (refusal.why, refusal.line)
+}
+
 #[test]
 fn block_appends_to_an_existing_config_and_keeps_it() {
     let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
-    let text = with_block(existing).expect("appended");
+    let text = wire(existing).expect("appended");
     assert_eq!(text, format!("{existing}{}", block()));
 }
 
@@ -353,26 +376,34 @@ fn block_appends_to_an_existing_config_and_keeps_it() {
 #[test]
 fn a_config_without_a_final_newline_round_trips() {
     let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")";
-    let text = with_block(existing).expect("appended");
+    let text = wire(existing).expect("appended");
     assert!(text.starts_with(&format!("{existing}\n{BLOCK_BEGIN}\n")));
-    assert_eq!(block_at(&text), BlockAt::Whole { begin: 1, end: 3 });
-    assert_eq!(without_block(&text), (existing.to_string(), true));
+    assert_eq!(read(&text).blocks, vec![(1, 3)]);
+    assert_eq!(unwire(&text), existing);
 
     // A line written after the block keeps everything before it as it was.
     let edited = format!("{text}\nrex.bind(\"cmd+k\", \"pane.close\")\n");
     assert_eq!(
-        without_block(&edited),
-        (
-            format!("{existing}\nrex.bind(\"cmd+k\", \"pane.close\")\n"),
-            true
-        )
+        unwire(&edited),
+        format!("{existing}\nrex.bind(\"cmd+k\", \"pane.close\")\n")
     );
+}
+
+/// Lua ends a line at a lone `\r` as at a `\n`, so a file with `\r`-only
+/// line ends is lines, not one long comment, and round-trips byte for byte.
+#[test]
+fn a_config_with_cr_only_line_ends_round_trips() {
+    let existing = "-- mine\rrex.bind(\"cmd+e\", \"pane.zoom\")\r";
+    let text = wire(existing).expect("appended");
+    assert_eq!(text, format!("{existing}{}", block()));
+    assert_eq!(read(&text).blocks, vec![(2, 4)]);
+    assert_eq!(unwire(&text), existing);
 }
 
 #[test]
 fn block_is_not_appended_twice() {
-    let once = with_block("").expect("appended");
-    assert_eq!(with_block(&once), None);
+    let once = wire("").expect("appended");
+    assert_eq!(wire(&once), None);
 }
 
 /// Install and uninstall read the markers alike: a begin line an editor left
@@ -384,12 +415,8 @@ fn a_marker_line_with_trailing_whitespace_is_still_the_block() {
         let text = format!(
             "-- mine\n{BLOCK_BEGIN}{end}\nrequire(\"clauth\").setup{{}}\n{BLOCK_END}{end}\n"
         );
-        assert_eq!(with_block(&text), None, "{end:?}");
-        assert_eq!(
-            without_block(&text),
-            ("-- mine\n".to_string(), true),
-            "{end:?}"
-        );
+        assert_eq!(wire(&text), None, "{end:?}");
+        assert_eq!(unwire(&text), "-- mine\n", "{end:?}");
     }
 }
 
@@ -402,18 +429,25 @@ fn a_hand_written_require_is_left_alone() {
         "require 'clauth'.setup{}\n",
         "local c = require ( \"clauth\" )\n",
         "require [[clauth]].setup{}\n",
+        "require [==[clauth]==].setup{}\n",
+        // Split over lines, a comment between.
+        "require(\n  \"clauth\"\n).setup{}\n",
+        "require --[[ the plugin ]] \"clauth\"\n",
         // A `--` inside a string starts no comment.
         "local s = \"--\"; require(\"clauth\").setup{}\n",
+        "local s = 'it\\'s --[[ no comment'; require(\"clauth\").setup{}\n",
         // Code after a block comment's close is code.
         "--[[ old ]] require(\"clauth\").setup{}\n",
+        // Lua ends a line comment at a lone `\r`, so this loads the module.
+        "-- note\rrequire(\"clauth\").setup{}\n",
     ] {
-        assert!(loads_plugin(existing), "{existing}");
-        assert_eq!(with_block(existing), None, "{existing}");
+        assert!(loads(existing), "{existing:?}");
+        assert_eq!(wire(existing), None, "{existing:?}");
     }
 }
 
-/// A require that sits in a comment, or merely names a longer module, loads
-/// nothing, so install still appends the block.
+/// A require that sits in a comment or a string, or merely names a longer
+/// module, loads nothing, so install still appends the block.
 #[test]
 fn a_require_that_loads_nothing_is_not_taken_for_one() {
     for existing in [
@@ -421,11 +455,13 @@ fn a_require_that_loads_nothing_is_not_taken_for_one() {
         "--[[\nrequire(\"clauth\").setup{}\n]]\n",
         "--[==[\nrequire(\"clauth\").setup{}\n]] still the comment\n]==]\n",
         "--[[ require('clauth') ]]\n",
+        "local s = [[\nrequire(\"clauth\").setup{}\n]]\n",
+        "local s = \"require('clauth')\"\n",
         "require(\"clauth.extra\")\n",
         "my_require(\"clauth\")\n",
     ] {
-        assert!(!loads_plugin(existing), "{existing}");
-        assert!(with_block(existing).is_some(), "{existing}");
+        assert!(!loads(existing), "{existing:?}");
+        assert!(wire(existing).is_some(), "{existing:?}");
     }
 }
 
@@ -433,30 +469,130 @@ fn a_require_that_loads_nothing_is_not_taken_for_one() {
 fn the_loading_line_is_named_by_its_place_in_the_file() {
     let existing = "--[[\nnotes\n]]\nlocal c = require(\"clauth\")  \nc.setup{}\n";
     assert_eq!(
-        loading_line(existing),
-        Some((4, "local c = require(\"clauth\")"))
+        read(existing).still_loaded(),
+        Some(Refusal {
+            line: 4,
+            text: "local c = require(\"clauth\")".to_owned(),
+            why: Why::StillLoaded,
+        })
     );
     // clauth's own block is no hand-written require.
-    assert_eq!(loading_line(&format!("-- mine\n{}", block())), None);
+    assert_eq!(read(&format!("-- mine\n{}", block())).still_loaded(), None);
 }
 
 #[test]
 fn removing_the_block_restores_the_file() {
     let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
-    let wired = with_block(existing).expect("appended");
-    assert_eq!(without_block(&wired), (existing.to_string(), true));
+    let wired = wire(existing).expect("appended");
+    assert_eq!(unwire(&wired), existing);
 
     let around = format!("-- before\n{}-- after\n", block());
+    assert_eq!(unwire(&around), "-- before\n-- after\n");
+}
+
+/// A marker counts only where Lua reads a comment that starts its line: a
+/// copy of the block inside a user's long comment or long string, or one a
+/// lone `\r` puts inside a long comment, is the user's text, and stays.
+#[test]
+fn a_block_inside_a_comment_or_a_string_is_not_the_block() {
+    let block = block();
+    for user in [
+        format!("--[[\n{block}]]\n"),
+        format!("--[==[ old setup:\n{block}]==]\n"),
+        format!("local s = [=[\n{block}]=]\n"),
+        format!("-- note\r--[[\n{block}]]\n"),
+    ] {
+        let text = format!("{user}local keep = 1\n{block}");
+        assert_eq!(unwire(&text), format!("{user}local keep = 1\n"), "{user:?}");
+        assert_eq!(wire(&user), Some(format!("{user}{block}")), "{user:?}");
+    }
+}
+
+/// A marker after code on its line, or indented, is a comment like any other.
+#[test]
+fn a_marker_that_does_not_start_its_line_is_not_one() {
+    for line in [
+        format!("local x = 1 {BLOCK_BEGIN}"),
+        format!("  {BLOCK_END}"),
+    ] {
+        let text = format!("{line}\n");
+        assert_eq!(read(&text).blocks, Vec::new(), "{line:?}");
+        assert_eq!(unwire(&text), text, "{line:?}");
+    }
+}
+
+/// Each begin line reaches its end line before the next begin. Any other
+/// shape is refused, naming the line, before install or uninstall changes
+/// a file.
+#[test]
+fn markers_that_do_not_pair_up_are_refused() {
+    let block = block();
+    // The begin line cut off before a whole block: pairing it with the
+    // block's end line would take the user's lines between them too.
     assert_eq!(
-        without_block(&around),
-        ("-- before\n-- after\n".to_string(), true)
+        refused(&format!("-- mine\n{BLOCK_BEGIN}\nlocal keep = 1\n{block}")),
+        (Why::BeginAgain { next: 4 }, 2)
+    );
+    assert_eq!(
+        refused(&format!(
+            "-- mine\n{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\n"
+        )),
+        (Why::Unterminated, 2)
+    );
+    assert_eq!(
+        refused(&format!("-- mine\n{BLOCK_END}\n{block}")),
+        (Why::StrayEnd, 2)
+    );
+    assert_eq!(
+        refused(&format!("{block}{BLOCK_END}\n")),
+        (Why::StrayEnd, 4)
     );
 }
 
+/// Two whole blocks both go.
 #[test]
-fn an_unterminated_block_is_left_whole() {
-    let cut = format!("{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\n");
-    assert_eq!(without_block(&cut), (cut.clone(), false));
+fn every_whole_block_comes_out() {
+    let block = block();
+    assert_eq!(
+        unwire(&format!("-- a\n{block}-- b\n{block}-- c\n")),
+        "-- a\n-- b\n-- c\n"
+    );
+}
+
+/// A file Rex's lexer rejects is refused too: nothing in it says where its
+/// code stops and its comments start.
+#[test]
+fn a_file_that_does_not_lex_is_refused() {
+    for (text, why, line) in [
+        ("-- mine\nlocal s = \"no end\n", Why::UnfinishedString, 2),
+        ("local s = 'no end\rlocal t = 1\n", Why::UnfinishedString, 1),
+        ("local s = \"no end", Why::UnfinishedString, 1),
+        ("-- mine\n--[[ no end\n", Why::UnfinishedLong, 2),
+        ("local s = [==[ no end ]=]\n", Why::UnfinishedLong, 1),
+        ("--[=x\n", Why::BadLongBracket, 1),
+        ("local t = {}\nt[=1]\n", Why::BadLongBracket, 2),
+    ] {
+        assert_eq!(refused(text), (why, line), "{text:?}");
+    }
+}
+
+/// Lua 5.1's escapes, as Rex's lexer reads them: an escaped quote or line
+/// end stays inside the string, and a decimal escape is one byte.
+#[test]
+fn string_escapes_decode_as_rex_reads_them() {
+    let value = |text: &str| match &read(text).tokens[0].lexeme {
+        Lexeme::Str(value) => value.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(value("\"a\\\"b\""), b"a\"b");
+    assert_eq!(value("'a\\\r\nb'"), b"a\nb");
+    assert_eq!(value("\"\\99lauth\""), b"clauth");
+    assert_eq!(value("\"\\x63\""), b"x63");
+    assert_eq!(value("[[\r\nfirst\r\nsecond]]"), b"first\nsecond");
+    assert_eq!(
+        read("#!/usr/bin/env lua 'it\nlocal x = 1\n").tokens.len(),
+        4
+    );
 }
 
 #[test]
@@ -547,7 +683,7 @@ fn a_symlinked_init_lua_keeps_its_link_and_mode() {
     assert!(still_linked(), "install kept the link");
     assert_eq!(mode(), 0o600, "install kept the mode");
     let wired = std::fs::read_to_string(&tracked).expect("tracked file");
-    assert_eq!(wired, with_block(original).expect("appended"));
+    assert_eq!(wired, wire(original).expect("appended"));
 
     assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
     assert!(still_linked(), "uninstall kept the link");
@@ -646,7 +782,13 @@ fn uninstall_refuses_while_init_lua_still_loads_the_plugin() {
         std::fs::write(&paths.init, &existing).expect("seed init.lua");
         let err = uninstall_at(&paths, &state, true).expect_err("refused");
         let message = err.to_string();
-        assert!(message.contains("at line 2"), "{message}");
+        assert!(
+            message.starts_with(&format!(
+                "{}:2 loads the plugin outside clauth's block:\n",
+                paths.init.display()
+            )),
+            "{message}"
+        );
         assert!(
             message.contains("require(\"clauth\").setup{ tag = false }"),
             "{message}"
@@ -663,8 +805,8 @@ fn uninstall_refuses_while_init_lua_still_loads_the_plugin() {
     }
 }
 
-/// A block whose end line was cut is left whole by `without_block`, so its
-/// require would outlive the dir just the same.
+/// A block whose end line was cut has no end to stop at, so uninstall
+/// refuses it rather than guess, before it changes anything.
 #[test]
 fn uninstall_refuses_an_unterminated_block() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -675,12 +817,71 @@ fn uninstall_refuses_an_unterminated_block() {
     std::fs::write(&paths.init, &cut).expect("seed init.lua");
 
     let err = uninstall_at(&paths, &state, true).expect_err("refused");
-    assert!(err.to_string().contains("starting at line 2"), "{err}");
+    assert!(
+        err.to_string().starts_with(&format!(
+            "{}:2 begins clauth's block, but no end line closes it:\n",
+            paths.init.display()
+        )),
+        "{err}"
+    );
     assert_eq!(std::fs::read_to_string(&paths.init).expect("init.lua"), cut);
     assert!(matches!(
         plugin_at(&paths.plugin),
         PluginDir::Managed { .. }
     ));
+}
+
+/// The spellings of a load a line-by-line read missed: each refuses, naming
+/// the line the load starts on, and leaves init.lua and `clauth/` as they
+/// were.
+#[test]
+fn uninstall_refuses_a_load_whatever_its_line_ends() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+    for (existing, line) in [
+        ("-- mine\nrequire(\n  \"clauth\"\n).setup{}\n", 2),
+        ("-- note\rrequire(\"clauth\").setup{}\n", 2),
+        ("-- mine\rrequire(\"clauth\").setup{ tag = false }\r", 2),
+    ] {
+        std::fs::write(&paths.init, existing).expect("seed init.lua");
+        let err = uninstall_at(&paths, &state, true).expect_err("refused");
+        assert!(
+            err.to_string().starts_with(&format!(
+                "{}:{line} loads the plugin outside clauth's block:\n",
+                paths.init.display()
+            )),
+            "{existing:?}: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.init).expect("init.lua"),
+            existing,
+            "init.lua untouched"
+        );
+        assert!(matches!(
+            plugin_at(&paths.plugin),
+            PluginDir::Managed { .. }
+        ));
+    }
+}
+
+/// A copy of the block inside the user's own long comment is theirs:
+/// uninstall takes out only the real block below it.
+#[test]
+fn uninstall_keeps_a_commented_out_copy_of_the_block() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    let mine = format!("--[[ before the plugin:\n{}]]\nlocal keep = 1\n", block());
+    std::fs::write(&paths.init, &mine).expect("seed init.lua");
+    assert!(install_at(&paths, &state, true).expect("install"));
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
+    assert_eq!(
+        std::fs::read_to_string(&paths.init).expect("init.lua"),
+        mine
+    );
+    assert_eq!(plugin_at(&paths.plugin), PluginDir::Absent);
 }
 
 /// A plugin dir clauth did not write stays whatever uninstall does, so a

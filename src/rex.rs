@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::out::{errln, outln};
 
@@ -367,212 +367,497 @@ fn terminate(pid: u32) {
 #[cfg(not(unix))]
 fn terminate(_pid: u32) {}
 
-/// The block install appends. Its first and last lines are what uninstall
-/// matches, so they never change spelling between releases.
+/// The block install appends. Uninstall matches all three of its lines, so
+/// none of them changes spelling between releases.
 pub(crate) fn block() -> String {
-    format!("{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\n{BLOCK_END}\n")
+    format!("{BLOCK_BEGIN}\n{BLOCK_REQUIRE}\n{BLOCK_END}\n")
 }
 
-/// Where clauth's block sits in `init.lua`, by 0-based line.
+const BLOCK_REQUIRE: &str = "require(\"clauth\").setup{}";
+
+/// One line of `init.lua` as Lua counts lines: a `\n` or a `\r` ends one, and
+/// a `\r\n` or `\n\r` pair is a single line end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockAt {
-    Absent,
-    Whole {
-        begin: usize,
-        end: usize,
-    },
-    /// A begin marker with no end marker after it: a hand edit cut the end.
-    Unterminated {
-        begin: usize,
-    },
+struct Line {
+    start: usize,
+    /// Where the line's text stops, before its line end.
+    end: usize,
+    /// Where the next line starts, past the line end.
+    next: usize,
 }
 
-/// Finds the block. Install and uninstall both read the markers through
-/// here, so a line one of them takes for a marker the other does too (a
-/// trailing space or a CRLF included).
-fn block_at(existing: &str) -> BlockAt {
-    let mut lines = existing.lines().map(str::trim_end).enumerate();
-    let Some(begin) = lines
-        .by_ref()
-        .find_map(|(n, line)| (line == BLOCK_BEGIN).then_some(n))
-    else {
-        return BlockAt::Absent;
-    };
-    match lines.find_map(|(n, line)| (line == BLOCK_END).then_some(n)) {
-        Some(end) => BlockAt::Whole { begin, end },
-        None => BlockAt::Unterminated { begin },
+fn lua_lines(text: &str) -> Vec<Line> {
+    let src = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < src.len() {
+        if matches!(src[at], b'\n' | b'\r') {
+            let next = past_line_end(src, at);
+            lines.push(Line {
+                start,
+                end: at,
+                next,
+            });
+            start = next;
+            at = next;
+        } else {
+            at += 1;
+        }
+    }
+    if start < src.len() || lines.is_empty() {
+        lines.push(Line {
+            start,
+            end: src.len(),
+            next: src.len(),
+        });
+    }
+    lines
+}
+
+/// Past the line end at `at`, a pair counting as one; `at` itself when no
+/// line end starts there.
+fn past_line_end(src: &[u8], at: usize) -> usize {
+    match (src.get(at), src.get(at + 1)) {
+        (Some(b'\n'), Some(b'\r')) | (Some(b'\r'), Some(b'\n')) => at + 2,
+        (Some(b'\n' | b'\r'), _) => at + 1,
+        _ => at,
     }
 }
 
-/// The first line outside clauth's block that loads the module, as a
-/// hand-written `require("clauth").setup{ ... }` with the user's options
-/// does: its 1-based number and its text. Comments load nothing, so a
-/// `-- require("clauth")` or one inside `--[[ ]]` does not count.
-fn loading_line(existing: &str) -> Option<(usize, &str)> {
-    let ours = match block_at(existing) {
-        BlockAt::Whole { begin, end } => Some(begin..=end),
-        BlockAt::Absent | BlockAt::Unterminated { .. } => None,
+/// Where the line holding `at` stops, before its line end.
+fn line_end(src: &[u8], at: usize) -> usize {
+    src[at..]
+        .iter()
+        .position(|&b| matches!(b, b'\n' | b'\r'))
+        .map_or(src.len(), |n| at + n)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    Begin,
+    End,
+}
+
+/// What clauth keeps of a token: names, string values and markers. The
+/// rest of the code is one `Punct` per byte, which is enough to tell a
+/// `require(` from a `require` that something else follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lexeme {
+    Name(String),
+    /// A string literal's value, escapes decoded.
+    Str(Vec<u8>),
+    /// One of clauth's marker lines: a `--` comment that starts its line.
+    Marker(Marker),
+    Punct(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    lexeme: Lexeme,
+    /// The byte offset it starts at.
+    at: usize,
+}
+
+/// Lexes `init.lua` the way Rex's Lua (gopher-lua, which lexes Lua 5.1)
+/// does, so a comment or a string ends exactly where Rex ends it: a line
+/// comment and a quoted string stop at a lone `\r` as at a `\n`. A file it
+/// rejects, Rex rejects too, and the error names the byte it starts at.
+fn lex(text: &str) -> Result<Vec<Token>, (Why, usize)> {
+    let src = text.as_bytes();
+    let mut tokens = Vec::new();
+    // Lua skips a first line that starts with `#`, as `#!/usr/bin/env lua`.
+    let mut at = if src.first() == Some(&b'#') {
+        line_end(src, 0)
+    } else {
+        0
     };
-    let code = lua_code(existing);
-    code.split('\n')
-        .zip(existing.split('\n'))
-        .enumerate()
-        .find(|(n, (code, _))| {
-            !ours.as_ref().is_some_and(|block| block.contains(n)) && requires_clauth(code)
-        })
-        .map(|(n, (_, line))| (n + 1, line.trim_end()))
-}
-
-/// Whether `init.lua` already loads the module outside clauth's block.
-/// Install then leaves the file alone rather than loading it twice.
-pub(crate) fn loads_plugin(existing: &str) -> bool {
-    loading_line(existing).is_some()
-}
-
-/// Whether one line of Lua code (comments already blanked) calls
-/// `require("clauth")`, in any of the call's spellings: `require "clauth"`,
-/// `require'clauth'`, `require [[clauth]]`.
-fn requires_clauth(code: &str) -> bool {
-    code.match_indices("require").any(|(at, word)| {
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        if code[..at].chars().next_back().is_some_and(ident) {
-            return false;
-        }
-        let mut rest = code[at + word.len()..].trim_start();
-        if let Some(inner) = rest.strip_prefix('(') {
-            rest = inner.trim_start();
-        }
-        ["\"clauth\"", "'clauth'", "[[clauth]]"]
-            .iter()
-            .any(|arg| rest.starts_with(arg))
-    })
-}
-
-/// `text` with its Lua comments blanked out and every line break kept, so
-/// line `n` of the result is line `n` of `text`. Strings stay, since one
-/// names the module in `require("clauth")`, and a `--` inside one starts no
-/// comment.
-fn lua_code(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        let (keep, len) = if let Some(body) = rest.strip_prefix("--") {
-            // A comment runs to its long bracket's close (`--[[ ]]`,
-            // `--[==[ ]==]`), else to the end of the line.
-            let len = match long_open(body) {
-                Some((open, level)) => open + long_close_end(&body[open..], level),
-                None => body.find('\n').unwrap_or(body.len()),
-            };
-            (false, 2 + len)
-        } else if let Some((open, level)) = long_open(rest) {
-            (true, open + long_close_end(&rest[open..], level))
-        } else if c == '"' || c == '\'' {
-            (true, short_string_len(rest))
-        } else {
-            (true, c.len_utf8())
+    while let Some(&c) = src.get(at) {
+        let start = at;
+        let lexeme = match c {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                at += 1;
+                continue;
+            }
+            b'-' if src.get(at + 1) == Some(&b'-') => {
+                at += 2;
+                match long_bracket(src, at).map_err(|()| (Why::BadLongBracket, start))? {
+                    Some(level) => {
+                        at = long_string(src, at, level)
+                            .ok_or((Why::UnfinishedLong, start))?
+                            .1;
+                        continue;
+                    }
+                    None => {
+                        at = line_end(src, at);
+                        let starts_line = start == 0 || matches!(src[start - 1], b'\n' | b'\r');
+                        match text[start..at].trim_end() {
+                            BLOCK_BEGIN if starts_line => Lexeme::Marker(Marker::Begin),
+                            BLOCK_END if starts_line => Lexeme::Marker(Marker::End),
+                            _ => continue,
+                        }
+                    }
+                }
+            }
+            b'[' => match long_bracket(src, at).map_err(|()| (Why::BadLongBracket, start))? {
+                Some(level) => {
+                    let (value, end) =
+                        long_string(src, at, level).ok_or((Why::UnfinishedLong, start))?;
+                    at = end;
+                    Lexeme::Str(value)
+                }
+                None => {
+                    at += 1;
+                    Lexeme::Punct(c)
+                }
+            },
+            b'"' | b'\'' => {
+                let (value, end) = short_string(src, at).ok_or((Why::UnfinishedString, start))?;
+                at = end;
+                Lexeme::Str(value)
+            }
+            c if c == b'_' || c.is_ascii_alphabetic() => {
+                at += src[at..]
+                    .iter()
+                    .take_while(|&&b| b == b'_' || b.is_ascii_alphanumeric())
+                    .count();
+                Lexeme::Name(text[start..at].to_string())
+            }
+            c => {
+                at += 1;
+                Lexeme::Punct(c)
+            }
         };
-        let (taken, tail) = rest.split_at(len);
-        if keep {
-            out.push_str(taken);
+        tokens.push(Token { lexeme, at: start });
+    }
+    Ok(tokens)
+}
+
+/// The level of the long bracket opening at `at` (`[[` is 0, `[==[` is 2),
+/// or `None` when no `[` there opens one. A `[=` that never reaches its
+/// second `[` is an error, as Rex's lexer makes it.
+fn long_bracket(src: &[u8], at: usize) -> Result<Option<usize>, ()> {
+    if src.get(at) != Some(&b'[') {
+        return Ok(None);
+    }
+    let level = src[at + 1..].iter().take_while(|&&b| b == b'=').count();
+    match src.get(at + 1 + level) {
+        Some(b'[') => Ok(Some(level)),
+        _ if level == 0 => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// The long string (or long comment's body) whose bracket of `level` opens
+/// at `at`: its value, line ends read as `\n`, and where it ends, past its
+/// close. `None` when it never closes.
+fn long_string(src: &[u8], at: usize, level: usize) -> Option<(Vec<u8>, usize)> {
+    // A line end straight after the open bracket is no part of the value.
+    let mut i = past_line_end(src, at + level + 2);
+    let mut value = Vec::new();
+    loop {
+        let &b = src.get(i)?;
+        if b == b']'
+            && src[i + 1..].iter().take_while(|&&b| b == b'=').count() >= level
+            && src.get(i + 1 + level) == Some(&b']')
+        {
+            return Some((value, i + level + 2));
+        }
+        if matches!(b, b'\n' | b'\r') {
+            value.push(b'\n');
+            i = past_line_end(src, i);
         } else {
-            out.extend(taken.chars().filter(|&c| c == '\n'));
-        }
-        rest = tail;
-    }
-    out
-}
-
-/// The long bracket opening `text` (`[[`, `[=[`, ...): its length and level.
-fn long_open(text: &str) -> Option<(usize, usize)> {
-    let body = text.strip_prefix('[')?;
-    let level = body.len() - body.trim_start_matches('=').len();
-    body[level..].starts_with('[').then_some((level + 2, level))
-}
-
-/// How far into `text` a long bracket of `level` closes, past its `]=*]`,
-/// or all of `text` when it never does.
-fn long_close_end(text: &str, level: usize) -> usize {
-    let close = format!("]{}]", "=".repeat(level));
-    text.find(&close).map_or(text.len(), |at| at + close.len())
-}
-
-/// The length of the quoted string opening `text`, through its closing
-/// quote, or to the end of the line when it never closes. A backslash
-/// escapes the byte after it.
-fn short_string_len(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let quote = bytes[0];
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\n' => return i,
-            b if b == quote => return i + 1,
-            _ => i += 1,
+            value.push(b);
+            i += 1;
         }
     }
-    // Every stop above is an ASCII byte, so a char boundary; this one is
-    // the end of `text`.
-    text.len()
 }
 
-/// `existing` with clauth's block appended, or `None` when a block is
-/// already there (whole or cut short) or the user loads the module
-/// themselves.
-pub(crate) fn with_block(existing: &str) -> Option<String> {
-    if block_at(existing) != BlockAt::Absent || loads_plugin(existing) {
-        return None;
+/// The quoted string opening at `at`: its value and where it ends, past its
+/// closing quote. `None` when a line end or the file's end comes first. The
+/// escapes are gopher-lua's, Lua 5.1's: `\x` and `\z` stand for the letter.
+fn short_string(src: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
+    let quote = src[at];
+    let mut value = Vec::new();
+    let mut i = at + 1;
+    loop {
+        let &b = src.get(i)?;
+        i += 1;
+        match b {
+            b'\n' | b'\r' => return None,
+            b'\\' => {
+                let &escaped = src.get(i)?;
+                if matches!(escaped, b'\n' | b'\r') {
+                    value.push(b'\n');
+                    i = past_line_end(src, i);
+                } else if escaped.is_ascii_digit() {
+                    let digits = src[i..]
+                        .iter()
+                        .take(3)
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    let code = src[i..i + digits]
+                        .iter()
+                        .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+                    value.push(code.to_le_bytes()[0]);
+                    i += digits;
+                } else {
+                    value.push(match escaped {
+                        b'a' => 0x07,
+                        b'b' => 0x08,
+                        b'f' => 0x0c,
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'v' => 0x0b,
+                        other => other,
+                    });
+                    i += 1;
+                }
+            }
+            b if b == quote => return Some((value, i)),
+            b => value.push(b),
+        }
     }
-    let mut text = existing.to_string();
-    let mut block = block();
-    if !text.is_empty() && !text.ends_with('\n') {
-        // The block needs a line of its own. It then ends without a final
-        // newline of its own, which tells uninstall to take this one back.
-        text.push('\n');
-        block.pop();
-    }
-    text.push_str(&block);
-    Some(text)
 }
 
-/// `existing` without clauth's block, and whether one was there. Only the
-/// lines from the begin marker through the end marker go; an unterminated
-/// block (a hand edit cut the end line) is left whole rather than guessed at.
-pub(crate) fn without_block(existing: &str) -> (String, bool) {
-    let BlockAt::Whole { begin, end } = block_at(existing) else {
-        return (existing.to_string(), false);
-    };
-    let lines: Vec<&str> = existing.split_inclusive('\n').collect();
-    let mut text: String = lines[..begin].concat();
-    let after = lines[end + 1..].concat();
-    if after.is_empty() && !lines[end].ends_with('\n') && text.ends_with('\n') {
-        // The block ends the file with no final newline: install put it on
-        // a line of its own after a file that had none (see `with_block`).
-        text.pop();
-    }
-    text.push_str(&after);
-    (text, true)
+/// Why install or uninstall stopped before changing `init.lua`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// A quoted string that a line end or the file's end cuts short.
+    UnfinishedString,
+    /// A long string or comment (`[[ ]]`, `--[==[ ]==]`) that never closes.
+    UnfinishedLong,
+    /// A `[=` that never reaches its second `[`.
+    BadLongBracket,
+    /// A begin line with no end line after it.
+    Unterminated,
+    /// A begin line whose next marker, at this 1-based line, begins again.
+    BeginAgain { next: usize },
+    /// An end line that no begin line opens.
+    StrayEnd,
+    /// A line outside clauth's block that loads the module.
+    StillLoaded,
 }
 
-/// Why uninstall will not remove a managed plugin dir yet, when `init.lua`
-/// would still load the module once the dir is gone: Rex's next config load
-/// would then fail on a `require` of nothing.
-fn still_loaded(init: &Path, existing: &str) -> Option<String> {
-    if let BlockAt::Unterminated { begin } = block_at(existing) {
-        return Some(format!(
-            "{} has clauth's block starting at line {} but no `{BLOCK_END}` line after it; \
-             take that block out by hand, then rerun",
+/// A refusal, naming the line it is about: its 1-based number and its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    line: usize,
+    text: String,
+    why: Why,
+}
+
+impl Refusal {
+    /// The error `clauth rex <cmd>` prints for it.
+    fn message(&self, init: &Path, cmd: &str) -> String {
+        let unreadable = "so clauth cannot tell its code from its comments";
+        let unreadable_fix =
+            format!("fix that line, which Rex cannot load either, then rerun `clauth rex {cmd}`");
+        let (what, fix) = match self.why {
+            Why::UnfinishedString => (
+                format!("has a string that does not end on its line, {unreadable}"),
+                unreadable_fix,
+            ),
+            Why::UnfinishedLong => (
+                format!("opens a long string or comment that never closes, {unreadable}"),
+                unreadable_fix,
+            ),
+            Why::BadLongBracket => (
+                format!("has a `[=` that opens no long bracket, {unreadable}"),
+                unreadable_fix,
+            ),
+            Why::Unterminated => (
+                "begins clauth's block, but no end line closes it".to_string(),
+                format!(
+                    "put its `{BLOCK_END}` line back or take the block out by hand, \
+                     then rerun `clauth rex {cmd}`"
+                ),
+            ),
+            Why::BeginAgain { next } => (
+                format!("begins clauth's block, but line {next} begins another before it ends"),
+                format!(
+                    "take out the begin line that has no end line, then rerun `clauth rex {cmd}`"
+                ),
+            ),
+            Why::StrayEnd => (
+                "ends clauth's block, but no begin line opens it".to_string(),
+                format!("take that line out, then rerun `clauth rex {cmd}`"),
+            ),
+            Why::StillLoaded => (
+                "loads the plugin outside clauth's block".to_string(),
+                format!(
+                    "take that out first, then rerun `clauth rex {cmd}`; removing clauth/ \
+                     would leave it requiring a module that is gone"
+                ),
+            ),
+        };
+        format!(
+            "{}:{} {what}:\n  {}\n  {fix}",
             init.display(),
-            begin + 1
-        ));
+            self.line,
+            self.text
+        )
     }
-    let (line, text) = loading_line(existing)?;
-    Some(format!(
-        "{} still loads the plugin outside clauth's block, at line {line}:\n    {text}\n\
-         take that out first, then rerun; removing the plugin would leave it requiring a \
-         module that is gone",
-        init.display()
-    ))
+}
+
+/// Rex's `init.lua` as clauth reads it, lexed the way Rex lexes it: a
+/// marker or a `require` inside a comment or a string is neither, and
+/// every begin line reaches its end line before the next begin.
+#[derive(Debug)]
+struct InitLua<'a> {
+    text: &'a str,
+    lines: Vec<Line>,
+    tokens: Vec<Token>,
+    /// clauth's blocks, each from its begin line through its end line, by
+    /// 0-based line.
+    blocks: Vec<(usize, usize)>,
+}
+
+impl<'a> InitLua<'a> {
+    /// Reads `text`, or refuses a file whose markers do not pair up or that
+    /// does not lex. Install and uninstall both read it through here, so a
+    /// line one of them takes for a marker the other does too.
+    fn read(text: &'a str) -> Result<Self, Refusal> {
+        let lines = lua_lines(text);
+        let mut init = Self {
+            text,
+            lines,
+            tokens: Vec::new(),
+            blocks: Vec::new(),
+        };
+        init.tokens = lex(text).map_err(|(why, at)| init.refusal(init.line_of(at), why))?;
+        let mut open = None;
+        for token in &init.tokens {
+            let Lexeme::Marker(marker) = token.lexeme else {
+                continue;
+            };
+            let line = init.line_of(token.at);
+            open = match (marker, open) {
+                (Marker::Begin, None) => Some(line),
+                (Marker::Begin, Some(begin)) => {
+                    return Err(init.refusal(begin, Why::BeginAgain { next: line + 1 }));
+                }
+                (Marker::End, Some(begin)) => {
+                    init.blocks.push((begin, line));
+                    None
+                }
+                (Marker::End, None) => return Err(init.refusal(line, Why::StrayEnd)),
+            };
+        }
+        match open {
+            Some(begin) => Err(init.refusal(begin, Why::Unterminated)),
+            None => Ok(init),
+        }
+    }
+
+    /// The 0-based line holding byte `at`.
+    fn line_of(&self, at: usize) -> usize {
+        self.lines.partition_point(|line| line.next <= at)
+    }
+
+    fn line_text(&self, n: usize) -> &'a str {
+        let line = self.lines[n];
+        &self.text[line.start..line.end]
+    }
+
+    fn refusal(&self, n: usize, why: Why) -> Refusal {
+        Refusal {
+            line: n + 1,
+            text: self.line_text(n).trim_end().to_string(),
+            why,
+        }
+    }
+
+    fn in_block(&self, n: usize) -> bool {
+        self.blocks
+            .iter()
+            .any(|&(begin, end)| (begin..=end).contains(&n))
+    }
+
+    /// The first line outside clauth's blocks that loads the module, as a
+    /// hand-written `require("clauth").setup{ ... }` with the user's options
+    /// does, in any of the call's spellings: `require "clauth"`,
+    /// `require'clauth'`, `require [[clauth]]`, or split over lines.
+    fn loading_line(&self) -> Option<usize> {
+        let code: Vec<&Token> = self
+            .tokens
+            .iter()
+            .filter(|token| !matches!(token.lexeme, Lexeme::Marker(_)))
+            .collect();
+        code.iter().enumerate().find_map(|(i, token)| {
+            if !matches!(&token.lexeme, Lexeme::Name(name) if name == "require") {
+                return None;
+            }
+            let line = self.line_of(token.at);
+            if self.in_block(line) {
+                return None;
+            }
+            let mut rest = code[i + 1..].iter().map(|token| &token.lexeme);
+            let mut arg = rest.next();
+            if arg == Some(&Lexeme::Punct(b'(')) {
+                arg = rest.next();
+            }
+            matches!(arg, Some(Lexeme::Str(value)) if value == b"clauth").then_some(line)
+        })
+    }
+
+    /// Whether the file already loads the module: through a block of
+    /// clauth's, or a `require` of the user's own.
+    fn loads_plugin(&self) -> bool {
+        !self.blocks.is_empty() || self.loading_line().is_some()
+    }
+
+    /// The file with clauth's block appended, or `None` when it already
+    /// loads the module.
+    fn with_block(&self) -> Option<String> {
+        if self.loads_plugin() {
+            return None;
+        }
+        let mut text = self.text.to_string();
+        let mut block = block();
+        if !text.is_empty() && !text.ends_with(['\n', '\r']) {
+            // The block needs a line of its own. It then ends without a
+            // final newline of its own, which tells uninstall to take this
+            // one back.
+            text.push('\n');
+            block.pop();
+        }
+        text.push_str(&block);
+        Some(text)
+    }
+
+    /// The file without clauth's blocks: each goes from the start of its
+    /// begin line through its end line's line end.
+    fn without_blocks(&self) -> String {
+        let mut text = String::with_capacity(self.text.len());
+        let mut kept = 0;
+        for &(begin, end) in &self.blocks {
+            text.push_str(&self.text[kept..self.lines[begin].start]);
+            kept = self.lines[end].next;
+        }
+        let rest = &self.text[kept..];
+        let ends_file_bare = self
+            .blocks
+            .last()
+            .is_some_and(|&(_, end)| self.lines[end].end == self.text.len());
+        if ends_file_bare && text.ends_with('\n') && !text.ends_with("\r\n") {
+            // The block ends the file with no final newline: install put it
+            // on a line of its own after a file that had none (see
+            // `with_block`).
+            text.pop();
+        }
+        text.push_str(rest);
+        text
+    }
+
+    /// Why uninstall will not remove a managed plugin dir yet: `init.lua`
+    /// would still load the module once the dir is gone, and Rex's next
+    /// config load would fail on a `require` of nothing.
+    fn still_loaded(&self) -> Option<Refusal> {
+        self.loading_line()
+            .map(|n| self.refusal(n, Why::StillLoaded))
+    }
 }
 
 /// Writes the plugin and wires `init.lua`, after the confirm, then stops any
@@ -593,7 +878,9 @@ pub(crate) fn install_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<b
         PluginDir::Absent | PluginDir::Managed { .. } => {}
     }
     let existing = read_optional(&paths.init)?;
-    let wired = with_block(&existing);
+    let wired = InitLua::read(&existing)
+        .map_err(|refusal| anyhow!(refusal.message(&paths.init, "install")))?
+        .with_block();
     let procs = crate::which::SystemProcs;
     let watchers = running_watchers(state_dir, &procs);
 
@@ -657,16 +944,20 @@ fn write_init(path: &Path, text: &str) -> Result<()> {
 /// stops the watcher and removes its state directory, which would otherwise
 /// keep labelling panes with no resolver beside it. A linked or foreign
 /// plugin directory keeps its watcher and state: that checkout runs them.
-/// Refuses, before it changes anything, to remove a managed directory that
-/// `init.lua` would still load. Returns false when the user declined or there
-/// was nothing to remove.
+/// Refuses, before it changes anything, an `init.lua` it cannot read (see
+/// [`InitLua::read`]), and to remove a managed directory that `init.lua` would
+/// still load. Returns false when the user declined or there was nothing to
+/// remove.
 pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<bool> {
     let existing = read_optional(&paths.init)?;
-    let (unwired, had_block) = without_block(&existing);
+    let refuse = |refusal: Refusal| anyhow!(refusal.message(&paths.init, "uninstall"));
+    let init = InitLua::read(&existing).map_err(refuse)?;
+    let unwired = init.without_blocks();
+    let had_block = !init.blocks.is_empty();
     let dir = plugin_at(&paths.plugin);
     let managed = matches!(dir, PluginDir::Managed { .. });
-    if managed && let Some(reason) = still_loaded(&paths.init, &existing) {
-        bail!("{reason}");
+    if managed && let Some(refusal) = init.still_loaded() {
+        return Err(refuse(refusal));
     }
     if !had_block && !managed {
         outln!("clauth: no Rex plugin from clauth to remove");
