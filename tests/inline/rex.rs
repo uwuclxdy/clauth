@@ -834,6 +834,89 @@ fn uninstall_leaves_a_linked_checkouts_watcher() {
     let _ = watcher.wait();
 }
 
+/// A watcher that outlives the wait keeps its pidfile: the reload's
+/// start-watch.sh then finds it live and starts no second one beside it.
+#[cfg(unix)]
+#[test]
+fn a_watcher_that_will_not_stop_keeps_its_pidfile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let mut stubborn = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "trap '' TERM; while :; do sleep 1; done",
+            "tag-watch.lua",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn stubborn watcher");
+    let pidfile = record(&state, "1", stubborn.id());
+    let watchers = running_watchers(&state, &crate::which::SystemProcs);
+    assert_eq!(watchers.len(), 1);
+
+    stop_watchers(
+        &watchers,
+        &crate::which::SystemProcs,
+        Duration::from_millis(300),
+    );
+    assert!(
+        stubborn.try_wait().expect("try_wait").is_none(),
+        "it ignored the TERM"
+    );
+    assert!(pidfile.exists(), "its pidfile stays");
+    let _ = stubborn.kill();
+    let _ = stubborn.wait();
+}
+
+/// The watcher list is read before the prompt. A pid that has since stopped
+/// running the watcher (it exited, and the pid went to another program) is
+/// never signalled.
+#[cfg(unix)]
+#[test]
+fn a_pid_that_stopped_being_a_watcher_after_the_listing_is_not_signalled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("state");
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pidfile = record(&state, "1", other.id());
+    let listed = vec![Watcher {
+        pidfile: pidfile.clone(),
+        pid: other.id(),
+    }];
+
+    stop_watchers(
+        &listed,
+        &crate::which::SystemProcs,
+        Duration::from_millis(300),
+    );
+    assert!(
+        other.try_wait().expect("try_wait").is_none(),
+        "left running"
+    );
+    assert!(pidfile.exists(), "its pidfile is left alone");
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+/// A config load between the stop and the cleanup may record a fresh
+/// watcher in the same pidfile: only a pidfile still naming the stopped pid
+/// goes.
+#[test]
+fn only_a_pidfile_naming_the_stopped_watcher_is_removed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pidfile = tmp.path().join("watch-1.pid");
+    std::fs::write(&pidfile, "999\n").expect("pidfile");
+    remove_pidfile_naming(&pidfile, 123);
+    assert!(pidfile.exists(), "a fresh watcher's pidfile stays");
+    std::fs::write(&pidfile, "123\n").expect("pidfile");
+    remove_pidfile_naming(&pidfile, 123);
+    assert!(!pidfile.exists(), "the stopped watcher's pidfile goes");
+}
+
 #[test]
 fn the_cli_parses_both_subcommands() {
     let cli = Cli::try_parse_from(["clauth", "rex", "install", "--yes"]).expect("parse");

@@ -309,13 +309,25 @@ fn runs_watcher(pid: u32, procs: &dyn crate::which::ProcTable) -> bool {
 /// A `rex do` script ends at once on SIGTERM; this bounds a wedged one.
 const WATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// SIGTERMs each watcher and waits for it to go, then removes its pidfile,
-/// so the config reload that follows install starts a fresh one. Best
-/// effort: one that will not stop is reported, not fatal.
-pub(crate) fn stop_watchers(watchers: &[Watcher], procs: &dyn crate::which::ProcTable) {
+/// SIGTERMs each watcher and waits up to `timeout` for it to go, then removes
+/// its pidfile, so the config reload that follows install starts a fresh one.
+/// Best effort: one that will not stop is reported, not fatal, and keeps its
+/// pidfile, so that reload's start-watch.sh finds it live and starts no second
+/// watcher beside it.
+pub(crate) fn stop_watchers(
+    watchers: &[Watcher],
+    procs: &dyn crate::which::ProcTable,
+    timeout: Duration,
+) {
     for watcher in watchers {
+        // The list was read before the prompt: the watcher may have exited
+        // since, and its pid gone to another program.
+        if !runs_watcher(watcher.pid, procs) {
+            continue;
+        }
         terminate(watcher.pid);
-        let deadline = Instant::now() + WATCHER_STOP_TIMEOUT;
+        let deadline = Instant::now() + timeout;
+        let mut stopped = true;
         while runs_watcher(watcher.pid, procs) {
             if Instant::now() >= deadline {
                 errln!(
@@ -324,11 +336,27 @@ pub(crate) fn stop_watchers(watchers: &[Watcher], procs: &dyn crate::which::Proc
                     watcher.pid,
                     watcher.pid
                 );
+                stopped = false;
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let _ = std::fs::remove_file(&watcher.pidfile);
+        if stopped {
+            remove_pidfile_naming(&watcher.pidfile, watcher.pid);
+        }
+    }
+}
+
+/// Removes `pidfile` while it still names `pid`. A config load since the stop
+/// may have recorded a fresh watcher there, and that one's pidfile stays.
+fn remove_pidfile_naming(pidfile: &Path, pid: u32) {
+    let names_pid = crate::runtime::read_regular_capped(pidfile, PIDFILE_CAP)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|text| text.trim().parse::<u32>().ok() == Some(pid));
+    if names_pid {
+        let _ = std::fs::remove_file(pidfile);
     }
 }
 
@@ -625,7 +653,7 @@ pub(crate) fn install_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<b
     if let Some(text) = wired {
         write_init(&paths.init, &text)?;
     }
-    stop_watchers(&watchers, &procs);
+    stop_watchers(&watchers, &procs, WATCHER_STOP_TIMEOUT);
     Ok(true)
 }
 
@@ -701,7 +729,7 @@ pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result
     if had_block {
         write_init(&paths.init, &unwired)?;
     }
-    stop_watchers(&watchers, &procs);
+    stop_watchers(&watchers, &procs, WATCHER_STOP_TIMEOUT);
     if managed {
         std::fs::remove_dir_all(&paths.plugin)
             .with_context(|| format!("remove {}", paths.plugin.display()))?;
