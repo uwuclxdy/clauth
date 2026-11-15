@@ -636,6 +636,8 @@ enum Why {
     BeginAgain { next: usize },
     /// An end line that no begin line opens.
     StrayEnd,
+    /// A line inside clauth's block that clauth did not write.
+    NotClauths,
     /// A string outside clauth's block that names the module.
     NamesClauth,
 }
@@ -683,6 +685,10 @@ impl Refusal {
             Why::StrayEnd => (
                 "ends clauth's block, but no begin line opens it".to_string(),
                 format!("take that line out, then rerun `clauth rex {cmd}`"),
+            ),
+            Why::NotClauths => (
+                "is inside clauth's block, but clauth did not write it".to_string(),
+                format!("move that line out of the block first, then rerun `clauth rex {cmd}`"),
             ),
             Why::NamesClauth => (
                 "names clauth outside clauth's block, so it may still load the plugin".to_string(),
@@ -831,8 +837,17 @@ impl<'a> InitLua<'a> {
     }
 
     /// The file without clauth's blocks: each goes from the start of its
-    /// begin line through its end line's line end.
-    fn without_blocks(&self) -> String {
+    /// begin line through its end line's line end. Refuses a block holding a
+    /// line clauth did not write, which would go with it: one the user added,
+    /// or clauth's `require` edited to pass options.
+    fn without_blocks(&self) -> Result<String, Refusal> {
+        for &(begin, end) in &self.blocks {
+            if let Some(n) =
+                (begin + 1..end).find(|&n| self.line_text(n).trim_end() != BLOCK_REQUIRE)
+            {
+                return Err(self.refusal(n, Why::NotClauths));
+            }
+        }
         let mut text = String::with_capacity(self.text.len());
         let mut kept = 0;
         for &(begin, end) in &self.blocks {
@@ -851,7 +866,7 @@ impl<'a> InitLua<'a> {
             text.pop();
         }
         text.push_str(rest);
-        text
+        Ok(text)
     }
 
     /// Why uninstall will not remove a managed plugin dir yet: `init.lua`
@@ -972,7 +987,7 @@ pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result
     let existing = read_optional(&paths.init)?;
     let refuse = |refusal: Refusal| anyhow!(refusal.message(&paths.init, "uninstall"));
     let init = InitLua::read(&existing).map_err(refuse)?;
-    let unwired = init.without_blocks();
+    let unwired = init.without_blocks().map_err(refuse)?;
     let had_block = !init.blocks.is_empty();
     let dir = plugin_at(&paths.plugin);
     let managed = matches!(dir, PluginDir::Managed { .. });

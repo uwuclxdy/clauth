@@ -351,7 +351,7 @@ fn wire(text: &str) -> Option<String> {
 }
 
 fn unwire(text: &str) -> String {
-    read(text).without_blocks()
+    read(text).without_blocks().expect("unwires")
 }
 
 fn loads(text: &str) -> bool {
@@ -413,7 +413,7 @@ fn block_is_not_appended_twice() {
 fn a_marker_line_with_trailing_whitespace_is_still_the_block() {
     for end in [" ", "\t", "\r"] {
         let text = format!(
-            "-- mine\n{BLOCK_BEGIN}{end}\nrequire(\"clauth\").setup{{}}\n{BLOCK_END}{end}\n"
+            "-- mine\n{BLOCK_BEGIN}{end}\nrequire(\"clauth\").setup{{}}{end}\n{BLOCK_END}{end}\n"
         );
         assert_eq!(wire(&text), None, "{end:?}");
         assert_eq!(unwire(&text), "-- mine\n", "{end:?}");
@@ -547,6 +547,30 @@ fn markers_that_do_not_pair_up_are_refused() {
         refused(&format!("{block}{BLOCK_END}\n")),
         (Why::StrayEnd, 4)
     );
+}
+
+/// A line clauth did not write would go with its block, so the block is
+/// refused instead, naming the line: one the user added, a blank one, or
+/// clauth's `require` edited to pass options.
+#[test]
+fn a_line_clauth_did_not_write_keeps_its_block() {
+    for (inside, n) in [
+        (
+            "require(\"clauth\").setup{}\nrex.bind(\"cmd+k\", \"pane.close\")\n",
+            4,
+        ),
+        ("\nrequire(\"clauth\").setup{}\n", 3),
+        ("require(\"clauth\").setup{ tag = false }\n", 3),
+        ("  require(\"clauth\").setup{}\n", 3),
+    ] {
+        let text = format!("-- mine\n{BLOCK_BEGIN}\n{inside}{BLOCK_END}\n");
+        let refusal = read(&text).without_blocks().expect_err("refused");
+        assert_eq!(
+            (refusal.why, refusal.line),
+            (Why::NotClauths, n),
+            "{inside:?}"
+        );
+    }
 }
 
 /// Two whole blocks both go.
@@ -916,6 +940,38 @@ fn uninstall_keeps_a_commented_out_copy_of_the_block() {
         mine
     );
     assert_eq!(plugin_at(&paths.plugin), PluginDir::Absent);
+}
+
+/// The refusal names the line clauth did not write, and changes nothing.
+#[test]
+fn uninstall_refuses_a_block_holding_a_line_clauth_did_not_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+    let edited = format!(
+        "-- mine\n{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\nrex.bind(\"cmd+k\", \"pane.close\")\n{BLOCK_END}\n"
+    );
+    std::fs::write(&paths.init, &edited).expect("seed init.lua");
+
+    let err = uninstall_at(&paths, &state, true).expect_err("refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{}:4 is inside clauth's block, but clauth did not write it:\n  \
+             rex.bind(\"cmd+k\", \"pane.close\")\n  \
+             move that line out of the block first, then rerun `clauth rex uninstall`",
+            paths.init.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.init).expect("init.lua"),
+        edited
+    );
+    assert!(matches!(
+        plugin_at(&paths.plugin),
+        PluginDir::Managed { .. }
+    ));
 }
 
 /// A plugin dir clauth did not write stays whatever uninstall does, so a
