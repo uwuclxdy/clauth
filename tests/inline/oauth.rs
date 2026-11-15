@@ -4803,8 +4803,8 @@ fn write_global_record(home: &HomeSandbox, contents: &[u8]) -> std::path::PathBu
     record
 }
 
-/// A record that fails both parses and is older than the mid-create grace is
-/// not a write in progress, so the refusal names its dir.
+/// A record read whole that fails both parses and is older than the mid-create
+/// grace is not a write in progress, so the refusal names its dir.
 #[test]
 fn an_old_unparseable_job_record_refusal_names_the_dir() {
     let home = HomeSandbox::new();
@@ -4841,6 +4841,25 @@ fn a_future_dated_unparseable_job_record_keeps_the_retry_refusal() {
         std::time::SystemTime::now() + std::time::Duration::from_secs(20 * 60),
     );
     assert_job_store_refusal("future-parse", &retry_refusal("future-parse"));
+}
+
+/// A record over the read cap is cut by the capped read and fails both parses
+/// only because of the cut — a whole read parses it — so the retry sentence
+/// stays and nothing names the dir for deletion.
+#[test]
+fn an_over_cap_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let cap = usize::try_from(crate::runtime::RECORD_READ_CAP).expect("cap fits usize");
+    let pad = "x".repeat(cap);
+    let record = write_global_record(
+        &home,
+        format!("{{\"state\":\"working\",\"intent\":\"{pad}\"}}").as_bytes(),
+    );
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() - std::time::Duration::from_mins(20),
+    );
+    assert_job_store_refusal("over-cap", &retry_refusal("over-cap"));
 }
 
 /// A young empty job dir is a creation in flight and clears on its own.

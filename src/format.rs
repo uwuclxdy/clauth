@@ -165,9 +165,12 @@ pub(crate) enum Cause {
     /// own `jobs/`).
     UnreadableJobStoreOnRotatingChain { profile: String, store: String },
     /// The job store holds a job dir that never clears on its own — a
-    /// record-less dir of no known shape, or a record that no longer parses —
-    /// so clauth cannot rule out an unfinished job on a rotatable tree. Split
-    /// from [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
+    /// record-less dir of no known shape, or a record read whole that fails
+    /// both parses and is older than the mid-create grace — so clauth cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL stuck dir
+    /// blocks every profile on macOS until it is deleted; a tree-local one
+    /// blocks only the profile whose store holds it. Split from
+    /// [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
     /// help: only deleting the named dir lets the rotation through. The `dir`
     /// is the job dir, rendered home-relative by the caller.
     UnreadableJobDirOnRotatingChain { profile: String, dir: String },

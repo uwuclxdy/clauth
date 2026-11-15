@@ -1521,9 +1521,10 @@ pub(crate) enum RotationBlock {
     /// Carries the store dir the refusal names (the global store, or the
     /// account's own tree-local store).
     UnreadableJobStore(PathBuf),
-    /// The job store holds a job dir that never clears on its own, so no
-    /// profile's chain can be judged until it is deleted. Carries that job dir:
-    /// the global store's, or the account's own tree-local one.
+    /// The job store holds a job dir that never clears on its own, so the
+    /// chains that store covers (every profile's for the global store, the
+    /// account's own for a tree-local one) cannot be judged until it is
+    /// deleted. Carries that job dir.
     UnreadableJobDir(PathBuf),
 }
 
@@ -1583,8 +1584,10 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// read through [`credential_holds_refresh_token`], so a job on a
 /// `session-token.json` sidecar (linked or copied) frees the chain exactly like
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
-/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
-/// profile dir that cannot be resolved, blocks with the store's path named.
+/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or
+/// a profile dir that cannot be resolved, blocks with the store's path
+/// named, or with the job dir named when a stuck one made the store
+/// unreadable.
 ///
 /// The under-the-profile arm cannot see a handed-off per-launch chain tree
 /// correctly: the tree sits under its START profile's dir while the session

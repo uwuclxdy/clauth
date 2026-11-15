@@ -31,10 +31,12 @@
 //! dir, every tree for the global one, since the record about to land can name
 //! any of them. Any other record-less dir is unreadable and spares, and so does
 //! a record that fails both parses. Such a dir is STUCK, since it never clears
-//! on its own, when it is a record-less dir of no known shape (at once) or an
-//! unparseable record whose mtime is older than the same grace; a younger
-//! record, or one whose mtime is unreadable or in the future, may be a write in
-//! progress and is not stuck. The rotation refusal names a stuck job dir. The
+//! on its own, when it is a record-less dir of no known shape (at once) or a
+//! record read whole that fails both parses and whose mtime is older than the
+//! same grace; a younger record, or one whose mtime is unreadable or in the
+//! future, may be a write in progress, and a record the capped read cut short
+//! fails its parse on bytes that may parse whole, so neither is stuck. The
+//! rotation refusal names a stuck job dir. The
 //! settings term ([`JobTrees::spares_settings`]) spares a spawn-settings file
 //! a job's `respawnFlags` name. The rotation term
 //! ([`JobTrees::unfinished_under`]) and the live-session term
@@ -253,12 +255,13 @@ struct StoreReadFault {
     path: PathBuf,
     /// `path` is a job dir that never clears on its own, so a retry cannot
     /// help: a record-less dir of neither the leftover nor the mid-create
-    /// shape, or a record that fails both parses and whose own mtime is older
-    /// than [`MID_CREATE_GRACE`]. A younger record, or one whose mtime is
-    /// unreadable or in the future, can be a write in progress; every other
-    /// fault (the store or a job dir that cannot be listed, a record that
-    /// cannot be read, a config dir that cannot be resolved) is not stuck
-    /// either.
+    /// shape, or a record read whole that fails both parses and whose own
+    /// mtime is older than [`MID_CREATE_GRACE`]. A younger record, or one
+    /// whose mtime is unreadable or in the future, can be a write in progress,
+    /// and a read cut at [`crate::runtime::RECORD_READ_CAP`] fails both parses
+    /// on bytes that may parse whole; neither is stuck. Every other fault (the
+    /// store or a job dir that cannot be listed, a record that cannot be read,
+    /// a config dir that cannot be resolved) is not stuck either.
     stuck: bool,
 }
 
@@ -555,11 +558,12 @@ impl JobTrees {
 
     /// The canonical tree paths every UNFINISHED job names UNDER `dir`, so the
     /// rotation gate can read each tree's `.credentials.json` and apply the
-    /// same holds-a-refresh-token narrowing the marker term gets. `Err(`[`StoreRefusal`]`)`
-    /// when the store (or a scoped store under `dir`) is unreadable — fail
-    /// closed: the caller blocks and names the store, or the stuck job dir
-    /// ([`StoreRefusal::stuck_dir`]) when one made the store unreadable. A finished job
-    /// (`stopped`/`done`/`failed`) is not mid-task, so it names nothing here;
+    /// same holds-a-refresh-token narrowing the marker term gets. A
+    /// [`StoreRefusal`] when the store (or a scoped store under `dir`) is
+    /// unreadable — fail closed: the caller blocks and names the store, or the
+    /// stuck job dir ([`StoreRefusal::stuck_dir`]) when one made the store
+    /// unreadable. A finished job (`stopped`/`done`/`failed`) is not mid-task,
+    /// so it names nothing here;
     /// an unknown or missing `state` reads unfinished by construction.
     ///
     /// `dir` is canonicalized so it and the set share one spelling; a
@@ -966,14 +970,19 @@ fn read_jobs_dir(
                 },
                 // A record that fails both parses is a write in progress while
                 // it is young (Claude Code falls back to an in-place write when
-                // the rename fails) and stuck once it is old. An unreadable or
-                // future mtime cannot prove the age, so it reads young.
+                // the rename fails, measured on 2.1.322) and stuck once it is
+                // old. An unreadable or future mtime cannot prove the age, so
+                // it reads young. A read cut at the cap proves nothing either:
+                // its bytes may be a whole record merely over `RECORD_READ_CAP`,
+                // so it reads young too.
                 Err(_) => {
-                    let old = std::fs::metadata(job_dir.join("state.json"))
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|mtime| mtime.elapsed().ok())
-                        .is_some_and(|age| age > MID_CREATE_GRACE);
+                    let whole = (record.len() as u64) < crate::runtime::RECORD_READ_CAP;
+                    let old = whole
+                        && std::fs::metadata(job_dir.join("state.json"))
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                            .and_then(|mtime| mtime.elapsed().ok())
+                            .is_some_and(|age| age > MID_CREATE_GRACE);
                     return Err(StoreReadFault {
                         path: job_dir,
                         stuck: old,
