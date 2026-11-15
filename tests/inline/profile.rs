@@ -11873,3 +11873,88 @@ fn ac07_p_7_3_a_save_adds_no_picker_table_or_example_to_an_older_file() {
 }
 
 // ---- wiki Configuration page documents [model_picker] (plan clauth-model-picker, T-5) ----
+
+/// The first ```toml fenced block of `md` whose first line is `[model_picker]`.
+fn first_model_picker_toml_block(md: &str) -> Option<String> {
+    let mut lines = md.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != "```toml" {
+            continue;
+        }
+        let body: Vec<&str> = lines
+            .by_ref()
+            .take_while(|l| l.trim_end() != "```")
+            .collect();
+        if body.first().map(|l| l.trim_end()) == Some("[model_picker]") {
+            return Some(body.join("\n"));
+        }
+    }
+    None
+}
+
+// P-9.1: the wiki silk example parses, and the prose, field table and key-table row are present.
+#[test]
+fn ac09_wiki_silk_example_parses() {
+    #[derive(serde::Deserialize)]
+    struct WikiBlock {
+        model_picker: ModelPicker,
+    }
+    let wiki = include_str!("../../wiki/Configuration.md");
+    let block = first_model_picker_toml_block(wiki)
+        .expect("wiki/Configuration.md has a ```toml block whose first line is `[model_picker]`");
+    let parsed: WikiBlock = toml::from_str(&block).expect("the wiki silk example parses");
+    assert_eq!(parsed.model_picker.replace_built_in, Some(true));
+    let pairs: Vec<(String, Option<String>)> = parsed
+        .model_picker
+        .options
+        .iter()
+        .map(|o| (o.model.clone(), o.label.clone()))
+        .collect();
+    let want = [
+        ("kimi-k3.1-pro-uncensored", "Kimi K3.1 Pro"),
+        (
+            "deepseek-v4.1-flash-1017-uncensored",
+            "DeepSeek V4.1 Flash 1017",
+        ),
+        ("glm-5.3-uncensored", "GLM-5.3"),
+        ("glm-5.3-flash-uncensored", "GLM-5.3 Flash"),
+        ("hy4-uncensored", "Hy4"),
+    ];
+    let want: Vec<(String, Option<String>)> = want
+        .iter()
+        .map(|(m, l)| (m.to_string(), Some(l.to_string())))
+        .collect();
+    assert_eq!(pairs, want);
+
+    for sentence in [
+        "An account with no picker strips `modelPicker` from the `settings.json` a switch or a start writes: a switch removes it from `~/.claude/settings.json` itself, including one you set by hand, and a start leaves it out of the session's copy.",
+        "Claude Code honors `modelPicker` only from managed settings, `--settings` or the SDK, and user settings, and the highest-precedence of those that defines it wins outright, with no merging.",
+        "Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions` does not load.",
+    ] {
+        assert!(
+            wiki.contains(sentence),
+            "wiki lacks the sentence: {sentence}"
+        );
+    }
+
+    for row in [
+        "| `config.toml` | Claude Code `modelPicker` |",
+        "|---|---|",
+        "| `replace_built_in` | `replaceBuiltInOptions` |",
+        "| `model` | `options[].model` |",
+        "| `label` | `options[].label` |",
+        "| `description` | `options[].description` |",
+        "| `behaves_as` | `options[].behavesAs` |",
+    ] {
+        assert!(
+            wiki.lines().any(|l| l == row),
+            "wiki lacks the field-table line: {row}"
+        );
+    }
+
+    let key_row = "| `[model_picker]` | table | `{}` | `replace_built_in`, `[[model_picker.options]]` (`model`, `label`, `description`, `behaves_as`) |";
+    assert!(
+        wiki.lines().any(|l| l == key_row),
+        "wiki lacks the key-table line: {key_row}"
+    );
+}
