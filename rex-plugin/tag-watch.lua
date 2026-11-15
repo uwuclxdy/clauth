@@ -23,9 +23,16 @@ local tracked = {}
 
 -- Cheap filter before forking the resolver: every shell command fires
 -- process_changed, and only claude, clauth or codex can spend an account.
--- Match program names, not whole paths: everything run from ~/.codex/worktrees
--- has "codex" in its path. resolve-profile.sh makes the real decision.
-local AGENTS = { claude = true, clauth = true, codex = true }
+-- node, bun and deno run an npm-installed Claude Code or codex
+-- (`node .../@anthropic-ai/claude-code/cli.js`), and Rex names no script, so
+-- they pass too: `clauth which --pid` reads the script off the argv and
+-- answers nothing for any other. Match program names, not whole paths:
+-- everything run from ~/.codex/worktrees has "codex" in its path.
+-- resolve-profile.sh makes the real decision.
+local AGENTS = {
+  claude = true, clauth = true, codex = true,
+  node = true, bun = true, deno = true,
+}
 
 local function looks_like_agent(fg)
   if not fg then return false end
@@ -50,9 +57,11 @@ local function resolve(pid)
   return profile, how, agent
 end
 
+-- The pane's label, "" for none, or nil when Rex could not describe the pane.
 local function label_of(session_id, block_id)
   local d = rex.session.describe_block{ session_id = session_id, block_id = block_id }
-  return d and d.block and d.block.label or nil
+  if not (d and d.block) then return nil end
+  return d.block.label or ""
 end
 
 local function set_label(session_id, block_id, label)
@@ -64,7 +73,6 @@ end
 -- resolver just named is peeled: a user's own "deploy · prod" keeps its
 -- "· prod", whatever the clauth profiles are called.
 local function base_of(label, profile)
-  if not label then return nil end
   local tags = { SEP .. profile, SEP .. profile .. " (global)" }
   local peeled = true
   while peeled do
@@ -88,6 +96,9 @@ local function apply(session_id, block_id, pid)
     if profile == false then return end
   end
   local current = label_of(session_id, block_id)
+  -- Rex could not say what the label is: change nothing, so a label read as
+  -- missing is never kept as the one to restore. The timer asks again.
+  if current == nil then return end
 
   if not profile then
     if t then
@@ -107,7 +118,7 @@ local function apply(session_id, block_id, pid)
   t.session_id, t.pid = session_id, pid
 
   local base = t.orig
-  if base == nil or base == "" or base == "shell" then
+  if base == "" or base == "shell" then
     -- The resolver names the agent: a `clauth start` pane runs the clauth
     -- supervisor whether it hosts Claude Code or codex.
     base = agent
@@ -120,17 +131,22 @@ local function apply(session_id, block_id, pid)
   t.ours = want
 end
 
--- A pane that looked like an agent but has no registry row yet stays pending, so
--- the timer picks it up once `clauth start` writes the row.
+-- A pane that looked like an agent but resolved to no account stays pending,
+-- so the timer picks it up once `clauth start` writes its row, a moment after
+-- it starts. Each miss doubles the ticks until the next ask, up to MAX_WAIT,
+-- so a pane that never resolves (a codex on its own login, a node dev server)
+-- costs one resolver run every few minutes rather than one every tick.
 local pending = {}
+local MAX_WAIT = 32
 
 local function consider(session_id, block_id, fg)
   if looks_like_agent(fg) then
     apply(session_id, block_id, fg.pid)
-    if not tracked[block_id] then
-      pending[block_id] = { session_id = session_id, pid = fg.pid }
-    else
+    local p = pending[block_id]
+    if tracked[block_id] then
       pending[block_id] = nil
+    elseif not (p and p.pid == fg.pid) then
+      pending[block_id] = { session_id = session_id, pid = fg.pid, wait = 1, left = 1 }
     end
   else
     pending[block_id] = nil
@@ -154,8 +170,16 @@ rex.every(interval, function()
     apply(t.session_id, block_id, t.pid)
   end
   for block_id, p in pairs(pending) do
-    apply(p.session_id, block_id, p.pid)
-    if tracked[block_id] then pending[block_id] = nil end
+    p.left = p.left - 1
+    if p.left <= 0 then
+      apply(p.session_id, block_id, p.pid)
+      if tracked[block_id] then
+        pending[block_id] = nil
+      else
+        p.wait = math.min(p.wait * 2, MAX_WAIT)
+        p.left = p.wait
+      end
+    end
   end
 end)
 
