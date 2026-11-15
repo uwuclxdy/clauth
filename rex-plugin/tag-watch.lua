@@ -12,7 +12,6 @@ local SEP = " · "
 
 local root = debug.getinfo(1, "S").source:gsub("^@", ""):match("(.*)/[^/]*$") or "."
 local resolver = root .. "/resolve-profile.sh"
-local profiles_dir = (os.getenv("HOME") or "") .. "/.clauth/profiles"
 
 -- Zero would hot-spin the timer and a huge value overflows nothing useful;
 -- clamp to [1 s, 1 h] like the herdr plugin's tag_watch_secs.
@@ -60,29 +59,24 @@ local function set_label(session_id, block_id, label)
   rex.session.set_block_label{ session_id = session_id, block_id = block_id, label = label or "" }
 end
 
--- The clauth profile names, so only a tag naming one of them is ever taken for
--- ours: a user's own "deploy · prod" label must survive.
-local profiles = {}
-local function load_profiles()
-  local r = rex.exec({ "ls", "-1", profiles_dir }, { timeout = 5 })
-  if not (r and r.ok) then return end
-  local names = {}
-  for name in r.stdout:gmatch("[^\n]+") do names[name] = true end
-  profiles = names
-end
-
--- Strips every account tag this script may have added, so a label read back
--- after a watcher restart ("claude · work") is not tagged twice.
-local function base_of(label)
+-- The label without the tags naming `profile`, so a label read back after a
+-- watcher restart ("claude · work") is not tagged twice. Only the account the
+-- resolver just named is peeled: a user's own "deploy · prod" keeps its
+-- "· prod", whatever the clauth profiles are called.
+local function base_of(label, profile)
   if not label then return nil end
-  while true do
-    -- Greedy head: split at the last separator, peeling one tag per pass.
-    local head, tag = label:match("^(.*)" .. SEP .. "(.-)$")
-    if not head then return label end
-    local name = tag:gsub(" %(global%)$", "")
-    if not profiles[name] then return label end
-    label = head
+  local tags = { SEP .. profile, SEP .. profile .. " (global)" }
+  local peeled = true
+  while peeled do
+    peeled = false
+    for _, tag in ipairs(tags) do
+      if #label >= #tag and label:sub(-#tag) == tag then
+        label = label:sub(1, #label - #tag)
+        peeled = true
+      end
+    end
   end
+  return label
 end
 
 local function apply(session_id, block_id, pid)
@@ -105,10 +99,10 @@ local function apply(session_id, block_id, pid)
   end
 
   if not t then
-    t = { orig = base_of(current) }
+    t = { orig = base_of(current, profile) }
     tracked[block_id] = t
   elseif t.ours and current ~= t.ours then
-    t.orig = base_of(current)
+    t.orig = base_of(current, profile)
   end
   t.session_id, t.pid = session_id, pid
 
@@ -156,7 +150,6 @@ end)
 -- Re-resolve on a timer: a --with-fallback session swaps accounts, and a bare
 -- `claude` follows `clauth switch`, without any Rex event.
 rex.every(interval, function()
-  load_profiles()
   for block_id, t in pairs(tracked) do
     apply(t.session_id, block_id, t.pid)
   end
@@ -167,7 +160,6 @@ rex.every(interval, function()
 end)
 
 -- Panes already running Claude when the watcher starts fire no event.
-load_profiles()
 local sessions = rex.call("session.list") or {}
 for _, s in ipairs(sessions.sessions or {}) do
   -- Run in the background there is no session in the environment, and block
