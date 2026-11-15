@@ -1,5 +1,5 @@
-//! The plan end: the operator's `plan_ends` and `plan_renews` days and the
-//! monthly carry of a billing day.
+//! The plan end: the user's `plan_ends` and `plan_renews` days, the monthly
+//! carry of a billing day, and the local day both are compared against.
 
 use chrono::NaiveDate;
 
@@ -40,7 +40,7 @@ fn a_past_billing_day_carries_forward_a_month_at_a_time() {
     );
 }
 
-/// Each anniversary is counted from the operator's day, so a 31st lands on a
+/// Each anniversary is counted from the user's day, so a 31st lands on a
 /// shorter month's last day without drifting there for good.
 #[test]
 fn a_31st_clamps_to_short_months_and_comes_back() {
@@ -72,19 +72,24 @@ fn a_marked_end_wins_over_a_renewal() {
         ends: Some(date(2030, 4, 20)),
         renews: Some(date(2030, 4, 10)),
     };
-    assert_eq!(both.end(today), Some(PlanEnd::Ends(date(2030, 4, 20))));
+    assert_eq!(
+        both.end(today, false),
+        Some(PlanEnd::Ends(date(2030, 4, 20)))
+    );
     let renewing = PlanDates {
         ends: None,
         renews: Some(date(2030, 3, 10)),
     };
     assert_eq!(
-        renewing.end(today),
+        renewing.end(today, false),
         Some(PlanEnd::Renews(date(2030, 4, 10))),
         "a renewal carries forward to its next billing day"
     );
-    assert_eq!(PlanDates::default().end(today), None);
+    assert_eq!(PlanDates::default().end(today, false), None);
 }
 
+/// A past end keeps its own day and reads `ended` on a printed surface; the
+/// published kind stays `ends`.
 #[test]
 fn a_marked_end_reads_ended_once_past() {
     let today = date(2026, 11, 4);
@@ -92,15 +97,102 @@ fn a_marked_end_reads_ended_once_past() {
         ends: Some(day),
         renews: None,
     };
+    let last_day = ends(today).end(today, false);
     assert_eq!(
-        ends(today).end(today),
-        Some(PlanEnd::Ends(today)),
+        (last_day, last_day.map(|e| e.verb(today))),
+        (Some(PlanEnd::Ends(today)), Some("ends")),
         "a plan still serves on its last day"
     );
+    let past = ends(date(2026, 11, 3)).end(today, false);
     assert_eq!(
-        ends(date(2026, 11, 3)).end(today),
-        Some(PlanEnd::Ended(date(2026, 11, 3)))
+        (past, past.map(|e| e.verb(today))),
+        (Some(PlanEnd::Ends(date(2026, 11, 3))), Some("ended"))
     );
+}
+
+/// A `plan_renews` later than a past `plan_ends` is a plan taken up again:
+/// the renewal wins. One on or before that end leaves the plan ended, and a
+/// coming end still wins over any renewal.
+#[test]
+fn a_renewal_later_than_a_past_end_wins() {
+    let today = date(2026, 11, 14);
+    let dates = |ends, renews| PlanDates {
+        ends: Some(ends),
+        renews: Some(renews),
+    };
+    assert_eq!(
+        dates(date(2026, 9, 2), date(2026, 10, 20)).end(today, false),
+        Some(PlanEnd::Renews(date(2026, 11, 20))),
+        "a later billing day carries forward from its own anchor"
+    );
+    assert_eq!(
+        dates(date(2026, 9, 2), date(2026, 9, 2)).end(today, false),
+        Some(PlanEnd::Ends(date(2026, 9, 2))),
+        "a billing day on the end day itself is no new plan"
+    );
+    assert_eq!(
+        dates(date(2026, 9, 2), date(2026, 3, 15)).end(today, false),
+        Some(PlanEnd::Ends(date(2026, 9, 2))),
+        "an earlier billing day is the plan that ended"
+    );
+    assert_eq!(
+        dates(date(2026, 12, 1), date(2027, 1, 5)).end(today, false),
+        Some(PlanEnd::Ends(date(2026, 12, 1))),
+        "a coming end wins over a later renewal"
+    );
+}
+
+/// A plan whose reading refuses service (canceled, or refused by its
+/// organization) renews nothing; its marked end still shows, and a past one
+/// stays ended instead of yielding to a later renewal.
+#[test]
+fn a_plan_that_cannot_serve_shows_no_renewal() {
+    let today = date(2026, 11, 14);
+    let renewing = PlanDates {
+        ends: None,
+        renews: Some(date(2026, 12, 15)),
+    };
+    assert_eq!(renewing.end(today, true), None);
+    let ending = PlanDates {
+        ends: Some(date(2026, 11, 20)),
+        renews: Some(date(2026, 12, 15)),
+    };
+    assert_eq!(
+        ending.end(today, true),
+        Some(PlanEnd::Ends(date(2026, 11, 20)))
+    );
+    let resubscribed = PlanDates {
+        ends: Some(date(2026, 9, 2)),
+        renews: Some(date(2026, 12, 15)),
+    };
+    assert_eq!(
+        resubscribed.end(today, true),
+        Some(PlanEnd::Ends(date(2026, 9, 2)))
+    );
+}
+
+/// The day a plan date is compared against is the LOCAL calendar day: at
+/// every hour of one UTC day, `local_day` names the day chrono's own `Local`
+/// clock names. In a zone off UTC some of those hours fall on another local
+/// day, so a UTC pick reds here; on a UTC host the two agree by construction,
+/// the residual this cannot see.
+#[test]
+fn the_local_day_is_the_local_zones_calendar_day() {
+    use chrono::TimeZone;
+
+    // 2026-11-14T00:00:00Z.
+    let midnight_utc = 1_794_614_400_i64;
+    for hour in 0..24 {
+        let at = midnight_utc + hour * 3600;
+        assert_eq!(
+            crate::format::local_day(at),
+            chrono::Local
+                .timestamp_opt(at, 0)
+                .single()
+                .map(|t| t.date_naive()),
+            "hour {hour} UTC"
+        );
+    }
 }
 
 #[test]
@@ -114,6 +206,10 @@ fn a_plan_date_reads_an_iso_date_and_nothing_else() {
         "20/11/2026",
         "next week",
         "2026-11-20T00:00:00Z",
+        "26-12-15",
+        "202-01-05",
+        "+2026-01-05",
+        "02026-01-05",
     ] {
         assert_eq!(parse_plan_date(typo), None, "{typo:?} is no date");
     }

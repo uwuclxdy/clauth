@@ -15,14 +15,16 @@
 //! does not expose. All three are claude-only: a codex row reads none of them.
 
 use anyhow::Result;
+use chrono::NaiveDate;
 
 use crate::codex_profiles::CodexState;
-use crate::daemon::{ProfileEntry, build_codex_entries, build_profile_entries};
+use crate::daemon::{PlanEndEntry, ProfileEntry, build_codex_entries, build_profile_entries};
 use crate::format::{col_width, format_pct, pad_cells};
 use crate::harness::Harness;
 use crate::out::out;
 use crate::profile::{AppConfig, load_config};
 use crate::profile_json::Window;
+use crate::usage::render_plan_date;
 
 /// `clauth list [--all|--disabled]` — print the account table. `include_disabled`
 /// mirrors `build_profile_entries`'s flag: disabled profiles are hidden by
@@ -96,7 +98,8 @@ struct Row {
 }
 
 impl Row {
-    fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
+    /// `today` is the local day a published plan end is printed against.
+    fn from_entry(config: &AppConfig, entry: &ProfileEntry, today: Option<NaiveDate>) -> Self {
         let typed_name = &entry.name;
         // A codex row reads its entry alone. The claude-only reads below would
         // answer off a file the codex name shares: a claude body can sit in a
@@ -137,10 +140,17 @@ impl Row {
             name: entry.name.as_str().to_string(),
             // When the plan ends or renews rides its cell, in plain ASCII like
             // all CLI text: `Ultra (renews 2026-12-03)`, `Ultra (ends
-            // 2026-11-20)`.
-            plan: match &entry.plan_end {
-                Some(end) => format!("{tier} ({} {})", end.kind, end.date),
-                None => tier.to_string(),
+            // 2026-11-20)`, and `Ultra (ended 2026-11-02)` once today is past
+            // the end the entry publishes.
+            plan: match (entry.plan_end.as_ref().and_then(PlanEndEntry::read), today) {
+                (Some(end), Some(today)) => {
+                    format!(
+                        "{tier} ({} {})",
+                        end.verb(today),
+                        render_plan_date(end.day())
+                    )
+                }
+                _ => tier.to_string(),
             },
             five_h,
             seven_d,
@@ -228,10 +238,16 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
         return "no accounts yet. add one with `clauth login <name>`.\n".to_string();
     }
 
-    let rows: Vec<Row> = entries.iter().map(|e| Row::from_entry(config, e)).collect();
+    // One clock read for the whole table, so no two rows judge a plan end
+    // against different days.
+    let today = crate::format::local_day(crate::usage::now_epoch_secs());
+    let rows: Vec<Row> = entries
+        .iter()
+        .map(|e| Row::from_entry(config, e, today))
+        .collect();
     let codex_rows: Vec<Row> = codex_entries
         .iter()
-        .map(|e| Row::from_entry(config, e))
+        .map(|e| Row::from_entry(config, e, today))
         .collect();
 
     // Each header is bound once: `col_width` sizes the column off the same

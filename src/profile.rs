@@ -338,6 +338,11 @@ impl OAuthToken {
 }
 
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    clippy::allow_attributes,
+    reason = "each bool is a per-profile config.toml switch, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+)]
 pub(crate) struct Profile {
     pub(crate) name: ProfileName,
     pub(crate) base_url: Option<String>,
@@ -398,14 +403,13 @@ pub(crate) struct Profile {
     /// answered and which only lets serving chain members claim. Lets one account own the weekend without an external
     /// job rewriting `config.toml` twice a day.
     pub(crate) preferred_days: Vec<Weekday>,
-    /// The local day this account's canceled plan ends, copied by the operator
-    /// off claude.ai's billing page: `/profile` shows a cancellation only once
-    /// the plan has ended. Wins over `plan_renews`. Read through
-    /// [`Profile::plan_dates`]: see [`crate::usage::PlanDates`].
+    /// The local day this account's canceled plan ends, copied by the user off
+    /// claude.ai's billing page. Read through [`Profile::plan_dates`], which
+    /// says when it wins over `plan_renews`: see [`crate::usage::PlanDates`].
     pub(crate) plan_ends: Option<NaiveDate>,
     /// A local billing day of this account's renewing plan, copied by the
-    /// operator off claude.ai's billing page; once it passes, the plan renews
-    /// on its monthly anniversaries. No endpoint clauth reads names it.
+    /// user off claude.ai's billing page; once it passes, the plan renews on
+    /// its monthly anniversaries. No endpoint clauth reads names it.
     pub(crate) plan_renews: Option<NaiveDate>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
     /// usage chain's current access token on every rotation (full scopes,
@@ -532,7 +536,7 @@ fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth
 }
 
 impl Profile {
-    /// The two plan dates the operator gave this profile (`plan_ends`,
+    /// The two plan dates the user gave this profile (`plan_ends`,
     /// `plan_renews`), the one input every plan-end surface reads.
     pub(crate) fn plan_dates(&self) -> crate::usage::PlanDates {
         crate::usage::PlanDates {
@@ -2373,6 +2377,11 @@ impl ProfileId {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    clippy::allow_attributes,
+    reason = "each bool is one config.toml key this struct mirrors, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+)]
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
@@ -2409,13 +2418,15 @@ struct ProfileConfig {
     /// drops it from disk, which is the visible signal it was not understood.
     #[serde(default)]
     preferred_days: Vec<String>,
-    /// The `YYYY-MM-DD` behind [`Profile::plan_ends`]. A string rather than a
-    /// date so an unreadable value costs this key alone: the load reads it as
-    /// unset and comments the line out.
-    #[serde(default)]
+    /// The `YYYY-MM-DD` behind [`Profile::plan_ends`], quoted or a bare TOML
+    /// date ([`plan_date_text`]). Text rather than a date so a date clauth
+    /// cannot read costs this key alone: the load reads it as unset and
+    /// comments the line out. A value of any other type fails the account's
+    /// load.
+    #[serde(default, deserialize_with = "plan_date_text")]
     plan_ends: Option<String>,
     /// The `YYYY-MM-DD` behind [`Profile::plan_renews`], read the same way.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "plan_date_text")]
     plan_renews: Option<String>,
     #[serde(default)]
     max_auto_spend: Option<f64>,
@@ -2436,6 +2447,25 @@ struct ProfileConfig {
     /// must render after every scalar key in `render_config_toml`.
     #[serde(default)]
     console: ConsoleConfig,
+}
+
+/// A plan date as `config.toml` holds it: a quoted string as typed, or an
+/// unquoted TOML date, time or date-time in its TOML spelling, which a bare
+/// `plan_ends = 2026-11-20` is. Either then meets
+/// [`crate::usage::parse_plan_date`], so a date it cannot read costs this key
+/// alone: the load reads it as unset and comments the line out. A value of
+/// any other type fails the account's load.
+fn plan_date_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::String(text) => Ok(Some(text)),
+        toml::Value::Datetime(when) => Ok(Some(when.to_string())),
+        other => Err(serde::de::Error::invalid_type(
+            serde::de::Unexpected::Other(other.type_str()),
+            &"a date, quoted or bare",
+        )),
+    }
 }
 
 /// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
@@ -7053,8 +7083,8 @@ fn push_scalar_doc(out: &mut String, key: &str) {
         }
         "plan_ends" => {
             out.push_str("# The day this account's canceled plan ends (YYYY-MM-DD, local time), as\n");
-            out.push_str("# claude.ai's billing page states it. clauth cannot read a cancellation\n");
-            out.push_str("# before the plan ends. Wins over plan_renews.\n");
+            out.push_str("# claude.ai's billing page states it. Wins over plan_renews until it\n");
+            out.push_str("# passes; after that, a later plan_renews wins.\n");
         }
         "plan_renews" => {
             out.push_str("# The next day this account's plan bills (YYYY-MM-DD, local time), as\n");
@@ -7512,6 +7542,14 @@ fn known_doc_blocks(key: &str) -> Vec<String> {
              # no running window. ~0.001{CENT} per ping. OAuth profiles only.\n\
              # Old name `kick_timer = true` is still accepted.\n"
         )),
+        // The plan-dates feature's first form, before the win-over rule was
+        // corrected for a past end.
+        "plan_ends" => docs.push(
+            "# The day this account's canceled plan ends (YYYY-MM-DD, local time), as\n\
+             # claude.ai's billing page states it. clauth cannot read a cancellation\n\
+             # before the plan ends. Wins over plan_renews.\n"
+                .to_string(),
+        ),
         // ce69b154 reworded the alert copy (90205d2d wrote the older block).
         "bell_threshold" => docs.push(
             "# 5-hour utilization percentage at/above which clauth fires a bell\n\
@@ -8473,6 +8511,8 @@ enum KeyShape {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScalarKind {
     Str,
+    /// A string, or a bare TOML date-time ([`plan_date_text`]).
+    Date,
     F64,
     U64,
     Bool,
@@ -8487,8 +8527,8 @@ fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
         "base_url" => (ScalarKind::Str, "base_url"),
         "api_key" => (ScalarKind::Str, "api_key"),
         "effort" => (ScalarKind::Str, "effort"),
-        "plan_ends" => (ScalarKind::Str, "plan_ends"),
-        "plan_renews" => (ScalarKind::Str, "plan_renews"),
+        "plan_ends" => (ScalarKind::Date, "plan_ends"),
+        "plan_renews" => (ScalarKind::Date, "plan_renews"),
         "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
         "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
         "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
@@ -8527,13 +8567,15 @@ fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
         return KeyShape::Unreadable; // a table or array-of-tables where a value belongs
     };
     match kind {
-        ScalarKind::Str => {
+        ScalarKind::Str | ScalarKind::Date => {
             if v.is_str() {
                 if is_multiline_string(v) {
                     KeyShape::NonPlain
                 } else {
                     KeyShape::Plain
                 }
+            } else if kind == ScalarKind::Date && v.is_datetime() {
+                KeyShape::Plain
             } else {
                 KeyShape::Unreadable
             }
@@ -8797,7 +8839,11 @@ fn apply_config_edits(
     ] {
         match mode {
             ConfigEditMode::Save => edit_string_scalar(doc, od_date, ca_date, key),
-            ConfigEditMode::Load => edit_plan_date_load(doc, od_date, ca_date, key),
+            ConfigEditMode::Load => {
+                edit_scalar_load(doc, od_date.as_ref(), ca_date.as_ref(), key, |doc| {
+                    edit_string_scalar(doc, od_date, ca_date, key);
+                });
+            }
         }
     }
     edit_bool_scalar(
@@ -8853,24 +8899,22 @@ fn edit_threshold_load(
     ca: Option<f64>,
     key: &str,
 ) {
-    if od == ca {
-        return;
-    }
-    if ca.is_none() {
-        comment_out_scalar(doc, key);
-    } else {
+    edit_scalar_load(doc, od.as_ref(), ca.as_ref(), key, |doc| {
         edit_f64_scalar(doc, od, ca, key);
-    }
+    });
 }
 
-/// An unreadable `plan_ends` or `plan_renews` date is commented out in place,
-/// the way an ignored threshold is; a readable one spelled another way is
-/// written back in its `YYYY-MM-DD` form.
-fn edit_plan_date_load(
+/// The load's repair of a scalar it reads leniently: a value it ignores
+/// outright (an ignored threshold, a plan date that is no date) is commented
+/// out in place, the visible signal it was not understood; one it reads but
+/// spells another way (a clamped threshold, an unpadded date) goes back
+/// through `write`.
+fn edit_scalar_load<T: PartialEq>(
     doc: &mut toml_edit::DocumentMut,
-    od: &Option<String>,
-    ca: &Option<String>,
+    od: Option<&T>,
+    ca: Option<&T>,
     key: &str,
+    write: impl FnOnce(&mut toml_edit::DocumentMut),
 ) {
     if od == ca {
         return;
@@ -8878,7 +8922,7 @@ fn edit_plan_date_load(
     if ca.is_none() {
         comment_out_scalar(doc, key);
     } else {
-        edit_string_scalar(doc, od, ca, key);
+        write(doc);
     }
 }
 

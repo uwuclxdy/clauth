@@ -1,19 +1,17 @@
 //! When an account's paid plan ends or renews: the date the Usage tab,
 //! `clauth list` and the feeds show.
 //!
-//! Neither OAuth endpoint clauth reads (`/api/oauth/usage`,
-//! `/api/oauth/profile`) names a billing date. `/profile`'s
-//! `subscription_created_at` is no billing anchor: a plan change moves the
-//! billing day and keeps that start. A cancellation shows on `/profile` only
-//! once the plan has ended. So both dates are the operator's, copied off
-//! claude.ai's billing page into the profile's `config.toml`: `plan_ends` for
-//! a canceled plan's last day, `plan_renews` for a renewing plan's next
-//! billing date.
+//! No endpoint clauth reads names a billing date: the Claude Code 2.1.319
+//! binary carries no billing-day field (measured 2026-11-06). So both dates
+//! are the user's, copied off claude.ai's billing page into the profile's
+//! `config.toml`: `plan_ends` for a canceled plan's last day, `plan_renews`
+//! for a renewing plan's billing day. A billing day rolls forward a month at a
+//! time, a guess the plan's `/profile` status overrules: a plan that reads
+//! canceled or refused shows no renewal.
 
-use chrono::{DateTime, Datelike, Local, Months, NaiveDate};
+use chrono::{Datelike, Months, NaiveDate};
 
-/// The two dates the operator may give a profile. A marked end wins over a
-/// renewal: a canceled plan bills no more.
+/// The two dates the user may give a profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlanDates {
     /// `plan_ends`: the last day of a canceled plan.
@@ -24,30 +22,30 @@ pub(crate) struct PlanDates {
 }
 
 impl PlanDates {
-    /// When this plan ends or renews, as of the local date `today`: the marked
-    /// end (ended once `today` is past it), else the next renewal on or after
-    /// `today`. `None` when neither date is set.
-    pub(crate) fn end(self, today: NaiveDate) -> Option<PlanEnd> {
-        if let Some(day) = self.ends {
-            return Some(if day < today {
-                PlanEnd::Ended(day)
-            } else {
-                PlanEnd::Ends(day)
-            });
+    /// When this plan ends or renews, as of the local date `today`. A marked
+    /// end still to come wins over a renewal: a canceled plan bills no more.
+    /// A past one stands unless `plan_renews` is later than it, the plan
+    /// taken up again. A plan whose reading `refuses_service` (canceled, or
+    /// refused by its organization) renews nothing. `None` when no date
+    /// applies.
+    pub(crate) fn end(self, today: NaiveDate, refuses_service: bool) -> Option<PlanEnd> {
+        let renews = self.renews.filter(|_| !refuses_service);
+        match self.ends {
+            Some(day) if day >= today || renews.is_none_or(|anchor| anchor <= day) => {
+                Some(PlanEnd::Ends(day))
+            }
+            _ => renews
+                .and_then(|anchor| next_renewal(anchor, today))
+                .map(PlanEnd::Renews),
         }
-        self.renews
-            .and_then(|anchor| next_renewal(anchor, today))
-            .map(PlanEnd::Renews)
     }
 }
 
 /// When a plan stops serving or renews, each a local calendar day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanEnd {
-    /// The canceled plan's last day, today or later.
+    /// The canceled plan's last day, kept as it is once it passes.
     Ends(NaiveDate),
-    /// The canceled plan's last day, now past.
-    Ended(NaiveDate),
     /// The plan's next billing day, today or later.
     Renews(NaiveDate),
 }
@@ -56,7 +54,17 @@ impl PlanEnd {
     /// The day this end falls on.
     pub(crate) fn day(self) -> NaiveDate {
         match self {
-            PlanEnd::Ends(day) | PlanEnd::Ended(day) | PlanEnd::Renews(day) => day,
+            Self::Ends(day) | Self::Renews(day) => day,
+        }
+    }
+
+    /// The word a printed surface names this end by on `today`: an end whose
+    /// day has passed reads `ended`. The published kind stays `ends`.
+    pub(crate) fn verb(self, today: NaiveDate) -> &'static str {
+        match self {
+            Self::Ends(day) if day < today => "ended",
+            Self::Ends(_) => "ends",
+            Self::Renews(_) => "renews",
         }
     }
 }
@@ -83,22 +91,19 @@ pub(crate) fn next_renewal(anchor: NaiveDate, today: NaiveDate) -> Option<NaiveD
     }
 }
 
-/// The local calendar date of an epoch-seconds instant: the day a plan date is
-/// compared against, in the zone the operator typed it in.
-pub(crate) fn local_date_of(epoch_secs: i64) -> Option<NaiveDate> {
-    Some(
-        DateTime::from_timestamp(epoch_secs, 0)?
-            .with_timezone(&Local)
-            .date_naive(),
-    )
-}
-
 /// `plan_ends` or `plan_renews` as typed in `config.toml`: a `YYYY-MM-DD`
-/// date. Anything else reads as unset, and the load then comments the line
-/// out, the visible signal it was not understood (the rule an ignored
-/// threshold follows).
+/// date with a four-digit year. Anything else reads as unset, and the load
+/// then comments the line out, the visible signal it was not understood (the
+/// rule an ignored threshold follows).
 pub(crate) fn parse_plan_date(raw: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok()
+    let raw = raw.trim();
+    // `%Y` alone takes one to four digits, so `26-12-15` would read as the
+    // year 26 and be written back as `0026-12-15`.
+    let (year, _) = raw.split_once('-')?;
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
 }
 
 /// The canonical `config.toml` spelling of a plan date.

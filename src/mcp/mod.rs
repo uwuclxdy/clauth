@@ -385,11 +385,14 @@ fn profile_row(
     if let Some(banked) = claude_limit_resets(name) {
         row["limit_resets"] = serde_json::json!(banked);
     }
-    // When the plan ends or renews, emitted only when the operator gave a
-    // date: the picker is choosing where to spend, and a plan that ends soon
-    // is quota to use first. The same object `status.json` publishes.
-    if let Some(end) = crate::usage::local_date_of(now).and_then(|today| p.plan_dates().end(today))
-    {
+    // When the plan ends or renews, emitted only when the user gave a date:
+    // the picker is choosing where to spend, and a plan that ends soon is
+    // quota to use first. The same object `status.json` publishes, off the
+    // same cached plan the row's `canceled`/`org_refused` flags read.
+    if let Some(end) = crate::format::local_day(now).and_then(|today| {
+        p.plan_dates()
+            .end(today, crate::profile_json::refuses_service_cached(p))
+    }) {
         row["plan_end"] = serde_json::json!(crate::daemon::PlanEndEntry::of(end));
     }
     row

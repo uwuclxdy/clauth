@@ -26,8 +26,8 @@ use crate::profile_json::{
     publishes_a_live_window, stale_after_ms, tier_label, usage_cache_file, usage_windows,
 };
 use crate::usage::{
-    FetchStatus, LegKey, PlanEnd, UsageInfo, is_stuck_rate_limited, local_date_of, ms_to_iso,
-    now_ms, render_plan_date, selected_next_refresh, windows_maxed,
+    FetchStatus, LegKey, PlanEnd, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
+    parse_plan_date, render_plan_date, selected_next_refresh, windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -199,13 +199,13 @@ pub(crate) struct CapBlock {
 }
 
 /// When a profile's plan ends or renews ([`crate::usage::PlanEnd`]), as
-/// published per profile. The whole object is `null` when the profile carries
-/// neither `plan_ends` nor `plan_renews`.
+/// published per profile. The whole object is `null` when no date applies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub(crate) struct PlanEndEntry {
-    /// `ends`: the profile's `plan_ends`, today or later; `ended`: that day is
-    /// past; `renews`: the next billing day off `plan_renews`, carried
-    /// forward a month at a time once it passes.
+    /// `ends`: the profile's `plan_ends`, published as it is after the day
+    /// passes, so a reader compares it to its own today; `renews`: the next
+    /// billing day off `plan_renews`, carried forward a month at a time once
+    /// it passes.
     pub(crate) kind: String,
     /// `YYYY-MM-DD`, a local calendar day.
     pub(crate) date: String,
@@ -216,12 +216,22 @@ impl PlanEndEntry {
     pub(crate) fn of(end: PlanEnd) -> Self {
         let kind = match end {
             PlanEnd::Ends(_) => "ends",
-            PlanEnd::Ended(_) => "ended",
             PlanEnd::Renews(_) => "renews",
         };
         Self {
             kind: kind.to_string(),
             date: render_plan_date(end.day()),
+        }
+    }
+
+    /// The end this entry publishes, read back; `None` for a kind or date
+    /// this build does not know.
+    pub(crate) fn read(&self) -> Option<PlanEnd> {
+        let day = parse_plan_date(&self.date)?;
+        match self.kind.as_str() {
+            "ends" => Some(PlanEnd::Ends(day)),
+            "renews" => Some(PlanEnd::Renews(day)),
+            _ => None,
         }
     }
 }
@@ -746,8 +756,17 @@ pub(crate) fn build_profile_entries(
             // One load for the count and its stamp: a second read could pair a
             // new count with an old date.
             let banked_resets = crate::profile_cache::claude_limit_resets_reading(name);
-            let plan_end = local_date_of((now / 1000) as i64)
-                .and_then(|today| p.plan_dates().end(today))
+            // A plan the entry's own disk body reads as canceled or refused
+            // publishes no renewal.
+            let plan_end = i64::try_from(now / 1000)
+                .ok()
+                .and_then(crate::format::local_day)
+                .and_then(|today| {
+                    p.plan_dates().end(
+                        today,
+                        crate::fallback::refuses_service_from_info(oauth_usage.as_ref()),
+                    )
+                })
                 .map(PlanEndEntry::of);
 
             ProfileEntry {

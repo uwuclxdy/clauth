@@ -736,11 +736,7 @@ fn month_label(month: u32) -> &'static str {
 /// whole days from `today` to it. A day more than half a year away also
 /// names its year.
 pub(super) fn plan_end_text(end: PlanEnd, today: NaiveDate) -> String {
-    let verb = match end {
-        PlanEnd::Ends(_) => "ends",
-        PlanEnd::Ended(_) => "ended",
-        PlanEnd::Renews(_) => "renews",
-    };
+    let verb = end.verb(today);
     let day = end.day();
     let days = (day - today).num_days();
     let date = if days.abs() > 183 {
@@ -748,9 +744,9 @@ pub(super) fn plan_end_text(end: PlanEnd, today: NaiveDate) -> String {
     } else {
         format!("{} {}", month_label(day.month()), day.day())
     };
-    match end {
-        PlanEnd::Ended(_) => format!("{verb} {date}"),
-        _ if days <= 0 => format!("{verb} today"),
+    match days {
+        ..0 => format!("{verb} {date}"),
+        0 => format!("{verb} today"),
         _ => format!("{verb} {date} ({days}d)"),
     }
 }

@@ -8809,7 +8809,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "plan_ends",
-            "5d6468b8b134899b5447ce1d331904d1af059b268b5f3670a22d9ec8a61bb029",
+            "3ab519338145b4db500fbc0f9ea8d1460e68142d1527bca829f62ed71151cd66",
         ),
         (
             "plan_renews",
@@ -9147,6 +9147,76 @@ fn a_load_writes_an_unpadded_plan_ends_in_its_canonical_form() {
     let expected = "plan_ends = \"2026-12-01\"\n";
     assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     assert_next_load_writes_nothing("endspad", &path, expected);
+}
+
+/// Both plan keys read a date typed unquoted (a TOML date) the same as a
+/// quoted one, the load leaves either spelling as written, and a save beside
+/// a bare date edits the file instead of refusing it.
+#[test]
+fn a_load_reads_a_plan_date_typed_bare_or_quoted() {
+    let _home = HomeSandbox::new();
+    for (name, body) in [
+        ("bare", "plan_ends = 2026-11-20\nplan_renews = 2026-12-15\n"),
+        (
+            "quoted",
+            "plan_ends = \"2026-11-20\"\nplan_renews = \"2026-12-15\"\n",
+        ),
+    ] {
+        let path = raw_config(name, body);
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(
+            (profile.plan_ends, profile.plan_renews),
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 20),
+                chrono::NaiveDate::from_ymd_opt(2026, 12, 15),
+            ),
+            "{name}: (plan_ends, plan_renews)"
+        );
+        assert_next_load_writes_nothing(name, &path, body);
+    }
+
+    let mut profile = load_profile(&ProfileName::from("bare")).unwrap();
+    profile.last_resort = true;
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(profile_config_path(&ProfileName::from("bare")).unwrap()).unwrap(),
+        "plan_ends = 2026-11-20\nplan_renews = \"2027-01-31\"\nlast_resort = true\n"
+    );
+}
+
+/// A TOML date-time or time where a plan date belongs is no date: the load
+/// comments it out where it sits, as typed, and keeps the account.
+#[test]
+fn a_load_comments_out_a_plan_date_typed_as_a_date_time() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "endsat",
+        "plan_ends = 2026-11-20T10:00:00\nplan_renews = 07:32:00\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("endsat")).unwrap();
+    assert_eq!((profile.plan_ends, profile.plan_renews), (None, None));
+    let expected =
+        "# plan_ends = 2026-11-20T10:00:00\n# plan_renews = 07:32:00\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endsat", &path, expected);
+}
+
+/// A plan date whose year is not four digits is no date: `26-12-15` is
+/// commented out as typed, never read as the year 26 and written back as
+/// `0026-12-15`.
+#[test]
+fn a_load_comments_out_a_plan_date_without_a_four_digit_year() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "shortyear",
+        "plan_ends = \"26-12-15\"\nplan_renews = \"202-01-05\"\n",
+    );
+    let profile = load_profile(&ProfileName::from("shortyear")).unwrap();
+    assert_eq!((profile.plan_ends, profile.plan_renews), (None, None));
+    let expected = "# plan_ends = \"26-12-15\"\n# plan_renews = \"202-01-05\"\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("shortyear", &path, expected);
 }
 
 /// The `plan_ends` scalar saves into the template in place: a set date

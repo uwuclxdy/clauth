@@ -10,7 +10,7 @@
 //! mint one-caller abstractions, so the split stands over a single grab-bag
 //! `format.rs`.
 
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
 use ratatui::text::Span;
@@ -1067,20 +1067,24 @@ pub(crate) fn group_thousands(n: f64, decimals: usize) -> String {
     out
 }
 
+/// The local calendar day of an epoch-seconds instant: the one epoch to
+/// local-date conversion, behind [`local_date`] and every plan-date
+/// comparison. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_day(epoch: i64) -> Option<NaiveDate> {
+    Some(
+        DateTime::from_timestamp(epoch, 0)?
+            .with_timezone(&Local)
+            .date_naive(),
+    )
+}
+
 /// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age
 /// spelling (an ISO date, no time). [`local_stamp`] is this plus the time of
 /// day. Returns `None` when the instant falls outside chrono's representable
 /// range.
 pub(crate) fn local_date(epoch: i64) -> Option<String> {
-    let naive = DateTime::from_timestamp(epoch, 0)?
-        .with_timezone(&Local)
-        .naive_local();
-    Some(format!(
-        "{:04}-{:02}-{:02}",
-        naive.year(),
-        naive.month(),
-        naive.day(),
-    ))
+    local_day(epoch).map(|day| format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day()))
 }
 
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as

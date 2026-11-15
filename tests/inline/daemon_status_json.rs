@@ -3004,9 +3004,11 @@ fn status_schema_agrees_with_the_serialized_body() {
 
     // One OAuth profile in the fallback chain and the auto-start queue, a
     // second chain member, and a third-party profile, with caches written
-    // through the crate's real writers so `windows` is non-empty.
+    // through the crate's real writers so `windows` is non-empty. The first
+    // carries a billing day, so the walk reaches `PlanEndEntry`.
     let mut oauth = oauth_profile("schema-oauth");
     oauth.auto_start = true;
+    oauth.plan_renews = chrono::NaiveDate::from_ymd_opt(2099, 12, 15);
     save_profile(&oauth).unwrap();
 
     let mut chain = oauth_profile("schema-chain");
@@ -3108,6 +3110,10 @@ fn status_schema_agrees_with_the_serialized_body() {
     assert!(
         body.profiles.iter().any(|e| !e.windows.is_empty()),
         "fixture never populates a window"
+    );
+    assert!(
+        body.profiles.iter().any(|e| e.plan_end.is_some()),
+        "fixture never populates a plan end"
     );
     let value = serde_json::to_value(&body).unwrap();
     assert!(
@@ -4011,58 +4017,176 @@ fn build_status_ages_a_probed_account_at_its_probe_interval() {
     assert_eq!(entry(&v, "polled")["stale"], true);
 }
 
-/// `profiles[].plan_end`: a marked `plan_ends` wins over `plan_renews`, a
-/// past billing day carries forward a month, and a profile with neither date
-/// publishes `null`.
+/// Every published entry's `(name, plan_end)`, in body order.
+fn plan_ends_of(body: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["plan_end"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn plan_day(y: i32, m: u32, d: u32) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::from_ymd_opt(y, m, d)
+}
+
+/// `profiles[].plan_end`: a coming `plan_ends` wins over `plan_renews`; a past
+/// one still publishes `ends` with its own date, unless a `plan_renews` later
+/// than it is set, which publishes that renewal; a billing day already past
+/// carries forward to its next monthly anniversary; neither date publishes
+/// `null`. Every date is hand-written, or for the carry hand-derived from the
+/// 1st of a month, which no month clamps.
 #[test]
 fn build_status_publishes_the_plan_end() {
+    use chrono::Datelike;
+
     let _home = HomeSandbox::new();
-    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
-    let mut marked = oauth_profile("marked");
-    marked.plan_ends = Some(today + chrono::Duration::days(10));
-    marked.plan_renews = Some(today + chrono::Duration::days(4));
-    let mut renewing = oauth_profile("renewing");
-    renewing.plan_renews = Some(today - chrono::Duration::days(1));
+    let (body, next_first) = crate::testutil::on_one_local_day(|today| {
+        let mut marked = oauth_profile("marked");
+        marked.plan_ends = plan_day(2099, 11, 20);
+        marked.plan_renews = plan_day(2099, 4, 10);
+        let mut ended = oauth_profile("ended");
+        ended.plan_ends = plan_day(2020, 3, 2);
+        let mut lapsed = oauth_profile("lapsed");
+        lapsed.plan_ends = plan_day(2020, 3, 2);
+        lapsed.plan_renews = plan_day(2020, 1, 15);
+        let mut resubscribed = oauth_profile("resubscribed");
+        resubscribed.plan_ends = plan_day(2020, 3, 2);
+        resubscribed.plan_renews = plan_day(2099, 12, 15);
+        // The 1st of the month before last: its next anniversary on or after
+        // today is today itself on a 1st, else the 1st of next month.
+        let this_first = today.with_day(1).unwrap();
+        let mut renewing = oauth_profile("renewing");
+        renewing.plan_renews = Some(this_first - chrono::Months::new(2));
+        let next_first = if today.day() == 1 {
+            today
+        } else {
+            this_first + chrono::Months::new(1)
+        };
+        let names = [
+            "marked",
+            "ended",
+            "lapsed",
+            "resubscribed",
+            "renewing",
+            "bare",
+        ];
+        let config = AppConfig {
+            state: AppState::default(),
+            profiles: vec![
+                marked,
+                ended,
+                lapsed,
+                resubscribed,
+                renewing,
+                oauth_profile("bare"),
+            ],
+        };
+        crate::testutil::register_names(&names);
+        (status_value(&config, 60_000, None, false), next_first)
+    });
+    let entry = |name: &str, plan_end: serde_json::Value| (name.to_string(), plan_end);
+    assert_eq!(
+        plan_ends_of(&body),
+        vec![
+            entry(
+                "marked",
+                serde_json::json!({ "kind": "ends", "date": "2099-11-20" })
+            ),
+            entry(
+                "ended",
+                serde_json::json!({ "kind": "ends", "date": "2020-03-02" })
+            ),
+            entry(
+                "lapsed",
+                serde_json::json!({ "kind": "ends", "date": "2020-03-02" })
+            ),
+            entry(
+                "resubscribed",
+                serde_json::json!({ "kind": "renews", "date": "2099-12-15" })
+            ),
+            entry(
+                "renewing",
+                serde_json::json!({
+                    "kind": "renews",
+                    "date": format!("{}-{:02}-01", next_first.year(), next_first.month()),
+                })
+            ),
+            entry("bare", serde_json::Value::Null),
+        ]
+    );
+}
+
+/// A plan whose cached `/profile` reading says it cannot serve, canceled or
+/// refused by its organization, publishes no renewal: the billing day it
+/// would roll is a guess that reading overrules. A marked end still
+/// publishes, and an active reading keeps the renewal.
+#[test]
+fn build_status_publishes_no_renewal_for_a_plan_that_cannot_serve() {
+    let _home = HomeSandbox::new();
+    let reading = |status: &str| crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
+            subscription_status: Some(status.to_string()),
+            codex_plan: None,
+            email: None,
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    let renewing = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.plan_renews = plan_day(2099, 12, 15);
+        p
+    };
+    let mut canceled_ending = renewing("canceled-ending");
+    canceled_ending.plan_ends = plan_day(2099, 11, 20);
     let config = AppConfig {
         state: AppState::default(),
-        profiles: vec![marked, renewing, oauth_profile("bare")],
+        profiles: vec![
+            renewing("canceled"),
+            renewing("refused"),
+            canceled_ending,
+            renewing("active"),
+        ],
     };
-    crate::testutil::register_names(&["marked", "renewing", "bare"]);
-    let body = status_value(&config, 60_000, None, false);
-    let entry = |name: &str| -> serde_json::Value {
-        body["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == name)
-            .unwrap_or_else(|| panic!("{name} is published"))
-            .clone()
-    };
-    assert_eq!(
-        entry("marked")["plan_end"],
-        serde_json::json!({
-            "kind": "ends",
-            "date": crate::usage::render_plan_date(today + chrono::Duration::days(10)),
-        })
-    );
-    let next = crate::usage::PlanDates {
-        ends: None,
-        renews: Some(today - chrono::Duration::days(1)),
+    crate::testutil::register_names(&["canceled", "refused", "canceled-ending", "active"]);
+    for (name, status) in [
+        ("canceled", "canceled"),
+        ("refused", crate::usage::ORG_REFUSED_STATUS),
+        ("canceled-ending", "canceled"),
+        ("active", "active"),
+    ] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &reading(status),
+        );
     }
-    .end(today)
-    .expect("a billing day renews");
+    let body = status_value(&config, 60_000, None, false);
+    let entry = |name: &str, plan_end: serde_json::Value| (name.to_string(), plan_end);
     assert_eq!(
-        entry("renewing")["plan_end"],
-        serde_json::json!({
-            "kind": "renews",
-            "date": crate::usage::render_plan_date(next.day()),
-        })
+        plan_ends_of(&body),
+        vec![
+            entry("canceled", serde_json::Value::Null),
+            entry("refused", serde_json::Value::Null),
+            entry(
+                "canceled-ending",
+                serde_json::json!({ "kind": "ends", "date": "2099-11-20" })
+            ),
+            entry(
+                "active",
+                serde_json::json!({ "kind": "renews", "date": "2099-12-15" })
+            ),
+        ]
     );
-    assert!(
-        next.day() > today,
-        "yesterday's billing day carried forward a month"
-    );
-    assert_eq!(entry("bare")["plan_end"], serde_json::Value::Null);
 }
 
 /// A claude entry publishes the count its `limit_resets.json` holds: a reading

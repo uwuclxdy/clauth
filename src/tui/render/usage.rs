@@ -1499,7 +1499,7 @@ fn header_lines(
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
-    // as a real plan on the one row an operator checks their plan from.
+    // as a real plan on the one row a user checks their plan from.
     let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
@@ -1508,25 +1508,27 @@ fn header_lines(
     let plan_key = key_span("plan");
     let mut left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
-    // When the plan ends or renews, beside its name while the row has room.
-    if let Some((text, style)) = plan_end_tail(profile) {
+    let row_w = usize::from(inner_w);
+    // A plan with no 5h limit has no window the kick could open, and no kick
+    // leg spends a chain clauth never spends, so either way the countdown
+    // would name a kick that never fires.
+    let kick = (profile.has_effective_auto_start()
+        && !readings.no_five_hour_limit(profile.name.as_str()))
+    .then(|| kick_text(profile, header, readings));
+    // When the plan ends or renews, beside its name in the room the countdown
+    // leaves: the countdown and its gap stay reserved, so the date drops
+    // before the countdown shortens.
+    let kick_room = kick.as_deref().map_or(0, |k| grapheme_cells(k) + KICK_GAP);
+    if let Some((text, style)) = plan_end_tail(profile, readings) {
         let tail = format!(" · {text}");
         let tail_w = grapheme_cells(&tail);
-        if left_w + tail_w <= inner_w as usize {
+        if left_w + tail_w + kick_room <= row_w {
             left_w += tail_w;
             plan_spans.push(Span::styled(tail, style));
         }
     }
-    // A plan with no 5h limit has no window the kick could open, and no kick
-    // leg spends a chain clauth never spends, so either way the countdown
-    // would name a kick that never fires.
-    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
-    if profile.has_effective_auto_start() && !no_five_hour_limit {
-        plan_spans.extend(kick_spans(
-            &kick_text(profile, header, readings),
-            left_w,
-            inner_w as usize,
-        ));
+    if let Some(kick) = kick {
+        plan_spans.extend(kick_spans(&kick, left_w, row_w));
     }
     let mut lines = vec![Line::from(plan_spans)];
     if let Some(peak) = header.peak {
@@ -1537,14 +1539,17 @@ fn header_lines(
 }
 
 /// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: a plan
-/// marked ending in the warning color, a renewal faint. `None` when the
-/// profile carries neither `plan_ends` nor `plan_renews`.
-fn plan_end_tail(profile: &Profile) -> Option<(String, Style)> {
-    let today = crate::usage::local_date_of(now_epoch_secs())?;
-    let end = profile.plan_dates().end(today)?;
+/// marked ending in the warning color, a renewal faint. `None` when no date
+/// applies, a renewal included on a plan whose reading says it cannot serve
+/// (the status the Overview's `⊖` marks).
+fn plan_end_tail(profile: &Profile, readings: &ReadingsSnapshot) -> Option<(String, Style)> {
+    let today = crate::format::local_day(now_epoch_secs())?;
+    let refuses_service =
+        crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name));
+    let end = profile.plan_dates().end(today, refuses_service)?;
     let style = match end {
         PlanEnd::Renews(_) => theme::faint(),
-        PlanEnd::Ends(_) | PlanEnd::Ended(_) => theme::warning(),
+        PlanEnd::Ends(_) => theme::warning(),
     };
     Some((plan_end_text(end, today), style))
 }
@@ -1741,20 +1746,23 @@ fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapsho
     }
 }
 
+/// The house minimum gap, in cells, between the `plan` row's left content and
+/// its flush-right countdown.
+const KICK_GAP: usize = 3;
+
 /// Spans putting `text` flush against the pane's right edge on the `plan` row,
-/// keeping the house 3-cell minimum gap from the row's left content. Truncates
-/// with `…` when the row can't hold both; drops the kick when not even a
-/// countdown hint fits.
+/// keeping the [`KICK_GAP`] from the row's left content. Truncates with `…`
+/// when the row can't hold both; drops the kick when not even a countdown hint
+/// fits.
 fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
-    let avail = inner_w.saturating_sub(left_w);
-    if avail < 3 {
+    let Some(room) = inner_w.saturating_sub(left_w).checked_sub(KICK_GAP) else {
         return Vec::new();
-    }
-    let text = truncate(text, avail - 3);
+    };
+    let text = truncate(text, room);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - Span::raw(&text).width();
+    let pad = room.saturating_sub(Span::raw(&text).width()) + KICK_GAP;
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),

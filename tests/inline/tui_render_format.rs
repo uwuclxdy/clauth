@@ -916,7 +916,7 @@ fn plan_end_text_names_the_day_and_the_days_left() {
     );
     assert_eq!(plan_end_text(PlanEnd::Ends(today), today), "ends today");
     assert_eq!(
-        plan_end_text(PlanEnd::Ended(day(2026, 11, 2)), today),
+        plan_end_text(PlanEnd::Ends(day(2026, 11, 2)), today),
         "ended nov 2"
     );
     assert_eq!(
