@@ -36,8 +36,10 @@ That writes these files, as bundled in the clauth binary, to `clauth/` beside Re
 stops the running watcher, and reloads Rex, which starts a fresh one. With no `rex` CLI on
 `PATH` there is no reload, so no watcher runs until you run `rex config reload`.
 `clauth rex uninstall` takes the files and the block back out, stops the watcher and removes its
-state directory. It refuses while `init.lua` loads the module outside clauth's block. See the
-[wiki page](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) for the details.
+state directory. It refuses while a string outside a comment and outside clauth's block in
+`init.lua` names `clauth`, and while the block holds a line clauth did not write. Both commands
+read `init.lua` the way Rex's Lua lexes it, and refuse a file whose markers do not pair up. See
+the [wiki page](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) for the details.
 
 To develop against a checkout instead, link it in place of the installed copy (install then
 refuses to overwrite the link):

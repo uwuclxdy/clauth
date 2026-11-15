@@ -24,7 +24,9 @@ It shows what it will write and asks `[y/N]` first; `--yes` skips the prompt and
 
 Rex's own rules pick the files: `REX_CONFIG` names `init.lua` when set, else `$XDG_CONFIG_HOME/rex/init.lua`, else `~/.config/rex/init.lua`.
 
-Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone. An `init.lua` that is itself a symlink, such as one into a dotfiles checkout, is written in place, so the link and the file's mode stay.
+Install and uninstall read `init.lua` the way Rex's Lua (gopher-lua) lexes it, so a marker or a `require` inside a comment or a string is neither, and a line comment ends at a lone `\r` as at a `\n`. A marker counts only as a comment that starts its line, and each begin line has to reach its end line before the next begin. A file whose markers do not pair up that way, or that Rex's Lua could not load either (a string or a long comment that never closes), is refused before either command changes anything, naming the line.
+
+Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone; any spelling of the call counts, `require "clauth"` or one split over lines too. An `init.lua` that is itself a symlink, such as one into a dotfiles checkout, is written in place, so the link and the file's mode stay.
 
 ## Updates
 
@@ -38,7 +40,7 @@ clauth rex uninstall
 
 Takes clauth's block out of `init.lua`, leaving the rest of the file as it was, and removes the `clauth/` directory when clauth wrote it. It stops the pane-label watcher and removes its state directory, `~/.local/state/clauth-rex/` (`$XDG_STATE_HOME/clauth-rex/` when that is set). A `clauth/` that clauth did not write (a link onto a checkout, or a directory without clauth's `.clauth-managed` marker) keeps its watcher and state. `--yes` skips the prompt, and is required on a non-TTY stdin or stdout.
 
-Uninstall refuses, before it changes anything, while `init.lua` would still load the module once `clauth/` is gone: a `require("clauth")` of your own outside clauth's block, or a block whose end line was cut. It prints the line to take out; Rex's next config load would otherwise fail on a module that is no longer there.
+Uninstall refuses, before it changes anything, while `init.lua` may still load the module once `clauth/` is gone: any string naming `clauth` outside a comment and outside clauth's block counts, since every spelling of a load names the module somewhere (a `local m = "clauth"` handed to `require(m)`, a `dofile` of a path into `clauth/`). A string naming it for another reason costs a refusal too. It also refuses a block holding a line clauth did not write, which would otherwise go with the block. It prints the line to move or take out; Rex's next config load would otherwise fail on a module that is no longer there.
 
 ## Actions and keys
 
@@ -54,7 +56,7 @@ A new Claude Code pane starts with `clauth start --auto --with-fallback`: the fi
 
 ## Options
 
-Replace the managed block with your own `require` to pass options; install then leaves the file alone. Take your `require` out before `clauth rex uninstall`, which refuses while it is there.
+Replace the managed block with your own `require` to pass options; install then leaves the file alone. Write it outside the block's markers: uninstall refuses a block holding a line clauth did not write, the block's own `require` edited included. Take your `require` out before `clauth rex uninstall`, which refuses while it is there.
 
 ```lua
 require("clauth").setup{
