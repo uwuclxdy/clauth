@@ -1132,17 +1132,26 @@ fn uninstall_leaves_a_linked_checkouts_watcher() {
 fn a_watcher_that_will_not_stop_keeps_its_pidfile() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let state = tmp.path().join("state");
+    // The script touches `ready` once its trap is set: a TERM sent before
+    // `sh` reached the `trap` would kill it, as it did 2 runs in 3 on Linux.
+    let ready = tmp.path().join("ready");
     let mut stubborn = std::process::Command::new("sh")
         .args([
             "-c",
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; : >\"$1\"; while :; do sleep 1; done",
             "tag-watch.lua",
         ])
+        .arg(&ready)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn stubborn watcher");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "the trap was never set");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let pidfile = record(&state, "1", stubborn.id());
     let watchers = running_watchers(&state, &crate::which::SystemProcs);
     assert_eq!(watchers.len(), 1);
