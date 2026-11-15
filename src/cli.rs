@@ -872,14 +872,16 @@ pub(crate) enum RexCommand {
     /// directory clauth did not write, or a symlink onto a checkout, refuses
     /// the install rather than being overwritten.
     Install {
-        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },
 
     /// Remove the plugin and the block install added to init.lua
     Uninstall {
-        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },
