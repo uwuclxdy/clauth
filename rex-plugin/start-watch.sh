@@ -85,15 +85,26 @@ watcher_alive() {
     return 1
 }
 
+stale() {
+    [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]
+}
+
 # mkdir is atomic, so two loads racing on a stale pidfile start one watcher.
-# A lock older than a minute was left by a killed run and is taken over.
+# A lock older than a minute was left by a killed run and is taken over. The
+# takeover renames it first: of two loads that both find it stale, only one
+# rename succeeds, and the other backs off. A rename that caught a fresh lock
+# instead (a third load took it meanwhile) puts a lock back for that load,
+# whose exit removes it, and backs off too.
 if ! mkdir "$lock" 2>/dev/null; then
-    if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-        rmdir "$lock" 2>/dev/null
-        mkdir "$lock" 2>/dev/null || exit 0
-    else
+    stale "$lock" || exit 0
+    mv "$lock" "$lock.$$" 2>/dev/null || exit 0
+    if ! stale "$lock.$$"; then
+        mkdir "$lock" 2>/dev/null
+        rmdir "$lock.$$" 2>/dev/null
         exit 0
     fi
+    rmdir "$lock.$$" 2>/dev/null
+    mkdir "$lock" 2>/dev/null || exit 0
 fi
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 
