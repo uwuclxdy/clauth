@@ -639,6 +639,12 @@ pub(crate) fn install_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<b
 
     std::fs::create_dir_all(&paths.plugin)
         .with_context(|| format!("create {}", paths.plugin.display()))?;
+    // The marker goes first: an install cut short after it leaves a dir a
+    // rerun recognizes as clauth's and finishes, where one cut short before
+    // it would leave a dir every rerun refuses as not written by clauth.
+    let marker = format!("{MARKER_PREFIX}{}\n", env!("CARGO_PKG_VERSION"));
+    crate::profile::atomic_write(&paths.plugin.join(MARKER), marker)
+        .with_context(|| format!("write {}", paths.plugin.join(MARKER).display()))?;
     for (name, contents, executable) in FILES {
         let path = paths.plugin.join(name);
         crate::profile::atomic_write(&path, contents)
@@ -647,9 +653,6 @@ pub(crate) fn install_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<b
             make_executable(&path)?;
         }
     }
-    let marker = format!("{MARKER_PREFIX}{}\n", env!("CARGO_PKG_VERSION"));
-    crate::profile::atomic_write(&paths.plugin.join(MARKER), marker)
-        .with_context(|| format!("write {}", paths.plugin.join(MARKER).display()))?;
     if let Some(text) = wired {
         write_init(&paths.init, &text)?;
     }
