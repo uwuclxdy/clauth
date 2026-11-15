@@ -1116,6 +1116,70 @@ fn a_clauth_on_the_inherited_path_wins_over_the_install_dirs() {
     assert_eq!(out, "new\tglobal\tclaude\n");
 }
 
+/// Runs the real `start-watch.sh` as the child of a stand-in Rex server whose
+/// argv is `server_args`, with a stand-in `rex` that records the argv the
+/// watcher gets. Returns that argv.
+#[cfg(unix)]
+fn watcher_argv(server_args: &[&str]) -> Vec<String> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rex = fake_rex(
+        tmp.path(),
+        "printf '%s\\n' \"$@\" >\"$(dirname \"$0\")/argv.tmp\"\nmv \"$(dirname \"$0\")/argv.tmp\" \"$(dirname \"$0\")/argv\"\n",
+    );
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/rex-plugin/start-watch.sh");
+    // `sh -c` with a second command after the script never execs into it, so
+    // the script's parent is this sh, whose argv carries the server's flags.
+    let status = std::process::Command::new("sh")
+        .args(["-c", "sh \"$0\"; wait", script])
+        .args(server_args)
+        .env("HOME", tmp.path())
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("CLAUTH_REX_BIN", &rex)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("start-watch.sh runs");
+    assert!(status.success());
+    // The watcher runs in the background: wait for its argv.
+    let argv = tmp.path().join("argv");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !argv.exists() {
+        assert!(Instant::now() < deadline, "the watcher never started");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::read_to_string(&argv)
+        .expect("argv")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The watcher is pinned to whatever `--listen` the server names: macOS's
+/// `unix://` URL, Linux's bare shared-server path, or a path with a space in
+/// it, in either `--listen X` or `--listen=X` form.
+#[cfg(unix)]
+#[test]
+fn the_watcher_is_pinned_to_any_listen_address() {
+    for listen in [
+        "unix:///Users/u/Library/Application%20Support/rex/server.sock",
+        "/run/rex/server.sock",
+        "/tmp/rex dir/server.sock",
+    ] {
+        for args in [
+            vec!["server", "run", "--listen", listen, "--log-format", "text"],
+            vec!["server", "run", "--listen", listen],
+        ] {
+            let argv = watcher_argv(&args);
+            assert_eq!(argv[..3], ["--server", listen, "do"], "{args:?}");
+        }
+        let joined = format!("--listen={listen}");
+        let argv = watcher_argv(&["server", "run", &joined, "--max-panes", "64"]);
+        assert_eq!(argv[..3], ["--server", listen, "do"], "{joined}");
+    }
+    // A server with no --listen runs on Rex's default address.
+    let argv = watcher_argv(&["server", "run", "--log-format", "text"]);
+    assert_eq!(argv[0], "do");
+}
+
 /// The script's answer when `clauth which --pid 100 --json` prints `json`.
 /// The join itself is the Rust resolver's, pinned by `which::tests`; these
 /// pin what the script asks for and how it maps the answer onto the

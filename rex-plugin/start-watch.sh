@@ -38,8 +38,27 @@ server_bin() {
     fi
 }
 
-server_args=$(proc_args "$PPID")
-listen=$(printf '%s\n' "$server_args" | sed -n 's/.*--listen[ =]\(unix:[^ ]*\).*/\1/p')
+# The server's --listen value, whatever its form: a `unix://` URL on macOS, a
+# bare socket path such as Linux's shared /run/rex/server.sock. /proc keeps
+# each argument whole; ps joins them with spaces, so there the value runs to
+# the next flag, which keeps a path with a space in it.
+listen_of() {
+    if [ -r "/proc/$1/cmdline" ]; then
+        tr '\0' '\n' <"/proc/$1/cmdline" | awk '
+            take { print; exit }
+            $0 == "--listen" { take = 1; next }
+            sub(/^--listen=/, "") { print; exit }'
+    else
+        ps -o args= -p "$1" 2>/dev/null | awk '
+            match($0, / --listen[ =]/) {
+                v = substr($0, RSTART + RLENGTH)
+                sub(/ --.*/, "", v)
+                print v
+            }'
+    fi
+}
+
+listen=$(listen_of "$PPID")
 
 rex_bin="${CLAUTH_REX_BIN:-}"
 if [ -z "$rex_bin" ]; then
