@@ -343,10 +343,30 @@ fn state_in(dir: &Path) -> PathBuf {
 
 #[test]
 fn block_appends_to_an_existing_config_and_keeps_it() {
+    let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")\n";
+    let text = with_block(existing).expect("appended");
+    assert_eq!(text, format!("{existing}{}", block()));
+}
+
+/// A file with no final newline gets the block on lines of its own, and
+/// gets its missing newline back when the block comes out.
+#[test]
+fn a_config_without_a_final_newline_round_trips() {
     let existing = "rex.bind(\"cmd+e\", \"pane.zoom\")";
     let text = with_block(existing).expect("appended");
-    assert!(text.starts_with("rex.bind(\"cmd+e\", \"pane.zoom\")\n"));
-    assert!(text.ends_with(&block()));
+    assert!(text.starts_with(&format!("{existing}\n{BLOCK_BEGIN}\n")));
+    assert_eq!(block_at(&text), BlockAt::Whole { begin: 1, end: 3 });
+    assert_eq!(without_block(&text), (existing.to_string(), true));
+
+    // A line written after the block keeps everything before it as it was.
+    let edited = format!("{text}\nrex.bind(\"cmd+k\", \"pane.close\")\n");
+    assert_eq!(
+        without_block(&edited),
+        (
+            format!("{existing}\nrex.bind(\"cmd+k\", \"pane.close\")\n"),
+            true
+        )
+    );
 }
 
 #[test]
@@ -355,17 +375,69 @@ fn block_is_not_appended_twice() {
     assert_eq!(with_block(&once), None);
 }
 
+/// Install and uninstall read the markers alike: a begin line an editor left
+/// a trailing space or a CRLF on is still the block, so a reinstall appends
+/// no second one, and uninstall takes it out.
+#[test]
+fn a_marker_line_with_trailing_whitespace_is_still_the_block() {
+    for end in [" ", "\t", "\r"] {
+        let text = format!(
+            "-- mine\n{BLOCK_BEGIN}{end}\nrequire(\"clauth\").setup{{}}\n{BLOCK_END}{end}\n"
+        );
+        assert_eq!(with_block(&text), None, "{end:?}");
+        assert_eq!(
+            without_block(&text),
+            ("-- mine\n".to_string(), true),
+            "{end:?}"
+        );
+    }
+}
+
 #[test]
 fn a_hand_written_require_is_left_alone() {
     for existing in [
         "require(\"clauth\").setup{ tag = false }\n",
         "local c = require('clauth')\nc.setup{}\n",
+        "require\"clauth\".setup{}\n",
+        "require 'clauth'.setup{}\n",
+        "local c = require ( \"clauth\" )\n",
+        "require [[clauth]].setup{}\n",
+        // A `--` inside a string starts no comment.
+        "local s = \"--\"; require(\"clauth\").setup{}\n",
+        // Code after a block comment's close is code.
+        "--[[ old ]] require(\"clauth\").setup{}\n",
     ] {
         assert!(loads_plugin(existing), "{existing}");
         assert_eq!(with_block(existing), None, "{existing}");
     }
-    // A commented-out require does not load anything.
-    assert!(!loads_plugin("-- require(\"clauth\").setup{}\n"));
+}
+
+/// A require that sits in a comment, or merely names a longer module, loads
+/// nothing, so install still appends the block.
+#[test]
+fn a_require_that_loads_nothing_is_not_taken_for_one() {
+    for existing in [
+        "-- require(\"clauth\").setup{}\n",
+        "--[[\nrequire(\"clauth\").setup{}\n]]\n",
+        "--[==[\nrequire(\"clauth\").setup{}\n]] still the comment\n]==]\n",
+        "--[[ require('clauth') ]]\n",
+        "require(\"clauth.extra\")\n",
+        "my_require(\"clauth\")\n",
+    ] {
+        assert!(!loads_plugin(existing), "{existing}");
+        assert!(with_block(existing).is_some(), "{existing}");
+    }
+}
+
+#[test]
+fn the_loading_line_is_named_by_its_place_in_the_file() {
+    let existing = "--[[\nnotes\n]]\nlocal c = require(\"clauth\")  \nc.setup{}\n";
+    assert_eq!(
+        loading_line(existing),
+        Some((4, "local c = require(\"clauth\")"))
+    );
+    // clauth's own block is no hand-written require.
+    assert_eq!(loading_line(&format!("-- mine\n{}", block())), None);
 }
 
 #[test]
@@ -552,6 +624,84 @@ fn uninstall_leaves_a_foreign_directory() {
     assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
     assert_eq!(std::fs::read_to_string(&paths.init).expect("init.lua"), "");
     assert_eq!(plugin_at(&paths.plugin), PluginDir::Foreign);
+}
+
+/// The options recipe: a hand-written `require("clauth").setup{ ... }` in
+/// place of the block. Removing `clauth/` under it would leave Rex's next
+/// config load requiring a module that is gone, so uninstall refuses before
+/// it changes anything, and names the line.
+#[test]
+fn uninstall_refuses_while_init_lua_still_loads_the_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+    let hand_written =
+        "rex.bind(\"cmd+e\", \"pane.zoom\")\nrequire(\"clauth\").setup{ tag = false }\n";
+    for existing in [
+        hand_written.to_string(),
+        // Beside the block too: taking the block out leaves this one.
+        format!("{hand_written}{}", block()),
+    ] {
+        std::fs::write(&paths.init, &existing).expect("seed init.lua");
+        let err = uninstall_at(&paths, &state, true).expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("at line 2"), "{message}");
+        assert!(
+            message.contains("require(\"clauth\").setup{ tag = false }"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.init).expect("init.lua"),
+            existing,
+            "init.lua untouched"
+        );
+        assert!(
+            matches!(plugin_at(&paths.plugin), PluginDir::Managed { .. }),
+            "the plugin stays"
+        );
+    }
+}
+
+/// A block whose end line was cut is left whole by `without_block`, so its
+/// require would outlive the dir just the same.
+#[test]
+fn uninstall_refuses_an_unterminated_block() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    assert!(install_at(&paths, &state, true).expect("install"));
+    let cut = format!("-- mine\n{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\n");
+    std::fs::write(&paths.init, &cut).expect("seed init.lua");
+
+    let err = uninstall_at(&paths, &state, true).expect_err("refused");
+    assert!(err.to_string().contains("starting at line 2"), "{err}");
+    assert_eq!(std::fs::read_to_string(&paths.init).expect("init.lua"), cut);
+    assert!(matches!(
+        plugin_at(&paths.plugin),
+        PluginDir::Managed { .. }
+    ));
+}
+
+/// A plugin dir clauth did not write stays whatever uninstall does, so a
+/// hand-written require of it keeps loading and is no reason to refuse.
+#[cfg(unix)]
+#[test]
+fn a_hand_written_require_of_a_linked_checkout_does_not_block_uninstall() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = paths_in(tmp.path());
+    let state = state_in(tmp.path());
+    let checkout = tmp.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    std::os::unix::fs::symlink(&checkout, &paths.plugin).expect("link");
+    let hand_written = "require(\"clauth\").setup{ tag = false }\n";
+    std::fs::write(&paths.init, format!("{hand_written}{}", block())).expect("seed init.lua");
+
+    assert!(uninstall_at(&paths, &state, true).expect("uninstall"));
+    assert_eq!(
+        std::fs::read_to_string(&paths.init).expect("init.lua"),
+        hand_written
+    );
 }
 
 /// A stand-in watcher: a child whose argv names `tag-watch.lua`, the way

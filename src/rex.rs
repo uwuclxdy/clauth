@@ -361,34 +361,165 @@ pub(crate) fn block() -> String {
     format!("{BLOCK_BEGIN}\nrequire(\"clauth\").setup{{}}\n{BLOCK_END}\n")
 }
 
-/// Whether `init.lua` already loads the module outside clauth's block, as a
-/// hand-written `require("clauth").setup{ ... }` with the user's options does.
+/// Where clauth's block sits in `init.lua`, by 0-based line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockAt {
+    Absent,
+    Whole {
+        begin: usize,
+        end: usize,
+    },
+    /// A begin marker with no end marker after it: a hand edit cut the end.
+    Unterminated {
+        begin: usize,
+    },
+}
+
+/// Finds the block. Install and uninstall both read the markers through
+/// here, so a line one of them takes for a marker the other does too (a
+/// trailing space or a CRLF included).
+fn block_at(existing: &str) -> BlockAt {
+    let mut lines = existing.lines().map(str::trim_end).enumerate();
+    let Some(begin) = lines
+        .by_ref()
+        .find_map(|(n, line)| (line == BLOCK_BEGIN).then_some(n))
+    else {
+        return BlockAt::Absent;
+    };
+    match lines.find_map(|(n, line)| (line == BLOCK_END).then_some(n)) {
+        Some(end) => BlockAt::Whole { begin, end },
+        None => BlockAt::Unterminated { begin },
+    }
+}
+
+/// The first line outside clauth's block that loads the module, as a
+/// hand-written `require("clauth").setup{ ... }` with the user's options
+/// does: its 1-based number and its text. Comments load nothing, so a
+/// `-- require("clauth")` or one inside `--[[ ]]` does not count.
+fn loading_line(existing: &str) -> Option<(usize, &str)> {
+    let ours = match block_at(existing) {
+        BlockAt::Whole { begin, end } => Some(begin..=end),
+        BlockAt::Absent | BlockAt::Unterminated { .. } => None,
+    };
+    let code = lua_code(existing);
+    code.split('\n')
+        .zip(existing.split('\n'))
+        .enumerate()
+        .find(|(n, (code, _))| {
+            !ours.as_ref().is_some_and(|block| block.contains(n)) && requires_clauth(code)
+        })
+        .map(|(n, (_, line))| (n + 1, line.trim_end()))
+}
+
+/// Whether `init.lua` already loads the module outside clauth's block.
 /// Install then leaves the file alone rather than loading it twice.
 pub(crate) fn loads_plugin(existing: &str) -> bool {
-    without_block(existing).0.lines().any(|line| {
-        let code = line.split("--").next().unwrap_or_default();
-        [
-            "require(\"clauth\")",
-            "require('clauth')",
-            "require \"clauth\"",
-            "require 'clauth'",
-        ]
-        .iter()
-        .any(|form| code.contains(form))
+    loading_line(existing).is_some()
+}
+
+/// Whether one line of Lua code (comments already blanked) calls
+/// `require("clauth")`, in any of the call's spellings: `require "clauth"`,
+/// `require'clauth'`, `require [[clauth]]`.
+fn requires_clauth(code: &str) -> bool {
+    code.match_indices("require").any(|(at, word)| {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        if code[..at].chars().next_back().is_some_and(ident) {
+            return false;
+        }
+        let mut rest = code[at + word.len()..].trim_start();
+        if let Some(inner) = rest.strip_prefix('(') {
+            rest = inner.trim_start();
+        }
+        ["\"clauth\"", "'clauth'", "[[clauth]]"]
+            .iter()
+            .any(|arg| rest.starts_with(arg))
     })
 }
 
-/// `existing` with clauth's block appended, or `None` when it is already
-/// there or the user loads the module themselves.
+/// `text` with its Lua comments blanked out and every line break kept, so
+/// line `n` of the result is line `n` of `text`. Strings stay, since one
+/// names the module in `require("clauth")`, and a `--` inside one starts no
+/// comment.
+fn lua_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let (keep, len) = if let Some(body) = rest.strip_prefix("--") {
+            // A comment runs to its long bracket's close (`--[[ ]]`,
+            // `--[==[ ]==]`), else to the end of the line.
+            let len = match long_open(body) {
+                Some((open, level)) => open + long_close_end(&body[open..], level),
+                None => body.find('\n').unwrap_or(body.len()),
+            };
+            (false, 2 + len)
+        } else if let Some((open, level)) = long_open(rest) {
+            (true, open + long_close_end(&rest[open..], level))
+        } else if c == '"' || c == '\'' {
+            (true, short_string_len(rest))
+        } else {
+            (true, c.len_utf8())
+        };
+        let (taken, tail) = rest.split_at(len);
+        if keep {
+            out.push_str(taken);
+        } else {
+            out.extend(taken.chars().filter(|&c| c == '\n'));
+        }
+        rest = tail;
+    }
+    out
+}
+
+/// The long bracket opening `text` (`[[`, `[=[`, ...): its length and level.
+fn long_open(text: &str) -> Option<(usize, usize)> {
+    let body = text.strip_prefix('[')?;
+    let level = body.len() - body.trim_start_matches('=').len();
+    body[level..].starts_with('[').then_some((level + 2, level))
+}
+
+/// How far into `text` a long bracket of `level` closes, past its `]=*]`,
+/// or all of `text` when it never does.
+fn long_close_end(text: &str, level: usize) -> usize {
+    let close = format!("]{}]", "=".repeat(level));
+    text.find(&close).map_or(text.len(), |at| at + close.len())
+}
+
+/// The length of the quoted string opening `text`, through its closing
+/// quote, or to the end of the line when it never closes. A backslash
+/// escapes the byte after it.
+fn short_string_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let quote = bytes[0];
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\n' => return i,
+            b if b == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    // Every stop above is an ASCII byte, so a char boundary; this one is
+    // the end of `text`.
+    text.len()
+}
+
+/// `existing` with clauth's block appended, or `None` when a block is
+/// already there (whole or cut short) or the user loads the module
+/// themselves.
 pub(crate) fn with_block(existing: &str) -> Option<String> {
-    if existing.lines().any(|line| line == BLOCK_BEGIN) || loads_plugin(existing) {
+    if block_at(existing) != BlockAt::Absent || loads_plugin(existing) {
         return None;
     }
     let mut text = existing.to_string();
+    let mut block = block();
     if !text.is_empty() && !text.ends_with('\n') {
+        // The block needs a line of its own. It then ends without a final
+        // newline of its own, which tells uninstall to take this one back.
         text.push('\n');
+        block.pop();
     }
-    text.push_str(&block());
+    text.push_str(&block);
     Some(text)
 }
 
@@ -396,19 +527,40 @@ pub(crate) fn with_block(existing: &str) -> Option<String> {
 /// lines from the begin marker through the end marker go; an unterminated
 /// block (a hand edit cut the end line) is left whole rather than guessed at.
 pub(crate) fn without_block(existing: &str) -> (String, bool) {
+    let BlockAt::Whole { begin, end } = block_at(existing) else {
+        return (existing.to_string(), false);
+    };
     let lines: Vec<&str> = existing.split_inclusive('\n').collect();
-    let Some(begin) = lines.iter().position(|l| l.trim_end() == BLOCK_BEGIN) else {
-        return (existing.to_string(), false);
-    };
-    let Some(len) = lines[begin..]
-        .iter()
-        .position(|l| l.trim_end() == BLOCK_END)
-    else {
-        return (existing.to_string(), false);
-    };
     let mut text: String = lines[..begin].concat();
-    text.push_str(&lines[begin + len + 1..].concat());
+    let after = lines[end + 1..].concat();
+    if after.is_empty() && !lines[end].ends_with('\n') && text.ends_with('\n') {
+        // The block ends the file with no final newline: install put it on
+        // a line of its own after a file that had none (see `with_block`).
+        text.pop();
+    }
+    text.push_str(&after);
     (text, true)
+}
+
+/// Why uninstall will not remove a managed plugin dir yet, when `init.lua`
+/// would still load the module once the dir is gone: Rex's next config load
+/// would then fail on a `require` of nothing.
+fn still_loaded(init: &Path, existing: &str) -> Option<String> {
+    if let BlockAt::Unterminated { begin } = block_at(existing) {
+        return Some(format!(
+            "{} has clauth's block starting at line {} but no `{BLOCK_END}` line after it; \
+             take that block out by hand, then rerun",
+            init.display(),
+            begin + 1
+        ));
+    }
+    let (line, text) = loading_line(existing)?;
+    Some(format!(
+        "{} still loads the plugin outside clauth's block, at line {line}:\n    {text}\n\
+         take that out first, then rerun; removing the plugin would leave it requiring a \
+         module that is gone",
+        init.display()
+    ))
 }
 
 /// Writes the plugin and wires `init.lua`, after the confirm, then stops any
@@ -490,12 +642,17 @@ fn write_init(path: &Path, text: &str) -> Result<()> {
 /// stops the watcher and removes its state directory, which would otherwise
 /// keep labelling panes with no resolver beside it. A linked or foreign
 /// plugin directory keeps its watcher and state: that checkout runs them.
-/// Returns false when the user declined or there was nothing to remove.
+/// Refuses, before it changes anything, to remove a managed directory that
+/// `init.lua` would still load. Returns false when the user declined or there
+/// was nothing to remove.
 pub(crate) fn uninstall_at(paths: &Paths, state_dir: &Path, yes: bool) -> Result<bool> {
     let existing = read_optional(&paths.init)?;
     let (unwired, had_block) = without_block(&existing);
     let dir = plugin_at(&paths.plugin);
     let managed = matches!(dir, PluginDir::Managed { .. });
+    if managed && let Some(reason) = still_loaded(&paths.init, &existing) {
+        bail!("{reason}");
+    }
     if !had_block && !managed {
         outln!("clauth: no Rex plugin from clauth to remove");
         if dir != PluginDir::Absent {
