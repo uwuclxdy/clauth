@@ -146,7 +146,7 @@ function M.setup(user)
     name = "clauth_claude",
     title = "New Claude Code pane (clauth)",
     description = "Split a pane running Claude Code through clauth, "
-      .. "on the account with the most headroom.",
+      .. "on the first fallback-chain member with headroom.",
     category = "clauth",
     keywords = "claude agent account subscription",
     args = { direction = "string?", profile = "string?" },

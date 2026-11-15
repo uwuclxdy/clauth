@@ -198,7 +198,7 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
 - **`rex install`** writes the Rex plugin bundled in the binary to `clauth/` beside Rex's `init.lua` and appends one marked `require("clauth")` block that loads it, after a `[y/N]`.
   - **Rex support is experimental**: nothing heals or updates the install on its own, the Services tab's `rex` row only reports it (naming `clauth rex install` when it is missing or stale), and a new Rex build can break it.
   - The plugin opens Claude Code through `clauth start --auto --with-fallback`, shows the dashboard in a floating pane, and labels each pane with the account it spends.
-  - Rerun it after upgrading clauth to refresh the files; it stops the running pane-label watcher so Rex's reload starts one on the new files. **`rex uninstall`** takes the block and the files back out, stops the watcher and removes its state under `~/.local/state/clauth-rex/`. `--yes` skips the prompt for either.
+  - Rerun it after upgrading clauth to refresh the files; it stops the running pane-label watcher so Rex's reload starts one on the new files. **`rex uninstall`** takes the block and the files back out, stops the watcher and removes its state under `~/.local/state/clauth-rex/`; it refuses while `init.lua` loads the module outside clauth's block. `--yes` skips the prompt for either.
   - The whole surface: [Rex plugin](Rex-Plugin).
 
 ### Environment variables

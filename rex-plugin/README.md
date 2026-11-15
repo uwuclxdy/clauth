@@ -7,8 +7,8 @@ after upgrading clauth), the Services tab's `rex` row only reports it and names
 break it. It does three things:
 
 - **Launch Claude Code through clauth.** The `clauth_claude` action splits a pane running
-  `clauth start --auto --with-fallback`, so a new session starts on the fallback-chain member
-  with headroom and moves on as each account runs out. `clauth_claude_tab` opens a tab instead.
+  `clauth start --auto --with-fallback`, so a new session starts on the first fallback-chain
+  member with headroom and moves on as each account runs out. `clauth_claude_tab` opens a tab instead.
 - **Open the clauth dashboard** in a floating pane (`clauth_dashboard`). A second press closes it.
 - **Label each pane with the account it spends**: `claude · work`, `codex · codex` for a
   codex started through clauth or on a login clauth adopted, or `claude · main (global)` for a
@@ -18,9 +18,9 @@ All three actions are in the command palette under "clauth".
 
 ## Requires
 
-- clauth on the PATH a login shell sets (`clauth start` runs through it), or in
-  `~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin` for the watcher, which Rex runs with a
-  bare system PATH.
+- clauth on the PATH a login shell sets (`clauth start` runs through it), and for the watcher,
+  which Rex runs with a bare system PATH, on the Rex server's PATH or in `~/.local/bin`,
+  `/opt/homebrew/bin` or `/usr/local/bin`, searched in that order.
 - `--with-fallback` needs a running `clauth daemon` to decide the switches.
 - Rex with Lua config (`rex config check`).
 
@@ -30,11 +30,13 @@ All three actions are in the command palette under "clauth".
 clauth rex install
 ```
 
-That writes these files, as bundled in the clauth binary, to `~/.config/rex/clauth/` (Rex's own
-rules: `REX_CONFIG`, then `$XDG_CONFIG_HOME/rex/`), appends a marked `require("clauth").setup{}`
-block to `init.lua`, stops the running watcher, and reloads Rex, which starts a fresh one.
-`clauth rex uninstall` takes the files and the block back out, stops the watcher and removes
-`~/.local/state/clauth-rex/`. See the
+That writes these files, as bundled in the clauth binary, to `clauth/` beside Rex's `init.lua`
+(Rex's own rules: the file `REX_CONFIG` names, else `$XDG_CONFIG_HOME/rex/init.lua`, else
+`~/.config/rex/init.lua`), appends a marked `require("clauth").setup{}` block to `init.lua`,
+stops the running watcher, and reloads Rex, which starts a fresh one. With no `rex` CLI on
+`PATH` there is no reload, so no watcher runs until you run `rex config reload`.
+`clauth rex uninstall` takes the files and the block back out, stops the watcher and removes its
+state directory. It refuses while `init.lua` loads the module outside clauth's block. See the
 [wiki page](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) for the details.
 
 To develop against a checkout instead, link it in place of the installed copy (install then
@@ -55,11 +57,13 @@ documents each. Default keys: `alt+cmd+c` splits right, `shift+alt+cmd+c` splits
 - On every config load, `init.lua` starts `start-watch.sh`, which runs one `rex do --all
   tag-watch.lua` per Rex server and exits. Several servers (one per installed Rex version) each
   get their own watcher, pinned to the server's `--listen` socket.
-- The watcher runs `resolve-profile.sh` when a pane's foreground program is `claude`, `clauth`
-  or `codex`, and every 10 s for each pane it tags. The resolver is one
-  `clauth which --pid <pid> --json` call; a clauth older than `--pid` leaves labels as they are.
-  It never writes clauth state.
-- The only writes are pane labels and the files under `~/.local/state/clauth-rex/`.
+- The watcher runs `resolve-profile.sh` when a pane's foreground program is `claude`, `clauth`,
+  `codex`, or `node`, `bun` or `deno` (an npm-installed agent), and every 10 s for each pane it
+  tags. A pane that resolves to no account is asked again with a doubling gap, up to 32
+  intervals (about 5 minutes at the default 10 s). The resolver is one `clauth which --pid <pid> --json` call; a clauth older than
+  `--pid` leaves labels as they are. It never writes clauth state.
+- The only writes are pane labels and the files in the state directory,
+  `~/.local/state/clauth-rex/` (`$XDG_STATE_HOME/clauth-rex/` when that is set).
 
 ## How the labels work
 
@@ -68,8 +72,8 @@ It hears `terminal.process_changed`, resolves the foreground pid through `clauth
 as `herdr-plugin/report-profile.sh` does (the `clauth start` supervisor is the terminal's
 foreground process and keys its live-session row), and appends the account to the pane's label.
 The original label comes back when the agent exits, unless someone relabeled the pane meanwhile.
-Only a suffix naming a known clauth profile is ever taken for a tag, so a label such as
-`deploy · prod` is left alone.
+Only a suffix naming the account the pane spends is ever taken for a tag, so a label such as
+`deploy · prod` keeps its `· prod` even when `prod` is a clauth profile.
 
 A timer re-resolves tagged panes, since a `--with-fallback` swap and a `clauth switch` fire no
 Rex event.
@@ -90,13 +94,11 @@ Both must be in the Rex server's environment.
 | `init.lua` | The module `require("clauth")` loads: actions, keys, watcher start. |
 | `start-watch.sh` | Starts one watcher per server. |
 | `tag-watch.lua` | The `rex do` script that labels panes. |
-| `resolve-profile.sh` | Pid to account, shared logic with the herdr plugin. |
+| `resolve-profile.sh` | Maps `clauth which --pid`'s answer onto the watcher's line. |
 
-State: `~/.local/state/clauth-rex/watch.log` and `watch-<server>.pid`. `clauth rex install` and
+State: `watch.log` and `watch-<server>.pid` in the state directory. `clauth rex install` and
 `uninstall` read the pidfiles to stop the watcher, so keep their names and contents as they are.
 
 ## Limits
 
 - Rex has no custom sidebar field, so the account goes in the pane label.
-- `resolve-profile.sh` repeats the live-session join in `herdr-plugin/report-profile.sh`;
-  change the two together.
