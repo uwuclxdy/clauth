@@ -191,8 +191,10 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
             .filter(|k| !k.is_empty()),
         limit_resets: raw.rate_limit_reset_credits.map(|c| LimitResets {
             usable: u32::try_from(c.available_count.max(0)).unwrap_or(u32::MAX),
+            banked: None,
             clears: Vec::new(),
             ends_at: None,
+            fetched_at: None,
         }),
         ..UsageInfo::default()
     })

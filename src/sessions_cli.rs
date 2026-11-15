@@ -423,7 +423,10 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
     // `current_member` is None until a session's first swap, so a session that
     // never moved runs as its launch profile.
     let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
-    if current == canonical.as_str() {
+    // An equal target is a no-op only with no intent to another account
+    // standing: the executor still reads that intent, so it must be replaced
+    // or the session moves onto the account that intent names.
+    if current == canonical.as_str() && pending_member(&row).is_none() {
         outln!("{}", already_on_line(sid, canonical.as_str()));
         return Ok(());
     }
@@ -501,9 +504,10 @@ fn switch_receipt(sid: &str, profile: &str) -> String {
     )
 }
 
-/// The no-op line for a session already running the named profile: the
-/// executor treats an intent equal to the current member as the steady state,
-/// so writing one would promise a move that never comes.
+/// The no-op line for a session already running the named profile with no
+/// intent to another account standing: the executor treats an intent equal to
+/// the current member as the steady state, so writing one would promise a move
+/// that never comes.
 fn already_on_line(sid: &str, profile: &str) -> String {
     format!("clauth: session '{sid}' is already on '{profile}'")
 }
@@ -987,8 +991,9 @@ fn switch_list_row_line(c: &SwitchListCells, w: SwitchListWidths) -> String {
 }
 
 /// The member a session's recorded intent points at while it differs from the
-/// account the session runs, else `None`. Shared by the table's pending cell
-/// and the `--json` field so the two cannot disagree.
+/// account the session runs, else `None`. Shared by the table's pending cell,
+/// the `--json` field and `run_switch`'s no-op guard so the three cannot
+/// disagree.
 fn pending_member(row: &crate::live_sessions::LiveSession) -> Option<&str> {
     let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
     row.intended_member.as_deref().filter(|i| *i != current)

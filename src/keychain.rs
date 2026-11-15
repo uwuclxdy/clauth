@@ -795,7 +795,16 @@ fn merge_and_put_reporting_at(
     {
         return Ok(false);
     }
-    match merge_write(incoming, existing.as_ref(), keep) {
+    let merged = merge_write(incoming, existing.as_ref(), keep).map(|mut blob| {
+        // A switch's carry keeps the incoming store's own MCP logins while the
+        // MCP login sync is on; a relink keeping everything has nothing to
+        // keep apart.
+        if matches!(keep, Keep::CarriedOnly) {
+            crate::claude::keep_own_mcp_logins(&mut blob, incoming, None, None);
+        }
+        blob
+    });
+    match merged {
         Some(blob) => put_blob_at(service, account, &blob).map(|()| true),
         None => Ok(true),
     }
@@ -1687,10 +1696,29 @@ pub(crate) fn keychain_hand_off_for_config_dir(
         Ok(Some(blob)) => blob,
         Err(e) => return sign_out_over_failed_read(&service, &account, &e),
     };
-    let landed = match crate::claude::carried_keys_of(&blob) {
+    let landed = match crate::claude::hand_off_carried_keys(&blob) {
         None => true,
         Some(carried) => match crate::claude::carry_item_keys_into_store(store, &carried) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Every other account's store too: an MCP login belongs to no
+                // Claude account, and the next swap may land the session on
+                // any of them. Best effort, never failing the hand-off, and on
+                // its own thread: it takes the state flock per store, which no
+                // wait inside this Keychain budget scope may. A failed spawn
+                // leaves it to the next MCP login sync: a running daemon's
+                // pass, or the next hand-off.
+                if let Err(e) = std::thread::Builder::new()
+                    .name("clauth-mcp-fan-out".into())
+                    .spawn(move || crate::claude::fan_out_carried_mcp_logins(&carried))
+                {
+                    logline!(
+                        "clauth: could not start copying the handed-off MCP server logins \
+                         into every account's store: {e}. The next MCP login sync copies \
+                         them (a running daemon's pass, or the next hand-off)"
+                    );
+                }
+                true
+            }
             Err(e) => {
                 logline!(
                     "clauth: could not save the per-session Keychain item's MCP server logins \

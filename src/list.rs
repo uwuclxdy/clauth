@@ -8,9 +8,9 @@
 //! `build_status` appends after the claude ones. Presentation only: it reads
 //! the on-disk usage caches `build_status` reads and never fetches.
 //!
-//! Three facts do NOT come from the entries, because they carry neither: the
-//! `disabled` and `keyless` flags (both read off `config`) and the `canceled`
-//! flag (read off the per-profile usage cache). All three surface in the
+//! Three facts do NOT come from the entries, because they carry none of them:
+//! the `keyless` flag (read off `config`) and the `canceled` and org-refused
+//! flags (read off the per-profile usage cache). All three surface in the
 //! trailing state marker, so this table shows three states `status --json`
 //! does not expose. All three are claude-only: a codex row reads none of them.
 
@@ -43,7 +43,7 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
 
 /// One rendered table row. Three sources for a claude row, because the status
 /// entry carries only the first: a single `build_profile_entries` profile
-/// entry, `config` for the disabled and keyless flags, and the profile's own
+/// entry, `config` for the keyless flag, and the profile's own
 /// `usage_cache.json` for the canceled and org-refused ones (via
 /// `profile_json::is_canceled_cached`). A codex row reads its entry alone.
 struct Row {
@@ -138,9 +138,8 @@ impl Row {
             five_h,
             seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
-            disabled: profile.is_some_and(|p| p.is_disabled()),
-            keyless: profile
-                .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
+            disabled: entry.disabled,
+            keyless: profile.is_some_and(|p| p.is_keyless()),
             canceled: profile.is_some_and(crate::profile_json::is_canceled_cached),
             org_refused: profile.is_some_and(crate::profile_json::is_org_refused_cached),
             stale: entry.stale,
@@ -211,9 +210,12 @@ fn window_pct(windows: &[Window], label: &str) -> String {
 }
 
 fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
+    // `clauth list` is single-shot: no live lease to consult, so the stamp
+    // derived from the cache keeps its derived form.
     let codex_entries = build_codex_entries(
         &CodexState::load().unwrap_or_default(),
         config.state.refresh_interval_ms,
+        true,
     );
     if entries.is_empty() && codex_entries.is_empty() {
         return "no accounts yet. add one with `clauth login <name>`.\n".to_string();

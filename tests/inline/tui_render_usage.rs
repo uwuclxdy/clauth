@@ -2226,6 +2226,139 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
     );
 }
 
+/// A keyless proxy account (its key cleared on the setup tab) keeps its last
+/// figures, and its fix hint names the re-login that mints a new key, never
+/// the setup tab: the user never holds a proxy account's key.
+#[test]
+fn a_keyless_proxy_accounts_hint_names_the_re_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("px");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    ))
+    .expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let px = crate::profile::load_profile(&name).expect("load profile");
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "px",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        status_text(&status_lines(&px, &header, 120, &readings)),
+        "status    [ no key ]\n└ no api key set, run `clauth login px --proxy stub`"
+    );
+}
+
+/// The empty body shares the status hint's words: a keyless proxy account with
+/// no figures names its re-login there, with its own name and recorded
+/// service, and a keyless endpoint with no record keeps the setup-tab fix in
+/// both places, byte for byte.
+#[test]
+fn the_keyless_fix_reads_alike_in_the_empty_body_and_the_status_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("relay");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "relay".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    ))
+    .expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("zcode").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let relay = crate::profile::load_profile(&name).expect("load profile");
+    let mut generic = crate::testutil::blank_profile(&crate::profile::ProfileName::from("g"));
+    generic.base_url = Some("https://example.com".to_string());
+    let body = |profile: &crate::profile::Profile| -> Vec<String> {
+        build_tp_rows(
+            profile,
+            120,
+            &ReadingsSnapshot::default(),
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect()
+    };
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let empty_stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    let readings = snap_with_stats(
+        snap_with_stats(ReadingsSnapshot::default(), "g", empty_stats.clone()),
+        "relay",
+        empty_stats,
+    );
+
+    assert_eq!(
+        (body(&relay), body(&generic)),
+        (
+            vec!["no api key set, run `clauth login relay --proxy zcode`".to_string()],
+            vec!["no api key set, add one on the setup tab".to_string()]
+        ),
+        "(proxy, non-proxy) empty body"
+    );
+    assert_eq!(
+        status_text(&status_lines(&generic, &header, 120, &readings)),
+        "status    [ no key ]\n└ no api key set, add one on the setup tab",
+        "the non-proxy status hint"
+    );
+}
+
 /// The `[ no key ]` pill is a third-party state — an OAuth profile never
 /// renders it, keyless or not.
 #[test]
@@ -2467,6 +2600,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             streaks: StreakCounts {
                 rate_limit: 3,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -2550,6 +2684,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -2796,6 +2931,186 @@ fn a_failed_fetch_row_with_no_deadline_reads_failed_not_queued() {
     );
 }
 
+/// The fetch row of an account 4 minutes past its refresh on an instance that
+/// runs no countdown, with the account's reading `read_ago_ms` old.
+fn overdue_fetch_row(read_ago_ms: u64, stale: bool) -> Vec<String> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    if stale {
+        readings = snap_with_stale(readings, "a");
+    }
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"));
+    row.split_whitespace().map(str::to_string).collect()
+}
+
+/// An overdue refresh on a stood-down instance says so and dates the reading,
+/// never `refresh in 0s`: the reading is old and nothing here will fetch it.
+#[test]
+fn an_overdue_fetch_row_says_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_fetch_row(330_000, false),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+}
+
+/// The `[ stale ]` pill keeps its own threshold: it prepends the overdue row
+/// only once the reading is past it, never for being overdue alone.
+#[test]
+fn a_stale_overdue_fetch_row_prepends_the_stale_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_fetch_row(13 * 60_000 + 30_000, true),
+        [
+            "status", "[", "stale", "]", "◌", "refresh", "overdue", "·", "read", "13m", "ago"
+        ],
+    );
+}
+
+/// The default and `[ stale ]` arms' joined row text, the same fixture the
+/// frozen `overdue_fetch_row` renders, returned un-tokenized so the spacing
+/// pins byte-exact (the token form collapses whitespace).
+fn overdue_joined_row(read_ago_ms: u64, stale: bool) -> String {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    if stale {
+        readings = snap_with_stale(readings, "a");
+    }
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone()
+}
+
+/// The default and `[ stale ]` arms' joined spacing is pinned byte-exact: the
+/// dot follows the key pad single-spaced, the stale pill prepends with one
+/// raw space, and neither may collapse or widen.
+#[test]
+fn the_overdue_rows_keep_their_join_spacing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        overdue_joined_row(330_000, false),
+        "status    ◌ refresh overdue · read 5m ago",
+    );
+    assert_eq!(
+        overdue_joined_row(13 * 60_000 + 30_000, true),
+        "status    [ stale ] ◌ refresh overdue · read 13m ago",
+    );
+}
+
+/// The fetch row of a stood-down mirror whose published deadline is
+/// `deadline_ago_ms` past, with the account's reading `read_ago_ms` old.
+fn mirror_fetch_row_at_deadline(deadline_ago_ms: u64, read_ago_ms: u64) -> Vec<String> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - read_ago_ms),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - deadline_ago_ms),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"));
+    row.split_whitespace().map(str::to_string).collect()
+}
+
+/// A mirror's published deadline reads overdue only past the tick's fetch
+/// deadline (90 s): 89 s past still draws the countdown form, 91 s the overdue
+/// wording. The fixtures sit one second either side of the grace
+/// boundary, the margin this pin holds against the wall clock moving between
+/// stamp and render.
+#[test]
+fn a_mirror_fetch_row_reads_overdue_only_past_the_tick_deadline_grace() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        mirror_fetch_row_at_deadline(89_000, 330_000),
+        ["status", "◌", "refresh", "in", "0s"],
+    );
+    assert_eq!(
+        mirror_fetch_row_at_deadline(91_000, 330_000),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+}
+
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
 /// (`HeaderState.streak`) so a deep slot reads as stuck from the count alone;
 /// a zero streak keeps the bare `retry in` suffix.
@@ -2812,6 +3127,7 @@ fn rate_limited_suffix_counts_the_retry() {
         streaks: StreakCounts {
             rate_limit: streak,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
         kick_block: None,
         queue_slot: None,
@@ -2857,6 +3173,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
         streaks: StreakCounts {
             rate_limit: 0,
             refresh_fail,
+            last_fetch_failed: false,
         },
         kick_block: None,
         queue_slot: None,
@@ -2930,11 +3247,13 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             (|n| StreakCounts {
                 rate_limit: n,
                 refresh_fail: 0,
+                last_fetch_failed: false,
             }) as fn(u32) -> StreakCounts,
         ),
         (FetchStatus::Cached, |n| StreakCounts {
             rate_limit: 0,
             refresh_fail: n,
+            last_fetch_failed: false,
         }),
     ] {
         let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -3031,6 +3350,262 @@ fn spent_skipped_account_pill_is_bare() {
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"
+    );
+}
+
+/// A spent account the poll skips still carries a `Cached` status when the
+/// TUI seeds it off the aged cache (a stood-down TUI, or the boot seed). With
+/// no refresh scheduled, no refresh streak and no failed-fetch mark, nothing
+/// failed: the row is the same bare `[ spent ]` pill, never `[ cached ]` with
+/// "last usage check failed". A spent account WITH a countdown is still
+/// polled, so its `Cached` stays the honest serving-old-numbers state.
+#[test]
+fn a_skipped_spent_account_seeded_cached_reads_spent() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = |next_refresh_ms: Option<u64>| HeaderState {
+        fetches_here: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let skipped = text(status_lines(&p, &header(None), 120, &readings));
+    assert!(
+        skipped.contains("[ spent ]"),
+        "a skipped spent account reads spent: {skipped}"
+    );
+    assert!(
+        !skipped.contains("[ cached ]"),
+        "nothing failed, so no cached pill: {skipped}"
+    );
+    assert!(
+        !skipped.contains("last usage check failed"),
+        "a skipped poll is no failed check: {skipped}"
+    );
+
+    let polled = text(status_lines(
+        &p,
+        &header(Some(crate::usage::now_ms() + 60_000)),
+        120,
+        &readings,
+    ));
+    assert!(
+        polled.contains("[ cached ]"),
+        "a spent account still on the schedule keeps its cached state: {polled}"
+    );
+}
+
+/// A skipped spent account whose last fetch attempt failed keeps the honest
+/// `[ cached ]` pill: the failure mark outranks the spent pill exactly as a
+/// refresh streak does, so a failed forced `r` stays visible after the next
+/// tick drops the countdown. Only the seeded `Cached` (no streak, no mark) is
+/// the bare `[ spent ]` pill, the case the test above pins.
+#[test]
+fn a_skipped_spent_account_whose_last_fetch_failed_reads_cached() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts {
+            last_fetch_failed: true,
+            ..StreakCounts::default()
+        },
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let rendered = text(status_lines(&p, &header, 120, &readings));
+    assert!(
+        rendered.contains("[ cached ]"),
+        "a failed fetch on a skipped spent account reads cached: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[ spent ]"),
+        "a failed fetch is never hidden as the spent pill: {rendered}"
+    );
+}
+
+/// The Usage pane draws the failed-fetch mark from `app.poll_streaks` itself:
+/// a skipped spent account whose `Cached` reading follows a failed attempt
+/// keeps `[ cached ]`, never the seeded `[ spent ]` pill.
+#[test]
+fn the_usage_pane_draws_the_failed_fetch_mark_from_the_streak_store() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+    use crate::usage::{FetchStatus, StreakCounts, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["a"]);
+    let name = ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    app.usage_store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), FetchStatus::Cached);
+    app.poll_streaks.lock().unwrap().insert(
+        "a".to_string(),
+        StreakCounts {
+            last_fetch_failed: true,
+            ..StreakCounts::default()
+        },
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains("[ cached ]")),
+        "the mark travels from poll_streaks to the pane's cached pill: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("[ spent ]")),
+        "a failed attempt is never hidden as the spent pill: {rows:#?}"
+    );
+}
+
+/// A skipped spent account that carries a run of failed token refreshes stays
+/// on `[ auth failing ]`, never `[ spent ]`: a refresh failure is never hidden
+/// as a spent pill. The seeded `Cached` is the only record a refresh is
+/// failing, so the guard keeps it live even though the poll skips the account
+/// — as the failed-fetch mark does for a failed fetch, the case the test above
+/// pins.
+#[test]
+fn a_skipped_spent_account_with_a_refresh_streak_reads_auth_failing() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let header = HeaderState {
+        fetches_here: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts {
+            refresh_fail: 2,
+            ..StreakCounts::default()
+        },
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(
+        snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                seven_day: Some(crate::usage::UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        "a",
+        FetchStatus::Cached,
+    );
+
+    let rendered = text(status_lines(&p, &header, 120, &readings));
+    assert!(
+        rendered.contains("[ auth failing ]"),
+        "a refresh-failure streak outranks the spent pill: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[ spent ]"),
+        "a refresh-failure streak outranks the spent pill: {rendered}"
     );
 }
 
@@ -3891,7 +4466,7 @@ fn kick_hint_diverges_on_auto_start() {
 #[test]
 fn auth_broken_hint_names_the_profile() {
     assert_eq!(
-        diag_fix(UsageDiag::AuthBroken, "kerry"),
+        diag_fix(UsageDiag::AuthBroken { proxy: None }, "kerry"),
         format!(
             "re-login with {}",
             crate::tui::render::prose::cmd("clauth login kerry")
@@ -4372,6 +4947,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
             streaks: StreakCounts {
                 rate_limit: 0,
                 refresh_fail: 3,
+                last_fetch_failed: false,
             },
             kick_block: Some(KickBlock {
                 streak: 2,
@@ -4682,6 +5258,7 @@ fn effective_rate_limit_is_oauth_first_with_a_third_party_fallback() {
         StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )]);
     let third_party = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1)]);
@@ -4800,6 +5377,7 @@ fn a_hybrid_stuck_hint_names_the_winning_reading_source() {
         StreakCounts {
             rate_limit: deep,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     )]);
     let healthy_tp = HashMap::from([("hybrid".to_string(), 1u32)]);
@@ -5380,7 +5958,11 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let rail = rail_hint_lines(&diag_fix(UsageDiag::AuthBroken, "kerry"), 60, false);
+    let rail = rail_hint_lines(
+        &diag_fix(UsageDiag::AuthBroken { proxy: None }, "kerry"),
+        60,
+        false,
+    );
     assert_prose_part(
         &lines_buffer(rail, 60),
         "re-login with clauth login kerry",
@@ -5736,6 +6318,10 @@ fn t6_pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     }
 }
 
@@ -5918,7 +6504,7 @@ fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
         [
             "type      codex",
             "plan      plus",
-            "resets    ↺ 2 banked",
+            "resets    2 available",
             "status    ◌ read 2h ago",
             "",
         ],
@@ -5944,6 +6530,158 @@ fn the_usage_codex_pane_shows_its_facts_and_two_windows() {
     assert_eq!(detail.len(), 10, "nothing after the 7d bar: {detail:?}");
 }
 
+/// The claude pane's `resets` rows, whitespace runs folded to one space so
+/// the pin reads the words, not the key column's width.
+fn claude_resets_rows(detail: &[String]) -> Vec<String> {
+    detail
+        .iter()
+        .filter(|r| r.starts_with("resets"))
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// `ends` as the resets line dates it: the local month and day.
+fn local_day(ends_secs: i64) -> String {
+    use chrono::TimeZone as _;
+    chrono::Local
+        .timestamp_opt(ends_secs, 0)
+        .single()
+        .expect("a local instant")
+        .format("%b %-d")
+        .to_string()
+}
+
+/// A claude account's pane carries its banked resets off the hourly side
+/// read: the usable count, the windows the next grant clears and its end;
+/// a reading under 75 min old carries no age.
+#[test]
+fn the_usage_claude_pane_shows_its_banked_resets() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ends = crate::usage::now_epoch_secs() + 20 * 86_400;
+    let ends_iso = chrono::DateTime::from_timestamp(ends, 0)
+        .expect("instant")
+        .to_rfc3339();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour", "seven_day"],
+        Some(&ends_iso),
+        crate::usage::now_ms() - 10 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        [format!(
+            "resets 1 available · resets 5h, 7d · expires {}",
+            local_day(ends)
+        )],
+        "{detail:?}"
+    );
+}
+
+/// The window Fable counts into reads `7d fable` in the resets row, as the
+/// pane's own bar names it.
+#[test]
+fn the_claude_resets_row_names_the_fable_weekly_7d_fable() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets_banked(
+        "cl1",
+        1,
+        1,
+        &["seven_day_overage_included"],
+        now,
+    );
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 available · resets 7d fable"],
+        "{detail:?}"
+    );
+}
+
+/// A reading that carries the banked total says how many of them a spend can
+/// use now, and keeps the row at 0 so a cooldown hides no banked reset.
+#[test]
+fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets_banked("cl1", 2, 3, &["five_hour"], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2/3 available · resets 5h"],
+        "{detail:?}"
+    );
+
+    crate::testutil::write_claude_limit_resets_banked("cl1", 0, 3, &[], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 0/3 available"],
+        "{detail:?}"
+    );
+
+    // Every banked reset usable: the total adds nothing, so the row reads the
+    // bare count.
+    crate::testutil::write_claude_limit_resets_banked("cl1", 2, 2, &["five_hour"], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2 available · resets 5h"],
+        "{detail:?}"
+    );
+
+    crate::testutil::write_claude_limit_resets_banked("cl1", 0, 0, &[], now);
+    let (_, detail) = t6_panes(&t6_app());
+    assert!(claude_resets_rows(&detail).is_empty(), "{detail:?}");
+}
+
+/// A reading older than 75 min (a missed hourly read) says its age.
+#[test]
+fn a_stale_claude_resets_reading_says_its_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - (3 * 3600 + 5 * 60) * 1000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 2 available · resets 5h · read 3h ago"],
+        "{detail:?}"
+    );
+}
+
+/// No usable reset on a reading that carries no banked total, or no reading at
+/// all: no `resets` row on a claude pane.
+#[test]
+fn a_claude_pane_without_a_usable_reset_has_no_resets_row() {
+    for usable in [Some(0), None] {
+        let _home = crate::testutil::HomeSandbox::new();
+        if let Some(n) = usable {
+            crate::testutil::write_claude_limit_resets(
+                "cl1",
+                n,
+                &["five_hour"],
+                None,
+                crate::usage::now_ms() - 60_000,
+            );
+        }
+        let app = t6_app();
+        let (_, detail) = t6_panes(&app);
+        assert!(
+            claude_resets_rows(&detail).is_empty(),
+            "usable {usable:?}: {detail:?}"
+        );
+    }
+}
+
 /// A quarantined codex account names it on a `login` row between `plan` and
 /// `resets`; without the quarantine the row is gone (the pane pin above).
 #[test]
@@ -5963,7 +6701,7 @@ fn a_quarantined_codex_account_shows_its_login_row() {
             "type      codex",
             "plan      plus",
             "login     [ needs re-login ]",
-            "resets    ↺ 2 banked",
+            "resets    2 available",
         ],
         "{detail:?}"
     );
@@ -6018,6 +6756,234 @@ fn a_cooling_down_pool_account_shows_its_status_pill() {
         "the cooldown pill and its 240 s countdown: {detail:?}"
     );
     assert_eq!(detail[5], "read      2m ago", "{detail:?}");
+}
+
+/// Pool account `alpha` as shunt v0.61.0+ serializes its row: the request
+/// counters ride it as top-level keys, `requests_attempted` the sum of the
+/// other three since shunt's process start or the account's add,
+/// `mean_latency_ms` a float that is
+/// `null` until an attempt got response headers (shunt `tests/admin_surface.rs`
+/// at v0.64.0). Parsed through the listing's own `Deserialize`. A 5h reading
+/// keeps the bars below the facts, so the blank row after them stays inside
+/// the pane's trimmed rows.
+fn counted_alpha(
+    attempted: u64,
+    failed: u64,
+    cancelled: u64,
+    mean_latency_ms: Option<f64>,
+) -> crate::gateway_admin::PoolAccount {
+    let row = serde_json::json!({
+        "name": "alpha",
+        "available": true,
+        "near_quota": false,
+        "cooldown_secs_remaining": null,
+        "needs_relogin": false,
+        "paused": false,
+        "disabled": false,
+        "utilization_5h": 0.73,
+        "reset_5h": crate::usage::now_epoch_secs() as u64 + 2 * 3600 + 13 * 60,
+        "utilization_7d": null,
+        "reset_7d": null,
+        "utilization_7d_oi": null,
+        "reset_7d_oi": null,
+        "status": null,
+        "requests_attempted": attempted,
+        "requests_succeeded": attempted - failed - cancelled,
+        "requests_failed": failed,
+        "requests_cancelled": cancelled,
+        "mean_latency_ms": mean_latency_ms,
+    });
+    serde_json::from_value(row).expect("a v0.61.0 pool row parses")
+}
+
+/// `t6_app` with `alpha` swapped for `account`, its Usage pane selected; the
+/// detail pane's rows and its outer width at 100 columns.
+fn counted_pool_pane(account: crate::gateway_admin::PoolAccount) -> (Vec<String>, usize) {
+    let mut app = t6_app();
+    let crate::tui::app::ShuntPool::Read(providers) = &mut app.shunt_pool else {
+        panic!("t6_app reads its pool");
+    };
+    providers[0].accounts[0] = account;
+    t6_down(&mut app);
+    t6_down(&mut app);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let top: Vec<char> = crate::testutil::buffer_rows(term.backend().buffer())[0]
+        .chars()
+        .collect();
+    let split = top
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    (t6_panes(&app).1, top.len() - split)
+}
+
+/// The counters take one `requests` row under the read age: the attempted
+/// count, then the failed and cancelled counts, then the mean latency in whole
+/// milliseconds (839.6 rounds to 840), counts grouped by thousands as a detail
+/// pane's are.
+#[test]
+fn a_pool_pane_shows_the_request_counters_under_its_read_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, _) = counted_pool_pane(counted_alpha(1204, 12, 3, Some(839.6)));
+    assert_eq!(
+        detail
+            .iter()
+            .take(7)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "type      shunt",
+            "family    claude",
+            "provider  claude-main",
+            "plan      —",
+            "read      2m ago",
+            "requests  1,204 · 12 failed · 3 cancelled · 840 ms avg",
+            "",
+        ],
+        "{detail:?}"
+    );
+}
+
+/// A zero failed or cancelled count leaves its part out, and so does a latency
+/// shunt has not measured yet; the attempted count stays, at 0 too.
+#[test]
+fn a_pool_pane_leaves_out_zero_counts_and_an_unmeasured_latency() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (account, row) in [
+        (
+            counted_alpha(7, 0, 0, Some(52.0)),
+            "requests  7 · 52 ms avg",
+        ),
+        (
+            counted_alpha(9, 0, 2, Some(1.0)),
+            "requests  9 · 2 cancelled · 1 ms avg",
+        ),
+        (counted_alpha(5, 5, 0, None), "requests  5 · 5 failed"),
+        (counted_alpha(0, 0, 0, None), "requests  0"),
+    ] {
+        let (detail, _) = counted_pool_pane(account);
+        assert_eq!(
+            detail
+                .iter()
+                .skip(4)
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["read      2m ago", row, ""],
+            "{detail:?}"
+        );
+    }
+}
+
+/// A row too wide for the pane sheds whole parts from the right, never cuts
+/// one: here the latency goes and the cancelled count stays.
+#[test]
+fn a_pool_pane_sheds_request_parts_whole_from_the_right() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, pane_width) =
+        counted_pool_pane(counted_alpha(1_204_567, 12_345, 3_456, Some(12_345.0)));
+    // The whole row is 69 cells and the row without its latency 53, so a pane
+    // whose content width (its outer width less two border and two padding
+    // cells) lies in 53..69 must shed the latency part alone.
+    let content = pane_width - 4;
+    assert!(
+        (53..69).contains(&content),
+        "the fixture's pane must force exactly one shed: {content} cells"
+    );
+    assert_eq!(
+        detail.get(5).map(String::as_str),
+        Some("requests  1,204,567 · 12,345 failed · 3,456 cancelled"),
+        "{detail:?}"
+    );
+}
+
+/// A mean latency of a second or more is grouped by thousands like the counts.
+#[test]
+fn a_pool_pane_groups_a_long_latency_by_thousands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (detail, _) = counted_pool_pane(counted_alpha(1204, 0, 0, Some(12_345.4)));
+    assert_eq!(
+        detail.get(5).map(String::as_str),
+        Some("requests  1,204 · 12,345 ms avg"),
+        "{detail:?}"
+    );
+}
+
+/// The `requests` row's key and value text and their styles, off the row
+/// builder at a given content width.
+fn requests_row(account: &crate::gateway_admin::PoolAccount, inner_w: u16) -> (String, String) {
+    let line = pool_requests_line(account, inner_w).expect("a counted row draws");
+    assert_eq!(line.spans.len(), 2, "{line:?}");
+    assert_eq!(line.spans[0].style, theme::label(), "the key: {line:?}");
+    assert_eq!(line.spans[1].style, theme::accent(), "the value: {line:?}");
+    (
+        line.spans[0].content.to_string(),
+        line.spans[1].content.to_string(),
+    )
+}
+
+/// The row sheds one whole part at a time as the content width falls, keeps a
+/// value that fits to the cell, and never sheds the attempted count. The full
+/// value is 44 cells, 31 without the latency, 17 without the cancelled count;
+/// the key column is 10.
+#[test]
+fn the_requests_row_sheds_one_part_per_missing_width_down_to_the_count() {
+    let account = counted_alpha(1204, 12, 3, Some(839.6));
+    for (inner_w, value) in [
+        (54, "1,204 · 12 failed · 3 cancelled · 840 ms avg"),
+        (53, "1,204 · 12 failed · 3 cancelled"),
+        (41, "1,204 · 12 failed · 3 cancelled"),
+        (40, "1,204 · 12 failed"),
+        (27, "1,204 · 12 failed"),
+        (26, "1,204"),
+        (12, "1,204"),
+    ] {
+        assert_eq!(
+            requests_row(&account, inner_w),
+            ("requests  ".to_string(), value.to_string()),
+            "at {inner_w} cells"
+        );
+    }
+}
+
+/// A mean latency that is negative or not finite is no measurement: the row
+/// reads as if shunt had measured none.
+#[test]
+fn the_requests_row_leaves_out_a_latency_that_is_no_measurement() {
+    for ms in [-123.0, -0.4, -0.0, f64::NAN, f64::INFINITY] {
+        let account = crate::gateway_admin::PoolAccount {
+            mean_latency_ms: Some(ms),
+            ..counted_alpha(7, 0, 0, None)
+        };
+        assert_eq!(
+            requests_row(&account, 66),
+            ("requests  ".to_string(), "7".to_string()),
+            "a mean of {ms}"
+        );
+    }
+}
+
+/// A measured mean under half a millisecond, zero included, is still a
+/// measurement: it draws `0 ms avg`.
+#[test]
+fn the_requests_row_keeps_a_sub_millisecond_latency() {
+    for ms in [0.0, 0.4] {
+        let account = crate::gateway_admin::PoolAccount {
+            mean_latency_ms: Some(ms),
+            ..counted_alpha(7, 0, 0, None)
+        };
+        assert_eq!(
+            requests_row(&account, 66),
+            ("requests  ".to_string(), "7 · 0 ms avg".to_string()),
+            "a mean of {ms}"
+        );
+    }
 }
 
 /// The footer offers `n note` on a claude row only: codex and pool accounts
@@ -6218,4 +7184,1104 @@ fn a_third_party_stat_key_renders_dim_and_bold() {
     let spans = key_value_span("remaining", "$4.20", Style::default(), 8);
     assert_eq!(spans[0].content.trim(), "remaining");
     assert_eq!(spans[0].style, theme::label());
+}
+
+/// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
+/// reading shows the `resets` row: the file's presence is the one predicate,
+/// the same one the Overview chip reads, so the pane never narrows it to
+/// pure-OAuth accounts.
+#[test]
+fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["cl1"]);
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - 60_000,
+    );
+    let mut profile = crate::profile::Profile::new(
+        "cl1".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-hybrid".to_string()),
+    );
+    profile.credentials = Some(crate::testutil::oauth_pair("cl1"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("cl1")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.tab = crate::tui::app::Tab::Usage;
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 available · resets 5h"],
+        "{detail:?}"
+    );
+}
+
+/// The claude `resets` row sits right under the plan row — the pane's first
+/// two rows — wherever the other rows fall.
+#[test]
+fn the_claude_resets_row_sits_right_under_the_plan_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms() - 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert!(
+        detail[0].starts_with("plan"),
+        "the plan row leads the pane: {detail:?}"
+    );
+    assert!(
+        detail[1].starts_with("resets"),
+        "the resets row sits right under the plan row: {detail:?}"
+    );
+}
+
+/// The age part appears only once the reading is older than 75 min: 74 min
+/// shows no `· read` part, 76 min says `1h`. The code compares strictly
+/// (`>`), so exactly 75 min is not aged; the renderer reads the real clock,
+/// so the pins sit one minute off the boundary instead of on it.
+#[test]
+fn the_resets_row_says_its_age_only_past_75_minutes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &[],
+        None,
+        crate::usage::now_ms() - 74 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 available"],
+        "74 min: no age part: {detail:?}"
+    );
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &[],
+        None,
+        crate::usage::now_ms() - 76 * 60_000,
+    );
+    let app = t6_app();
+    let (_, detail) = t6_panes(&app);
+    assert_eq!(
+        claude_resets_rows(&detail),
+        ["resets 1 available · read 1h ago"],
+        "76 min: the age part: {detail:?}"
+    );
+}
+
+/// A row too wide for its pane ends on `…`: a bare clip turned `expires Nov 26`
+/// into a false `expires Nov 2`. At 57 columns the pane holds 53 cells, 43 of
+/// them after the key, one short of this 44-cell value. A row that fits keeps
+/// every part, the exact fit included.
+#[test]
+fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
+    use chrono::TimeZone as _;
+
+    fn row_at(app: &App, width: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+            .expect("terminal");
+        term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let at = rows
+            .iter()
+            .find(|r| r.contains("resets  "))
+            .unwrap_or_else(|| panic!("a resets row at {width}: {rows:?}"));
+        let tail = &at[at.find("resets  ").expect("the row")..];
+        let end = tail.find(['│', '┊', '┃']).unwrap_or(tail.len());
+        tail[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let ends = chrono::Local
+        .with_ymd_and_hms(2099, 11, 26, 12, 0, 0)
+        .single()
+        .expect("a local instant")
+        .to_rfc3339();
+    crate::testutil::write_claude_limit_resets(
+        "cl1",
+        1,
+        &["five_hour", "seven_day"],
+        Some(&ends),
+        crate::usage::now_ms() - 10 * 60_000,
+    );
+    let app = t6_app();
+
+    assert_eq!(
+        row_at(&app, 57),
+        "resets 1 available · resets 5h, 7d · expires Nov …"
+    );
+    assert_eq!(
+        row_at(&app, 58),
+        "resets 1 available · resets 5h, 7d · expires Nov 26",
+        "44 cells in a 44-cell budget fit"
+    );
+}
+
+/// A quarantined proxy account's status block sends it to the login through
+/// its proxy, the one login clauth takes for it; the same account with no
+/// proxy record keeps the re-login fix, byte for byte.
+#[test]
+fn a_quarantined_proxy_accounts_status_names_the_login_through_its_proxy() {
+    let rows = |proxy: bool| -> Vec<String> {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("px"));
+        profile.proxy = proxy.then(|| crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        let header = HeaderState {
+            diag: DiagFlags {
+                auth_broken: true,
+                ..DiagFlags::default()
+            },
+            ..idle_header()
+        };
+        status_lines(&profile, &header, 120, &ReadingsSnapshot::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    };
+    assert_eq!(
+        (rows(true), rows(false)),
+        (
+            vec![
+                "status    [ auth broken ]".to_string(),
+                "└ log in again with clauth login px --proxy stub".to_string(),
+            ],
+            vec![
+                "status    [ auth broken ]".to_string(),
+                "└ re-login with clauth login px".to_string(),
+            ],
+        ),
+        "(the proxy account's status rows, the plain account's)"
+    );
+}
+
+/// A keyless proxy account holding a stored pair loads as an OAuth login no
+/// leg polls; its empty Usage body names the login through its proxy, while a
+/// plain account holding nothing keeps the setup-tab line.
+#[test]
+fn a_keyless_proxy_account_holding_a_pair_names_its_login_in_the_empty_body() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let name = ProfileName::from("px");
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    );
+    px.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-px".to_string(),
+            refresh_token: Some("rt-px".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&px).expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let px = crate::profile::load_profile(&name).expect("load profile");
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.is_oauth(),
+            px.access_token(),
+            px.usage_cache_is_third_party(),
+        ),
+        (true, true, Some("at-px"), false),
+        "fixture control: (the proxy record, an OAuth body, the stored pair, a third-party body)"
+    );
+    let rows = |profile: crate::profile::Profile| -> Vec<String> {
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![profile.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![profile],
+        });
+        app.profile_cursor.set(0);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let proxy_row = format!(
+        "│   no api key set, run `clauth login px --proxy stub`{}│",
+        " ".repeat(25)
+    );
+    let plain_row = format!(
+        "│   not logged in, use + login on the setup tab{}│",
+        " ".repeat(32)
+    );
+
+    let proxy_rows = rows(px);
+    let plain_rows = rows(crate::testutil::blank_profile(&ProfileName::from("oau")));
+    assert_eq!(
+        (
+            proxy_rows.contains(&proxy_row),
+            plain_rows.contains(&plain_row)
+        ),
+        (true, true),
+        "(the proxy account's empty body row, the plain account's): {proxy_rows:#?} {plain_rows:#?}"
+    );
+}
+
+/// A stored OAuth pair for `name`, the access token `at-<name>`.
+fn stored_pair(name: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// Keyless proxy account `px` of proxy `stub` holding a stored pair, saved
+/// and loaded back from disk, with `auto_start` as given and its record's
+/// `account` set to `account` (an empty one is a table clauth cannot read).
+fn keyless_proxy_account_holding_a_pair(
+    auto_start: bool,
+    account: &str,
+) -> crate::profile::Profile {
+    let name = crate::profile::ProfileName::from("px");
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        None,
+    );
+    px.auto_start = auto_start;
+    px.credentials = Some(stored_pair("px"));
+    crate::profile::save_profile(&px).expect("save profile");
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+    let path = crate::profile::profile_subpath(&name, "config.toml").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let edited = text.replace("account = \"acct-1\"", &format!("account = \"{account}\""));
+    assert_eq!(
+        edited == text,
+        account == "acct-1",
+        "fixture control: the record's account is {account:?}"
+    );
+    std::fs::write(&path, edited).unwrap();
+    crate::profile::load_profile(&name).expect("load profile")
+}
+
+/// `draw_usage_detail`'s rows for `profile` alone, on a `width`x24 frame with
+/// no readings.
+fn usage_detail_rows(profile: crate::profile::Profile, width: u16) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::App;
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// A profile holding a stored pair whose `[proxy]` table clauth cannot read
+/// loads as an OAuth login no leg polls and every login refuses; its empty
+/// Usage body says to fix the table, while a plain account holding nothing
+/// keeps the setup-tab line.
+#[test]
+fn an_unreadable_proxy_record_holding_a_pair_names_the_table_in_the_empty_body() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let px = keyless_proxy_account_holding_a_pair(false, "");
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.has_unreadable_proxy_record,
+            px.is_oauth(),
+            px.access_token(),
+        ),
+        (false, true, true, Some("at-px")),
+        "fixture control: (a readable proxy record, an unreadable one, an OAuth body, the \
+         stored pair)"
+    );
+    let unreadable_row = format!(
+        "│   can't read its [proxy] table, fix it in config.toml{}│",
+        " ".repeat(24)
+    );
+    let plain_row = format!(
+        "│   not logged in, use + login on the setup tab{}│",
+        " ".repeat(32)
+    );
+
+    let px_rows = usage_detail_rows(px, 80);
+    let plain_rows = usage_detail_rows(
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("oau")),
+        80,
+    );
+    assert_eq!(
+        (
+            px_rows.contains(&unreadable_row),
+            plain_rows.contains(&plain_row)
+        ),
+        (true, true),
+        "(the unreadable record's empty body row, the plain account's): {px_rows:#?} \
+         {plain_rows:#?}"
+    );
+}
+
+/// A proxy account with `auto_start` on holding a stored pair shows no
+/// auto-start countdown on its plan row, since no kick spends its chain; a
+/// plain OAuth account with `auto_start` on shows it.
+#[test]
+fn a_proxy_account_shows_no_auto_start_countdown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oa"]);
+    let px = keyless_proxy_account_holding_a_pair(true, "acct-1");
+    let mut oa = crate::profile::Profile::new("oa".to_string(), None, None);
+    oa.auto_start = true;
+    oa.credentials = Some(stored_pair("oa"));
+    assert_eq!(
+        (
+            px.proxy.is_some(),
+            px.auto_start,
+            px.access_token(),
+            oa.auto_start,
+            oa.access_token()
+        ),
+        (true, true, Some("at-px"), true, Some("at-oa")),
+        "fixture control: (px's proxy record, its auto_start, its pair, oa's auto_start, its \
+         pair)"
+    );
+    let px_plan_row = format!("│ plan      —{}│", " ".repeat(76));
+    let oa_plan_row = format!("│ plan      —{}usage auto-start due now │", " ".repeat(51));
+
+    let px_rows = usage_detail_rows(px, 90);
+    let oa_rows = usage_detail_rows(oa, 90);
+    assert_eq!(
+        (
+            px_rows.contains(&px_plan_row),
+            px_rows.iter().any(|row| row.contains("usage auto-start")),
+            oa_rows.contains(&oa_plan_row)
+        ),
+        (true, false, true),
+        "(px's bare plan row, any countdown on px, oa's countdown row): {px_rows:#?} \
+         {oa_rows:#?}"
+    );
+}
+
+/// A proxy account holding a setup-token sidecar beside its stored pair, its
+/// `[proxy]` table readable or not, gets its own empty-body line, never the
+/// sidecar line naming `+ login`, which refuses it; a plain account holding
+/// the same sidecar keeps the sidecar line.
+#[test]
+fn a_proxy_account_holding_a_sidecar_never_reads_the_relogin_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px", "oau"]);
+    let with_sidecar = |mut profile: crate::profile::Profile| {
+        profile.has_long_lived_sidecar = true;
+        profile
+    };
+    let readable = with_sidecar(keyless_proxy_account_holding_a_pair(false, "acct-1"));
+    let readable_shape = (
+        readable.proxy.is_some(),
+        readable.has_unreadable_proxy_record,
+        readable.is_oauth(),
+    );
+    let readable_rows = usage_detail_rows(readable, 80);
+    let unreadable = with_sidecar(keyless_proxy_account_holding_a_pair(false, ""));
+    let unreadable_shape = (
+        unreadable.proxy.is_some(),
+        unreadable.has_unreadable_proxy_record,
+        unreadable.is_oauth(),
+    );
+    let unreadable_rows = usage_detail_rows(unreadable, 80);
+    let plain_rows = usage_detail_rows(
+        with_sidecar(crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("oau"),
+        )),
+        120,
+    );
+    assert_eq!(
+        (readable_shape, unreadable_shape),
+        ((true, false, true), (false, true, true)),
+        "fixture control: (a readable proxy record, an unreadable one, an OAuth body) for each"
+    );
+    let readable_row = format!(
+        "│   no api key set, run `clauth login px --proxy stub`{}│",
+        " ".repeat(25)
+    );
+    let unreadable_row = format!(
+        "│   can't read its [proxy] table, fix it in config.toml{}│",
+        " ".repeat(24)
+    );
+    let plain_row = format!(
+        "│   can't read usage, log in the same account with + login on the setup tab, or turn \
+         on its usage probe{}│",
+        " ".repeat(16)
+    );
+
+    assert_eq!(
+        (
+            readable_rows.contains(&readable_row),
+            unreadable_rows.contains(&unreadable_row),
+            plain_rows.contains(&plain_row),
+        ),
+        (true, true, true),
+        "(the readable proxy account's empty body row, the unreadable record's, the plain \
+         account's): {readable_rows:#?} {unreadable_rows:#?} {plain_rows:#?}"
+    );
+}
+
+/// The fetch row of a stood-down instance 4 minutes past its deadline, in
+/// `status` (its pill and retry ordinal kept), with the reading 5.5 minutes
+/// old so `read 5m ago` lands away from a minute boundary. Returns the token
+/// vector and the row's joined span text — the token pin collapses whitespace,
+/// so the spacing (the double space after a pill) needs the joined form
+/// pinned beside it.
+fn overdue_status_row(status: FetchStatus, rate_limit: u32) -> (Vec<String>, String) {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 330_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", status);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts {
+                rate_limit,
+                ..StreakCounts::default()
+            },
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in") || l.contains("retry in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone();
+    (row.split_whitespace().map(str::to_string).collect(), row)
+}
+
+/// `[ failed ]` overdue: the pill and verb stay, the countdown becomes the
+/// overdue wording dated by the reading.
+#[test]
+fn a_failed_overdue_fetch_row_says_retry_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::Failed, 0);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "failed", "]", "retry", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ failed ]  retry overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// `[ cached ]` overdue keeps its `refresh` verb (a refresh attempt, not a
+/// retry, while the token chain is not failing).
+#[test]
+fn a_cached_overdue_fetch_row_says_refresh_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::Cached, 0);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "cached", "]", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ cached ]  refresh overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// `[ rate limited ]` overdue keeps the retry ordinal: the depth signal
+/// survives the reworded countdown.
+#[test]
+fn a_rate_limited_overdue_fetch_row_keeps_the_retry_ordinal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = overdue_status_row(FetchStatus::RateLimited, 3);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "rate", "limited", "]", "3rd", "retry", "overdue", "·", "read", "5m",
+            "ago"
+        ],
+    );
+    assert_eq!(
+        joined, "status    [ rate limited ]  3rd retry overdue · read 5m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A fetching instance with a past deadline keeps its `queued` spinner: a
+/// fetch IS coming there, so the stood-down overdue wording never replaces
+/// it (and `refresh in 0s` never appears either).
+#[test]
+fn a_fetching_instance_with_a_past_deadline_keeps_the_queued_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.split_whitespace().any(|w| w == "queued"))
+        .unwrap_or_else(|| panic!("a queued row renders: {lines:?}"));
+    assert!(
+        crate::spinner::SPINNER_FRAMES
+            .iter()
+            .any(|f| row.split_whitespace().any(|w| w.contains(f))),
+        "`queued` follows its spinner frame: {row:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("overdue")),
+        "a fetching instance's past deadline never reads overdue: {lines:?}"
+    );
+}
+
+/// A third-party reading's `read N ago` dates off its cache mtime, which the
+/// snapshot's per-tick clock map carries (its `UsageInfo` holds no
+/// `fetched_at` stamp).
+#[test]
+fn a_third_party_overdue_fetch_row_dates_off_its_cache_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    let reading = crate::usage::UsageInfo::default();
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading);
+    readings.clock.insert("a".to_string(), now_ms() - 330_000);
+    readings.is_third_party.insert("a".to_string(), true);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue"))
+        .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        [
+            "status", "◌", "refresh", "overdue", "·", "read", "5m", "ago"
+        ],
+        "the third-party reading dates off its cache mtime, no fetched_at stamp"
+    );
+}
+
+/// An OAuth body with no `fetched_at` stamp shows its overdue form undated:
+/// the cache mtime that dates its due time is not a stamp clauth read, so
+/// no `read Nm ago` can ride the row — with and without the `[ stale ]`
+/// pill, which keeps its own threshold.
+#[test]
+fn an_undated_overdue_fetch_row_reads_overdue_without_a_read_age() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for stale in [false, true] {
+        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let mut readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo::default(),
+        );
+        readings = snap_with_oauth_usage(readings, "a", crate::usage::UsageInfo::default());
+        readings.clock.insert("a".to_string(), now_ms() - 330_000);
+        if stale {
+            readings = snap_with_stale(readings, "a");
+        }
+        let lines: Vec<String> = status_lines(
+            &profile,
+            &HeaderState {
+                fetches_here: false,
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() - 240_000),
+                tick: 0,
+                rate_limit_source: super::RateLimitSource::ThirdParty,
+                streaks: StreakCounts::default(),
+                kick_block: None,
+                queue_slot: None,
+                diag: DiagFlags::default(),
+                peak: None,
+            },
+            120,
+            &readings,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+        let row = lines
+            .iter()
+            .find(|l| l.contains("overdue"))
+            .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"))
+            .clone();
+        let expected: Vec<&str> = if stale {
+            vec!["status", "[", "stale", "]", "◌", "refresh", "overdue"]
+        } else {
+            vec!["status", "◌", "refresh", "overdue"]
+        };
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            expected,
+            "no stamp, no read age: the undated form (stale={stale})"
+        );
+    }
+}
+
+/// [`overdue_status_row`] for a body with no `fetched_at`: the due time
+/// derives off the clock map's mtime, but the read age has no stamp to
+/// date.
+fn undated_overdue_status_row(status: FetchStatus, rate_limit: u32) -> (Vec<String>, String) {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let mut readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo::default(),
+    );
+    readings = snap_with_oauth_usage(readings, "a", crate::usage::UsageInfo::default());
+    readings.clock.insert("a".to_string(), now_ms() - 330_000);
+    readings = snap_with_status(readings, "a", status);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: false,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() - 240_000),
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts {
+                rate_limit,
+                ..StreakCounts::default()
+            },
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue") || l.contains("refresh in") || l.contains("retry in"))
+        .unwrap_or_else(|| panic!("a fetch row renders: {lines:?}"))
+        .clone();
+    (row.split_whitespace().map(str::to_string).collect(), row)
+}
+
+/// The pill arms keep their pill, verb and retry ordinal on an undated
+/// body, dropping only the ` · read Nm ago` half: the due time (the cache
+/// mtime plus the interval) still reads overdue, the read age has no stamp.
+#[test]
+fn the_pill_arms_read_overdue_undated_when_the_body_has_no_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::Failed, 0);
+    assert_eq!(tokens, ["status", "[", "failed", "]", "retry", "overdue"]);
+    assert_eq!(
+        joined, "status    [ failed ]  retry overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::Cached, 0);
+    assert_eq!(tokens, ["status", "[", "cached", "]", "refresh", "overdue"]);
+    assert_eq!(
+        joined, "status    [ cached ]  refresh overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+    let (tokens, joined) = undated_overdue_status_row(FetchStatus::RateLimited, 3);
+    assert_eq!(
+        tokens,
+        [
+            "status", "[", "rate", "limited", "]", "3rd", "retry", "overdue"
+        ]
+    );
+    assert_eq!(
+        joined, "status    [ rate limited ]  3rd retry overdue",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A failed account whose leg a left-running fetch worker holds has no
+/// published deadline: the reading's own stamp plus the account's interval
+/// dates when the refresh fell due, so the fetch row reads the overdue
+/// wording on the instance that fetches, never a bare `[ failed ]`.
+#[test]
+fn a_late_workers_failed_fetch_row_says_retry_overdue_and_dates_the_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let interval = crate::usage::usage_interval_ms(
+        &profile,
+        crate::profile::AppState::default().refresh_interval_ms,
+    );
+    // The 90 s interval + 4m30s lands the stamp exactly 6 m out, and
+    // `spoken_age` floors, so `read 6m ago` holds from the stamp to the 7 m
+    // boundary — a full minute of margin.
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - interval - 270_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", FetchStatus::Failed);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: interval,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let row = lines
+        .iter()
+        .find(|l| l.contains("overdue"))
+        .unwrap_or_else(|| panic!("the overdue row renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        [
+            "status", "[", "failed", "]", "retry", "overdue", "·", "read", "6m", "ago"
+        ],
+    );
+    assert_eq!(
+        row, "status    [ failed ]  retry overdue · read 6m ago",
+        "the double space after the pill is pinned byte-exact"
+    );
+}
+
+/// A deliberately blanked leg keeps its blank slot even when its reading
+/// dates an overdue refresh: the blank IS the published fact (a spent skip,
+/// a suppressed credential, a selected leg on no work list), never a stuck
+/// worker's silence, so the fetch row renders the bare `[ spent ]` pill.
+#[test]
+fn a_blanked_spent_row_stays_bare_even_with_a_reading_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let interval = crate::usage::usage_interval_ms(
+        &profile,
+        crate::profile::AppState::default().refresh_interval_ms,
+    );
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 330_000),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    let readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                blanked: true,
+                interval_ms: interval,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let row = lines
+        .iter()
+        .find(|l| l.contains("[ spent ]"))
+        .unwrap_or_else(|| panic!("the spent pill renders: {lines:?}"));
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        ["status", "[", "spent", "]"],
+        "the deliberate blank keeps the pill bare"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("overdue")),
+        "the blank, not a stuck worker, holds the leg:\n{lines:?}"
+    );
+}
+
+/// The three overdue fetch-row shapes whose reading-age suffix the width
+/// guard sheds: the stale-plus-pill row, the bare queue dot, and the late
+/// worker's failed row.
+#[derive(Clone, Copy, Debug)]
+enum OverdueBoundary {
+    StaleCached,
+    Dot,
+    LateFailed,
+}
+
+/// A stood-down fetch row in [`OverdueBoundary`]'s shape, drawn at `inner_w`.
+fn overdue_boundary_lines(shape: OverdueBoundary, inner_w: u16) -> Vec<Line<'static>> {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 13 * 60_000 - 30_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    let (fetches_here, next_refresh_ms, status) = match shape {
+        OverdueBoundary::StaleCached => {
+            (false, Some(now_ms() - 240_000), Some(FetchStatus::Cached))
+        }
+        OverdueBoundary::Dot => (false, Some(now_ms() - 240_000), None),
+        OverdueBoundary::LateFailed => (true, None, Some(FetchStatus::Failed)),
+    };
+    if let Some(status) = status {
+        readings = snap_with_status(readings, "a", status);
+    }
+    if matches!(shape, OverdueBoundary::StaleCached) {
+        readings = snap_with_stale(readings, "a");
+    }
+    status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: crate::profile::DEFAULT_REFRESH_INTERVAL_MS,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        inner_w,
+        &readings,
+    )
+}
+
+/// The fetch row among `lines`, found by its overdue wording.
+fn overdue_boundary_row<'a>(lines: &'a [Line<'static>]) -> &'a Line<'static> {
+    lines
+        .iter()
+        .find(|l| l.spans.iter().any(|s| s.content.contains("overdue")))
+        .unwrap_or_else(|| panic!("the overdue fetch row renders: {lines:?}"))
+}
+
+/// The overdue row sheds its ` · read Nm ago` figure at its own exact display
+/// width: `inner_w` equal to the row's cells keeps the figure, one cell less
+/// drops it whole. A guard that sheds a cell early or late cuts a figure the
+/// eye reads as data, so both sides of the boundary are pinned.
+#[test]
+fn the_overdue_fetch_row_sheds_its_reading_age_at_its_exact_display_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (shape, dated, undated) in [
+        (
+            OverdueBoundary::StaleCached,
+            "status    [ stale ] [ cached ]  refresh overdue · read 13m ago",
+            "status    [ stale ] [ cached ]  refresh overdue",
+        ),
+        (
+            OverdueBoundary::Dot,
+            "status    ◌ refresh overdue · read 13m ago",
+            "status    ◌ refresh overdue",
+        ),
+        (
+            OverdueBoundary::LateFailed,
+            "status    [ failed ]  retry overdue · read 13m ago",
+            "status    [ failed ]  retry overdue",
+        ),
+    ] {
+        let wide = overdue_boundary_lines(shape, 200);
+        let row = overdue_boundary_row(&wide);
+        let text = |l: &Line<'static>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(
+            text(row),
+            dated,
+            "{shape:?}: the row fits whole at 200 cells"
+        );
+        let exact = spans_cells(&row.spans) as u16;
+        assert_eq!(
+            text(overdue_boundary_row(&overdue_boundary_lines(shape, exact))),
+            dated,
+            "{shape:?}: at the row's own {exact} cells the reading age stays",
+        );
+        assert_eq!(
+            text(overdue_boundary_row(&overdue_boundary_lines(
+                shape,
+                exact - 1
+            ))),
+            undated,
+            "{shape:?}: one cell short of {exact} drops the reading age whole",
+        );
+    }
+}
+
+/// A probed account's overdue row derives its due time from the probe
+/// interval, not from the base poll interval the diag flags carry: the
+/// selector runs once, inside the row.
+#[test]
+fn a_probed_accounts_overdue_fetch_row_derives_from_its_probe_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.usage_probe = true;
+    profile.has_long_lived_sidecar = true;
+    profile.usage_probe_interval_ms = 90_000;
+    // Two minutes on the reading is past the probe's 90 s cadence but not the
+    // base 300 s one, so only the probe interval dates it overdue.
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(now_ms() - 120_000),
+        ..crate::usage::UsageInfo::default()
+    };
+    let mut readings = snap_with_usage(ReadingsSnapshot::default(), "a", reading.clone());
+    readings = snap_with_oauth_usage(readings, "a", reading);
+    readings = snap_with_status(readings, "a", FetchStatus::Failed);
+    let lines = status_lines(
+        &profile,
+        &HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::ThirdParty,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags {
+                interval_ms: 300_000,
+                ..DiagFlags::default()
+            },
+            peak: None,
+        },
+        120,
+        &readings,
+    );
+    let row = overdue_boundary_row(&lines);
+    assert_eq!(
+        row.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>(),
+        "status    [ failed ]  retry overdue · read 2m ago",
+        "the probe's 90 s cadence dates the reading, not the 300 s base"
+    );
 }

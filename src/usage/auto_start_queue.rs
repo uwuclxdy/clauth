@@ -419,6 +419,7 @@ fn span_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
 /// The exclusions are the ones that mean "cannot open a window", because a
 /// member that can never kick would still take a slot and thin everyone else's
 /// share of the 5h span: user-disabled, `auth_broken`, no stored OAuth pair,
+/// a pair clauth never spends ([`crate::profile::Profile::spends_oauth_chain`]),
 /// a canceled subscription (its windows are
 /// gone, a kick cannot open one), a plan whose own `/usage` body says it has no
 /// 5h limit ([`UsageInfo::no_five_hour_limit`]), and a switch-grade kick block.
@@ -459,7 +460,7 @@ pub(crate) fn auto_start_queue_members(
         .profiles
         .iter()
         .filter(|p| {
-            p.auto_start
+            p.has_effective_auto_start()
                 && !p.is_disabled()
                 && p.access_token().is_some()
                 && !config.is_auth_broken(&p.name)

@@ -178,7 +178,13 @@ fn setup_selector_row(
             } else {
                 name_color(cfg.is_active(&p.name))
             };
-            picker_row(selected, focused, p.name.to_string(), ns, width)
+            let mark = (app.deleting.as_ref() == Some(&p.name)).then(|| {
+                Span::styled(
+                    format!("{} ", spinner_frame(app.tick_count)),
+                    theme::accent(),
+                )
+            });
+            marked_picker_row(selected, focused, mark, p.name.to_string(), ns, width)
         }
         MainItemKind::Codex(i) => {
             let Some(row) = app.codex_rows.get(i) else {
@@ -217,6 +223,9 @@ fn dead_credential_mark(style: Style) -> Span<'static> {
 struct Snap {
     title: String,
     name: String,
+    /// The spinner frame the delete row shows while this card's account is the
+    /// one being deleted.
+    delete_frame: Option<&'static str>,
     /// The saved (typed) base URL — what the base-url row shows at rest, even
     /// while a keyless URL is hidden behind the login.
     base_url: String,
@@ -252,6 +261,9 @@ struct Snap {
     bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
     disabled: bool,
+    /// The account's login is quarantined (`AppState::auth_broken`): the
+    /// `switch to a rolling token` row's dim gate, beside `disabled`.
+    auth_broken: bool,
     /// The global active profile — one of the two gates (mirroring
     /// `actions::disable_profile`'s own gate) that dims the `disabled` row inert.
     is_active: bool,
@@ -267,6 +279,13 @@ struct Snap {
     /// Whether the stored api key is non-blank: read off the profile, not the
     /// `api_key` text field, which a draft-open snap leaves empty.
     has_api_key: bool,
+    /// [`crate::profile::Profile::spends_oauth_chain`] read false: a proxy
+    /// account, whose log out blanks the key alone, whatever it stores.
+    logs_out_by_key: bool,
+    /// [`crate::actions::proxy_login_command`] on a proxy account
+    /// ([`crate::profile::Profile::proxy`]): the one login it takes, so the
+    /// `Login` row's hint names it over either account-type hint.
+    proxy_login: Option<String>,
     /// Credential typing for the login / log-out rows (`Profile::login_is_oauth`,
     /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
     /// keep tracking the base-url buffer instead.
@@ -353,21 +372,46 @@ struct Snap {
     login_disabled_reason: Option<String>,
 }
 
+/// The `ClearSessionToken` gate — ONE formula for every reader: the card's
+/// [`Snap`] feeds it the per-frame sidecar read, the footer and help feed it
+/// the tick's sidecar cache, and `run_config_row` makes the same judgment
+/// from a fresh disk read. Refused only when clearing would strip the
+/// account's LAST credential, i.e. a stored PIECE (sidecar or preserved mint)
+/// with no other login behind it. A flag-only account disarms without
+/// touching a credential, so it is never gated — a row that dims while its
+/// press acts would be the renderer's own lie.
+pub(crate) fn clear_gated_facts(
+    has_other_login: bool,
+    rolling_armed: bool,
+    holds_sidecar: bool,
+    has_static_backup: bool,
+) -> bool {
+    if has_other_login {
+        return false;
+    }
+    let flag_only = rolling_armed && !holds_sidecar && !has_static_backup;
+    !flag_only
+}
+
 impl Snap {
-    /// The `ClearSessionToken` gate — ONE spelling for both render readers
-    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row` makes
-    /// the same judgment from a fresh disk read): refused only when clearing
-    /// would strip the account's LAST credential, i.e. a stored PIECE (sidecar
-    /// or preserved mint) with no other login behind it. A flag-only account
-    /// disarms without touching a credential, so it is never gated — a row
-    /// that dims while its press acts would be the renderer's own lie.
+    /// The `ClearSessionToken` gate off the per-frame facts [`Self`] holds,
+    /// through the one formula [`clear_gated_facts`].
     fn clear_gated(&self) -> bool {
-        if self.has_other_login {
-            return false;
-        }
-        let flag_only =
-            self.rolling_armed && self.session_token.is_none() && !self.has_static_backup;
-        !flag_only
+        clear_gated_facts(
+            self.has_other_login,
+            self.rolling_armed,
+            self.session_token.is_some(),
+            self.has_static_backup,
+        )
+    }
+
+    /// The `RollingTokenSwitch` gate — ONE spelling for both render readers
+    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row`
+    /// re-derives the same judgment from the live config): inert on a
+    /// disabled account or a quarantined login, the two states the CLI
+    /// refuses up front.
+    fn rolling_switch_gated(&self) -> bool {
+        self.disabled || self.auth_broken
     }
 
     /// Blank snapshot for the `+ new` form and the empty fallback.
@@ -375,6 +419,7 @@ impl Snap {
         Snap {
             title: title.to_string(),
             name: String::new(),
+            delete_frame: None,
             base_url: String::new(),
             base_url_derived: String::new(),
             base_url_unused: false,
@@ -395,11 +440,14 @@ impl Snap {
             usage_probe_interval: String::new(),
             bell_threshold: String::new(),
             disabled: false,
+            auth_broken: false,
             is_active: false,
             has_live_session: false,
             logged_in: false,
             has_unreadable_store: false,
             has_api_key: false,
+            logs_out_by_key: false,
+            proxy_login: None,
             login_is_oauth: true,
             has_other_login: false,
             clear_falls_back_to_oauth: false,
@@ -492,6 +540,10 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 } else {
                     String::new()
                 },
+                // The stored name, never the draft's typed buffer, so a rename
+                // typed mid-delete keeps the mark.
+                delete_frame: (app.deleting.as_ref() == Some(&p.name))
+                    .then(|| spinner_frame(app.tick_count)),
                 base_url: text(&saved_url),
                 base_url_derived: text(&p.base_url),
                 base_url_unused: saved_url.is_some() && p.base_url.is_none(),
@@ -521,6 +573,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                     .map(crate::tui::app::format_weekly_pct)
                     .unwrap_or_default(),
                 disabled: p.is_disabled(),
+                auth_broken: cfg.state.auth_broken.contains(&p.name),
                 is_active: cfg.is_active(&p.name),
                 // The marker probe reads fresh for the selected profile only
                 // (same as `session_token` below), but the job-store walk and
@@ -549,6 +602,10 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 },
                 has_unreadable_store: p.unreadable_credentials_store.is_some(),
                 has_api_key: p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+                logs_out_by_key: !p.spends_oauth_chain(),
+                proxy_login: p.proxy.as_ref().map(|record| {
+                    crate::actions::proxy_login_command(p.name.as_str(), &record.service)
+                }),
                 login_is_oauth: p.login_is_oauth(),
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
@@ -1069,7 +1126,11 @@ fn draw_settings_rows(
         _ => app.config_draft.as_ref(),
     };
     let editing = draft.and_then(|d| d.active);
-    let armed_action = draft.and_then(|d| d.armed_action);
+    // An arm belongs to the draft's account: the worker's removal can leave the
+    // draft open on a neighbour's card until the result drains.
+    let armed_action = draft
+        .filter(|d| d.editing_name.as_deref() == Some(snap.title.as_str()))
+        .and_then(|d| d.armed_action);
 
     // The endpoint-shaped typing reads the derived URL (the draft buffer live,
     // else the profile's routing URL), never the saved value the base-url row
@@ -1309,6 +1370,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
+        | ConfigRow::RollingTokenSwitch
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => "",
@@ -1318,7 +1380,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe, phrased for the row's
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
-/// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
+/// name what ⏎ really does, and a proxy account's log out blanks only its key
+/// — while `auto_start`, `base_url` and `alert at` flip
 /// on their own value, and auto-start and the usage probe also on whether the
 /// plan has a 5h limit at all.
 /// `value` is the row's own live value (the draft buffer while a draft holds
@@ -1403,12 +1466,19 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
         ConfigRow::Login if snap.login_disabled_reason.is_some() => {
             return Some(snap.login_disabled_reason.clone().unwrap_or_default());
         }
+        ConfigRow::Login if snap.proxy_login.is_some() => {
+            return snap
+                .proxy_login
+                .as_ref()
+                .map(|command| format!("log in with `{command}`"));
+        }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "browser OAuth login",
         ConfigRow::CaptureLogin if snap.account_type == crate::tui::app::NewAccountType::Codex => {
             "capture the current codex login into this account"
         }
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if snap.logs_out_by_key => "clears the stored API key",
         ConfigRow::DeleteCreds if api_login && snap.has_unreadable_store => {
             if snap.has_api_key {
                 "clears the stored API key and the unreadable credentials.json"
@@ -1465,6 +1535,19 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
                 hint.push_str(" · the preserved mint goes too");
             }
             return Some(hint);
+        }
+        // Gate reason first (same order as the clear row: a gate only ever
+        // bites the armable state), then the disclosure — this hint is the
+        // TUI's entire statement that the session credential gets wider.
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() && snap.disabled => {
+            "cannot switch a disabled account"
+        }
+        ConfigRow::RollingTokenSwitch if snap.rolling_switch_gated() => {
+            "cannot switch: this login is dead · log in again first"
+        }
+        ConfigRow::RollingTokenSwitch => {
+            "sessions get this login's full-scope token, re-stamped by the daemon · \
+             wider than a setup token · no refresh token"
         }
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
@@ -1781,10 +1864,13 @@ fn detail_row(
             selected,
         ),
         ConfigRow::Delete => {
-            let label = if armed_action == Some(ConfigRow::Delete) {
-                "press again to delete".to_string()
-            } else {
-                "delete account".to_string()
+            let (arrow, label) = match snap.delete_frame {
+                Some(frame) => (
+                    Span::styled(format!("{frame} "), theme::accent()),
+                    "deleting\u{2026}",
+                ),
+                None if armed_action == Some(ConfigRow::Delete) => (arrow, "press again to delete"),
+                None => (arrow, "delete account"),
             };
             Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }
@@ -1872,6 +1958,30 @@ fn detail_row(
                 ("press again to clear", theme::danger().bold())
             } else {
                 ("clear long-lived token", theme::danger().bold())
+            };
+            Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
+        // The `switch to a rolling token` row: `Delete`'s button class —
+        // always-bold DANGER, `press again to switch` once armed — because an
+        // arm retargets every future switch and, on the active account, moves
+        // a running session's credentials. Dimmed/inert (arrow included,
+        // matching the gated `disabled` row) on a disabled account or a
+        // quarantined login: `run_config_row`'s own gate no-ops there, and
+        // `Snap::rolling_switch_gated` is the one spelling both render
+        // readers share.
+        ConfigRow::RollingTokenSwitch => {
+            let gated = snap.rolling_switch_gated();
+            let row_arrow = if gated && selected {
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
+            } else {
+                arrow
+            };
+            let (label, style) = if gated {
+                ("switch to a rolling token", theme::faint())
+            } else if armed_action == Some(ConfigRow::RollingTokenSwitch) {
+                ("press again to switch", theme::danger().bold())
+            } else {
+                ("switch to a rolling token", theme::danger().bold())
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
         }

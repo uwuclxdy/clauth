@@ -53,6 +53,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
@@ -1711,6 +1713,7 @@ fn the_spent_fix_names_a_monthly_quota() {
                 monthly: true,
             },
             &crate::profile::ProfileName::from("acct"),
+            None,
             false,
         ),
         "monthly quota is spent"
@@ -1748,6 +1751,7 @@ fn the_soft_fix_names_a_monthly_quota() {
                 monthly: true,
             },
             &crate::profile::ProfileName::from("acct"),
+            None,
             false,
         ),
         "monthly quota past the weekly switch line, still serving"
@@ -2389,7 +2393,12 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
     }
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
-        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"), false);
+        let fix = reason_fix(
+            &reason,
+            &crate::profile::ProfileName::from("acct"),
+            None,
+            false,
+        );
         assert!(!fix.trim().is_empty(), "{reason:?} has no fix copy");
         assert_eq!(
             fix,
@@ -2412,6 +2421,7 @@ fn key_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::KeyRejected,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2437,6 +2447,7 @@ fn token_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::TokenRejected,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2466,6 +2477,7 @@ fn logged_out_fix_line_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::LoggedOut,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2486,6 +2498,127 @@ fn logged_out_fix_line_is_pinned_by_equality() {
         .map(|s| s.content.as_ref())
         .collect();
     assert_eq!(pill, "[ logged out ]", "the rendered pill is {pill:?}");
+}
+
+/// `px` alone on the chain, drawn on the Fallback pane the way the operator
+/// reaches its card: the proxy claim on the runtime profile as `load_profile`
+/// records it when `proxy` (the same member with no claim otherwise), a key in
+/// hand when `key`, and that key recorded dead when `rejected`. Returns the
+/// detail pane's pill row, the fix row under it, and the style of the card
+/// span that is exactly `command`, when one is.
+fn px_member_card(
+    proxy: bool,
+    key: bool,
+    rejected: bool,
+    command: &str,
+) -> (String, String, Option<ratatui::style::Style>) {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        key.then(|| "sk-px-0001".to_string()),
+    );
+    px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let fp = crate::usage::dead_login_fingerprint(&px);
+    let (cfg, readings) = config_with(vec![(px, ReadingsSnapshot::default())], None, vec!["px"]);
+    let app = app_with_readings(cfg, &readings);
+    if rejected {
+        app.third_party_broken.lock().unwrap().insert(
+            "px".to_string(),
+            fp.expect("a keyed member has a fingerprint"),
+        );
+    }
+    let rows = render_chain(&app, 100, 24);
+    let screen = rows.join("\n");
+    let pill = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("status"))
+        .unwrap_or_else(|| panic!("no status row on the card:\n{screen}"));
+    let key_rejected = app.key_rejected_names();
+    let cfg = app.config();
+    let lines = member_detail(
+        &cfg,
+        &ProfileName::from("px"),
+        MemberCard {
+            width: 200,
+            ..Default::default()
+        },
+        &key_rejected,
+        &readings,
+    )
+    .0;
+    let styled = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == command)
+        .map(|s| s.style);
+    (
+        detail_of(&rows[pill]).to_string(),
+        detail_of(&rows[pill + 1]).to_string(),
+        styled,
+    )
+}
+
+/// A proxy account's key is the proxy's to mint, so a proxy member with no key
+/// is sent to the one login clauth takes for it, through its proxy, the command
+/// drawn as one command run; the same member with no proxy claim keeps the
+/// login-or-key fix, byte for byte.
+#[test]
+fn a_keyless_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, false, false, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, false, false, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px, or add an api key on the setup tab"
+        )
+    );
+}
+
+/// A proxy member whose key a provider refused gets a new key the one way
+/// clauth takes one for it, a login through its proxy; the same member with no
+/// proxy claim keeps the setup-tab fix, byte for byte.
+#[test]
+fn a_rejected_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, true, true, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ log in again with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, true, true, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ re-enter the api key on the setup tab"
+        )
+    );
 }
 
 // ── `max spend` dims while inert (spend budget off) ──────────────────────────
@@ -3694,7 +3827,12 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"), false);
+    let fix = reason_fix(
+        &BlockedReason::AuthBroken,
+        &ProfileName::from("a"),
+        None,
+        false,
+    );
     assert_prose_part(
         &lines_buffer(rail_hint_lines(&fix, 60, false), 60),
         "re-login with clauth login a",
@@ -4915,5 +5053,52 @@ fn moving_the_selector_to_another_member_clears_the_cards_tint() {
         card_tinted_cells(&chain_buffer(&app, 100, 30)),
         Vec::new(),
         "a's card is never-entered again"
+    );
+}
+
+/// A quarantined proxy member is sent to the login through its proxy, the one
+/// login clauth takes for it; the same member with no proxy claim keeps the
+/// re-login fix, byte for byte. The pill row and the fix row under it, as the
+/// member card draws them.
+#[test]
+fn a_quarantined_proxy_members_card_names_the_login_through_its_proxy() {
+    let card = |proxy: bool| {
+        let (mut px, readings) = profile("px", 95.0, 10.0, 3600);
+        px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        let (mut cfg, readings) = config_with(vec![(px, readings)], None, vec!["px"]);
+        cfg.state.auth_broken.push("px".into());
+        let (lines, _, _) = member_detail(
+            &cfg,
+            &ProfileName::from("px"),
+            MemberCard {
+                width: 200,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let at = text
+            .iter()
+            .position(|l| l.starts_with("└ "))
+            .unwrap_or_else(|| panic!("no fix line in {text:#?}"));
+        (text[at - 1].clone(), text[at].clone())
+    };
+    assert_eq!(
+        (card(true), card(false)),
+        (
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ log in again with clauth login px --proxy stub".to_string(),
+            ),
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ re-login with clauth login px".to_string(),
+            ),
+        ),
+        "((proxy member's pill row, fix row), (plain member's ...))"
     );
 }

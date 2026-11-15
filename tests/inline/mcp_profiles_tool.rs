@@ -70,6 +70,52 @@ fn lines(result: &CallToolResult) -> Vec<String> {
     first_text(result).lines().map(str::to_string).collect()
 }
 
+/// A row names the available resets its account's last read found, singular
+/// at one, and says nothing at zero or with no reading.
+#[test]
+fn a_row_names_the_banked_limit_resets_it_read() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let row = || lines(&call_profiles(Some(vec!["solo"]), None));
+
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "no reading names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("solo", 2, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             2 limit resets available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 1, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             1 limit reset available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 0, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a reading of zero names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("vendor", 1, &[], None, 1);
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; 1 limit reset available; \
+             no api key"
+        ],
+        "the file decides, on an api-key account too",
+    );
+}
+
 #[test]
 fn names_filter_selects_one_profile_case_insensitively() {
     let _home = HomeSandbox::new();
@@ -686,8 +732,9 @@ fn seed_auth_states() {
 }
 
 /// `keyless` is the only-when-news signal a picker needs before a `delegate`:
-/// true on a third-party profile with no inference auth source, absent (never
-/// `false`) on a keyed third-party and on an OAuth profile.
+/// true on a profile whose inference needs a key it does not carry
+/// (`Profile::is_keyless`), absent (never `false`) on a keyed third-party and
+/// on an OAuth profile.
 #[test]
 fn keyless_flag_names_only_the_keyless_third_party_profile() {
     let _home = HomeSandbox::new();
@@ -1366,6 +1413,7 @@ fn the_runway_payload_carries_the_funded_wallets_balance() {
     let payload = windows_payload(&ProfileWindows::ThirdParty {
         stats: Some(stats),
         age_secs: None,
+        chain_age_secs: None,
         provider: None,
         wallet_rate: Some(rate),
     });
@@ -1394,6 +1442,7 @@ fn the_runway_reaches_the_delegate_receipt_through_live_usage_json() {
         Some(&ProfileWindows::ThirdParty {
             stats: Some(stats),
             age_secs: None,
+            chain_age_secs: None,
             provider: None,
             wallet_rate: Some(rate),
         }),
@@ -1971,5 +2020,78 @@ fn a_named_accounts_advisor_row_prints_among_its_binds() {
             "- vendor [DeepSeek, api.deepseek.com]: usage unknown; models: opus -> \
              deepseek-v4-pro, advisor -> opus; no api key"
         ],
+    );
+}
+
+/// A keyless third-party control (`vendor`), then two proxy accounts on their
+/// proxy's loopback bind as `clauth login <name> --proxy <service>` creates
+/// them: `pb` with its key cleared, `pk` keyed.
+fn seed_proxy_auth_states() {
+    save_profile(&Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    ))
+    .expect("save vendor");
+    save_app_state(&AppState {
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+}
+
+/// The roster flags exactly the accounts the delegate refuses as keyless: a
+/// keyless proxy account on its bind carries `keyless` and renders `no api
+/// key`, the keyed proxy account beside it carries neither, and the keyless
+/// third-party control keeps its flag.
+#[test]
+fn the_roster_flags_a_keyless_proxy_account_on_its_bind_keyless() {
+    let _home = HomeSandbox::new();
+    seed_proxy_auth_states();
+
+    let config = crate::profile::load_config().expect("config");
+    let live = crate::live_sessions::LiveTally::collect(&config);
+    let keyless = |name: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("seeded");
+        profile_row(p, &config, crate::usage::now_epoch_secs(), &live)
+            .get("keyless")
+            .cloned()
+    };
+    assert_eq!(
+        (
+            lines(&call_profiles(None, None)),
+            [keyless("vendor"), keyless("pb"), keyless("pk")],
+        ),
+        (
+            vec![
+                "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+                "- pb [generic, 127.0.0.1:9141, local endpoint]: usage unknown; no api key"
+                    .to_string(),
+                "- pk [generic, 127.0.0.1:9141, local endpoint]: usage unknown".to_string(),
+            ],
+            [
+                Some(serde_json::json!(true)),
+                Some(serde_json::json!(true)),
+                None
+            ],
+        ),
+        "(the reply's rows, the JSON `keyless` value of vendor, pb, pk)"
     );
 }

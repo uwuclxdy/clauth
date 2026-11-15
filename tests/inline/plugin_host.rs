@@ -220,9 +220,9 @@ fn no_post_tool_use_entry_runs_on_every_tool_call() {
 }
 
 /// The note window map's sweep is its only bound on growth besides a
-/// subagent's stop. `claude plugin test` loads the module in its own graph, so
-/// a plugin test cannot read the map size (measured 2026-10-30: an exported
-/// counter read 0 and a global read -1); the sweep is pinned at the
+/// subagent's run ending. `claude plugin test` loads the module in its own
+/// graph, so a plugin test cannot read the map size (measured 2026-10-30: an
+/// exported counter read 0 and a global read -1); the sweep is pinned at the
 /// source instead. What that cannot see: whether the sweep runs at all, and
 /// whether a `return`, an uncalled function or a `/* */` block comment inside
 /// the handler span leaves it dead code.
@@ -232,15 +232,15 @@ fn the_note_window_sweep_bounds_the_map() {
     assert!(
         source.contains("for (const [stale, at] of lastNoteAt)"),
         "register.ts must keep the note window sweep: it is the map's only \
-         bound besides a subagent's stop"
+         bound besides a subagent's run ending"
     );
     assert!(
         source.contains("lastNoteAt.delete(stale)"),
         "the sweep must drop the entry it found stale, not just walk the map"
     );
     let handler = source
-        .find("on('classic.PostToolUse'")
-        .expect("register.ts registers a classic.PostToolUse handler");
+        .find("on('tool.call', async")
+        .expect("register.ts registers the note's tool.call handler");
     let stamp = handler
         + source[handler..]
             .find("lastNoteAt.set(key, now)")
@@ -259,8 +259,8 @@ fn the_note_window_sweep_bounds_the_map() {
             "for (const [stale, at] of lastNoteAt) { if (now - at >= NOTE_CADENCE_MS) \
              lastNoteAt.delete(stale) }"
         ),
-        "the window stamp must be preceded, inside classic.PostToolUse, by the \
-         sweep loop and its bare NOTE_CADENCE_MS threshold: {body}"
+        "the window stamp must be preceded, inside the note's tool.call handler, \
+         by the sweep loop and its bare NOTE_CADENCE_MS threshold: {body}"
     );
 }
 

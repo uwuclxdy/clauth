@@ -18,11 +18,11 @@ use serde::Deserialize;
 
 use super::codex_reset::{
     FailureVoice, cap_drawn, quoted_escaped, re_send_deadline, re_send_hint,
-    read_failure as shared_read_failure, read_reply, spend_failure as shared_spend_failure, stamp,
-    trim_padding,
+    read_failure as shared_read_failure, read_reply, read_reply_hinted,
+    spend_failure as shared_spend_failure, stamp, trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
-use super::fetch::AuthClient;
+use super::fetch::{AuthClient, LimitResets};
 use crate::format::{local_stamp, plural, shows_nothing, terminal_safe};
 
 /// The reset inventory read: the poll's `/usage` path plus the two query flags
@@ -60,6 +60,66 @@ impl ResetStatus {
         let id = self.next_grant_id.as_deref()?;
         self.grants.iter().find(|g| g.id == id)
     }
+
+    /// The grant a spend would send now, or why a fresh spend refuses: the
+    /// server's next grant, when the server marks it usable now and its id
+    /// fits the pattern Claude Code sends. The server refuses any grant but
+    /// its next one, and Claude Code refuses to send an id off the pattern
+    /// before it spends. A grant both cooling and off the pattern reads as
+    /// not usable now.
+    pub(crate) fn try_spend_grant(&self) -> Result<&Grant, SpendRefusal<'_>> {
+        let grant = self.next_grant().ok_or(SpendRefusal::NoNextGrant(self))?;
+        if !grant.is_usable_now() {
+            return Err(SpendRefusal::NotUsableNow(grant));
+        }
+        if !grant_id_is_sendable(&grant.id) {
+            return Err(SpendRefusal::UnsendableId);
+        }
+        Ok(grant)
+    }
+
+    /// [`Self::try_spend_grant`] without its reason, for the surfaces that
+    /// only count.
+    pub(crate) fn spend_grant(&self) -> Option<&Grant> {
+        self.try_spend_grant().ok()
+    }
+
+    /// The account's banked resets a fresh spend can use now: the sum of
+    /// `resets_left` over grants the server marks usable, and 0 while the
+    /// server's next reset cannot be spent. The scheduler's side read and the
+    /// CLI's post-spend refresh land this count in `limit_resets.json`.
+    /// Saturated, as the codex arm clamps its server count: a body whose
+    /// grants sum past `u32::MAX` reads as maxed, never wraps or panics.
+    pub(crate) fn usable_resets(&self) -> u32 {
+        if self.spend_grant().is_none() {
+            return 0;
+        }
+        self.grants
+            .iter()
+            .filter(|g| g.usable_now)
+            .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
+    }
+
+    /// Every banked reset the last read found, usable or not: the sum of
+    /// `resets_left` over every grant, saturated. The Usage row counts the
+    /// spendable ones against this total, so a cooldown hides no banked reset.
+    pub(crate) fn banked_resets(&self) -> u32 {
+        self.grants
+            .iter()
+            .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
+    }
+}
+
+/// Why [`ResetStatus::try_spend_grant`] refuses, each variant carrying what
+/// its refusal line names.
+#[derive(Debug)]
+pub(crate) enum SpendRefusal<'a> {
+    /// The server names no next grant, or none it lists matches its id.
+    NoNextGrant(&'a ResetStatus),
+    /// The server does not mark its next grant usable now.
+    NotUsableNow(&'a Grant),
+    /// The next grant's id is off `^[a-z0-9_-]{1,40}$`.
+    UnsendableId,
 }
 
 /// One grant, as the status block lists it. Every field but `id` defaults, so
@@ -70,8 +130,6 @@ pub(crate) struct Grant {
     pub(crate) id: String,
     #[serde(default)]
     label: String,
-    #[serde(default)]
-    resets_total: u32,
     #[serde(default)]
     resets_left: u32,
     #[serde(default)]
@@ -94,14 +152,25 @@ impl Grant {
         self.usable_now
     }
 
-    /// The server's label, or the generic name; control characters dropped,
-    /// cut to the same 40 the window names use (this text reaches a terminal).
+    /// The window names this grant clears, raw server spelling — the side
+    /// read's file and the TUI's labels both take them off here.
+    pub(crate) fn clears(&self) -> &[String] {
+        &self.clears
+    }
+
+    /// The grant's ISO end stamp, raw server spelling.
+    pub(crate) fn ends_at(&self) -> Option<&str> {
+        self.ends_at.as_deref()
+    }
+
+    /// The server's label whole, or the generic name; control characters
+    /// dropped, since this text reaches a terminal. The prompt cuts it to 40.
     fn label(&self) -> String {
         let label = terminal_safe(&self.label);
         if shows_nothing(&label) {
             "limit reset".to_string()
         } else {
-            cap_drawn(trim_padding(&label), 40)
+            trim_padding(&label).to_string()
         }
     }
 
@@ -128,7 +197,7 @@ impl CedarEmberBody {
 }
 
 /// Parse the `cedar_ember` block off a raw usage body. Test-only: the wire
-/// read ([`read_status_at`]) parses the typed body through [`read_reply`], and
+/// read ([`read_status_at`]) parses the typed body through [`read_reply_hinted`], and
 /// this seam lets tests drive fixture bytes straight into the parser.
 #[cfg(test)]
 pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
@@ -139,7 +208,16 @@ pub(crate) fn read_status(body: &str) -> Result<ResetStatus, ResetCallError> {
 
 /// GET the account's reset grants. Spends nothing.
 pub(crate) fn read_status_at(url: &str, access_token: &str) -> Result<ResetStatus, ResetCallError> {
-    read_reply::<CedarEmberBody>(
+    read_status_hinted_at(url, access_token).map_err(|(err, _)| err)
+}
+
+/// [`read_status_at`] carrying a non-2xx reply's `retry-after` beside its
+/// error (see [`read_reply_hinted`]), for the scheduler's side read.
+pub(crate) fn read_status_hinted_at(
+    url: &str,
+    access_token: &str,
+) -> Result<ResetStatus, (ResetCallError, Option<Duration>)> {
+    read_reply_hinted::<CedarEmberBody>(
         super::fetch::apply_auth_headers(
             super::fetch::http_agent().get(url),
             access_token,
@@ -152,6 +230,22 @@ pub(crate) fn read_status_at(url: &str, access_token: &str) -> Result<ResetStatu
         .call(),
     )
     .map(CedarEmberBody::into_status)
+}
+
+/// The reading a banked-reset status lands on disk: the usable count, the
+/// banked total, the next grant's raw window names and end, and the read's own
+/// epoch-ms stamp. The scheduler's hourly side read and the CLI's post-spend
+/// refresh share it, so a spend's re-read lands exactly what the hourly read
+/// would have.
+pub(crate) fn status_reading(status: &ResetStatus) -> LimitResets {
+    let next = status.next_grant();
+    LimitResets {
+        usable: status.usable_resets(),
+        banked: Some(status.banked_resets()),
+        clears: next.map(|g| g.clears().to_vec()).unwrap_or_default(),
+        ends_at: next.and_then(|g| g.ends_at().map(str::to_string)),
+        fetched_at: Some(super::now_ms()),
+    }
 }
 
 /// The profile reply's org id, the only field the spend needs.
@@ -247,6 +341,16 @@ pub(crate) fn read_url(origin: &str) -> String {
     format!("{origin}{READ_PATH}")
 }
 
+/// The side read's URL off the poll's own resolved `/usage` endpoint: that
+/// endpoint already ends in the path [`READ_PATH`] spells, so only its query
+/// flags join — the flags are spelled once, in [`READ_PATH`].
+pub(crate) fn read_url_from_endpoint(endpoint: &str) -> String {
+    let Some((_, query)) = READ_PATH.split_once('?') else {
+        return format!("{endpoint}{READ_PATH}");
+    };
+    format!("{endpoint}?{query}")
+}
+
 pub(crate) fn org_url(origin: &str) -> String {
     format!("{origin}{PROFILE_PATH}")
 }
@@ -265,15 +369,29 @@ pub(crate) fn new_request_id() -> anyhow::Result<String> {
 // ── the operator-facing text ────────────────────────────────────────────────
 
 /// A cleared-window name as the terminal reads it: the short labels Claude
-/// Code's own copy uses, any other name as sent with its control characters
-/// dropped and cut to 40.
-fn window_label(name: &str) -> String {
+/// Code's own copy uses, `7d fable` for the weekly window Fable counts into
+/// (the name the usage bars give it), any other name as sent with its control
+/// characters dropped and cut to 40. Shared by `--list` and the TUI's resets
+/// row, so the two surfaces never spell a label apart.
+pub(crate) fn window_label(name: &str) -> String {
     match name {
         "five_hour" => "5h".to_string(),
         "seven_day" => "7d".to_string(),
         "seven_day_opus" => "7d opus".to_string(),
+        "seven_day_overage_included" => "7d fable".to_string(),
         "seven_day_sonnet" => "7d sonnet".to_string(),
         other => cap_drawn(&terminal_safe(other), 40),
+    }
+}
+
+/// `N available` when a spend can use every reset still held, else
+/// `usable/held available`. Shared by `--list` and the TUI's resets row, so
+/// both count against what is held, never a grant's original size.
+pub(crate) fn available_of(usable: u32, held: u32) -> String {
+    if usable == held {
+        format!("{usable} available")
+    } else {
+        format!("{usable}/{held} available")
     }
 }
 
@@ -293,8 +411,8 @@ fn join_windows(clears: &[String]) -> String {
     }
 }
 
-/// The `clears` phrase a grant's line and the prompt share: `nothing` when the
-/// server names no window.
+/// The window phrase a grant's `--list` row and the prompt share: `nothing`
+/// when the server names no window.
 fn clears_summary(clears: &[String]) -> String {
     if clears.is_empty() {
         "nothing".to_string()
@@ -315,6 +433,24 @@ fn grant_state(grant: &Grant) -> String {
             }
             Some(_) | None => "unavailable".to_string(),
         }
+    }
+}
+
+/// The tail a `--list` row carries after its windows: nothing on a grant the
+/// server marks usable now, `paused`, else the server's own reason — cleaned
+/// and capped, since this text reaches a terminal. Nothing when it gives none.
+fn row_state(grant: &Grant) -> Option<String> {
+    if grant.usable_now {
+        return None;
+    }
+    if grant.paused {
+        return Some("paused".to_string());
+    }
+    match grant.unavailable_reason.as_deref() {
+        Some(reason) if !shows_nothing(&terminal_safe(reason)) => {
+            Some(cap_drawn(&terminal_safe(reason), 40))
+        }
+        Some(_) | None => None,
     }
 }
 
@@ -395,16 +531,12 @@ fn not_at_limit_warning(name: &str, grant: &Grant) -> Option<String> {
 /// marked `*`.
 pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
     let next = status.next_grant();
+    let spendable = status.spend_grant();
     let mut lines = vec![match next {
         Some(_) => {
-            let count: u32 = status
-                .grants
-                .iter()
-                .filter(|g| g.usable_now)
-                .map(|g| g.resets_left)
-                .sum();
+            let count = status.usable_resets();
             format!(
-                "clauth: '{name}' has {count} limit reset{} usable now.",
+                "clauth: '{name}' has {count} limit reset{} available.",
                 plural(count as usize)
             )
         }
@@ -416,37 +548,47 @@ pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
             .ends_at
             .as_deref()
             .filter(|e| !shows_nothing(&terminal_safe(e)))
-            .map(|e| format!(", ends {}", stamp(e)))
+            .map(|e| format!(", expires {}", stamp(e)))
             .unwrap_or_default();
         let suffix = if marked { "  (used next)" } else { "" };
+        // The row counts the grant's resets the server marks usable now,
+        // against the ones it still holds; with no spendable next grant the
+        // header counts none and every row reads 0 too.
+        let count = if grant.usable_now && spendable.is_some() {
+            grant.resets_left
+        } else {
+            0
+        };
+        let tail = row_state(grant)
+            .map(|state| format!(", {state}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  {} {}: {} of {} left, clears {}, {}{ends}{suffix}",
+            "  {} {}: {}, resets {}{tail}{ends}{suffix}",
             if marked { "*" } else { " " },
             grant.label(),
-            grant.resets_left,
-            grant.resets_total,
+            available_of(count, grant.resets_left),
             clears_summary(&grant.clears),
-            grant_state(grant),
         ));
     }
     lines
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
+/// Only the spendable next grant is asked about, so every reset it holds is
+/// usable and the count reads bare.
 pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> String {
     let head = if grant.is_untitled() {
         format!("clauth: use a limit reset on '{name}'?")
     } else {
         format!(
             "clauth: use the limit reset \"{}\" on '{name}'?",
-            grant.label()
+            cap_drawn(&grant.label(), 40)
         )
     };
     let mut prompt = format!(
-        "{head} It clears {} now and cannot be undone; {} of {} left on it.",
+        "{head} It resets {} now and cannot be undone; {} available on it.",
         clears_summary(&grant.clears),
         grant.resets_left,
-        grant.resets_total,
     );
     if !status.at_limit
         && let Some(warning) = not_at_limit_warning(name, grant)
@@ -509,6 +651,68 @@ pub(crate) fn org_failure(name: &str, err: &ResetCallError) -> String {
     shared_read_failure(name, err, &CLAUDE_ORG_VOICE)
 }
 
+/// What the post-spend refresh did with the stored count after its re-read
+/// failed, decided under the state flock so the line it prints says only what
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshDrop {
+    /// The delete landed under the state flock.
+    Dropped,
+    /// The stored count was read at or after this run's send, so the delete
+    /// was skipped: a side read that already saw the spend is the best count
+    /// clauth holds.
+    KeptNewer,
+    /// The gate refused: the stored login changed or could not be read.
+    LoginChanged,
+    /// The state flock could not be taken; nothing was attempted.
+    LockTimedOut,
+    /// The delete was attempted and did not land.
+    Failed,
+}
+
+/// The stderr line for the post-spend re-read's failure: the spend already
+/// landed, so the line names what the re-read hit and what became of the
+/// stored count, never that no reset was used.
+pub(crate) fn refresh_read_failure(name: &str, err: &ResetCallError, drop: RefreshDrop) -> String {
+    let why = match err {
+        ResetCallError::Unauthorized => "Anthropic rejected the stored access token".to_string(),
+        ResetCallError::Status(status) => format!("Anthropic answered with HTTP {status}"),
+        ResetCallError::Transport => "could not reach Anthropic".to_string(),
+        ResetCallError::Parse => "Anthropic answered in a shape clauth does not read".to_string(),
+    };
+    let after = match drop {
+        RefreshDrop::Dropped => "; the stored count was dropped",
+        RefreshDrop::KeptNewer => "; the stored count is newer than the spend, so it stays",
+        RefreshDrop::LoginChanged => {
+            "; the stored login changed or could not be read, so nothing was touched"
+        }
+        RefreshDrop::LockTimedOut => "; the state lock was unavailable, so nothing was touched",
+        RefreshDrop::Failed => "",
+    };
+    format!("clauth: '{name}': the limit reset read after the spend failed ({why}){after}")
+}
+
+/// The stderr line for a failed drop of the stored count after a failed
+/// re-read: one more line, and the run's exit stays what it was.
+pub(crate) fn refresh_drop_failure(name: &str) -> String {
+    format!("clauth: '{name}': could not remove the stored limit reset count")
+}
+
+/// The stderr line for a re-read the refresh could not store: the write leg's
+/// gate admitted it and the cache write did not land.
+pub(crate) fn refresh_store_failure(name: &str) -> String {
+    format!("clauth: '{name}': the limit reset count read after the spend was not stored")
+}
+
+/// The stderr line for a state flock the refresh could not take: nothing was
+/// stored, and the count stays what it was until the hourly side read.
+pub(crate) fn refresh_lock_failure(name: &str) -> String {
+    format!(
+        "clauth: '{name}': the state lock was unavailable, so the limit reset count read after \
+         the spend was not stored"
+    )
+}
+
 /// A failed POST. A fresh send's 401 proves nothing was spent and any other 4xx
 /// spent nothing; every other failure leaves the outcome open, and the shared
 /// line points at the re-run the pending record makes safe. A re-send's
@@ -529,7 +733,7 @@ pub(crate) enum SpendOutcome {
     Reset,
     /// The grant was already spent.
     AlreadyUsed,
-    /// The account is not at a limit a reset clears.
+    /// The account is not at a limit a reset covers.
     NotLimited,
     /// The account's resets are cooling down.
     Cooldown,
@@ -573,6 +777,17 @@ pub(crate) fn spend_settled(reply: &SpendReply) -> bool {
     )
 }
 
+/// Whether a reply means a reset actually came off the account's count: the
+/// spend landed, or the grant was already gone. Narrower than
+/// [`spend_settled`], which is also true for refusals that spent nothing;
+/// the CLI's post-spend refresh re-reads only on this predicate.
+pub(crate) fn spend_moved_the_count(reply: &SpendReply) -> bool {
+    matches!(
+        reply.outcome(),
+        SpendOutcome::Reset | SpendOutcome::AlreadyUsed
+    )
+}
+
 /// A spend reply as the line to print (`Ok`) or the error to exit with
 /// (`Err`). Only `reset` is a success; a result or reason that leaves the
 /// outcome open says so and names the re-send window's end.
@@ -585,7 +800,7 @@ pub(crate) fn spend_outcome_line(
         SpendOutcome::Reset => {
             let mut line = format!("clauth: used a limit reset on '{name}'");
             if !reply.cleared.is_empty() {
-                line.push_str(&format!(": cleared {}", join_windows(&reply.cleared)));
+                line.push_str(&format!(": reset {}", join_windows(&reply.cleared)));
             }
             if let Some(left) = reply.resets_left {
                 line.push_str(&format!(", {left} left"));
@@ -598,7 +813,7 @@ pub(crate) fn spend_outcome_line(
              --list` to see what is left"
         )),
         SpendOutcome::NotLimited => Err(format!(
-            "'{name}' is not at a limit that reset clears, so no reset was used"
+            "'{name}' is not at a limit that reset covers, so no reset was used"
         )),
         SpendOutcome::Cooldown => {
             let until = reply

@@ -859,7 +859,7 @@ fn revoking_legacy_deletes_the_plaintext_copy_of_its_token() {
     assert!(authenticate(Some(TOKEN)).expect("read").is_none());
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n\
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n\
          clauth: deleted ~/.clauth/auth_token.json, which still held its token.\n"
     );
 }
@@ -883,7 +883,7 @@ fn revoking_legacy_keeps_a_file_holding_another_token() {
     );
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n"
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n"
     );
 }
 
@@ -962,7 +962,7 @@ fn a_failed_push_drop_still_deletes_the_plaintext_copy() {
     );
     assert_eq!(
         printed,
-        "clauth: revoked device 'legacy'; its next request is refused.\n\
+        "clauth: revoked device 'legacy'; its next request is refused and its open streams close within seconds.\n\
          clauth: deleted ~/.clauth/auth_token.json, which still held its token.\n"
     );
     assert!(authenticate(Some(TOKEN)).expect("read").is_none());
@@ -1081,7 +1081,7 @@ fn revoking_another_device_leaves_an_unreadable_plaintext_file_alone() {
 
     assert_eq!(
         printed,
-        "clauth: revoked device 'phone'; its next request is refused.\n"
+        "clauth: revoked device 'phone'; its next request is refused and its open streams close within seconds.\n"
     );
     assert!(path.is_dir(), "nothing is deleted");
 }
@@ -1280,4 +1280,65 @@ fn the_table_lists_sessions_yes_or_no() {
             width = cell.chars().count()
         )
     );
+}
+
+// --- An open stream's watch on its row -----------------------------------------
+
+fn watched_device() -> Device {
+    Device::minted("phone", Tier::View, false, TOKEN, Joined::Add)
+}
+
+/// Every due and undue instant across two intervals costs one read per
+/// interval, whatever the caller's own rate: a stream asks on every loop.
+#[test]
+fn a_row_watch_reads_once_per_interval_however_often_it_is_asked() {
+    let opened = std::time::Instant::now();
+    let device = watched_device();
+    let mut watch = RowWatch::new(&device, opened);
+    let reads = std::cell::Cell::new(0u32);
+    let read = |id: &str| {
+        reads.set(reads.get() + 1);
+        assert_eq!(id, device.pairing_id());
+        Ok(Some(device.clone()))
+    };
+    for millis in 0..4999 {
+        let now = opened + std::time::Duration::from_millis(millis);
+        assert!(!watch.due(now));
+        assert!(!watch.lost_by(now, read));
+    }
+    assert_eq!(reads.get(), 0, "nothing is due inside the first 5 s");
+
+    let first = opened + std::time::Duration::from_secs(5);
+    assert!(watch.due(first));
+    assert!(!watch.lost_by(first, read));
+    assert_eq!(reads.get(), 1);
+    assert!(!watch.due(first), "a read moves the next one out");
+    for millis in 0..4999 {
+        assert!(!watch.lost_by(first + std::time::Duration::from_millis(millis), read));
+    }
+    assert_eq!(reads.get(), 1);
+    assert!(!watch.lost_by(first + std::time::Duration::from_secs(5), read));
+    assert_eq!(reads.get(), 2);
+}
+
+#[test]
+fn a_row_watch_loses_a_gone_row_and_an_unreadable_list() {
+    let opened = std::time::Instant::now();
+    let due = opened + std::time::Duration::from_secs(5);
+    let device = watched_device();
+    assert!(RowWatch::new(&device, opened).lost_by(due, |_| Ok(None)));
+    assert!(RowWatch::new(&device, opened).lost_by(due, |_| Err(anyhow::anyhow!("torn"))));
+}
+
+#[test]
+fn a_pairing_id_finds_its_row_and_only_its_row() {
+    let _home = HomeSandbox::new();
+    seed("phone", Tier::View, TOKEN);
+    seed("tray", Tier::Control, OTHER);
+    let id = watched_device().pairing_id();
+    let row = by_pairing_id(&id)
+        .expect("the list reads")
+        .expect("the row");
+    assert_eq!(row.name, "phone");
+    assert!(by_pairing_id("nope").expect("the list reads").is_none());
 }

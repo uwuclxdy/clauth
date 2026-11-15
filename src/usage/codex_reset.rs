@@ -28,7 +28,7 @@ use ratatui::text::Span;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::fetch::{ANTHROPIC_ORIGIN, iso_to_epoch_secs};
+use super::fetch::{ANTHROPIC_ORIGIN, iso_to_epoch_secs, parse_retry_after};
 use crate::format::{
     draws_nothing, grapheme_cells, is_blank, local_stamp, plural, shows_nothing, terminal_safe,
     truncate,
@@ -272,17 +272,34 @@ pub(crate) fn consume_settled(reply: &ConsumeReply) -> bool {
 pub(crate) fn read_reply<T: DeserializeOwned>(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<T, ResetCallError> {
-    let mut response = result.map_err(|_| ResetCallError::Transport)?;
-    match response.status().as_u16() {
-        200..=299 => {}
-        401 => return Err(ResetCallError::Unauthorized),
-        status => return Err(ResetCallError::Status(status)),
+    read_reply_hinted(result).map_err(|(err, _)| err)
+}
+
+/// [`read_reply`] carrying a non-2xx reply's `retry-after` beside its error,
+/// read by the poll's own parser: `None` when no reply came, the header is
+/// absent, or it does not parse.
+pub(crate) fn read_reply_hinted<T: DeserializeOwned>(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<T, (ResetCallError, Option<Duration>)> {
+    let mut response = result.map_err(|_| (ResetCallError::Transport, None))?;
+    let status = response.status().as_u16();
+    if !(200..=299).contains(&status) {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
+        let err = match status {
+            401 => ResetCallError::Unauthorized,
+            status => ResetCallError::Status(status),
+        };
+        return Err((err, retry_after));
     }
     let body = response
         .body_mut()
         .read_to_string()
-        .map_err(|_| ResetCallError::Transport)?;
-    serde_json::from_str(&body).map_err(|_| ResetCallError::Parse)
+        .map_err(|_| (ResetCallError::Transport, None))?;
+    serde_json::from_str(&body).map_err(|_| (ResetCallError::Parse, None))
 }
 
 /// GET the account's credits. Spends nothing.

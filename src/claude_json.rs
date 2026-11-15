@@ -719,8 +719,13 @@ pub(crate) fn try_honor_pending_strip() {
 /// re-derive it from a swapped credentials file — so a hit is "CC's last booted
 /// identity", not fresh proof of the live token's account.
 pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
-    let path = home_dir().ok()?.join(".claude.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    oauth_account_uuid_in(&home_dir().ok()?.join(".claude.json"))
+}
+
+/// [`home_oauth_account_uuid`]'s read of the `.claude.json` at `path`: a
+/// session's config dir holds its own beside its credentials file.
+pub(crate) fn oauth_account_uuid_in(path: &Path) -> Option<AccountId> {
+    let Ok(bytes) = std::fs::read(path) else {
         return None; // missing — never create
     };
     let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {

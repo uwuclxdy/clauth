@@ -43,7 +43,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts on a plan with a 5h limit queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
-- 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, tells a session when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a paired phone
+- 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, tells a session when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a connected phone
 - 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves to another machine over HTTPS with `--listen`: that feed, the account switch, the herdr panes with their terminal streams, Claude Code session history, prompts and key presses into a pane, and prompts and interrupts into a session
 - 🔀 **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and let a separate codex chain rotate accounts between sessions ([Codex](https://github.com/uwuclxdy/clauth/wiki/Codex))
 - 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, signed self-updates, multi-instance safe
@@ -106,7 +106,7 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth` | open the TUI |
 | `clauth <profile>` | switch and exit |
 | `clauth start <profile>` | run `claude` under that account, in its own config dir |
-| `clauth login <profile>` | add or re-authenticate an account, browser or API key; the browser login also takes a code from a link opened on any device (ssh, no browser) |
+| `clauth login <profile>` | add or re-authenticate an account, browser or API key, or through an enabled clauth proxy (`--proxy <service>`, the only login a proxy account takes); the browser login also takes a code from a link opened on any device (ssh, no browser) |
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
 | `clauth daemon` | headless refresh + auto-switch loop, optionally serving the REST API (`--listen`) |
@@ -183,7 +183,8 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Interface and keys](https://github.com/uwuclxdy/clauth/wiki/Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](https://github.com/uwuclxdy/clauth/wiki/Configuration) | both TOML files key by key, model routing, storage layout |
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
-| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
+| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
+| [REST API](https://github.com/uwuclxdy/clauth/wiki/REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server, `delegate` in full, answering a session from your phone |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |

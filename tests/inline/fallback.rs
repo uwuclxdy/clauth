@@ -115,6 +115,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         usage,
         fresh: false,
@@ -4310,7 +4312,7 @@ fn walk_skips_broken_last_resort_member() {
     );
 }
 
-// ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
+// ── burn-aware auto-switch (opt-in, default off) ────────────────────────────
 //
 // `is_exhausted_projected` and the ACTIVE-side check
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
@@ -10035,7 +10037,7 @@ fn a_monthly_only_active_walks_off_past_the_weekly_line() {
 
 /// A hybrid active under burn-aware switching never pairs
 /// its OAuth burn history with its provider window — the static threshold
-/// decides (maintainer ruling 2026-09-10). Gamma (third-party) at 92% with a 600 %/h OAuth
+/// decides. Gamma (third-party) at 92% with a 600 %/h OAuth
 /// climb must NOT be walked off, where the burn branch would project past 100.
 #[test]
 fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
