@@ -22999,3 +22999,105 @@ fn a_rename_of_a_record_with_no_directory_never_adopts_a_codex_store() {
         "the record keeps its name"
     );
 }
+
+// P-1.6: a duplicate of an account holding a two-row [model_picker] carries
+// the same picker.
+#[test]
+fn ac01_p_1_6_duplicate_profile_copies_the_model_picker() {
+    let _home = HomeSandbox::new();
+    let src = ProfileName::from("src");
+    let dir = crate::profile::profile_dir(&src).expect("profile dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[model_picker]\nreplace_built_in = true\n\n\
+         [[model_picker.options]]\nmodel = \"kimi-k3.1-pro-uncensored\"\nlabel = \"Kimi K3.1 Pro\"\n\n\
+         [[model_picker.options]]\nmodel = \"glm-5.3-uncensored\"\ndescription = \"fast\"\nbehaves_as = \"claude-opus-4-8\"\n",
+    )
+    .unwrap();
+    crate::testutil::register_names(&["src"]);
+    let source = load_profile(&src).expect("load the source");
+    let picker = source
+        .model_picker
+        .clone()
+        .expect("the source holds a picker");
+    assert_eq!(picker.options.len(), 2);
+    let mut config = inactive_config(source);
+
+    duplicate_profile(&mut config, &src, "dup".to_string()).expect("duplicate");
+
+    let copy = load_profile(&ProfileName::from("dup")).expect("load the copy");
+    assert_eq!(copy.model_picker, Some(picker));
+}
+
+// A duplicate whose new name already has a readable leftover config.toml (a
+// delete-then-recreate) still gets the source's picker, and the leftover's own
+// picker is replaced, not kept.
+#[test]
+fn ac01_duplicate_profile_over_a_leftover_config_writes_the_picker() {
+    let _home = HomeSandbox::new();
+    let src = ProfileName::from("src");
+    let dir = crate::profile::profile_dir(&src).expect("profile dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[model_picker]\nreplace_built_in = true\n\n\
+         [[model_picker.options]]\nmodel = \"glm-5.3-uncensored\"\nlabel = \"GLM-5.3\"\n",
+    )
+    .unwrap();
+    let dup = ProfileName::from("dup");
+    let dup_dir = crate::profile::profile_dir(&dup).expect("profile dir");
+    std::fs::create_dir_all(&dup_dir).unwrap();
+    std::fs::write(
+        dup_dir.join("config.toml"),
+        "[model_picker]\n\n[[model_picker.options]]\nmodel = \"stale-model\"\n",
+    )
+    .unwrap();
+    crate::testutil::register_names(&["src"]);
+    let source = load_profile(&src).expect("load the source");
+    let picker = source
+        .model_picker
+        .clone()
+        .expect("the source holds a picker");
+    let mut config = inactive_config(source);
+
+    duplicate_profile(&mut config, &src, "dup".to_string()).expect("duplicate");
+
+    let copy = load_profile(&dup).expect("load the copy");
+    assert_eq!(copy.model_picker, Some(picker));
+}
+
+// The drop direction: a duplicate of a picker-less source over a readable
+// leftover config.toml that holds a [model_picker] drops the leftover table, so
+// one account's picker never lands in another account's live settings.
+#[test]
+fn ac01_duplicate_picker_less_profile_over_a_leftover_config_drops_the_picker() {
+    let _home = HomeSandbox::new();
+    let src = ProfileName::from("src");
+    let dir = crate::profile::profile_dir(&src).expect("profile dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), "# no picker here\n").unwrap();
+    let dup = ProfileName::from("dup");
+    let dup_dir = crate::profile::profile_dir(&dup).expect("profile dir");
+    std::fs::create_dir_all(&dup_dir).unwrap();
+    std::fs::write(
+        dup_dir.join("config.toml"),
+        "[model_picker]\nreplace_built_in = true\n\n\
+         [[model_picker.options]]\nmodel = \"stale-model\"\n",
+    )
+    .unwrap();
+    crate::testutil::register_names(&["src"]);
+    let source = load_profile(&src).expect("load the source");
+    assert_eq!(source.model_picker, None, "the source holds no picker");
+    let mut config = inactive_config(source);
+
+    duplicate_profile(&mut config, &src, "dup".to_string()).expect("duplicate");
+
+    let copy = load_profile(&dup).expect("load the copy");
+    assert_eq!(copy.model_picker, None);
+    let written = std::fs::read_to_string(dup_dir.join("config.toml")).expect("read config");
+    assert!(
+        !written.contains("[model_picker]") && !written.contains("stale-model"),
+        "the leftover table is gone, got:\n{written}"
+    );
+}

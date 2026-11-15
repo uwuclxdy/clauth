@@ -18,6 +18,7 @@ fn seed_roster(name: &str) {
 
 fn mini_profile(name: &str) -> Profile {
     Profile {
+        model_picker: None,
         name: name.into(),
         base_url: None,
         api_key: None,

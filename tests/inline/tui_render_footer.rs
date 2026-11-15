@@ -39,6 +39,7 @@ fn the_usage_hints_advertise_the_note_key() {
     use std::collections::BTreeMap;
     let _home = crate::testutil::HomeSandbox::new();
     let profile = Profile {
+        model_picker: None,
         name: "alice".into(),
         base_url: None,
         api_key: None,

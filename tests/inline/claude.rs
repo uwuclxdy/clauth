@@ -9636,3 +9636,200 @@ fn global_switch_stamps_a_store_whose_mtime_already_differs() {
         "a relink onto the same store is not a swap"
     );
 }
+
+// ---- model picker -> settings.json `modelPicker` (plan step 2) ----
+
+fn picker_row(model: &str) -> crate::profile::ModelPickerOption {
+    crate::profile::ModelPickerOption {
+        model: model.to_string(),
+        label: None,
+        description: None,
+        behaves_as: None,
+    }
+}
+
+fn picker_profile(
+    replace_built_in: Option<bool>,
+    options: Vec<crate::profile::ModelPickerOption>,
+) -> Profile {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.model_picker = Some(crate::profile::ModelPicker {
+        replace_built_in,
+        options,
+    });
+    profile
+}
+
+/// Settings JSON built from `profile` over an optional base file body.
+fn picker_settings(base_body: Option<&str>, profile: &Profile) -> serde_json::Value {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    if let Some(body) = base_body {
+        fs::write(&base, body).expect("write base");
+    }
+    let json = build_claude_settings_json(Some(&base), profile, &[]).expect("build settings");
+    serde_json::from_str(&json).expect("parse settings")
+}
+
+// P-2.1: the P-1.1 profile lands as camelCase `modelPicker`, no null keys
+#[test]
+fn ac02_p_2_1_model_picker_lands_as_camel_case() {
+    let profile = picker_profile(
+        Some(true),
+        vec![
+            crate::profile::ModelPickerOption {
+                label: Some("Kimi K3.1 Pro".to_string()),
+                ..picker_row("kimi-k3.1-pro-uncensored")
+            },
+            crate::profile::ModelPickerOption {
+                description: Some("fast".to_string()),
+                behaves_as: Some("claude-opus-4-8".to_string()),
+                ..picker_row("glm-5.3-uncensored")
+            },
+        ],
+    );
+    let v = picker_settings(None, &profile);
+    assert_eq!(
+        v["modelPicker"],
+        serde_json::json!({
+            "replaceBuiltInOptions": true,
+            "options": [
+                {"model": "kimi-k3.1-pro-uncensored", "label": "Kimi K3.1 Pro"},
+                {"model": "glm-5.3-uncensored", "description": "fast", "behavesAs": "claude-opus-4-8"}
+            ]
+        })
+    );
+}
+
+// P-2.2: account B's picker replaces account A's base `modelPicker` wholesale
+#[test]
+fn ac02_p_2_2_profile_picker_replaces_the_base_picker() {
+    let base = r#"{"modelPicker": {"replaceBuiltInOptions": true, "options": [{"model": "a-model", "label": "A"}]}}"#;
+    let profile = picker_profile(Some(false), vec![picker_row("b-model")]);
+    let v = picker_settings(Some(base), &profile);
+    assert_eq!(
+        v["modelPicker"],
+        serde_json::json!({
+            "replaceBuiltInOptions": false,
+            "options": [{"model": "b-model"}]
+        })
+    );
+}
+
+// P-3.1: no `[model_picker]` removes the base `modelPicker`, keeps other keys
+#[test]
+fn ac03_p_3_1_no_picker_removes_the_base_model_picker() {
+    let base =
+        r#"{"modelPicker": {"options": [{"model": "x"}]}, "theme": "dark", "hooks": {"Stop": []}}"#;
+    let profile = Profile::new("p".to_string(), None, None);
+    assert!(profile.model_picker.is_none());
+    let v = picker_settings(Some(base), &profile);
+    assert!(
+        v.get("modelPicker").is_none(),
+        "modelPicker must be removed: {v}"
+    );
+    assert_eq!(v["theme"], "dark");
+    assert_eq!(v["hooks"], serde_json::json!({"Stop": []}));
+}
+
+// P-4.1: blank rows are dropped, model is trimmed, label is emitted as written
+#[test]
+fn ac04_p_4_1_blank_rows_dropped_and_model_trimmed() {
+    let profile = picker_profile(
+        None,
+        vec![
+            picker_row(""),
+            picker_row("   "),
+            crate::profile::ModelPickerOption {
+                label: Some(" GLM ".to_string()),
+                ..picker_row("  glm-5.3  ")
+            },
+        ],
+    );
+    let v = picker_settings(None, &profile);
+    assert_eq!(
+        v["modelPicker"]["options"],
+        serde_json::json!([{"model": "glm-5.3", "label": " GLM "}])
+    );
+}
+
+// P-4.2: an all-blank picker and an empty `options` each write no
+// `modelPicker` and remove one present in the base file
+#[test]
+fn ac04_p_4_2_picker_without_live_rows_writes_and_keeps_nothing() {
+    let base = r#"{"modelPicker": {"options": [{"model": "x"}]}, "theme": "dark"}"#;
+    for (case, profile) in [
+        (
+            "all blank rows",
+            picker_profile(Some(true), vec![picker_row(""), picker_row("  ")]),
+        ),
+        ("options = []", picker_profile(Some(true), Vec::new())),
+    ] {
+        let without_base = picker_settings(None, &profile);
+        assert!(
+            without_base.get("modelPicker").is_none(),
+            "{case}: no modelPicker written: {without_base}"
+        );
+        let over_base = picker_settings(Some(base), &profile);
+        assert!(
+            over_base.get("modelPicker").is_none(),
+            "{case}: base modelPicker removed: {over_base}"
+        );
+        assert_eq!(over_base["theme"], "dark", "{case}: other keys stay");
+    }
+}
+
+// P-4.3: `replace_built_in` unset writes no `replaceBuiltInOptions` key
+#[test]
+fn ac04_p_4_3_unset_replace_built_in_writes_no_key() {
+    let profile = picker_profile(None, vec![picker_row("glm-5.3")]);
+    let v = picker_settings(None, &profile);
+    let picker = v["modelPicker"].as_object().expect("modelPicker object");
+    assert!(
+        !picker.contains_key("replaceBuiltInOptions"),
+        "no replaceBuiltInOptions key: {picker:?}"
+    );
+    assert_eq!(
+        v["modelPicker"]["options"],
+        serde_json::json!([{"model": "glm-5.3"}])
+    );
+}
+
+// P-5.1: a profile whose only setting is a live picker creates settings.json
+#[test]
+fn ac05_p_5_1_a_live_picker_alone_writes_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+    assert!(!path.exists(), "sandbox starts without settings.json");
+
+    let profile = picker_profile(None, vec![picker_row("glm-5.3-uncensored")]);
+    apply_profile_to_claude_settings(&profile, &[]).expect("apply");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("settings written"))
+            .expect("parse settings");
+    assert_eq!(
+        v["modelPicker"]["options"][0]["model"],
+        "glm-5.3-uncensored"
+    );
+}
+
+// P-5.2: an all-blank picker alone creates no settings.json. The live-row
+// control at the end proves the gate reads the picker at all (without it the
+// blank case passes vacuously before the gate counts pickers).
+#[test]
+fn ac05_p_5_2_a_blank_picker_alone_writes_no_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+
+    let blank = picker_profile(None, vec![picker_row("")]);
+    apply_profile_to_claude_settings(&blank, &[]).expect("apply blank");
+    assert!(
+        !path.exists(),
+        "an all-blank picker counts as unset: no settings.json"
+    );
+
+    let live = picker_profile(None, vec![picker_row("glm-5.3-uncensored")]);
+    apply_profile_to_claude_settings(&live, &[]).expect("apply live");
+    assert!(path.exists(), "a live picker does create settings.json");
+}

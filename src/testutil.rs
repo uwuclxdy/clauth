@@ -2267,6 +2267,7 @@ pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color:
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
     crate::profile::Profile {
+        model_picker: None,
         name: name.clone(),
         base_url: None,
         api_key: None,

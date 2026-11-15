@@ -23413,6 +23413,7 @@ use std::collections::BTreeMap;
 
 fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
     Profile {
+        model_picker: None,
         name: name.into(),
         base_url: None,
         api_key: api_key.map(str::to_string),

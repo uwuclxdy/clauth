@@ -21,6 +21,7 @@ fn logo_slot_cols() -> usize {
 fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,
@@ -65,6 +66,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
 fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("key".to_string()),

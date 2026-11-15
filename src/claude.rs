@@ -11,8 +11,9 @@ use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600,
-    claude_dir, profile_dir, read_json_file, read_json_file_capped, update_profile_login,
+    AppConfig, AppState, ClaudeCredentials, ModelPicker, Profile, ProfileName, atomic_write,
+    atomic_write_600, claude_dir, profile_dir, read_json_file, read_json_file_capped,
+    update_profile_login,
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
@@ -6317,6 +6318,10 @@ fn apply_profile_to_claude_settings_inner(
         || !profile.env.is_empty()
         || !profile.models.is_empty()
         || profile.effort.is_some()
+        || profile
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| !p.live_options().is_empty())
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
         // No live file: nothing an earlier clauth wrote can sit in it, so only
@@ -7203,6 +7208,39 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
         .unwrap_or_else(|| profile.effort.clone().unwrap_or_default())
 }
 
+/// The `modelPicker` settings value for `picker`: `None` when no row is live,
+/// else `{"options": [...]}` plus `replaceBuiltInOptions` when set. Optional
+/// row fields appear only when the row sets them.
+fn model_picker_json(picker: &ModelPicker) -> Option<serde_json::Value> {
+    let live = picker.live_options();
+    if live.is_empty() {
+        return None;
+    }
+    let options: Vec<serde_json::Value> = live
+        .into_iter()
+        .map(|row| {
+            let mut o = serde_json::Map::new();
+            o.insert("model".into(), row.model.into());
+            if let Some(v) = row.label {
+                o.insert("label".into(), v.into());
+            }
+            if let Some(v) = row.description {
+                o.insert("description".into(), v.into());
+            }
+            if let Some(v) = row.behaves_as {
+                o.insert("behavesAs".into(), v.into());
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    let mut out = serde_json::Map::new();
+    if let Some(replace) = picker.replace_built_in {
+        out.insert("replaceBuiltInOptions".into(), replace.into());
+    }
+    out.insert("options".into(), options.into());
+    Some(serde_json::Value::Object(out))
+}
+
 /// Build the merged settings.json content. A custom key `profile` lacks that
 /// `prev_env_keys` or `~/.clauth/base-env.json` names is stripped before the
 /// new profile's env is applied when clauth wrote its value: back to the
@@ -7213,7 +7251,9 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The profile's effort rides
+/// previous profile's model routing. The top-level `modelPicker` follows the
+/// same rule: set from the profile's `[model_picker]` when it has a live row,
+/// removed otherwise. The profile's effort rides
 /// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
 /// profile's own `[env]` entry outranking the `effort` field
 /// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
@@ -7349,6 +7389,16 @@ fn build_settings(
         }
         None => {
             obj.remove("advisorModel");
+        }
+    }
+    // `modelPicker` is clauth-owned the same way: the profile's live rows
+    // replace whatever the base held, and a profile without any removes it.
+    match profile.model_picker.as_ref().and_then(model_picker_json) {
+        Some(picker) => {
+            obj.insert("modelPicker".into(), picker);
+        }
+        None => {
+            obj.remove("modelPicker");
         }
     }
     // `effortLevel` is Claude Code's own key (its `/effort` command writes it

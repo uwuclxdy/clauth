@@ -87,6 +87,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
     use std::collections::BTreeMap;
     Fixture {
         profile: Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,

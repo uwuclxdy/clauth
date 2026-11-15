@@ -25,6 +25,7 @@ fn transition_lines_keep_a_wide_name_whole() {
 
 fn oauth(name: &str) -> Profile {
     Profile {
+        model_picker: None,
         name: name.into(),
         base_url: None,
         api_key: None,
