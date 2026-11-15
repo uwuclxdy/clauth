@@ -2236,11 +2236,14 @@ pub(crate) fn seed_plan_cache(
 /// changes the plan without changing the account, so [`seed_plan_cache`] never
 /// runs for it, and a cached `canceled` would keep the account out of every walk
 /// until the next `/profile` read. A cache holding no plan has nothing to correct
-/// and is left to that read. Answers whether the two disagreed, the caller's cue
-/// to expire the `/profile` clock for processes holding the old plan in memory.
+/// and is left to that read. Answers whether the two disagreed — once they do,
+/// every exit answers `true`, a cache path that will not resolve or a body that
+/// will not serialize included — the caller's cue to expire the `/profile`
+/// clock for processes holding the old plan in memory.
 ///
 /// Only the plan moves, and the file keeps its mtime: the windows beside it are
-/// as old as they were, and a cache's age is read off its mtime.
+/// as old as they were, and for a body carrying no `fetched_at` the mtime is
+/// the age clock, so a plan-only rewrite must not advance it.
 pub(crate) fn correct_cached_plan(
     name: &ProfileName,
     plan: PlanInfo,
@@ -2267,12 +2270,12 @@ pub(crate) fn correct_cached_plan(
     let Some(path) =
         crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
     else {
-        return false;
+        return true;
     };
     let dated = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     info.plan = Some(plan);
     let Ok(json) = serde_json::to_vec(&info) else {
-        return false;
+        return true;
     };
     if let Err(e) = crate::profile::atomic_write_600_dated(&path, &json, dated) {
         logline!("clauth: {name}: could not save the login's plan: {e}");

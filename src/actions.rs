@@ -5394,8 +5394,9 @@ fn rollback_first_account_create(
 /// each half's fetch caches are dropped only when that half's stored identity
 /// actually changed (a proven same-account re-login forgets nothing), never
 /// unconditionally. The `/profile` TTL clock describes the old account too, so
-/// it is expired only when the OAuth half changed — a proven same-account
-/// re-login keeps the stamp and its memo — otherwise the swapped-in account's
+/// it is expired when the OAuth half changed — a proven same-account re-login
+/// keeps the stamp and its memo unless its probe corrected a disagreeing
+/// cached plan, which expires it too — otherwise the swapped-in account's
 /// tier stays unfetched (and, with `usage_cache.json` just dropped, unrendered)
 /// for up to an hour. A snapshot carrying a proven identity (an interactive
 /// login's probe) re-anchors the profile here, on the commit — the confirm-gated
