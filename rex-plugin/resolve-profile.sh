@@ -18,8 +18,9 @@
 # reading the failure as "no account" and clearing it.
 set -u
 
-# Rex runs this with a bare system PATH.
-PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Rex runs this with a bare system PATH. The usual install dirs go after it,
+# so a clauth the server's own PATH names still wins over an older one there.
+PATH="${PATH:+$PATH:}$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 pid="${1:?usage: resolve-profile.sh <pid>}"
 
 answer=$(clauth which --pid "$pid" --json 2>/dev/null) || exit 1

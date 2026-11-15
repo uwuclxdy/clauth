@@ -1055,31 +1055,65 @@ fn the_cli_parses_both_subcommands() {
     ));
 }
 
-/// Runs the real `rex-plugin/resolve-profile.sh` for pid 100 against a
-/// sandbox `$HOME` whose `.local/bin/clauth` shim, first on the script's PATH,
-/// is `clauth_body`. Returns whether the script exited 0, and its stdout.
+/// A `clauth` shim in `dir` running `body`.
 #[cfg(unix)]
-fn resolve_with(clauth_body: &str) -> (bool, String) {
+fn clauth_shim(dir: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let bin = tmp.path().join(".local/bin");
-    std::fs::create_dir_all(&bin).expect("bin dir");
-    let shim = bin.join("clauth");
-    std::fs::write(&shim, format!("#!/bin/sh\n{clauth_body}")).expect("shim");
+    std::fs::create_dir_all(dir).expect("bin dir");
+    let shim = dir.join("clauth");
+    std::fs::write(&shim, format!("#!/bin/sh\n{body}")).expect("shim");
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// Runs the real `rex-plugin/resolve-profile.sh` for pid 100 with `$HOME` at
+/// `home` and the bare `path` Rex hands it. Returns whether the script exited
+/// 0, and its stdout.
+#[cfg(unix)]
+fn run_resolver(home: &Path, path: &str) -> (bool, String) {
     let out = std::process::Command::new("sh")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/rex-plugin/resolve-profile.sh"
         ))
         .arg("100")
-        .env("HOME", tmp.path())
+        .env("HOME", home)
+        .env("PATH", path)
         .output()
         .expect("resolve-profile.sh runs");
     (
         out.status.success(),
         String::from_utf8(out.stdout).expect("utf-8"),
     )
+}
+
+/// [`run_resolver`] against a sandbox `$HOME` whose `.local/bin/clauth` shim
+/// is `clauth_body`, on a system PATH with no clauth: the script must find
+/// the shim in the install dirs it appends.
+#[cfg(unix)]
+fn resolve_with(clauth_body: &str) -> (bool, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    clauth_shim(&tmp.path().join(".local/bin"), clauth_body);
+    run_resolver(tmp.path(), "/usr/bin:/bin")
+}
+
+/// The install dirs go after the PATH Rex hands the script, so a clauth the
+/// server's own PATH names wins over an older one left in `~/.local/bin`.
+#[cfg(unix)]
+#[test]
+fn a_clauth_on_the_inherited_path_wins_over_the_install_dirs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let answer = |profile: &str| {
+        format!(
+            "printf '%s\\n' '{{\"harness\":\"claude\",\"profile\":\"{profile}\",\"source\":\"global\"}}'\n"
+        )
+    };
+    clauth_shim(&tmp.path().join(".local/bin"), &answer("old"));
+    let current = tmp.path().join("current");
+    clauth_shim(&current, &answer("new"));
+
+    let (ok, out) = run_resolver(tmp.path(), &format!("{}:/usr/bin:/bin", current.display()));
+    assert!(ok);
+    assert_eq!(out, "new\tglobal\tclaude\n");
 }
 
 /// The script's answer when `clauth which --pid 100 --json` prints `json`.

@@ -16,8 +16,9 @@ state="${XDG_STATE_HOME:-$HOME/.local/state}/clauth-rex"
 mkdir -p "$state" || exit 1
 log="$state/watch.log"
 
-# Rex runs this with a bare system PATH.
-PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Rex runs this with a bare system PATH. The usual install dirs go after it,
+# so a clauth or rex the server's own PATH names still wins.
+PATH="${PATH:+$PATH:}$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 
 proc_args() {
     if [ -r "/proc/$1/cmdline" ]; then
