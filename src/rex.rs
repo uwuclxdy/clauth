@@ -636,8 +636,8 @@ enum Why {
     BeginAgain { next: usize },
     /// An end line that no begin line opens.
     StrayEnd,
-    /// A line outside clauth's block that loads the module.
-    StillLoaded,
+    /// A string outside clauth's block that names the module.
+    NamesClauth,
 }
 
 /// A refusal, naming the line it is about: its 1-based number and its text.
@@ -684,11 +684,11 @@ impl Refusal {
                 "ends clauth's block, but no begin line opens it".to_string(),
                 format!("take that line out, then rerun `clauth rex {cmd}`"),
             ),
-            Why::StillLoaded => (
-                "loads the plugin outside clauth's block".to_string(),
+            Why::NamesClauth => (
+                "names clauth outside clauth's block, so it may still load the plugin".to_string(),
                 format!(
                     "take that out first, then rerun `clauth rex {cmd}`; removing clauth/ \
-                     would leave it requiring a module that is gone"
+                     would leave it naming a module that is gone"
                 ),
             ),
         };
@@ -803,7 +803,10 @@ impl<'a> InitLua<'a> {
     }
 
     /// Whether the file already loads the module: through a block of
-    /// clauth's, or a `require` of the user's own.
+    /// clauth's, or a `require` of the user's own. Install asks for no more
+    /// than a `require`, since a string naming clauth for another reason (a
+    /// pane command running `clauth`) must not keep it from wiring the
+    /// plugin.
     fn loads_plugin(&self) -> bool {
         !self.blocks.is_empty() || self.loading_line().is_some()
     }
@@ -852,12 +855,29 @@ impl<'a> InitLua<'a> {
     }
 
     /// Why uninstall will not remove a managed plugin dir yet: `init.lua`
-    /// would still load the module once the dir is gone, and Rex's next
-    /// config load would fail on a `require` of nothing.
+    /// may still load the module once the dir is gone, and Rex's next config
+    /// load would then fail on a `require` of nothing. Any string outside a
+    /// comment and outside clauth's blocks that names clauth counts, so
+    /// every spelling of a load does: `require(m)` after `local m =
+    /// "clauth"`, a `dofile` of a path into `clauth/`. A string naming it for
+    /// another reason only costs a refusal.
     fn still_loaded(&self) -> Option<Refusal> {
-        self.loading_line()
-            .map(|n| self.refusal(n, Why::StillLoaded))
+        self.tokens.iter().find_map(|token| match &token.lexeme {
+            Lexeme::Str(value) if names_clauth(value) => {
+                let line = self.line_of(token.at);
+                (!self.in_block(line)).then(|| self.refusal(line, Why::NamesClauth))
+            }
+            _ => None,
+        })
     }
+}
+
+/// Whether a string's value names clauth, in any case: macOS's default file
+/// system ignores case, so a `require("Clauth")` finds `clauth/` there.
+fn names_clauth(value: &[u8]) -> bool {
+    value
+        .windows("clauth".len())
+        .any(|window| window.eq_ignore_ascii_case(b"clauth"))
 }
 
 /// Writes the plugin and wires `init.lua`, after the confirm, then stops any

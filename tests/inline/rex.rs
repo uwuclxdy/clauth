@@ -473,7 +473,7 @@ fn the_loading_line_is_named_by_its_place_in_the_file() {
         Some(Refusal {
             line: 4,
             text: "local c = require(\"clauth\")".to_owned(),
-            why: Why::StillLoaded,
+            why: Why::NamesClauth,
         })
     );
     // clauth's own block is no hand-written require.
@@ -784,7 +784,7 @@ fn uninstall_refuses_while_init_lua_still_loads_the_plugin() {
         let message = err.to_string();
         assert!(
             message.starts_with(&format!(
-                "{}:2 loads the plugin outside clauth's block:\n",
+                "{}:2 names clauth outside clauth's block, so it may still load the plugin:\n",
                 paths.init.display()
             )),
             "{message}"
@@ -832,8 +832,8 @@ fn uninstall_refuses_an_unterminated_block() {
 }
 
 /// The spellings of a load a line-by-line read missed: each refuses, naming
-/// the line the load starts on, and leaves init.lua and `clauth/` as they
-/// were.
+/// the line holding the string that names the module, and leaves init.lua
+/// and `clauth/` as they were.
 #[test]
 fn uninstall_refuses_a_load_whatever_its_line_ends() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -841,7 +841,9 @@ fn uninstall_refuses_a_load_whatever_its_line_ends() {
     let state = state_in(tmp.path());
     assert!(install_at(&paths, &state, true).expect("install"));
     for (existing, line) in [
-        ("-- mine\nrequire(\n  \"clauth\"\n).setup{}\n", 2),
+        // The string naming the module is on the line after the `require(`.
+        ("-- mine\nrequire(\n  \"clauth\"\n).setup{}\n", 3),
+        ("-- mine\nlocal m = \"clauth\"\nrequire(m).setup{}\n", 2),
         ("-- note\rrequire(\"clauth\").setup{}\n", 2),
         ("-- mine\rrequire(\"clauth\").setup{ tag = false }\r", 2),
     ] {
@@ -849,7 +851,7 @@ fn uninstall_refuses_a_load_whatever_its_line_ends() {
         let err = uninstall_at(&paths, &state, true).expect_err("refused");
         assert!(
             err.to_string().starts_with(&format!(
-                "{}:{line} loads the plugin outside clauth's block:\n",
+                "{}:{line} names clauth outside clauth's block, so it may still load the plugin:\n",
                 paths.init.display()
             )),
             "{existing:?}: {err}"
@@ -863,6 +865,38 @@ fn uninstall_refuses_a_load_whatever_its_line_ends() {
             plugin_at(&paths.plugin),
             PluginDir::Managed { .. }
         ));
+    }
+}
+
+/// Uninstall counts any string naming clauth outside a comment and outside
+/// clauth's block as a load: every spelling of a `require` names the module
+/// somewhere, and a string naming it for another reason only costs a
+/// refusal.
+#[test]
+fn any_string_naming_clauth_outside_a_comment_keeps_the_plugin() {
+    for (existing, line) in [
+        ("local m = \"clauth\"\nrequire(m).setup{}\n", 1),
+        ("local m = 'cl' .. 'x'\nlocal n = [[Clauth]]\n", 2),
+        (
+            "dofile(os.getenv(\"HOME\") .. \"/.config/rex/clauth/init.lua\")\n",
+            1,
+        ),
+        ("local m = \"\\99lauth\"\n", 1),
+        ("local s = [=[\nclauth\n]=]\n", 1),
+    ] {
+        let refusal = read(existing).still_loaded().expect("refused");
+        assert_eq!(
+            (refusal.why, refusal.line),
+            (Why::NamesClauth, line),
+            "{existing:?}"
+        );
+    }
+    for existing in [
+        "-- local m = \"clauth\"\n",
+        "--[[ local m = \"clauth\" ]]\n",
+        "local m = \"claut\" .. \"h\"\n",
+    ] {
+        assert_eq!(read(existing).still_loaded(), None, "{existing:?}");
     }
 }
 
