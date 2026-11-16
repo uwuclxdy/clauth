@@ -6409,6 +6409,116 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
 
+/// The synced writers and the unsynced one land the same file: the new bytes
+/// over the old ones, owner-only on Unix whatever the old file's mode, and no
+/// temp left beside it. The syncs run for real here ([`sync_in_tests`]), but
+/// whether one reached the disk is not observable; this pins only that they
+/// succeed and change nothing a reader sees.
+#[test]
+fn the_synced_and_the_fast_writers_land_the_same_owner_only_file() {
+    sync_in_tests();
+    type Writer = fn(&Path, &[u8]) -> std::io::Result<()>;
+    let writers: [(&str, Writer); 4] = [
+        ("atomic_write_600", |p, b| atomic_write_600(p, b)),
+        ("atomic_write_600_with", |p, b| {
+            atomic_write_600_with(p, |f| std::io::Write::write_all(f, b))
+        }),
+        ("atomic_write_600_fast", |p, b| atomic_write_600_fast(p, b)),
+        ("atomic_write", |p, b| atomic_write(p, b)),
+    ];
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (label, write) in writers {
+        let path = dir.join(format!("{label}.json"));
+        std::fs::write(&path, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new", "{label}");
+        #[cfg(unix)]
+        if label != "atomic_write" {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{label} landed {mode:o}");
+        }
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "atomic_write.json",
+            "atomic_write_600.json",
+            "atomic_write_600_fast.json",
+            "atomic_write_600_with.json",
+        ],
+        "a temp stayed behind"
+    );
+}
+
+/// A dated write synced before its temp takes the mtime still lands carrying
+/// that mtime: the sync goes through the writing handle, the date through a
+/// handle of its own afterwards.
+#[test]
+fn a_synced_dated_write_still_lands_its_mtime() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cache.json");
+    std::fs::write(&path, b"old").unwrap();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    atomic_write_600_dated(&path, b"new", Some(at)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), at);
+}
+
+/// The unsynced writer stays on the files a tick rewrites and the next tick
+/// rebuilds: `status.json` (the daemon's tick and its post-switch publish),
+/// `tps_cache.json` and `tps_attribution.json`. A new call anywhere else, a
+/// credential store above all, has to change this list, and so has to say why
+/// that file may come back empty after a power loss.
+#[test]
+fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let scanned = crate::testutil::rs_files(&root);
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/ — it is not reading the crate",
+        scanned.len()
+    );
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    for file in scanned {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let n = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .filter(|code| code.contains("atomic_write_600_fast(") && !code.contains("fn "))
+            .count();
+        if n > 0 {
+            let rel = file.strip_prefix(&root).unwrap();
+            calls.push((rel.to_string_lossy().replace('\\', "/"), n));
+        }
+    }
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            ("daemon/mod.rs".to_string(), 2),
+            ("tps.rs".to_string(), 1),
+            ("usage/scheduler.rs".to_string(), 1),
+        ],
+        "the unsynced writer's callers moved"
+    );
+}
+
 // ── a profile's id: what a login in flight lands by ──────────────────────────
 
 fn create_account(name: &str) {

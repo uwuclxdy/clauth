@@ -594,7 +594,7 @@ impl Timeline {
         let written = serde_json::to_vec(&wire)
             .map_err(|e| e.to_string())
             .and_then(|bytes| {
-                crate::profile::atomic_write_600(&path, &bytes).map_err(|e| e.to_string())
+                crate::profile::atomic_write_600_fast(&path, &bytes).map_err(|e| e.to_string())
             });
         match written {
             Ok(()) => {

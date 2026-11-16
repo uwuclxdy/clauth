@@ -61,7 +61,7 @@ use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{
-    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, clauth_dir,
+    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600_fast, clauth_dir,
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
@@ -1263,7 +1263,7 @@ fn write_status_json(json: &[u8]) {
         );
         return;
     }
-    if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), json) {
+    if let Err(e) = atomic_write_600_fast(&dir.join(STATUS_FILE), json) {
         logline!("clauth: failed to publish status.json after a switch: {e}");
     }
 }
@@ -2521,7 +2521,7 @@ impl Daemon {
             status_json::build_status_with_codex(&cfg_snap, interval, Some(&live), false);
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
-                if let Err(e) = atomic_write_600(&self.status_path, &json) {
+                if let Err(e) = atomic_write_600_fast(&self.status_path, &json) {
                     logline!("clauth daemon: failed to write status.json: {e}");
                 }
             }
