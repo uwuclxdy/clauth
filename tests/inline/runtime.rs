@@ -4657,6 +4657,46 @@ fn read_settings_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).expect("read settings")).expect("parse settings")
 }
 
+/// A shared session's copy keeps the `/model` pick the operator file holds on
+/// a member with no `default` row, and leaves out the model keys clauth wrote
+/// there for the active account; an isolated copy keeps neither.
+#[test]
+fn a_shared_copy_keeps_the_operators_model_pick_but_not_clauths_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let operator = claude_home.join("settings.json");
+        fs::write(&operator, br#"{}"#).expect("write settings");
+        let mut active = make_profile("active");
+        active.models.default = Some("active-model".to_string());
+        active.models.subagent = Some("active-subagent".to_string());
+        crate::claude::apply_profile_to_claude_settings(&active, &[]).expect("live apply");
+        let mut live = read_settings_json(&operator);
+        live["advisorModel"] = serde_json::json!("pick-advisor");
+        live["model"] = serde_json::json!("pick");
+        fs::write(&operator, serde_json::to_vec(&live).expect("ser")).expect("a /model pick");
+
+        let member = make_profile("member");
+        for (isolation, model, advisor) in [
+            (Isolation::Shared, Some("pick"), Some("pick-advisor")),
+            (Isolation::Isolated, None, None),
+        ] {
+            let runtime = tmp.path().join(format!("runtime-{isolation:?}"));
+            fs::create_dir_all(&runtime).expect("mkdir runtime");
+            write_merged_settings(&runtime, &claude_home, &member, isolation, &[])
+                .expect("write_merged_settings");
+            let copy = read_settings_json(&runtime.join("settings.json"));
+            assert_eq!(copy["model"].as_str(), model, "{isolation:?}");
+            assert_eq!(copy["advisorModel"].as_str(), advisor, "{isolation:?}");
+            assert_eq!(
+                copy["env"].get("CLAUDE_CODE_SUBAGENT_MODEL"),
+                None,
+                "{isolation:?}: the active account's subagent row stays out"
+            );
+        }
+    });
+}
+
 /// Build one shared tree from an operator file holding `days`, so the build
 /// remembers it the way production learns it.
 fn remember_through_a_build(root: &Path, claude_home: &Path, days: u64) {

@@ -6367,7 +6367,7 @@ pub(crate) fn release_saved_base_env(
         None => serde_json::Map::new(),
     };
     let unchanged = env.clone();
-    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]))?;
+    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]), false)?;
     let content = if env == unchanged {
         None
     } else {
@@ -6487,6 +6487,14 @@ struct SavedBaseEnv {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migrating: bool,
     keys: BTreeMap<String, BaseEnvEntry>,
+    /// What clauth last wrote under each model key ([`MODEL_KEYS`]) it set in
+    /// the live file, keyed by settings key. Absent (`None`) until the first
+    /// live apply of a clauth that records them: until then a model key with
+    /// no entry is judged as the migration judges a cover ([`Judge`]). A
+    /// fresh stamp holds an empty map, since no live file means no value
+    /// clauth wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models: Option<BTreeMap<String, ModelEntry>>,
 }
 
 const SAVED_BASE_ENV_VERSION: u32 = 1;
@@ -6498,7 +6506,29 @@ impl Default for SavedBaseEnv {
             active: None,
             migrating: false,
             keys: BTreeMap::new(),
+            models: Some(BTreeMap::new()),
         }
+    }
+}
+
+/// What clauth last wrote under one model key of the live file: the SHA-256
+/// hex digest of that JSON value (`wrote`), and, as for a [`BaseEnvEntry`],
+/// the digest of the clauth value still live while a pre-write has moved
+/// `wrote` on (`pending`). Unlike a cover it keeps no `base`: a row writes
+/// over the key as it always has, and an account without the row removes the
+/// key only while the live value is one clauth wrote. Any other value (a
+/// `/model` pick, a hand edit) is the user's and stays.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ModelEntry {
+    wrote: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<String>,
+}
+
+impl ModelEntry {
+    fn wrote_live(&self, live: &serde_json::Value) -> bool {
+        let digest = wrote_digest(live);
+        digest == self.wrote || self.pending.as_ref() == Some(&digest)
     }
 }
 
@@ -6526,7 +6556,7 @@ fn read_saved_base_env() -> Result<Option<SavedBaseEnv>> {
     }
     let context = || {
         format!(
-            "{} holds the ~/.claude/settings.json env values your profiles' [env] keys cover; repair it (removing it gives those values up)",
+            "{} holds the ~/.claude/settings.json env values your profiles' [env] keys cover and the model keys clauth wrote there; repair it (removing it gives those env values up)",
             path.display()
         )
     };
@@ -6875,9 +6905,11 @@ enum Found {
 }
 
 /// The record a live apply lands around its write: `captured` with each new
-/// or re-based entry, `landed` with every change.
+/// or re-based entry, `landed` with every change. `judge` is how the build
+/// judged live values the record does not name.
 struct RecordPlan {
     found: Found,
+    judge: Judge,
     captured: SavedBaseEnv,
     landed: SavedBaseEnv,
 }
@@ -6900,14 +6932,16 @@ struct SettingsBuild {
 /// recorded account.
 /// A live apply reads the record whenever it exists, to stamp it; a sibling's
 /// build only when `env` holds a key the account lacks, the only kind an
-/// entry can change. One that does not parse refuses the build only when a
-/// covered key, or a leaving key `prev_env_keys` lists and `env` holds, needs
-/// a decision.
+/// entry can change, or when `model_decision` says a model key the account
+/// leaves unset is held ([`settle_model_keys`]). One that does not parse
+/// refuses the build only when a covered key, a leaving key `prev_env_keys`
+/// lists and `env` holds, or such a model key needs a decision.
 fn settle_custom_env(
     env: &mut serde_json::Map<String, serde_json::Value>,
     profile_env: &BTreeMap<String, String>,
     prev_env_keys: &[String],
     live: Option<&[&BTreeMap<String, String>]>,
+    model_decision: bool,
 ) -> Result<RecordPlan> {
     let covering: Vec<(&String, &String)> = match live {
         Some(_) => profile_env
@@ -6918,10 +6952,11 @@ fn settle_custom_env(
     };
     let leaving = |key: &str| !profile_env.contains_key(key) && keeps_base_value(key);
     let needed = !covering.is_empty()
+        || model_decision
         || prev_env_keys
             .iter()
             .any(|key| leaving(key) && env.contains_key(key));
-    let found = if live.is_some() || env.keys().any(|key| leaving(key)) {
+    let found = if live.is_some() || model_decision || env.keys().any(|key| leaving(key)) {
         match read_saved_base_env() {
             Ok(Some(saved)) => Found::Read(saved),
             Ok(None) => Found::Absent,
@@ -7024,9 +7059,226 @@ fn settle_custom_env(
     }
     Ok(RecordPlan {
         found,
+        judge,
         captured,
         landed,
     })
+}
+
+/// The settings keys a `[models]` row writes, each with whether it lives in
+/// the `env` block (`false`: top level).
+const MODEL_KEYS: [(&str, bool); 7] = [
+    ("model", false),
+    ("advisorModel", false),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", true),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", true),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", true),
+    ("ANTHROPIC_DEFAULT_FABLE_MODEL", true),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", true),
+];
+
+fn is_model_env_key(key: &str) -> bool {
+    MODEL_KEYS
+        .iter()
+        .any(|&(model_key, in_env)| in_env && model_key == key)
+}
+
+/// The value a build on `profile` writes under model key `key`: its `[env]`
+/// entry for an env key (the build's "profile env last" pass lets it win),
+/// else its `[models]` row. `None`: the account leaves the key unset.
+fn account_model_value<'a>(profile: &'a Profile, key: &str, in_env: bool) -> Option<&'a str> {
+    let models = &profile.models;
+    let row = match key {
+        "model" => &models.default,
+        "advisorModel" => &models.advisor,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL" => &models.opus,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL" => &models.sonnet,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL" => &models.haiku,
+        "ANTHROPIC_DEFAULT_FABLE_MODEL" => &models.fable,
+        "CLAUDE_CODE_SUBAGENT_MODEL" => &models.subagent,
+        _ => return None,
+    };
+    in_env
+        .then(|| profile.env.get(key))
+        .flatten()
+        .or(row.as_ref())
+        .map(String::as_str)
+}
+
+/// The value `settings` holds under model key `key`.
+fn held_model_value<'a>(
+    settings: &'a serde_json::Value,
+    key: &str,
+    in_env: bool,
+) -> Option<&'a serde_json::Value> {
+    if in_env {
+        settings.get("env").and_then(|env| env.get(key))
+    } else {
+        settings.get(key)
+    }
+}
+
+/// The accounts' own model values, which name clauth's writes where the
+/// record cannot ([`Judge`]). Read off disk only when a judgment needs them;
+/// an account that no longer reads names nothing, so its value is kept.
+#[derive(Default)]
+struct OutgoingModels {
+    outgoing: Option<Vec<Profile>>,
+    roster: Option<Vec<Profile>>,
+}
+
+impl OutgoingModels {
+    /// Whether an outgoing account (the active one, or every account with
+    /// none active: [`outgoing_profiles_on_disk`]) writes `live` under `key`.
+    fn outgoing_names(
+        &mut self,
+        key: &str,
+        in_env: bool,
+        live: &serde_json::Value,
+    ) -> Result<bool> {
+        let profiles = match self.outgoing.take() {
+            Some(profiles) => profiles,
+            None => outgoing_profiles_on_disk(&crate::profile::load_app_state()?)
+                .filter_map(Result::ok)
+                .collect(),
+        };
+        Ok(names_model(
+            self.outgoing.insert(profiles),
+            key,
+            in_env,
+            live,
+        ))
+    }
+
+    /// Whether any account on the roster writes `live` under `key`.
+    fn roster_names(&mut self, key: &str, in_env: bool, live: &serde_json::Value) -> Result<bool> {
+        let profiles = match self.roster.take() {
+            Some(profiles) => profiles,
+            None => {
+                let state = crate::profile::load_app_state()?;
+                state
+                    .profiles
+                    .iter()
+                    .filter_map(|name| crate::profile::read_profile(name).ok())
+                    .collect()
+            }
+        };
+        Ok(names_model(self.roster.insert(profiles), key, in_env, live))
+    }
+}
+
+fn names_model(profiles: &[Profile], key: &str, in_env: bool, live: &serde_json::Value) -> bool {
+    live.as_str().is_some_and(|live| {
+        profiles
+            .iter()
+            .any(|profile| account_model_value(profile, key, in_env) == Some(live))
+    })
+}
+
+/// Whether clauth wrote the live value `live` under model key `key`: the
+/// record's entry names it, or, where the record cannot speak for the live
+/// file, an account's own value is `live`, judged as [`live_owner`] judges a
+/// cover. Before the record holds any model entry (`Migrating`, the upgrade
+/// case) that is the outgoing account's value; after an older clauth moved
+/// the marker (`Unseen`) any account's. Otherwise the value is the user's.
+fn model_written_by_clauth(
+    entry: Option<&ModelEntry>,
+    judge: Judge,
+    key: &str,
+    in_env: bool,
+    live: &serde_json::Value,
+    outgoing: &mut OutgoingModels,
+) -> Result<bool> {
+    if entry.is_some_and(|entry| entry.wrote_live(live)) {
+        return Ok(true);
+    }
+    Ok(match judge {
+        Judge::Recorded => false,
+        Judge::Migrating => entry.is_none() && outgoing.outgoing_names(key, in_env, live)?,
+        Judge::Unseen => outgoing.roster_names(key, in_env, live)?,
+    })
+}
+
+/// Decide the model keys ([`MODEL_KEYS`]) for a build on `profile` over
+/// `settings`, and return the ones it removes: a key the account leaves unset
+/// leaves only while its live value is one clauth wrote
+/// ([`model_written_by_clauth`]); any other value stays. A key the account
+/// sets is written over whatever the file holds, by the caller. With `live`
+/// the record follows: each written value gets an entry, a removed key's
+/// entry keeps naming the value until the live write lands, and a key the
+/// account leaves unset retires its entry after it.
+fn settle_model_keys(
+    settings: &serde_json::Value,
+    profile: &Profile,
+    record: &mut RecordPlan,
+    live: bool,
+) -> Result<Vec<&'static str>> {
+    let saved = match &record.found {
+        Found::Read(saved) => saved.models.as_ref(),
+        Found::Absent | Found::Unread => None,
+    };
+    let judge = match &record.found {
+        Found::Read(found) if found.models.is_none() => Judge::Migrating,
+        _ => record.judge,
+    };
+    let empty = BTreeMap::new();
+    let entries = saved.unwrap_or(&empty);
+    let mut outgoing = OutgoingModels::default();
+    let mut captured = entries.clone();
+    let mut landed = BTreeMap::new();
+    let mut removed = Vec::new();
+    for (key, in_env) in MODEL_KEYS {
+        let entry = entries.get(key);
+        let held = held_model_value(settings, key, in_env);
+        let clauths = match held {
+            Some(held) => model_written_by_clauth(entry, judge, key, in_env, held, &mut outgoing)?,
+            None => false,
+        };
+        match account_model_value(profile, key, in_env) {
+            Some(value) => {
+                let landed_entry = ModelEntry {
+                    wrote: wrote_digest(&value.into()),
+                    pending: None,
+                };
+                // As for a cover: the pre-write keeps the digest of the
+                // clauth value still live until the live write lands.
+                let pending = held
+                    .filter(|_| clauths)
+                    .map(wrote_digest)
+                    .filter(|digest| *digest != landed_entry.wrote);
+                let next = ModelEntry {
+                    pending,
+                    ..landed_entry.clone()
+                };
+                if entry != Some(&next) {
+                    captured.insert(key.to_string(), next);
+                }
+                landed.insert(key.to_string(), landed_entry);
+            }
+            None if clauths => {
+                // The pre-write names the value it removes, so a crash before
+                // the live write lands still reads it as clauth's.
+                if let Some(held) = held
+                    && !entry.is_some_and(|entry| entry.wrote_live(held))
+                {
+                    captured.insert(
+                        key.to_string(),
+                        ModelEntry {
+                            wrote: wrote_digest(held),
+                            pending: None,
+                        },
+                    );
+                }
+                removed.push(key);
+            }
+            None => {}
+        }
+    }
+    if live {
+        record.captured.models = Some(captured);
+        record.landed.models = Some(landed);
+    }
+    Ok(removed)
 }
 
 /// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
@@ -7210,10 +7462,13 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// not write stays. A sibling's build reads the record, never retires it.
 /// An `[env]` inference entry [`session_env`] leaves out, either one on a
 /// proxy account holding a slot key, counts as a key `profile` lacks.
-/// Also writes the profile's model config — the top-level `model` setting and
-/// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
-/// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The profile's effort rides
+/// Also writes the profile's model config — the top-level `model` and
+/// `advisorModel` settings and the `ANTHROPIC_DEFAULT_*_MODEL` /
+/// `CLAUDE_CODE_SUBAGENT_MODEL` env keys — each set when present, and removed
+/// when unset only while the file holds the value clauth last wrote there
+/// (the record's model entries, [`settle_model_keys`]), so a switch never
+/// inherits the previous profile's model routing and never drops a value the
+/// user set (a `/model` pick, a hand edit). The profile's effort rides
 /// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
 /// profile's own `[env]` entry outranking the `effort` field
 /// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
@@ -7267,12 +7522,29 @@ fn build_settings(
         settings["env"] = serde_json::json!({});
     }
 
+    // A model key the account leaves unset is decided against the record
+    // ([`settle_model_keys`]), never by the outgoing account's `[env]` list:
+    // the strip list would remove a value the user changed since.
+    let prev_env_keys: Vec<String> = prev_env_keys
+        .iter()
+        .filter(|key| !is_model_env_key(key))
+        .cloned()
+        .collect();
+    let model_decision = MODEL_KEYS.iter().any(|&(key, in_env)| {
+        account_model_value(profile, key, in_env).is_none()
+            && held_model_value(&settings, key, in_env).is_some()
+    });
+
     let env = settings["env"]
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
     let session_env = session_env(profile);
-    let record = settle_custom_env(env, &session_env, prev_env_keys, live)?;
+    let mut record = settle_custom_env(env, &session_env, &prev_env_keys, live, model_decision)?;
+    let removed_models = settle_model_keys(&settings, profile, &mut record, live.is_some())?;
+    let env = settings["env"]
+        .as_object_mut()
+        .context("settings.json `env` is not an object")?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -7288,8 +7560,10 @@ fn build_settings(
     // previous profile's token.
     env.remove("ANTHROPIC_AUTH_TOKEN");
 
-    // Model-tier and subagent overrides — clauth-owned env keys, always set or
-    // cleared deterministically so a switch never inherits the prior profile's.
+    // Model-tier and subagent overrides: a row is written over whatever the
+    // file holds, and an unset one removes the key only while clauth wrote
+    // its value (`removed_models`), so a switch never inherits the prior
+    // profile's routing and never drops one the user set.
     let model_env = [
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", &profile.models.opus),
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", &profile.models.sonnet),
@@ -7302,9 +7576,10 @@ fn build_settings(
             Some(v) => {
                 env.insert(key.into(), v.clone().into());
             }
-            None => {
+            None if removed_models.contains(&key) => {
                 env.remove(key);
             }
+            None => {}
         }
     }
 
@@ -7335,21 +7610,23 @@ fn build_settings(
         Some(model) => {
             obj.insert("model".into(), model.into());
         }
-        None => {
+        None if removed_models.contains(&"model") => {
             obj.remove("model");
         }
+        None => {}
     }
-    // `advisorModel` is clauth-owned the same way `model` is: set when the
-    // profile has an `advisor` row, removed when it has none, so a profile
-    // without the row runs with the advisor off instead of inheriting the
-    // previous profile's (or a hand-set global) value.
+    // `advisorModel` is settled the same way `model` is: set when the profile
+    // has an `advisor` row, removed when it has none while clauth wrote the
+    // value, so a profile without the row never inherits the previous
+    // profile's advisor and keeps one the user set (by hand or with `/advisor`).
     match profile.models.advisor.as_deref() {
         Some(model) => {
             obj.insert("advisorModel".into(), model.into());
         }
-        None => {
+        None if removed_models.contains(&"advisorModel") => {
             obj.remove("advisorModel");
         }
+        None => {}
     }
     // `effortLevel` is Claude Code's own key (its `/effort` command writes it
     // under `modelSettings`): clauth never writes or removes it.

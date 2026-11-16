@@ -5724,6 +5724,16 @@ fn seed_fable_spent_member(member_default: Option<&'static str>, global_model: &
     );
 }
 
+/// Have clauth's own live apply write the global `model` in
+/// `~/.claude/settings.json`, as a switch onto an account with that
+/// `[models] default` does: only a value clauth wrote leaves a member's
+/// runtime when the member has no `default`, and a hand-set one counts.
+fn clauth_wrote_the_global_model(model: &str) {
+    let mut writer = crate::profile::Profile::new("writer".to_string(), None, None);
+    writer.models.default = Some(model.to_owned());
+    crate::claude::apply_profile_to_claude_settings(&writer, &[]).unwrap();
+}
+
 /// The developer's shell may export either model variable; every `--auto`
 /// demand test pins both unset unless it sets one itself.
 fn no_model_env(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
@@ -6518,8 +6528,10 @@ fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
     let sb = crate::testutil::HomeSandbox::new();
     let _env = no_model_env(&sb);
     seed_fable_spent_member(None, "opus");
+    clauth_wrote_the_global_model("opus");
 
-    // No `[models] default`: the runtime drops the global `model`, the session
+    // No `[models] default`: the runtime drops the global `model` clauth
+    // wrote, the session
     // runs Claude Code's own default, and an unresolved demand keeps the blanket
     // per-model judgment (`check_scoped`, on by default).
     let err = cmd_start_auto(Isolation::Shared)
@@ -6572,6 +6584,7 @@ fn cmd_start_auto_a_no_model_launch_with_a_fallback_keeps_the_blanket_scoped_jud
             spent: "7d opus",
         }],
     );
+    clauth_wrote_the_global_model("opus");
 
     let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
         .expect_err("the unknown headline is judged against every per-model week");
@@ -6615,6 +6628,7 @@ fn cmd_start_auto_an_unresolved_default_keeps_its_known_headline_on_the_scoped_r
             spent: "7d sonnet",
         }],
     );
+    clauth_wrote_the_global_model("opus");
     let name = crate::profile::ProfileName::from("a");
     let mut profile = crate::profile::load_profile(&name).unwrap();
     profile.check_scoped = false;
@@ -6658,6 +6672,7 @@ fn cmd_start_auto_never_judges_a_member_by_a_subagent_model_the_session_scrubs()
         ],
     );
     seed_fable_spent_member(None, "opus");
+    clauth_wrote_the_global_model("opus");
 
     let err = cmd_start_auto(Isolation::Shared)
         .expect_err("a scrubbed variable is no demand, so the blanket judgment holds");

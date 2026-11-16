@@ -3987,11 +3987,12 @@ fn the_advisor_model_is_read_from_each_settings_tier_in_precedence_order() {
     );
 }
 
-/// The overlay strips a global `advisorModel` when the profile has no row (the
-/// writer is clauth-owned, like `model`), so the global key never reaches the
-/// demand; an isolated runtime has no base at all, and only the row applies.
+/// The overlay strips a global `advisorModel` clauth wrote when the profile
+/// has no row, as it does `model`, so that one never reaches the demand; a
+/// hand-set one stays in a shared runtime and counts. An isolated runtime has
+/// no base at all, and only the row applies.
 #[test]
-fn a_global_advisor_model_never_counts_without_a_profile_row() {
+fn a_global_advisor_model_counts_without_a_profile_row_only_when_the_user_set_it() {
     let home = HomeSandbox::new();
     let claude = home.home().join(".claude");
     fs::create_dir_all(&claude).unwrap();
@@ -4005,8 +4006,15 @@ fn a_global_advisor_model_never_counts_without_a_profile_row() {
 
     assert_eq!(
         demand(&profile_with_advisor(None), Isolation::Shared),
+        ["m", "opus"],
+        "no row: a hand-set advisorModel in the shared base stays and counts"
+    );
+    crate::claude::apply_profile_to_claude_settings(&profile_with_advisor(Some("sonnet")), &[])
+        .expect("clauth writes an advisor row live");
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Shared),
         ["m"],
-        "no row: the shared base's advisorModel is removed by the overlay"
+        "no row: the advisorModel clauth wrote is removed by the overlay"
     );
     assert_eq!(
         demand(&profile_with_advisor(Some("haiku")), Isolation::Shared),

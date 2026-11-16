@@ -469,29 +469,40 @@ fn build_settings_writes_model_knobs() {
     );
 }
 
-/// A row-less profile removes `advisorModel` from the base, the way it removes
-/// `model`: the advisor is clauth-owned, so a profile without the row runs with
-/// it off instead of inheriting a hand-set or earlier profile's value. This is
-/// the one place a global `advisorModel` is dropped on a switch or start.
+/// A row-less profile removes an `advisorModel` clauth wrote, the way it
+/// removes such a `model`, so it never inherits an earlier profile's advisor;
+/// one set by hand or with `/advisor` stays. A row replaces either.
 #[test]
-fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let base = tmp.path().join("settings.json");
+fn build_settings_removes_only_an_advisor_model_clauth_wrote_when_the_profile_has_no_row() {
+    let _home = HomeSandbox::new();
+    let live = claude_settings_path().expect("settings path");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir ~/.claude");
     fs::write(
-        &base,
+        &live,
         r#"{"advisorModel":"opus","permissions":{"allow":["Bash"]}}"#,
     )
-    .expect("seed base settings");
+    .expect("seed live settings");
     let profile = crate::profile::Profile::new("p".to_string(), None, None);
-    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let json = build_claude_settings_json(Some(&live), &profile, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
-    assert!(v.get("advisorModel").is_none(), "no row → no advisorModel");
+    assert_eq!(v["advisorModel"], "opus", "a hand-set advisor stays");
+
+    let mut wrote = crate::profile::Profile::new("w".to_string(), None, None);
+    wrote.models.advisor = Some("sonnet".to_string());
+    apply_profile_to_claude_settings(&wrote, &[]).expect("clauth writes an advisor row");
+    let json = build_claude_settings_json(Some(&live), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert!(
+        v.get("advisorModel").is_none(),
+        "no row → the advisor clauth wrote leaves"
+    );
     assert_eq!(
         v["permissions"]["allow"][0], "Bash",
         "other top-level keys survive"
     );
 
     // With the row set, the base value is replaced rather than kept.
+    let base = live;
     let mut with_row = crate::profile::Profile::new("p".to_string(), None, None);
     with_row.models.advisor = Some("claude-opus-5-5".to_string());
     let json = build_claude_settings_json(Some(&base), &with_row, &[]).expect("build settings");
@@ -623,20 +634,23 @@ fn a_tier_override_alone_is_enough_to_write_settings() {
     assert_eq!(v["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"], "claude-fable-5");
 }
 
-// A profile with no model config must strip a previous profile's model knobs
-// from the base settings.json, so a switch never inherits stale model routing.
+// A profile with no model config must strip the model knobs a previous
+// profile had clauth write into the base settings.json, so a switch never
+// inherits stale model routing.
 #[test]
 fn build_settings_clears_stale_model_knobs() {
     // `KEEP` is a custom key the profile lacks, so the build consults the
     // saved base values under `~/.clauth`.
     let _home = HomeSandbox::new();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let base = tmp.path().join("settings.json");
-    fs::write(
-        &base,
-        r#"{"model":"opus","env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"old","ANTHROPIC_DEFAULT_FABLE_MODEL":"old","CLAUDE_CODE_SUBAGENT_MODEL":"old","KEEP":"1"}}"#,
-    )
-    .expect("seed base settings");
+    let base = claude_settings_path().expect("settings path");
+    fs::create_dir_all(base.parent().expect("parent")).expect("mkdir ~/.claude");
+    fs::write(&base, r#"{"env":{"KEEP":"1"}}"#).expect("seed live settings");
+    let mut previous = crate::profile::Profile::new("old".to_string(), None, None);
+    previous.models.default = Some("opus".to_string());
+    previous.models.opus = Some("old".to_string());
+    previous.models.fable = Some("old".to_string());
+    previous.models.subagent = Some("old".to_string());
+    apply_profile_to_claude_settings(&previous, &[]).expect("the previous profile's apply");
     let profile = crate::profile::Profile::new("p".to_string(), None, None); // empty models
     let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
@@ -5862,17 +5876,21 @@ fn the_sign_out_skips_its_destructive_read_degrade_only_over_a_locked_keychain()
 /// follows the session, not the global live settings.
 #[test]
 fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let base = tmp.path().join("settings.json");
+    let _home = HomeSandbox::new();
+    let base = claude_settings_path().expect("settings path");
+    fs::create_dir_all(base.parent().expect("parent")).expect("mkdir ~/.claude");
     fs::write(
         &base,
-        r#"{"model":"opus","fallbackModel":["claude-sonnet-5",7,null,"haiku"],"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"claude-haiku-4-5"}}"#,
+        r#"{"fallbackModel":["claude-sonnet-5",7,null,"haiku"]}"#,
     )
     .expect("seed base settings");
 
     let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
     profile.models.default = Some("opus".to_string());
     profile.models.subagent = Some("claude-haiku-4-5".to_string());
+    // clauth writes the model and subagent into the live file, so a member
+    // without the rows drops them.
+    apply_profile_to_claude_settings(&profile, &[]).expect("live apply");
     let src = runtime_model_sources(Some(base.as_path()), &profile, &[]);
     assert_eq!(src.model.as_deref(), Some("opus"));
     assert_eq!(
@@ -8986,6 +9004,279 @@ fn an_unparseable_saved_record_refuses_the_uncover_without_quoting_it() {
         live_endpoint().as_deref(),
         Some("p-value"),
         "the refused write leaves the live file as it was"
+    );
+}
+
+// ── model keys: an unset row removes only the value clauth wrote ────────────
+
+/// Every settings key a `[models]` row writes, with whether it rides `env`.
+const EVERY_MODEL_KEY: [(&str, bool); 7] = [
+    ("model", false),
+    ("advisorModel", false),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", true),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", true),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", true),
+    ("ANTHROPIC_DEFAULT_FABLE_MODEL", true),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", true),
+];
+
+/// A profile with a row for every model key, each `"{tag}-{key}"`.
+fn every_model_row(name: &str, tag: &str) -> Profile {
+    let mut profile = Profile::new(name.to_string(), None, None);
+    let row = |key: &str| Some(format!("{tag}-{key}"));
+    let models = &mut profile.models;
+    models.default = row("model");
+    models.advisor = row("advisorModel");
+    models.opus = row("ANTHROPIC_DEFAULT_OPUS_MODEL");
+    models.sonnet = row("ANTHROPIC_DEFAULT_SONNET_MODEL");
+    models.haiku = row("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+    models.fable = row("ANTHROPIC_DEFAULT_FABLE_MODEL");
+    models.subagent = row("CLAUDE_CODE_SUBAGENT_MODEL");
+    profile
+}
+
+/// Each model key's value in `settings`, in [`EVERY_MODEL_KEY`] order.
+fn model_values(settings: &serde_json::Value) -> Vec<Option<String>> {
+    EVERY_MODEL_KEY
+        .iter()
+        .map(|&(key, in_env)| {
+            let held = if in_env {
+                settings["env"].get(key)
+            } else {
+                settings.get(key)
+            };
+            held.and_then(|v| v.as_str()).map(str::to_string)
+        })
+        .collect()
+}
+
+/// `"{tag}-{key}"` for every model key, as [`model_values`] reads them.
+fn tagged_models(tag: &str) -> Vec<Option<String>> {
+    EVERY_MODEL_KEY
+        .iter()
+        .map(|(key, _)| Some(format!("{tag}-{key}")))
+        .collect()
+}
+
+fn live_settings_value() -> serde_json::Value {
+    read_json_file(&claude_settings_path().expect("settings path")).expect("live settings")
+}
+
+/// Hand-edit every model key of the live file to `"{tag}-{key}"`, as a
+/// `/model` pick or an edit in an editor would.
+fn hand_set_every_live_model(tag: &str) {
+    let mut live = live_settings_value();
+    for (key, in_env) in EVERY_MODEL_KEY {
+        let value = serde_json::json!(format!("{tag}-{key}"));
+        if in_env {
+            live["env"][key] = value;
+        } else {
+            live[key] = value;
+        }
+    }
+    atomic_write(
+        &claude_settings_path().expect("settings path"),
+        serde_json::to_string(&live).expect("ser"),
+    )
+    .expect("hand-edit live settings");
+}
+
+fn seed_live_settings(json: &str) {
+    let path = claude_settings_path().expect("settings path");
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir ~/.claude");
+    atomic_write(&path, json).expect("seed live settings");
+}
+
+fn built_over_live(profile: &Profile) -> serde_json::Value {
+    let json = build_claude_settings_json(
+        Some(&claude_settings_path().expect("settings path")),
+        profile,
+        &[],
+    )
+    .expect("build settings");
+    serde_json::from_str(&json).expect("parse settings")
+}
+
+/// The live apply behind a switch: every model value clauth wrote leaves on
+/// an account without the rows (a preset's ids never follow onto it), every
+/// value the user set instead stays, and a row still writes over either.
+#[test]
+fn an_unset_model_row_removes_only_the_value_clauth_wrote_live() {
+    let _home = HomeSandbox::new();
+    seed_live_settings(r#"{"theme":"dark"}"#);
+    let rowless = Profile::new("plain".to_string(), None, None);
+
+    apply_profile_to_claude_settings(&every_model_row("preset", "preset"), &[]).expect("rows");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("preset")
+    );
+    apply_profile_to_claude_settings(&rowless, &[]).expect("rowless");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        vec![None; 7],
+        "every value clauth wrote leaves"
+    );
+    assert_eq!(live_settings_value()["theme"], "dark", "other keys stay");
+
+    apply_profile_to_claude_settings(&every_model_row("preset", "preset"), &[]).expect("rows");
+    hand_set_every_live_model("mine");
+    apply_profile_to_claude_settings(&rowless, &[]).expect("rowless");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("mine"),
+        "every value the user set stays"
+    );
+
+    apply_profile_to_claude_settings(&every_model_row("other", "other"), &[]).expect("rows");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("other"),
+        "a row writes over the user's value"
+    );
+    apply_profile_to_claude_settings(&rowless, &[]).expect("rowless");
+    assert_eq!(model_values(&live_settings_value()), vec![None; 7]);
+}
+
+/// A `clauth start` copy and the start walk's demand read build over the live
+/// file with the same rule: the user's `/model` pick follows a member without
+/// a `default` row, the active account's own rows do not. An isolated build
+/// has no base and keeps nothing.
+#[test]
+fn a_shared_start_build_keeps_the_users_model_and_drops_the_ones_clauth_wrote() {
+    let _home = HomeSandbox::new();
+    seed_live_settings("{}");
+    apply_profile_to_claude_settings(&every_model_row("active", "active"), &[]).expect("rows");
+    let mut live = live_settings_value();
+    live["model"] = serde_json::json!("pick");
+    atomic_write(
+        &claude_settings_path().expect("settings path"),
+        serde_json::to_string(&live).expect("ser"),
+    )
+    .expect("a /model pick");
+
+    let member = Profile::new("member".to_string(), None, None);
+    let mut expected = vec![None; 7];
+    expected[0] = Some("pick".to_string());
+    assert_eq!(model_values(&built_over_live(&member)), expected);
+
+    let demand = runtime_model_sources(
+        Some(&claude_settings_path().expect("settings path")),
+        &member,
+        &[],
+    );
+    assert_eq!(demand.model.as_deref(), Some("pick"));
+    assert_eq!(demand.advisor, None, "the active account's advisor row");
+    assert_eq!(
+        demand.env_subagent, None,
+        "the active account's subagent row"
+    );
+    assert_eq!(demand.env_opus, None, "the active account's opus remap");
+
+    let isolated = runtime_model_sources(None, &member, &[]);
+    assert_eq!(isolated.model, None, "an isolated build keeps nothing");
+}
+
+/// A record that does not parse refuses a build that must decide whether a
+/// model value clauth may have written leaves, live or for a session, without
+/// quoting the record and leaving the live file as it was. A build with no
+/// such decision (every key set by a row) still lands.
+#[test]
+fn an_unparseable_record_refuses_a_model_removal_it_would_decide() {
+    let _home = HomeSandbox::new();
+    seed_live_settings("{}");
+    apply_profile_to_claude_settings(&every_model_row("preset", "preset"), &[]).expect("rows");
+    atomic_write_600(&saved_base_env_record(), r#"{"models":"sk-saved-secret""#)
+        .expect("seed a torn record");
+    let rowless = Profile::new("plain".to_string(), None, None);
+
+    let error = apply_profile_to_claude_settings(&rowless, &[])
+        .expect_err("an unreadable record refuses the removal");
+    let text = format!("{error:#}");
+    assert!(text.contains("base-env.json"), "names the record: {text}");
+    assert!(!text.contains("sk-saved-secret"), "never quotes it");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("preset"),
+        "the refused write leaves the live file as it was"
+    );
+    build_claude_settings_json(
+        Some(&claude_settings_path().expect("settings path")),
+        &rowless,
+        &[],
+    )
+    .expect_err("a session build refuses the same decision");
+
+    apply_profile_to_claude_settings(&every_model_row("other", "other"), &[])
+        .expect("a build with no removal to decide lands");
+    assert_eq!(model_values(&live_settings_value()), tagged_models("other"));
+}
+
+/// With no record at all (the first build after an upgrade, before any live
+/// apply recorded a model), a model value is the user's unless an outgoing
+/// account's own row is that value; with none active, every account counts,
+/// and with no accounts nothing does.
+#[test]
+fn with_no_record_a_hand_set_model_stays() {
+    let _home = HomeSandbox::new();
+    seed_live_settings(r#"{"model":"pick","env":{"CLAUDE_CODE_SUBAGENT_MODEL":"mine"}}"#);
+    assert!(!saved_base_env_record().exists(), "control: no record");
+    let rowless = Profile::new("plain".to_string(), None, None);
+    let mut expected = vec![None; 7];
+    expected[0] = Some("pick".to_string());
+    expected[6] = Some("mine".to_string());
+    assert_eq!(
+        model_values(&built_over_live(&rowless)),
+        expected,
+        "a session build keeps both"
+    );
+    apply_profile_to_claude_settings(&rowless, &[]).expect("rowless");
+    assert_eq!(model_values(&live_settings_value()), expected);
+    let record: serde_json::Value =
+        read_json_file(&saved_base_env_record()).expect("the apply stamps the record");
+    assert_eq!(
+        record["models"],
+        serde_json::json!({}),
+        "and records no model"
+    );
+}
+
+/// A crash between the record's pre-write and the live write never turns
+/// clauth's value into the user's: a removal that did not land, and a row
+/// that replaced another but did not land, both still leave on the retry.
+#[test]
+fn a_failed_live_write_leaves_clauths_model_values_clauths() {
+    let home = HomeSandbox::new();
+    seed_live_settings("{}");
+    let rowless = Profile::new("plain".to_string(), None, None);
+    apply_profile_to_claude_settings(&every_model_row("preset", "preset"), &[]).expect("rows");
+
+    {
+        let _fault = FailLiveSettingsWrite::new(&home);
+        apply_profile_to_claude_settings(&rowless, &[]).expect_err("the removal fails");
+    }
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("preset")
+    );
+    apply_profile_to_claude_settings(&rowless, &[]).expect("retry");
+    assert_eq!(model_values(&live_settings_value()), vec![None; 7]);
+
+    apply_profile_to_claude_settings(&every_model_row("preset", "preset"), &[]).expect("rows");
+    {
+        let _fault = FailLiveSettingsWrite::new(&home);
+        apply_profile_to_claude_settings(&every_model_row("other", "other"), &[])
+            .expect_err("the replacement fails");
+    }
+    assert_eq!(
+        model_values(&live_settings_value()),
+        tagged_models("preset")
+    );
+    apply_profile_to_claude_settings(&rowless, &[]).expect("rowless");
+    assert_eq!(
+        model_values(&live_settings_value()),
+        vec![None; 7],
+        "the value the failed write would have replaced is still clauth's"
     );
 }
 
