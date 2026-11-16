@@ -201,6 +201,8 @@ fn the_listing_pages_newest_first_across_both_stores_with_a_round_trip_cursor() 
                 "updated": "1970-01-01T00:16:40+00:00",
                 "first_message": "tie",
                 "last_message": "tie",
+                "title": null,
+                "git_branch": null,
                 "store": "global",
                 "via": [],
                 "lacks": [],
@@ -218,6 +220,96 @@ fn the_listing_pages_newest_first_across_both_stores_with_a_round_trip_cursor() 
     );
     assert_eq!(viewed.status, 200);
     assert_eq!(body_text(&viewed), LISTING_PAGE_1.trim_end());
+}
+
+/// A row carries the session's name, the newest `custom-title` record Claude
+/// Code wrote (sanitized like a preview), found even when it sits before the
+/// last user message; and the git branch off the newest user record that
+/// names one. A session that wrote neither carries `null` for both.
+#[test]
+fn a_row_carries_the_newest_title_and_git_branch() {
+    let sb = HomeSandbox::new();
+    let ctx = ctx();
+    let titled = |title: &str| {
+        serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": "s-named"})
+            .to_string()
+    };
+    let on_branch = |text: &str, branch: &str| {
+        serde_json::json!({"sessionId": "s-named", "cwd": "/w/app", "gitBranch": branch, "message": {"role": "user", "content": text}})
+            .to_string()
+    };
+    global_session(
+        &sb,
+        "s-named",
+        &[
+            titled("old-name"),
+            on_branch("first", "main"),
+            titled("new\u{1b}name"),
+            on_branch("last", "mommy"),
+        ],
+        2_000,
+    );
+    global_session(
+        &sb,
+        "s-plain",
+        &[user_line("s-plain", "/w/app", "hi")],
+        1_000,
+    );
+
+    let listed = call(&ctx, &req("GET", "/api/v1/sessions", Some(TOKEN), ""));
+    assert_eq!(listed.status, 200);
+    let rows = body_json(&listed)["sessions"].clone();
+    assert_eq!(rows[0]["id"], "s-named");
+    assert_eq!(rows[0]["title"], "new name");
+    assert_eq!(rows[0]["git_branch"], "mommy");
+    assert_eq!(rows[0]["last_message"], "last");
+    assert_eq!(rows[1]["id"], "s-plain");
+    assert_eq!(rows[1]["title"], serde_json::Value::Null);
+    assert_eq!(rows[1]["git_branch"], serde_json::Value::Null);
+}
+
+/// The newest `custom-title` record decides even when it names nothing usable:
+/// the row reads `null`, never an older name. The branch comes from the newest
+/// user record that names one, so a newer record without a branch falls back
+/// to an older one; it reaches the phone with control and bidi characters
+/// dropped and nothing else changed, so it still names the branch.
+#[test]
+fn a_row_skips_an_unnamed_newest_title_and_a_branchless_newest_message() {
+    let sb = HomeSandbox::new();
+    let ctx = ctx();
+    let titled = |title: &str| {
+        serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": "s-odd"})
+            .to_string()
+    };
+    let user = |text: &str, branch: Option<&str>| {
+        let mut record = serde_json::json!({"sessionId": "s-odd", "cwd": "/w/app", "message": {"role": "user", "content": text}});
+        if let Some(branch) = branch {
+            record["gitBranch"] = serde_json::json!(branch);
+        }
+        record.to_string()
+    };
+    global_session(
+        &sb,
+        "s-odd",
+        &[
+            titled("kept-name"),
+            user("first", Some("fix\u{202e}evil")),
+            titled("\u{1b}"),
+            user("middle", Some("")),
+            user("last", None),
+            serde_json::json!({"sessionId": "s-odd", "type": "assistant", "gitBranch": "other", "message": {"role": "assistant", "content": "x"}})
+                .to_string(),
+        ],
+        2_000,
+    );
+
+    let listed = call(&ctx, &req("GET", "/api/v1/sessions", Some(TOKEN), ""));
+    assert_eq!(listed.status, 200);
+    let row = body_json(&listed)["sessions"][0].clone();
+    assert_eq!(row["id"], "s-odd");
+    assert_eq!(row["last_message"], "last");
+    assert_eq!(row["title"], serde_json::Value::Null);
+    assert_eq!(row["git_branch"], "fixevil");
 }
 
 /// `next_before` is `null` on the last page that carries rows, never only on

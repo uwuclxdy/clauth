@@ -722,6 +722,7 @@ fn a_full_queue_refuses_a_command_with_a_503() {
     let me = std::process::id();
     let (_t, r) = table(&[(me, instance("s-self", "1"))]);
     let hub = Hub::new(true, r);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, me, "s-self");
     // An open ask, so the answer route reaches its Busy arm (a Busy leaves the
     // ask open, so the poll below still sees only the queued interrupts).

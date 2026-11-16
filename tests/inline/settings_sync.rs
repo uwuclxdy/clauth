@@ -63,7 +63,7 @@ fn write_config(home: &Path, profile: &str, body: &str) {
 /// order significant).
 fn sync() {
     assert!(
-        sync_members().expect("sync"),
+        sync_members().expect("sync").merged,
         "the merge must have run; a paused tick means a config.toml did not parse"
     );
 }
@@ -262,7 +262,7 @@ fn a_torn_base_env_record_pauses_the_merge_without_quoting_it() {
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
     let lines = crate::logline::LogLines::new();
     let capture = lines.capture_here();
-    let merged = sync_members().expect("sync");
+    let merged = sync_members().expect("sync").merged;
     drop(capture);
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 
@@ -891,7 +891,7 @@ fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
         CODEX_ROSTER_WARNED.load(Ordering::Relaxed),
         "the roster failure is reported once"
     );
-    assert!(sync_members().expect("sync"), "the merge runs");
+    assert!(sync_members().expect("sync").merged, "the merge runs");
 
     // A valid roster naming a codex dir whose own config.toml does not parse:
     // the dir is skipped by membership, the claude keys still arrive.
@@ -1015,7 +1015,7 @@ fn a_config_that_does_not_parse_aborts_the_tick() {
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 
     assert!(
-        !sync_members().expect("sync"),
+        !sync_members().expect("sync").merged,
         "the merge must not run while a profile's [env] set is unknown"
     );
     assert_eq!(
@@ -1221,6 +1221,38 @@ fn the_settings_record_is_owner_only_and_holds_no_member_bytes() {
     );
 }
 
+/// `is_recorded` asks what `can_win` asks: whether the record names the path,
+/// whatever the bytes on disk now are.
+#[test]
+fn is_recorded_answers_by_path_even_after_claude_code_rewrote_the_copy() {
+    let home = HomeSandbox::new();
+    let record = home
+        .home()
+        .join(".clauth")
+        .join(SETTINGS_SYNC_WRITTEN_FILENAME);
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    let other = session_runtime_path(home.home(), "p2", "4242-1");
+    assert!(
+        !crate::jsonsync::is_recorded(&record, &copy),
+        "a missing record holds nothing"
+    );
+
+    write_recorded_json(home.home(), &copy, &json!({"env": {}}), t(1));
+    write_json(&copy, &json!({"theme": "dark", "env": {}}), t(5));
+
+    assert!(
+        crate::jsonsync::is_recorded(&record, &copy),
+        "a copy Claude Code rewrote keeps its entry"
+    );
+    assert!(!crate::jsonsync::is_recorded(&record, &other));
+
+    fs::write(&record, b"{not json").expect("corrupt the record");
+    assert!(
+        !crate::jsonsync::is_recorded(&record, &copy),
+        "a corrupt record holds nothing"
+    );
+}
+
 #[test]
 fn a_copy_no_live_session_holds_never_rewrites_the_base() {
     let home = HomeSandbox::new();
@@ -1342,7 +1374,8 @@ fn a_recorded_live_copy_carrying_a_newer_edit_still_reaches_the_base() {
 
 /// Guard 3: a recorded live winner lacking four of the base's shared top-level
 /// keys is one over the bound, so the pass writes nothing, backs the base up
-/// once, and says so with the exact line.
+/// once, and says so with the exact line. The base holds a value clauth never
+/// remembers, so no put-back reaches the winner before the guard does.
 #[test]
 fn a_winner_lacking_four_shared_keys_writes_nothing_and_backs_the_base_up() {
     let home = HomeSandbox::new();
@@ -1350,7 +1383,7 @@ fn a_winner_lacking_four_shared_keys_writes_nothing_and_backs_the_base_up() {
     let winner = session_runtime_path(home.home(), "p1", "4242-0");
     write_json(
         &base,
-        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+        &json!({"cleanupPeriodDays": 0, "outputStyle": "x",
             "hooks": {"PreToolUse": []}, "attribution": {"commit": ""}, "env": {}}),
         t(1),
     );
@@ -1456,7 +1489,8 @@ fn a_winner_lacking_exactly_three_shared_keys_still_merges() {
 
 /// Guard 3's retention: the newest ten backups of one file are kept, the oldest
 /// goes on the eleventh refusal, and the other operator file's backups are
-/// untouched.
+/// untouched. The base holds a value clauth never remembers, so no put-back
+/// reaches the winner before the guard does.
 #[test]
 fn the_eleventh_refusal_keeps_ten_backups_and_spares_the_other_files() {
     let home = HomeSandbox::new();
@@ -1464,7 +1498,7 @@ fn the_eleventh_refusal_keeps_ten_backups_and_spares_the_other_files() {
     let winner = session_runtime_path(home.home(), "p1", "4242-0");
     write_json(
         &base,
-        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+        &json!({"cleanupPeriodDays": 0, "outputStyle": "x",
             "hooks": {"PreToolUse": []}, "attribution": {"commit": ""}, "env": {}}),
         t(1),
     );
@@ -1506,7 +1540,9 @@ fn the_eleventh_refusal_keeps_ten_backups_and_spares_the_other_files() {
 
 /// The delete bound carries one protected key: a winner lacking
 /// `cleanupPeriodDays` refuses even when that is the only shared key the pass
-/// would delete, because its absence re-arms Claude Code's 30-day sweep.
+/// would delete, because its absence re-arms Claude Code's 30-day sweep. The
+/// base holds a value clauth never remembers, so no put-back reaches the winner
+/// before the guard does.
 #[test]
 fn a_winner_lacking_only_the_cleanup_retention_key_refuses_the_pass() {
     let home = HomeSandbox::new();
@@ -1514,7 +1550,7 @@ fn a_winner_lacking_only_the_cleanup_retention_key_refuses_the_pass() {
     let winner = session_runtime_path(home.home(), "p1", "4242-0");
     write_json(
         &base,
-        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        &json!({"cleanupPeriodDays": 0, "theme": "light", "env": {}}),
         t(1),
     );
     let _live = live_recorded_json(
@@ -2471,5 +2507,1420 @@ fn shorten_home_renders_the_platform_separator_and_leaves_foreign_paths_alone() 
         crate::jsonsync::shorten_home(&foreign),
         foreign.display().to_string(),
         "a path outside home renders through Path::display"
+    );
+}
+
+// ── the remembered transcript retention ─────────────────────────────────────
+
+/// The one line a put-back into the operator file logs.
+fn put_back_line(days: u64) -> String {
+    format!(
+        "clauth: cleanupPeriodDays was gone from ~/.claude/settings.json, put {days} back; \
+         open clauth to keep or remove it"
+    )
+}
+
+fn retention() -> crate::retention::Retention {
+    crate::retention::load().expect("load the retention record")
+}
+
+fn remembered(days: u64, question_open: bool) -> crate::retention::Retention {
+    crate::retention::Retention {
+        days: Some(days),
+        question_open,
+    }
+}
+
+/// Seed the remembered number the way production learns it: one pass over an
+/// operator file that holds it.
+fn remember_through_a_pass(home: &Path, days: u64) {
+    write_json(
+        &base_path(home),
+        &json!({"cleanupPeriodDays": days, "theme": "light", "env": {}}),
+        t(1),
+    );
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(days, false),
+        "the pass remembers the number"
+    );
+}
+
+#[test]
+fn a_keyless_operator_file_gets_the_remembered_number_back_with_one_line_and_an_open_question() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+        sync();
+    }
+
+    let expected = json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}});
+    assert_eq!(
+        read_json(&base),
+        expected,
+        "the operator file holds the number again"
+    );
+    assert_eq!(
+        read_json(&copy),
+        expected,
+        "the live copy holds the number too"
+    );
+    assert_eq!(retention(), remembered(3650, true), "the question is open");
+    assert_eq!(
+        lines.snapshot(),
+        vec![put_back_line(3650)],
+        "one line for one loss, however many passes follow"
+    );
+}
+
+/// The put-back must not make the operator file the newest member: a live
+/// copy's newer in-session edit still wins the same pass.
+#[test]
+fn a_put_back_keeps_a_newer_in_session_edit() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        t(30),
+    );
+
+    sync();
+
+    let expected = json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}});
+    assert_eq!(
+        read_json(&base),
+        expected,
+        "the in-session edit reaches the operator file"
+    );
+    assert_eq!(read_json(&copy), expected, "the copy keeps its edit");
+}
+
+#[test]
+fn a_new_number_by_hand_replaces_the_remembered_one_with_no_question() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    remember_through_a_pass(home.home(), 3650);
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 365, "theme": "light", "env": {}}),
+        t(20),
+    );
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(retention(), remembered(365, false));
+    assert_eq!(read_json(&base)["cleanupPeriodDays"], json!(365));
+    assert!(lines.snapshot().is_empty(), "a changed number logs nothing");
+}
+
+#[test]
+fn a_missing_operator_file_stays_missing_while_the_live_copy_gets_the_number() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    fs::remove_file(&base).expect("remove the operator file");
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "light", "env": {}}),
+        t(10),
+    );
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert!(!base.exists(), "clauth never creates the operator file");
+    assert_eq!(read_json(&copy)["cleanupPeriodDays"], json!(3650));
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "no question without a put-back"
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "nothing was put back into the operator file"
+    );
+}
+
+#[test]
+fn an_unparseable_operator_file_keeps_its_bytes_while_the_live_copy_gets_the_number() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let torn = b"{\"theme\": \"light\", \"env\": {";
+    fs::write(&base, torn).expect("write a torn operator file");
+    set_mtime(&base, t(20));
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "light", "env": {}}),
+        t(10),
+    );
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(
+        fs::read(&base).expect("read base"),
+        torn,
+        "the torn file is left alone"
+    );
+    assert_eq!(read_json(&copy)["cleanupPeriodDays"], json!(3650));
+    assert_eq!(retention(), remembered(3650, false));
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+}
+
+#[test]
+fn nothing_remembered_puts_nothing_back() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    let keyless = json!({"theme": "light", "env": {}});
+    write_json(&base, &keyless, t(1));
+    let _live = live_recorded_json(home.home(), &copy, &keyless, t(1));
+    let before = fs::read(&base).expect("read base");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(fs::read(&base).expect("read base"), before);
+    assert!(read_json(&copy).get("cleanupPeriodDays").is_none());
+    assert_eq!(retention(), crate::retention::Retention::default());
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+}
+
+/// Claude Code's schema takes a positive integer only; anything else in the
+/// operator file is never remembered, and a remembered number is kept.
+#[test]
+fn a_value_claude_code_rejects_is_never_remembered() {
+    for rejected in [json!(0), json!(-7), json!(1.5), json!("3650"), json!(null)] {
+        let home = HomeSandbox::new();
+        let base = base_path(home.home());
+        write_json(
+            &base,
+            &json!({"cleanupPeriodDays": rejected.clone(), "env": {}}),
+            t(1),
+        );
+        sync();
+        assert_eq!(
+            retention(),
+            crate::retention::Retention::default(),
+            "{rejected} is not remembered"
+        );
+
+        remember_through_a_pass(home.home(), 3650);
+        write_json(
+            &base,
+            &json!({"cleanupPeriodDays": rejected.clone(), "env": {}}),
+            t(20),
+        );
+        sync();
+        assert_eq!(
+            retention(),
+            remembered(3650, false),
+            "{rejected} leaves the remembered number in place"
+        );
+        assert_eq!(
+            read_json(&base)["cleanupPeriodDays"],
+            rejected,
+            "a key that is present is never overwritten"
+        );
+    }
+}
+
+#[test]
+fn an_isolated_copy_never_gets_the_number() {
+    let home = HomeSandbox::new();
+    let isolated = isolated_path(home.home(), "p1");
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&isolated, &json!({"env": {}}), t(10));
+
+    sync();
+
+    assert!(read_json(&isolated).get("cleanupPeriodDays").is_none());
+}
+
+#[test]
+fn remove_forgets_the_number_and_deletes_the_key_everywhere_until_a_new_number_appears() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+
+    crate::retention::remove().expect("remove");
+
+    let keyless = json!({"theme": "light", "env": {}});
+    assert_eq!(read_json(&base), keyless, "the operator file loses the key");
+    assert_eq!(read_json(&copy), keyless, "the live copy loses the key");
+    assert_eq!(retention(), crate::retention::Retention::default());
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+    assert_eq!(read_json(&base), keyless, "a later pass puts nothing back");
+    assert_eq!(read_json(&copy), keyless);
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 30, "theme": "light", "env": {}}),
+        t(40),
+    );
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(30, false),
+        "a new number arms it again"
+    );
+}
+
+/// The daemon's leg: with no live session there is no reconcile pass, and the
+/// check still puts the number back.
+#[test]
+fn the_daemon_check_puts_the_number_back_with_no_live_session() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(1),
+    );
+    crate::retention::reconcile().expect("reconcile");
+    assert_eq!(retention(), remembered(3650, false));
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        crate::retention::reconcile().expect("reconcile");
+    }
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}})
+    );
+    assert_eq!(retention(), remembered(3650, true));
+    assert_eq!(lines.snapshot(), vec![put_back_line(3650)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_retention_record_is_owner_only_under_clauth_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    remember_through_a_pass(home.home(), 3650);
+
+    let path = crate::retention::record_path().expect("record path");
+    assert_eq!(
+        path,
+        home.home().join(".clauth").join("settings-retention.json")
+    );
+    let mode = fs::metadata(&path)
+        .expect("the record exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+// ── the put-back's record status and rank ───────────────────────────────────
+
+/// A put-back into a live copy the record never named leaves it unnamed, so
+/// the copy still cannot win a pass.
+#[test]
+fn a_put_back_into_an_unrecorded_copy_leaves_it_unrecorded() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    fs::remove_file(&base).expect("remove the operator file");
+    let _marker = arm_runtime_marker(copy.parent().expect("runtime dir"));
+    write_json(&copy, &json!({"theme": "dark", "env": {}}), t(10));
+
+    sync();
+
+    assert_eq!(
+        read_json(&copy),
+        json!({"theme": "dark", "env": {}, "cleanupPeriodDays": 3650})
+    );
+    let record = home
+        .home()
+        .join(".clauth")
+        .join(SETTINGS_SYNC_WRITTEN_FILENAME);
+    assert!(
+        !crate::jsonsync::is_recorded(&record, &copy),
+        "the copy stays out of the record"
+    );
+}
+
+/// A put-back into a recorded copy Claude Code rewrote since keeps that copy's
+/// rank, so the operator file's newer edit still wins the pass.
+#[test]
+fn a_put_back_into_a_rewritten_recorded_copy_keeps_its_rank() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&copy, &json!({"theme": "dark", "env": {}}), t(20));
+    write_json(&base, &json!({"theme": "solarized", "env": {}}), t(30));
+
+    sync();
+
+    let expected = json!({"cleanupPeriodDays": 3650, "theme": "solarized", "env": {}});
+    assert_eq!(read_json(&base), expected, "the operator file's edit wins");
+    assert_eq!(read_json(&copy), expected);
+}
+
+/// A torn retention record remembers nothing and is reported once; it is
+/// rewritten only once the operator file holds a number again.
+#[test]
+fn a_torn_retention_record_puts_nothing_back_until_a_number_appears() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let record = crate::retention::record_path().expect("record path");
+    fs::create_dir_all(record.parent().expect("record dir")).expect("mkdir ~/.clauth");
+    let torn = b"{\"days\": ";
+    fs::write(&record, torn).expect("tear the record");
+    let keyless = json!({"theme": "light", "env": {}});
+    write_json(&base, &keyless, t(1));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+        write_json(&base, &json!({"theme": "dark", "env": {}}), t(2));
+        sync();
+    }
+
+    assert_eq!(read_json(&base), json!({"theme": "dark", "env": {}}));
+    assert_eq!(
+        fs::read(&record).expect("read record"),
+        torn,
+        "kept until a number appears"
+    );
+    let logged = lines.snapshot();
+    assert_eq!(
+        logged.len(),
+        1,
+        "one line for a record that stays torn: {logged:?}"
+    );
+
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 90, "theme": "dark", "env": {}}),
+        t(10),
+    );
+    sync();
+    assert_eq!(retention(), remembered(90, false));
+}
+
+// ── the healed winner and the fault-tolerant pass ────────────────────────────
+
+/// The put-back heals the winner before the delete-bound refusal, so a winner
+/// lacking exactly `cleanupPeriodDays` plus three more shared keys merges
+/// (deleting the three) where a keyless winner used to refuse: the restored
+/// key is no deletion.
+#[test]
+fn a_healed_winner_lacking_three_shared_keys_still_merges() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "outputStyle": "x",
+            "hooks": {}, "attribution": {}, "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &winner,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "the pass remembers the number"
+    );
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        "the restored key is no deletion, so three dropped keys stay under the bound"
+    );
+    assert_eq!(
+        read_json(&winner)["cleanupPeriodDays"],
+        json!(3650),
+        "the winner carries the restored key"
+    );
+    assert!(
+        backups_named(
+            &home.home().join(".clauth").join("backups"),
+            "settings.json"
+        )
+        .is_empty(),
+        "a pass under the bound takes no backup"
+    );
+}
+
+/// A retention-record fault (the record path is a directory) never stops the
+/// merge: the pass still merges a shared-key change and still puts the
+/// remembered number back into a keyless copy, and one latched line covers the
+/// standing fault. The build's half of this fault lives in
+/// `a_retention_record_fault_never_refuses_a_build` (runtime tests).
+#[test]
+fn a_retention_record_fault_never_stops_the_merge_or_a_build() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    let record = crate::retention::record_path().expect("record path");
+    fs::create_dir_all(record.parent().expect("record dir")).expect("mkdir ~/.clauth");
+    fs::create_dir_all(&record).expect("make the record path a directory");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+        sync();
+    }
+
+    assert_eq!(
+        read_json(&base)["theme"],
+        json!("dark"),
+        "the merge still runs over the copy's newer edit"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the copy still gets the remembered number back"
+    );
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "one latched line for the standing record fault"
+    );
+}
+
+/// The operator answering with a different valid number closes the open
+/// question silently.
+#[test]
+fn a_new_number_while_the_question_is_open_closes_it_silently() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 90, "theme": "light", "env": {}}),
+        t(30),
+    );
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync();
+    }
+
+    assert_eq!(
+        retention(),
+        remembered(90, false),
+        "a new valid number closes the question"
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "answering by hand logs nothing"
+    );
+}
+
+/// The operator file's own value, valid or not, is what a keyless copy carries:
+/// `0` is never remembered, but a copy that could win the merge must still get
+/// the operator file's `0` rather than go keyless and refuse the pass.
+#[test]
+fn a_keyless_copy_carries_the_operator_files_own_value_even_when_it_is_invalid() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "dark", "env": {}}),
+        t(30),
+    );
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 0, "theme": "light", "env": {}}),
+        t(20),
+    );
+
+    sync();
+
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "0 is never remembered"
+    );
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(0),
+        "a key that is present is never overwritten"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(0),
+        "the keyless copy carries the operator file's own value"
+    );
+}
+
+/// A failed put-back into the operator file skips that pass's merge only: the
+/// copies still get the number, the operator file keeps its keyless bytes, the
+/// open question closes again, and the failure line is latched.
+#[cfg(unix)]
+#[test]
+fn a_failed_operator_put_back_skips_the_merge_and_closes_the_question() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    let _read_only = crate::testutil::UnwritableDir::new(&home.home().join(".claude"));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        assert!(
+            !sync_members().expect("the check runs").merged,
+            "a failed operator put-back skips the merge"
+        );
+        assert!(
+            !sync_members().expect("the check runs").merged,
+            "the merge stays skipped while the put-back keeps failing"
+        );
+    }
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "light", "env": {}}),
+        "the operator file keeps its keyless bytes"
+    );
+    assert_eq!(
+        read_json(&copy),
+        json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        "the copy still gets the number back"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "no put-back landed, so the question closes again"
+    );
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "one latched line for the failed put-back"
+    );
+}
+
+/// A Claude Code rewrite of the operator file between the read and the
+/// put-back's re-stat — the same race the `Err` arm guards — skips the merge:
+/// the newer keyless file would win it and strip the key from the copies this
+/// pass just healed, so the copies keep the key and nothing is logged.
+#[test]
+fn a_claude_code_rewrite_between_read_and_put_back_skips_the_merge() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    let base_for_hook = base.clone();
+    let once = std::sync::Once::new();
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == base_for_hook.as_path() {
+            once.call_once(|| {
+                write_json(
+                    &base_for_hook,
+                    &json!({"theme": "solarized", "env": {}}),
+                    t(30),
+                );
+            });
+        }
+    })));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        assert!(
+            !sync_members().expect("the check runs").merged,
+            "the merge must skip while the newer keyless file stands"
+        );
+    }
+    crate::retention::set_rewrite_hook(None);
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "solarized", "env": {}}),
+        "the newer keyless file stands"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the copy still holds the key"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "no put-back landed, so the question stays closed"
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "a refused put-back logs nothing"
+    );
+}
+
+/// A hand edit landing on the operator file mid-pass, after this pass read it,
+/// must still get the number back on the next check. The unparseable
+/// `config.toml` pauses the merge, so nothing else rewrites the copy between
+/// the passes and the mid-pass edit is the only change the next pass sees.
+#[test]
+fn a_hand_edit_landing_mid_pass_still_gets_the_number_back() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "dark", "env": {}}),
+        t(5),
+    );
+    write_config(home.home(), "p1", "not = [toml");
+
+    let base_for_hook = base.clone();
+    let copy_for_hook = copy.clone();
+    let once = std::sync::Once::new();
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == copy_for_hook.as_path() {
+            once.call_once(|| {
+                write_json(&base_for_hook, &json!({"theme": "light", "env": {}}), t(30));
+            });
+        }
+    })));
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        sync_members().expect("the first pass runs");
+    }
+    crate::retention::set_rewrite_hook(None);
+    {
+        let _capture = lines.capture_here();
+        sync_members().expect("the second pass runs");
+    }
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        "the operator file holds the number again"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the live copy holds the number too"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == put_back_line(3650))
+            .count(),
+        1,
+        "exactly one put-back line across both passes"
+    );
+}
+
+/// A keyless write landing right after the operator put-back's rename, before
+/// the pass stores its fast-path key, is not the pass's own write: the next
+/// check re-reads the file and puts the number back. Daemon path, no session
+/// live, so nothing else would ever move the key again.
+#[test]
+fn a_keyless_write_right_after_the_put_back_still_gets_the_number_back() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(1),
+    );
+    crate::retention::reconcile().expect("the remembering pass");
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    let base_for_hook = base.clone();
+    let once = std::sync::Once::new();
+    crate::jsonsync::set_post_write_hook(Some(Box::new(move || {
+        once.call_once(|| {
+            write_json(&base_for_hook, &json!({"theme": "dark", "env": {}}), t(30));
+        });
+    })));
+    crate::retention::reconcile().expect("the put-back pass");
+    crate::jsonsync::set_post_write_hook(None);
+    crate::retention::reconcile().expect("the next pass");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "theme": "dark", "env": {}}),
+        "the keyless write keeps its theme and gets the number back"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+}
+
+/// A failed operator put-back is retried by the very next check once the
+/// fault clears, with nothing else moving: the failed pass cached nothing.
+#[cfg(unix)]
+#[test]
+fn a_failed_operator_put_back_is_retried_by_the_next_check_once_the_fault_clears() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    {
+        let _read_only = crate::testutil::UnwritableDir::new(&home.home().join(".claude"));
+        crate::settings_sync::sync_once().expect("the session sync runs");
+    }
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "light", "env": {}}),
+        "the failed put-back left the file as it was"
+    );
+
+    crate::settings_sync::sync_once().expect("the session sync runs");
+
+    assert_eq!(
+        read_json(&base),
+        json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        "the next check retries the put-back and it lands"
+    );
+}
+
+/// A live copy that stays unparseable fails `remove` with a reason that says
+/// so — the key may still be in it, and nothing says it is moving — and the
+/// record keeps the number.
+#[test]
+fn remove_errors_on_a_live_copy_that_does_not_parse_and_says_so() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    std::fs::write(&copy, br#"{"cleanupPeriodDays": 36"#).expect("tear the copy");
+
+    let started = std::time::Instant::now();
+    let err = crate::retention::remove().expect_err("an unparseable copy fails the remove");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "each re-read of the torn copy waits for a write in flight to land"
+    );
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} cannot be read or does not parse, so its cleanupPeriodDays was not removed; the key may still be there",
+            copy.display()
+        )
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "the record keeps the number"
+    );
+}
+
+/// Restores a directory's mode on drop, so a failing assertion never leaves a
+/// sandbox directory the temp-dir cleanup cannot enter.
+#[cfg(unix)]
+struct ModeGuard(PathBuf, u32);
+
+#[cfg(unix)]
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        drop(fs::set_permissions(
+            &self.0,
+            fs::Permissions::from_mode(self.1),
+        ));
+    }
+}
+
+/// A live copy whose stat fails for any reason but absence (its directory
+/// unreadable) is not "missing": `remove` fails naming it and keeps the
+/// record, or a later merge would flow the key it may still hold back.
+#[cfg(unix)]
+#[test]
+fn remove_errors_on_a_live_copy_it_cannot_stat_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    let runtime_dir = copy.parent().expect("runtime dir").to_path_buf();
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    let restore = ModeGuard(runtime_dir, 0o700);
+
+    let err = crate::retention::remove().expect_err("an unstattable copy fails the remove");
+    drop(restore);
+
+    assert!(
+        err.to_string().contains(&copy.display().to_string()),
+        "the error names the copy: {err:#}"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "the record keeps the number"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the copy was never touched"
+    );
+}
+
+/// Run `check` over an operator file that loses the key, gets it back, and is
+/// then restored to the exact keyless bytes at the exact mtime it had before
+/// the put-back (a cron `rsync -a` or `cp -p` from a source lacking the key):
+/// the restored file matches every stat the put-back pass read, so only a
+/// check that cached nothing after its own write sees it. `recheck` runs one
+/// more check between the put-back and the restore, as the put-back's own
+/// rename wakes one; without it the restore lands before any later check
+/// (inside the watcher's cooldown, or on the poll fallback).
+fn a_keyless_restore_at_the_old_stat_gets_the_number_back_through(check: fn(), recheck: bool) {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let keyless = json!({"theme": "light", "env": {}});
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(1),
+    );
+    check();
+    write_json(&base, &keyless, t(20));
+    check();
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the first loss is put back"
+    );
+    if recheck {
+        check();
+    }
+
+    write_json(&base, &keyless, t(20));
+    check();
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the restored keyless file is put back too"
+    );
+}
+
+fn daemon_check() {
+    crate::retention::reconcile().expect("the daemon check runs");
+}
+
+fn session_check() {
+    crate::settings_sync::sync_once().expect("the session sync runs");
+}
+
+#[test]
+fn a_keyless_restore_at_the_old_stat_gets_the_number_back_on_the_daemon_path() {
+    a_keyless_restore_at_the_old_stat_gets_the_number_back_through(daemon_check, false);
+}
+
+#[test]
+fn a_keyless_restore_at_the_old_stat_gets_the_number_back_on_the_session_path() {
+    a_keyless_restore_at_the_old_stat_gets_the_number_back_through(session_check, false);
+}
+
+#[test]
+fn a_keyless_restore_after_a_recheck_gets_the_number_back_on_both_paths() {
+    a_keyless_restore_at_the_old_stat_gets_the_number_back_through(daemon_check, true);
+    a_keyless_restore_at_the_old_stat_gets_the_number_back_through(session_check, true);
+}
+
+/// A put-back into a live copy that fails is retried once the fault clears,
+/// with nothing else moving: a pass whose write failed caches nothing.
+#[cfg(unix)]
+#[test]
+fn a_failed_copy_put_back_is_retried_once_the_fault_clears() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"theme": "dark", "env": {}}),
+        t(10),
+    );
+    {
+        let _read_only = crate::testutil::UnwritableDir::new(copy.parent().expect("runtime dir"));
+        crate::settings_sync::sync_once().expect("the session sync runs");
+    }
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "a failed copy put-back never costs the operator file its number"
+    );
+
+    crate::settings_sync::sync_once().expect("the session sync runs");
+
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the copy gets the number once its write can land"
+    );
+}
+
+/// A keyless file that settled, gained the key by hand and lost it again to
+/// its own old bytes at its old stat (a dotfile restore from a source
+/// predating the hand edit) is put back: no snapshot of the settled keyless
+/// pass may skip the check once the number is remembered.
+#[test]
+fn a_restore_to_a_settled_keyless_stat_gets_the_number_back_on_the_session_path() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let keyless = json!({"theme": "light", "env": {}});
+    write_json(&base, &keyless, t(1));
+    session_check();
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(10),
+    );
+    session_check();
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "the hand-added number is remembered"
+    );
+
+    write_json(&base, &keyless, t(1));
+    session_check();
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the keyless bytes back at their settled stat are put back"
+    );
+}
+
+/// A number learned outside this session's own pass (a build's settle) while
+/// the session had settled a keyless operator file, then the keyless bytes
+/// back at that settled stat: no settings file differs from the session's
+/// cached snapshot, so only the retention record in its key shows the change.
+#[test]
+fn a_number_learned_by_a_build_reaches_a_session_settled_on_the_keyless_file() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let keyless = json!({"theme": "light", "env": {}});
+    write_json(&base, &keyless, t(1));
+    session_check();
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(10),
+    );
+    let sync_record = crate::settings_sync::written_record_path().expect("record path");
+    crate::lock::with_state_lock(|held| crate::retention::settle(held, &base, &[], &sync_record))
+        .expect("the build's settle runs");
+    assert_eq!(
+        retention(),
+        remembered(3650, false),
+        "the build learned the number"
+    );
+
+    write_json(&base, &keyless, t(1));
+    session_check();
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the session puts the number back"
+    );
+}
+
+/// Clears the settings sync's pre-lock hook on drop, so a failing assertion
+/// never leaves it armed for a later test.
+struct PreLockHookGuard;
+
+impl Drop for PreLockHookGuard {
+    fn drop(&mut self) {
+        set_pre_lock_hook(None);
+    }
+}
+
+/// Another process puts the number back while this session's check waits on
+/// the state flock, with the question already open so the record holds still:
+/// the check reads the keyed file, but the keyless stat it took before the
+/// wait must not key the fast path, or the same keyless bytes restored at that
+/// stat read as settled.
+#[test]
+fn a_put_back_landing_during_the_flock_wait_leaves_a_later_restore_to_be_put_back() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let keyless = json!({"theme": "light", "env": {}});
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &keyless, t(1));
+    session_check();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the first loss opens the question"
+    );
+    session_check();
+
+    write_json(&base, &keyless, t(1));
+    let sync_record = crate::settings_sync::written_record_path().expect("record path");
+    set_pre_lock_hook(Some(Box::new({
+        let base = base.clone();
+        move || {
+            crate::lock::with_state_lock(|held| {
+                crate::retention::settle(held, &base, &[], &sync_record)
+            })
+            .expect("the other process's settle runs");
+        }
+    })));
+    let hook = PreLockHookGuard;
+    session_check();
+    drop(hook);
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the other process put the number back"
+    );
+
+    write_json(&base, &keyless, t(1));
+    session_check();
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the session puts the number back"
+    );
+}
+
+/// Clears the merge engine's interleave hook on drop.
+#[cfg(unix)]
+struct InterleaveHookGuard;
+
+#[cfg(unix)]
+impl Drop for InterleaveHookGuard {
+    fn drop(&mut self) {
+        crate::jsonsync::set_interleave_hook(None);
+    }
+}
+
+/// A refusal whose backup re-read fails (the operator file unreadable for that
+/// read, its stat unchanged) still owes the backup: the next session check
+/// reruns and takes it, though no stat moved. Unix-only: mode 000 yields the
+/// read error portably there.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_home_at_the_backup_reread_is_retried_with_its_stat_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let winner = session_runtime_path(home.home(), "p1", "4242-0");
+    write_json(
+        &base,
+        &json!({"outputStyle": "x", "hooks": {}, "attribution": {}, "theme": "dark", "env": {}}),
+        t(1),
+    );
+    let _live = live_recorded_json(home.home(), &winner, &json!({"env": {}}), t(10));
+    let backups_dir = home.home().join(".clauth").join("backups");
+    crate::jsonsync::set_interleave_hook(Some(Box::new({
+        let base = base.clone();
+        move || {
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        }
+    })));
+    let hook = InterleaveHookGuard;
+    session_check();
+    drop(hook);
+    assert!(
+        backups_named(&backups_dir, "settings.json").is_empty(),
+        "no backup while the operator file is unreadable"
+    );
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+
+    session_check();
+
+    assert_eq!(
+        backups_named(&backups_dir, "settings.json").len(),
+        1,
+        "the owed backup lands with no stat moved"
+    );
+}
+
+/// A member that keeps changing while `remove` works on it (a Claude Code
+/// write landing in every read-to-re-stat window) fails the whole remove
+/// naming that file, and the record keeps the number and the open question.
+#[test]
+fn remove_errors_on_a_member_that_keeps_moving_and_keeps_the_record() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+
+    let copy_for_hook = copy.clone();
+    let move_n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let move_n_for_hook = std::sync::Arc::clone(&move_n);
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == copy_for_hook.as_path() {
+            let n = move_n_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json(
+                &copy_for_hook,
+                &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+                t(100 + n),
+            );
+        }
+    })));
+
+    let err = crate::retention::remove().expect_err("a member that keeps moving fails the remove");
+    crate::retention::set_rewrite_hook(None);
+
+    assert!(
+        err.to_string().contains(&copy.display().to_string()),
+        "the error names the moving file: {err:#}"
+    );
+    assert_eq!(
+        move_n.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the moving copy is retried exactly the cap of three times"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the record keeps the number and the open question"
+    );
+}
+
+/// A member that moves once inside the read-to-re-stat window is re-read and
+/// removed on the retry, so `remove` completes and the record is forgotten.
+#[test]
+fn remove_succeeds_on_a_member_that_moves_once() {
+    let home = HomeSandbox::new();
+    crate::retention::reset_latches();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+
+    let copy_for_hook = copy.clone();
+    let once = std::sync::Once::new();
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == copy_for_hook.as_path() {
+            once.call_once(|| {
+                write_json(
+                    &copy_for_hook,
+                    &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+                    t(30),
+                );
+            });
+        }
+    })));
+
+    crate::retention::remove().expect("a member that moves once is removed on the retry");
+    crate::retention::set_rewrite_hook(None);
+
+    assert_eq!(
+        read_json(&base),
+        json!({"theme": "light", "env": {}}),
+        "the operator file lost the key"
+    );
+    assert_eq!(
+        read_json(&copy),
+        json!({"theme": "light", "env": {}}),
+        "the copy lost the key"
+    );
+    assert_eq!(
+        retention(),
+        crate::retention::Retention::default(),
+        "the record is forgotten"
+    );
+}
+
+/// `JSON.parse` yields the integer 3650 for `3650.0` and `3.65e3`, and Claude
+/// Code's schema takes it, so any integral positive number is remembered — and
+/// the put-back writes the integer spelling.
+#[test]
+fn an_integral_float_is_remembered_as_the_integer() {
+    for spelled in [json!(3650.0), json!(3.65e3)] {
+        let home = HomeSandbox::new();
+        let base = base_path(home.home());
+        write_json(
+            &base,
+            &json!({"cleanupPeriodDays": spelled, "env": {}}),
+            t(1),
+        );
+        sync();
+        assert_eq!(
+            retention(),
+            remembered(3650, false),
+            "{spelled} is remembered as 3650"
+        );
+    }
+
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 3650.0, "theme": "light", "env": {}}),
+        t(1),
+    );
+    sync();
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(3650),
+        "the put-back writes the integer spelling"
     );
 }

@@ -787,21 +787,22 @@ fn jobs_listing_prose(p: &Value) -> String {
         }
         // The resume sentence is what makes the pair-loop possible from the
         // listing alone: a session id whose run is over is a handle. Rendered
-        // for an orphaned row (the only handle left) and a done one (the
-        // completion's own id, stamped by every completion arm). On a running
-        // row it would invite resuming a session the live run still holds, so
-        // it stays unsaid there — the JSON row still carries the key either
-        // way. An isolated orphan's id is no handle either (its transcript
-        // left with the throwaway tree), so its row says nothing about
-        // resuming; a done row keeps the sentence whatever its run was.
-        let isolated = row
-            .get("isolated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if matches!(state, "orphaned" | "done")
-            && !(state == "orphaned" && isolated)
-            && let Some(sid) = row.get("session_id").and_then(Value::as_str)
-        {
+        // for a done row (the completion's own id, stamped by every completion
+        // arm) and for a stopped or orphaned row whose own `resumable` verdict
+        // says the handle is real now: a stopped row's transcript may never
+        // have reached the global store, and an orphan whose recorded child
+        // still writes the transcript would put a second writer on a live
+        // session. On a running row it would invite resuming a session the
+        // live run still holds, so it stays unsaid there — the JSON row still
+        // carries the key either way.
+        let resume_sentence = if matches!(state, "stopped" | "orphaned") {
+            row.get("resumable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        } else {
+            state == "done"
+        };
+        if resume_sentence && let Some(sid) = row.get("session_id").and_then(Value::as_str) {
             out.push_str(&format!("; resume with session id `{sid}`"));
         }
         out.push_str(&age_phrase(row));
@@ -819,7 +820,7 @@ fn jobs_listing_prose(p: &Value) -> String {
 /// The one age a listing row carries, named for the question that row's state
 /// makes worth asking: a live run's is how long it has been going, a finished
 /// one's how long its result has been sitting there, an orphan's how long ago
-/// anything last wrote to it.
+/// anything last wrote to it, a stopped one's how long ago the stop landed.
 fn age_phrase(row: &Value) -> String {
     // `humanize_span`, never `humanize_duration`: every figure here is a SPAN,
     // and at zero that function spells `now`, which renders `elapsed now` and
@@ -834,6 +835,7 @@ fn age_phrase(row: &Value) -> String {
     let when = humanize_span(secs);
     match row.get("state").and_then(Value::as_str) {
         Some("orphaned") => format!(", last seen {when} ago"),
+        Some("stopped") => format!(", stopped {when} ago"),
         _ => format!(", finished {when} ago"),
     }
 }
@@ -2014,8 +2016,22 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
 pub(crate) fn monitor_job_prose(p: &Value) -> String {
-    // A crashed tombstone's owner copy is the whole line: no `delegate to`,
-    // `finished`/`failed`, or target footer may qualify it.
+    // A stopped tombstone's copy is the whole line: no `delegate to`,
+    // `finished`/`failed`, or target footer may qualify it. The text the run
+    // had written rides the same line when the record still holds it: the copy
+    // replaces the false resume promise, never the salvage.
+    if p.get("stopped").and_then(Value::as_bool).unwrap_or(false) {
+        let mut out = p
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if let Some(partial) = p.get("partial_result").and_then(Value::as_str) {
+            out.push_str(&format!("; partial result: {partial}"));
+        }
+        return out;
+    }
+    // A crashed tombstone's copy is the whole line, the same rule.
     if p.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
         return p
             .get("result")

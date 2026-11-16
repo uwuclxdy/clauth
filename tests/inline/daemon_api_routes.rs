@@ -1577,6 +1577,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         let resolver: crate::daemon::bridge::PeerResolver =
             Box::new(move |pid| read.lock().unwrap().get(&pid).cloned());
         let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        let _stream = hub.subscribe_as(Some(&Tier::Control));
         let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "prompt_reports": true});
         assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
         let opened = serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "ask_opened", "ask": FIXTURE_ASK_ID, "tool": "Bash", "input": {"command": "ls"}});
@@ -1821,6 +1822,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         let resolver: crate::daemon::bridge::PeerResolver =
             Box::new(move |pid| read.lock().unwrap().get(&pid).cloned());
         let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        let _stream = hub.subscribe_as(Some(&Tier::Control));
         let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
         assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
         let opened = serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "ask_opened", "ask": FIXTURE_ASK_ID, "tool": "Bash", "input": {"command": "ls"}});

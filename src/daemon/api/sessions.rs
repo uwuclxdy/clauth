@@ -19,7 +19,7 @@ use utoipa::ToSchema;
 use super::http::{Request, Response, sanitize_for_log};
 use super::routes::{ApiContext, Caller, ErrorBody};
 use crate::logline::logline;
-use crate::sessions::{PAGE_MAX_BYTES, SessionInfo, SessionSource, Walked, newest_first};
+use crate::sessions::{Labels, PAGE_MAX_BYTES, SessionInfo, SessionSource, Walked, newest_first};
 
 const LISTING_LIMIT_DEFAULT: usize = 50;
 const LISTING_LIMIT_MAX: usize = 200;
@@ -43,7 +43,8 @@ pub(crate) struct SessionsBody {
 }
 
 /// One row of the transcript index: the fields `clauth sessions --json`
-/// emits minus its `tokens`/`cost`, plus the store the transcript lives in.
+/// emits minus its `tokens`/`cost`, plus the session's name, git branch and
+/// the store the transcript lives in.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionRow {
     /// The transcript filename stem, the id `GET /api/v1/sessions/{id}` pages.
@@ -63,6 +64,19 @@ pub(crate) struct SessionRow {
     /// tail held none.
     #[schema(required = true)]
     last_message: Option<String>,
+    /// The session's Claude Code name (`-n`, `/rename`): the newest
+    /// `custom-title` record within the transcript's bounded tail window (the
+    /// last 1 MiB, `TAIL_MAX` in `src/sessions.rs`), redacted and cut like the
+    /// previews; `null` when that window holds no such record, or when the
+    /// newest one has no usable name (an older one is never used).
+    #[schema(required = true)]
+    title: Option<String>,
+    /// The branch of the newest user record that names one, within the
+    /// transcript's bounded tail window (the last 1 MiB, `TAIL_MAX` in
+    /// `src/sessions.rs`), with control and bidi characters dropped; `null`
+    /// when none there names one.
+    #[schema(required = true)]
+    git_branch: Option<String>,
     /// `global`, or `isolated:<profile>` for a live isolated run's own store.
     store: String,
     /// How a command reaches this session now: `mod` when a mod instance is
@@ -75,8 +89,8 @@ pub(crate) struct SessionRow {
     lacks: Vec<String>,
 }
 
-impl From<SessionInfo> for SessionRow {
-    fn from(info: SessionInfo) -> Self {
+impl SessionRow {
+    fn new(info: SessionInfo, labels: Labels, (via, lacks): (Vec<String>, Vec<String>)) -> Self {
         Self {
             id: info.id,
             last_ran_profile: info.last_ran_profile,
@@ -84,12 +98,14 @@ impl From<SessionInfo> for SessionRow {
             updated: crate::sessions::updated_iso(info.updated),
             first_message: info.first_message,
             last_message: info.last_message,
+            title: labels.title,
+            git_branch: labels.git_branch,
             store: match info.source {
                 SessionSource::Global => "global".to_string(),
                 SessionSource::Isolated { profile } => format!("isolated:{profile}"),
             },
-            via: Vec::new(),
-            lacks: Vec::new(),
+            via,
+            lacks,
         }
     }
 }
@@ -191,7 +207,7 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
         ("before" = Option<String>, Query, description = "the `next_before` of an earlier page; absent for the newest page")
     ),
     responses(
-        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach, at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
+        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach, its `title` and `git_branch` (both `null` when the tail window holds none), at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
         (status = 400, description = "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
@@ -223,11 +239,14 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
     let more = rows.len() > limit;
     rows.truncate(limit);
 
-    let mut page: Vec<SessionInfo> = rows.into_iter().map(crate::sessions::preview).collect();
-    crate::sessions::annotate_owners_of(page.iter_mut());
+    let mut page: Vec<(SessionInfo, Labels)> = rows
+        .into_iter()
+        .map(crate::sessions::preview_labelled)
+        .collect();
+    crate::sessions::annotate_owners_of(page.iter_mut().map(|(info, _)| info));
     let next_before = if more {
         page.last()
-            .map(|last| Cursor::encode(last.updated, &last.id))
+            .map(|(last, _)| Cursor::encode(last.updated, &last.id))
     } else {
         None
     };
@@ -241,12 +260,9 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
             ok: true,
             sessions: page
                 .into_iter()
-                .map(|info| {
-                    let (via, lacks) = reach(&mod_ids, &pane_ids, &info.id);
-                    let mut row = SessionRow::from(info);
-                    row.via = via;
-                    row.lacks = lacks;
-                    row
+                .map(|(info, labels)| {
+                    let reach = reach(&mod_ids, &pane_ids, &info.id);
+                    SessionRow::new(info, labels, reach)
                 })
                 .collect(),
             next_before,

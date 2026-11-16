@@ -13,7 +13,7 @@ use crate::profile::{
 };
 use crate::testutil::{countdown_reset_in, reset_in};
 use crate::usage::{FetchLeg, FetchStatus, UsageInfo};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Build a `ReadingsSnapshot` seed the render helpers read, keyed by name.
 fn snap_with_usage(mut s: ReadingsSnapshot, name: &str, u: UsageInfo) -> ReadingsSnapshot {
@@ -1140,6 +1140,491 @@ fn a_failed_row_with_no_deadline_draws_a_blank_timer_slot_not_a_spinner() {
     );
 }
 
+/// Stands `app` down from the usage-fetch lease, the state of an instance that
+/// mirrors another's caches and runs no countdown of its own.
+fn stand_down(app: &App) {
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: the watchdog step releases the lease"
+    );
+    assert!(!app.fetch_lease.fetches_here(), "fixture: stood down");
+}
+
+/// The timer span of a row: the one whose trimmed text is `want`.
+fn timer_span(line: &Line<'static>, want: &str) -> Span<'static> {
+    line.spans
+        .iter()
+        .find(|s| s.content.trim() == want)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {want:?} timer cell on {:?}", line_text(line)))
+}
+
+/// A reading 4.5 minutes past its refresh on an instance that runs no
+/// countdown shows how far past due it is, `+4m`, right-aligned in the 5-cell
+/// slot, amber: never a `0s` that reads as a fetch about to start.
+#[test]
+fn an_overdue_row_on_a_stood_down_instance_shows_its_age_in_amber() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() - 270_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(!text.contains("0s"), "no clamped countdown: {text:?}");
+    let cell = timer_span(&line, "+4m");
+    assert_eq!(cell.content, " +4m ", "right-aligned in the 5-cell slot");
+    assert_eq!(cell.style.fg, Some(theme::warning_color()));
+}
+
+/// The same overdue row reads red while the account's last fetch failed.
+#[test]
+fn an_overdue_row_whose_last_fetch_failed_shows_its_age_in_red() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() - 270_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let cell = timer_span(&line, "+4m");
+    assert_eq!(cell.content, " +4m ");
+    assert_eq!(cell.style.fg, Some(theme::danger_color()));
+}
+
+/// A failed account a left-running fetch worker holds has no published
+/// deadline. Its reading still dates when the refresh fell due (the reading's
+/// own stamp plus the account's interval), so the slot shows that overdue age
+/// in red instead of staying blank.
+#[test]
+fn a_late_workers_failed_row_shows_the_overdue_age_its_reading_dates() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let interval = crate::usage::usage_interval_ms(&a, AppState::default().refresh_interval_ms);
+    a_readings
+        .usage
+        .get_mut("a")
+        .expect("fixture reading")
+        .fetched_at = Some(now_ms() - interval - 270_000);
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "a late worker belongs to the instance that fetches"
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let cell = timer_span(&line, "+4m");
+    assert_eq!(cell.content, " +4m ");
+    assert_eq!(cell.style.fg, Some(theme::danger_color()));
+}
+
+/// The scheduler deliberately publishes no countdown for a spent-skipped leg,
+/// and the renderer reads that fact off the activity store: the row's past-due
+/// reading clock must NOT date an overdue refresh over the deliberate blank.
+#[test]
+fn a_spent_skipped_row_with_no_deadline_keeps_the_blank_timer_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let interval = crate::usage::usage_interval_ms(&a, AppState::default().refresh_interval_ms);
+    a_readings
+        .usage
+        .get_mut("a")
+        .expect("fixture reading")
+        .fetched_at = Some(now_ms() - interval - 270_000);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    crate::usage::publish_blanked_countdowns(
+        &app.activity,
+        &HashSet::from([FetchLeg::OAuth.key(ProfileName::from("a"))]),
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the deliberately blanked slot stays blank: {text:?}"
+    );
+}
+
+/// The same deliberate blank for a session-suppressed dead credential: the
+/// row's AuthExpired state is not a failed fetch to date, so no age renders.
+#[test]
+fn an_auth_expired_suppressed_row_with_no_deadline_keeps_the_blank_timer_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let interval = crate::usage::usage_interval_ms(&a, AppState::default().refresh_interval_ms);
+    a_readings
+        .usage
+        .get_mut("a")
+        .expect("fixture reading")
+        .fetched_at = Some(now_ms() - interval - 270_000);
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::AuthExpired);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    crate::usage::publish_blanked_countdowns(
+        &app.activity,
+        &HashSet::from([FetchLeg::OAuth.key(ProfileName::from("a"))]),
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the suppressed row's slot stays blank: {text:?}"
+    );
+}
+
+/// A stood-down mirror's published deadline reads overdue only past the tick's
+/// fetch deadline (90 s): 89 s past due (one second inside the grace) still
+/// draws the countdown form, 91 s (one second past it) the overdue age. The
+/// fixtures sit one second either side of the grace boundary, the margin this
+/// pin holds against the wall clock moving between stamp and render.
+#[test]
+fn a_mirror_reads_a_deadline_overdue_only_past_the_tick_deadline_grace() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    let key = FetchLeg::OAuth.key(ProfileName::from("a"));
+
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(key.clone(), now_ms() - 89_000);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let cell = timer_span(&line, "0s");
+    assert_eq!(
+        cell.content, "  0s ",
+        "inside the grace the slot keeps the countdown form"
+    );
+    let text = line_text(&line);
+    assert!(
+        !text.split_whitespace().any(|w| w == "+1m"),
+        "inside the grace the slot must not read overdue: {text:?}"
+    );
+
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(key, now_ms() - 91_000);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let cell = timer_span(&line, "+1m");
+    assert_eq!(
+        cell.content, " +1m ",
+        "past the grace the slot reads the overdue age"
+    );
+    assert_eq!(cell.style.fg, Some(theme::warning_color()));
+}
+
+/// On the instance that fetches, a reading dates its own refresh (no deadline
+/// is published while a stuck worker holds the leg): one second past due
+/// already reads the overdue age — the tick-deadline grace is a mirror's rule,
+/// never the holder's. The `+1s` label holds for a second of wall-clock drift
+/// before it renders `+2s`.
+#[test]
+fn a_holder_reads_a_reading_overdue_immediately_past_its_due_time() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (config, mut readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    // The interval off the app's own config: the due-time arm reads
+    // `cfg.state.refresh_interval_ms`, so the fixture must derive its
+    // boundary from the same value or a custom-interval change silently
+    // shifts it.
+    let interval = {
+        let cfg = app.config();
+        crate::usage::usage_interval_ms(
+            cfg.find(&ProfileName::from("a")).expect("fixture profile"),
+            cfg.state.refresh_interval_ms,
+        )
+    };
+    readings
+        .usage
+        .get_mut("a")
+        .expect("fixture reading")
+        .fetched_at = Some(now_ms() - interval - 1_000);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "the stuck worker belongs to the instance that fetches"
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let cell = timer_span(&line, "+1s");
+    assert_eq!(
+        cell.content, " +1s ",
+        "one second past due already reads the overdue age"
+    );
+}
+
+/// The mirror twin of the suppressed-credential blank: a stood-down instance's
+/// work list still holds the suppressed entry, so its derived countdown would
+/// read overdue where the holder blanks the slot. The slot stays blank on a
+/// mirror alike.
+#[test]
+fn an_auth_expired_suppressed_row_keeps_the_blank_timer_slot_on_a_mirror() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let interval = crate::usage::usage_interval_ms(&a, AppState::default().refresh_interval_ms);
+    a_readings
+        .usage
+        .get_mut("a")
+        .expect("fixture reading")
+        .fetched_at = Some(now_ms() - interval - 270_000);
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::AuthExpired);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() - 270_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the suppressed row's slot stays blank on a mirror: {text:?}"
+    );
+    assert!(
+        !text.split_whitespace().any(|w| w.starts_with('+')),
+        "no overdue age renders on a mirror: {text:?}"
+    );
+}
+
+/// A spent OAuth account that also has a third-party provider keeps the
+/// third-party leg's published countdown: the deliberate blank covers the
+/// OAuth leg alone, so the cell the selected (third-party) cache reads keeps
+/// counting down. The reading clock sits past-due too — the blank must not
+/// reach the countdown arm, and the no-deadline arm must not fire over it.
+#[test]
+fn a_spent_hybrid_row_keeps_its_third_party_countdown() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    a.provider = Some(Provider::DeepSeek);
+    let interval = crate::usage::usage_interval_ms(&a, AppState::default().refresh_interval_ms);
+    let (config, mut readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    readings
+        .clock
+        .insert("a".to_string(), now_ms() - interval - 270_000);
+    let app = App::new(config);
+    crate::usage::publish_blanked_countdowns(
+        &app.activity,
+        &HashSet::from([FetchLeg::OAuth.key(ProfileName::from("a"))]),
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::ThirdParty.key(ProfileName::from("a")),
+        now_ms() + 60_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    // The countdown reads whole seconds off the wall clock, so the pinned
+    // shape is `Ns` (a positive integer) rather than an exact value: the
+    // render stamps its own `now` after the fixture's, and a loaded leg can
+    // cross a second boundary between the two.
+    let countdown = line
+        .spans
+        .iter()
+        .find(|span| {
+            let text = span.content.trim();
+            text.ends_with('s')
+                && text[..text.len() - 1].parse::<u64>().is_ok()
+                && !text.starts_with('+')
+        })
+        .expect("the third-party countdown survives the OAuth blank");
+    assert_eq!(
+        countdown.content,
+        format!("{:>4} ", countdown.content.trim()),
+        "the countdown keeps the slot's right-aligned shape",
+    );
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|span| span.content.trim_start().starts_with('+')),
+        "no overdue age replaces the countdown: {text:?}",
+        text = line_text(&line)
+    );
+}
+
+/// An AuthExpired endpoint account on a stood-down mirror: the holder
+/// suppresses the dead credential and blanks its countdown, and the mirror's
+/// work list still derives a stamp for it — which must not draw either. The
+/// suppressed account has no next attempt to count down to, so the slot stays
+/// blank on a mirror alike, never a red overdue age.
+#[test]
+fn an_auth_expired_suppressed_endpoint_row_keeps_the_blank_timer_slot_on_a_mirror() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.base_url = Some("https://api.deepseek.com".to_string());
+    a.api_key = Some("sk-test".to_string());
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::AuthExpired);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::ThirdParty.key(ProfileName::from("a")),
+        now_ms() - 270_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let text = line_text(&line);
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the suppressed endpoint's slot stays blank on a mirror: {text:?}"
+    );
+    assert!(
+        !text.split_whitespace().any(|w| w.starts_with('+')),
+        "no overdue age renders on a mirror: {text:?}"
+    );
+}
+
+/// The slot reads red while the account's last fetch failed, with no
+/// account-shape gate: an endpoint account's overdue age is danger too, where
+/// the bars' OAuth-gated cue would drop it to amber.
+#[test]
+fn a_failed_endpoint_row_dates_its_age_in_red() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.base_url = Some("https://api.deepseek.com".to_string());
+    a.api_key = Some("sk-test".to_string());
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::ThirdParty.key(ProfileName::from("a")),
+        now_ms() - 270_000,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let cell = timer_span(&line, "+4m");
+    assert_eq!(cell.content, " +4m ");
+    assert_eq!(cell.style.fg, Some(theme::danger_color()));
+}
+
+/// The overview row a stood-down instance renders for a deadline `age_ms` old.
+fn overdue_row_for_age(age_ms: u64) -> Line<'static> {
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    stand_down(&app);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() - age_ms,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+    render_overview_row(&app, 0, &widths, false, true, &readings)
+}
+
+/// The overdue label stays inside the slot's 4 inner cells at every scale:
+/// days up to 99, then whole weeks, then whole years. Each age sits a margin
+/// off the unit boundary (the rendered-duration rule — the label flips on
+/// whole days/weeks, and the wall clock moves between the fixture's stamp and
+/// the render): 99d+12h is 12h below the 100d flip to weeks; 101d is 1d above
+/// it and 4d below the 15w flip; 696d+12h is 3.5d inside the 99w cell
+/// (693..700d); 707d is 7d above the 100w flip to years and 21d below the 2y
+/// flip at 104w.
+#[test]
+fn the_overdue_timer_label_fits_the_slot_past_days_and_weeks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let day = 86_400_000u64;
+    let hour = 3_600_000u64;
+
+    let cell = timer_span(&overdue_row_for_age(99 * day + 12 * hour), "+99d");
+    assert_eq!(cell.content, "+99d ");
+
+    let cell = timer_span(&overdue_row_for_age(101 * day), "+14w");
+    assert_eq!(cell.content, "+14w ");
+
+    let cell = timer_span(&overdue_row_for_age(696 * day + 12 * hour), "+99w");
+    assert_eq!(cell.content, "+99w ");
+
+    let cell = timer_span(&overdue_row_for_age(707 * day), "+1y");
+    assert_eq!(cell.content, " +1y ");
+}
+
 /// Every `(reset)` countdown suffix on a row, in column order.
 fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
     line.spans
@@ -2210,6 +2695,71 @@ fn disabled_row_type_cell_does_not_pulse() {
         enabled_snapshot(994),
         enabled_snapshot(1444),
         "control: an enabled credentialed row's type cell really does animate"
+    );
+}
+
+/// `reduce_motion` holds the provider wave still at every phase, while a
+/// spinner on the same row keeps turning with the tick.
+#[test]
+fn reduce_motion_stills_the_provider_wave_but_not_the_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    b.credentials = Some(oauth_creds());
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
+
+    let colors = |still: bool, elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
+        let mut config = config.clone();
+        config.state.reduce_motion = still;
+        let mut app = App::new(config);
+        app.anim_phase_ms = Some(elapsed_ms);
+        let widths = OverviewWidths::new(110, &app, &readings);
+        render_overview_row(&app, 1, &widths, false, true, &readings)
+            .spans
+            .iter()
+            .map(|s| s.style.fg)
+            .collect()
+    };
+    // Row 1's sweep: 994ms is its flat first frame, 1444ms its crest.
+    assert_ne!(
+        colors(false, 994),
+        colors(false, 1444),
+        "control: the row's type cell animates with motion on"
+    );
+    assert_eq!(
+        colors(true, 994),
+        colors(true, 1444),
+        "the wave moved under reduce_motion"
+    );
+    // At 0ms row 1 sits in its rest gap: the plain, uncrested label.
+    assert_eq!(
+        colors(true, 1444),
+        colors(false, 0),
+        "a still wave draws the plain label"
+    );
+
+    let mut config = config.clone();
+    config.state.reduce_motion = true;
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("b"));
+    let widths = OverviewWidths::new(110, &app, &readings);
+    app.tick_count = 0;
+    let first = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+    app.tick_count = 1;
+    let next = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings,
+    ));
+    assert!(
+        first.split_whitespace().take(2).eq(["⠋", "b"]),
+        "the spinner leads the name: {first:?}"
+    );
+    assert!(
+        next.split_whitespace().take(2).eq(["⠙", "b"]),
+        "the spinner turns under reduce_motion: {next:?}"
     );
 }
 
@@ -4390,8 +4940,7 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
             "{filter:?}: the gap dash takes no title or slot styling"
         );
 
-        for x in start..start + name.len() {
-            let cell = &buf.content[x];
+        for (x, cell) in (start..).zip(&buf.content[start..start + name.len()]) {
             assert_eq!(
                 cell.fg,
                 theme::text_dim_color(),
@@ -4407,8 +4956,7 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
             );
         }
 
-        for x in eyebrow..eyebrow + "ACCOUNTS".len() {
-            let cell = &buf.content[x];
+        for (x, cell) in (eyebrow..).zip(&buf.content[eyebrow..eyebrow + "ACCOUNTS".len()]) {
             assert_eq!(
                 cell.fg,
                 theme::accent_2_color(),
@@ -9282,6 +9830,172 @@ fn each_providers_first_row_crests_apart_from_the_others() {
     }
 }
 
+/// Three claude rows, each with a 35% 7d window: `ultra` on a plan with no 5h
+/// limit (its reading carries the mark, plus a 40% 5h window when
+/// `stored_five` is set), `max` with a 1% 5h bar, and `unread` with no 5h
+/// reading.
+fn no_five_hour_limit_app(stored_five: bool) -> (App, ReadingsSnapshot) {
+    let row = |name: &str, five: Option<f64>, marked: bool| {
+        let (p, mut r) = polled(name, 95.0, five.unwrap_or(0.0), 3 * 3600);
+        let usage = r.usage.get_mut(name).expect("polled seeds a reading");
+        if five.is_none() {
+            usage.five_hour = None;
+        }
+        usage.seven_day = Some(UsageWindow {
+            utilization: 35.0,
+            resets_at: Some(countdown_reset_in(5 * 86_400)),
+        });
+        usage.no_five_hour_limit = marked;
+        (p, r)
+    };
+    let (config, readings) = config_with(
+        vec![
+            row("ultra", stored_five.then_some(40.0), true),
+            row("max", Some(1.0), false),
+            row("unread", None, false),
+        ],
+        Some("ultra"),
+        vec![],
+    );
+    (App::new(config), readings)
+}
+
+/// The panel's rows at `w` columns as the panel lays them out, keyed by
+/// account name, with the 5h cell's char range.
+fn no_five_hour_limit_rows(
+    app: &App,
+    readings: &ReadingsSnapshot,
+    w: u16,
+) -> (BTreeMap<&'static str, Vec<char>>, (usize, usize)) {
+    let list = w - 4;
+    let widths = if list > OVERVIEW_MAX_W {
+        OverviewWidths::new(OVERVIEW_MAX_W, app, readings).filled(usize::from(list))
+    } else {
+        OverviewWidths::new(list, app, readings)
+    };
+    let rows = band_rows(app, readings, w, 7);
+    let by_name = ["ultra", "max", "unread"]
+        .into_iter()
+        .map(|name| {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(&format!(" {name} ")))
+                .unwrap_or_else(|| panic!("fixture control: {name} draws a row at {w}"));
+            (name, row.chars().collect())
+        })
+        .collect();
+    (by_name, cell_spans(&widths).0)
+}
+
+fn slice(row: &[char], (start, end): (usize, usize)) -> String {
+    row[start..end].iter().collect()
+}
+
+fn bracket_cols(row: &[char]) -> Vec<usize> {
+    row.iter()
+        .enumerate()
+        .filter_map(|(i, c)| (*c == '[').then_some(i))
+        .collect()
+}
+
+/// The 5h cell's text for a row whose dash sits on the reading rail: the `%`
+/// of `max`'s 5h reading, the first `%` in its row.
+fn dash_on_rail(max: &[char], (start, end): (usize, usize)) -> String {
+    let pct = max
+        .iter()
+        .position(|c| *c == '%')
+        .expect("fixture control: max draws its 5h reading");
+    cell(&format!("{NO_DATA:>w$}", w = pct + 1 - start), end - start)
+}
+
+/// A plan with no 5h limit reads `no limit` from the 5h cell's first column,
+/// where another row's bar draws `[`, and the row pad fills the rest of the
+/// cell, so the 7d bar starts where it does on a row with a 5h bar. An
+/// account with no 5h reading keeps the dash on the reading rail. Pinned at
+/// a laid-out width and a filled wide one.
+#[test]
+fn a_plan_with_no_five_hour_limit_reads_no_limit_in_the_five_hour_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (app, readings) = no_five_hour_limit_app(false);
+    for w in [124, 200] {
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        let (ultra, max, unread) = (&rows["ultra"], &rows["max"], &rows["unread"]);
+        assert_eq!(
+            max[five.0], '[',
+            "fixture control: the 5h cell opens where the bar draws at {w}"
+        );
+        assert_eq!(
+            slice(ultra, five),
+            cell("no limit", five.1 - five.0),
+            "the note opens the 5h cell at {w}"
+        );
+        assert_eq!(
+            bracket_cols(ultra),
+            vec![bracket_cols(max)[1]],
+            "the no-limit row's 7d bar starts where the bar row's does at {w}"
+        );
+        assert_eq!(
+            slice(unread, five),
+            dash_on_rail(max, five),
+            "an unread 5h cell keeps its dash on the rail at {w}"
+        );
+        assert_eq!(
+            bracket_cols(unread),
+            vec![bracket_cols(max)[1]],
+            "the unread row's 7d bar starts where the bar row's does at {w}"
+        );
+    }
+}
+
+/// A 5h cell under the note's 8 cells draws the no-data dash on the reading
+/// rail for a no-limit plan, a stored 5h window under the mark included.
+#[test]
+fn a_no_limit_plan_in_a_narrow_five_hour_cell_draws_the_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for stored_five in [false, true] {
+        let (app, readings) = no_five_hour_limit_app(stored_five);
+        let w = 40;
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        assert!(
+            five.1 - five.0 < 8,
+            "fixture control: a {w}-column pane's 5h cell is under 8 cells"
+        );
+        assert_eq!(
+            slice(&rows["ultra"], five),
+            dash_on_rail(&rows["max"], five),
+            "a narrow no-limit cell draws the dash (stored 5h window: {stored_five})"
+        );
+    }
+}
+
+/// The mark alone decides the cell, as on the Usage tab: a reading holding
+/// both a 5h window and the mark reads `no limit`, the hidden window moves no
+/// other row's reading, and a reading without the mark keeps its bar.
+#[test]
+fn a_no_limit_mark_hides_a_stored_five_hour_window() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (plain_app, plain_readings) = no_five_hour_limit_app(false);
+    let (app, readings) = no_five_hour_limit_app(true);
+    for w in [124, 200] {
+        let (rows, five) = no_five_hour_limit_rows(&app, &readings, w);
+        let (plain_rows, plain_five) = no_five_hour_limit_rows(&plain_app, &plain_readings, w);
+        assert_eq!(
+            slice(&rows["ultra"], five),
+            cell("no limit", five.1 - five.0),
+            "the mark outranks a stored 5h window at {w}"
+        );
+        assert_eq!(
+            slice(&rows["max"], five),
+            slice(&plain_rows["max"], plain_five),
+            "the hidden window leaves the bar row's 5h cell as it is at {w}"
+        );
+        assert_eq!(
+            rows["max"][five.0], '[',
+            "a reading without the mark keeps its bar at {w}"
+        );
+    }
+}
+
 /// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
 /// reading shows the chip: the chip reads the same file the leg wrote, the
 /// same predicate the pane now uses, never a profile-kind filter.
@@ -11353,4 +12067,123 @@ fn the_filled_layout_holds_still_as_a_countdown_ticks() {
             );
         }
     }
+}
+
+/// The codex plan cell samples the identity wave through the same
+/// `reduce_motion` gate as the claude type cell: with the key on, two
+/// animation phases render identical plain cells, and with it off the same
+/// two phases differ because the crest reached the cell.
+#[test]
+fn the_codex_plan_cell_stills_under_reduce_motion() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    let plan_cells = |app: &mut App, still: bool, phase_ms: u64| -> Vec<ratatui::style::Color> {
+        app.config().state.reduce_motion = still;
+        app.anim_phase_ms = Some(phase_ms);
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let rows = crate::testutil::buffer_rows(buf);
+        let y = rows
+            .iter()
+            .position(|row| row.contains("cx1"))
+            .expect("the codex row draws") as u16;
+        // `find` answers a byte offset; the border glyphs before the plan are
+        // multi-byte, so map it onto the cell column the buffer indexes by.
+        let byte = rows[y as usize].find("pro").expect("the plan draws");
+        let x = rows[y as usize][..byte].chars().count() as u16;
+        (x..x + 3)
+            .map(|x| buf.cell((x, y)).expect("cell").fg)
+            .collect()
+    };
+    assert_eq!(
+        plan_cells(&mut app, true, 0),
+        plan_cells(&mut app, true, 450),
+        "the codex plan cell moved under reduce_motion"
+    );
+    assert_eq!(
+        plan_cells(&mut app, true, 0),
+        vec![theme::text_dim_color(); 3],
+        "a still codex plan cell draws the plain dim label"
+    );
+    assert_ne!(
+        plan_cells(&mut app, false, 0),
+        plan_cells(&mut app, false, 450),
+        "control: the codex plan cell crests with motion on"
+    );
+}
+
+/// A third-party account's reading carries no `fetched_at` stamp — its clock
+/// is its cache file's mtime, carried by the snapshot's per-tick clock map.
+/// A late worker's third-party row (no published deadline) dates its own due
+/// time off that clock, so the slot shows the overdue age instead of staying
+/// blank: the same shape the failed OAuth row reads, on the third-party leg.
+#[test]
+fn a_third_party_late_workers_row_shows_the_overdue_age_its_cache_dates() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["a"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let interval = crate::usage::usage_interval_ms(
+        &Profile {
+            provider: Some(Provider::DeepSeek),
+            ..crate::testutil::blank_profile(&ProfileName::from("a"))
+        },
+        AppState::default().refresh_interval_ms,
+    );
+    let path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("a"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the cache path resolves");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(interval + 270_000),
+    );
+
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.provider = Some(Provider::DeepSeek);
+    let (config, _readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let mut app = App::new(config);
+    app.apply_usage();
+    let readings = app.readings_snapshot();
+    let clock = readings
+        .clock_of("a")
+        .expect("the per-tick map dates the third-party cache by its mtime");
+    assert!(
+        clock < now_ms(),
+        "the cache mtime back-dated by set_mtime is the reading's clock"
+    );
+    let widths = OverviewWidths::new(80, &app, &readings);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
+
+    let cell = timer_span(&line, "+4m");
+    assert_eq!(cell.content, " +4m ");
+    assert_eq!(cell.style.fg, Some(theme::warning_color()));
 }

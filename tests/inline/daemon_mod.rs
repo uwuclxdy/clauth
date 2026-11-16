@@ -199,6 +199,27 @@ fn the_daemon_refresher_scans_the_same_skip_store_the_drain_marks() {
     );
 }
 
+/// The API's bind writes the `listen` slot through the stores one
+/// `live_stores` call hands `serve_prepared`, and each tick's status write
+/// reads it through another call: a fresh slot per call would leave every
+/// `--listen` feed without `listen`, so `pair` would build no link, with every
+/// feed test still green.
+#[test]
+fn the_api_bind_writes_the_same_listen_slot_the_status_write_reads() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    let daemon = daemon_for(config);
+
+    assert!(
+        std::sync::Arc::ptr_eq(&daemon.live_stores().listen, &daemon.listen),
+        "the bind's handle must be the slot every status write reads"
+    );
+}
+
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
@@ -11788,4 +11809,610 @@ fn a_stop_with_a_stuck_spend_and_a_stuck_tick_ends_at_one_bound() {
         waited >= bound && waited < bound + bound / 2,
         "the spend and the tick share one bound: {waited:?}"
     );
+}
+
+/// The `next_refresh_at` the daemon's last `status.json` write published for
+/// `name`.
+fn published_next_refresh(daemon: &Daemon, name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(&daemon.status_path).expect("status.json written");
+    let feed: serde_json::Value = serde_json::from_str(&raw).expect("status.json parses");
+    feed["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} entry in {feed}"))["next_refresh_at"]
+        .clone()
+}
+
+/// A daemon that stood down from the usage-fetch lease runs no countdown, so
+/// the feed publishes `next_refresh_at: null` for it rather than a stamp its
+/// mirror derived from another instance's cache clock; the holder's own armed
+/// stamp is published as before.
+#[test]
+fn a_stood_down_daemon_publishes_no_next_refresh_and_a_holder_keeps_its_stamp() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+
+    daemon.tick();
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder publishes its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    daemon.tick();
+
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down instance publishes no countdown it does not run"
+    );
+}
+
+/// The feed's API republish path takes the daemon's live snapshot, so it must
+/// publish the same stood-down null the tick's writer does: the flag rides
+/// the snapshot, and no writer that passes it can forget it.
+#[test]
+fn a_republish_from_a_stood_down_daemon_publishes_no_next_refresh() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let daemon = daemon_for(config.clone());
+    daemon
+        .fetch_lease
+        .acquire_ticket()
+        .expect("take the fetch lease");
+    let armed = now_ms() + 60_000;
+    daemon
+        .live_stores()
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(
+            FetchLeg::OAuth.key(crate::profile::ProfileName::from("alpha")),
+            armed,
+        );
+    // The context's live stores share the daemon's lease `Arc`, so one context
+    // sees the holder's state now and the stood-down state after the release.
+    let ctx = std::sync::Arc::new(crate::daemon::api::routes::ApiContext::for_tests(
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config)),
+        daemon.status_path.clone(),
+        Some(daemon.live_stores()),
+        crate::daemon::api::panes::absent_probe(),
+    ));
+
+    crate::daemon::api::routes::republish(&ctx);
+    let held = published_next_refresh(&daemon, "alpha");
+    assert!(
+        held.is_string(),
+        "control: the holder's republish keeps its armed stamp, got {held}"
+    );
+
+    assert!(
+        daemon.fetch_lease.release_if_stale(
+            now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "the watchdog releases the holder"
+    );
+    crate::daemon::api::routes::republish(&ctx);
+    assert_eq!(
+        published_next_refresh(&daemon, "alpha"),
+        serde_json::Value::Null,
+        "a stood-down republish publishes no countdown it does not run"
+    );
+}
+
+/// The retention leg runs its check at start and again on a change to
+/// `settings.json`, from the change event alone: every timer sits an hour out.
+#[test]
+fn the_retention_leg_runs_its_check_on_a_settings_change() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    })
+    .expect("spawn the retention leg");
+    let reached = |count: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if checks.load(Ordering::SeqCst) >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(reached(1), "the leg checks once at start");
+
+    std::fs::write(claude_home.join("settings.json"), b"{}").expect("write settings.json");
+    let after_change = reached(2);
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(after_change, "a settings.json change runs the check");
+}
+
+/// A check whose files' stats did not move reads nothing, so the check's own
+/// reads do not re-arm the watcher: after one write the run count stays
+/// bounded, where a check that reads `settings.json` on every pass re-wakes
+/// the loop at its cooldown forever.
+#[test]
+fn the_retention_check_reads_nothing_when_nothing_moved() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(crate::retention::reconcile());
+    })
+    .expect("spawn the retention leg");
+    let reached = |count: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if checks.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(reached(1), "the leg checks once at start");
+
+    std::fs::write(claude_home.join("settings.json"), b"{}").expect("write settings.json");
+    assert!(reached(2), "a settings.json change runs the check");
+    std::thread::sleep(Duration::from_secs(3));
+    let settled = checks.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Wakes from writes the check does not read: each one runs the leg, and
+    // the fast path in front of the settle keeps every one from reading.
+    // Linux-only: the per-write event delivery this needs is inotify's;
+    // FSEvents coalesces them.
+    #[cfg(target_os = "linux")]
+    let (woken, passes) = {
+        let operator = claude_home.join("settings.json");
+        let passes_before = crate::retention::settle_passes(&operator);
+        let mut woken = 0;
+        for n in 0..5 {
+            let target = checks.load(std::sync::atomic::Ordering::SeqCst) + 1;
+            std::fs::write(claude_home.join("history.jsonl"), format!("{n}\n"))
+                .expect("write history");
+            if reached(target) {
+                woken += 1;
+            }
+        }
+        (
+            woken,
+            crate::retention::settle_passes(&operator) - passes_before,
+        )
+    };
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(
+        settled <= 10,
+        "one write must leave the check count bounded: {settled} runs in 3 s"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(woken, 5, "each unrelated write wakes the leg");
+        assert!(
+            passes <= 1,
+            "a wake whose inputs did not move reads nothing: {passes} settle passes over 5 wakes"
+        );
+    }
+}
+
+/// A live `clauth start` session's own `settings.json` under the sandbox, its
+/// marker held: keep the returned handle alive for the copy to stay a member.
+fn live_session_settings(
+    home: &std::path::Path,
+    profile: &str,
+    sid: &str,
+    bytes: &[u8],
+) -> std::fs::File {
+    let runtime_dir = home
+        .join(".clauth")
+        .join("profiles")
+        .join(profile)
+        .join(format!("runtime-{sid}"));
+    std::fs::create_dir_all(&runtime_dir).expect("mkdir runtime dir");
+    let sessions = runtime_dir.with_file_name(format!("sessions-{sid}"));
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions dir");
+    let pid = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("open pid file");
+    pid.lock().expect("lock pid file");
+    std::fs::write(runtime_dir.join("settings.json"), bytes).expect("write settings.json");
+    pid
+}
+
+/// A paused sync (a profile's `config.toml` does not parse) must not turn the
+/// watchdog into a read loop: a paused pass caches nothing, so it re-reads on
+/// every wake, but its own reads raise only opens, which wake nothing, so the
+/// check count over ~3 s stays bounded.
+#[test]
+fn a_paused_sync_does_not_loop_on_its_own_reads() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    std::fs::write(
+        claude_home.join("settings.json"),
+        br#"{"theme":"light","env":{}}"#,
+    )
+    .expect("write settings.json");
+    let _live = live_session_settings(
+        home.home(),
+        "p1",
+        "4242-0",
+        br#"{"theme":"light","env":{}}"#,
+    );
+    std::fs::create_dir_all(home.home().join(".clauth").join("profiles").join("p1"))
+        .expect("mkdir profile dir");
+    std::fs::write(
+        home.home()
+            .join(".clauth")
+            .join("profiles")
+            .join("p1")
+            .join("config.toml"),
+        b"not = [toml",
+    )
+    .expect("write config.toml");
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(crate::settings_sync::sync_once());
+    })
+    .expect("spawn the retention leg");
+    let reached = |count: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if checks.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(reached(1), "the leg checks once at start");
+    std::thread::sleep(Duration::from_secs(3));
+    let settled = checks.load(std::sync::atomic::Ordering::SeqCst);
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(
+        settled <= 10,
+        "a paused sync must not loop on its own reads: {settled} checks in 3 s"
+    );
+}
+
+/// A standing failed operator put-back (a read-only `~/.claude`) must not turn
+/// the watchdog into a read loop either: the write fails before it creates
+/// anything in the read-only directory and the pass's reads raise only opens,
+/// so nothing wakes the retry and the check count over ~3 s stays bounded.
+#[cfg(unix)]
+#[test]
+fn a_failed_operator_put_back_does_not_loop_on_its_own_reads() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    std::fs::write(
+        claude_home.join("settings.json"),
+        br#"{"cleanupPeriodDays":3650,"theme":"light","env":{}}"#,
+    )
+    .expect("write settings.json");
+    let _live = live_session_settings(
+        home.home(),
+        "p1",
+        "4242-0",
+        br#"{"theme":"light","env":{}}"#,
+    );
+    crate::settings_sync::sync_once().expect("the first pass remembers the number");
+    std::fs::write(
+        claude_home.join("settings.json"),
+        br#"{"theme":"light","env":{}}"#,
+    )
+    .expect("drop the key");
+    let _read_only = crate::testutil::UnwritableDir::new(&claude_home);
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(crate::settings_sync::sync_once());
+    })
+    .expect("spawn the retention leg");
+    let reached = |count: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if checks.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(reached(1), "the leg checks once at start");
+    std::thread::sleep(Duration::from_secs(3));
+    let settled = checks.load(std::sync::atomic::Ordering::SeqCst);
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(
+        settled <= 10,
+        "a failed put-back must not loop on its own reads: {settled} checks in 3 s"
+    );
+}
+
+/// The retention leg watches every child of `~/.claude`, so a box with no
+/// `settings.json` still counts each other write as a match and a healthy
+/// watcher never trips the dead-filter defect line: a write to an unrelated
+/// child (`history.jsonl`) must wake the leg's check. The name-only interest it
+/// replaced left such writes unmatched, which is what reported the healthy
+/// watcher from the third fallback tick (the dead filter fires on `matched ==
+/// 0` with events seen; the counting is pinned in the watchdog tests, and the
+/// line itself is raised on the leg's thread where no capture seam reaches).
+/// Linux-only: the per-write event delivery the pin needs is inotify's;
+/// FSEvents coalesces them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_retention_legs_watch_matches_writes_with_no_settings_json() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .expect("spawn the retention leg");
+    let reached = |count: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if checks.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(reached(1), "the leg checks once at start");
+
+    std::fs::write(claude_home.join("history.jsonl"), b"x\n").expect("write history");
+    let woken = reached(2);
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(
+        woken,
+        "an unrelated ~/.claude write must wake the leg, so the healthy watcher \
+         never reads as a dead filter"
+    );
+}
+
+/// The leg's own check must not wake it again. A shared runtime tree no marker
+/// holds (a background job's tree, or one a killed session left for GC) makes
+/// every check's member listing read the global job store `~/.claude/jobs`, a
+/// child of the watched `~/.claude`; inotify reports that read as an open. A
+/// leg that woke on it would run the check at its cooldown rate for as long as
+/// the tree exists, with no session live. Linux-only: the open event is
+/// inotify's.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_retention_leg_does_not_wake_on_its_own_job_store_reads() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(claude_home.join("jobs")).expect("mkdir jobs");
+    std::fs::write(
+        claude_home.join("settings.json"),
+        br#"{"cleanupPeriodDays":3650,"env":{}}"#,
+    )
+    .expect("write settings.json");
+    let profile = home.home().join(".clauth").join("profiles").join("p1");
+    std::fs::create_dir_all(profile.join("runtime-9999-0")).expect("mkdir the markerless tree");
+    let hour = Duration::from_secs(3600);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::from_millis(20),
+        fallback: hour,
+        config_poll: hour,
+        credential_poll: hour,
+        swap_poll: hour,
+    };
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&checks);
+    let (stop, shutdown) = crossbeam_channel::bounded::<()>(1);
+    let leg = super::spawn_retention_watch(&claude_home, timings, shutdown, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(crate::retention::reconcile());
+    })
+    .expect("spawn the retention leg");
+    std::thread::sleep(Duration::from_secs(3));
+    let n = checks.load(std::sync::atomic::Ordering::SeqCst);
+    drop(stop);
+    leg.join().expect("the leg stops on shutdown");
+
+    assert!(
+        n <= 10,
+        "{n} checks in 3 s with nothing changing: the leg wakes on its own reads"
+    );
+}
+
+/// `serve` starts the retention leg. Every other retention test drives the leg
+/// or its check directly, and `serve` cannot run in a test, so the wiring is
+/// pinned by source scan, the mechanism the spawn-site pins in the `cc_exempt`
+/// tests use.
+#[test]
+fn serve_starts_the_retention_leg() {
+    fn serve_body(src: &str) -> Option<&str> {
+        let rest = src.split_once("pub(crate) fn serve(")?.1;
+        Some(
+            rest.split_once("\nfn ")
+                .or_else(|| rest.split_once("\npub(crate) fn "))
+                .map_or(rest, |(body, _)| body),
+        )
+    }
+    // Only code counts: a call left behind in a comment starts nothing.
+    let wired = |src: &str| {
+        serve_body(src).is_some_and(|body| {
+            let code: String = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            code.contains("spawn_retention_watch(") && code.contains("retention_check")
+        })
+    };
+    assert!(
+        wired(
+            "pub(crate) fn serve() {\n    spawn_retention_watch(&h, t, n, retention_check);\n}\n"
+        ),
+        "control: a serve body starting the leg reads as wired"
+    );
+    assert!(
+        !wired(
+            "pub(crate) fn serve() {\n}\nfn spawn_retention_watch() {\n    retention_check();\n}\n"
+        ),
+        "control: the names outside serve's body do not count"
+    );
+    assert!(
+        !wired(
+            "pub(crate) fn serve() {\n    // spawn_retention_watch(&h, t, n, retention_check);\n}\n"
+        ),
+        "control: a commented-out call does not count"
+    );
+    assert!(
+        wired(include_str!("../../src/daemon/mod.rs")),
+        "serve must start the retention leg"
+    );
+}
+
+/// The `serve` wiring's check latch: two failing checks log one line, a clean
+/// check re-arms it, and the next failure run logs again. The failing input is
+/// `~/.clauth` as a regular file, which fails the state flock the check takes
+/// (with no statable file the fast path would never reach the flock, so the
+/// operator file must exist).
+#[test]
+fn the_retention_check_failure_line_is_latched_and_rearmed() {
+    let home = HomeSandbox::new();
+    let claude_home = home.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    std::fs::write(claude_home.join("settings.json"), b"{}").expect("write settings.json");
+    std::fs::write(home.home().join(".clauth"), b"not a dir").expect("block the flock");
+    super::RETENTION_CHECK_FAILED.store(false, Ordering::Relaxed);
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        super::retention_check();
+        super::retention_check();
+        assert_eq!(lines.snapshot().len(), 1, "two failing checks log one line");
+
+        std::fs::remove_file(home.home().join(".clauth")).expect("clear the block");
+        super::retention_check();
+        assert_eq!(
+            lines.snapshot().len(),
+            1,
+            "a clean check logs nothing and re-arms the latch"
+        );
+
+        // The clean check created `~/.clauth` as a directory.
+        std::fs::remove_dir_all(home.home().join(".clauth")).expect("clear the clean check's dir");
+        std::fs::write(home.home().join(".clauth"), b"not a dir").expect("block the flock again");
+        // A check whose inputs did not move since the clean one never reaches
+        // the flock, so the operator file changes first.
+        std::fs::write(claude_home.join("settings.json"), br#"{"theme":"dark"}"#)
+            .expect("move settings.json");
+        super::retention_check();
+    }
+    assert_eq!(lines.snapshot().len(), 2, "the next failure run logs again");
 }

@@ -2143,6 +2143,7 @@ fn a_stand_down_tick_drops_the_instances_own_failed_fetch_mark() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -14411,7 +14412,8 @@ fn a_probe_at_its_interval_cap_still_gets_a_burn_rate() {
 
 /// `filter_suppressed` drops third-party entries suppressed under the SAME
 /// credential they still carry, and passes the rest through in order; an empty
-/// map (the steady state for healthy profiles) is a no-op fast path.
+/// map (the steady state for healthy profiles) is a no-op fast path. The
+/// dropped entries' leg keys come back for the blanked-countdown publish.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
     let suppressed_auth_expired: SuppressedAuthExpiredStore =
@@ -14423,14 +14425,21 @@ fn filter_suppressed_drops_only_named_entries() {
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed_auth_expired, snap);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
+    assert_eq!(
+        blanked,
+        HashSet::from([tp_key("no-data")]),
+        "the dropped entry's third-party leg key is the blanked publish's input",
+    );
 
-    // Empty map → identity (the fast path).
+    // Empty map → identity (the fast path), nothing blanked.
     let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
-    assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+    let (out, blanked) = filter_suppressed(&empty, snap2);
+    assert_eq!(out.len(), 2);
+    assert!(blanked.is_empty());
 }
 
 /// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
@@ -14449,15 +14458,23 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
+    assert!(
+        filter_suppressed(&suppressed_auth_expired, vec![expired])
+            .0
+            .is_empty()
+    );
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
+    let (out, blanked) = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
         "a re-login must re-admit the profile without a restart or a timer",
+    );
+    assert!(
+        blanked.is_empty(),
+        "a re-admitted credential blanks nothing",
     );
 }
 
@@ -14475,7 +14492,9 @@ fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
     assert_eq!(
-        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        filter_suppressed(&suppressed_auth_expired, vec![rotated])
+            .0
+            .len(),
         1
     );
 }
@@ -14741,6 +14760,7 @@ fn third_party_state_at_interval(
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -14975,6 +14995,51 @@ fn land_on_a_dead_key(
         before,
         crate::fallback::third_party_key_rejected(profile, &profile.name),
     )
+}
+
+/// A `[proxy]` table clauth cannot read is still a proxy account to the
+/// scheduler: its usage entry keeps today's generic arm, never the whole-pool
+/// read a profile with no table at all takes on the same bind.
+#[test]
+fn an_unreadable_proxy_record_never_targets_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a free port");
+    let port = listener.local_addr().expect("local addr").port();
+    let registry = crate::proxy::registry_path().expect("registry path");
+    std::fs::create_dir_all(registry.parent().expect("registry dir")).expect("registry dir");
+    std::fs::write(
+        &registry,
+        format!("[stub]\nport = {port}\nenabled = true\n"),
+    )
+    .expect("write the registry");
+    let name = crate::profile::ProfileName::from("px");
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("clp_stub-key-0".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    let mut text = std::fs::read_to_string(&path).expect("config text");
+    text.push_str("\n[proxy]\nservice = \"stub\"\naccount = \"\"\n");
+    std::fs::write(&path, text).expect("write the broken record");
+    assert!(
+        matches!(
+            crate::profile::stored_proxy_claim(&name),
+            crate::profile::ProxyClaim::Unreadable
+        ),
+        "fixture control: the record is unreadable"
+    );
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    let entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+    assert!(
+        matches!(
+            entry.target,
+            crate::providers::ThirdPartyTarget::Generic { .. }
+        ),
+        "an unreadable record keeps today's generic arm"
+    );
 }
 
 /// Alibaba's usage fetch reads the console session alone, so a live console
@@ -16100,6 +16165,8 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         ],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -16176,6 +16243,8 @@ fn standdown_hydrate_removes_a_cacheless_third_party_name() {
         &[],
         &["tp-cacheless".to_string()],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -16218,6 +16287,8 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
             &tp_status,
             &last_fetched,
             seed_names,
+            &[],
+            &[],
             &[],
             &[],
             REFRESH_INTERVAL_MS,
@@ -16295,6 +16366,8 @@ fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
         &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
         &[],
         &[],
+        &[],
+        &[],
         REFRESH_INTERVAL_MS,
     );
 
@@ -16347,6 +16420,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16445,6 +16519,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16490,6 +16565,536 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
+}
+
+/// A stood-down mirror's only channel for the fetching instance's third-party
+/// verdict is the durable record a refused endpoint credential leaves: the
+/// cache seed derives `Fresh`/`Cached` off the cache clock and this instance
+/// runs no fetch, so nothing else publishes `AuthExpired`. The tick seeds the
+/// verdict from the record, and the Overview row reads it off the app's own
+/// snapshot — the suppressed account's timer cell is blank, as the holder's
+/// is. A cleared record (the holder re-keyed or re-logged the account) drops
+/// the seed at the next tick and the row returns to its derived overdue age.
+#[test]
+fn a_stood_down_mirror_blanks_a_suppressed_endpoint_row_from_its_durable_record() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    // A disabled endpoint of the same credential shape: the seed's scope is
+    // the work list, which never holds a disabled account.
+    let off_name = "off";
+    let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from(off_name));
+    off.base_url = Some("https://disabled.example.com".to_string());
+    off.api_key = Some("off-key".to_string());
+    off.disabled = true;
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::profile::save_profile(&off).expect("save the disabled profile");
+    crate::testutil::register_names(&[name, off_name]);
+    // The holder's last reading, dated far past its refresh so the derived
+    // deadline sits far past the grace and its age form is deterministic.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), off.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The durable verdict, through its own writer.
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(name),
+            fingerprint,
+        ),
+        "the durable record landed"
+    );
+    // The same durable verdict for the disabled endpoint: the record lands,
+    // and only the work-list scope keeps it from seeding a status.
+    let off_fingerprint = crate::usage::profile_credential_fingerprint(&off)
+        .expect("a disabled endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(
+        &crate::profile::ProfileName::from(off_name),
+        off_fingerprint,
+    );
+    assert!(
+        crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from(off_name),
+            off_fingerprint,
+        ),
+        "the disabled endpoint's durable record landed"
+    );
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::AuthExpired),
+        "the durable verdict reaches the snapshot the Overview renders from"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        !row.split_whitespace().any(|w| w.starts_with('+')),
+        "the suppressed row's timer cell is blank, never an overdue age:\n{row}"
+    );
+    assert_eq!(
+        readings.status_of(off_name),
+        None,
+        "the seed is scoped to the work list: a disabled endpoint's record seeds nothing"
+    );
+    assert!(
+        !app.third_party_status
+            .lock()
+            .unwrap()
+            .contains_key(off_name),
+        "the disabled endpoint's store entry stays unseeded"
+    );
+
+    // The holder re-keyed the account: the record clears, and the next
+    // stand-down tick drops the seed — the row returns to its derived form.
+    crate::profile_cache::clear_auth_expired(&crate::profile::ProfileName::from(name));
+    super::tick(&state);
+    let readings = app.readings_snapshot();
+    assert_eq!(
+        readings.status_of(name),
+        Some(super::FetchStatus::Cached),
+        "a cleared record reverts the seed to the cache-derived status"
+    );
+    let row = row_of(&app, name);
+    assert!(
+        row.split_whitespace().any(|w| w == "+4m"),
+        "the row returns to its derived overdue age:\n{row}"
+    );
+}
+
+/// A stood-down daemon has no display surface, so its feed reads the same
+/// third-party store a TUI mirror does: the tick seeds the durable verdict
+/// there, and `status.json` publishes `AuthExpired` for the suppressed account
+/// rather than the `Cached` the hydrate derived from the cache clock.
+#[test]
+fn a_stood_down_daemon_publishes_the_durable_auth_expired_verdict() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::AtomicU64;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    // A warm cache older than the interval: the hydrate derives `Cached` from
+    // it, and that live entry outranks the durable record in the feed, so only
+    // the seed turns the published verdict into `AuthExpired`.
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from(name), fingerprint);
+
+    // The daemon shape: no display reader, and a competing instance holds the
+    // lease, so the public `tick` routes to the stand-down pass.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: false,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+    super::tick(&state);
+
+    assert_eq!(
+        published_fetch_status(&app, name),
+        Some("AuthExpired".to_string()),
+        "a stood-down daemon's feed publishes the durable verdict, not the hydrated cache's form"
+    );
+}
+
+/// A reader sampling the status stores (and the published feed) across many
+/// stand-down ticks never observes a refused name as anything but
+/// `AuthExpired`: the cache-derived hydrate write and the durable-verdict
+/// seed land in one pass, so a frame or a `status.json` write landing
+/// between them cannot show the dead account as fresh or cached.
+#[test]
+fn no_reader_observes_a_refused_name_as_fresh_or_cached_across_standdown_ticks() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // The refused endpoint: a warm cache dated far past its refresh, so the
+    // hydrate derives a status for it each tick.
+    let name = "endpoint";
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+    profile.base_url = Some("https://example.com".to_string());
+    profile.api_key = Some("key".to_string());
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::testutil::register_names(&[name]);
+    write_profile_cache(
+        &ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 42.0)]),
+    );
+    let cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(name), THIRD_PARTY_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let fingerprint =
+        crate::usage::profile_credential_fingerprint(&profile).expect("an endpoint fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(name), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(name), fingerprint),
+        "the durable record landed"
+    );
+
+    // The refused setup token, the probe seed's own shape, with a usage
+    // cache dated far past its refresh so the OAuth hydrate derives a
+    // status for it too.
+    let probe_name = "probed";
+    let mut probe = crate::testutil::blank_profile(&ProfileName::from(probe_name));
+    probe.usage_probe = true;
+    probe.has_long_lived_sidecar = true;
+    probe.setup_token_digest =
+        crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN).setup_token;
+    crate::profile::save_profile(&probe).expect("save the probed profile");
+    crate::testutil::register_names(&[probe_name]);
+    write_profile_cache(
+        &ProfileName::from(probe_name),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+    let probe_cache_path =
+        crate::profile_cache::profile_cache_path(&ProfileName::from(probe_name), USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &probe_cache_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_millis(REFRESH_INTERVAL_MS + 270_000),
+    );
+    let probe_fp = probe.setup_token_digest.expect("a digest");
+    crate::profile_cache::write_auth_expired(&ProfileName::from(probe_name), probe_fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from(probe_name), probe_fp),
+        "the probe verdict landed"
+    );
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone(), probe.clone()],
+    };
+    let app = crate::tui::App::new(app_config);
+
+    // The tick over the app's own stores, with a competing instance holding
+    // the lease: the real stand-down path the public `tick` routes to.
+    let state = super::SchedulerState {
+        config: Arc::clone(&app.config),
+        tokens: Arc::clone(&app.usage_tokens),
+        store: Arc::clone(&app.usage_store),
+        status: Arc::clone(&app.usage_status),
+        refresh_interval: Arc::clone(&app.refresh_interval),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        activity: Arc::clone(&app.activity),
+        last_fetched: Arc::clone(&app.last_fetched),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+        claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        pending_switch: Arc::clone(&app.pending_switch),
+        pending_switch_off: Arc::clone(&app.pending_switch_off),
+        refetch_queue: Arc::clone(&app.refetch_queue),
+        third_party_tokens: Arc::clone(&app.third_party_tokens),
+        third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        third_party_broken: Arc::clone(&app.third_party_broken),
+        skipped_unreadable: Arc::clone(&app.skipped_unreadable),
+        suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        display_reader: true,
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+        snapshot: Arc::clone(&app.snapshot),
+    };
+    let holder = crate::daemon::FetchLease::new();
+    assert!(holder.acquire(), "the competing instance wins the lease");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let iterations = Arc::new(AtomicU64::new(0));
+    let verdict_seen = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // The reader signals one full sampling pass before the ticks and the first
+    // verdict sighting before the window closes: the bounded-work pin below
+    // then holds by construction, never by a scheduling race.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (sampled_tx, sampled_rx) = std::sync::mpsc::channel::<()>();
+    let tp_status = Arc::clone(&app.third_party_status);
+    let oauth_status = Arc::clone(&app.usage_status);
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let config = app.config().clone();
+    let reader = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let iterations = Arc::clone(&iterations);
+        let verdict_seen = Arc::clone(&verdict_seen);
+        let violations = Arc::clone(&violations);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let first_pass = iterations.fetch_add(1, Ordering::Relaxed) == 0;
+                if let Ok(st) = tp_status.lock()
+                    && let Some(seen) = st.get(name).copied()
+                {
+                    if seen == super::FetchStatus::AuthExpired {
+                        if verdict_seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let _ = sampled_tx.send(());
+                        }
+                    } else {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("third-party store: {seen:?}"));
+                    }
+                }
+                if let Ok(st) = oauth_status.lock()
+                    && let Some(seen) = st.get(probe_name).copied()
+                    && seen != super::FetchStatus::AuthExpired
+                {
+                    violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("oauth store: {seen:?}"));
+                }
+                if iterations.load(Ordering::Relaxed).is_multiple_of(16) {
+                    let snapshot = live.snapshot();
+                    let signals = snapshot.signals();
+                    let body = crate::daemon::build_status(
+                        &config,
+                        REFRESH_INTERVAL_MS,
+                        Some(&signals),
+                        false,
+                    );
+                    if let Some(entry) = body.profiles.iter().find(|e| e.name.as_str() == name)
+                        && entry.fetch_status.as_deref() != Some("AuthExpired")
+                    {
+                        violations
+                            .lock()
+                            .unwrap()
+                            .push(format!("published feed: {:?}", entry.fetch_status));
+                    }
+                }
+                if first_pass {
+                    let _ = started_tx.send(());
+                }
+            }
+        }
+    });
+
+    // The reader proves it sampled before the window opens and that it saw the
+    // verdict before the window closes: both pins below hold by construction
+    // under any scheduling, and a starved reader fails the handshake instead of
+    // this test's own invariant. The reader is stopped and joined on the
+    // failure path too, so a red never leaves it spinning past the test.
+    let wait = std::time::Duration::from_secs(30);
+    let started = started_rx.recv_timeout(wait);
+    if started.is_ok() {
+        for _ in 0..60 {
+            super::tick(&state);
+        }
+    }
+    let sampled = started.is_ok().then(|| sampled_rx.recv_timeout(wait));
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("the reader joins");
+    started.expect("the reader thread sampled the stores before the ticks");
+    sampled
+        .expect("the tick window ran")
+        .expect("the reader saw the refused verdict before the stop");
+    assert!(
+        iterations.load(Ordering::Relaxed) > 0 && verdict_seen.load(Ordering::Relaxed) > 0,
+        "the reader sampled the refused name as AuthExpired across the ticks"
+    );
+    let violations = violations.lock().unwrap();
+    assert!(
+        violations.is_empty(),
+        "a refused name never reads as anything but AuthExpired during a tick: {violations:?}"
+    );
+}
+
+/// `name`'s published `fetch_status`, built the way the daemon's own tick
+/// builds it: the live stores' snapshot, then `status.json`'s body.
+fn published_fetch_status(app: &crate::tui::App, name: &str) -> Option<String> {
+    let live = crate::daemon::LiveStores {
+        usage_status: Arc::clone(&app.usage_status),
+        third_party_status: Arc::clone(&app.third_party_status),
+        third_party_streaks: Arc::clone(&app.third_party_streaks),
+        next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+        poll_streaks: Arc::clone(&app.poll_streaks),
+        pending_switch: Arc::clone(&app.pending_switch),
+        auto_start_queue: Arc::clone(&app.auto_start_queue),
+        kick_blocks: Arc::clone(&app.kick_blocks),
+        usage_store: Arc::clone(&app.usage_store),
+        activity: Arc::clone(&app.activity),
+        shutting_down: Arc::clone(&app.shutting_down),
+        fetch_lease: Arc::clone(&app.fetch_lease),
+        ..Default::default()
+    };
+    let snapshot = live.snapshot();
+    let signals = snapshot.signals();
+    let config = app.config().clone();
+    crate::daemon::build_status(&config, REFRESH_INTERVAL_MS, Some(&signals), false)
+        .profiles
+        .into_iter()
+        .find(|entry| entry.name.as_str() == name)
+        .expect("the profile is published in the feed")
+        .fetch_status
+}
+
+/// The Overview row holding `needle`, as the full frame draws it off the
+/// app's own snapshot.
+fn row_of(app: &crate::tui::App, needle: &str) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+        .expect("a test terminal");
+    term.draw(|f| crate::tui::draw(f, app))
+        .expect("draw the frame");
+    let buf = term.backend().buffer().clone();
+    crate::testutil::buffer_rows(&buf)
+        .into_iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row holds {needle:?}:\n{}",
+                crate::testutil::buffer_rows(&buf).join("\n")
+            )
+        })
 }
 
 /// A stood-down TUI hydrates the third-party display superset off the daemon's
@@ -16672,6 +17277,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16786,6 +17392,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16908,6 +17515,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17008,6 +17616,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17130,6 +17739,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: auto_start_queue.clone(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17746,6 +18356,7 @@ fn completion_order_state() -> super::SchedulerState {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -18649,6 +19260,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -18765,6 +19377,7 @@ fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -19361,6 +19974,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -21838,6 +22452,25 @@ fn rolling_profile_config(
         .map(|n| {
             let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
             p.rolling_token = true;
+            // A rolling profile is a logged-in one: the scan reads a sidecar
+            // as due only beside a stored chain. Its access token has expired,
+            // so a rolling sidecar never reads as behind it. A chain the test
+            // already wrote is its own and stays.
+            let dir = crate::profile::profile_dir(&p.name).expect("profile dir");
+            if dir.join("credentials.json").exists() {
+                return p;
+            }
+            p.credentials = Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: format!("at-chain-{n}"),
+                    refresh_token: Some(format!("rt-chain-{n}")),
+                    expires_at: Some(crate::usage::now_ms() as i64 - 3_600_000),
+                    scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+                    subscription_type: Some("max".into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            });
+            crate::profile::save_profile(&p).expect("save rolling profile");
             p
         })
         .chain(
@@ -22079,12 +22712,14 @@ fn tick_refreshes_a_due_codex_chain_under_its_own_spend_marker() {
         })
     };
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
-    // The codex usage leg runs in the same tick: keep it on a refused port.
+    // The codex legs run in the same tick: keep them on a refused port.
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     write_due_codex_chain("cx-tick-own");
 
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(handle.join().expect("join stub"), ["/oauth/token"]);
     assert_eq!(
@@ -22104,6 +22739,7 @@ fn a_shutting_down_tick_leaves_a_due_codex_chain() {
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, "http://127.0.0.1:9");
     let state = third_party_state(stub_ok_stats);
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     write_due_codex_chain("cx-tick-quit");
     state
         .shutting_down
@@ -22111,6 +22747,7 @@ fn a_shutting_down_tick_leaves_a_due_codex_chain() {
 
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert!(
         !codex_attempt_memo_exists("cx-tick-quit"),
@@ -22823,6 +23460,97 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
     );
 }
 
+/// The same leash end to end, through the real re-stamp gate: a rolling
+/// profile whose sidecar holds a live mint (due, so the rolling bearer can
+/// come back) beside a chain whose recorded grant can never stamp one. Only a
+/// re-login changes that, so the scan must not rerun the gate, or relog its
+/// refusal, on the 15-minute hold.
+#[test]
+fn claude_rolling_tick_paces_an_unrecorded_grant_beside_a_mint_on_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-grant");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-live".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 6 * 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec![name.clone()],
+            ..Default::default()
+        },
+        profiles: vec![profile],
+    }));
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let gate = |n: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::restamp_rolling_token(&config, n, |_: &str, _: Option<&str>| {
+            panic!("a live chain with an unusable grant must not spend a refresh")
+        })
+    };
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &gate,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &std::sync::atomic::AtomicBool::new(false),
+        &gate,
+    );
+
+    drop(capture);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unrecorded grant beside a mint is not retried on the transient cadence"
+    );
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|l| l.contains("cannot mint a rolling bearer"))
+            .count(),
+        0,
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot
+            .iter()
+            .filter(|l| l.contains("re-stamp for 'cl-mint-grant' failed"))
+            .count(),
+        1,
+        "{snapshot:?}"
+    );
+}
+
 /// The long leash's exit is the OPERATOR'S FIX, not the clock: a re-login
 /// writes `credentials.json` and stamps nothing scheduler-side, so a hold that
 /// only time releases would sit on the prescribed recovery for up to six
@@ -23115,6 +23843,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -23371,6 +24100,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -23510,6 +24240,7 @@ fn auto_start_queue_election_leaves_out_a_plan_with_no_five_hour_limit() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -23664,6 +24395,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -27346,6 +28078,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -28888,7 +29621,8 @@ fn due_oauth_state() -> super::SchedulerState {
 }
 
 /// Two codex profiles, due (the process-global poll memo is empty for these
-/// fresh names), pointing at `base` through the codex URL override.
+/// fresh names), pointing at `base` through the two codex URL overrides: the
+/// poll and the banked-reset list share one host in production.
 fn write_codex_due(base: &str) {
     crate::testutil::write_codex_roster(&["qc1", "qc2"]);
     for n in ["qc1", "qc2"] {
@@ -28902,6 +29636,7 @@ fn write_codex_due(base: &str) {
         .expect("auth.json");
     }
     crate::usage::set_codex_usage_url_override(base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(base);
     crate::usage::reset_request_slots();
 }
 
@@ -28998,6 +29733,7 @@ fn a_tick_with_codex_due_under_a_wedge_takes_one_wait() {
     super::tick(&state);
 
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     let _ = server.join().expect("listener");
     drop(holder);
     crate::lock::set_state_lock_timeout_override(None);
@@ -29120,6 +29856,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -29150,6 +29887,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
 
     let seen = server.join().expect("listener");
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     drop(holder);
     crate::lock::set_state_lock_timeout_override(None);
 
@@ -29279,6 +30017,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -32106,6 +32845,265 @@ fn a_skipped_spent_probed_account_drops_its_queued_mark() {
     );
 }
 
+/// The spent skip publishes the deliberate-blank fact beside the blanked
+/// countdown: the leg's activity state carries the flag the renderer reads,
+/// so a past-due reading clock never dates the absent deadline as overdue.
+#[test]
+fn a_spent_skipped_leg_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the spent skip publishes the OAuth leg's blanked flag",
+    );
+}
+
+/// A session-suppressed credential publishes the same blanked flag: the tick
+/// drops the suppressed entry from its work list (no fetch, no countdown) and
+/// flags the leg, so the renderer keeps the row's slot blank.
+#[test]
+fn a_suppressed_credential_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    let fingerprint = state
+        .config
+        .lock()
+        .unwrap()
+        .profiles
+        .first()
+        .and_then(|p| p.setup_token_digest)
+        .expect("the fixture mints a setup token");
+    state
+        .suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), fingerprint);
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("spent")),
+        "the suppressed probe's OAuth leg is flagged blanked",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "the suppressed entry publishes no countdown",
+    );
+}
+
+/// A spent OAuth account that also carries a third-party credential keeps its
+/// third-party countdown: the skip blanks the OAuth leg alone, so a hybrid
+/// row whose figures the third-party cache supplies keeps counting down.
+#[test]
+fn a_spent_hybrid_keeps_its_third_party_countdown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut state = spent_probe_state(false);
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![tp_entry("spent")]));
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("spent"),
+        FetchStamp::at(EpochMs::from_millis(crate::usage::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    let next = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        next.contains_key(&tp_key("spent")),
+        "the third-party leg's countdown survives the OAuth skip",
+    );
+    assert!(
+        !next.contains_key(&oauth_key("spent")),
+        "the OAuth leg's countdown is blanked",
+    );
+    drop(next);
+    let activity = state.activity.lock().unwrap();
+    assert!(super::countdown_blanked(&activity, &oauth_key("spent")));
+    assert!(
+        !super::countdown_blanked(&activity, &tp_key("spent")),
+        "the third-party leg is not blanked",
+    );
+}
+
+/// The stood-down mirror's spent skip publishes the same blanked flag, so a
+/// stood-down TUI shows a spent row blank exactly as the armed one does, and
+/// nothing else is flagged (the mirror runs no worker, so no leg is late).
+#[test]
+fn a_stood_down_spent_row_publishes_its_blanked_countdown_flag() {
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+    // The hydration seeds the store from the disk cache, so the spent reading
+    // must live there — a store-seeded entry with no cache file is dropped as
+    // stale by the same pass.
+    crate::testutil::register_names(&["kitty"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent_reading(),
+    );
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("kitty", false)],
+    }));
+    config.lock().unwrap().state.refresh_spent_accounts = false;
+    let state = chain_state(&config, vec![token("kitty")]);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &oauth_key("kitty")),
+        "the mirror's spent skip publishes the OAuth leg's blanked flag",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("kitty")),
+        "the mirror blanks the spent countdown",
+    );
+}
+
+/// One DeepSeek provider profile, `keyless`, holding no api key: its
+/// selected leg is the third-party one and no work list carries it.
+fn keyless_provider_config() -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState};
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyless"));
+    profile.provider = Some(crate::providers::Provider::DeepSeek);
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            profiles: vec![crate::profile::ProfileName::from("keyless")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    }))
+}
+
+/// A keyless provider profile still displays its cached figures (the
+/// third-party display seed) while nothing polls its selected leg: the tick
+/// publishes the deliberate blank for that leg, so the renderer never dates
+/// the fossil cache as a late worker's overdue refresh.
+#[test]
+fn a_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the unpolled selected leg's blanked flag is published",
+    );
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("keyless")),
+        "nothing polls the leg, so no countdown",
+    );
+}
+
+/// A leg blanked as unpolled while the account had no key stops reading blank
+/// once the key is back and the account joins the third-party work list: the
+/// publish clears the flag in the same pass, so a worker left running on that
+/// leg later is still dated overdue.
+#[test]
+fn a_keyless_leg_that_gains_its_key_drops_its_blanked_countdown_flag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "control: the keyless selected leg is blanked",
+    );
+    // The key comes back: the account joins the work list, and a fresh stamp
+    // keeps the leg off this tick's fetch.
+    state.config.lock().unwrap().profiles[0].api_key = Some("sk-keyless".to_string());
+    let entries = super::collect_third_party_entries(&state.config.lock().unwrap().profiles);
+    *state.third_party_tokens.lock().unwrap() = entries;
+    state.last_fetched.lock().unwrap().insert(
+        tp_key("keyless"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !super::countdown_blanked(&state.activity.lock().unwrap(), &tp_key("keyless")),
+        "the restored key takes the leg off the blank set",
+    );
+}
+
+/// The stood-down mirror publishes the same blank for a selected leg on no
+/// work list, so a stood-down TUI's row keeps the blank slot too.
+#[test]
+fn a_stood_down_selected_leg_on_no_work_list_publishes_its_blanked_countdown_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = chain_state(&keyless_provider_config(), Vec::new());
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        super::countdown_blanked(&activity, &tp_key("keyless")),
+        "the mirror's publish blanks the unpolled selected leg",
+    );
+}
+
+/// An entry the blanked flag alone keeps alive is dropped in the same pass
+/// that clears it: an account blanked one tick and gone the next leaves no
+/// inert entry behind (the fetching tick has no general idle sweep).
+#[test]
+fn an_account_blanked_one_tick_and_removed_the_next_leaves_no_activity_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        super::countdown_blanked(&state.activity.lock().unwrap(), &oauth_key("spent")),
+        "control: the first tick blanked the spent probe",
+    );
+    // The profile is gone before the next tick: nothing re-raises its flag.
+    state.config.lock().unwrap().profiles.clear();
+    probe_tick_expecting_none(&home, &state, 0);
+    assert!(
+        !state.activity.lock().unwrap().contains_key("spent"),
+        "the cleared entry is dropped in the same publish pass",
+    );
+}
+
+/// A polled OAuth leg that is merely not due stays off the blank set: the
+/// blank's work list is the tick's whole snapshot, never the due subset, so
+/// an idle-but-pending leg keeps its published countdown.
+#[test]
+fn a_polled_not_due_oauth_leg_is_not_blanked_after_a_real_tick() {
+    use crate::profile::{AppConfig, AppState};
+    let home = crate::testutil::HomeSandbox::new();
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("polled", false)],
+    }));
+    let state = chain_state(&config, vec![token("polled")]);
+    // Just-fetched: the leg falls due a whole interval out, so the armed tick
+    // fetches nothing and the blank decision reads a real, not-due member.
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key("polled"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
+    // The endpoint stub answers the claude-resets side read (the tick's one
+    // network leg, unrelated to the blank) and records any fetch leak.
+    probe_tick_expecting_none(&home, &state, 1);
+    let activity = state.activity.lock().unwrap();
+    assert!(
+        !super::countdown_blanked(&activity, &oauth_key("polled")),
+        "the not-due leg stays off the blank set",
+    );
+    assert!(
+        state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("polled")),
+        "its countdown publishes",
+    );
+}
+
 #[test]
 fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
     let home = crate::testutil::HomeSandbox::new();
@@ -32425,6 +33423,138 @@ fn a_stood_down_instance_reads_a_refused_setup_token_off_its_record() {
             "cached {cached}, recorded {recorded_token}"
         );
     }
+}
+
+/// A refused setup token whose cache holds a plan-only body (a login-plan seed)
+/// still reads as the refusal it is: the plan-only arm leaves the OAuth cadence
+/// unstamped, so the verdict rides its own status insert there.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_a_plan_only_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        },
+    );
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the plan-only arm carries the verdict with no cadence stamp"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("probed"),
+        "the plan-only body still fills the reading store"
+    );
+}
+
+/// A refused setup token whose usage cache will not parse keeps the verdict:
+/// the cache seed's no-body arm writes it in the same pass, where the name
+/// would otherwise carry no status at all.
+#[test]
+fn a_stood_down_instance_reads_a_refused_setup_token_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probed");
+    let state = probe_state("probed", 90_000, true);
+    let path =
+        crate::profile_cache::profile_cache_path(&name, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    let recorded = crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN)
+        .setup_token
+        .expect("a digest");
+    crate::profile_cache::write_auth_expired(&name, recorded);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no reading"
+    );
+}
+
+/// A stood-down scheduler state over one refused endpoint `name`: its work
+/// list holds the credential `tp_entry` builds, and the durable record keys
+/// that entry's fingerprint, so the tick's hydrate sees the name as refused.
+fn refused_endpoint_state(name: &str) -> super::SchedulerState {
+    crate::testutil::register_names(&[name]);
+    let pn = crate::profile::ProfileName::from(name);
+    let entry = tp_entry(name);
+    let fingerprint = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&pn, fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&pn, fingerprint),
+        "the durable refusal record landed"
+    );
+    let mut state = completion_order_state();
+    state.tokens = Arc::new(RankedMutex::new(Vec::new()));
+    state.third_party_tokens = Arc::new(RankedMutex::new(vec![entry]));
+    state
+}
+
+/// A refused endpoint whose third-party cache will not parse keeps the
+/// verdict: the third-party no-body arm writes it where the cache yields no
+/// copy to seed.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_an_unparseable_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("mkdir profile");
+    std::fs::write(&path, b"not json").expect("write the unparseable cache");
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the no-body arm carries the verdict where the cache yields no copy"
+    );
+}
+
+/// A refused endpoint with no cache at all drops its stale reading and keeps
+/// the verdict: the cache-gone arm removes the store entries and writes
+/// `AuthExpired` where the removal alone would leave no status behind.
+#[test]
+fn a_stood_down_instance_reads_a_refused_endpoint_with_no_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "tp-refused";
+    let state = refused_endpoint_state(name);
+    state.third_party_usage_store.lock().unwrap().insert(
+        name.to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    state
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), super::FetchStatus::Cached);
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name),
+        Some(&super::FetchStatus::AuthExpired),
+        "the cache-gone arm keeps the verdict"
+    );
+    assert!(
+        !state
+            .third_party_usage_store
+            .lock()
+            .unwrap()
+            .contains_key(name),
+        "and drops the stale reading whose cache is gone"
+    );
 }
 
 /// A stood-down TUI beside the process that fetches usage, whose probe finds
@@ -34651,6 +35781,7 @@ fn a_tick_returns_while_one_codex_usage_fetch_hangs() {
     )
     .expect("write auth.json");
     crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&silent.base);
     crate::usage::reset_request_slots();
 
     let state = hung_third_party_state(&[("landed", OK_URL)]);
@@ -34660,6 +35791,7 @@ fn a_tick_returns_while_one_codex_usage_fetch_hangs() {
     super::tick(&state);
     let took = started.elapsed();
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(
         silent.accepted(),
@@ -34720,6 +35852,7 @@ fn a_tick_returns_while_three_codex_usage_fetches_hang() {
         write_codex_account(name);
     }
     crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&silent.base);
     crate::usage::reset_request_slots();
 
     let state = hung_third_party_state(&[("landed", OK_URL)]);
@@ -34729,6 +35862,7 @@ fn a_tick_returns_while_three_codex_usage_fetches_hang() {
     super::tick(&state);
     let took = started.elapsed();
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(
         silent.accepted(),
@@ -35684,13 +36818,13 @@ fn a_claude_reset_read_runs_once_an_hour_per_oauth_account() {
             "{name}: g-old + g-week, not the cooling g-cool"
         );
         assert_eq!(
-            body["clears"],
+            body["grants"][1]["clears"],
             serde_json::json!(["five_hour", "seven_day"]),
-            "{name}: the next grant's windows"
+            "{name}: each grant's own windows, the weekly one's here"
         );
         assert!(
-            body["ends_at"].is_null(),
-            "{name}: the next grant names no end"
+            body["grants"][1]["ends_at"].is_null(),
+            "{name}: the weekly grant names no end"
         );
         let stamped = body["fetched_at"].as_u64().expect("stamped");
         assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
@@ -35895,33 +37029,782 @@ fn tick_runs_the_claude_resets_side_read() {
     assert!(file.exists(), "the read landed its file");
 }
 
-/// A read whose next grant the spend path would refuse lands an available
-/// count of 0. Two usable grants sit in the fixture; only `next_grant_id`
-/// moves between the three accounts, one read each.
+// ── the codex reset side read ───────────────────────────────────────────────
+
+/// Production wiring pin for the codex side read: `tick` runs the leg, so a
+/// codex roster account's `limit_resets.json` lands on a real tick (the
+/// cadence tests drive `codex_resets_tick_at` directly and never reach it).
+/// The poll parses its own body, so its matched arm is the one that must let
+/// the same tick's read through.
 #[test]
-fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
+fn tick_runs_the_codex_resets_side_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-tickpin"]);
+    crate::testutil::write_codex_store(
+        "cx-tickpin",
+        &crate::testutil::codex_auth_body("at.cx-tickpin", "rt.cx-tickpin"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(6, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CODEX_RESET_LIST_BODY.to_string())
+            } else {
+                (200, CODEX_SPENT.to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    let state = completion_order_state();
+
+    super::tick(&state);
+
+    drop(endpoints);
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    crate::usage::clear_codex_usage_url_override();
+    drop(server.join().expect("listener"));
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the tick ran the leg");
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cx-tickpin"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(file.exists(), "the read landed its file");
+}
+
+/// The production leg reads ONE codex account a tick: with two accounts due,
+/// the first tick sends one list request and the next tick the other, never
+/// both in one pass. `codex_resets_tick` passes `Some(1)` where the test seam
+/// passes `None`, so a tick-level drive is what binds the production limit.
+#[test]
+fn a_tick_reads_one_due_codex_account_and_the_next_tick_the_other() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx2a", "cx2b"]);
+    for name in ["cx2a", "cx2b"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(&format!("at.{name}"), &format!("rt.{name}")),
+        );
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(8, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    let state = completion_order_state();
+
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "one account read in the first tick"
+    );
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the other account reads the next tick, never both in one pass"
+    );
+
+    drop(endpoints);
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    crate::usage::clear_codex_usage_url_override();
+    drop(server.join().expect("listener"));
+    for name in ["cx2a", "cx2b"] {
+        let file = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path");
+        assert!(file.exists(), "{name}: the read landed its file");
+    }
+}
+
+/// A landed `limit_resets.json` whose `fetched_at` sits inside the hour seeds
+/// a fresh scheduler's memo: the first pass sends no list request, and the
+/// hour runs out at the file's stamp rather than the scheduler's start.
+#[test]
+fn a_landed_codex_reading_inside_the_hour_seeds_a_fresh_scheduler() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxseed"]);
+    crate::testutil::write_codex_store(
+        "cxseed",
+        &crate::testutil::codex_auth_body("at.cxseed", "rt.cxseed"),
+    );
+    let t = 1_900_000_000_000;
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cxseed"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &file,
+        format!(r#"{{"usable":1,"fetched_at":{}}}"#, t - 10 * 60 * 1000),
+    )
+    .expect("write the landed reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The poll answers first, so the account is not held off; the seed is
+    // what must keep the first pass quiet.
+    super::codex_usage_tick(&state);
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the landed reading's stamp holds the hour on a fresh scheduler"
+    );
+    super::codex_resets_tick_at(&state, t + 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the hour runs out at the file's stamp and the read runs once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(file.exists(), "the read re-landed the file");
+}
+
+/// The due set is computed before the login snapshot: a tick whose codex
+/// accounts all sit inside their hour runs no precondition at all (no
+/// `auth.json` read, no quarantine read), and the first due account pays them
+/// once.
+#[test]
+fn a_tick_inside_every_codex_hour_runs_no_precondition() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxquiet"]);
+    crate::testutil::write_codex_store(
+        "cxquiet",
+        &crate::testutil::codex_auth_body("at.cxquiet", "rt.cxquiet"),
+    );
+    let t = 1_900_000_000_000;
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cxquiet"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &file,
+        format!(r#"{{"usable":1,"fetched_at":{}}}"#, t - 10 * 60 * 1000),
+    )
+    .expect("write the landed reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The poll answers first, so the account is not held off; only the hour
+    // keeps the first pass from reading.
+    super::codex_usage_tick(&state);
+    crate::limit_reset::CODEX_PRECONDITION_RUNS.with(|c| c.set(0));
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        crate::limit_reset::CODEX_PRECONDITION_RUNS.with(std::cell::Cell::get),
+        0,
+        "an account inside its hour pays no login or quarantine read"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "nothing to read yet");
+
+    super::codex_resets_tick_at(&state, t + 60 * 60 * 1000);
+    assert_eq!(
+        crate::limit_reset::CODEX_PRECONDITION_RUNS.with(std::cell::Cell::get),
+        1,
+        "the due account's preconditions run once"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the hour ran out");
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+}
+
+/// The credit-list path the codex side read hits, as the CLI sends it.
+const CODEX_RESET_LIST_PATH: &str = "/backend-api/wham/rate-limit-reset-credits";
+
+/// Two credits: one available, one redeemed. The reading lands `usable` 1
+/// (the count of credits the list marks available, not the body's
+/// `available_count` 2), `banked` 1, and every credit it names.
+const CODEX_RESET_LIST_BODY: &str = r#"{"credits": [
+    {"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"},
+    {"id": "c2", "reset_type": "codex_rate_limits", "status": "redeemed"}
+], "available_count": 2}"#;
+
+/// The codex reset side read runs once an hour per codex roster account with
+/// a stored login: each read lands the credit list in that account's own
+/// `limit_resets.json`, the file the codex rail names each credit from, and a
+/// second tick inside the hour sends no request.
+#[test]
+fn a_codex_reset_read_lands_the_list_once_an_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxr1", "cxr2"]);
+    for name in ["cxr1", "cxr2"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(&format!("at.{name}"), &format!("rt.{name}")),
+        );
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+    let before = crate::usage::now_ms();
+
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "one read per codex account"
+    );
+    super::codex_resets_tick_at(&state, t + hour - 60_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "nothing inside the hour");
+    super::codex_resets_tick_at(&state, t + hour);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "each account again once the hour is up"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        [
+            "Bearer at.cxr1",
+            "Bearer at.cxr1",
+            "Bearer at.cxr2",
+            "Bearer at.cxr2"
+        ],
+        "each read carries its own account's token"
+    );
+    for name in ["cxr1", "cxr2"] {
+        let profile = crate::profile::ProfileName::from(name);
+        let path = crate::profile::profile_subpath(&profile, "limit_resets.json").expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(
+            body["usable"], 1,
+            "{name}: only the available credit is spendable"
+        );
+        assert_eq!(
+            body["credits"].as_array().expect("the credits").len(),
+            2,
+            "{name}: every credit the list names"
+        );
+        let stamped = body["fetched_at"].as_u64().expect("stamped");
+        assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
+        let usage =
+            crate::profile::profile_subpath(&profile, super::USAGE_CACHE_FILE).expect("path");
+        assert!(
+            !usage.exists(),
+            "{name}: the side read writes no usage cache"
+        );
+    }
+}
+
+/// A codex login that moved since the read was spawned lands nothing: the
+/// lander re-reads `auth.json` under the state flock, so the old account's
+/// credit list never lands under the new account's login.
+#[test]
+fn a_codex_reset_read_across_an_account_change_lands_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxm"]);
+    let name = crate::profile::ProfileName::from("cxm");
+    crate::testutil::write_codex_store(
+        "cxm",
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    // A codex login to account B lands after the read, before the compare.
+    super::set_codex_compare_hook("cxm", |n| {
+        let p = crate::profile::profile_subpath(n, "auth.json").expect("path");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok-b","account_id":"account-b"}}"#,
+        )
+        .expect("rewrite auth.json");
+    });
+    let state = completion_order_state();
+
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the read ran");
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "the old account's list must not land"
+    );
+}
+
+/// A refused codex list read stamps the back-off: the account gets no second
+/// request inside it, and no file, while a later pass reads again once the gap
+/// is out.
+#[test]
+fn a_refused_codex_reset_read_stamps_the_backoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx429"]);
+    crate::testutil::write_codex_store(
+        "cx429",
+        &crate::testutil::codex_auth_body("at.cx429", "rt.cx429"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (
+                    429,
+                    vec![("retry-after".to_string(), "2".to_string())],
+                    String::new(),
+                )
+            } else {
+                (200, Vec::new(), String::new())
+            }
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+    let t = 1_900_000_000_000;
+
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+    super::codex_resets_tick_at(&state, t + 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "no second request inside the back-off"
+    );
+    super::codex_resets_tick_at(&state, t + 2 * 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the gap out, the account reads again"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    let name = crate::profile::ProfileName::from("cx429");
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "a refused read lands no file"
+    );
+}
+
+/// A quarantined codex login gets no reset read: the leg runs the CLI's own
+/// refusals before anything leaves the machine, so a dead chain costs no
+/// request and lands no file.
+#[test]
+fn a_quarantined_codex_login_gets_no_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxq"]);
+    crate::testutil::write_codex_store(
+        "cxq",
+        &crate::testutil::codex_auth_body("at.cxq", "rt.cxq"),
+    );
+    crate::codex_auth::quarantine_for_test("cxq", "reused", "rt.cxq");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "nothing leaves the machine"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    let name = crate::profile::ProfileName::from("cxq");
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "a quarantined chain lands no file"
+    );
+}
+
+/// A codex poll that got no answer stamps the poll memo's `answered: false`
+/// flag, and the side read skips that account without a list request or a
+/// stamp while it stands; once a later poll answers, the next pass reads the
+/// list once.
+#[test]
+fn a_codex_poll_that_got_no_answer_holds_off_the_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-na"]);
+    crate::testutil::write_codex_store(
+        "cx-na",
+        &crate::testutil::codex_auth_body("at.cx-na", "rt.cx-na"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // A refused connection is the no-answer outcome the record is about, and
+    // it ends the poll at once instead of an 8 s stall.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-na"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the no-answer poll stamped the memo's hold-off flag"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "no list request while the poll's last outcome is no answer"
+    );
+    let memo = state.codex_resets_memo.lock().unwrap();
+    assert!(
+        memo.last_read_at.is_empty() && memo.due.is_empty() && memo.retry.is_empty(),
+        "the held-off account's memo stays unstamped"
+    );
+    drop(memo);
+
+    // A later poll answers and clears the flag; the next pass reads once.
+    super::forget_codex_polled("cx-na");
+    crate::usage::set_codex_usage_url_override(&base);
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-na"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the answered poll overwrote the memo's hold-off flag"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000 + 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the cleared hold reads the list once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-na"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// Control: an account whose codex poll answered this pass carries no
+/// hold-off flag, so the side read's same-pass read runs as it did before the
+/// hold-off existed.
+#[test]
+fn a_codex_poll_that_answered_reads_the_list_in_the_same_pass() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-ctl"]);
+    crate::testutil::write_codex_store(
+        "cx-ctl",
+        &crate::testutil::codex_auth_body("at.cx-ctl", "rt.cx-ctl"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-ctl"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the answered poll stamped the memo's answered flag, not a hold-off"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the answered account read in the same pass"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-ctl"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// A poll answering a status after a no-answer poll clears the hold-off: the
+/// answering poll overwrites the memo's flag with `answered: true` (a 429 is
+/// an answer — the host responded), so the next side-read pass reads the list
+/// once instead of staying held off until a 200.
+#[test]
+fn a_later_poll_answering_429_clears_the_no_answer_holdoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-429a"]);
+    crate::testutil::write_codex_store(
+        "cx-429a",
+        &crate::testutil::codex_auth_body("at.cx-429a", "rt.cx-429a"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CODEX_RESET_LIST_BODY.to_string())
+            } else {
+                (429, String::new())
+            }
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The no-answer poll stamps the hold-off flag.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-429a"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the no-answer poll held the account off"
+    );
+    // The 429-answering poll overwrites the flag; it must be due, so the
+    // cadence is forgotten first.
+    super::forget_codex_polled("cx-429a");
+    crate::usage::set_codex_usage_url_override(&base);
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-429a"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the 429-answering poll cleared the hold-off"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the cleared hold reads the list once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-429a"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// A no-answer poll writes the hold-off on the poll's own cadence memo only:
+/// the shared StatusStore gains no `Failed` entry under the codex name, so
+/// the claude surfaces reading that store never see a codex poll's failure.
+#[test]
+fn a_no_answer_poll_writes_no_failed_status_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-nas"]);
+    crate::testutil::write_codex_store(
+        "cx-nas",
+        &crate::testutil::codex_auth_body("at.cx-nas", "rt.cx-nas"),
+    );
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-nas"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the hold-off rides the poll's own memo"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("cx-nas"),
+        None,
+        "no Failed entry reaches the shared StatusStore"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+}
+
+/// A read lands the count of every grant a spend of its id would send, and
+/// 0 where no grant is one: which grant the server would spend next moves
+/// nothing. Two usable grants sit in the fixture; one account reads it with no
+/// next grant, one with a cooling one named next, and one with every grant
+/// marked unusable, one read each.
+#[test]
+fn a_claude_reset_read_lands_the_count_a_spend_by_id_would_use() {
     let home = crate::testutil::HomeSandbox::new();
     let none = save_unanchored_login("lr4n", "lr4n-tok");
     let cooling = save_unanchored_login("lr4c", "lr4c-tok");
-    let usable = save_unanchored_login("lr4u", "lr4u-tok");
+    let unusable = save_unanchored_login("lr4u", "lr4u-tok");
     crate::testutil::register_names(&["lr4n", "lr4c", "lr4u"]);
     let (base, server) = crate::testutil::serve_endpoints_by_request(4, |raw, _| {
-        let next = match crate::testutil::request_header(raw, "authorization").as_deref() {
-            Some("Bearer lr4n-tok") => r#""next_grant_id": null"#,
-            Some("Bearer lr4c-tok") => r#""next_grant_id": "g-cool""#,
-            _ => r#""next_grant_id": "g-week""#,
+        let body = match crate::testutil::request_header(raw, "authorization").as_deref() {
+            Some("Bearer lr4n-tok") => CEDAR_EMBER_THREE_GRANTS.replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": null"#,
+                1,
+            ),
+            Some("Bearer lr4c-tok") => CEDAR_EMBER_THREE_GRANTS.replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": "g-cool""#,
+                1,
+            ),
+            _ => {
+                CEDAR_EMBER_THREE_GRANTS.replace(r#""usable_now": true"#, r#""usable_now": false"#)
+            }
         };
-        let body = CEDAR_EMBER_THREE_GRANTS.replacen(r#""next_grant_id": "g-week""#, next, 1);
         (200, Vec::new(), body)
     });
     let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let state = resets_state(vec![none, cooling, usable]);
+    let state = resets_state(vec![none, cooling, unusable]);
 
     super::claude_resets_tick_at(&state, 1_900_000_000_000);
 
     drop(endpoints);
     let _ = server.join().expect("listener");
-    for (name, want) in [("lr4n", 0), ("lr4c", 0), ("lr4u", 2)] {
+    for (name, want) in [("lr4n", 2), ("lr4c", 2), ("lr4u", 0)] {
         let path = crate::profile::profile_subpath(
             &crate::profile::ProfileName::from(name),
             "limit_resets.json",
@@ -35932,6 +37815,11 @@ fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
                 .expect("json");
         assert_eq!(body["usable"], want, "{name}");
         assert_eq!(body["banked"], 3, "{name}: every grant left, usable or not");
+        assert_eq!(
+            body["grants"].as_array().map(Vec::len),
+            Some(3),
+            "{name}: every grant the read listed"
+        );
     }
 }
 
@@ -39865,6 +41753,7 @@ fn the_refresher_starts_the_watchdog_on_the_states_lease_and_stamps_each_tick() 
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -40114,6 +42003,7 @@ fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
     let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     crate::testutil::write_codex_roster(&["cx-belt-kept"]);
     crate::testutil::write_codex_store(
         "cx-belt-kept",
@@ -40124,6 +42014,7 @@ fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
     );
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     let _ = handle.join();
     let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-kept"))
         .expect("dir")
@@ -40654,5 +42545,124 @@ fn the_usage_probe_never_sends_a_proxy_accounts_setup_token() {
             [true, false, false],
         ),
         "(probes sent, their bearers, a reading stored for plain, px, pu)"
+    );
+}
+
+/// Drives `claude_rolling_tick` over four scans one transient hold apart and
+/// counts the gate runs, for a rolling profile whose sidecar holds a mint.
+/// `after_mint` runs with the mint in the sidecar and before the first scan,
+/// for a case whose store or profile changes at that point.
+fn rolling_mint_gate_runs(
+    mut profile: crate::profile::Profile,
+    after_mint: impl FnOnce(&mut crate::profile::Profile),
+) -> (bool, usize) {
+    let name = profile.name.clone();
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    after_mint(&mut profile);
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec![name.clone()],
+            ..Default::default()
+        },
+        profiles: vec![profile],
+    }));
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    let due = crate::oauth::rolling_sidecar_restamp_due(&config, &name, now as i64);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let gate = |n: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::restamp_rolling_token(&config, n, |_: &str, _: Option<&str>| {
+            panic!("no stored chain clauth can stamp from may spend a refresh")
+        })
+    };
+    for k in 0..4u64 {
+        pacing.lock().unwrap().next_scan_ms = 0;
+        super::claude_rolling_tick(
+            &config,
+            &pacing,
+            now + k * (super::ROLLING_RETRY_MS + 1),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &std::sync::atomic::AtomicBool::new(false),
+            &gate,
+        );
+    }
+    (due, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A logged-out rolling profile keeps its sidecar, and a mint there has no
+/// stored chain to be re-stamped from: only a re-login changes that, so the
+/// scan never reads it as due and never re-runs the gate on the 15-minute hold.
+#[test]
+fn a_logged_out_rolling_profile_holding_a_mint_is_not_regated() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-logged-out");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = None;
+
+    assert_eq!(
+        rolling_mint_gate_runs(profile, |_| {}),
+        (false, 0),
+        "(mint read as due, gate runs over four scans one hold apart)"
+    );
+}
+
+/// The proxy claim the due predicate reads is the `[proxy]` record in
+/// `config.toml`, the one the gate's stamp refuses on. A mint written while
+/// the account still spent its own chain stays in the sidecar when that record
+/// lands; beside a comfortable stored chain it is not due, and the scan never
+/// re-runs the gate.
+#[test]
+fn a_mint_armed_before_a_proxy_record_lands_stays_off_the_scan() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("cl-mint-proxy-record");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-live".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 6 * 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let runs = rolling_mint_gate_runs(profile, |profile| {
+        crate::profile::write_proxy_record(&profile.name, &record).expect("proxy record");
+        profile.proxy = Some(record.clone());
+    });
+
+    assert_eq!(
+        (
+            crate::profile::stored_proxy_claim_failing_closed(&name),
+            crate::oauth::read_raw_store(&name)
+                .expect("store")
+                .and_then(|store| store.claude_ai_oauth)
+                .map(|oauth| oauth.access_token),
+            crate::claude::sidecar_summary(&name).map(|(kind, _)| kind),
+        ),
+        (
+            crate::profile::ProxyClaim::Account(record),
+            Some("at-live".to_string()),
+            Some(crate::claude::SidecarKind::Mint),
+        ),
+        "fixture control: (the claim on disk, the stored chain, the sidecar)"
+    );
+    assert_eq!(
+        runs,
+        (false, 0),
+        "(mint read as due, gate runs over four scans one hold apart)"
     );
 }

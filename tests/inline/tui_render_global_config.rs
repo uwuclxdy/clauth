@@ -58,6 +58,55 @@ fn toggles() -> RowState {
         reset_display: ResetDisplay::Relative,
         clock_format: ClockFormat::H24,
         home_tab: HomeTab::Overview,
+        reduce_motion: false,
+    }
+}
+
+/// The `reduce motion` toggle sits in the appearance band right after
+/// `home tab`, draws its state at the shared value column, and its hint names
+/// what each state does.
+#[test]
+fn the_reduce_motion_row_follows_home_tab_and_names_what_it_stills() {
+    let home = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::HomeTab)
+        .expect("home tab row");
+    assert_eq!(
+        GLOBAL_CONFIG_ROWS.get(home + 1),
+        Some(&GlobalConfigRow::ReduceMotion)
+    );
+    assert_eq!(GlobalConfigRow::ReduceMotion.band(), "appearance");
+
+    for (on, glyph, hint) in [
+        (
+            false,
+            "○─",
+            "the mascot reacts to events and provider names shimmer",
+        ),
+        (
+            true,
+            "─●",
+            "the mascot and provider names stay still; spinners keep turning",
+        ),
+    ] {
+        let rows = RowState {
+            reduce_motion: on,
+            ..toggles()
+        };
+        let line = line_text(&one_row(
+            GlobalConfigRow::ReduceMotion,
+            false,
+            rows,
+            tunables(),
+            None,
+        ));
+        let col = value_col("reduce motion", &line);
+        assert_eq!(col, 2 + KEY_W + KEY_GUTTER, "{line:?}");
+        assert_eq!(line[col..].trim_end(), glyph, "{line:?}");
+        assert_eq!(
+            row_hint(GlobalConfigRow::ReduceMotion, rows, tunables()).as_deref(),
+            Some(hint)
+        );
     }
 }
 

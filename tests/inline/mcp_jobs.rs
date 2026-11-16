@@ -61,6 +61,30 @@ fn pinned_format_spec(job_id: &str, profile: &str, started_at: u64) -> RunningSp
     }
 }
 
+/// A job id names the server process that minted it, `d-<base36 ms>-<pid>-<n>`:
+/// the counter restarts at 0 in every `clauth mcp` process, so two servers
+/// minting their n-th job in the same millisecond would otherwise share an id,
+/// and the id is the tag the exit stop and `monitor` cancel sweep by.
+#[test]
+fn a_job_id_carries_the_minting_servers_pid() {
+    let first = new_job_id(1000);
+    let second = new_job_id(1000);
+    let pid = std::process::id().to_string();
+    for id in [&first, &second] {
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 4, "four dash-separated parts: {id}");
+        assert_eq!(parts[0], "d", "{id}");
+        assert_eq!(parts[1], "rs", "1000 in base 36: {id}");
+        assert_eq!(parts[2], pid, "the minting process's pid, in decimal: {id}");
+        assert!(
+            !parts[3].is_empty() && parts[3].chars().all(|c| c.is_ascii_digit()),
+            "a decimal counter last: {id}"
+        );
+        assert!(is_safe_job_id(id), "{id}");
+    }
+    assert_ne!(first, second, "one process never mints the same id twice");
+}
+
 /// The isolation flag rides the mint like `endpoint` does: resolved once at
 /// the reserve, carried through every heartbeat, and kept on the finalized
 /// record, so the orphan arm can split shared from isolated off the corpse
@@ -1639,5 +1663,917 @@ fn job_files_and_dir_are_owner_only() {
         0o600,
         "job file mode should be 0o600, got {:#o}",
         mode(&file)
+    );
+}
+
+/// A pid no live server holds a marker for: a record it owns reads as owned by
+/// a dead server, the shape a session's `/exit` leaves when Claude Code kills
+/// `clauth mcp` before it could stop its delegates.
+const DEAD_SERVER_PID: u32 = 999_999_937;
+
+fn owned_by_dead_server(spec: RunningSpec) -> RunningSpec {
+    RunningSpec {
+        owner_pid: DEAD_SERVER_PID,
+        owner_started_at: 1,
+        ..spec
+    }
+}
+
+/// N1's backstop: a background job whose server died at `/exit` before it
+/// could stop the job is kept as `stopped`, with its resume handle, rather than
+/// deleted (the resumed session's own server boot runs this sweep, so a delete
+/// erased the one handle that session needs).
+#[test]
+fn the_sweep_keeps_a_dead_servers_background_job_as_stopped_with_its_handle() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = owned_by_dead_server(spec(&id, "work", now - 60_000));
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-stop-1")).unwrap();
+
+    gc_running_corpses(now);
+
+    let job = list(now)
+        .into_iter()
+        .find(|job| job.record.job_id == id)
+        .expect("the record is kept, not deleted");
+    assert_eq!(job.phase().label(), "stopped");
+    assert_eq!(
+        job.record.session_id.as_deref(),
+        Some("sess-stop-1"),
+        "the resume handle survives"
+    );
+    assert!(
+        job.record.envelope.is_none(),
+        "no envelope is invented for a stop the server never saw"
+    );
+}
+
+/// The keep is for the handle: a dead server's background job that never
+/// learned its session id has nothing to resume from and is reaped as before.
+#[test]
+fn a_dead_servers_background_job_with_no_handle_is_still_reaped() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = owned_by_dead_server(spec(&id, "work", now - 60_000));
+    write_heartbeat_with_session(&spec, now - 5_000, "half", None).unwrap();
+
+    gc_running_corpses(now);
+
+    assert!(read(&id).is_none(), "nothing to resume, nothing kept");
+}
+
+/// A blocking run that was still going when its
+/// session exited reads `stopped` too, the same as a background one, so the
+/// resumed session is told how to resume it.
+#[test]
+fn a_dead_servers_blocking_run_reads_stopped() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = owned_by_dead_server(live_spec(&id, "work", now - 60_000));
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-stop-2")).unwrap();
+
+    gc_running_corpses(now);
+
+    let job = list(now)
+        .into_iter()
+        .find(|job| job.record.job_id == id)
+        .expect("the blocking run's handle is kept");
+    assert_eq!(job.phase().label(), "stopped");
+    assert_eq!(job.record.session_id.as_deref(), Some("sess-stop-2"));
+}
+
+/// A conversion whose source a concurrent resume removed after the sweep read
+/// it writes nothing: the tombstone must never resurrect a record the resume
+/// already retired, or the next compact names the resumed run again. The seam
+/// removes the source at the conversion's own write point, so the source guard
+/// is driven on real store bytes rather than a hand-built interleaving.
+#[test]
+fn a_conversion_whose_source_was_removed_after_the_read_writes_no_tombstone() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-b".to_string()),
+        ..owned_by_dead_server(spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-stop-9")).unwrap();
+    let _seam = RemoveConversionSource::new(&_home);
+
+    gc_running_corpses(now);
+
+    assert!(
+        read(&id).is_none(),
+        "no tombstone appears for a source the resume already removed"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-b".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        None,
+        "the next note names nothing"
+    );
+}
+
+/// A resume racing the conversion's claim wins whatever lands first: the seam
+/// parks the sweep between its claim and its tombstone write while the resume
+/// runs, and the tombstone the sweep writes next must not survive the
+/// resume's removal — the next note names nothing.
+#[test]
+fn a_resume_racing_the_conversion_claim_leaves_no_stopped_record_behind() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-race".to_string()),
+        ..owned_by_dead_server(live_spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-race-1")).unwrap();
+
+    let hold = HoldConversionAfterClaim::new(&_home);
+    let sweep = std::thread::spawn(move || gc_running_corpses(now));
+    hold.wait_parked();
+    remove_stopped_with_session("sess-race-1", now, now);
+    drop(hold);
+    sweep.join().unwrap();
+
+    assert!(
+        read(&id).is_none(),
+        "no stopped record survives a resume that landed inside the claim window"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-race".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        None,
+        "the next note names nothing"
+    );
+}
+
+/// The mirror order: a resume that retires the record first leaves the
+/// conversion nothing to claim — the sweep writes no tombstone, and the next
+/// note names nothing.
+#[test]
+fn a_resume_ahead_of_the_conversion_leaves_nothing_to_convert() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-mirror".to_string()),
+        ..owned_by_dead_server(live_spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-mirror-1")).unwrap();
+
+    remove_stopped_with_session("sess-mirror-1", now, now);
+    gc_running_corpses(now);
+
+    assert!(
+        read(&id).is_none(),
+        "no record is left for the conversion to claim"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-mirror".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        None,
+        "the next note names nothing"
+    );
+}
+
+/// A sweep whose claim lands while the resume is mid-removal and whose
+/// tombstone write lands before the resume's scan: the claim is seen by
+/// neither side, so the tombstone must not survive the resume — the next
+/// note names nothing. The seams park the sweep between its claim and its
+/// write and the resume at its park point, so the order is driven on real
+/// store bytes rather than a hand-built interleaving.
+#[test]
+fn a_sweep_that_finishes_inside_the_resume_leaves_no_stopped_record_behind() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-gap".to_string()),
+        ..owned_by_dead_server(spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-gap-1")).unwrap();
+
+    let hold = HoldConversionAfterClaim::new(&_home);
+    let sweep = std::thread::spawn(move || gc_running_corpses(now));
+    hold.wait_parked();
+    let hold_resume = HoldResumeMidRemoval::new(&_home);
+    let resume = std::thread::spawn(move || remove_stopped_with_session("sess-gap-1", now, now));
+    hold_resume.wait_parked();
+    drop(hold);
+    sweep.join().unwrap();
+    drop(hold_resume);
+    resume.join().unwrap();
+
+    assert!(
+        read(&id).is_none(),
+        "no stopped record survives a sweep that finished inside the resume"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-gap".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        None,
+        "the next note names nothing"
+    );
+}
+
+/// The sweep's tombstone lands before the resume's marker exists: the
+/// resume's own removal retires it — the next note names nothing.
+#[test]
+fn a_conversion_that_finished_first_is_removed_by_the_resume() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-write".to_string()),
+        ..owned_by_dead_server(spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-write-1")).unwrap();
+
+    gc_running_corpses(now);
+    remove_stopped_with_session("sess-write-1", now, now);
+
+    assert!(
+        read(&id).is_none(),
+        "the resume retires a tombstone the sweep wrote first"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-write".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        None,
+        "the next note names nothing"
+    );
+}
+
+/// The resumed marker outlives the resume it guards only until the store's
+/// Done TTL: the full sweep's foreign arm keeps a fresh marker — and never
+/// reads it as a job — and reaps an aged one.
+#[test]
+fn a_resumed_marker_is_reaped_at_the_done_ttl_and_spared_while_fresh() {
+    let _home = HomeSandbox::new();
+    // The real clock: the marker's TTL reads its mtime, and a synthetic
+    // epoch would date every marker centuries old.
+    let now = crate::usage::now_ms();
+    write_resumed_marker("sess-marker-1", now, &[]).unwrap();
+    let path = jobs_dir().unwrap().join("sess-marker-1.resumed");
+    assert!(path.exists(), "the marker lands beside the job records");
+    let instant: u64 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("the marker carries the resume instant the fence compares");
+    assert!(
+        instant <= crate::usage::now_ms(),
+        "the instant is the write's own"
+    );
+
+    gc(now);
+
+    assert!(path.exists(), "a full sweep spares a fresh resumed marker");
+    assert!(
+        list(now)
+            .iter()
+            .all(|job| job.record.job_id != "sess-marker-1"),
+        "the marker is never read as a job record"
+    );
+
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - DONE_TTL_MS - 60_000),
+        ))
+        .unwrap();
+
+    gc(now);
+
+    assert!(
+        !path.exists(),
+        "a full sweep reaps a marker past the Done TTL"
+    );
+}
+
+/// The marker is a state file under `~/.clauth`: 0o600 like every other
+/// writer's file, its directory 0o700.
+#[cfg(unix)]
+#[test]
+fn a_resumed_marker_is_0600_in_a_0700_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    write_resumed_marker("sess-mode-1", crate::usage::now_ms(), &[]).unwrap();
+    let path = jobs_dir().unwrap().join("sess-mode-1.resumed");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the marker lands owner-only"
+    );
+    assert_eq!(
+        std::fs::metadata(jobs_dir().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the jobs dir is owner-only"
+    );
+}
+
+/// A stopped record whose session holds the resumed marker is the one the
+/// note must never re-tell: a compaction after the resume names nothing,
+/// whatever record shape survived the race.
+#[test]
+fn a_stopped_record_whose_session_holds_the_resumed_marker_is_never_named() {
+    let _home = HomeSandbox::new();
+    // The real clock: the note's Done-TTL check reads the store against it,
+    // and a synthetic epoch would read the tombstone as already expired.
+    let now = crate::usage::now_ms();
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-note".to_string()),
+        ..owned_by_dead_server(spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-note-1")).unwrap();
+    gc_running_corpses(now);
+    let payload = crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: "sess-note".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    };
+    assert!(
+        crate::hook_jobs::note(&payload).is_some(),
+        "without the marker the note names the stopped record"
+    );
+
+    write_resumed_marker("sess-note-1", crate::usage::now_ms(), &[]).unwrap();
+
+    assert_eq!(
+        crate::hook_jobs::note(&payload),
+        None,
+        "a session holding the resumed marker is never named"
+    );
+}
+
+/// A resume whose marker cannot land keeps the stopped record: without the
+/// marker the sweep's post-write check has nothing to key on, so the removal
+/// fails instead of narrowing the no-re-tell guarantee. The fault is a
+/// directory at the marker's own path, so ONLY the marker's rename fails: the
+/// claims the removal would make next stay available, and dropping the abort
+/// reds this.
+#[test]
+fn a_resume_whose_marker_cannot_land_keeps_the_stopped_record() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-fail".to_string()),
+        ..owned_by_dead_server(spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-fail-1")).unwrap();
+    gc_running_corpses(now);
+    assert!(
+        read(&id).is_some(),
+        "the stopped tombstone stands before the resume"
+    );
+
+    let marker = jobs_dir().unwrap().join("sess-fail-1.resumed");
+    std::fs::create_dir(&marker).unwrap();
+
+    remove_stopped_with_session("sess-fail-1", now, now);
+
+    assert!(
+        read(&id).is_some(),
+        "a resume whose marker cannot land keeps the record it cannot retire safely"
+    );
+}
+
+/// The resume-note payload a `sess-later` compaction fires.
+fn sess_later_payload() -> crate::hook_note::Payload {
+    crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: "sess-later".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    }
+}
+
+/// The marker fences only the run the resume consumed: a stop of a run the
+/// SAME session started after the resume is a new record, so the sweep's
+/// tombstone for it survives the resumed-marker check and the next note
+/// names it.
+#[test]
+fn a_stop_of_a_run_started_after_the_resume_is_kept_and_told() {
+    let _home = HomeSandbox::new();
+    // The real clock: the marker's instant and the later run's start are
+    // compared directly, and a synthetic epoch would read the later run as
+    // older than any resume.
+    let now = crate::usage::now_ms();
+    write_resumed_marker("sess-later-1", now, &[]).unwrap();
+    let started = now + 1_000;
+    let id = new_job_id(started);
+    let spec = RunningSpec {
+        host_session: Some("sess-later".to_string()),
+        ..owned_by_dead_server(live_spec(&id, "work", started))
+    };
+    write_heartbeat_with_session(&spec, started, "half", Some("sess-later-1")).unwrap();
+
+    gc_running_corpses(started + 1_000);
+
+    let record = read(&id).expect("a later run's stopped record is not the resume's to retire");
+    assert!(record.stopped, "the sweep's tombstone is kept: {record:?}");
+    assert_eq!(
+        crate::hook_jobs::note(&sess_later_payload()),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{id}` on `work`. `delegate` with `session_id: \"sess-later-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "the later run's stop is told"
+    );
+}
+
+/// The host-exit writer's shape: a run of the resumed session that started
+/// after the resume exits and its `Done + stopped` record lands. That record
+/// is not the one the resume consumed, so the note names it.
+#[test]
+fn a_host_exit_stop_of_a_run_started_after_the_resume_is_told() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    write_resumed_marker("sess-later-1", now, &[]).unwrap();
+    let started = now + 1_000;
+    let id = new_job_id(started);
+    let spec = RunningSpec {
+        host_session: Some("sess-later".to_string()),
+        ..spec(&id, "work", started)
+    };
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-later-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::hook_jobs::note(&sess_later_payload()),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{id}` on `work`. `delegate` with `session_id: \"sess-later-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "a later run's host-exit stop is told"
+    );
+}
+
+/// A stopped liveness spelling beside the job's finished collectable record:
+/// the resume claims only the stopped spelling, so the finished result and
+/// its envelope survive for a `monitor` collect.
+#[test]
+fn a_resume_keeps_a_finished_result_beside_a_stopped_liveness_leftover() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 60_000);
+    let leftover = RunningSpec {
+        host_session: Some("sess-finished".to_string()),
+        ..owned_by_dead_server(live_spec(&id, "work", now - 60_000))
+    };
+    write_heartbeat_with_session(&leftover, now - 5_000, "half", Some("sess-finished-1")).unwrap();
+    write_done(
+        &RunningSpec {
+            kind: RecordKind::Collectable,
+            ..leftover
+        },
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "the finished result",
+            "session_id": "sess-finished-1",
+        }),
+    )
+    .unwrap();
+
+    remove_stopped_with_session("sess-finished-1", now, now);
+
+    let kept = read(&id).expect("a resume never deletes a finished result");
+    assert_eq!(
+        kept.envelope
+            .as_ref()
+            .and_then(|envelope| envelope.get("result"))
+            .and_then(serde_json::Value::as_str),
+        Some("the finished result"),
+        "the finished envelope survives"
+    );
+    assert!(!kept.stopped);
+}
+
+/// The TTL reap and a resume's marker write serialize on the marker store's
+/// state-lock gate: the reap stats and unlinks as one step against a writer,
+/// so it can never delete the fresh marker a concurrent resume just landed.
+#[test]
+fn a_reap_of_an_aged_marker_waits_for_the_writer_s_gate() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    write_resumed_marker("sess-reapgate-1", now, &[]).unwrap();
+    let path = jobs_dir().unwrap().join("sess-reapgate-1.resumed");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - DONE_TTL_MS - 60_000),
+        ))
+        .unwrap();
+    let holder = hold_marker_store_gate();
+
+    let park = crate::lock::flock_wait_park::arm();
+    let sweep = std::thread::spawn(move || gc(now));
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the sweep reaches the marker store's flock wait");
+    assert!(
+        path.exists(),
+        "a full sweep reaps no marker while a resume holds the marker store's gate"
+    );
+    drop(holder);
+    park.release.send(()).unwrap();
+    sweep.join().unwrap();
+    assert!(
+        !path.exists(),
+        "the aged marker is reaped once the gate is free"
+    );
+}
+
+/// Hold the store's state flock out of band, the way a concurrent process
+/// holds it: a raw file handle, so the holder blocks no in-process waiter and
+/// the next waiter in this process reaches the parked flock wait.
+fn hold_marker_store_gate() -> std::fs::File {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open the state lock file");
+    holder.lock().expect("hold the marker store's gate");
+    holder
+}
+
+/// The resumed marker's write takes the same gate the reap does, so a reap
+/// inside its stat-and-unlink never sees the write land under it.
+#[test]
+fn writing_the_resumed_marker_waits_for_the_reap_s_gate() {
+    let _home = HomeSandbox::new();
+    let path = jobs_dir().unwrap().join("sess-writegate-1.resumed");
+    let holder = hold_marker_store_gate();
+
+    let park = crate::lock::flock_wait_park::arm();
+    let writer = std::thread::spawn(|| {
+        write_resumed_marker("sess-writegate-1", crate::usage::now_ms(), &[])
+    });
+    park.parked
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the writer reaches the marker store's flock wait");
+    assert!(
+        !path.exists(),
+        "the marker write waits for the gate a reap holds"
+    );
+    drop(holder);
+    park.release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(path.exists(), "the marker lands once the gate is free");
+}
+
+/// The resume-note payload a `sess-live` compaction fires.
+fn sess_live_payload() -> crate::hook_note::Payload {
+    crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: "sess-live".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    }
+}
+
+/// A same-session run that was still live when the resume listed it was never
+/// consumed by that resume: its later host-exit stop is told and kept, never
+/// fenced by the marker the resume left.
+#[test]
+fn a_stop_of_a_run_live_at_the_resume_is_told() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-live".to_string()),
+        ..spec(&id, "work", now - 60_000)
+    };
+    write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-live-1")).unwrap();
+
+    remove_stopped_with_session("sess-live-1", now, now);
+
+    assert!(
+        read(&id).is_some(),
+        "a live run's record is not the resume's to retire"
+    );
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-live-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::hook_jobs::note(&sess_live_payload()),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{id}` on `work`. `delegate` with `session_id: \"sess-live-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "a stop of a run that was live at the resume is told"
+    );
+}
+
+/// The removal claims only what the resume consumed: a stop of a run that
+/// started at or after the resumed run's own start is kept and told.
+#[test]
+fn a_stop_started_at_the_resume_instant_or_later_is_never_claimed() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let started = now + 1_000;
+    let id = new_job_id(started);
+    let spec = RunningSpec {
+        host_session: Some("sess-claim".to_string()),
+        ..spec(&id, "work", started)
+    };
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-claim-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+
+    remove_stopped_with_session("sess-claim-1", now, now);
+
+    assert!(
+        read(&id).is_some(),
+        "a stop of a run started after the resumed run is not the resume's to retire"
+    );
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-claim".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{id}` on `work`. `delegate` with `session_id: \"sess-claim-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "the later run's stop is told"
+    );
+}
+
+/// The strict boundary the instant exists for: the resumed run's own record
+/// carries exactly the resume instant, and its own host-exit stop is told. A
+/// fence widened to `<=` would retire it.
+#[test]
+fn a_host_exit_stop_of_the_resumed_run_itself_is_told() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    std::fs::write(dir.join("sess-own-1.resumed"), now.to_string()).unwrap();
+    let id = new_job_id(now);
+    let spec = RunningSpec {
+        host_session: Some("sess-own".to_string()),
+        ..spec(&id, "work", now)
+    };
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-own-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-own".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{id}` on `work`. `delegate` with `session_id: \"sess-own-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "the resumed run's own stop at its own start instant is told"
+    );
+}
+
+/// A resume consumes a host-exit stop: an envelope-carrying stopped record is
+/// a stop the resume takes, not the finished result it must keep.
+#[test]
+fn a_resume_consumes_a_host_exit_stop() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-stop".to_string()),
+        ..spec(&id, "work", now - 60_000)
+    };
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-stop-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+
+    remove_stopped_with_session("sess-stop-1", now, now);
+
+    assert!(
+        read(&id).is_none(),
+        "a resume consumes the host-exit stop it names"
+    );
+}
+
+/// A marker whose content is not an instant fences every stop, and so does one
+/// carrying the old content — the session id itself. A numeric id read as an
+/// instant would be a centuries-old value and fence nothing.
+#[test]
+fn an_unparsable_marker_fences_every_stop() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let id = new_job_id(now - 60_000);
+    let spec = RunningSpec {
+        host_session: Some("sess-old".to_string()),
+        ..spec(&id, "work", now - 60_000)
+    };
+    write_done(
+        &spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "1234567890",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+    let payload = crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: "sess-old".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    };
+    assert!(
+        crate::hook_jobs::note(&payload).is_some(),
+        "without a marker the note names the stop"
+    );
+    let marker = jobs_dir().unwrap().join("1234567890.resumed");
+
+    std::fs::write(&marker, b"not an instant").unwrap();
+    assert_eq!(
+        crate::hook_jobs::note(&payload),
+        None,
+        "a marker whose content does not parse fences everything"
+    );
+
+    std::fs::write(&marker, b"1234567890").unwrap();
+    assert_eq!(
+        crate::hook_jobs::note(&payload),
+        None,
+        "a marker carrying the session id reads as an old format and fences everything"
+    );
+}
+
+/// A backward wall-clock step between two resumes of one session never
+/// narrows the fence: the earlier resume's instant outranks the later one, so
+/// a stop it consumed is never re-told.
+#[test]
+fn a_backward_step_between_two_resumes_keeps_the_fence_monotone() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let small = now - 60_000;
+    remove_stopped_with_session("sess-step-1", now, now);
+    remove_stopped_with_session("sess-step-1", now, small);
+
+    // A stop of a run that started between the two resumes' instants: the
+    // earlier resume's fence still covers it.
+    let inside = new_job_id(now - 30_000);
+    let inside_spec = RunningSpec {
+        host_session: Some("sess-step".to_string()),
+        ..spec(&inside, "work", now - 30_000)
+    };
+    write_done(
+        &inside_spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-step-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+    // A stop of a run that started after both instants: told, so the equality
+    // below cannot pass on a note that names nothing at all.
+    let after = new_job_id(now + 1_000);
+    let after_spec = RunningSpec {
+        host_session: Some("sess-step".to_string()),
+        ..spec(&after, "work", now + 1_000)
+    };
+    write_done(
+        &after_spec,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "",
+            "session_id": "sess-step-1",
+            "stopped": "host_exit",
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::hook_jobs::note(&crate::hook_note::Payload {
+            event: "SessionStart".to_string(),
+            session_id: "sess-step".to_string(),
+            agent_id: None,
+            tool_name: None,
+            source: Some("resume".to_string()),
+            transcript: None,
+        }),
+        Some(format!(
+            "clauth note: a delegate this session started was stopped when the session exited: \
+             `{after}` on `work`. `delegate` with `session_id: \"sess-step-1\"` and \
+             `profiles: [\"work\"]` resumes it."
+        )),
+        "the earlier resume's fence is not narrowed by a backward step"
     );
 }

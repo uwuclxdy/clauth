@@ -183,6 +183,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
 | `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `services`; a saved `plugin` loads as `services`. edited from the Config tab's `home tab` row. the first herdr launch lands on `services` with the herdr row open instead |
+| `reduce_motion` | bool | `false` | keep the header mascot and the Overview's provider shimmer still; spinners and saving marks keep moving. edited from the Config tab's `reduce motion` row |
 | `show_estimates` | bool | `true` | burn estimates on the Usage tab |
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
@@ -198,9 +199,11 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
 | `[plugin]` | table | `{}` | the Claude Code plugin knob the Services tab's `plugin` card edits ([Claude Code plugin](Claude-Code-Plugin)) |
 | `[plugin] idle_wake` | bool | `true` | the one wake a session idle 55 min gets while a delegate of its own still runs on a 1 h prompt cache, so the cache stays warm; off stops it, and the delegate's result and lost-job wakes still arrive; clauth writes the table only while this is off, and removes it when you turn it back on |
-| `[serve]` | table | `{}` | the daemon-wide session-creation switch and the browser origin list ([REST API](REST-API)) |
+| `[serve]` | table | `{}` | the daemon-wide session-creation switch, the browser origin list and the two halves of the pairing link ([REST API](REST-API)) |
 | `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all, herdr panes and background sessions alike; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
 | `[serve] app_origins` | list | `[]` | the origins whose pages may read the REST API ([REST API](REST-API)); set by hand, read fresh per request; empty sends no CORS header and checks no `Origin`, a terminal ticket aside (its mint needs an `Origin`, and its upgrade must carry the same one). An entry is exact, the form a browser sends: `scheme://host[:port]`, `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]` alone, with a lowercase host and no port that is the scheme's default. Anything else is skipped with one `daemon.log` line, never widened or rewritten: a wildcard, a path or trailing slash, a query, a fragment, userinfo, whitespace, plain `http` on any other host, or a value that is not a string in a list; the rest of `profiles.toml` still loads. While `profiles.toml` does not read or is missing, the daemon keeps in memory the last list a request read; with none read since it started, the list is empty. An entry grants every token paired under it: a script on that origin holds that token's whole tier, so list only origins you run. While the list is non-empty, a paired request carrying an `Origin` it lacks is refused, so a same-origin deployment lists its own origin too. A loopback entry such as `http://localhost:5173` is dev-only, since any process on that port of the browser's machine is that origin. Before giving up a domain, delete its entry and revoke its devices (`clauth devices revoke <name>`): deleting the entry alone revokes nothing, and browser storage follows the origin, so the domain's next owner can use every token stored there |
+| `[serve] app_url` | string | none | the app page that the pairing link `clauth devices pair` prints opens ([REST API](REST-API)), as `app_url = "https://app.example.net"`; set by hand, read by each `pair`. An absolute `https` URL, a path allowed, no fragment (the link's own fragment carries the address and the code), its `scheme://host[:port]` part in the `app_origins` entry form. List that origin in `app_origins` too: the app calls the API from it, an origin missing from the list gets no answer its page can read, and `pair` prints the link either way. Unset, the one `app_origins` entry that counts is the page when it is `https`; with several entries that count, none, or a lone plain-`http` one, `pair` prints no link and, on a terminal or under `--json`, a line naming this key. A value of the wrong form prints no link either, with that line saying why; with no daemon running there is no link and no such line |
+| `[serve] public_address` | string | none | the `host:port` the pairing link names for the daemon, as `public_address = "clauth.example.net:443"`, for a reverse proxy or a name other than the one the daemon publishes; set by hand, read by each `pair`. No scheme, a lowercase host (a bracketed IPv6 address too), a port from 1 to 65535. Unset, the link carries the `listen` address a `--listen` daemon publishes in `status.json` ([Daemon](Daemon#field-notes)). A value of the wrong form prints no link, and once the app's page resolves, a line on a terminal or under `--json` says why; with no daemon running there is no link whatever this holds |
 | `[update]` | table | `{}` | the auto-updater toggle (Config tab) |
 | `[update] auto_update` | bool | `true` | the background update check when the TUI opens and the daemon's remote herdr-plugin reinstall; clauth writes the table only while this is off, and when you turn it back on removes the `auto_update` line, and the table once it holds nothing else; `CLAUTH_NO_UPDATE=1` disables both even when this is on |
 
@@ -325,9 +328,11 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
   base-env.json            # the values your own settings.json held under custom env keys a profile replaced (0600; a value clauth records writing only as a SHA-256 digest)
   mcp-sync-state.json      # the MCP login sync's memory: which login each store, live file and Keychain item held per MCP server (a truncated SHA-256 of its token, never the token) and which logins were signed out (0600); one that does not parse is renamed mcp-sync-state.json.corrupt-<epoch_ms> (0600) before the next save, and the sync then only fills gaps
   .oauth-strip-pending     # a `pid:nanos` stamp saying a switch's `oauthAccount` strip is still owed; the next daemon tick or sync pass strips home `~/.claude.json` under the sync lock and deletes it (0600)
-  jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
-  jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
+  jobs/<id>.json           # backgrounded delegate jobs and the delegates a session's exit stopped, GC'd after a day
+  jobs/<id>.live.json      # a blocking delegate's run while its caller is attached, then its done record until the 24 h sweep
   jobs/<id>.json.delivered # exactly-once delivery ledger after collection
+  jobs/<sid>.resumed       # left each time a `delegate` resumes a session id, so a stop that resume took is never named again (0600; removed after a day)
+  jobs/<id>.pending        # a delegate whose leftover processes clauth could not list when it stopped the run; each `clauth mcp` start retries the stop and removes it once it can (0600)
   keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live session clauth launched (start, delegate, background)
@@ -344,8 +349,8 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
       credentials.json     # OAuth snapshot
       credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
       auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
-      limit_reset_pending_claude.json # a limit-reset spend whose answer was lost; a re-run within 10 minutes re-sends it (0600)
-      limit_resets.json    # the account's banked usage-limit resets, read about once an hour, retried at the usage poll's own backoff when a read is refused or gets no answer (within minutes at the default refresh interval), sooner when a usage window fills or its use falls before its reset, and re-read right after a limit-reset spend that used a reset or found one already used (0600)
+      limit_reset_pending_claude.json # a limit-reset spend whose answer was lost; naming its grant again within 10 minutes re-sends it, and no other grant is spent until then (0600)
+      limit_resets.json    # the account's banked usage-limit resets, every grant with its label, windows, end and state, read about once an hour, retried at the usage poll's own backoff when a read is refused or gets no answer (within minutes at the default refresh interval), sooner when a usage window fills or its use falls before its reset, and re-read right after a limit-reset spend that used a reset or found one already used (0600)
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       note.txt             # the account's free-form note, edited from the Usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
@@ -379,7 +384,8 @@ Login/refresh, usage and codex usage keep the roots they resolved at their first
       auth.lkg.json        # last-known-good copy of auth.json
       auth.attempt         # no-replay memo: a fingerprint of the refresh token last sent
       auth.quarantine.json # the verdict that killed the chain, while its token is still in the store
-      limit_reset_pending_codex.json # the codex twin: a lost consume, re-sent with the same ids within 10 minutes (0600)
+      limit_reset_pending_codex.json # the codex twin: a lost consume, re-sent with the same ids within 10 minutes when its credit is named again (0600)
+      limit_resets.json    # every reset credit the account's last list read named (the daemon's about-hourly codex side read, a clauth limit-reset listing, or a spend's re-read from the CLI or the TUI), re-read after a reset or a no_credit answer; gone when the account logs in as another (0600)
       usage_cache.json     # last usage reading and plan
       codex-home/          # the durable store: sessions/, archived_sessions/, history.jsonl, the sqlite state stores
       codex-home-<sid>/    # one live session's CODEX_HOME, removed at exit

@@ -11018,6 +11018,10 @@ fn the_rotate_refusal_titles_name_their_cause() {
             crate::runtime::RotationBlock::UnreadableJobStore("~/.claude/jobs".into()),
             "'busy' can't be checked for background sessions",
         ),
+        (
+            crate::runtime::RotationBlock::UnreadableJobDir("~/.claude/jobs/0123abcd".into()),
+            "'busy' can't be checked for background sessions",
+        ),
     ] {
         assert_eq!(super::rotate_blocked_message("busy", block), want);
     }
@@ -74748,4 +74752,3376 @@ fn a_stop_signal_arriving_during_the_shutdown_still_decides_the_exit() {
         Some(signal_hook::consts::signal::SIGHUP),
         "a signal recorded during the shutdown decides the exit over the frame error: {outcome:?}"
     );
+}
+
+/// Runs the mascot's launch animation out, then pins the animation clock at
+/// `ms`, so the next event plays at once and its start reads exact.
+fn mascot_idle_at(app: &mut App, ms: u64) {
+    app.anim_phase_ms = Some(0);
+    app.mascot.tick(0);
+    app.mascot.tick(5_000);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the launch animation never ended"
+    );
+    app.anim_phase_ms = Some(ms);
+}
+
+fn two_oauth_accounts_app(first: &str, second: &str) -> App {
+    use crate::profile::{AppConfig, AppState, save_app_state};
+    let names: Vec<ProfileName> = [first, second].map(ProfileName::from).to_vec();
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from(first)),
+        profiles: names.clone(),
+        fallback_chain: names.clone(),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::force_link_profile_credentials(&ProfileName::from(first))
+        .expect("link the first account");
+    App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from(first)),
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles: vec![
+            stored_oauth_profile(first, far_future()),
+            stored_oauth_profile(second, far_future()),
+        ],
+    })
+}
+
+#[test]
+fn a_switch_made_in_the_tui_makes_the_mascot_jump() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_oauth_accounts_app("alpha", "beta");
+    mascot_idle_at(&mut app, 30_000);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a quiet tick moved the mascot"
+    );
+
+    super::perform_switch(&mut app, &ProfileName::from("beta"));
+    super::drain_switch_gates(&mut app);
+    assert!(app.config().is_active(&ProfileName::from("beta")));
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Jump)
+    );
+}
+
+#[test]
+fn a_switch_another_process_makes_reaches_the_mascot_as_a_jump() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_oauth_accounts_app("a", "b");
+    mascot_idle_at(&mut app, 30_000);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a quiet tick moved the mascot"
+    );
+
+    let mut peer = crate::profile::load_config().expect("peer read");
+    crate::actions::switch_profile_locked(&mut peer, &ProfileName::from("b")).expect("peer switch");
+    let state_file = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &state_file,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000),
+    );
+    super::on_tick(&mut app);
+    assert!(
+        app.config().is_active(&ProfileName::from("b")),
+        "the reload read the peer's switch"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Jump)
+    );
+}
+
+fn live_session(id: &str, last_swap_at: Option<u64>) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        last_swap_at,
+        ..crate::testutil::live_row(id, "acct")
+    }
+}
+
+/// A live row that moved onto `member` (`None`: still on its start account)
+/// with its last swap stamped at `last_swap_at`.
+fn live_on(
+    id: &str,
+    member: Option<&str>,
+    last_swap_at: Option<u64>,
+) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        current_member: member.map(str::to_owned),
+        last_swap_at,
+        ..crate::testutil::live_row(id, "acct")
+    }
+}
+
+#[test]
+fn a_new_live_session_makes_the_mascot_waddle() {
+    use crate::live_sessions::LiveTally;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    app.set_live_sessions(LiveTally::of([]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an empty reading moved the mascot"
+    );
+
+    // A session born already swapped is still a new session, not a move.
+    app.set_live_sessions(LiveTally::of([live_session("4242-0", Some(1_000))]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Waddle)
+    );
+}
+
+#[test]
+fn a_session_moving_account_makes_the_mascot_skip_and_one_ending_does_nothing() {
+    use crate::live_sessions::LiveTally;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    app.set_live_sessions(LiveTally::of([live_session("4242-0", None)]));
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    assert_eq!(app.mascot.playing_anim(), None);
+
+    app.set_live_sessions(LiveTally::of([live_on(
+        "4242-0",
+        Some("other"),
+        Some(1_000),
+    )]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Skip)
+    );
+
+    app.mascot.tick(90_000);
+    app.anim_phase_ms = Some(90_000);
+    app.set_live_sessions(LiveTally::of([live_on(
+        "4242-0",
+        Some("other"),
+        Some(1_000),
+    )]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an unchanged reading moved the mascot"
+    );
+    app.set_live_sessions(LiveTally::of([]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an ending session moved the mascot"
+    );
+}
+
+#[test]
+fn a_live_session_at_launch_is_no_event_and_a_later_one_waddles() {
+    use crate::live_sessions::LiveTally;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::live_sessions::register(&live_session("4242-0", None))
+        .expect("register the launch-time session");
+    let _marker =
+        crate::runtime::hold_session_row_marker(&ProfileName::from("acct"), false, "4242-0")
+            .expect("hold the launch-time session's marker");
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    app.set_live_sessions(LiveTally::of([live_session("4242-0", None)]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a session live at launch read as starting"
+    );
+
+    app.set_live_sessions(LiveTally::of([
+        live_session("4242-0", None),
+        live_session("4242-1", None),
+    ]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Waddle),
+        "a session born after launch did not waddle"
+    );
+}
+
+/// One account with no bell threshold, its readings under `status`.
+fn reset_app(status: FetchStatus) -> App {
+    let profile = crate::testutil::blank_profile(&ProfileName::from(GATE_PROFILE));
+    let app = app_with(vec![profile]);
+    app.usage_status
+        .lock()
+        .expect("usage_status mutex poisoned")
+        .insert(GATE_PROFILE.to_string(), status);
+    app
+}
+
+fn set_windows(app: &App, five_hour: Option<String>, seven_day: Option<String>) {
+    let window = |resets_at: Option<String>| {
+        resets_at.map(|resets_at| UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(resets_at),
+        })
+    };
+    app.usage_store
+        .lock()
+        .expect("usage_store mutex poisoned")
+        .insert(
+            GATE_PROFILE.to_string(),
+            UsageInfo {
+                five_hour: window(five_hour),
+                seven_day: window(seven_day),
+                ..UsageInfo::default()
+            },
+        );
+}
+
+fn iso_in(hours: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
+}
+
+#[test]
+fn a_five_hour_or_weekly_window_reset_makes_the_mascot_spin() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    let five = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let week = iso_in(-1);
+    set_windows(&app, Some(five.to_rfc3339()), Some(week.clone()));
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the first reading moved the mascot"
+    );
+
+    // The same instant spelled in another offset is no reset.
+    let same_elsewhere = five
+        .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).expect("offset"))
+        .to_rfc3339();
+    set_windows(&app, Some(same_elsewhere), Some(week.clone()));
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a re-spelled reset moved the mascot"
+    );
+
+    // The 5h window lapses, then reopens on a later reset.
+    set_windows(&app, None, Some(week.clone()));
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a lapsed window moved the mascot"
+    );
+    set_windows(&app, Some(iso_in(6)), Some(week));
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin)
+    );
+
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    set_windows(&app, Some(iso_in(6)), Some(iso_in(48 + 7 * 24)));
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin),
+        "a weekly reset spins too"
+    );
+}
+
+#[test]
+fn a_reset_read_off_a_stale_reading_waits_for_a_fresh_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    set_windows(&app, Some(iso_in(-1)), None);
+    app.apply_usage();
+    app.usage_status
+        .lock()
+        .expect("usage_status mutex poisoned")
+        .insert(GATE_PROFILE.to_string(), FetchStatus::Cached);
+    set_windows(&app, Some(iso_in(6)), None);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a cached reading moved the mascot"
+    );
+
+    app.usage_status
+        .lock()
+        .expect("usage_status mutex poisoned")
+        .insert(GATE_PROFILE.to_string(), FetchStatus::Fresh);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin)
+    );
+}
+
+/// An idle stamp drifts ±1 s around its minute boundary with no reset, so a
+/// read a second later than the one before it is no event.
+#[test]
+fn an_idle_window_stamp_drifting_a_second_forward_is_no_reset() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    let boundary = chrono::Utc::now() + chrono::Duration::hours(1);
+    set_windows(&app, Some(boundary.to_rfc3339()), None);
+    app.apply_usage();
+    set_windows(
+        &app,
+        Some((boundary + chrono::Duration::seconds(1)).to_rfc3339()),
+        None,
+    );
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an idle stamp drifting a second forward moved the mascot"
+    );
+}
+
+/// An idle stamp also re-anchors hours forward while the boundary it last
+/// named is still ahead; only the rollover it waits for is a reset.
+#[test]
+fn a_window_boundary_re_anchored_while_the_old_one_is_ahead_is_no_reset() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    set_windows(&app, Some(iso_in(1)), None);
+    app.apply_usage();
+    set_windows(&app, Some(iso_in(6)), None);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a boundary re-anchored ahead of the old one moved the mascot"
+    );
+}
+
+/// A rollover reports `now + 5h` for a while before settling to the boundary
+/// the window really ends on; the next rollover is measured from the settled
+/// boundary, not from the spike's highest value.
+#[test]
+fn a_rollover_after_a_settled_spike_still_spins() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    let at = |secs: i64| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339();
+    set_windows(&app, Some(at(40)), None);
+    app.apply_usage();
+    set_windows(&app, Some(at(-20)), None);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the spike settling to an earlier boundary moved the mascot"
+    );
+    set_windows(&app, Some(iso_in(5)), None);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin)
+    );
+}
+
+/// The window rolls over once the boundary last named has passed and a fresh
+/// reading names a later one.
+#[test]
+fn a_later_window_boundary_once_the_old_one_has_passed_is_a_reset() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = reset_app(FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    set_windows(&app, Some(iso_in(-1)), None);
+    app.apply_usage();
+    set_windows(&app, Some(iso_in(6)), None);
+    app.apply_usage();
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin),
+        "a boundary after the old one passed played no spin"
+    );
+}
+
+#[test]
+fn a_bell_crossing_makes_the_mascot_peek() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _) = gate_app(&_home, FetchStatus::Fresh);
+    mascot_idle_at(&mut app, 30_000);
+    app.apply_usage();
+    assert!(app.bell_fired.is_ringing(GATE_PROFILE));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Peek)
+    );
+}
+
+#[test]
+fn a_new_status_incident_makes_the_mascot_peek_on_any_tab() {
+    use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
+    let incident = |id: &str| Incident {
+        id: id.into(),
+        title: "api errors".into(),
+        link: String::new(),
+        phase: UpdatePhase::Monitoring,
+        impact: Impact::Minor,
+        started_ms: 1_780_740_881_000,
+        resolved_ms: None,
+        components: Vec::new(),
+        updates: vec![IncidentUpdate {
+            phase: UpdatePhase::Monitoring,
+            at_ms: 1_780_741_000_000,
+            text: String::new(),
+            transitions: Vec::new(),
+        }],
+    };
+    for tab in [super::Tab::Overview, super::Tab::Status] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        app.tab = tab;
+        mascot_idle_at(&mut app, 30_000);
+        super::apply_status_incidents(&mut app, vec![incident("a")], 1, false, false);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "the initial load moved the mascot"
+        );
+        super::apply_status_incidents(&mut app, vec![incident("b")], 2, false, false);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Peek),
+            "{tab:?}"
+        );
+    }
+}
+
+#[test]
+fn a_daemon_on_a_replaced_binary_makes_the_mascot_peek() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    mascot_idle_at(&mut app, 30_000);
+    feed(false);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a plain feed moved the mascot"
+    );
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Peek)
+    );
+}
+
+#[test]
+fn a_quarantined_login_makes_the_mascot_sneeze() {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let work = crate::profile::Profile::new("work".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    let mut app = app_with(vec![work]);
+    mascot_idle_at(&mut app, 30_000);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a quiet tick moved the mascot"
+    );
+
+    crate::oauth::mark_auth_broken(&app.config, &ProfileName::from("work"), true);
+    super::on_tick(&mut app);
+    assert!(app.config().is_auth_broken(&ProfileName::from("work")));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Sneeze)
+    );
+
+    // Lifting it is no failure.
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    crate::oauth::mark_auth_broken(&app.config, &ProfileName::from("work"), false);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a lifted quarantine moved the mascot"
+    );
+}
+
+#[test]
+fn a_failed_refresh_makes_the_mascot_sneeze_and_a_rotation_does_not() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a rotation moved the mascot"
+    );
+
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Err(anyhow::anyhow!("the token endpoint refused")),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Sneeze)
+    );
+}
+
+fn write_fresh_feed() {
+    let secs = (crate::usage::now_ms() / 1000) as i64;
+    write_binary_feed(&crate::usage::epoch_secs_to_iso(secs), false, false);
+}
+
+#[test]
+fn the_daemon_going_down_makes_the_mascot_sneeze_and_starting_does_not() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    mascot_idle_at(&mut app, 30_000);
+    poll_and_land(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Absent);
+
+    let lock = crate::daemon::hold_daemon_lock();
+    write_fresh_feed();
+    poll_and_land(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Fresh);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a daemon start moved the mascot"
+    );
+
+    drop(lock);
+    poll_and_land(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Absent);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Sneeze)
+    );
+}
+
+fn write_done_job(job_id: &str, envelope: serde_json::Value, crashed: bool) {
+    let now = crate::usage::now_ms();
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": job_id,
+            "profile": "acct",
+            "state": "done",
+            "started_at": now - 60_000,
+            "done_at": now - 1_000,
+            "envelope": envelope,
+            "crashed": crashed,
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+}
+
+fn poll_jobs_now(app: &mut App) {
+    app.last_delegate_poll = None;
+    super::poll_delegate_jobs(app);
+}
+
+/// An attached delegate's finish settles its liveness record with an outcome
+/// and no result; the mascot reads that outcome.
+#[test]
+fn an_attached_delegate_finishing_makes_the_mascot_wink_or_sneeze() {
+    for (outcome, expected) in [
+        (true, crate::tui::clawd::Anim::Wink),
+        (false, crate::tui::clawd::Anim::Sneeze),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::switch_tab(&mut app, super::Tab::Overview);
+        mascot_idle_at(&mut app, 30_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "an empty store moved the mascot"
+        );
+
+        let now = crate::usage::now_ms();
+        let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("d-att-0.live.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": "d-att-0",
+                "profile": "acct",
+                "state": "done",
+                "started_at": now - 60_000,
+                "done_at": now - 1_000,
+                "outcome": outcome,
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(expected),
+            "outcome {outcome}"
+        );
+    }
+}
+
+/// A background finish its await hook claims between two polls still reaches
+/// the mascot: the claim leaves its own record of the finish.
+#[test]
+fn a_delegate_finish_claimed_between_two_polls_still_winks_or_sneezes() {
+    for (envelope, expected) in [
+        (
+            serde_json::json!({ "result": "ok" }),
+            crate::tui::clawd::Anim::Wink,
+        ),
+        (
+            serde_json::json!({ "is_error": true, "result": "the model refused" }),
+            crate::tui::clawd::Anim::Sneeze,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::switch_tab(&mut app, super::Tab::Overview);
+        mascot_idle_at(&mut app, 30_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "an empty store moved the mascot"
+        );
+
+        write_done_job("d-claimed-0", envelope.clone(), false);
+        assert!(
+            matches!(
+                crate::mcp::jobs::claim("d-claimed-0", crate::mcp::jobs::Claimant::Hook),
+                crate::mcp::jobs::Claim::Owned(_)
+            ),
+            "fixture control: the hook claimed the finish"
+        );
+        poll_jobs_now(&mut app);
+        assert_eq!(app.mascot.playing_anim(), Some(expected), "{envelope}");
+    }
+}
+
+/// A finish claimed before the TUI's first read is no event, and one finish
+/// cues once whichever spelling a later read meets it in: a claimed finish
+/// already cued, or a record cued and then claimed, stays quiet once the
+/// mascot's same-kind repeat window has run out.
+#[test]
+fn a_claimed_finish_cues_once_and_never_from_before_launch() {
+    let claim_ok = |job_id: &str| {
+        write_done_job(job_id, serde_json::json!({ "result": "ok" }), false);
+        assert!(
+            matches!(
+                crate::mcp::jobs::claim(job_id, crate::mcp::jobs::Claimant::Hook),
+                crate::mcp::jobs::Claim::Owned(_)
+            ),
+            "fixture control: the hook claimed {job_id}"
+        );
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    claim_ok("d-pre-0");
+    mascot_idle_at(&mut app, 30_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a finish claimed before the first read cued on that read"
+    );
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a finish claimed before the first read cued on the next read"
+    );
+
+    claim_ok("d-led-0");
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "a finish claimed between two reads never cued"
+    );
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "one claimed finish played twice"
+    );
+
+    write_done_job("d-rec-0", serde_json::json!({ "result": "ok" }), false);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "fixture control: a finished record cued"
+    );
+    assert!(
+        matches!(
+            crate::mcp::jobs::claim("d-rec-0", crate::mcp::jobs::Claimant::Hook),
+            crate::mcp::jobs::Claim::Owned(_)
+        ),
+        "fixture control: the hook claimed d-rec-0"
+    );
+    app.mascot.tick(90_000);
+    app.anim_phase_ms = Some(90_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a finish cued as a record played again once claimed"
+    );
+}
+
+/// A ledger an older build wrote — before the ledger carried the finish's
+/// verdict — reads as a successful finish, never a failure or nothing.
+#[test]
+fn a_ledger_without_a_failed_key_reads_as_a_finished_ok() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    mascot_idle_at(&mut app, 30_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an empty store moved the mascot"
+    );
+
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("d-plain-0.json.delivered"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-plain-0",
+            "by": "hook",
+            "at": crate::usage::now_ms(),
+            "profile": "acct",
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "a ledger with no failed key read as a failure or nothing"
+    );
+}
+
+/// The job store is read off the Services tab too: a delegate finishing while
+/// the Overview is up still reaches the mascot.
+#[test]
+fn a_delegate_finishing_makes_the_mascot_wink_or_sneeze() {
+    for (envelope, crashed, expected) in [
+        (
+            serde_json::json!({ "result": "ok" }),
+            false,
+            crate::tui::clawd::Anim::Wink,
+        ),
+        (
+            serde_json::json!({ "is_error": true, "result": "the model refused" }),
+            false,
+            crate::tui::clawd::Anim::Sneeze,
+        ),
+        (
+            serde_json::Value::Null,
+            true,
+            crate::tui::clawd::Anim::Sneeze,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::switch_tab(&mut app, super::Tab::Overview);
+        write_done_job("d-before-0", serde_json::json!({ "result": "ok" }), false);
+        mascot_idle_at(&mut app, 30_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "a job done before the first read moved the mascot"
+        );
+        write_done_job("d-new-0", envelope.clone(), crashed);
+        poll_jobs_now(&mut app);
+        assert_eq!(app.mascot.playing_anim(), Some(expected), "{envelope}");
+        app.mascot.tick(60_000);
+        app.anim_phase_ms = Some(60_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(app.mascot.playing_anim(), None, "one finish played twice");
+    }
+}
+
+/// A stopped delegate moves the mascot not at all, whichever shape left the
+/// record: the in-process stop at the host's exit, the sweep's tombstone for
+/// the run it killed, or an isolated run whose transcript was not rescued.
+/// The reads around it still cue a plain finish and a failed one.
+#[test]
+fn a_stopped_delegate_never_moves_the_mascot() {
+    for (stopped_id, envelope, crashed) in [
+        (
+            "d-stop-exit-0",
+            serde_json::json!({
+                "profile": "acct",
+                "stopped": "host_exit",
+                "is_error": true,
+                "elapsed_secs": 61,
+                "result": "the host session's exit stopped the run",
+            }),
+            false,
+        ),
+        ("d-stop-swept-0", serde_json::Value::Null, true),
+        (
+            "d-stop-isolated-0",
+            serde_json::json!({
+                "profile": "acct",
+                "stopped": "host_exit",
+                "is_error": true,
+                "elapsed_secs": 61,
+                "transcript_rescued": false,
+                "result": "the host session's exit stopped the run",
+            }),
+            false,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        super::switch_tab(&mut app, super::Tab::Overview);
+        mascot_idle_at(&mut app, 30_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "an empty store moved the mascot"
+        );
+
+        let now = crate::usage::now_ms();
+        let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join(format!("{stopped_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": stopped_id,
+                "profile": "acct",
+                "state": "done",
+                "started_at": now - 60_000,
+                "done_at": now - 1_000,
+                "envelope": envelope,
+                "crashed": crashed,
+                "stopped": true,
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "{stopped_id} moved the mascot"
+        );
+        let seen = app
+            .mascot_seen
+            .delegates_done
+            .as_ref()
+            .expect("the first read seeds the seen set");
+        assert!(
+            seen.contains(stopped_id),
+            "{stopped_id} never entered the seen set"
+        );
+        app.mascot.tick(60_000);
+        app.anim_phase_ms = Some(60_000);
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "{stopped_id} cued on a later read"
+        );
+
+        write_done_job(
+            "d-finish-ok-0",
+            serde_json::json!({ "result": "ok" }),
+            false,
+        );
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Wink),
+            "a plain finish stopped cueing"
+        );
+        app.mascot.tick(90_000);
+        app.anim_phase_ms = Some(90_000);
+        write_done_job(
+            "d-finish-fail-0",
+            serde_json::json!({ "is_error": true, "result": "the model refused" }),
+            false,
+        );
+        poll_jobs_now(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Sneeze),
+            "a failed finish stopped cueing"
+        );
+    }
+}
+
+/// A stop collected between two reads moves the mascot not at all: one
+/// `monitor` call converts a dead owner's running record, claims it, and
+/// leaves the delivery ledger whose arm reads the claim's own stop verdict.
+/// A ledger an older build wrote, with no stop key, still parses and cues its
+/// finish.
+#[test]
+fn a_stop_collected_between_two_reads_never_moves_the_mascot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    mascot_idle_at(&mut app, 30_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an empty store moved the mascot"
+    );
+    let now = crate::usage::now_ms();
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let id = "d-stop-collected-0";
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": id,
+            "profile": "acct",
+            "state": "running",
+            "started_at": now - 60_000,
+            "session_id": "sess-stop-collected",
+            "owner_pid": 999_999_937u32,
+            "owner_started_at": now - 120_000,
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the running corpse moved the mascot"
+    );
+
+    // What one `monitor` call by id does: the reader sweep converts the
+    // corpse, then the claim consumes it and leaves its delivery ledger.
+    crate::mcp::jobs::gc_running_corpses(crate::usage::now_ms());
+    let converted = crate::mcp::jobs::read(id).expect("the sweep left a tombstone");
+    assert!(
+        converted.stopped,
+        "fixture control: the reader sweep did not convert {id} into a stop"
+    );
+    assert!(
+        matches!(
+            crate::mcp::jobs::claim(id, crate::mcp::jobs::Claimant::Monitor),
+            crate::mcp::jobs::Claim::Owned(_)
+        ),
+        "fixture control: the monitor claim did not own {id}"
+    );
+    let ledger = crate::mcp::jobs::delivery_ledger(id).expect("the claim left a ledger");
+    assert!(
+        ledger.failed,
+        "fixture control: the stop's ledger does not read failed"
+    );
+    app.mascot.tick(90_000);
+    app.anim_phase_ms = Some(90_000);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a stop collected between two reads moved the mascot through its ledger"
+    );
+    let seen = app
+        .mascot_seen
+        .delegates_done
+        .as_ref()
+        .expect("the first read seeds the seen set");
+    assert!(
+        seen.contains(id),
+        "the collected stop never entered the seen set"
+    );
+
+    let old_id = "d-ledger-old-0";
+    std::fs::write(
+        dir.join(format!("{old_id}.json.delivered")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": old_id,
+            "by": "hook",
+            "at": crate::usage::now_ms(),
+            "profile": "acct",
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+    assert!(
+        crate::mcp::jobs::delivery_ledger(old_id).is_some(),
+        "a ledger an older build wrote, with no stop key, no longer parses"
+    );
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "an old ledger with no stop key stopped cueing its finish"
+    );
+}
+
+#[test]
+fn a_login_landing_makes_the_mascot_celebrate() {
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("old"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into()],
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+    crate::testutil::register_names(&["work"]);
+    mascot_idle_at(&mut app, 30_000);
+    super::apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_outcome("new", Some("uuid-new-account")),
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate)
+    );
+}
+
+#[test]
+fn a_first_login_adopted_from_outside_makes_the_mascot_celebrate() {
+    use crate::profile::{AppConfig, AppState, Profile, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let work = Profile::new("work".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        active_profile: Some(ProfileName::from("work")),
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+    mascot_idle_at(&mut app, 30_000);
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+    force_poll(&mut app);
+    assert!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .is_some_and(|p| p.credentials.is_some()),
+        "the poll adopted the login"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate)
+    );
+}
+
+#[test]
+fn an_installed_update_makes_the_mascot_celebrate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.update_results = rx;
+    mascot_idle_at(&mut app, 30_000);
+    tx.send(crate::update::UpdateEvent::Available("9.9.9".to_string()))
+        .expect("send");
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an available update moved the mascot"
+    );
+    tx.send(crate::update::UpdateEvent::Installed("9.9.9".to_string()))
+        .expect("send");
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate)
+    );
+}
+
+/// A key after five minutes with no key plays a small hello; the clock starts
+/// when the TUI opens.
+#[test]
+fn a_key_after_five_quiet_minutes_says_hello() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 5 * 60 * 1000 - 1);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a hello before five minutes"
+    );
+
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 5 * 60 * 1000);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Look | crate::tui::clawd::Anim::Wink)
+        ),
+        "{:?}",
+        app.mascot.playing_anim()
+    );
+}
+
+fn fail_a_refresh(app: &mut App) {
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Err(anyhow::anyhow!("the token endpoint refused")),
+        })
+        .expect("send op result");
+    super::drain_op_results(app);
+}
+
+/// The art header's fit is the same one the header draws by: below 14 rows,
+/// or narrower than the logo, brand, version and daemon chip, the mascot is
+/// hidden and an event drops.
+#[test]
+fn a_terminal_too_small_for_the_art_drops_the_mascots_events() {
+    let fit = 10
+        + "clauth".len()
+        + format!(" v{}", env!("CARGO_PKG_VERSION")).len()
+        + 3
+        + "[ daemon ]".len();
+    let fit = u16::try_from(fit).expect("narrow");
+    for (rows, cols) in [(13, 120), (24, fit - 1)] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = bare_app();
+        mascot_idle_at(&mut app, 30_000);
+        app.update_compact(rows, cols);
+        fail_a_refresh(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "{rows}x{cols} played a hidden event"
+        );
+        app.update_compact(14, fit);
+        app.mascot.tick(30_080);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "a hidden event played later"
+        );
+        fail_a_refresh(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            Some(crate::tui::clawd::Anim::Sneeze),
+            "{rows}x{cols} then {fit} cols"
+        );
+    }
+}
+
+/// The Config row flips `reduce_motion`, saves it, and stills the mascot at
+/// once.
+#[test]
+fn reduce_motion_saves_from_its_config_row_and_stills_the_mascot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    super::run_global_config_row(&mut app, super::GlobalConfigRow::ReduceMotion);
+    let saved = crate::profile::load_config().expect("reload");
+    assert!(saved.state.reduce_motion, "the row saved the key");
+    fail_a_refresh(&mut app);
+    assert!(
+        app.mascot.frame(30_080).is_none(),
+        "a still mascot moved on an event"
+    );
+
+    super::run_global_config_row(&mut app, super::GlobalConfigRow::ReduceMotion);
+    assert!(
+        !crate::profile::load_config()
+            .expect("reload")
+            .state
+            .reduce_motion
+    );
+    app.anim_phase_ms = Some(60_000);
+    fail_a_refresh(&mut app);
+    assert!(
+        app.mascot.frame(60_080).is_some(),
+        "motion did not come back"
+    );
+}
+
+#[test]
+fn a_launch_with_reduce_motion_set_starts_still() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            reduce_motion: true,
+            ..crate::profile::AppState::default()
+        },
+        profiles: Vec::new(),
+    });
+    app.mascot.tick(0);
+    assert!(
+        app.mascot.frame(0).is_none(),
+        "the launch animation played under reduce_motion"
+    );
+}
+
+// ── rename edges ─────────────────────────────────────────────────────────
+
+/// Three accounts each holding a stored id on disk, with `active` and
+/// `broken` written into the persisted state before the App is built, so the
+/// construct seed reads every name's id from there.
+fn ided_accounts_app(active: Option<&str>, broken: &[&str]) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names = ["alpha", "beta", "gamma"];
+    crate::testutil::register_names(&names);
+    let profiles: Vec<crate::profile::Profile> = names
+        .iter()
+        .map(|name| {
+            let mut profile = crate::testutil::blank_profile(&ProfileName::from(*name));
+            profile.credentials = Some(creds_ra(
+                &format!("rt-rename-{name}"),
+                &format!("at-rename-{name}"),
+            ));
+            crate::profile::save_profile(&profile).expect("save the fixture profile");
+            crate::testutil::profile_id(name);
+            profile
+        })
+        .collect();
+    let state = AppState {
+        active_profile: active.map(ProfileName::from),
+        profiles: names.iter().map(|name| ProfileName::from(*name)).collect(),
+        auth_broken: broken.iter().map(|name| ProfileName::from(*name)).collect(),
+        preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist the fixture state");
+    App::new(AppConfig { state, profiles })
+}
+
+/// Rename the Setup row at `cursor` to `new` through the tab's own key and
+/// commit it.
+fn rename_through_setup(app: &mut App, cursor: usize, new: &str) {
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(cursor);
+    super::handle_key(app, key(KeyCode::Enter));
+    if let Some(draft) = app.config_draft.as_mut() {
+        draft.name = InputState::new(new);
+    }
+    assert!(super::commit_rename(app), "the rename landed");
+}
+
+/// Move `profiles.toml` past the reloader's fingerprint and run a tick, the
+/// way another process's write lands.
+fn tick_after_peer_write(app: &mut App) {
+    let state_file = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &state_file,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000),
+    );
+    super::on_tick(app);
+}
+
+#[test]
+fn renaming_the_active_account_in_the_tui_does_not_make_the_mascot_jump() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = ided_accounts_app(Some("alpha"), &[]);
+    mascot_idle_at(&mut app, 30_000);
+    rename_through_setup(&mut app, 0, "alpha2");
+    assert!(
+        app.config().is_active(&ProfileName::from("alpha2")),
+        "the rename moved the active marker"
+    );
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "renaming the active account played the switch jump"
+    );
+}
+
+#[test]
+fn a_peer_rename_of_the_active_account_does_not_make_the_mascot_jump() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = ided_accounts_app(Some("alpha"), &[]);
+    mascot_idle_at(&mut app, 30_000);
+    let alpha = ProfileName::from("alpha");
+    let alpha2 = ProfileName::from("alpha2");
+    let mut peer = crate::profile::load_config().expect("peer read");
+    let rotation = crate::actions::rotation_guard_for_mutation(&alpha).expect("rotation guard");
+    crate::actions::rename_profile(&mut peer, &alpha, &alpha2, &rotation).expect("peer rename");
+    drop(rotation);
+    tick_after_peer_write(&mut app);
+    assert!(
+        app.config().is_active(&alpha2),
+        "the reload read the peer's rename"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a peer rename played the switch jump"
+    );
+}
+
+#[test]
+fn renaming_a_quarantined_account_does_not_make_the_mascot_sneeze() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = ided_accounts_app(Some("alpha"), &["beta"]);
+    mascot_idle_at(&mut app, 30_000);
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the seed tick moved the mascot"
+    );
+    rename_through_setup(&mut app, 1, "beta2");
+    assert!(
+        app.config()
+            .state
+            .auth_broken
+            .iter()
+            .any(|name| name.as_str() == "beta2"),
+        "the quarantine record followed the rename"
+    );
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "renaming a quarantined account played the sneeze"
+    );
+}
+
+#[test]
+fn a_real_switch_in_the_same_reload_as_a_peer_rename_still_jumps() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = ided_accounts_app(Some("alpha"), &[]);
+    mascot_idle_at(&mut app, 30_000);
+    let beta = ProfileName::from("beta");
+    let beta2 = ProfileName::from("beta2");
+    let gamma = ProfileName::from("gamma");
+    let mut peer = crate::profile::load_config().expect("peer read");
+    let rotation = crate::actions::rotation_guard_for_mutation(&beta).expect("rotation guard");
+    crate::actions::rename_profile(&mut peer, &beta, &beta2, &rotation).expect("peer rename");
+    drop(rotation);
+    crate::actions::switch_profile_locked(&mut peer, &gamma).expect("peer switch");
+    tick_after_peer_write(&mut app);
+    assert!(
+        app.config().is_active(&gamma),
+        "the reload read the peer's switch"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Jump),
+        "a real switch was swallowed as a rename"
+    );
+}
+
+#[test]
+fn renaming_a_non_active_account_stays_silent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = ided_accounts_app(Some("alpha"), &[]);
+    mascot_idle_at(&mut app, 30_000);
+    let beta = ProfileName::from("beta");
+    let beta2 = ProfileName::from("beta2");
+    let mut peer = crate::profile::load_config().expect("peer read");
+    let rotation = crate::actions::rotation_guard_for_mutation(&beta).expect("rotation guard");
+    crate::actions::rename_profile(&mut peer, &beta, &beta2, &rotation).expect("peer rename");
+    drop(rotation);
+    tick_after_peer_write(&mut app);
+    assert!(
+        app.config()
+            .profiles
+            .iter()
+            .any(|profile| profile.name == beta2),
+        "the reload read the peer's rename"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "renaming a non-active account moved the mascot"
+    );
+}
+
+// ── daemon health writer ─────────────────────────────────────────────────
+
+#[test]
+fn a_daemon_stop_run_from_the_tui_makes_the_mascot_sneeze() {
+    use crate::daemon::{DaemonHealth, DaemonStop, StartOutcome};
+    let _home = crate::testutil::HomeSandbox::new();
+    let lock = crate::daemon::hold_daemon_lock();
+    write_fresh_feed();
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "fixture control: construction read the running daemon"
+    );
+    mascot_idle_at(&mut app, 30_000);
+    drop(lock);
+    app.daemon_control_tx
+        .send(super::DaemonControlResult::Stop(Ok(DaemonStop::Stopped)))
+        .expect("send the stop");
+    super::drain_daemon_control(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Absent);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Sneeze),
+        "a TUI stop played no sneeze"
+    );
+
+    let lock = crate::daemon::hold_daemon_lock();
+    write_fresh_feed();
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    app.daemon_control_tx
+        .send(super::DaemonControlResult::Start(Ok(StartOutcome::Holding)))
+        .expect("send the start");
+    super::drain_daemon_control(&mut app);
+    assert_eq!(app.daemon_health, DaemonHealth::Fresh);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a daemon start moved the mascot"
+    );
+    drop(lock);
+}
+
+// ── delegate store readability ───────────────────────────────────────────
+
+#[test]
+fn an_unreadable_job_store_neither_seeds_nor_cues_the_delegate_edge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    mascot_idle_at(&mut app, 30_000);
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(dir.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&dir, b"not a directory").expect("pose an unreadable store");
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an unreadable read moved the mascot"
+    );
+    std::fs::remove_file(&dir).expect("clear the posed file");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    write_done_job("d-old-0", serde_json::json!({ "result": "ok" }), false);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an old finish cued after an unreadable first read"
+    );
+    write_done_job("d-new-0", serde_json::json!({ "result": "ok" }), false);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "a new finish played no wink"
+    );
+}
+
+/// A box that has never run a delegate has no jobs directory; that is an
+/// empty store, so the first done record is a finish, not the seed.
+#[test]
+fn a_missing_job_dir_seeds_empty_and_a_first_finish_cues() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::switch_tab(&mut app, super::Tab::Overview);
+    mascot_idle_at(&mut app, 30_000);
+    let dir = crate::mcp::jobs::jobs_dir().expect("jobs dir");
+    assert!(
+        !dir.exists(),
+        "fixture control: the sandbox has no jobs dir"
+    );
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an empty store moved the mascot"
+    );
+    write_done_job("d-first-0", serde_json::json!({ "result": "ok" }), false);
+    poll_jobs_now(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Wink),
+        "the first finish after an empty store played no wink"
+    );
+}
+
+// ── login landings ───────────────────────────────────────────────────────
+
+#[test]
+fn a_console_login_landing_makes_the_mascot_celebrate() {
+    use crate::profile::{ConsoleCredential, ConsoleSite};
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url = Some(base.to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(base);
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "old".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&qwen).expect("save the fixture profile");
+    crate::testutil::register_names(&["qwen"]);
+    let mut app = app_with(vec![qwen]);
+    mascot_idle_at(&mut app, 30_000);
+    let session = login_session("qwen", false, 1);
+    super::apply_console_login(&mut app, session, console_outcome("token-new"));
+    assert!(
+        app.toasts
+            .iter()
+            .any(|toast| toast.body.contains("console session captured for 'qwen'")),
+        "fixture control: the console landing toasts"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate),
+        "a console login landing played no celebrate"
+    );
+}
+
+#[test]
+fn a_codex_relogin_landing_makes_the_mascot_celebrate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(Vec::new());
+    mascot_idle_at(&mut app, 30_000);
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-one".to_string(),
+        generation: 9,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    app.codex_login_result_tx
+        .send((9, "cdx-one".to_string(), Ok("cdx-one".to_string())))
+        .expect("send the landing");
+    super::drain_codex_login(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|toast| toast.body.contains("logged in 'cdx-one'")),
+        "fixture control: the codex relogin toasts"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate),
+        "a codex relogin landing played no celebrate"
+    );
+}
+
+#[test]
+fn a_codex_new_login_landing_makes_the_mascot_celebrate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(Vec::new());
+    mascot_idle_at(&mut app, 30_000);
+    let mut draft = super::build_draft_new();
+    draft.account_type = super::NewAccountType::Codex;
+    app.config_draft = Some(draft);
+    app.codex_login = Some(super::CodexLoginSession {
+        name: "cdx-new".to_string(),
+        generation: 4,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: true,
+    });
+    app.codex_new_login_result_tx
+        .send((
+            4,
+            Ok(crate::codex_login::CodexLoginOutcome {
+                auth_json: crate::testutil::codex_auth_body("acc.1", "refresh.new").into_bytes(),
+                account_id: Some("acc".to_string()),
+            }),
+        ))
+        .expect("send the landing");
+    super::drain_codex_new_login(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|toast| toast.body.contains("logged in\ncreate account saves it")),
+        "fixture control: the codex + new landing stages"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate),
+        "a codex + new landing played no celebrate"
+    );
+}
+
+#[test]
+fn a_claude_draft_mint_landing_makes_the_mascot_celebrate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(Vec::new());
+    mascot_idle_at(&mut app, 30_000);
+    app.config_draft = Some(super::build_draft_new());
+    let session = login_session("new-account", true, 1);
+    super::apply_login(&mut app, session, login_outcome("rt-draft-mint", None));
+    assert!(
+        app.toasts
+            .iter()
+            .any(|toast| toast.body.contains("logged in\ncreate account saves it")),
+        "fixture control: the claude draft mint stages"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Celebrate),
+        "a claude draft mint landing played no celebrate"
+    );
+}
+
+#[test]
+fn an_external_reduce_motion_write_applies_on_the_next_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(Vec::new());
+    mascot_idle_at(&mut app, 30_000);
+    let mut state = crate::profile::load_app_state().expect("state read");
+    state.reduce_motion = true;
+    crate::profile::save_app_state(&state).expect("external write");
+    tick_after_peer_write(&mut app);
+    assert!(
+        app.config().state.reduce_motion,
+        "fixture control: the reload read the external write"
+    );
+    app.cue_mascot(crate::tui::mascot::Cue::Switch);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an externally written reduce_motion did not still the mascot"
+    );
+}
+
+/// A swap stamp that moves while the session stays on its account (a token
+/// converging in place) is no move; a later swap onto another account is.
+#[test]
+fn a_swap_stamp_on_the_same_account_is_no_move_and_a_new_account_is() {
+    use crate::live_sessions::LiveTally;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    app.set_live_sessions(LiveTally::of([live_on("4242-0", None, None)]));
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    assert_eq!(app.mascot.playing_anim(), None);
+
+    app.set_live_sessions(LiveTally::of([live_on(
+        "4242-0",
+        Some("acct"),
+        Some(1_000),
+    )]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a swap onto the account the session already ran on moved the mascot"
+    );
+    app.set_live_sessions(LiveTally::of([live_on("4242-0", None, Some(2_000))]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a restamped swap with no member moved the mascot"
+    );
+
+    app.set_live_sessions(LiveTally::of([live_on(
+        "4242-0",
+        Some("other"),
+        Some(3_000),
+    )]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Skip)
+    );
+
+    app.mascot.tick(90_000);
+    app.anim_phase_ms = Some(90_000);
+    app.set_live_sessions(LiveTally::of([live_on(
+        "4242-0",
+        Some("other"),
+        Some(4_000),
+    )]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a second swap stamp on the account already moved to moved the mascot"
+    );
+}
+
+/// The codex roster, `active` holding its active slot.
+fn write_codex_roster_active(names: &[&str], active: &str) {
+    let list = names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::testutil::write_codex_state(&format!(
+        "active_profile = \"{active}\"\nprofiles = [{list}]\n"
+    ));
+}
+
+/// Codex `name`'s usage cache, read now, with each window's reset at the given
+/// instant (`None`: no such window).
+fn write_codex_windows(name: &str, five_hour: Option<String>, seven_day: Option<String>) {
+    let window = |resets_at: Option<String>| {
+        resets_at.map(|resets_at| UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(resets_at),
+        })
+    };
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: window(five_hour),
+            seven_day: window(seven_day),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..UsageInfo::default()
+        },
+    );
+}
+
+/// One tick with the codex roster's once-a-second refresh due.
+fn tick_codex_due(app: &mut App) {
+    app.last_codex_rows_refresh = None;
+    super::on_tick(app);
+}
+
+#[test]
+fn a_codex_switch_another_process_makes_reaches_the_mascot_as_a_jump() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster_active(&["cx1", "cx2"], "cx1");
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    tick_codex_due(&mut app);
+    assert!(
+        app.codex_rows
+            .iter()
+            .any(|row| row.active && row.name.as_str() == "cx1"),
+        "fixture control: cx1 holds the codex active slot"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a quiet tick moved the mascot"
+    );
+
+    write_codex_roster_active(&["cx1", "cx2"], "cx2");
+    tick_codex_due(&mut app);
+    assert!(
+        app.codex_rows
+            .iter()
+            .any(|row| row.active && row.name.as_str() == "cx2"),
+        "fixture control: the refresh read the switch"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Jump)
+    );
+}
+
+#[test]
+fn a_codex_quarantine_makes_the_mascot_sneeze_and_lifting_it_does_not() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster_active(&["cx1"], "cx1");
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a quiet tick moved the mascot"
+    );
+
+    crate::codex_auth::quarantine_for_test("cx1", "invalid_grant", "dead-refresh");
+    tick_codex_due(&mut app);
+    assert!(
+        app.codex_rows.iter().any(|row| row.broken),
+        "fixture control: the refresh read the quarantine"
+    );
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Sneeze)
+    );
+
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    crate::codex_auth::clear_quarantine("cx1");
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "a lifted quarantine moved the mascot"
+    );
+}
+
+#[test]
+fn a_codex_rollover_after_a_settled_spike_still_spins() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster_active(&["cx1"], "cx1");
+    let at = |secs: i64| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339();
+    write_codex_windows("cx1", Some(at(40)), None);
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    tick_codex_due(&mut app);
+    write_codex_windows("cx1", Some(at(-20)), None);
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the spike settling to an earlier boundary moved the mascot"
+    );
+    write_codex_windows("cx1", Some(iso_in(5)), None);
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin)
+    );
+}
+
+#[test]
+fn a_codex_five_hour_or_weekly_window_reset_makes_the_mascot_spin() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster_active(&["cx1"], "cx1");
+    let week = iso_in(-1);
+    write_codex_windows("cx1", Some(iso_in(-1)), Some(week.clone()));
+    let mut app = bare_app();
+    mascot_idle_at(&mut app, 30_000);
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the first reading moved the mascot"
+    );
+
+    write_codex_windows("cx1", Some(iso_in(6)), Some(week));
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin)
+    );
+
+    app.mascot.tick(60_000);
+    app.anim_phase_ms = Some(60_000);
+    write_codex_windows("cx1", Some(iso_in(6)), Some(iso_in(48 + 7 * 24)));
+    tick_codex_due(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Spin),
+        "a weekly reset spins too"
+    );
+}
+
+#[test]
+fn an_unread_tally_between_readings_waddles_nothing() {
+    use crate::live_sessions::LiveTally;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.set_live_sessions(LiveTally::of([live_session("s-one", None)]));
+    mascot_idle_at(&mut app, 30_000);
+    app.set_live_sessions(LiveTally::unread());
+    app.set_live_sessions(LiveTally::of([live_session("s-one", None)]));
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "an unread tally read as an empty store"
+    );
+}
+
+mod limit_reset_modal {
+    use super::super::{
+        LimitResetPhase, Modal, Tab, build_action_menu, drain_limit_reset, handle_key,
+        limit_reset_form,
+    };
+    use super::{App, app_with};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+
+    const THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
+
+    /// `cl2` saved with an OAuth login whose access token is `at.cl2`, its
+    /// stored reading the three-grant body's, on the Usage tab.
+    fn reset_app(body: &str) -> App {
+        crate::testutil::register_names(&["cl2"]);
+        let mut profile = crate::profile::Profile::new("cl2".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at.cl2".into(),
+                refresh_token: Some("rt.cl2".into()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save cl2");
+        let mut app = app_with(vec![profile]);
+        crate::profile::save_app_state(&app.config().state).expect("save state");
+        let status = crate::usage::claude_reset::read_status(body).expect("a block");
+        app.claude_resets.insert(
+            "cl2".to_string(),
+            crate::usage::claude_reset::status_reading(&status),
+        );
+        app.tab = Tab::Usage;
+        app.profile_cursor.set(0);
+        app
+    }
+
+    fn labels(app: &App) -> Vec<&'static str> {
+        build_action_menu(app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .collect()
+    }
+
+    /// The Usage menu offers `use a limit reset` exactly while the focused
+    /// account's stored reading names a reset it still holds, on the hotkey
+    /// its label's first letter gives; no reading, or only used grants, offer
+    /// nothing.
+    #[test]
+    fn the_usage_menu_offers_a_reset_only_while_one_is_held() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        assert!(
+            labels(&app).contains(&"use a limit reset"),
+            "{:?}",
+            labels(&app)
+        );
+        assert_eq!(super::menu_hotkey(&app, "use a limit reset"), 'u');
+
+        let spent = THREE_GRANTS.replace(r#""resets_left": 1"#, r#""resets_left": 0"#);
+        let status = crate::usage::claude_reset::read_status(&spent).expect("a block");
+        app.claude_resets.insert(
+            "cl2".to_string(),
+            crate::usage::claude_reset::status_reading(&status),
+        );
+        assert!(limit_reset_form(&app).is_none());
+        assert!(!labels(&app).contains(&"use a limit reset"));
+
+        app.claude_resets.clear();
+        assert!(!labels(&app).contains(&"use a limit reset"));
+    }
+
+    /// The modal lists every grant with the focused one's details, and its
+    /// `use reset` is off on a grant the server marks unusable; the arrows walk
+    /// the list (wrapping) and the buttons.
+    #[test]
+    fn the_modal_lists_every_reset_and_names_the_focused_one() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let form = limit_reset_form(&app).expect("a form");
+        let labels: Vec<&str> = form.resets.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Old reset", "Weekly reset", "limit reset"]);
+        assert_eq!(form.available, "2/3 available");
+        assert_eq!(
+            form.resets[1].rows,
+            [
+                ("id", "g-week".to_string()),
+                ("resets", "5h, 7d".to_string()),
+                ("valid", "—".to_string()),
+                ("left", "1 of 2".to_string()),
+                ("state", "ready".to_string()),
+                ("now", "60% of 7d left".to_string()),
+            ]
+        );
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Up));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the modal stays open");
+        };
+        assert_eq!(form.cursor, 2, "↑ from the first wraps to the last");
+        assert_eq!(form.focused().map(|r| r.id.as_str()), Some("g-cool"));
+        assert!(!form.can_use(), "a cooling grant keeps the button off");
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("an off button closes nothing");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Idle,
+            "an off button sends nothing"
+        );
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("backend");
+        term.draw(|f| crate::tui::draw(f, &app)).expect("draw");
+        let rows: Vec<Vec<char>> = crate::testutil::buffer_rows(term.backend().buffer())
+            .iter()
+            .map(|r| r.chars().collect())
+            .collect();
+        let top = rows
+            .iter()
+            .position(|r| r.iter().collect::<String>().contains("USE A LIMIT RESET"))
+            .expect("the modal's title row");
+        let left = rows[top]
+            .iter()
+            .position(|c| *c == '╭')
+            .expect("left corner");
+        let right = rows[top]
+            .iter()
+            .position(|c| *c == '╮')
+            .expect("right corner");
+        let body: Vec<String> = rows[top + 1..]
+            .iter()
+            .take_while(|r| r.get(left) != Some(&'╰'))
+            .map(|r| {
+                r[left + 1..right]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            body,
+            [
+                "",
+                "  cl2 · 2/3 available",
+                "",
+                "    Old reset",
+                "    Weekly reset",
+                "  ❯ limit reset",
+                "",
+                "  id        g-cool",
+                "  resets    5h, seven_day_blue",
+                "  valid     —",
+                "  left      1 of 1",
+                "  state     cooldown",
+                "",
+                "           cancel   use reset",
+                "",
+            ]
+        );
+    }
+
+    /// A fresh pending record pins its grant: another grant reads the record's
+    /// refusal with its button off, the recorded one can be re-sent.
+    #[test]
+    fn a_fresh_record_pins_the_modal_to_its_grant() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = reset_app(THREE_GRANTS);
+        let sent_at_ms = crate::usage::now_ms();
+        let path = crate::usage::limit_reset_pending::path::<
+            crate::usage::limit_reset_pending::ClaudePending,
+        >(&crate::profile::ProfileName::from("cl2"))
+        .expect("path");
+        crate::usage::limit_reset_pending::write(
+            &path,
+            &crate::usage::limit_reset_pending::ClaudePending {
+                grant_id: "g-old".to_string(),
+                request_id: "seeded-id".to_string(),
+                sent_at_ms,
+            },
+        )
+        .expect("record");
+        assert_eq!(limit_reset_form(&app).expect("a form").pinned, None);
+        let mut form = super::super::pin_pending_reset(limit_reset_form(&app).expect("a form"));
+        assert!(form.can_use(), "the recorded grant can be re-sent");
+        form.cursor = 1;
+        assert_eq!(
+            form.pinned_refusal(),
+            Some(
+                crate::usage::claude_reset::pinned_record_line("cl2", "g-old", sent_at_ms).as_str()
+            )
+        );
+        assert!(!form.can_use());
+    }
+
+    /// `use reset` runs the CLI's spend core on a worker against the stub: the
+    /// read, the org read, one POST naming the focused grant, the re-read; a
+    /// second press while it runs sends nothing; the outcome lands as a
+    /// success toast and closes the modal.
+    #[test]
+    fn use_reset_spends_the_focused_grant_once_off_the_key_thread() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let spent = r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour"]}"#;
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, _| {
+            if path.starts_with("/api/oauth/usage") {
+                (200, THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (200, spent.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        let form = limit_reset_form(&app).expect("a form");
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the modal stays open while the spend runs");
+        };
+        assert_eq!(form.phase, LimitResetPhase::Spending);
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        assert!(app.modals.is_empty(), "a success closes the modal");
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((
+                super::super::ToastKind::Success,
+                "limit reset used\nused a limit reset on 'cl2': reset 5h, 0 left."
+            ))
+        );
+        let seen = handle.join().expect("stub");
+        let lines: Vec<&str> = seen
+            .iter()
+            .map(|r| r.lines().next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 HTTP/1.1",
+                "GET /api/oauth/profile HTTP/1.1",
+                "POST /api/organizations/org-1/reset_rate_limits HTTP/1.1",
+                "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 HTTP/1.1",
+            ],
+            "one spend for two presses"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&crate::testutil::request_body(&seen[2])).expect("json");
+        assert_eq!(
+            body["grant_id"], "g-old",
+            "the focused grant, the list's first"
+        );
+    }
+
+    /// A server refusal stays in the modal, in the error colour's line, and
+    /// spends nothing.
+    #[test]
+    fn a_server_refusal_stays_in_the_modal() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let refused = r#"{"result":"unavailable","reason":"not_next_grant"}"#;
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(4, move |path, _| {
+            if path.starts_with("/api/oauth/usage") {
+                (200, THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (200, refused.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        let form = limit_reset_form(&app).expect("a form");
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("a refusal keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "the server refused this reset (not_next_grant); no reset was used".to_string()
+            )
+        );
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("backend");
+        term.draw(|f| crate::tui::draw(f, &app)).expect("draw");
+        let refused = "the server refused this reset (not_next_grant); no reset was used";
+        let cells =
+            crate::testutil::needle_cells(term.backend().buffer(), refused).unwrap_or_else(|| {
+                panic!(
+                    "the modal body holds {refused:?}:\n{}",
+                    crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+                )
+            });
+        for cell in cells {
+            if cell.symbol() != " " {
+                assert_eq!(
+                    cell.fg,
+                    crate::tui::theme::danger_color(),
+                    "the refusal reads in the error colour"
+                );
+            }
+        }
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            3,
+            "no re-read after a refusal"
+        );
+    }
+
+    /// A spend whose modal was closed lands nowhere else: a modal reopened
+    /// while the account's spend is in flight shows `Spending` (so `↵` starts
+    /// nothing), the closed spend's result toasts, and a second spend's own
+    /// result stays on its modal.
+    #[test]
+    fn a_closed_spends_result_toasts_and_a_second_spend_lands_on_its_own_modal() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(6, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                (200, THREE_GRANTS.to_string())
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else if i == 2 {
+                (
+                    200,
+                    r#"{"result":"unavailable","reason":"first_spend"}"#.to_string(),
+                )
+            } else {
+                (
+                    200,
+                    r#"{"result":"unavailable","reason":"second_spend"}"#.to_string(),
+                )
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        app.open_modal(Modal::LimitReset(limit_reset_form(&app).expect("a form")));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(
+            app.modals.is_empty(),
+            "esc closed the first modal mid-spend"
+        );
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reopened modal is open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Spending,
+            "the reopened modal shows the spend still in flight"
+        );
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("backend");
+        term.draw(|f| crate::tui::draw(f, &app)).expect("draw");
+        let text = modal_body(term.backend().buffer()).join("\n");
+        assert!(
+            !text.contains("first_spend"),
+            "the closed spend's line never reaches the reopened modal: {text}"
+        );
+        handle_key(&mut app, key(KeyCode::Enter));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("↵ while a spend runs sends nothing");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Spending,
+            "↵ is inert while the account's spend runs"
+        );
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the first spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("a refused result keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Idle,
+            "the drained result never lands on the reopened modal"
+        );
+        assert_eq!(
+            app.toasts
+                .iter()
+                .map(|t| t.body.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "limit reset not used\nthe server refused this reset (first_spend); no reset was \
+                 used"
+            ],
+            "the closed spend's own result toasts"
+        );
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the second spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the second refusal keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "the server refused this reset (second_spend); no reset was used".to_string()
+            ),
+            "the second spend's result lands on its own modal"
+        );
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            6,
+            "one read, one org read and one POST per spend"
+        );
+    }
+
+    /// The modal's interior rows: between its top border and its bottom-left
+    /// corner, trimmed.
+    fn modal_body(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let rows: Vec<Vec<char>> = crate::testutil::buffer_rows(buffer)
+            .iter()
+            .map(|row| row.chars().collect())
+            .collect();
+        let top = rows
+            .iter()
+            .position(|row| row.iter().collect::<String>().contains("USE A LIMIT RESET"))
+            .expect("the modal's title row");
+        let left = rows[top]
+            .iter()
+            .position(|c| *c == '╭')
+            .expect("left corner");
+        let right = rows[top]
+            .iter()
+            .position(|c| *c == '╮')
+            .expect("right corner");
+        rows[top + 1..]
+            .iter()
+            .take_while(|row| row.get(left) != Some(&'╰'))
+            .map(|row| {
+                row[left + 1..right]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A form reopened while the account's spend ran holds the rows it was
+    /// built with, older than the spend's own re-read: once the spend lands,
+    /// its stored reading rebuilds them, so the reset it just used is not
+    /// offered again and `↵` on it sends nothing.
+    #[test]
+    fn a_reopened_modal_settles_its_rows_from_the_spend_that_landed() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let spent = THREE_GRANTS.replace(
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 1"#,
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 0"#,
+        );
+        assert_ne!(spent, THREE_GRANTS, "the spent grant applied");
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    (200, THREE_GRANTS.to_string())
+                } else {
+                    (200, spent.clone())
+                }
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour"]}"#
+                        .to_string(),
+                )
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        app.open_modal(Modal::LimitReset(limit_reset_form(&app).expect("a form")));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.modals.is_empty(), "esc closed the modal mid-spend");
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reopened modal is open");
+        };
+        assert_eq!(
+            form.available, "2/3 available",
+            "the reopened form's rows predate the spend's re-read"
+        );
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("another spend's result leaves the reopen's form open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Idle,
+            "the result it waited on leaves the form idle"
+        );
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((
+                super::super::ToastKind::Success,
+                "limit reset used\nused a limit reset on 'cl2': reset 5h, 0 left."
+            ))
+        );
+        assert_eq!(
+            form.available, "1/2 available",
+            "the stored reading's own count replaces the open-time one"
+        );
+        let row = form
+            .resets
+            .iter()
+            .find(|reset| reset.id == "g-old")
+            .expect("the spent reset is listed");
+        assert!(!row.usable, "the spent reset is not offered again");
+        assert_eq!(
+            row.rows,
+            [
+                ("id", "g-old".to_string()),
+                ("resets", "5h".to_string()),
+                ("valid", "—".to_string()),
+                ("left", "0 of 1".to_string()),
+                ("state", "used".to_string()),
+                ("now", "0% of 5h left".to_string()),
+            ],
+            "the re-landed reading rebuilds the spent reset's rows"
+        );
+        assert!(!form.can_use(), "use reset is off on the spent reset");
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            4,
+            "one read, one org read, one POST and the re-read; ↵ on the spent reset sends nothing"
+        );
+    }
+
+    /// The same reopen when the spend's re-read fails: no reading was stored,
+    /// so the reopened form keeps its open-time rows, but the reset the spend
+    /// used is turned off by its id, never the reopened form's focused row:
+    /// the spend takes the second reset while the reopen focuses the first.
+    #[test]
+    fn a_reopened_modal_turns_the_spent_reset_off_when_its_reread_failed() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    (200, THREE_GRANTS.to_string())
+                } else {
+                    (500, "{}".to_string())
+                }
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour"]}"#
+                        .to_string(),
+                )
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        app.open_modal(Modal::LimitReset(limit_reset_form(&app).expect("a form")));
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.modals.is_empty(), "esc closed the modal mid-spend");
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("another spend's result leaves the reopen's form open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Idle,
+            "the result it waited on leaves the form idle"
+        );
+        assert_eq!(
+            form.focused().map(|reset| reset.id.as_str()),
+            Some("g-old"),
+            "the reopened form focuses the first reset, not the spent one"
+        );
+        assert_eq!(
+            app.toasts.back().map(|t| t.kind),
+            Some(super::super::ToastKind::Success),
+            "the spend itself was used"
+        );
+        assert_eq!(
+            form.available, "2/3 available",
+            "no reading was stored, so the open-time count stays"
+        );
+        let usable = |id: &str| {
+            form.resets
+                .iter()
+                .find(|reset| reset.id == id)
+                .map(|reset| reset.usable)
+        };
+        assert_eq!(
+            usable("g-week"),
+            Some(false),
+            "the spent reset is turned off by its id"
+        );
+        assert_eq!(
+            usable("g-old"),
+            Some(true),
+            "the focused, unspent reset stays offered"
+        );
+        handle_key(&mut app, key(KeyCode::Down));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reopened modal is still open");
+        };
+        assert!(!form.can_use(), "use reset is off on the spent reset");
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            4,
+            "one read, one org read, one POST and the failed re-read; ↵ on the spent reset sends nothing"
+        );
+    }
+
+    /// A re-send the server answers `already_used` moved the count: the modal
+    /// shows the CLI's already-used line, never the refusal sentence claiming
+    /// no reset was used, and the record settles as a use.
+    #[test]
+    fn an_already_used_resend_shows_the_cli_line() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let sent_at_ms = crate::usage::now_ms();
+        let path = crate::usage::limit_reset_pending::path::<
+            crate::usage::limit_reset_pending::ClaudePending,
+        >(&crate::profile::ProfileName::from("cl2"))
+        .expect("path");
+        crate::usage::limit_reset_pending::write(
+            &path,
+            &crate::usage::limit_reset_pending::ClaudePending {
+                grant_id: "g-old".to_string(),
+                request_id: "seeded-id".to_string(),
+                sent_at_ms,
+            },
+        )
+        .expect("record");
+        let already =
+            r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#;
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        // The spend's own read still lists `g-old`; the re-read it lands after
+        // the reply names that grant spent, the reading the modal then shows.
+        let spent = THREE_GRANTS.replace(
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 1"#,
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 0"#,
+        );
+        assert_ne!(spent, THREE_GRANTS, "the spent grant applied");
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    (200, THREE_GRANTS.to_string())
+                } else {
+                    (200, spent.clone())
+                }
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (200, already.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        let form = super::super::pin_pending_reset(limit_reset_form(&app).expect("a form"));
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "that limit reset on 'cl2' was already used; run `clauth limit-reset cl2 \
+                 --list` to see what is left"
+                    .to_string()
+            ),
+            "the CLI's already-used line, never a refusal claiming nothing was used"
+        );
+        assert!(!path.is_file(), "the reply settled the record as a use");
+        assert_eq!(form.available, "1/2 available", "the re-landed count");
+        assert_eq!(
+            form.focused().expect("a focused reset").rows,
+            [
+                ("id", "g-old".to_string()),
+                ("resets", "5h".to_string()),
+                ("valid", "—".to_string()),
+                ("left", "0 of 1".to_string()),
+                ("state", "used".to_string()),
+                ("now", "0% of 5h left".to_string()),
+            ],
+            "the re-landed reading rebuilds the rows on the spent grant"
+        );
+        assert!(
+            !form.focused().expect("a focused reset").usable,
+            "a spent reset's button is off"
+        );
+        assert!(
+            !form.can_use(),
+            "the settled record pins nothing, so the spent reset cannot be re-sent"
+        );
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("backend");
+        term.draw(|f| crate::tui::draw(f, &app)).expect("draw");
+        let text = modal_body(term.backend().buffer()).join("\n");
+        assert!(text.contains("was already used"), "{text}");
+        assert!(!text.contains("no reset was used"), "{text}");
+        // `use reset` still has the focus from the press above; ↵ on a spent
+        // reset sends nothing.
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            4,
+            "the count moved and the re-read landed, so a press on the spent reset sends nothing"
+        );
+    }
+
+    /// A count-moving refusal whose re-read request fails leaves the button
+    /// off: the modal keeps its open-time rows and the refusal line, the
+    /// settled pin cannot re-arm the send, and a second ↵ sends no request.
+    #[test]
+    fn a_count_moving_refusal_whose_reread_failed_turns_the_button_off() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let sent_at_ms = crate::usage::now_ms();
+        let path = crate::usage::limit_reset_pending::path::<
+            crate::usage::limit_reset_pending::ClaudePending,
+        >(&crate::profile::ProfileName::from("cl2"))
+        .expect("path");
+        crate::usage::limit_reset_pending::write(
+            &path,
+            &crate::usage::limit_reset_pending::ClaudePending {
+                grant_id: "g-old".to_string(),
+                request_id: "seeded-id".to_string(),
+                sent_at_ms,
+            },
+        )
+        .expect("record");
+        let already =
+            r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#;
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        // The re-read after the reply fails, so no reading re-lands and the
+        // stored copy is dropped: the open-time rows must stay, with only the
+        // button off.
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    (200, THREE_GRANTS.to_string())
+                } else {
+                    (500, String::new())
+                }
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (200, already.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        let form = super::super::pin_pending_reset(limit_reset_form(&app).expect("a form"));
+        let open_rows = form.focused().expect("a focused reset").rows.clone();
+        let open_available = form.available.clone();
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "that limit reset on 'cl2' was already used; run `clauth limit-reset cl2 \
+                 --list` to see what is left"
+                    .to_string()
+            ),
+            "the CLI's already-used line, never a refusal claiming nothing was used"
+        );
+        assert_eq!(
+            form.available, open_available,
+            "no reading re-landed, so the open-time count stays"
+        );
+        assert_eq!(
+            form.focused().expect("a focused reset").rows,
+            open_rows,
+            "no reading re-landed, so the open-time rows stay"
+        );
+        assert!(
+            !form.focused().expect("a focused reset").usable,
+            "the count moved and no reading re-landed, so the button is off"
+        );
+        assert!(
+            !form.can_use(),
+            "the settled record's stale pin cannot re-arm the send"
+        );
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            4,
+            "one read, the org read, one spend, one failed re-read; ↵ sends nothing"
+        );
+    }
+
+    /// A count-moving refusal whose re-read landed but whose store was refused
+    /// keeps its open-time rows and turns `use reset` off: a stored copy an
+    /// earlier read left on disk must not re-arm the spent grant.
+    #[test]
+    fn a_count_moving_refusal_whose_reread_was_not_stored_turns_the_button_off() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        // The copy a file probe would find: the open-time reading, already on
+        // disk before this run's own re-read.
+        crate::profile_cache::write_profile_cache_for(
+            crate::harness::Harness::Claude,
+            &crate::profile::ProfileName::from("cl2"),
+            crate::profile_cache::LIMIT_RESETS_FILE,
+            &crate::usage::claude_reset::status_reading(
+                &crate::usage::claude_reset::read_status(THREE_GRANTS).expect("a block"),
+            ),
+        );
+        let sent_at_ms = crate::usage::now_ms();
+        let path = crate::usage::limit_reset_pending::path::<
+            crate::usage::limit_reset_pending::ClaudePending,
+        >(&crate::profile::ProfileName::from("cl2"))
+        .expect("path");
+        crate::usage::limit_reset_pending::write(
+            &path,
+            &crate::usage::limit_reset_pending::ClaudePending {
+                grant_id: "g-old".to_string(),
+                request_id: "seeded-id".to_string(),
+                sent_at_ms,
+            },
+        )
+        .expect("record");
+        let already =
+            r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#;
+        let profile = r#"{"organization": {"uuid": "org-1"}}"#;
+        let spent = THREE_GRANTS.replace(
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 1"#,
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 0"#,
+        );
+        assert_ne!(spent, THREE_GRANTS, "the spent grant applied");
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    (200, THREE_GRANTS.to_string())
+                } else {
+                    // The re-read answers while this process holds the state
+                    // flock elsewhere, so its reading cannot be stored.
+                    let dir = crate::profile::clauth_dir().expect("clauth dir");
+                    let holder =
+                        crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+                            .expect("open holder handle");
+                    holder.lock().expect("hold the state flock");
+                    held_tx.send(holder).expect("hand the holder back");
+                    (200, spent.clone())
+                }
+            } else if path == "/api/oauth/profile" {
+                (200, profile.to_string())
+            } else {
+                (200, already.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        let form = super::super::pin_pending_reset(limit_reset_form(&app).expect("a form"));
+        let open_rows = form.focused().expect("a focused reset").rows.clone();
+        let open_available = form.available.clone();
+        app.open_modal(Modal::LimitReset(form));
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        crate::lock::set_state_lock_timeout_override(None);
+        drop(held_rx.try_recv().expect("the stub held the state flock"));
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "that limit reset on 'cl2' was already used; run `clauth limit-reset cl2 \
+                 --list` to see what is left"
+                    .to_string()
+            ),
+            "the CLI's already-used line, never a refusal claiming nothing was used"
+        );
+        assert_eq!(
+            form.available, open_available,
+            "the run stored no reading, so the open-time count stays"
+        );
+        assert_eq!(
+            form.focused().expect("a focused reset").rows,
+            open_rows,
+            "the run stored no reading, so the open-time rows stay"
+        );
+        assert!(
+            !form.focused().expect("a focused reset").usable,
+            "the count moved and this run stored no reading, so the button is off"
+        );
+        assert!(!form.can_use(), "the spent grant cannot be re-sent");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            4,
+            "one read, the org read, one spend, one unstored re-read; ↵ sends nothing"
+        );
+    }
+
+    /// The pick list follows the cursor: on a terminal too short for the body,
+    /// each ↓ redraws with the focused reset's row still on screen, and the
+    /// footer keeps one `↑↓` row because the walk itself scrolls.
+    #[test]
+    fn the_pick_list_scrolls_to_follow_the_cursor() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = reset_app(THREE_GRANTS);
+        let form = limit_reset_form(&app).expect("a form");
+        app.open_modal(Modal::LimitReset(form));
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).expect("backend");
+        let mut draw = |app: &App| {
+            term.draw(|frame| crate::tui::draw(frame, app))
+                .expect("draw");
+            modal_body(term.backend().buffer())
+        };
+        let body = draw(&app);
+        assert!(body.iter().any(|row| row.contains("Old reset")), "{body:?}");
+        assert!(
+            !body.iter().any(|row| row.contains("state")),
+            "the body overflows at 14 rows: {body:?}"
+        );
+        for want in ["Weekly reset", "limit reset"] {
+            handle_key(&mut app, key(KeyCode::Down));
+            let body = draw(&app);
+            assert!(
+                body.iter().any(|row| row.contains(want)),
+                "the focused {want:?} stays drawn: {body:?}"
+            );
+        }
+        // ↑ reads the offset the previous frame saved: the head row stays
+        // where the ↓ steps left it instead of re-pinning the list, then
+        // follows the cursor back to the first reset.
+        handle_key(&mut app, key(KeyCode::Up));
+        let body = draw(&app);
+        assert_eq!(
+            body.iter().position(|row| row.contains("Old reset")),
+            Some(1),
+            "the ↓ offset carries into the ↑ step: {body:?}"
+        );
+        handle_key(&mut app, key(KeyCode::Up));
+        let body = draw(&app);
+        assert_eq!(
+            body.iter().position(|row| row.contains("Old reset")),
+            Some(2),
+            "back at the first reset the offset follows the cursor: {body:?}"
+        );
+        term.draw(|frame| crate::tui::draw(frame, &app))
+            .expect("draw");
+        let footer = crate::testutil::buffer_rows(term.backend().buffer())
+            .pop()
+            .unwrap_or_default();
+        assert_eq!(
+            footer.trim_end(),
+            " ↑↓ reset   ←→ button   ↵ choose   q back",
+            "one ↑↓ row: the list's own walk is the scroll"
+        );
+    }
+
+    /// A grant the server still marks usable now but holds no resets is never
+    /// pressable: its row reads `used` and `use reset` stays off on it.
+    #[test]
+    fn a_zero_left_reset_is_never_pressable() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let body = THREE_GRANTS.replace(
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 1"#,
+            r#""id": "g-old", "label": "Old reset", "resets_total": 1, "resets_left": 0"#,
+        );
+        let mut app = reset_app(&body);
+        let form = limit_reset_form(&app).expect("a form");
+        assert_eq!(
+            form.resets[0]
+                .rows
+                .iter()
+                .find(|(key, _)| *key == "state")
+                .map(|(_, value)| value.as_str()),
+            Some("used")
+        );
+        assert!(
+            !form.resets[0].usable,
+            "a grant holding none is never pressable"
+        );
+        assert!(
+            form.resets[1].usable,
+            "the other held grants stay pressable"
+        );
+        app.open_modal(Modal::LimitReset(form));
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("an off button closes nothing");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Idle,
+            "an off button sends nothing"
+        );
+    }
+
+    /// A grant the server marks usable now whose id is off the pattern clauth
+    /// sends reads `unavailable` in the state row, so the off button says why.
+    #[test]
+    fn an_unsendable_id_reads_unavailable_in_the_modal() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let body = THREE_GRANTS.replace(
+            r#""id": "g-old", "label": "Old reset""#,
+            r#""id": "G WEEK", "label": "Old reset""#,
+        );
+        let app = reset_app(&body);
+        let form = limit_reset_form(&app).expect("a form");
+        assert_eq!(form.resets[0].id, "G WEEK");
+        assert_eq!(
+            form.resets[0]
+                .rows
+                .iter()
+                .find(|(key, _)| *key == "state")
+                .map(|(_, value)| value.as_str()),
+            Some("unavailable")
+        );
+        assert!(!form.resets[0].usable, "the id is not one a spend sends");
+    }
+
+    const CODEX_CREDITS: &str = r#"{"credits": [
+        {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"},
+        {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "expires_at": "2027-06-01T00:00:00Z"}
+    ], "available_count": 2}"#;
+
+    /// A codex account on the Usage tab whose stored reading names two
+    /// available credits, with its store seeded for a spend.
+    fn codex_reset_app() -> App {
+        crate::testutil::write_codex_roster(&["cx"]);
+        crate::testutil::write_codex_store(
+            "cx",
+            &crate::testutil::codex_auth_body("at.cx", "rt.cx"),
+        );
+        let mut app = app_with(vec![]);
+        let credits: crate::usage::codex_reset::ResetCredits =
+            serde_json::from_str(CODEX_CREDITS).expect("a credit list");
+        app.codex_resets.insert(
+            "cx".to_string(),
+            crate::usage::codex_reset::credits_reading(&credits),
+        );
+        app.tab = Tab::Usage;
+        app
+    }
+
+    /// The modal on a codex account: the action menu opens it, the credits
+    /// list with the focused one's rows, `use reset` spends that credit once
+    /// over the codex wire, and a success closes the modal and re-reads.
+    #[test]
+    fn use_reset_spends_the_focused_codex_credit_once() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = codex_reset_app();
+        let consumed = r#"{"code": "reset", "windows_reset": 2}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(4, move |path, _| {
+            if path.ends_with("/consume") {
+                (200, consumed.to_string())
+            } else {
+                (200, CODEX_CREDITS.to_string())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the menu opens the modal");
+        };
+        assert_eq!(form.harness, crate::harness::Harness::Codex);
+        assert_eq!(form.available, "2 available");
+        assert_eq!(form.focused().map(|reset| reset.id.as_str()), Some("later"));
+        let rows: Vec<(&str, &str)> = form
+            .focused()
+            .expect("a focused credit")
+            .rows
+            .iter()
+            .filter(|(key, _)| *key != "valid")
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("id", "later"),
+                ("resets", "usage windows"),
+                ("left", "1 of 1"),
+                ("state", "ready"),
+            ]
+        );
+        assert!(
+            form.focused()
+                .expect("a focused credit")
+                .rows
+                .iter()
+                .any(|(key, value)| *key == "valid" && value.starts_with("until ")),
+            "{:?}",
+            form.focused().expect("a focused credit").rows
+        );
+
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        assert!(app.modals.is_empty(), "a success closes the modal");
+        assert_eq!(
+            app.toasts
+                .back()
+                .map(|toast| (toast.kind, toast.body.as_str())),
+            Some((
+                super::super::ToastKind::Success,
+                "limit reset used\nused a usage-limit reset on 'cx': 2 windows reopened, 1 left."
+            ))
+        );
+        let seen = handle.join().expect("stub");
+        assert_eq!(seen.len(), 3, "the list, one consume, the re-read");
+        let consumes: Vec<serde_json::Value> = seen
+            .iter()
+            .filter(|request| {
+                request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("POST "))
+            })
+            .map(|request| {
+                serde_json::from_str(&crate::testutil::request_body(request)).expect("json")
+            })
+            .collect();
+        assert_eq!(consumes.len(), 1, "one press, one consume");
+        assert_eq!(consumes[0]["credit_id"], "later");
+    }
+
+    /// A consume the server answers `no_credit` moved the count: the reply's
+    /// line stays, and the credit rows come from the list the spend re-landed,
+    /// so the spent credit reads its own status with its button off.
+    #[test]
+    fn a_no_credit_consume_rebuilds_the_codex_credit_rows() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = codex_reset_app();
+        let no_credit = r#"{"code": "no_credit"}"#;
+        let spent = CODEX_CREDITS.replacen(
+            r#"{"id": "later", "reset_type": "codex_rate_limits", "status": "available""#,
+            r#"{"id": "later", "reset_type": "codex_rate_limits", "status": "redeemed""#,
+            1,
+        );
+        assert_ne!(spent, CODEX_CREDITS, "the spent credit applied");
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(4, move |path, i| {
+            if path.ends_with("/consume") {
+                (200, no_credit.to_string())
+            } else if i == 0 {
+                (200, CODEX_CREDITS.to_string())
+            } else {
+                (200, spent.clone())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "the server refused this reset (no_credit); no reset was used".to_string()
+            )
+        );
+        assert_eq!(form.available, "1 available", "the re-landed count");
+        let rows: Vec<(&str, &str)> = form
+            .focused()
+            .expect("a focused credit")
+            .rows
+            .iter()
+            .filter(|(key, _)| *key != "valid")
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("id", "later"),
+                ("resets", "usage windows"),
+                ("left", "0 of 1"),
+                ("state", "redeemed"),
+            ],
+            "the re-landed list rebuilds the rows on the spent credit"
+        );
+        assert!(
+            !form.focused().expect("a focused credit").usable,
+            "a spent credit's button is off"
+        );
+        assert!(!form.can_use(), "the spent credit cannot be re-sent");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            3,
+            "the re-read landed, so a press on the spent credit sends nothing"
+        );
+    }
+
+    /// A codex `no_credit` whose re-read fails leaves the button off: the
+    /// open-time credit rows stay beside the refusal line, the spent credit
+    /// cannot be re-sent, and a second ↵ sends nothing.
+    #[test]
+    fn a_no_credit_whose_reread_failed_turns_the_codex_button_off() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = codex_reset_app();
+        let no_credit = r#"{"code": "no_credit"}"#;
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(4, move |path, i| {
+            if path.ends_with("/consume") {
+                (200, no_credit.to_string())
+            } else if i == 0 {
+                (200, CODEX_CREDITS.to_string())
+            } else {
+                (500, String::new())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the menu opens the modal");
+        };
+        let open_rows = form.focused().expect("a focused credit").rows.clone();
+        let open_available = form.available.clone();
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "the server refused this reset (no_credit); no reset was used".to_string()
+            )
+        );
+        assert_eq!(
+            form.available, open_available,
+            "the re-read failed, so the open-time count stays"
+        );
+        assert_eq!(
+            form.focused().expect("a focused credit").rows,
+            open_rows,
+            "the re-read failed, so the open-time rows stay"
+        );
+        assert!(
+            !form.focused().expect("a focused credit").usable,
+            "the count moved and no reading re-landed, so the button is off"
+        );
+        assert!(!form.can_use(), "the spent credit cannot be re-sent");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            3,
+            "one list read, one consume, one failed re-read; ↵ sends nothing"
+        );
+    }
+
+    /// A codex `no_credit` whose re-read's write did not land (the roster
+    /// dropped the name between the re-read and the store) leaves the button
+    /// off: the open-time credit rows stay beside the refusal line, the spent
+    /// credit cannot be re-sent, and a second ↵ sends nothing.
+    #[test]
+    fn a_no_credit_whose_reread_was_not_stored_turns_the_codex_button_off() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = codex_reset_app();
+        let no_credit = r#"{"code": "no_credit"}"#;
+        let spent = CODEX_CREDITS.replacen(
+            r#"{"id": "later", "reset_type": "codex_rate_limits", "status": "available""#,
+            r#"{"id": "later", "reset_type": "codex_rate_limits", "status": "redeemed""#,
+            1,
+        );
+        assert_ne!(spent, CODEX_CREDITS, "the spent credit applied");
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(4, move |path, i| {
+            if path.ends_with("/consume") {
+                (200, no_credit.to_string())
+            } else if i == 0 {
+                (200, CODEX_CREDITS.to_string())
+            } else {
+                // The re-read answers while the roster no longer holds the
+                // name, so the landing's write reports not-stored.
+                crate::testutil::write_codex_roster(&[]);
+                (200, spent.clone())
+            }
+        });
+        app.reset_urls = crate::usage::codex_reset::ResetUrls::under(&addr);
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the menu opens the modal");
+        };
+        let open_rows = form.focused().expect("a focused credit").rows.clone();
+        let open_available = form.available.clone();
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        super::super::join_test_workers_within(std::time::Duration::from_secs(60))
+            .expect("the spend worker ends");
+        drain_limit_reset(&mut app);
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the reply's line keeps the modal open");
+        };
+        assert_eq!(
+            form.phase,
+            LimitResetPhase::Refused(
+                "the server refused this reset (no_credit); no reset was used".to_string()
+            )
+        );
+        assert_eq!(
+            form.available, open_available,
+            "the re-read stored nothing, so the open-time count stays"
+        );
+        assert_eq!(
+            form.focused().expect("a focused credit").rows,
+            open_rows,
+            "the re-read stored nothing, so the open-time rows stay"
+        );
+        assert!(
+            !form.focused().expect("a focused credit").usable,
+            "the count moved and the re-read stored nothing, so the button is off"
+        );
+        assert!(!form.can_use(), "the spent credit cannot be re-sent");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            handle.join().expect("stub").len(),
+            3,
+            "one list read, one consume, one unstored re-read; ↵ sends nothing"
+        );
+    }
+
+    /// The codex rail and the `use a limit reset` item appear off a reading the
+    /// scheduler's hourly side read landed: no `clauth limit-reset` listing ran
+    /// first.
+    #[test]
+    fn the_codex_rail_and_reset_item_appear_off_the_schedulers_read() {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::testutil::write_codex_roster(&["cx-hour"]);
+        crate::testutil::write_codex_store(
+            "cx-hour",
+            &crate::testutil::codex_auth_body("at.cx-hour", "rt.cx-hour"),
+        );
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(2, move |_path, _| {
+            (200, CODEX_CREDITS.to_string())
+        });
+        crate::usage::codex_reset::set_codex_reset_list_origin_override(&addr);
+        crate::usage::reset_request_slots();
+
+        let mut app = app_with(vec![]);
+        app.tab = Tab::Usage;
+        // The leg runs in this process's own scheduler state, sharing the
+        // app's stores: the reading lands in the sandbox's profile directory,
+        // where the frame loop's codex refresh reads it.
+        let state = crate::usage::SchedulerState::over_shared(
+            std::sync::Arc::clone(&app.config),
+            std::sync::Arc::clone(&app.usage_tokens),
+            std::sync::Arc::clone(&app.usage_store),
+            std::sync::Arc::clone(&app.usage_status),
+            std::sync::Arc::clone(&app.last_fetched),
+            std::sync::Arc::clone(&app.poll_streaks),
+            std::sync::Arc::clone(&app.snapshot),
+        );
+        crate::usage::codex_resets_tick_at(&state, 1_900_000_000_000);
+
+        crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+        drop(handle.join().expect("stub"));
+        // The per-second codex refresh re-reads the landed file, the way the
+        // frame loop does after a spend.
+        app.last_codex_rows_refresh = None;
+        super::super::poll_codex_rows(&mut app);
+        assert!(
+            app.codex_resets
+                .get("cx-hour")
+                .is_some_and(|r| r.usable >= 1),
+            "the rail names the credits the read landed"
+        );
+        super::pick_menu_entry(&mut app, "use a limit reset");
+        let Some(Modal::LimitReset(form)) = app.modals.last() else {
+            panic!("the menu offers the reset the read landed");
+        };
+        assert_eq!(form.harness, crate::harness::Harness::Codex);
+        assert_eq!(form.available, "2 available");
+        assert_eq!(form.focused().map(|reset| reset.id.as_str()), Some("later"));
+        handle_key(&mut app, key(KeyCode::Esc));
+    }
 }

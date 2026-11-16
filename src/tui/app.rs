@@ -64,21 +64,22 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::clawd;
+use crate::tui::mascot;
 use crate::tui::render::prose::{self, cmd_lit};
 use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, ClaudeResetsMemoLock, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt,
-    MemoryStores, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
-    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
-    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, FetchLeg, FetchStatus, KickBlocks,
+    LastFetchedAt, MemoryStores, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender,
+    PendingSwitch, PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity,
+    RefetchQueue, SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
     any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
-    collect_tokens, is_idle, mark_activity, new_claude_resets_memo, now_ms, spawn_refresher,
-    switch_gate_in_flight, token_spend_in_flight, windows_maxed,
+    collect_tokens, is_idle, mark_activity, new_claude_resets_memo, new_codex_resets_memo, now_ms,
+    spawn_refresher, switch_gate_in_flight, token_spend_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -877,6 +878,10 @@ pub(crate) enum GlobalConfigRow {
     /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
+    /// `AppState.reduce_motion`: space/⏎ stills the header mascot, the header
+    /// gauge's account name and the Overview's provider wave, or lets them
+    /// move again.
+    ReduceMotion,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     SwitchOffWhenSpent,
@@ -1761,6 +1766,130 @@ impl NamePromptAction {
     }
 }
 
+/// The `use a limit reset` modal: every reset the account's stored reading
+/// names, the focused one's details, and the spend it runs. Built by
+/// [`limit_reset_form`], which the action menu's item reads too, so the item
+/// shows exactly when the modal has a reset to offer.
+#[derive(Debug, Clone)]
+pub(crate) struct LimitResetForm {
+    pub(crate) name: ProfileName,
+    pub(crate) harness: crate::harness::Harness,
+    /// The count line's value: `3 available`, `0/2 available`.
+    pub(crate) available: String,
+    pub(crate) resets: Vec<ResetChoice>,
+    pub(crate) cursor: usize,
+    /// Whether `use reset` holds the button focus; `cancel` does on open.
+    pub(crate) on_use: bool,
+    /// A fresh pending record's grant or credit id and its refusal line: only
+    /// that reset can be sent until the record's window ends.
+    pub(crate) pinned: Option<(String, String)>,
+    pub(crate) phase: LimitResetPhase,
+    /// The id this form's own spend is sending: a result lands on the form
+    /// only when it names that id. `None` while no spend of this form runs,
+    /// including a form reopened while the account's spend was in flight.
+    pub(crate) spending: Option<String>,
+    /// The pick list's scroll offset, kept across frames so the cursor follows
+    /// the list instead of re-pinning it to the viewport's edge each draw.
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// The largest offset the last render's body allowed, and the frame it
+    /// was computed for: the footer's `↑↓ scroll` hint reads both.
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) scroll_stamp: std::cell::Cell<ScrollStamp>,
+}
+
+/// Where a [`LimitResetForm`]'s spend stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LimitResetPhase {
+    Idle,
+    /// The spend runs on a worker; the modal ignores a second press.
+    Spending,
+    /// The spend was refused; the line names why and that nothing was used.
+    Refused(String),
+}
+
+/// One reset as the modal lists it: its label, its detail rows (`id`,
+/// `resets`, `valid`, `left`, `state`, and `now` where the read names the
+/// headroom), and whether a spend of it can be sent now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResetChoice {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) rows: Vec<(&'static str, String)>,
+    pub(crate) usable: bool,
+    pub(crate) held: bool,
+}
+
+impl LimitResetForm {
+    /// The reset under the cursor.
+    pub(crate) fn focused(&self) -> Option<&ResetChoice> {
+        self.resets
+            .get(self.cursor.min(self.resets.len().saturating_sub(1)))
+    }
+
+    /// The refusal the focused reset reads before anything is sent: a fresh
+    /// record pinning another reset.
+    pub(crate) fn pinned_refusal(&self) -> Option<&str> {
+        let focused = self.focused()?;
+        self.pinned
+            .as_ref()
+            .filter(|(id, _)| *id != focused.id)
+            .map(|(_, line)| line.as_str())
+    }
+
+    /// Whether `use reset` can be pressed: the focused reset is usable now, no
+    /// record pins another, and no spend is running.
+    pub(crate) fn can_use(&self) -> bool {
+        self.phase != LimitResetPhase::Spending
+            && self.pinned_refusal().is_none()
+            && self.focused().is_some_and(|r| {
+                r.usable || self.pinned.as_ref().is_some_and(|(id, _)| *id == r.id)
+            })
+    }
+
+    /// Re-read the count line and rows from `reading`, holding the cursor on
+    /// the same reset by id and re-reading the pending pin from disk: a spend
+    /// that re-landed a reading leaves no row still offering the reset it
+    /// spent, and a settled record no longer pins one.
+    fn reload(&mut self, reading: &crate::usage::LimitResets) {
+        let focused = self.focused().map(|reset| reset.id.clone());
+        let (available, resets) = limit_reset_rows(self.harness, reading);
+        let cursor = focused
+            .and_then(|id| resets.iter().position(|reset| reset.id == id))
+            .unwrap_or_else(|| self.cursor.min(resets.len().saturating_sub(1)));
+        self.available = available;
+        self.resets = resets;
+        self.cursor = cursor;
+        self.pinned = pending_reset_pin(&self.name, self.harness);
+    }
+
+    /// A run that moved the count left no re-landed reading behind: flip the
+    /// spent reset's own row's flag in place so the open-time rows stay but
+    /// `use reset` turns off, and re-read the pin from disk so a settled
+    /// record's stale id cannot re-arm the send. The row is named by id: this
+    /// form may have been reopened while that run was in flight, its cursor
+    /// somewhere else.
+    fn mark_unusable(&mut self, id: &str) {
+        if let Some(reset) = self.resets.iter_mut().find(|reset| reset.id == id) {
+            reset.usable = false;
+        }
+        self.pinned = pending_reset_pin(&self.name, self.harness);
+    }
+
+    /// Settle a form reopened while another spend ran: its rows were built
+    /// before that spend landed, so follow the reading the run stored, or
+    /// turn the spent reset's own row off when it stored none.
+    fn settle_reopened(&mut self, id: &str, moved: bool, reread_stored: bool) {
+        if reread_stored
+            && let Some(reading) =
+                limit_resets_of(std::slice::from_ref(&self.name)).get(self.name.as_str())
+        {
+            self.reload(reading);
+        } else if moved {
+            self.mark_unusable(id);
+        }
+    }
+}
+
 /// Preset picker for `apply preset`. Built-ins lead the list (see
 /// [`crate::presets::list_presets`]), so the cursor's index is the list's index
 /// and nothing has to track the split.
@@ -2400,6 +2529,9 @@ pub(crate) enum ActionMenuAction {
     // Usage
     ToggleEstimates,
     TogglePace,
+    /// Open the focused account's banked resets to spend one; offered only
+    /// while its stored reading names one it still holds.
+    UseLimitReset,
     // Tokens
     TokensPeriodLifetime,
     TokensPeriodDaily,
@@ -2595,6 +2727,7 @@ impl ActionMenuAction {
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
             Self::TogglePace => "toggle pace marker",
+            Self::UseLimitReset => "use a limit reset",
             Self::TokensPeriodLifetime => "period: lifetime",
             Self::TokensPeriodDaily => "period: daily",
             Self::TokensPeriodWeekly => "period: weekly",
@@ -2619,6 +2752,9 @@ pub(crate) enum Modal {
     NamePrompt(NamePromptForm),
     /// Setup menu `apply preset`: pick which preset stamps the account.
     PresetPicker(PresetPickerForm),
+    /// Usage menu `use a limit reset`: pick one of the account's banked resets
+    /// and spend it.
+    LimitReset(LimitResetForm),
     /// `apply preset` over set fields the preset leaves unset: keep or clear.
     PresetApply(PresetApplyForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
@@ -2707,7 +2843,8 @@ fn rotate_blocked_message(name: &str, block: crate::runtime::RotationBlock) -> S
     let suffix = match block {
         crate::runtime::RotationBlock::LiveSession => ROTATE_LIVE_SESSION_MSG,
         crate::runtime::RotationBlock::BackgroundJob => ROTATE_BACKGROUND_SESSION_MSG,
-        crate::runtime::RotationBlock::UnreadableJobStore(_) => ROTATE_UNREADABLE_JOBS_MSG,
+        crate::runtime::RotationBlock::UnreadableJobStore(_)
+        | crate::runtime::RotationBlock::UnreadableJobDir(_) => ROTATE_UNREADABLE_JOBS_MSG,
     };
     format!("'{name}' {suffix}")
 }
@@ -5127,15 +5264,40 @@ pub(crate) struct CodexRow {
     pub(crate) fetched_at: Option<u64>,
 }
 
-/// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
-/// roster is one small TOML and each reading is the profile's own cache file
-/// plus the small files beside its store (the quarantine record, and the store
-/// itself on a cache miss for the plan), the same set `status --json` reads
-/// with no daemon running.
+/// [`codex_rows_landed`]'s rows, for the tests that only need the snapshot.
+#[cfg(test)]
 pub(crate) fn codex_rows() -> Vec<CodexRow> {
-    crate::codex_profiles::CodexState::load()
-        .map(|state| codex_rows_from(&state))
-        .unwrap_or_default()
+    codex_rows_landed().0
+}
+
+/// Read the codex roster into the [`App::codex_rows`] snapshot, naming
+/// whether the read landed: construction seeds the mascot's codex edges only
+/// off a landed read, so a roster unreadable then seeds on its first landed
+/// refresh instead of reading as edges. Lock-free: the roster is one small
+/// TOML and each reading is the profile's own cache file plus the small files
+/// beside its store (the quarantine record, and the store itself on a cache
+/// miss for the plan), the same set `status --json` reads with no daemon
+/// running.
+fn codex_rows_landed() -> (Vec<CodexRow>, bool) {
+    match crate::codex_profiles::CodexState::load() {
+        Ok(state) => (codex_rows_from(&state), true),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+/// A window's reset instant, parsed the way every reset compare reads it.
+fn window_reset_instant(window: Option<&crate::usage::UsageWindow>) -> Option<i64> {
+    window
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(crate::usage::iso_to_epoch_secs)
+}
+
+/// One codex row's 5h and 7d reset instants, for the codex reset compare.
+fn window_instants(row: &CodexRow) -> [Option<i64>; 2] {
+    [
+        window_reset_instant(row.five_hour.as_ref()),
+        window_reset_instant(row.seven_day.as_ref()),
+    ]
 }
 
 /// [`codex_rows`] over a roster already read.
@@ -5185,15 +5347,15 @@ fn refresh_codex_rows(app: &mut App) -> bool {
     true
 }
 
-/// The claude accounts' banked-reset readings, off each profile's own
-/// `limit_resets.json` (the scheduler's hourly side read or the CLI's
-/// post-spend refresh), keyed by name.
+/// The named accounts' banked-reset readings, off each profile's own
+/// `limit_resets.json` (a claude account's hourly side read or post-spend
+/// refresh, a codex account's last reset-list read), keyed by name.
 /// Loaded where [`codex_rows`] loads its caches — construction and the
 /// per-tick reload — so a pane reads one snapshot per second, never per frame.
 /// Takes the names, not the config, so the loader itself never reads the
 /// config; only the per-tick reload copies them under the Config guard and
 /// drops it before the file reads below.
-pub(crate) fn claude_resets(
+pub(crate) fn limit_resets_of(
     names: &[crate::profile::ProfileName],
 ) -> HashMap<String, crate::usage::LimitResets> {
     names
@@ -5406,6 +5568,85 @@ impl AutoSwitchProjection {
     }
 }
 
+/// The last reading of each producer field a mascot cue is an edge of. Each
+/// starts from the first reading (construction's, where it takes one), so a
+/// launch is never an event, and a reading that could not be taken leaves the
+/// last one standing rather than reading as a change.
+#[derive(Default)]
+struct MascotSeen {
+    active: Option<SeenAccount>,
+    auth_broken: Vec<SeenAccount>,
+    /// Session id -> the account the row last read ran on, off the last tally
+    /// that read.
+    sessions: Option<std::collections::BTreeMap<String, String>>,
+    /// Per account, each window's 5h and 7d boundary as a `(last named,
+    /// highest named)` pair: the reset test reads the first, the "later"
+    /// test the second.
+    resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Every delegate job id seen finished; `None` before the first read. Ids
+    /// are minted unique and a finish is final, so the set only grows: a read
+    /// that misses a record cannot make it finish twice.
+    delegates_done: Option<HashSet<String>>,
+    /// The codex roster's active name at the last landed reading.
+    codex_active: Option<String>,
+    /// The codex roster's broken names at the last landed reading.
+    codex_broken: Vec<String>,
+    /// Per codex account, each window's 5h and 7d boundary as a `(last
+    /// named, highest named)` pair, the same shape [`Self::resets`] holds.
+    codex_resets: HashMap<String, [Option<(i64, i64)>; 2]>,
+    /// Whether a codex reading has landed yet: the first landing seeds, so a
+    /// roster unreadable at construction cannot read as an edge once it lands.
+    codex_seeded: bool,
+}
+
+/// One account as a name-keyed producer field names it, with the stored id
+/// under the name: a rename moves the name but keeps the id, so an id that
+/// matches across a move is the same account, never an event.
+#[derive(Clone)]
+struct SeenAccount {
+    name: ProfileName,
+    id: Option<crate::profile::ProfileId>,
+}
+
+impl SeenAccount {
+    /// The reading under `name` now, with the id the disk holds for it.
+    fn read(name: &ProfileName) -> Self {
+        Self {
+            name: name.clone(),
+            id: crate::profile::stored_profile_id(name),
+        }
+    }
+}
+
+impl MascotSeen {
+    /// The seed a fresh app reads: every name-keyed field with the id the disk
+    /// holds under it.
+    fn seeded(active: Option<&ProfileName>, auth_broken: &[ProfileName]) -> Self {
+        Self {
+            active: active.map(SeenAccount::read),
+            auth_broken: auth_broken.iter().map(SeenAccount::read).collect(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The one mascot slot's concrete type, named here alone: the slot field,
+/// the header's size read and the row floor below all follow it, so swapping
+/// the mascot is a one-site edit.
+type SlotMascot = clawd::Clawd;
+
+/// The art header's info column needs a row for the brand, one for the
+/// status line and one for the tabs: a mascot shorter than three rows cannot
+/// carry them, so the slot mascot's height floors at three.
+const _: () = assert!(
+    <SlotMascot as mascot::Mascot>::SIZE.1 >= 3,
+    "the mascot must stand at least 3 rows tall to carry the header's info column"
+);
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "unrelated switches, each read on its own"
+)]
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -5464,11 +5705,20 @@ pub(crate) struct App {
     /// The claude banked-reset side read's cadence memo, shared with the
     /// scheduler the same way [`Self::weekly_reset_kicks`] is.
     pub(crate) claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, shared the same way.
+    pub(crate) codex_resets_memo: CodexResetsMemoLock,
     pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
     /// plain map, not a ranked store: written and read only on the UI thread.
     pub(crate) stale_cues: HashMap<String, bool>,
+    /// The reading clock per profile, written each tick by `apply_usage` beside
+    /// the stale cue and read by the per-frame snapshot: the OAuth arm's
+    /// `fetched_at` (with the cache mtime fallback for an undatable body), the
+    /// third-party arm's cache mtime. The overdue rows derive their due time
+    /// off this, once per tick, never per frame; the read age dates off the
+    /// reading's own stamp ([`ReadingsSnapshot::read_clock_of`]).
+    pub(crate) reading_clocks: HashMap<String, u64>,
     /// Per-name stats of the durable key-rejection records the last time
     /// [`sync_broken_verdicts`] checked them. The stat is the read gate: a
     /// per-second stat per profile is cheap, a per-second read of every record
@@ -5789,6 +6039,19 @@ pub(crate) struct App {
     pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
     /// Sender side; cloned into each worker.
     pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
+    /// Finished `use a limit reset` spends, drained each tick.
+    pub(crate) limit_reset_rx: std::sync::mpsc::Receiver<LimitResetResult>,
+    /// Sender side; cloned into each spend worker.
+    pub(crate) limit_reset_tx: std::sync::mpsc::Sender<LimitResetResult>,
+    /// The accounts whose TUI spend still runs: one per account, set when the
+    /// worker spawns, cleared once its result drains. A modal reopened while
+    /// its account's spend is in flight shows `Spending`, so a press cannot
+    /// start a second spend. UI-thread-only.
+    pub(crate) limit_reset_in_flight: HashSet<String>,
+    /// Where a TUI spend's calls go: the live endpoints, and in a test build a
+    /// port nothing answers until a test points it at its own stub, so no test
+    /// can reach a live account.
+    pub(crate) reset_urls: crate::usage::codex_reset::ResetUrls,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -5879,9 +6142,12 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
-    /// Header mascot playback: a random big animation at launch and every 30
-    /// minutes, a subtler one every 10 seconds.
-    pub(crate) clawd: clawd::Clawd,
+    /// Header mascot playback: one big animation at launch, then a
+    /// [`mascot::Cue`] a producer raises or a quiet key's hello, under the
+    /// slot rules in [`mascot::Stage`].
+    pub(crate) mascot: mascot::Stage<SlotMascot>,
+    /// The readings the per-tick mascot cues compare against.
+    mascot_seen: MascotSeen,
     /// Pinned animation phase for render tests that must sample a specific point
     /// of the wave. Backdating `started_at` instead would subtract from
     /// `Instant::now()`, which panics on a host whose uptime is shorter than the
@@ -6009,6 +6275,8 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// When [`poll_delegate_jobs`] last read the job store; `None` = due.
+    last_delegate_poll: Option<Instant>,
     /// The job-store snapshot the Setup detail's live-session field reads from,
     /// so a frame never walks `~/.claude/jobs`. Cached like `live_sessions`:
     /// refreshed by [`poll_live_sessions`] on its own tick, never on a config
@@ -6057,6 +6325,10 @@ pub(crate) struct App {
     /// post-spend refresh). Cached beside `codex_rows` with the same contract:
     /// reloaded on the per-tick poll, never read per frame.
     pub(crate) claude_resets: HashMap<String, crate::usage::LimitResets>,
+    /// The codex accounts' last reset-list readings (each one's
+    /// `limit_resets.json`, landed by `clauth limit-reset` or a TUI spend),
+    /// naming each credit; loaded beside `claude_resets`.
+    pub(crate) codex_resets: HashMap<String, crate::usage::LimitResets>,
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
@@ -6234,6 +6506,7 @@ struct WorkerHandles {
     skipped_unreadable: SkippedUnreadable,
     weekly_reset_kicks: WeeklyResetKicks,
     claude_resets_memo: ClaudeResetsMemoLock,
+    codex_resets_memo: CodexResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -6271,6 +6544,7 @@ impl WorkerHandles {
             skipped_unreadable: Arc::clone(&app.skipped_unreadable),
             weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&app.codex_resets_memo),
             suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
@@ -6324,6 +6598,14 @@ pub(crate) struct ReadingsSnapshot {
     pub(crate) oauth: HashMap<String, UsageInfo>,
     /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
     pub(crate) stale: HashMap<String, bool>,
+    /// The reading clock per profile name, cloned off `App::reading_clocks` —
+    /// the third-party arm's cache mtime (its `UsageInfo` carries no stamp) and
+    /// the mtime fallback for an undatable OAuth body.
+    pub(crate) clock: HashMap<String, u64>,
+    /// Whether each profile's usage cache is third-party-classified, the
+    /// picker's own split: the read age may date a third-party name off its
+    /// mtime (the file's only writer is a fetch outcome), never an OAuth one.
+    pub(crate) is_third_party: HashMap<String, bool>,
 }
 
 impl ReadingsSnapshot {
@@ -6339,6 +6621,27 @@ impl ReadingsSnapshot {
     pub(crate) fn stale_of(&self, name: &str) -> bool {
         self.stale.get(name).copied().unwrap_or(false)
     }
+    /// The clock dating `name`'s reading: its own stamp (`own_stamp`), falling
+    /// back to the per-tick map — the third-party arm's cache mtime and the mtime
+    /// fallback for an undatable OAuth body.
+    pub(crate) fn clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name)
+            .or_else(|| self.clock.get(name).copied())
+    }
+    /// The clock dating the `read Nm ago` phrase — only a stamp the reading
+    /// itself carries: the picked reading's own `fetched_at`, or a third-party
+    /// reading's cache mtime (its stamp; the file's only writer is a fetch
+    /// outcome). An undatable OAuth body's mtime fallback dates the due time
+    /// ([`Self::clock_of`]) only, never the read age: a date the cache mtime
+    /// alone would give is a date clauth did not read.
+    pub(crate) fn read_clock_of(&self, name: &str) -> Option<u64> {
+        self.own_stamp(name).or_else(|| {
+            self.clock
+                .get(name)
+                .copied()
+                .filter(|_| self.is_third_party.get(name).is_some_and(|tp| *tp))
+        })
+    }
     /// Whether `name`'s UNPICKED OAuth reading carries the no-5h-limit mark
     /// ([`crate::usage::UsageInfo::no_five_hour_limit`]) — the store the
     /// scheduler's election reads. The picked reading (`usage_of`) is the
@@ -6346,6 +6649,15 @@ impl ReadingsSnapshot {
     /// verdict reads only off the raw OAuth store.
     pub(crate) fn no_five_hour_limit(&self, name: &str) -> bool {
         self.oauth.get(name).is_some_and(|u| u.no_five_hour_limit)
+    }
+    /// The reading's own stamp when it dates the present: only a live fetch
+    /// stamps `fetched_at`, and a future stamp proves the clock moved, not
+    /// that the read is fresh ([`crate::usage::usage_cache_clock_of`]).
+    fn own_stamp(&self, name: &str) -> Option<u64> {
+        self.usage
+            .get(name)
+            .and_then(|u| u.fetched_at)
+            .filter(|at| *at <= crate::usage::now_ms())
     }
 }
 
@@ -6395,6 +6707,7 @@ impl App {
         let skipped_unreadable: SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
         let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
         let claude_resets_memo = new_claude_resets_memo();
+        let codex_resets_memo = new_codex_resets_memo();
         let suppressed_auth_expired: SuppressedAuthExpiredStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
@@ -6488,6 +6801,7 @@ impl App {
         }
 
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
+        let (limit_reset_tx, limit_reset_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
@@ -6507,7 +6821,7 @@ impl App {
         // tick refreshes the same pair from one read.
         let job_trees = crate::claude_jobs::job_trees();
         let live_sessions = crate::live_sessions::LiveTally::collect_in(&config, &job_trees);
-        let claude_resets = claude_resets(
+        let claude_resets = limit_resets_of(
             &config
                 .profiles
                 .iter()
@@ -6532,6 +6846,37 @@ impl App {
             .first()
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
+        let (codex, codex_landed) = codex_rows_landed();
+        let codex_resets =
+            limit_resets_of(&codex.iter().map(|r| r.name.clone()).collect::<Vec<_>>());
+        let mascot_seen = MascotSeen {
+            sessions: live_sessions.session_members().cloned(),
+            codex_seeded: codex_landed,
+            codex_active: codex
+                .iter()
+                .find(|row| row.active)
+                .map(|row| row.name.to_string()),
+            codex_broken: codex
+                .iter()
+                .filter(|row| row.broken)
+                .map(|row| row.name.to_string())
+                .collect(),
+            codex_resets: codex
+                .iter()
+                .map(|row| {
+                    (
+                        row.name.to_string(),
+                        Self::seed_windows(window_instants(row)),
+                    )
+                })
+                .collect(),
+            ..MascotSeen::seeded(
+                config.state.active_profile.as_ref(),
+                &config.state.auth_broken,
+            )
+        };
+        let mut mascot = mascot::Stage::new(SlotMascot::new());
+        mascot.set_reduce_motion(config.state.reduce_motion);
 
         let config: ConfigHandle = Arc::new(RankedMutex::new(config));
         let switch_gates = Arc::new(SwitchGates(std::sync::Mutex::new(switch_gates)));
@@ -6576,8 +6921,10 @@ impl App {
             skipped_unreadable,
             weekly_reset_kicks,
             claude_resets_memo,
+            codex_resets_memo,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
+            reading_clocks: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             credit_refusals: HashMap::new(),
@@ -6698,6 +7045,18 @@ impl App {
             daemon_control_busy: false,
             daemon_control_rx,
             daemon_control_tx,
+            limit_reset_rx,
+            limit_reset_tx,
+            limit_reset_in_flight: HashSet::new(),
+            reset_urls: if cfg!(test) {
+                crate::usage::codex_reset::ResetUrls {
+                    list: "http://127.0.0.1:9/list".to_string(),
+                    consume: "http://127.0.0.1:9/consume".to_string(),
+                    claude_origin: "http://127.0.0.1:9".to_string(),
+                }
+            } else {
+                crate::usage::codex_reset::ResetUrls::live()
+            },
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             services: ServicesState::default(),
             token_stats: None,
@@ -6738,7 +7097,8 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
-            clawd: clawd::Clawd::new(),
+            mascot,
+            mascot_seen,
             #[cfg(test)]
             anim_phase_ms: None,
             #[cfg(test)]
@@ -6772,6 +7132,7 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            last_delegate_poll: None,
             job_trees,
             handed_off,
             tps,
@@ -6782,8 +7143,9 @@ impl App {
             #[cfg(test)]
             delegate_speed_walks: 0,
             last_finished_speeds_refresh: Instant::now(),
-            codex_rows: codex_rows(),
+            codex_rows: codex,
             claude_resets,
+            codex_resets,
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
             shunt_pool_read_at_ms: None,
@@ -6948,12 +7310,31 @@ impl App {
     /// `false` paints Claude Code's simplified mascot, the one it draws on
     /// Apple's Terminal.app.
     pub(crate) fn with_full_sprite(mut self, full_sprite: bool) -> Self {
-        self.clawd.full_sprite = full_sprite;
+        self.mascot.set_full_sprite(full_sprite);
         self
     }
 
-    /// The production write path for the tally after construction.
+    /// The production write path for the tally after construction. A session
+    /// id the last read tally lacked is a session starting; one whose account
+    /// (the member it runs on) changed has moved, whatever its swap stamp. An
+    /// unread tally is no reading.
     pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        if let Some(now) = tally.session_members() {
+            let mut cues = Vec::new();
+            if let Some(before) = &self.mascot_seen.sessions {
+                for (id, member) in now {
+                    match before.get(id) {
+                        None => cues.push(mascot::Cue::SessionStarted),
+                        Some(was) if was != member => cues.push(mascot::Cue::SessionMoved),
+                        Some(_) => {}
+                    }
+                }
+            }
+            self.mascot_seen.sessions = Some(now.clone());
+            for cue in cues {
+                self.cue_mascot(cue);
+            }
+        }
         self.live_sessions = tally;
     }
 
@@ -7087,7 +7468,7 @@ impl App {
                             *boot = Some(settled.placed);
                         }
                         let _placed = enter_bare_item_placement(settled.placed);
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                     Ok(crate::claude::BareItemSettle::NeedsChoice(unplaced)) => {
@@ -7097,7 +7478,7 @@ impl App {
                     }
                     Err(e) => {
                         crate::logline::logline!("clauth: {e:#}");
-                        let _ = link_profile_credentials(&active);
+                        relink_at_boot(&active);
                         answer.disarm();
                     }
                 }
@@ -7463,6 +7844,7 @@ impl App {
             h.auto_start_queue,
             h.weekly_reset_kicks,
             h.claude_resets_memo,
+            h.codex_resets_memo,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -7499,6 +7881,7 @@ impl App {
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -7624,7 +8007,56 @@ impl App {
             third_party: third_party_usage,
             oauth: usage_store,
             stale: self.stale_cues.clone(),
+            clock: self.reading_clocks.clone(),
+            is_third_party: third_party,
         }
+    }
+
+    /// A window resets when a fresh reading names a later boundary and the
+    /// boundary it last named has passed. "Later" compares against the
+    /// highest boundary ever named and "passed" against the one last named:
+    /// a rollover spike reports `now + 5h` for a while before settling onto
+    /// the boundary the window really ends on, so the highest instant alone
+    /// would keep the next rollover from counting once the settled boundary
+    /// passed. Compared as an instant, so the same reset spelled in another
+    /// offset is none, and the highest instant outlives a lapsed window, so
+    /// a window reopening on a later reset still counts.
+    fn observe_window_resets(&mut self, readings: Vec<(String, [Option<i64>; 2])>) {
+        let now = crate::usage::now_epoch_secs();
+        if Self::reset_windows(&mut self.mascot_seen.resets, readings, now) {
+            self.cue_mascot(mascot::Cue::WindowReset);
+        }
+    }
+
+    /// The per-boundary reset compare shared by the claude and codex arms: a
+    /// fresh reading that names a later boundary than the highest one ever named
+    /// resets once the boundary LAST named has passed. The pair keeps both facts —
+    /// a rollover spike reports `now + 5h` for a while before settling, so the
+    /// highest instant alone would keep the next rollover from counting long
+    /// after the settled boundary passed.
+    fn reset_windows(
+        seen: &mut HashMap<String, [Option<(i64, i64)>; 2]>,
+        readings: impl IntoIterator<Item = (String, [Option<i64>; 2])>,
+        now: i64,
+    ) -> bool {
+        let mut reset = false;
+        for (name, instants) in readings {
+            let slot = seen.entry(name).or_default();
+            for (seen, read) in slot.iter_mut().zip(instants) {
+                let Some(read) = read else {
+                    continue;
+                };
+                reset |= seen.is_some_and(|(last, max)| last <= now && read > max);
+                *seen = Some((read, seen.map_or(read, |(_, max)| max.max(read))));
+            }
+        }
+        reset
+    }
+
+    /// The first stored reading of a window pair: the boundary last named and the
+    /// highest one are the same instant, so no reset can fire off it.
+    fn seed_windows(instants: [Option<i64>; 2]) -> [Option<(i64, i64)>; 2] {
+        instants.map(|instant| instant.map(|instant| (instant, instant)))
     }
 
     pub(crate) fn apply_usage(&mut self) {
@@ -7632,13 +8064,15 @@ impl App {
         // bell, history/wallet re-read sets and the stale map all derive from
         // its one picker pass, never a second one.
         let readings = self.readings_snapshot();
-        let (bells, history_names, wallet_names, stale_map) = {
+        let (bells, resets, history_names, wallet_names, stale_map, clock_map) = {
             let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             let mut stale_map = HashMap::new();
+            let mut clock_map = HashMap::new();
             let mut bells = Vec::new();
+            let mut resets = Vec::new();
             let mut history_names = Vec::new();
             let mut wallet_names = Vec::new();
             for p in &cfg.profiles {
@@ -7663,9 +8097,14 @@ impl App {
                     && oauth_usage
                         .as_ref()
                         .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                // One mtime stat per third-party profile per pass: the stale
+                // arm and the due-time clock arm share it.
+                let tp_mtime = p
+                    .usage_cache_is_third_party()
+                    .then(|| profile_cache_mtime_ms(&p.name, usage_cache_file(p)))
+                    .flatten();
                 let past_threshold = if p.usage_cache_is_third_party() {
-                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
-                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
+                    tp_mtime.is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
                 } else {
                     crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
                         stale_after_ms(interval_ms),
@@ -7676,6 +8115,21 @@ impl App {
                 };
                 let stale = !spent_skipped && past_threshold;
                 stale_map.insert(name.clone(), stale);
+                // The due-time clock the overdue arms derive their deadline
+                // off: the third-party arm's cache mtime (that file's only
+                // writer is a fetch outcome), the OAuth arm's own stamp with
+                // the mtime fallback for an undatable body. The fallback
+                // dates the due time only — the read age dates off the
+                // reading's own stamp, so an undatable OAuth body shows its
+                // overdue forms undated.
+                let clock = if p.usage_cache_is_third_party() {
+                    tp_mtime
+                } else {
+                    crate::usage::usage_cache_clock_of(&p.name, oauth_usage.as_ref())
+                };
+                if let Some(at) = clock {
+                    clock_map.insert(name.clone(), at);
+                }
                 // The same reading the daemon's bell judges: a lapsed 5h
                 // window is no figure, and an aged one is not fresh.
                 let util = readings
@@ -7702,7 +8156,17 @@ impl App {
                         .is_none_or(|age| stale && age > stale_after_ms(interval_ms)),
                     None => stale,
                 };
-                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !bell_stale;
+                let fetched_fresh = readings.status_of(&name) == Some(FetchStatus::Fresh);
+                if fetched_fresh && let Some(usage) = readings.usage_of(&name) {
+                    resets.push((
+                        name.clone(),
+                        [
+                            window_reset_instant(usage.five_hour.as_ref()),
+                            window_reset_instant(usage.seven_day.as_ref()),
+                        ],
+                    ));
+                }
+                let fresh = fetched_fresh && !bell_stale;
                 bells.push((name.clone(), p.bell_threshold, util, fresh));
                 if readings.usage.contains_key(&name) {
                     history_names.push(name.clone());
@@ -7711,22 +8175,35 @@ impl App {
                     wallet_names.push(name);
                 }
             }
-            (bells, history_names, wallet_names, stale_map)
+            (
+                bells,
+                resets,
+                history_names,
+                wallet_names,
+                stale_map,
+                clock_map,
+            )
         };
         self.stale_cues = stale_map;
+        self.reading_clocks = clock_map;
         // `bells` is the full profile set this pass observed, so an account
         // deleted while ringing forgets and re-arms if re-created past the line.
         {
             let present: HashSet<&str> =
                 bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
             self.bell_fired.forget_absent(&present);
+            self.mascot_seen
+                .resets
+                .retain(|name, _| present.contains(name.as_str()));
         }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);
                 self.set_tab_activity(Tab::Overview, ToastKind::Warning);
+                self.cue_mascot(mascot::Cue::BellCrossed);
             }
         }
+        self.observe_window_resets(resets);
 
         // Re-read any history log that changed on disk. The file is written by
         // whichever process holds the fetch lease — this one or a headless
@@ -8114,13 +8591,28 @@ impl App {
     /// binding surface.
     const WIDTH_FLOOR: u16 = 34;
 
+    /// The one mascot slot's cell size, `(columns, rows)`: the header's art
+    /// fit, its height and its logo column read it, and it follows the slot's
+    /// type ([`SlotMascot`]), so a new mascot re-sizes the header from the
+    /// one place its type is named.
+    pub(crate) const MASCOT_SIZE: (usize, usize) = <SlotMascot as mascot::Mascot>::SIZE;
+
     /// Called each frame with the current terminal size. Tracks compact
     /// state and the width floor; the matching warning banner is recomputed
     /// from these flags in `update_banner` each tick, so it self-clears on
-    /// resize (no toast).
+    /// resize (no toast). The mascot plays only while the header draws its art.
     pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
         self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
+        let frame = ratatui::layout::Rect::new(0, 0, terminal_width, terminal_height);
+        self.mascot.set_shown(crate::tui::render::art_fits(frame));
+    }
+
+    /// The one seam every mascot cue goes through, stamped on the clock the
+    /// mascot draws by.
+    pub(crate) fn cue_mascot(&mut self, cue: mascot::Cue) {
+        let now_ms = self.anim_ms();
+        self.mascot.cue(cue, now_ms);
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -9313,6 +9805,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
+    let now_ms = app.anim_ms();
+    app.mascot.key_pressed(now_ms);
 
     // The offset a one-shot scroll rendered becomes the key state on the next
     // key, whatever it is, ahead of every handler: a reset then acts on the
@@ -19344,6 +19838,14 @@ fn toast_bare_item_notice(app: &mut App, notice: crate::claude::BareItemNotice) 
     }
 }
 
+/// The boot relink of the active account, which nobody is waiting on: a failure
+/// (the guard's refusal, a failed stamp) is logged instead of dropped.
+fn relink_at_boot(name: &crate::profile::ProfileName) {
+    if let Err(e) = link_profile_credentials(name) {
+        crate::logline::logline!("clauth: {e:#}; .credentials.json was not relinked to '{name}'");
+    }
+}
+
 /// Run a held write again: its gate takes `placed` instead of settling.
 fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u8; 32]>) {
     app.bare_item_ready = Some(placed);
@@ -19352,7 +19854,7 @@ fn resume_bare_item_write(app: &mut App, write: BareItemWrite, placed: Option<[u
             if app.config().is_active(&name)
                 && let Some(_placed) = bare_item_gate(app, BareItemWrite::BootRelink(name.clone()))
             {
-                let _ = link_profile_credentials(&name);
+                relink_at_boot(&name);
                 app.refresh_unsaved_live_login();
             }
         }
@@ -20228,11 +20730,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 21] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 22] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
+    GlobalConfigRow::ReduceMotion,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::SyncMcpLogins,
@@ -20262,7 +20765,8 @@ impl GlobalConfigRow {
             GlobalConfigRow::Theme
             | GlobalConfigRow::ResetShape
             | GlobalConfigRow::ClockNotation
-            | GlobalConfigRow::HomeTab => "appearance",
+            | GlobalConfigRow::HomeTab
+            | GlobalConfigRow::ReduceMotion => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::SyncMcpLogins
@@ -20379,6 +20883,7 @@ pub(crate) fn global_config_row_live(app: &App, row: GlobalConfigRow) -> bool {
         GlobalConfigRow::Theme
         | GlobalConfigRow::ResetShape
         | GlobalConfigRow::HomeTab
+        | GlobalConfigRow::ReduceMotion
         | GlobalConfigRow::DivergenceDefault
         | GlobalConfigRow::SwitchOffWhenSpent
         | GlobalConfigRow::WeeklyThreshold
@@ -20407,6 +20912,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::ResetShape => cycle_reset_display(app),
         GlobalConfigRow::HomeTab => cycle_home_tab(app),
+        GlobalConfigRow::ReduceMotion => toggle_reduce_motion(app),
         GlobalConfigRow::ClockNotation => cycle_clock_format(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
@@ -20706,6 +21212,16 @@ fn cycle_home_tab(app: &mut App) {
     let next = next.next();
     app.save_state_delta(|s, _held| s.home_tab = Some(next.into()));
     app.apply_forgets();
+}
+
+/// Flip `reduce_motion` (default off). The mascot stills at once rather than
+/// at the next tick's compare, so no frame of motion follows the press.
+fn toggle_reduce_motion(app: &mut App) {
+    let next = !app.config().state.reduce_motion;
+    app.save_state_delta(|s, _held| s.reduce_motion = next);
+    app.apply_forgets();
+    let still = app.config().state.reduce_motion;
+    app.mascot.set_reduce_motion(still);
 }
 
 fn cycle_divergence_default(app: &mut App) {
@@ -22375,6 +22891,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
+        Modal::LimitReset(_) => handle_limit_reset_key(app, key),
         Modal::PresetApply(_) => handle_preset_apply_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::TokenPicker(_) => handle_token_picker_key(app, key),
@@ -22622,7 +23139,17 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                         row_identity = Some(RowIdentity::Pool(identity));
                     }
                 }
-                SetupSelection::Item(MainItemKind::Codex(_)) | SetupSelection::New => {}
+                SetupSelection::Item(MainItemKind::Codex(i)) => {
+                    if let Some(row) = app.codex_rows.get(i)
+                        && limit_reset_form(app).is_some()
+                    {
+                        context = Some(row.name.to_string());
+                    }
+                }
+                SetupSelection::New => {}
+            }
+            if limit_reset_form(app).is_some() {
+                scoped.push(UseLimitReset);
             }
             actions.push(RefreshAll);
             actions.push(ToggleEstimates);
@@ -23058,6 +23585,499 @@ fn account_by_name(app: &App, name: &ProfileName) -> Option<(ProfileName, bool, 
 /// refresh gate asks whether the account has a usage fetch leg, and the
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
+/// The `use a limit reset` modal for the Usage selection, off the account's
+/// stored reading (a claude account's `limit_resets.json` grants, a codex
+/// account's last list read), or `None` when that reading names no reset the
+/// account still holds: the action menu offers the item exactly when this
+/// builds a form.
+pub(crate) fn limit_reset_form(app: &App) -> Option<LimitResetForm> {
+    use crate::harness::Harness;
+    let (name, harness) = match app.usage_selection() {
+        SetupSelection::Item(MainItemKind::Profile(i)) => {
+            (app.profile_name_at(i)?, Harness::Claude)
+        }
+        SetupSelection::Item(MainItemKind::Codex(i)) => {
+            (app.codex_rows.get(i)?.name.clone(), Harness::Codex)
+        }
+        SetupSelection::Item(MainItemKind::Shunt(..)) | SetupSelection::New => return None,
+    };
+    let reading = match harness {
+        Harness::Claude => app.claude_resets.get(name.as_str())?,
+        Harness::Codex => app.codex_resets.get(name.as_str())?,
+    };
+    let (available, resets) = limit_reset_rows(harness, reading);
+    if !resets.iter().any(|r| r.held) {
+        return None;
+    }
+    Some(LimitResetForm {
+        name,
+        harness,
+        available,
+        resets,
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
+    })
+}
+
+/// The count line and per-reset choices a stored reading gives the modal: the
+/// form opens and a landed spend's re-read both build their rows here, so the
+/// count and the rows always agree.
+fn limit_reset_rows(
+    harness: crate::harness::Harness,
+    reading: &crate::usage::LimitResets,
+) -> (String, Vec<ResetChoice>) {
+    match harness {
+        crate::harness::Harness::Claude => (
+            crate::usage::claude_reset::available_of(
+                reading.usable,
+                reading.banked.unwrap_or(reading.usable),
+            ),
+            claude_reset_choices(reading),
+        ),
+        crate::harness::Harness::Codex => (
+            format!("{} available", reading.usable),
+            codex_reset_choices(reading),
+        ),
+    }
+}
+
+/// The account's fresh pending record, if any, as the reset id it pins and
+/// the line a spend of another reset shows: read from disk, never cached.
+fn pending_reset_pin(
+    name: &ProfileName,
+    harness: crate::harness::Harness,
+) -> Option<(String, String)> {
+    use crate::usage::limit_reset_pending::{ClaudePending, CodexPending, fresh_record, path};
+    match harness {
+        crate::harness::Harness::Claude => path::<ClaudePending>(name)
+            .ok()
+            .and_then(|p| fresh_record::<ClaudePending>(&p))
+            .map(|r| {
+                let line = crate::usage::claude_reset::pinned_record_line(
+                    name.as_str(),
+                    &r.grant_id,
+                    r.sent_at_ms,
+                );
+                (r.grant_id, line)
+            }),
+        crate::harness::Harness::Codex => path::<CodexPending>(name)
+            .ok()
+            .and_then(|p| fresh_record::<CodexPending>(&p))
+            .map(|r| {
+                let line = crate::usage::codex_reset::pinned_record_line(
+                    name.as_str(),
+                    &r.credit_id,
+                    r.sent_at_ms,
+                );
+                (r.credit_id, line)
+            }),
+    }
+}
+
+/// `form` with the account's fresh pending record, if any, pinning its reset:
+/// read once when the modal opens, never on the per-frame menu check.
+pub(crate) fn pin_pending_reset(mut form: LimitResetForm) -> LimitResetForm {
+    form.pinned = pending_reset_pin(&form.name, form.harness);
+    form
+}
+
+/// `until <day>, <time>` off a reset's end, local (`until Dec 10, 23:00`),
+/// the year added when it is not this one (`until Mar 9, 2027, 08:59`).
+fn reset_valid_until(raw: &str) -> Option<String> {
+    use chrono::Datelike as _;
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let shown = if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d, %H:%M")
+    } else {
+        local.format("%b %-d, %Y, %H:%M")
+    };
+    Some(format!("until {shown}"))
+}
+
+/// Every grant a claude reading names, in the server's order, used ones
+/// included (their STATE reads `used`).
+fn claude_reset_choices(reading: &crate::usage::LimitResets) -> Vec<ResetChoice> {
+    use crate::usage::claude_reset::{grant_id_is_sendable, grant_state, headroom, windows_cell};
+    let now = crate::usage::now_epoch_secs();
+    reading
+        .grants
+        .iter()
+        .map(|g| {
+            let windows = windows_cell(g.clears());
+            let mut rows = vec![
+                ("id", crate::format::terminal_safe(&g.id)),
+                (
+                    "resets",
+                    if windows.is_empty() {
+                        "—".to_string()
+                    } else {
+                        windows
+                    },
+                ),
+                (
+                    "valid",
+                    g.ends_at()
+                        .and_then(reset_valid_until)
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("left", g.left_of_total().replacen('/', " of ", 1)),
+                (
+                    "state",
+                    grant_state(g, reading.cooldown_until.as_deref(), reading.at_limit, now),
+                ),
+            ];
+            let weekly = reading
+                .weekly_resets_at
+                .as_deref()
+                .and_then(crate::usage::iso_to_epoch_secs)
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|at| {
+                    format!(
+                        "weekly reset {}",
+                        at.with_timezone(&chrono::Local).format("%b %-d")
+                    )
+                });
+            let now_row: Vec<String> = headroom(g)
+                .map(|(window, left)| format!("{left}% of {window} left"))
+                .into_iter()
+                .chain(weekly)
+                .collect();
+            if !now_row.is_empty() {
+                rows.push(("now", now_row.join(" · ")));
+            }
+            ResetChoice {
+                id: g.id.clone(),
+                label: g.label(),
+                rows,
+                usable: g.resets_left() > 0 && g.is_usable_now() && grant_id_is_sendable(&g.id),
+                held: g.resets_left() > 0,
+            }
+        })
+        .collect()
+}
+
+/// Every credit a codex list read names, in the server's order.
+fn codex_reset_choices(reading: &crate::usage::LimitResets) -> Vec<ResetChoice> {
+    reading
+        .credits
+        .iter()
+        .map(|c| {
+            let valid = match c.expires_at.as_deref() {
+                Some(raw) if !crate::format::shows_nothing(raw) => {
+                    reset_valid_until(raw).unwrap_or_else(|| c.expires_cell())
+                }
+                Some(_) | None => "no expiry".to_string(),
+            };
+            ResetChoice {
+                id: c.id.clone(),
+                label: c.label(),
+                rows: vec![
+                    ("id", crate::format::terminal_safe(&c.id)),
+                    ("resets", c.resets()),
+                    ("valid", valid),
+                    ("left", c.left_of_total().replacen('/', " of ", 1)),
+                    ("state", c.state()),
+                ],
+                usable: c.is_available(),
+                held: c.is_available(),
+            }
+        })
+        .collect()
+}
+
+/// The `use a limit reset` modal's keys: `↑`/`↓` walk the resets (wrapping),
+/// `←`/`→` move the button focus, `↵` runs the focused button (`use reset`
+/// only while [`LimitResetForm::can_use`]), `esc`/`q` close. While a spend
+/// runs every key but `esc`/`q` is ignored, so a second press sends nothing;
+/// closing then leaves the spend to land as a toast.
+fn handle_limit_reset_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::LimitReset(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        _ if form.phase == LimitResetPhase::Spending => {}
+        KeyCode::Up | KeyCode::Down => {
+            let n = form.resets.len().max(1);
+            form.cursor = if key.code == KeyCode::Up {
+                (form.cursor + n - 1) % n
+            } else {
+                (form.cursor + 1) % n
+            };
+            form.phase = LimitResetPhase::Idle;
+        }
+        KeyCode::Left | KeyCode::Right => form.on_use = !form.on_use,
+        KeyCode::Enter if !form.on_use => {
+            app.pop_modal();
+        }
+        KeyCode::Enter if form.can_use() => start_limit_reset(app),
+        _ => {}
+    }
+}
+
+/// What a TUI spend's worker reports, once: the success summary, or the line
+/// naming why nothing was used (or, for an answer that still moved the count,
+/// what the server said). The id is the reset the run spent, so the drain
+/// lands each result only on the modal whose own spend it answers.
+#[derive(Debug)]
+pub(crate) enum LimitResetResult {
+    Used {
+        id: String,
+        name: String,
+        summary: String,
+        /// The run's own re-read stored its reading: only then may the drain
+        /// rebuild a reopened modal's rows from the stored copy.
+        reread_stored: bool,
+    },
+    Refused {
+        id: String,
+        name: String,
+        line: String,
+        /// The reply refused the spend but still moved the count: the drain
+        /// must not offer the spent reset again when the re-read left no
+        /// reading behind.
+        moved_count: bool,
+        /// The run's own re-read stored its reading: only then may the drain
+        /// rebuild the modal's rows from the stored copy.
+        reread_stored: bool,
+    },
+}
+
+/// The TUI's side of a spend: no question (the modal's `use reset` was the
+/// confirmation), notes to the log, and the outcome kept for the drain, with
+/// the server's own reason when its reply refused the spend.
+#[derive(Default)]
+struct TuiSpend {
+    outcome: Option<std::result::Result<String, String>>,
+    refused: Option<String>,
+    moved_count: bool,
+    reread_stored: bool,
+}
+
+impl crate::limit_reset::SpendSurface for TuiSpend {
+    fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn note(&mut self, line: &str) {
+        crate::logline::logline!("{line}");
+    }
+
+    fn outcome(&mut self, outcome: &std::result::Result<String, String>) {
+        self.outcome = Some(outcome.clone());
+    }
+
+    fn refused(&mut self, reason: &str) {
+        self.refused = Some(reason.to_string());
+    }
+
+    fn moved_count(&mut self, reread_stored: bool) {
+        self.moved_count = true;
+        self.reread_stored = reread_stored;
+    }
+}
+
+/// Run the focused reset's spend on a worker: the CLI's own spend core, under
+/// `yes`, never on the draw or key thread.
+fn start_limit_reset(app: &mut App) {
+    let Some(Modal::LimitReset(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let Some(id) = form.focused().map(|r| r.id.clone()) else {
+        return;
+    };
+    form.phase = LimitResetPhase::Spending;
+    form.spending = Some(id.clone());
+    app.limit_reset_in_flight.insert(form.name.to_string());
+    let name = form.name.clone();
+    let harness = form.harness;
+    let urls = app.reset_urls.clone();
+    let tx = app.limit_reset_tx.clone();
+    spawn_worker(move || {
+        // One result per spawn, a crashed run included: the drain clears the
+        // in-flight mark off the result, so a run that sent none would leave
+        // the account's modal stuck in `Spending` forever.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_limit_reset(&name, harness, &id, &urls)
+        }))
+        .unwrap_or_else(|_| LimitResetResult::Refused {
+            id: id.clone(),
+            name: name.to_string(),
+            line: NO_OUTCOME_LINE.to_string(),
+            moved_count: false,
+            reread_stored: false,
+        });
+        drop(tx.send(result));
+    });
+}
+
+/// The line for a spend whose outcome nobody reported — a settled run and a
+/// crashed one alike; the pending record keeps a re-send safe.
+const NO_OUTCOME_LINE: &str = "the reset request settled with no outcome to show";
+
+/// One TUI spend, start to finish, folded into what the drain shows.
+fn run_limit_reset(
+    name: &ProfileName,
+    harness: crate::harness::Harness,
+    id: &str,
+    urls: &crate::usage::codex_reset::ResetUrls,
+) -> LimitResetResult {
+    let mut surface = TuiSpend::default();
+    let spent = match harness {
+        crate::harness::Harness::Codex => {
+            crate::limit_reset::spend_codex(name.as_str(), id, true, false, urls, &mut surface)
+        }
+        crate::harness::Harness::Claude => crate::profile::load_config().and_then(|config| {
+            let profile = config
+                .find(name)
+                .ok_or_else(|| anyhow::anyhow!("'{name}' is no longer an account"))?;
+            crate::limit_reset::spend_claude(&config, profile, id, true, false, urls, &mut surface)
+        }),
+    };
+    let id = id.to_string();
+    let name = name.to_string();
+    let moved_count = surface.moved_count;
+    let reread_stored = surface.reread_stored;
+    match (surface.refused, surface.outcome, spent) {
+        (Some(reason), _, _) => LimitResetResult::Refused {
+            id,
+            name,
+            line: crate::limit_reset::server_refused_line(&reason),
+            moved_count,
+            reread_stored,
+        },
+        (None, Some(Ok(summary)), _) => LimitResetResult::Used {
+            id,
+            name,
+            summary: summary.trim_start_matches("clauth: ").to_string(),
+            reread_stored,
+        },
+        (None, Some(Err(line)), _)
+        | (None, None, Ok(crate::limit_reset::Spent::Declined(line))) => {
+            LimitResetResult::Refused {
+                id,
+                name,
+                line,
+                moved_count,
+                reread_stored,
+            }
+        }
+        (None, None, Err(e)) => LimitResetResult::Refused {
+            id,
+            name,
+            line: e.to_string(),
+            moved_count,
+            reread_stored,
+        },
+        // `Sent` always tells its outcome first; this arm keeps the match
+        // total without claiming a spend nobody reported.
+        (None, None, Ok(crate::limit_reset::Spent::Sent)) => LimitResetResult::Refused {
+            id,
+            name,
+            line: NO_OUTCOME_LINE.to_string(),
+            moved_count,
+            reread_stored,
+        },
+    }
+}
+
+/// Land each finished TUI spend: a success closes its modal and toasts the
+/// summary, a refusal stays in the modal in the error colour (or toasts when
+/// the modal was closed meanwhile). A result lands only on the modal whose
+/// own spend it answers (the same account, still `Spending`, and the form's
+/// own sent id), so a spend whose modal was closed never reaches a modal
+/// reopened for the same account; that form only returns to idle, and settles
+/// its rows off the result as an answered modal does. The rows rebuild only
+/// from a reading the same run's re-read stored; a run that stored none keeps
+/// the open-time rows and, when it moved the count, turns the spent reset off.
+/// The stored readings reload so the Usage row follows.
+fn drain_limit_reset(app: &mut App) {
+    while let Ok(result) = app.limit_reset_rx.try_recv() {
+        app.last_codex_rows_refresh = None;
+        let name = match &result {
+            LimitResetResult::Used { name, .. } | LimitResetResult::Refused { name, .. } => {
+                name.clone()
+            }
+        };
+        // The spend this result answers is no longer in flight, wherever the
+        // result lands.
+        app.limit_reset_in_flight.remove(&name);
+        let open = |app: &mut App, name: &str, id: &str| match app.modals.last_mut() {
+            Some(Modal::LimitReset(form))
+                if form.name.as_str() == name
+                    && form.phase == LimitResetPhase::Spending
+                    && form.spending.as_deref() == Some(id)
+                    && form.focused().is_some_and(|r| r.id == id) =>
+            {
+                Some(())
+            }
+            _ => None,
+        };
+        // A form reopened while the account's spend was in flight shows
+        // `Spending` with no spend of its own; once the result it was waiting
+        // on drains, the truthful phase is idle again, so `use reset` runs.
+        let unstick = |app: &mut App, name: &str, id: &str, moved: bool, reread_stored: bool| {
+            if let Some(Modal::LimitReset(form)) = app.modals.last_mut()
+                && form.name.as_str() == name
+                && form.phase == LimitResetPhase::Spending
+                && form.spending.is_none()
+            {
+                form.phase = LimitResetPhase::Idle;
+                form.settle_reopened(id, moved, reread_stored);
+            }
+        };
+        match result {
+            LimitResetResult::Used {
+                id,
+                name,
+                summary,
+                reread_stored,
+            } => {
+                if open(app, &name, &id).is_some() {
+                    app.pop_modal();
+                } else {
+                    unstick(app, &name, &id, true, reread_stored);
+                }
+                app.toast(ToastKind::Success, format!("limit reset used\n{summary}"));
+            }
+            LimitResetResult::Refused {
+                id,
+                name,
+                line,
+                moved_count,
+                reread_stored,
+            } => {
+                if open(app, &name, &id).is_none() {
+                    unstick(app, &name, &id, moved_count, reread_stored);
+                    app.toast(ToastKind::Danger, format!("limit reset not used\n{line}"));
+                    continue;
+                }
+                if let Some(Modal::LimitReset(form)) = app.modals.last_mut() {
+                    form.phase = LimitResetPhase::Refused(line);
+                    if reread_stored {
+                        let stored = limit_resets_of(&[ProfileName::from(name.as_str())]);
+                        if let Some(reading) = stored.get(&name) {
+                            form.reload(reading);
+                        }
+                    } else if moved_count {
+                        form.mark_unusable(&id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
     let name = app.profile_name_at(app.profile_cursor.read())?;
     account_by_name(app, &name)
@@ -23289,6 +24309,18 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
         ActionMenuAction::TogglePace => toggle_show_pace(app),
+        ActionMenuAction::UseLimitReset => {
+            if let Some(form) = limit_reset_form(app) {
+                let mut form = pin_pending_reset(form);
+                // The account's spend still runs on its worker: the reopened
+                // modal shows that state, so a press cannot start a second
+                // spend while the first one is out.
+                if app.limit_reset_in_flight.contains(form.name.as_str()) {
+                    form.phase = LimitResetPhase::Spending;
+                }
+                app.open_modal(Modal::LimitReset(form));
+            }
+        }
         ActionMenuAction::TokensPeriodLifetime => set_token_period(app, TokenPeriod::Lifetime),
         ActionMenuAction::TokensPeriodDaily => set_token_period(app, TokenPeriod::Daily),
         ActionMenuAction::TokensPeriodWeekly => set_token_period(app, TokenPeriod::Weekly),
@@ -23594,11 +24626,24 @@ fn drain_daemon_control(app: &mut App) {
     }
 }
 
+/// Land one probe's health: the one place `daemon_health` moves, so the
+/// throttled poll and a TUI-issued stop/start tell the same edge. A held lock,
+/// fed or not, is a running daemon; only losing it is the daemon going down,
+/// and a start is no event.
+fn land_daemon_health(app: &mut App, health: crate::daemon::DaemonHealth) {
+    let went_down = app.daemon_health != crate::daemon::DaemonHealth::Absent
+        && health == crate::daemon::DaemonHealth::Absent;
+    app.daemon_health = health;
+    if went_down {
+        app.cue_mascot(mascot::Cue::DaemonDown);
+    }
+}
+
 /// Re-probe the header chip and the menu's verb at once rather than at the
 /// next throttled probe.
 fn reprobe_daemon(app: &mut App) {
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     app.last_daemon_probe = Instant::now();
@@ -24142,6 +25187,7 @@ fn drain_codex_login(app: &mut App) {
             Ok(canonical) => {
                 refresh_codex_rows(app);
                 app.toast(ToastKind::Success, format!("logged in '{canonical}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
@@ -26514,7 +27560,8 @@ fn drain_codex_new_login(app: &mut App) {
             Ok(outcome) => {
                 match stash_new_form_login(app, DraftLogin::CodexMint(Box::new(outcome))) {
                     StashOutcome::Staged => {
-                        app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                        app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                        app.cue_mascot(mascot::Cue::LoginGained);
                     }
                     StashOutcome::FormClosed => app.toast(
                         ToastKind::Warning,
@@ -30210,8 +31257,8 @@ fn run_capture_overwrite(
             )
             .map(|outcome| {
                 outcome.map(|landed| {
-                    landed.map(|oauth_moved| {
-                        if oauth_moved {
+                    landed.map(|plan_read_due| {
+                        if plan_read_due {
                             crate::usage::expire_profile_ttl(&name);
                         }
                     })
@@ -30320,7 +31367,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         // disk holds for the
                         // account it names active.
                         let keys = crate::actions::outgoing_env_keys_now(cfg)?;
-                        let oauth_moved = crate::actions::overwrite_captured_profile_held(
+                        let plan_read_due = crate::actions::overwrite_captured_profile_held(
                             cfg, &name, &account, snapshot, false,
                         )??;
                         // This arm activates OUTSIDE `overwrite_captured_profile`,
@@ -30339,17 +31386,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                                 let fresh = crate::profile::read_profile(&name)?;
                                 crate::claude::apply_profile_to_claude_settings(&fresh, &keys)
                             });
-                        Ok((oauth_moved, activated))
+                        Ok((plan_read_due, activated))
                     },
                 )
             };
             #[cfg(test)]
             run_after_adopt_hold_hook();
             let result = match result {
-                Ok(Ok((oauth_moved, activated))) => {
+                Ok(Ok((plan_read_due, activated))) => {
                     // After the hold (the TTL store ranks below the flock),
                     // whether or not the activation landed: the store moved.
-                    if oauth_moved {
+                    if plan_read_due {
                         crate::usage::expire_profile_ttl(&name);
                     }
                     activated
@@ -31698,6 +32745,7 @@ fn apply_status_incidents(
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }
+            app.cue_mascot(mascot::Cue::NewIncident);
         }
         app.status.seen_latest = newest_id.clone();
     }
@@ -31914,7 +32962,8 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // so the profile this login belongs to has no final name yet.
         match stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome))) {
             StashOutcome::Staged => {
-                app.toast(ToastKind::Success, "logged in\ncreate account saves it")
+                app.toast(ToastKind::Success, "logged in\ncreate account saves it");
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             StashOutcome::FormClosed => app.toast(
                 ToastKind::Warning,
@@ -32041,6 +33090,7 @@ fn apply_login_snapshot(
             app.apply_forgets();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{name}'"));
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -32098,6 +33148,7 @@ fn apply_console_login(
                     "console session captured for '{name}'\nit expires 48h after your aliyun sign-in, not after this login"
                 ),
             );
+            app.cue_mascot(mascot::Cue::LoginGained);
         }
         Err(e) => app.toast(
             ToastKind::Danger,
@@ -32112,7 +33163,7 @@ fn apply_console_login(
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
     let now_ms = app.anim_ms();
-    app.clawd.tick(now_ms);
+    app.mascot.tick(now_ms);
     // Safety net: a forget noted without an immediate drain still lands before
     // the next frame reads the stores; the per-site drains keep this a no-op.
     app.apply_forgets();
@@ -32124,6 +33175,7 @@ pub(crate) fn on_tick(app: &mut App) {
                     ToastKind::Success,
                     format!("updated to v{v}\nrestart to apply"),
                 );
+                app.cue_mascot(mascot::Cue::UpdateInstalled);
             }
             UpdateEvent::Available(v) => {
                 app.toast(
@@ -32188,6 +33240,7 @@ pub(crate) fn on_tick(app: &mut App) {
             app.usage_detail_scroll = 0;
         }
     }
+    observe_mascot_state(app);
     app.apply_usage();
 
     drain_switch_gates(app);
@@ -32278,6 +33331,7 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
     poll_live_sessions(app);
+    poll_delegate_jobs(app);
     sync_broken_verdicts(app);
     sync_credit_refusals(app);
     poll_codex_rows(app);
@@ -32288,6 +33342,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_pool_mutations(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
+    drain_limit_reset(app);
     poll_daemon_health(app);
     poll_tps(app);
     poll_finished_speeds(app);
@@ -32389,6 +33444,7 @@ fn poll_codex_rows(app: &mut App) {
     }
     app.last_codex_rows_refresh = Some(Instant::now());
     if refresh_codex_rows(app) {
+        observe_codex_state(app);
         app.place_overview_cursor();
     }
     let names: Vec<crate::profile::ProfileName> = app
@@ -32397,7 +33453,86 @@ fn poll_codex_rows(app: &mut App) {
         .iter()
         .map(|p| p.name.clone())
         .collect();
-    app.claude_resets = claude_resets(&names);
+    app.claude_resets = limit_resets_of(&names);
+    let codex_names: Vec<crate::profile::ProfileName> =
+        app.codex_rows.iter().map(|r| r.name.clone()).collect();
+    app.codex_resets = limit_resets_of(&codex_names);
+}
+
+/// The codex roster's mascot edges, compared right after each landed refresh
+/// off the snapshot the refresh already took (never a per-tick disk read): the
+/// active name changing is a switch, a name entering `broken` is a quarantine
+/// (one leaving it is none), and a 5h or 7d window rolls over under the same
+/// rule [`App::observe_window_resets`] applies to the claude windows — a
+/// fresh reading names a later boundary than the highest one ever named, once
+/// the boundary last named has passed. An unreadable roster keeps the
+/// previous rows, so it never reads as an edge, and the first landed reading
+/// only seeds.
+fn observe_codex_state(app: &mut App) {
+    let active = app
+        .codex_rows
+        .iter()
+        .find(|row| row.active)
+        .map(|row| row.name.to_string());
+    let broken: Vec<String> = app
+        .codex_rows
+        .iter()
+        .filter(|row| row.broken)
+        .map(|row| row.name.to_string())
+        .collect();
+    let resets: HashMap<String, [Option<i64>; 2]> = app
+        .codex_rows
+        .iter()
+        .map(|row| (row.name.to_string(), window_instants(row)))
+        .collect();
+
+    if !app.mascot_seen.codex_seeded {
+        app.mascot_seen.codex_seeded = true;
+        app.mascot_seen.codex_active = active;
+        app.mascot_seen.codex_broken = broken;
+        app.mascot_seen.codex_resets = resets
+            .into_iter()
+            .map(|(name, instants)| (name, App::seed_windows(instants)))
+            .collect();
+        return;
+    }
+
+    let switched = match (&app.mascot_seen.codex_active, &active) {
+        (Some(seen), Some(next)) => *seen != *next,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.codex_active = active;
+
+    let quarantined = broken
+        .iter()
+        .any(|name| !app.mascot_seen.codex_broken.contains(name));
+    app.mascot_seen.codex_broken = broken;
+
+    let now = crate::usage::now_epoch_secs();
+    let reset = App::reset_windows(
+        &mut app.mascot_seen.codex_resets,
+        resets
+            .iter()
+            .map(|(name, instants)| (name.clone(), *instants)),
+        now,
+    );
+    // A dropped codex profile forgets its boundaries, so a re-created one
+    // seeds again, the way the claude arm's retain does.
+    let present: HashSet<&str> = resets.keys().map(String::as_str).collect();
+    app.mascot_seen
+        .codex_resets
+        .retain(|name, _| present.contains(name.as_str()));
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+    if reset {
+        app.cue_mascot(mascot::Cue::WindowReset);
+    }
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
@@ -32411,7 +33546,7 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     let probe = crate::daemon::probe_daemon();
-    app.daemon_health = probe.health;
+    land_daemon_health(app, probe.health);
     app.set_gateway_state(probe.gateway.0.state);
     apply_daemon_binary_change(app, probe.binary_change);
     // The image this process runs never comes back, so each kind's toast
@@ -32536,6 +33671,7 @@ fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
         if app.daemon_toasted_kinds.latch(change) {
             app.toast(ToastKind::Warning, daemon_binary_toast(change));
         }
+        app.cue_mascot(mascot::Cue::DaemonReplaced);
     }
     refresh_plugin_check(app);
 }
@@ -32746,6 +33882,154 @@ fn poll_live_sessions(app: &mut App) {
     app.set_live_sessions(tally);
     app.handed_off = crate::runtime::handed_off_live_members(&jobs);
     app.job_trees = jobs;
+}
+
+/// Read the delegate job store at most once a second on every tab, so a
+/// delegate finishing while the Services tab is out of view still reaches the
+/// mascot: each job seen finished for the first time cues a finish, failed by
+/// the same error flag every stored-record delivery folds. A finish claimed
+/// between two reads left its delivery ledger, which cues by the verdict the
+/// claim stamped, so a claimed finish reaches the mascot exactly like an
+/// unclaimed one. One id cues once, whichever spelling it is first seen as.
+/// A stop cues nothing — the note a resumed session reads names it — and its
+/// id still enters the seen set, so no later read can cue it.
+/// The first read only seeds, ledgers included, so a finish from before the
+/// launch is no event; a store that could not be read is no reading, so it
+/// neither seeds nor cues.
+fn poll_delegate_jobs(app: &mut App) {
+    const DELEGATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_delegate_poll
+        .is_some_and(|t| t.elapsed() < DELEGATE_POLL_INTERVAL)
+    {
+        return;
+    }
+    app.last_delegate_poll = Some(Instant::now());
+    let Some(jobs) = crate::mcp::jobs::list_banded_readable(crate::usage::now_ms()) else {
+        return;
+    };
+    let finished = jobs
+        .iter()
+        .filter(|job| matches!(job.liveness, crate::mcp::jobs::JobLiveness::Done));
+    let Some(ledgers) = crate::mcp::jobs::list_ledgers_readable() else {
+        return;
+    };
+    let Some(seen) = app.mascot_seen.delegates_done.as_mut() else {
+        app.mascot_seen.delegates_done = Some(
+            finished
+                .map(|job| job.record.job_id.clone())
+                .chain(ledgers.into_iter().map(|ledger| ledger.job_id))
+                .collect(),
+        );
+        return;
+    };
+    let mut cues: Vec<mascot::Cue> = finished
+        .filter(|job| seen.insert(job.record.job_id.clone()))
+        .filter(|job| job.phase() != crate::mcp::jobs::JobPhase::Stopped)
+        .map(|job| {
+            if crate::mcp::done_job_failed(&job.record) {
+                mascot::Cue::DelegateFailed
+            } else {
+                mascot::Cue::DelegateDone
+            }
+        })
+        .collect();
+    cues.extend(
+        ledgers
+            .into_iter()
+            .filter(|ledger| seen.insert(ledger.job_id.clone()))
+            .filter(|ledger| !ledger.stopped)
+            .map(|ledger| {
+                if ledger.failed {
+                    mascot::Cue::DelegateFailed
+                } else {
+                    mascot::Cue::DelegateDone
+                }
+            }),
+    );
+    for cue in cues {
+        app.cue_mascot(cue);
+    }
+}
+
+/// The mascot's config-held edges, compared each tick after the reload so one
+/// compare covers an in-TUI write and another process's alike: the active
+/// account changing is a switch, and a name entering `auth_broken` is a
+/// quarantine (one leaving it is none). A rename moves a name but keeps the
+/// account's stored id under it, so an id matching across the move is no cue;
+/// a name whose id cannot be read falls back to the name answer. A reload that
+/// flips `reduce_motion` applies it here. An id is read only when its name is
+/// new to the reading, never per tick.
+fn observe_mascot_state(app: &mut App) {
+    let (active, auth_broken, still) = {
+        let cfg = app.config();
+        (
+            cfg.state.active_profile.as_ref().cloned(),
+            cfg.state.auth_broken.clone(),
+            cfg.state.reduce_motion,
+        )
+    };
+    app.mascot.set_reduce_motion(still);
+
+    let before = app.mascot_seen.active.clone();
+    let now = active.as_ref().map(|name| match &before {
+        Some(seen) if seen.name == *name => seen.clone(),
+        _ => SeenAccount::read(name),
+    });
+    let switched = match (&before, &now) {
+        (Some(seen), Some(next)) => {
+            seen.name != next.name && !same_account(seen.id.as_ref(), next.id.as_ref())
+        }
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    app.mascot_seen.active = now;
+
+    let before = std::mem::take(&mut app.mascot_seen.auth_broken);
+    let mut departed: Vec<crate::profile::ProfileId> = before
+        .iter()
+        .filter(|seen| !auth_broken.contains(&seen.name))
+        .filter_map(|seen| seen.id.clone())
+        .collect();
+    let mut quarantined = false;
+    let mut now = Vec::with_capacity(auth_broken.len());
+    for name in &auth_broken {
+        if let Some(seen) = before.iter().find(|seen| seen.name == *name) {
+            now.push(seen.clone());
+            continue;
+        }
+        let seen = SeenAccount::read(name);
+        let renamed =
+            seen.id
+                .as_ref()
+                .is_some_and(|id| match departed.iter().position(|old| old == id) {
+                    Some(pos) => {
+                        departed.remove(pos);
+                        true
+                    }
+                    None => false,
+                });
+        if !renamed {
+            quarantined = true;
+        }
+        now.push(seen);
+    }
+    app.mascot_seen.auth_broken = now;
+
+    if switched {
+        app.cue_mascot(mascot::Cue::Switch);
+    }
+    if quarantined {
+        app.cue_mascot(mascot::Cue::Quarantined);
+    }
+}
+
+/// Whether two names answer for one account: both stored ids read and equal.
+fn same_account(
+    old: Option<&crate::profile::ProfileId>,
+    new: Option<&crate::profile::ProfileId>,
+) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old == new)
 }
 
 /// Re-sync the durable dead-login verdicts into the live `ThirdPartyBroken`
@@ -33080,6 +34364,7 @@ fn drain_op_results(app: &mut App) {
                     ),
                 );
                 app.set_tab_activity(Tab::Usage, ToastKind::Danger);
+                app.cue_mascot(mascot::Cue::RefreshFailed);
             }
         }
     }
@@ -33361,6 +34646,7 @@ fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict 
                 app.apply_forgets();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
+                app.cue_mascot(mascot::Cue::LoginGained);
             }
             Err(e) => app.toast(
                 ToastKind::Danger,
