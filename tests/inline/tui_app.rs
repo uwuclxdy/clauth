@@ -70083,6 +70083,223 @@ fn disabling_the_highlighted_overview_row_hands_the_cursor_to_the_next() {
     );
 }
 
+/// A visit to the Overview keeps the shared selection. Usage selects the
+/// disabled `b`, which has no Overview row, so while the Overview shows its
+/// highlight and its actions name a shown row; back on Usage, and on Setup,
+/// `b` is still the selection.
+#[test]
+fn a_visit_to_the_overview_keeps_a_disabled_selection() {
+    use super::{MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    let b = SetupSelection::Item(MainItemKind::Profile(1));
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_selection(), b, "fixture control: Usage selects b");
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(0)));
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "the Overview's actions name the highlighted row"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.usage_selection(), b, "Usage still selects b");
+    handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.setup_selection(), b, "Setup reads b too");
+}
+
+/// A move on the Overview is a pick, onto a codex row too: the disabled
+/// selection the visit started over does not come back when it ends.
+#[test]
+fn a_move_on_the_overview_ends_the_kept_disabled_selection() {
+    use super::{MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![saved_account("a", false), saved_account("b", true)]);
+    app.codex_rows = vec![super::CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(1)),
+        "fixture control: Usage selects b"
+    );
+    handle_key(&mut app, alt_digit('1'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0)),
+        "fixture control: the move lands on the codex row"
+    );
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "the claude row the Overview held, never b"
+    );
+}
+
+/// A visit to the Overview keeps the shared selection even when the Overview
+/// remembers a codex row its filter hides: the entry placement moves the shared
+/// cursor onto a shown row, and leaving puts the selection back on the disabled
+/// account the visit started over.
+#[test]
+fn a_visit_keeps_a_disabled_selection_when_a_hidden_codex_row_is_remembered() {
+    use super::{HarnessFilter, MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    app.codex_rows = vec![super::CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.overview_remembered,
+        Some(MainItemKind::Codex(0)),
+        "fixture control: the Overview remembers the codex row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.harness_filter,
+        HarnessFilter::Claude,
+        "fixture control: `c` filters the list to claude"
+    );
+    assert_eq!(
+        app.main_items(),
+        [MainItemKind::Profile(0), MainItemKind::Profile(2)],
+        "fixture control: the filter hides the remembered codex row"
+    );
+
+    let b = SetupSelection::Item(MainItemKind::Profile(1));
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_selection(), b, "fixture control: Usage selects b");
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "fixture control: the entry placement moves off b"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.usage_selection(), b, "Usage still selects b");
+    handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.setup_selection(), b, "Setup reads b too");
+}
+
+/// A roster change on the Overview moves the shared cursor off the held
+/// disabled account: leaving keeps the row the change placed there, not the
+/// account the visit started over.
+#[test]
+fn a_mid_visit_roster_change_ends_the_kept_disabled_selection() {
+    use super::{MainItemKind, Modal, SetupSelection, handle_key, run_confirm_action};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(1)),
+        "fixture control: Usage selects the disabled b"
+    );
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(0)),
+        "fixture control: the visit parks on a"
+    );
+    assert!(
+        app.overview_held
+            .as_ref()
+            .is_some_and(|(name, _)| name.as_str() == "b"),
+        "fixture control: the visit holds the disabled b"
+    );
+
+    // Disabling the highlighted `a` takes its row away and re-places the shared
+    // cursor on `c`, which took its place.
+    pick_menu_entry(&mut app, "disable account");
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("disabling raises a confirm");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+    assert_eq!(
+        app.main_items(),
+        [MainItemKind::Profile(2)],
+        "fixture control: a's row is gone"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "fixture control: the change re-placed the shared cursor on c"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(2)),
+        "the row that took a's place, never the held b"
+    );
+}
+
+/// At startup the Overview's highlight and the shared selection agree before
+/// any tick: with the first account disabled both sit on the first shown row,
+/// and the `a` menu acts on it.
+#[test]
+fn startup_places_the_shared_selection_on_the_first_shown_row() {
+    use super::MainItemKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_unlinked_profiles(vec![saved_account("a", true), saved_account("b", false)])
+        .with_herdr_mode(false);
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "fixture control: the Overview is home"
+    );
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    assert_eq!(app.profile_cursor.read(), 1);
+    let menu = super::build_action_menu(&app);
+    assert_eq!(menu.context.as_deref(), Some("b"), "the menu names b");
+    assert!(
+        menu.items.iter().any(|i| i.label == "disable account")
+            && menu.items.iter().all(|i| i.label != "enable account"),
+        "the menu acts on the enabled b"
+    );
+}
+
 // ── `switch to a rolling token` row ─────────────────────────────────────────
 
 /// The five scopes a browser login stores, joined the way the token endpoint

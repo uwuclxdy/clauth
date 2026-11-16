@@ -5511,6 +5511,10 @@ const _: () = assert!(
     "the mascot must stand at least 3 rows tall to carry the header's info column"
 );
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the TUI's whole screen state: each bool is its own pane's or mode's flag"
+)]
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -5650,6 +5654,14 @@ pub(crate) struct App {
     /// another tab lands the Overview there for free while a codex/pool row
     /// stays put; a filter merely hides it, so the round trip restores it.
     pub(crate) overview_remembered: Option<MainItemKind>,
+    /// The disabled claude account the shared selection named when the
+    /// Overview was entered over it, with the shared cursor's move count right
+    /// after the entry placed the cursor: the Overview gives a disabled
+    /// account no row, so while it shows, its highlight and its actions take a
+    /// shown row. Leaving the Overview puts the selection back on the held
+    /// account while the count still equals the recorded one, so a visit costs
+    /// Usage and Setup nothing; a cursor move on the Overview drops it.
+    overview_held: Option<(ProfileName, u64)>,
     pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
@@ -6787,6 +6799,7 @@ impl App {
             overview_selector: ListView::default(),
             overview_cursor: 0,
             overview_remembered: None,
+            overview_held: None,
             usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
@@ -7128,6 +7141,10 @@ impl App {
         } else {
             let home: Tab = self.config().state.home_tab().into();
             self.tab = home;
+            // Before the first frame: a disabled account at the roster's head
+            // has no Overview row, so the highlight and the shared selection
+            // both land on the first shown row before any key reads them.
+            self.place_overview_cursor();
         }
         self
     }
@@ -9120,10 +9137,6 @@ impl App {
         }
     }
 
-    /// Whether the item universe still holds `item` (regardless of filter). A
-    /// row is gone only when its own list was read and lacks it; an unread
-    /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
-    /// them, so the next read restores the cursor.
     /// Whether `item` is a disabled claude account, which the Overview hides.
     fn is_disabled_item(&self, item: MainItemKind) -> bool {
         match item {
@@ -9136,6 +9149,10 @@ impl App {
         }
     }
 
+    /// Whether the item universe still holds `item` (regardless of filter). A
+    /// row is gone only when its own list was read and lacks it; an unread
+    /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
+    /// them, so the next read restores the cursor.
     fn holds_item(&self, item: MainItemKind) -> bool {
         match item {
             MainItemKind::Profile(i) => i < self.profile_count(),
@@ -9185,6 +9202,33 @@ impl App {
         self.sync_overview_profile_selection();
     }
 
+    /// The disabled account the shared selection names: the Overview gives it
+    /// no row, so the entry placement moves the shared cursor onto a shown
+    /// row, and [`App::overview_held`] puts the selection back on leave.
+    fn hidden_claude_selection(&self) -> Option<ProfileName> {
+        let cursor = self.profile_cursor.read();
+        if !self.is_disabled_item(MainItemKind::Profile(cursor)) {
+            return None;
+        }
+        self.profile_name_at(cursor)
+    }
+
+    /// Leaving the Overview: put the shared selection back on the account
+    /// [`App::overview_held`] holds, unless the cursor moved since the entry.
+    fn restore_overview_held(&mut self) {
+        let Some((name, moves)) = self.overview_held.take() else {
+            return;
+        };
+        if moves != self.profile_cursor.count() {
+            return;
+        }
+        let held = self.config().profiles.iter().position(|p| p.name == name);
+        if let Some(idx) = held {
+            self.profile_cursor.set(idx);
+            self.reload_selected_note();
+        }
+    }
+
     /// The placement invariant: while the Overview shows and its cursor rests
     /// on a claude row k, `profile_cursor == k`, so the `a` menu names the
     /// highlighted claude row (off the Overview, entering it re-places first).
@@ -9209,10 +9253,11 @@ impl App {
             self.sync_overview_profile_selection();
             self.note_overview_delete_selection();
             // A selection change on another tab replaces a held-but-hidden
-            // identity in both slots: the read must not restore it over this
-            // pick.
+            // identity in both slots, and the disabled account the Overview
+            // was entered over: neither must come back over this pick.
             self.setup.clear();
             self.usage.clear();
+            self.overview_held = None;
             // And drops a pending pool landing: the user moved on, so the
             // re-read must not yank the Overview onto the added row.
             self.pending_pool_landing = None;
@@ -10700,6 +10745,9 @@ fn suspend_source(app: &mut App) {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
+    if app.tab == Tab::Overview && tab != Tab::Overview {
+        app.restore_overview_held();
+    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
@@ -10710,8 +10758,16 @@ fn switch_tab(app: &mut App, tab: Tab) {
     if tab == Tab::Overview && app.overview_remembered.is_none() {
         app.overview_remembered = Some(MainItemKind::Profile(app.profile_cursor.read()));
     }
+    let held = if tab == Tab::Overview {
+        app.hidden_claude_selection()
+    } else {
+        None
+    };
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
+    if let Some(name) = held {
+        app.overview_held = Some((name, app.profile_cursor.count()));
+    }
     match tab {
         Tab::Overview => {}
         Tab::Usage => {
