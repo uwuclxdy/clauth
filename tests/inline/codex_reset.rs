@@ -1007,6 +1007,36 @@ fn the_listing_cuts_a_label_at_forty_four_drawn_cells() {
     );
 }
 
+/// The ID cell is the text a spend takes back, so it prints whole at a real
+/// codex credit id's length, past any cap the other cells keep: the id read
+/// back off the row's first column is the one the spend's lookup finds, and
+/// the columns after it still line up under a shorter id's row.
+#[test]
+fn the_listing_prints_a_codex_credit_id_whole() {
+    let long = "RateLimitResetCredit_3f9a1c7e5b2d4f6a8c0e1b3d5f7a9c2e";
+    let credits = list_of(
+        vec![
+            credit(long, "codex_rate_limits", "available", "not-a-stamp", None),
+            credit("a", "codex_rate_limits", "available", "not-a-stamp", None),
+        ],
+        2,
+    );
+    let lines = describe_reset_credits("work", &credits);
+    assert!(lines[3].contains(long), "row {:?} names {long}", lines[3]);
+    let read_back = lines[3].split_whitespace().next().expect("an ID cell");
+    assert_eq!(
+        credits
+            .try_spend_credit_id(read_back)
+            .map(|c| c.id.as_str())
+            .ok(),
+        Some(long),
+        "the listed id is the one a spend of it finds"
+    );
+    let left_at = |line: &str| line.find("1/1").expect("a LEFT cell");
+    assert_eq!(left_at(&lines[3]), left_at(&lines[4]), "{lines:#?}");
+    assert_eq!(left_at(&lines[3]), lines[2].find("LEFT").expect("LEFT"));
+}
+
 /// The STATE cell's status cap (20) counts only drawn characters too, and the
 /// column pads by drawn cells, so the zero-width characters widen nothing.
 #[test]
