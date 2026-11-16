@@ -43,7 +43,7 @@ Three per-account toggles relax this:
 
 ## Excluded members
 
-The walk skips a member for any of these, worst first. The Overview and Fallback tabs render the reason on the account's row, all but `credits refused`, which the Usage card shows.
+The walk skips a member for any of these, worst first. The Fallback tab and the Overview's chain panel render the reason on the member's row, all but `credits refused`, which the Usage card shows.
 
 | Reason | Meaning |
 |--------|---------|
