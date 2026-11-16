@@ -97,7 +97,7 @@ It takes `low`, `medium`, `high`, `xhigh` or `max`, or any custom value, passed 
 
 ### Model picker
 
-An account can carry a `[model_picker]` table that becomes Claude Code's `modelPicker` setting, the list the `/model` picker offers. `replace_built_in` says whether the list replaces Claude Code's built-in entries. Each `[[model_picker.options]]` row is one entry, with a `model` id, a `label`, a `description` and a `behaves_as` (the built-in model the entry acts like). This example is the one silkcompute.com documents for Claude Code (<https://silkcompute.com/docs/claude-code>):
+An account can carry a `[model_picker]` table that becomes Claude Code's `modelPicker` setting, the list the `/model` picker offers. With `replace_built_in = true` the picker shows only the Default row and these entries; false or unset adds them after the built-in lineup. Each `[[model_picker.options]]` row is one entry, with a `model` id, a `label`, a `description` and a `behaves_as` (the built-in model the entry acts like). This example is the one silkcompute.com documents for Claude Code (<https://silkcompute.com/docs/claude-code>):
 
 ```toml
 [model_picker]
@@ -110,6 +110,10 @@ label = "Kimi K3.1 Pro"
 [[model_picker.options]]
 model = "deepseek-v4.1-flash-1017-uncensored"
 label = "DeepSeek V4.1 Flash 1017"
+
+[[model_picker.options]]
+model = "deepseek-v4.1-flash-1017-fast-uncensored"
+label = "DeepSeek V4.1 Flash 1017 Fast"
 
 [[model_picker.options]]
 model = "glm-5.3-uncensored"
@@ -134,11 +138,11 @@ The fields map to Claude Code's `modelPicker` like this:
 | `description` | `options[].description` |
 | `behaves_as` | `options[].behavesAs` |
 
-The camelCase spellings (`replaceBuiltInOptions`, `behavesAs`) are accepted as aliases. Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions` does not load. Blank rows are dropped, and a table with no live row counts as unset. A malformed `[model_picker]` (a wrong type, or `options` that is not an array of tables) stops that account's `config.toml` from loading, as any broken key does.
+The camelCase spellings (`replaceBuiltInOptions`, `behavesAs`) are accepted as aliases. Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions`, or a row holding both `behaves_as` and `behavesAs`, does not load, and clauth refuses to write that `config.toml`, naming the field written twice. Blank rows are dropped, and a table with no live row counts as unset, so a `[model_picker]` needs at least one row with a `model` to be written. A malformed `[model_picker]` (a wrong type, or `options` that is not an array of tables) stops that account's `config.toml` from loading, as any broken key does.
 
-An account with no picker strips `modelPicker` from the `settings.json` a switch or a start writes: a switch removes it from `~/.claude/settings.json` itself, including one you set by hand, and a start leaves it out of the session's copy. Claude Code honors `modelPicker` only from managed settings, `--settings` or the SDK, and user settings, and the highest-precedence of those that defines it wins outright, with no merging.
+A switch onto an account with no picker removes only the `modelPicker` clauth wrote into `~/.claude/settings.json`: one you set by hand, or edited after clauth wrote it, stays. An account with a picker writes its own over whatever the file held. A `clauth start` session's copy of `settings.json` is clauth's own, so an account with no picker starts with none in it. Claude Code honors `modelPicker` only from managed settings, `--settings` or the SDK, and user settings, and the highest-precedence of those that defines it wins outright, with no merging.
 
-clauth never edits the table, and only a newly created `config.toml` carries its commented example. A `clauth start` session moved by auto-switch keeps the picker its runtime copy was started with, since the swap rewrites only the effort key. Whether a running Claude Code picks up a changed `modelPicker` is not confirmed, so restart the session to be sure. A switch-off leaves the last account's `modelPicker` in place, as it does `model` and `advisorModel`.
+A save never edits the table; creating an account over a leftover `config.toml` replaces the leftover's table with the new account's, or removes it when the new account has none. Only a newly created `config.toml` carries the commented example. A `clauth start` session moved by auto-switch keeps the picker its runtime copy was started with, since the swap rewrites only the effort key. Whether a running Claude Code picks up a changed `modelPicker` is not confirmed, so restart the session to be sure. A switch-off leaves the last account's `modelPicker` in place, as it does `model` and `advisorModel`.
 
 ## Presets
 
