@@ -70,13 +70,25 @@ fn ev(hub: &Hub, pid: u32, body: serde_json::Value) -> (u16, serde_json::Value) 
     hub.event(pid, body.to_string().as_bytes())
 }
 
-/// A control device paired, a live session `s-one` at pid 100, and its asks
-/// `asks` open and held (seqs 2.., after `start` at 1).
-fn session_with_asks(asks: &[&str]) -> (HomeSandbox, Arc<Hub>, Arc<ApiContext>) {
+/// The sandbox, and the control device's `/events` subscription held open
+/// beside it for the test's duration; the subscription drops first.
+struct HeldHome {
+    _stream: Subscription,
+    _home: HomeSandbox,
+}
+
+/// A control device paired with a live control stream, a live session `s-one`
+/// at pid 100, and its asks `asks` open and held (seqs 2.., after `start` at
+/// 1).
+fn session_with_asks(asks: &[&str]) -> (HeldHome, Arc<Hub>, Arc<ApiContext>) {
     let home = HomeSandbox::new();
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let home = HeldHome {
+        _stream: hub.subscribe_as(Some(&Tier::Control)),
+        _home: home,
+    };
     let start = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true});
     assert_eq!(ev(&hub, 100, start).0, 200);
     for (i, ask) in asks.iter().enumerate() {
@@ -355,6 +367,7 @@ fn the_wait_route_serves_over_the_socket() {
     let pid = std::process::id();
     let (_t, resolver) = table(&[(pid, instance("s-self", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     let start =
         json!({"session": "s-self", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
     assert_eq!(ev(&hub, pid, start).0, 200);
@@ -504,6 +517,7 @@ fn a_moved_record_wakes_its_wait_closed() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (table, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     let start =
         json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
     assert_eq!(ev(&hub, 100, start).0, 200);

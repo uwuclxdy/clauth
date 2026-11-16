@@ -211,6 +211,10 @@ pub(crate) enum FetchLeg {
     /// none of the poll's rows: its late count is what keeps a second read off
     /// an account, and the poll's own leg never sees it.
     ClaudeResets,
+    /// The codex banked-reset side read: the twin of [`Self::ClaudeResets`] on
+    /// the codex roster, reading the credit-list endpoint. Owns no status row,
+    /// fetch mark or countdown either, and no codex display profile maps to it.
+    CodexResets,
 }
 
 impl FetchLeg {
@@ -446,6 +450,10 @@ impl ThirdPartyEntry {
                 crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
                 crate::usage::hash_field(&mut hasher, account.as_bytes());
             }
+            crate::providers::ThirdPartyTarget::ProxyPool { service, .. } => {
+                crate::usage::hash_field(&mut hasher, b"proxy-pool");
+                crate::usage::hash_field(&mut hasher, service.as_str().as_bytes());
+            }
         }
         let digest = hasher.finalize();
         let mut head = [0u8; 8];
@@ -463,9 +471,10 @@ impl ThirdPartyEntry {
                 provider: crate::providers::Provider::Alibaba,
                 ..
             } => None,
-            // The proxy read authenticates with clauth's admin token: the
-            // profile's key never rides it.
-            crate::providers::ThirdPartyTarget::Proxy { .. } => None,
+            // The proxy reads authenticate with clauth's admin token: the
+            // profile's key never rides them.
+            crate::providers::ThirdPartyTarget::Proxy { .. }
+            | crate::providers::ThirdPartyTarget::ProxyPool { .. } => None,
             crate::providers::ThirdPartyTarget::Known { .. }
             | crate::providers::ThirdPartyTarget::Generic { .. } => {
                 crate::usage::inference_key_fingerprint(Some(&self.api_key), None)
@@ -663,6 +672,8 @@ pub(crate) struct ProfileActivityState {
     codex: Option<ProfileActivity>,
     /// Idle like `codex`: the side read marks no activity either.
     claude_resets: Option<ProfileActivity>,
+    /// Idle like `claude_resets`: the codex side read marks no activity either.
+    codex_resets: Option<ProfileActivity>,
     /// Per leg, how many fetch workers its drain left running past the tick
     /// fetch deadline ([`abandon_worker`]), each until it exits. A count, not a
     /// flag: one account can have two workers abandoned on the OAuth leg (its
@@ -675,6 +686,7 @@ pub(crate) struct ProfileActivityState {
     third_party_late: u32,
     codex_late: u32,
     claude_resets_late: u32,
+    codex_resets_late: u32,
     /// The scheduler deliberately publishes no countdown for this leg this tick
     /// (a spent account under `refresh_spent_accounts` off, a suppressed dead
     /// credential, a selected leg on no work list), so a display surface must
@@ -691,6 +703,7 @@ impl ProfileActivityState {
             FetchLeg::ThirdParty => self.third_party,
             FetchLeg::Codex => self.codex,
             FetchLeg::ClaudeResets => self.claude_resets,
+            FetchLeg::CodexResets => self.codex_resets,
         }
     }
 
@@ -700,6 +713,7 @@ impl ProfileActivityState {
             FetchLeg::ThirdParty => &mut self.third_party,
             FetchLeg::Codex => &mut self.codex,
             FetchLeg::ClaudeResets => &mut self.claude_resets,
+            FetchLeg::CodexResets => &mut self.codex_resets,
         }
     }
 
@@ -709,6 +723,7 @@ impl ProfileActivityState {
             FetchLeg::ThirdParty => self.third_party_late,
             FetchLeg::Codex => self.codex_late,
             FetchLeg::ClaudeResets => self.claude_resets_late,
+            FetchLeg::CodexResets => self.codex_resets_late,
         };
         abandoned > 0
     }
@@ -719,6 +734,7 @@ impl ProfileActivityState {
             FetchLeg::ThirdParty => &mut self.third_party_late,
             FetchLeg::Codex => &mut self.codex_late,
             FetchLeg::ClaudeResets => &mut self.claude_resets_late,
+            FetchLeg::CodexResets => &mut self.codex_resets_late,
         }
     }
 
@@ -728,7 +744,7 @@ impl ProfileActivityState {
             FetchLeg::ThirdParty => self.third_party_blanked,
             // No site blanks these legs: the codex side read owns no row, and
             // the banked-reset read leaves the poll's own countdown alone.
-            FetchLeg::Codex | FetchLeg::ClaudeResets => false,
+            FetchLeg::Codex | FetchLeg::ClaudeResets | FetchLeg::CodexResets => false,
         }
     }
 
@@ -753,6 +769,7 @@ impl ProfileActivityState {
     fn is_idle(&self) -> bool {
         self.is_settled()
             && self.claude_resets_late == 0
+            && self.codex_resets_late == 0
             && !self.oauth_blanked
             && !self.third_party_blanked
     }
@@ -767,6 +784,7 @@ impl ProfileActivityState {
             && self.third_party.is_none()
             && self.codex.is_none()
             && self.claude_resets.is_none()
+            && self.codex_resets.is_none()
             && self.oauth_late == 0
             && self.third_party_late == 0
             && self.codex_late == 0
@@ -4471,12 +4489,12 @@ fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry>
     })
 }
 
-/// The proxy arm's target for `p`, keyed on the REGISTRY: the profile's
-/// `base_url` must be the registered bind of the service its `[proxy]` record
-/// names, and the admin token and account id the read needs come from that
-/// registry and the record. A registry clauth cannot read, a service with no
-/// row, or a `base_url` that stopped matching leaves the profile to today's
-/// generic arm.
+/// The proxy arm's target for `p`, keyed on the REGISTRY: a profile whose
+/// `base_url` is a registered bind reads through that service. A `[proxy]`
+/// record names one account of it — the per-account read — while its absence
+/// is the funnel profile an auto-route setup points sessions at, which reads
+/// the whole pool. A registry clauth cannot read, or a bind no row holds,
+/// leaves the profile to today's generic arm.
 fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::ThirdPartyTarget> {
     // Pure pre-gate: a non-loopback endpoint is the generic arm's business and
     // must never cost a registry or config read — the entry constructor runs
@@ -4485,27 +4503,37 @@ fn proxy_target_for(p: &crate::profile::Profile) -> Option<crate::providers::Thi
     // home its callers may not hold.
     let port = crate::proxy::loopback_port(p.base_url.as_deref()?)?;
     let registry = crate::proxy::Registry::load().ok()?;
-    registry.holder(port)?;
+    // The row holding the profile's port is the bind check both arms share.
+    let service = registry.holder(port)?;
     // The record rides the profile's config.toml as an unmodelled key, and the
     // runtime Profile holds it as it loaded (`Profile::proxy`, the cache
-    // selector's read). This arm reads it fresh, the lock-free way
-    // (`profile::stored_proxy_record`), past the bind check above, so only a
-    // profile on a registered proxy bind pays the read.
-    let record = crate::profile::stored_proxy_record(&p.name)?;
-    let row = registry.get(&record.service)?;
-    if row.port != port
-        || !p
-            .base_url
-            .as_deref()
-            .is_some_and(|url| crate::proxy::is_loopback_url_on(url, row.port))
-    {
-        return None;
+    // selector's read). This arm reads it fresh, lock-free, past the bind check
+    // above, so only a profile on a registered proxy bind pays the read. A
+    // record clauth cannot read fails closed as a proxy account; only an absent
+    // record takes the whole-pool arm.
+    match crate::profile::stored_proxy_claim_failing_closed(&p.name) {
+        crate::profile::ProxyClaim::None => Some(crate::providers::ThirdPartyTarget::ProxyPool {
+            service: service.clone(),
+            base_url: format!("http://{}", crate::proxy::bind(port)),
+        }),
+        crate::profile::ProxyClaim::Account(record) => {
+            let row = registry.get(&record.service)?;
+            if row.port != port
+                || !p
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| crate::proxy::is_loopback_url_on(url, row.port))
+            {
+                return None;
+            }
+            Some(crate::providers::ThirdPartyTarget::Proxy {
+                service: record.service.clone(),
+                account: record.account.clone(),
+                base_url: format!("http://{}", crate::proxy::bind(row.port)),
+            })
+        }
+        crate::profile::ProxyClaim::Unreadable | crate::profile::ProxyClaim::Unclassifiable => None,
     }
-    Some(crate::providers::ThirdPartyTarget::Proxy {
-        service: record.service.clone(),
-        account: record.account.clone(),
-        base_url: format!("http://{}", crate::proxy::bind(row.port)),
-    })
 }
 
 /// Fingerprint of the credential `p` would fetch with. Deliberately NOT gated on
@@ -6114,7 +6142,7 @@ fn unpolled_selected_blanked(
             FetchLeg::OAuth => !oauth_work.contains(name),
             FetchLeg::ThirdParty => !third_party_work.contains(name),
             // No display profile maps to these legs.
-            FetchLeg::Codex | FetchLeg::ClaudeResets => false,
+            FetchLeg::Codex | FetchLeg::ClaudeResets | FetchLeg::CodexResets => false,
         })
         .map(|(name, leg)| leg.key(name.clone()))
         .collect()
@@ -6149,7 +6177,7 @@ pub(crate) fn publish_blanked_countdowns(activity: &ActivityStore, blanked: &Has
                 }
                 // Nothing blanks these legs; a key of theirs in the set is a
                 // bug, and the flag would have no reader either way.
-                FetchLeg::Codex | FetchLeg::ClaudeResets => {}
+                FetchLeg::Codex | FetchLeg::ClaudeResets | FetchLeg::CodexResets => {}
             }
         }
         states.retain(|_, state| !state.is_idle());
@@ -6334,11 +6362,15 @@ pub(crate) struct SchedulerState {
     /// Pending weekly-reset re-test kicks (see [`weekly_reset_pending`]).
     weekly_reset_kicks: WeeklyResetKicks,
     /// The claude banked-reset side read's cadence memo (see
-    /// [`ClaudeResetsMemo`]): last read per account, a refused read's retry,
+    /// [`ResetsMemo`]): last read per account, a refused read's retry,
     /// plus the due marks a 100% crossing or a fall before its reset sets. One
     /// per scheduler, so two schedulers sharing one process each run their own
     /// hour.
     claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, its twin of
+    /// [`Self::claude_resets_memo`]: last read per codex account and a refused
+    /// read's retry. One per scheduler for the same reason.
+    codex_resets_memo: CodexResetsMemoLock,
     /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
     /// queue spaces against, plus per-profile election health.
     auto_start_queue: crate::usage::AutoStartQueueState,
@@ -6396,6 +6428,7 @@ impl SchedulerState {
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -6436,6 +6469,7 @@ impl SchedulerState {
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             claude_resets_memo: new_claude_resets_memo(),
+            codex_resets_memo: new_codex_resets_memo(),
             auto_start_queue: crate::usage::new_auto_start_queue_state(),
             pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
             pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -7662,6 +7696,12 @@ pub(crate) fn tick(state: &SchedulerState) {
     // pass costs the tick at most one request slot, one fetch deadline and the
     // tick's one flock wait.
     claude_resets_tick(state, Some(timed_out.as_ref()), lease);
+    // The codex twin, right after it: one credit-list read per codex roster
+    // account an hour, at most one account a tick, so the codex rail and the
+    // `use a limit reset` item show without a CLI listing first. It shares
+    // nothing with the claude read's host, so it costs its own request slot
+    // and the same one-flock-wait budget.
+    codex_resets_tick(state, Some(timed_out.as_ref()), lease);
 
     // tps producer leg, lease holder only (a stood-down tick returned above,
     // and so does one that lost the lease): tail transcripts and republish the
@@ -8351,11 +8391,27 @@ fn note_probe_verdict(
 /// serialize behind the anthropic ones and vice versa.
 const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
 
-/// Per-profile pacing for the codex usage leg, epoch ms of the last poll. Its
-/// own map rather than `LastFetchedAt` because that store feeds the claude
-/// countdown surfaces, which have no codex column until the published-surface
-/// phase adds one.
-static CODEX_POLLED_AT: RankedMutex<Option<HashMap<String, u64>>, rank::CodexPolled> =
+/// One codex poll's cadence entry: the epoch ms the poll landed plus whether
+/// it got an answer. Every landing arm overwrites the entry, so the memo
+/// holds the latest completed poll that landed under the current epoch and
+/// lease; a poll that completes after its epoch moved or its lease lapsed
+/// writes nothing and leaves an older entry standing. A poll left running
+/// wrote nothing too, and its `late(FetchLeg::Codex)` mark is what holds the
+/// side read off while it is out. A forget drops the entry, which holds
+/// nothing.
+struct CodexPolled {
+    stamp: u64,
+    /// `false` only for a poll that got no answer (`FetchError::Network`): a
+    /// stall, a timeout, a refused connection, or a body cut off mid-read.
+    /// Every other outcome is an answer and stamps `true`.
+    answered: bool,
+}
+
+/// Per-profile pacing for the codex usage leg: the last poll's stamp plus
+/// whether it got an answer. Its own map rather than `LastFetchedAt` because
+/// that store feeds the claude countdown surfaces, which have no codex column
+/// until the published-surface phase adds one.
+static CODEX_POLLED_AT: RankedMutex<Option<HashMap<String, CodexPolled>>, rank::CodexPolled> =
     RankedMutex::new(None);
 
 /// Drop `name` from the codex poll-cadence memo — `forget_memory`'s codex arm:
@@ -8369,26 +8425,29 @@ pub(crate) fn forget_codex_polled(name: &str) {
     }
 }
 
-/// The claude banked-reset side read's cadence: one read per hour per OAuth
-/// account, independent of the poll's own interval — the resets change on a
-/// human timescale, and the read costs the same `/usage` quota class.
-const CLAUDE_RESETS_INTERVAL_MS: u64 = 60 * 60 * 1000;
+/// A banked-reset side read's cadence: one read per hour per account,
+/// independent of the poll's own interval — the resets change on a human
+/// timescale. The claude read costs the same `/usage` quota class; the codex
+/// read costs one credit-list request per account per hour.
+const RESETS_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
-/// Per-scheduler cadence memo for the claude banked-reset side read: epoch ms
+/// Per-scheduler cadence memo for a banked-reset side read: epoch ms
 /// of each account's last read attempt (the tick's `now`), the names a fresh
 /// landing marked due for a window that crossed to 100% or fell before its
-/// reset, and, for an account whose last read was refused (a 429, a 5xx, no
-/// answer), the epoch ms its retry falls due beside its count of 429s since
-/// the last landed read, hour-keeping failure or forget, which picks the rung
-/// of the poll's deferral ladder. A plain struct built empty, as
-/// `weekly_reset_kicks` is a plain set.
-pub(crate) struct ClaudeResetsMemo {
+/// reset (the claude leg's marks alone: the codex leg reads hourly), and, for
+/// an account whose last read was refused (a 429, a 5xx, no answer), the epoch
+/// ms its retry falls due beside its count of 429s since the last landed
+/// read, hour-keeping failure or forget, which picks the rung of the poll's
+/// deferral ladder. One shape, one rank per leg: the claude leg's under
+/// [`rank::ClaudeResets`], the codex leg's under [`rank::CodexResets`]. A
+/// plain struct built empty, as `weekly_reset_kicks` is a plain set.
+pub(crate) struct ResetsMemo {
     last_read_at: HashMap<String, u64>,
     due: HashSet<String>,
     retry: HashMap<String, (u64, u32)>,
 }
 
-impl ClaudeResetsMemo {
+impl ResetsMemo {
     fn new() -> Self {
         Self {
             last_read_at: HashMap::new(),
@@ -8397,10 +8456,11 @@ impl ClaudeResetsMemo {
         }
     }
 
-    /// Drop `name` — `clear_memory`'s OAuth arm and the rename path. A
-    /// re-login removes the account's reading with `forget_disk`, so the next
-    /// pass reads at once; a rename carries the reading to the new name, whose
-    /// seed dates the hour there. A pending retry and its rung go too.
+    /// Drop `name` — `clear_memory`'s OAuth and codex arms and the rename
+    /// path. A re-login removes the account's reading with `forget_disk`, so
+    /// the next pass reads at once; a rename carries the reading to the new
+    /// name, whose seed dates the hour there. A pending retry and its rung go
+    /// too.
     pub(crate) fn forget(&mut self, name: &str) {
         self.last_read_at.remove(name);
         self.due.remove(name);
@@ -8408,17 +8468,23 @@ impl ClaudeResetsMemo {
     }
 }
 
-/// The side read's cadence memo, one per scheduler. A standalone leaf like
+/// A side read's cadence memo, one per scheduler. A standalone leaf like
 /// [`CODEX_POLLED_AT`]: taken on the tick's thread by the leg, and by the
 /// forget paths and the landing's transition detector, never by a read's
-/// worker, so the rank (`ClaudeResets`) keeps it above every store
-/// any of those nests with.
-pub(crate) type ClaudeResetsMemoLock = Arc<RankedMutex<ClaudeResetsMemo, rank::ClaudeResets>>;
+/// worker, so the rank (`ClaudeResets` or `CodexResets`) keeps it above every
+/// store any of those nests with.
+pub(crate) type ClaudeResetsMemoLock = Arc<RankedMutex<ResetsMemo, rank::ClaudeResets>>;
+pub(crate) type CodexResetsMemoLock = Arc<RankedMutex<ResetsMemo, rank::CodexResets>>;
 
 /// A fresh, empty memo: every `SchedulerState` constructor builds its own, so
 /// two schedulers sharing one process each run their own hour.
 pub(crate) fn new_claude_resets_memo() -> ClaudeResetsMemoLock {
-    Arc::new(RankedMutex::new(ClaudeResetsMemo::new()))
+    Arc::new(RankedMutex::new(ResetsMemo::new()))
+}
+
+/// The codex twin of [`new_claude_resets_memo`].
+pub(crate) fn new_codex_resets_memo() -> CodexResetsMemoLock {
+    Arc::new(RankedMutex::new(ResetsMemo::new()))
 }
 
 /// Whether any usage window crossed from under 100% in `prev` to 100% or more
@@ -8535,8 +8601,8 @@ pub(crate) fn claude_resets_tick(
 /// Each claude OAuth account the poll would poll gets one GET of the side
 /// read an hour, and once more inside the hour when a fresh landing marked it
 /// due (a window crossed to 100% or fell before its reset). A successful read
-/// lands the usable count, the banked total, the next grant's windows and end,
-/// and the read's stamp in the account's own `limit_resets.json`. A failure
+/// lands the usable count, the banked total, every grant it listed, and the
+/// read's stamp in the account's own `limit_resets.json`. A failure
 /// writes nothing, says so in one line and still stamps the memo: a refusal
 /// (a 429, a 5xx, no answer) retries on the poll's deferral ladder, honouring
 /// the server's Retry-After, while a 401, any other status or a body clauth
@@ -8715,8 +8781,7 @@ fn claude_resets_tick_flagged(
                         .retry
                         .get(name.as_str())
                         .is_some_and(|(retry_at, _)| now >= *retry_at)
-                    || last
-                        .is_none_or(|last| now.saturating_sub(last) >= CLAUDE_RESETS_INTERVAL_MS);
+                    || last.is_none_or(|last| now.saturating_sub(last) >= RESETS_INTERVAL_MS);
                 due_now.then_some((name, access_token, epoch_at_spawn))
             })
             .collect();
@@ -8787,7 +8852,14 @@ fn claude_resets_tick_flagged(
             Ok(handle) => workers.push(FanoutWorker { ticket, handle }),
             Err(e) => {
                 let name = &ticket.key.name;
-                stamp_resets_attempt(state, name, epoch_at_spawn, now);
+                stamp_resets_attempt(
+                    state,
+                    &state.claude_resets_memo,
+                    name,
+                    crate::usage::Half::OAuth,
+                    epoch_at_spawn,
+                    now,
+                );
                 logline!("clauth: '{name}': the limit reset read could not start: {e}");
             }
         }
@@ -8824,8 +8896,15 @@ fn claude_resets_tick_flagged(
                 // Stamped whatever the lease says, as every failure is; only
                 // the holder says so, and only once the stamp names the gap.
                 let next = ResetsNext::after_failure(&err, retry_after);
-                if let Some(gap_ms) = stamp_resets(state, &name, epoch_at_spawn, now, &next)
-                    && lease_is_current(lease)
+                if let Some(gap_ms) = stamp_resets(
+                    state,
+                    &state.claude_resets_memo,
+                    &name,
+                    crate::usage::Half::OAuth,
+                    epoch_at_spawn,
+                    now,
+                    &next,
+                ) && lease_is_current(lease)
                 {
                     log_resets_failure(&name, &err, &next, gap_ms);
                 }
@@ -8856,7 +8935,14 @@ fn claude_resets_tick_flagged(
         if matches!(landed, Ok((false, false))) {
             continue;
         }
-        stamp_resets_attempt(state, &name, epoch_at_spawn, now);
+        stamp_resets_attempt(
+            state,
+            &state.claude_resets_memo,
+            &name,
+            crate::usage::Half::OAuth,
+            epoch_at_spawn,
+            now,
+        );
     }
 
     // Reap the workers. A left-running worker's outcome is dropped and a
@@ -8866,12 +8952,26 @@ fn claude_resets_tick_flagged(
     for worker in workers {
         let name = &worker.ticket.key.name;
         if worker.ticket.abandoned.load(Ordering::Relaxed) {
-            stamp_resets_attempt(state, name, worker.ticket.epoch_at_spawn, now);
+            stamp_resets_attempt(
+                state,
+                &state.claude_resets_memo,
+                name,
+                crate::usage::Half::OAuth,
+                worker.ticket.epoch_at_spawn,
+                now,
+            );
             if lease_is_current(lease) {
                 log_resets_left_running(name);
             }
         } else if worker.handle.join().is_err() {
-            stamp_resets_attempt(state, name, worker.ticket.epoch_at_spawn, now);
+            stamp_resets_attempt(
+                state,
+                &state.claude_resets_memo,
+                name,
+                crate::usage::Half::OAuth,
+                worker.ticket.epoch_at_spawn,
+                now,
+            );
             logline!("clauth: '{name}': the limit reset read stopped before it answered");
         }
     }
@@ -8924,9 +9024,25 @@ impl ResetsNext {
 }
 
 /// Date a side-read attempt that keeps the hour: [`stamp_resets`] with
-/// [`ResetsNext::Hour`].
-fn stamp_resets_attempt(state: &SchedulerState, name: &ProfileName, epoch_at_spawn: u64, now: u64) {
-    let _ = stamp_resets(state, name, epoch_at_spawn, now, &ResetsNext::Hour);
+/// [`ResetsNext::Hour`]. Shared by both legs: `memo` names the leg's own, and
+/// `half` the epoch the landing gated on.
+fn stamp_resets_attempt<R: crate::lockorder::Rank>(
+    state: &SchedulerState,
+    memo: &RankedMutex<ResetsMemo, R>,
+    name: &ProfileName,
+    half: crate::usage::Half,
+    epoch_at_spawn: u64,
+    now: u64,
+) {
+    let _ = stamp_resets(
+        state,
+        memo,
+        name,
+        half,
+        epoch_at_spawn,
+        now,
+        &ResetsNext::Hour,
+    );
 }
 
 /// Date a side-read attempt and set its account's next read; returns the gap
@@ -8938,24 +9054,27 @@ fn stamp_resets_attempt(state: &SchedulerState, name: &ProfileName, epoch_at_spa
 /// the rung as it stands and leaves the count alone. Anything else drops the
 /// retry, so the next refusal starts on the first rung. Epoch-gated here, past
 /// the read and any flock wait, so a forget that landed meanwhile leaves the
-/// name unstamped (`None`), as the landing's pre-check does.
-fn stamp_resets(
+/// name unstamped (`None`), as the landing's pre-check does. Shared by both
+/// legs: `memo` names the leg's own, and `half` the epoch the landing gated
+/// on.
+fn stamp_resets<R: crate::lockorder::Rank>(
     state: &SchedulerState,
+    memo: &RankedMutex<ResetsMemo, R>,
     name: &ProfileName,
+    half: crate::usage::Half,
     epoch_at_spawn: u64,
     now: u64,
     next: &ResetsNext,
 ) -> Option<u64> {
-    let _epoch =
-        crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch_at_spawn)?;
-    let mut guard = state.claude_resets_memo.lock().ok()?;
+    let _epoch = crate::usage::epoch_guard_if_current(name, half, epoch_at_spawn)?;
+    let mut guard = memo.lock().ok()?;
     let memo = &mut *guard;
     memo.due.remove(name.as_str());
     memo.last_read_at.insert(name.to_string(), now);
     match next {
         ResetsNext::Hour => {
             memo.retry.remove(name.as_str());
-            Some(CLAUDE_RESETS_INTERVAL_MS)
+            Some(RESETS_INTERVAL_MS)
         }
         ResetsNext::Ladder {
             retry_after,
@@ -8975,6 +9094,410 @@ fn stamp_resets(
             Some(gap_ms)
         }
     }
+}
+
+/// One pass of the codex banked-reset side read on the real clock: the twin of
+/// [`claude_resets_tick`] on the codex roster, at `now_ms()`, sharing the
+/// tick's `timed_out` flag and reading one account. Runs from [`tick`] right
+/// after the claude read, so the lease holder alone reads (like every leg
+/// there), and the codex rail and the `use a limit reset` item show a codex
+/// account's credits without a `clauth limit-reset` listing first.
+pub(crate) fn codex_resets_tick(
+    state: &SchedulerState,
+    timed_out: Option<&AtomicBool>,
+    lease: Option<LeaseTicket<'_>>,
+) {
+    codex_resets_tick_flagged(state, now_ms(), timed_out, Some(1), lease);
+}
+
+/// One pass of the codex banked-reset side read at virtual time `now` (epoch
+/// ms). `now` is the ONLY clock the hourly gate reads, as in the claude leg;
+/// the file's `fetched_at` stamp is the real clock at the response, as the
+/// poll's own stamp is.
+///
+/// Each codex roster account with a usable stored login gets one GET of the
+/// credit list an hour, and nothing brings a read forward inside the hour (the
+/// codex list has no usage windows to watch). A successful read lands every
+/// credit the list names, the usable count and the read's stamp in the
+/// account's own `limit_resets.json`, through the CLI's own lander. A failure
+/// writes nothing, says so in one line and still stamps the memo: a refusal
+/// (a 429, a 5xx, no answer) retries on the poll's deferral ladder, honouring
+/// the server's Retry-After, while a 401, any other status or a body clauth
+/// cannot read keeps the hour, so a broken account is not re-read every tick
+/// (the claude leg's rule). Each read runs on its own worker, and one still
+/// out at the tick fetch deadline, or one that never ran, counts as a failure:
+/// it is left running, its late answer lands nothing, and its account gets no
+/// second read until it exits.
+#[cfg(test)]
+pub(crate) fn codex_resets_tick_at(state: &SchedulerState, now: u64) {
+    codex_resets_tick_flagged(state, now, None, None, None);
+}
+
+/// [`codex_resets_tick_at`] sharing the tick's `timed_out` flag and, when
+/// `limit` is set, reading at most that many due accounts: the write's flock
+/// hold is a landing hold, so once any hold of the tick has timed out it skips
+/// without waiting, and a peer's flock hold stalls the tick once. An account
+/// whose latest codex poll got no answer is skipped unstamped until a later
+/// poll answers. Everything
+/// but the read stays on this thread: a worker past its deadline must have
+/// nothing left to land. `lease` is the tick's ticket: a read that lost the
+/// lease on the wire writes no file and leaves the hour unstamped for the next
+/// holder, whose own memo is empty anyway.
+fn codex_resets_tick_flagged(
+    state: &SchedulerState,
+    now: u64,
+    timed_out: Option<&AtomicBool>,
+    limit: Option<usize>,
+    lease: Option<LeaseTicket<'_>>,
+) {
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
+        return;
+    };
+    if codex.profiles().is_empty() {
+        return;
+    }
+    // Hold-off sets first, the claude leg's shape: a read left running owns
+    // the account's next one, a codex poll left running holds the same token
+    // against the same host, and a poll whose latest completed outcome was no
+    // answer would be re-hit by the read's own request, so all three wait
+    // unstamped and read once their hold clears. The due set is computed
+    // BEFORE the login snapshot: only a name whose hour is actually due pays
+    // the preconditions' auth and quarantine reads below, so a tick whose
+    // accounts all sit inside their hour reads nothing. Poison fails safe to
+    // skipping the leg, as the other partitions do.
+    let candidates: Vec<(ProfileName, crate::limit_reset::CodexLogin, u64)> = {
+        // The poll's own cadence memo: every poll that lands under the
+        // current epoch and lease overwrites the entry, so `answered: false`
+        // reads as "the latest poll that landed got no answer" and clears
+        // once a later poll lands; a poll discarded after its epoch moved or
+        // its lease lapsed writes nothing and leaves an older entry standing.
+        // A poll left running wrote nothing; its `late` mark is in `held_off`
+        // below. A name with no entry (a forget, a fresh start) holds
+        // nothing.
+        let no_answer: HashSet<String> = match CODEX_POLLED_AT.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .into_iter()
+                .flat_map(|seen| seen.iter())
+                .filter(|(_, poll)| !poll.answered)
+                .map(|(n, _)| n.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        let held_off: HashSet<String> = match state.activity.lock() {
+            Ok(activity) => activity
+                .iter()
+                .filter(|(_, s)| {
+                    s.late(FetchLeg::CodexResets) || holds_off_fetch(s, FetchLeg::Codex)
+                })
+                .map(|(n, _)| n.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        let names: Vec<(ProfileName, u64)> = {
+            let epoch = crate::usage::epoch_guard();
+            codex
+                .profiles()
+                .iter()
+                .filter(|name| {
+                    !held_off.contains(name.as_str()) && !no_answer.contains(name.as_str())
+                })
+                .map(|name| {
+                    let epoch_at_spawn = epoch
+                        .get(&(name.to_string(), crate::usage::Half::Codex))
+                        .copied()
+                        .unwrap_or(0);
+                    (name.clone(), epoch_at_spawn)
+                })
+                .collect()
+        };
+        // A reading an earlier lease holder landed dates the hour, as the
+        // startup usage seed dates the poll's cadence, so a fresh daemon or
+        // TUI keeps that hour instead of reading every account again on its
+        // first pass. A missing, unreadable or stamp-less file, or a stamp
+        // from the future, reads on this pass.
+        let (with_entry, seed_names) = {
+            let Ok(memo) = state.codex_resets_memo.lock() else {
+                return;
+            };
+            let mut with_entry = Vec::new();
+            let mut seed_names = Vec::new();
+            for (name, epoch_at_spawn) in names {
+                match memo.last_read_at.get(name.as_str()).copied() {
+                    Some(at) => with_entry.push((name, epoch_at_spawn, at)),
+                    None => seed_names.push((name, epoch_at_spawn)),
+                }
+            }
+            (with_entry, seed_names)
+        };
+        let seeds: HashMap<String, u64> = seed_names
+            .iter()
+            .filter_map(|(name, _)| {
+                let at = load_profile_cache::<LimitResets>(name, LIMIT_RESETS_FILE)
+                    .and_then(|r| r.fetched_at)
+                    .filter(|at| *at <= now)?;
+                Some((name.to_string(), at))
+            })
+            .collect();
+        // The due set under the epoch guard and the memo, the claude leg's
+        // shape: a cadence entry another path set since the snapshot wins over
+        // the file's stamp, while a name the snapshot found without an entry
+        // takes its hour from its reading — unless its epoch moved since the
+        // snapshot, when a forget has already dropped what that reading
+        // belonged to and the name waits for the next pass under the login it
+        // holds now. The account whose hour ran out first leads: a tick reads
+        // one account, so the ordering decides which of two overdue accounts
+        // reads this pass.
+        let due: Vec<(ProfileName, u64)> = {
+            let epoch = crate::usage::epoch_guard();
+            let Ok(mut guard) = state.codex_resets_memo.lock() else {
+                return;
+            };
+            let memo = &mut *guard;
+            let mut due: Vec<(ProfileName, u64)> = with_entry
+                .into_iter()
+                .filter_map(|(name, epoch_at_spawn, last)| {
+                    let due_now = memo.due.contains(name.as_str())
+                        || memo
+                            .retry
+                            .get(name.as_str())
+                            .is_some_and(|(retry_at, _)| now >= *retry_at)
+                        || now.saturating_sub(last) >= RESETS_INTERVAL_MS;
+                    due_now.then_some((name, epoch_at_spawn))
+                })
+                .collect();
+            for (name, epoch_at_spawn) in seed_names {
+                if epoch
+                    .get(&(name.to_string(), crate::usage::Half::Codex))
+                    .copied()
+                    .unwrap_or(0)
+                    != epoch_at_spawn
+                {
+                    continue;
+                }
+                let at = seeds.get(name.as_str()).copied();
+                if let Some(at) = at {
+                    memo.last_read_at.insert(name.to_string(), at);
+                }
+                let due_now = memo.due.contains(name.as_str())
+                    || memo
+                        .retry
+                        .get(name.as_str())
+                        .is_some_and(|(retry_at, _)| now >= *retry_at)
+                    || at.is_none_or(|last| now.saturating_sub(last) >= RESETS_INTERVAL_MS);
+                if due_now {
+                    due.push((name, epoch_at_spawn));
+                }
+            }
+            let hour_of = |name: &ProfileName| memo.last_read_at.get(name.as_str()).copied();
+            due.sort_by(|a, b| {
+                hour_of(&a.0)
+                    .cmp(&hour_of(&b.0))
+                    .then_with(|| a.0.as_str().cmp(b.0.as_str()))
+            });
+            due
+        };
+        // The login snapshot, only for due names and in due order, off the
+        // same refusals the CLI's codex list path runs before any request: a
+        // quarantined chain and a profile with no stored codex login are
+        // skipped silently, as the claude leg skips a broken or pairless
+        // account.
+        let mut candidates: Vec<(ProfileName, crate::limit_reset::CodexLogin, u64)> = due
+            .into_iter()
+            .filter_map(|(name, epoch_at_spawn)| {
+                let login = crate::limit_reset::codex_preconditions(name.as_str()).ok()?;
+                Some((name, login, epoch_at_spawn))
+            })
+            .collect();
+        if let Some(limit) = limit {
+            candidates.truncate(limit);
+        }
+        candidates
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Resolved on THIS thread, once an account can actually fetch: the test
+    // override is thread-local (a worker resolving it on its own thread would
+    // miss it, and a test build panics without one), as the codex usage leg's
+    // seam is. Production resolves the same static URL per worker.
+    let url = crate::usage::codex_reset::reset_list_url();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, CodexResetsRead)>();
+    let mut workers = Vec::with_capacity(candidates.len());
+    for (name, login, epoch_at_spawn) in candidates {
+        let ticket = WorkerTicket::new(FetchLeg::CodexResets.key(name.clone()), epoch_at_spawn);
+        let index = workers.len();
+        let tx = tx.clone();
+        let url = url.clone();
+        #[cfg(test)]
+        let spawn_fails = probe_spawn_fail::hit(name.as_str());
+        #[cfg(not(test))]
+        let spawn_fails = false;
+        let spawned = if spawn_fails {
+            Err(std::io::Error::other("armed codex resets spawn failure"))
+        } else {
+            let exit = WorkerExit::new(&ticket, &state.activity);
+            std::thread::Builder::new()
+                .name("clauth-usage-fetch".to_string())
+                .spawn(move || {
+                    let exit = exit;
+                    exit.watch_request_slots();
+                    #[cfg(test)]
+                    probe_panic::hit(name.as_str());
+                    await_request_slot(CODEX_USAGE_ORIGIN);
+                    let read = crate::usage::codex_reset::list_reset_credits_hinted_at(
+                        &url,
+                        &login.access_token,
+                        login.account_id.as_deref(),
+                        login.fedramp,
+                    );
+                    // A drain that stopped waiting on this worker drops this
+                    // send; harmless. A panicking worker never reaches here.
+                    drop(tx.send((
+                        index,
+                        CodexResetsRead {
+                            name,
+                            epoch_at_spawn,
+                            login,
+                            read,
+                        },
+                    )));
+                    drop(exit);
+                })
+        };
+        match spawned {
+            Ok(handle) => workers.push(FanoutWorker { ticket, handle }),
+            Err(e) => {
+                let name = &ticket.key.name;
+                stamp_resets_attempt(
+                    state,
+                    &state.codex_resets_memo,
+                    name,
+                    crate::usage::Half::Codex,
+                    epoch_at_spawn,
+                    now,
+                );
+                logline!("clauth: '{name}': the codex reset list read could not start: {e}");
+            }
+        }
+    }
+    // Drop the spare sender so the drain's wait ends once every worker's clone
+    // is gone (a panicked worker drops its clone on unwind).
+    drop(tx);
+
+    for outcome in drain_completions(&rx, &workers, &state.activity) {
+        let CodexResetsRead {
+            name,
+            epoch_at_spawn,
+            login,
+            read,
+        } = outcome;
+        // The read can outlive the login it was launched under: a re-login's
+        // `clear_memory` (or a rename) bumps the epoch and drops the memo while
+        // it is in flight. A moved name lands neither the old login's list in
+        // the account's file nor this attempt's stamp in the memo, so what the
+        // forget cleared stays cleared and the account reads under the new
+        // login on the next pass.
+        let Some(epoch) =
+            crate::usage::epoch_guard_if_current(&name, crate::usage::Half::Codex, epoch_at_spawn)
+        else {
+            continue;
+        };
+        drop(epoch);
+        // Residual, as at the claude landing and the kick: a forget in the
+        // window between this check and the write lands the old list; a
+        // re-login on disk still fails the lander's account-id compare below.
+        match read {
+            Ok(credits) => {
+                // The lander re-reads `auth.json` under the state flock: the
+                // compare hook poses a login landing in that window.
+                #[cfg(test)]
+                run_codex_compare_hook(name.as_str());
+                // A tick that already timed out a hold skips this flock wait,
+                // and a lease lost on the wire writes no file and leaves the
+                // hour unstamped, as the claude leg's in-hold checks do.
+                if !lease_is_current(lease) {
+                    continue;
+                }
+                if matches!(
+                    crate::limit_reset::land_codex(name.as_str(), &login, &credits, timed_out),
+                    crate::limit_reset::CodexLand::AccountMoved
+                ) {
+                    continue;
+                }
+                stamp_resets_attempt(
+                    state,
+                    &state.codex_resets_memo,
+                    &name,
+                    crate::usage::Half::Codex,
+                    epoch_at_spawn,
+                    now,
+                );
+            }
+            Err((err, retry_after)) => {
+                // Stamped whatever the lease says, as every failure is; only
+                // the holder says so, and only once the stamp names the gap.
+                let next = ResetsNext::after_failure(&err, retry_after);
+                if let Some(gap_ms) = stamp_resets(
+                    state,
+                    &state.codex_resets_memo,
+                    &name,
+                    crate::usage::Half::Codex,
+                    epoch_at_spawn,
+                    now,
+                    &next,
+                ) && lease_is_current(lease)
+                {
+                    log_resets_failure(&name, &err, &next, gap_ms);
+                }
+                continue;
+            }
+        }
+    }
+
+    // Reap the workers, the claude leg's shape: a left-running worker's
+    // outcome is dropped and a panicked worker sent none, so this is the only
+    // site left to date its attempt. It owns no status, mark or countdown, so
+    // that and its line are all the reap does; dropping a left-running
+    // worker's handle detaches it.
+    for worker in workers {
+        let name = &worker.ticket.key.name;
+        if worker.ticket.abandoned.load(Ordering::Relaxed) {
+            stamp_resets_attempt(
+                state,
+                &state.codex_resets_memo,
+                name,
+                crate::usage::Half::Codex,
+                worker.ticket.epoch_at_spawn,
+                now,
+            );
+            if lease_is_current(lease) {
+                log_resets_left_running(name);
+            }
+        } else if worker.handle.join().is_err() {
+            stamp_resets_attempt(
+                state,
+                &state.codex_resets_memo,
+                name,
+                crate::usage::Half::Codex,
+                worker.ticket.epoch_at_spawn,
+                now,
+            );
+            logline!("clauth: '{name}': the codex reset list read stopped before it answered");
+        }
+    }
+}
+
+/// One codex side read's answer plus the spawn-time login its landing
+/// compares, sent on the leg's completion channel.
+struct CodexResetsRead {
+    name: ProfileName,
+    epoch_at_spawn: u64,
+    login: crate::limit_reset::CodexLogin,
+    read: Result<
+        crate::usage::codex_reset::ResetCredits,
+        (crate::usage::codex_reset::ResetCallError, Option<Duration>),
+    >,
 }
 
 /// Codex accounts whose last poll answered 401. Their access token is stale, so
@@ -9023,7 +9546,7 @@ fn codex_usage_tick_flagged(
             .iter()
             .filter(|name| {
                 seen.get(name.as_str())
-                    .is_none_or(|last| now.saturating_sub(*last) >= interval_ms)
+                    .is_none_or(|poll| now.saturating_sub(poll.stamp) >= interval_ms)
             })
             .cloned()
             .collect()
@@ -9181,9 +9704,13 @@ fn codex_usage_tick_flagged(
                     continue;
                 };
                 if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
-                    guard
-                        .get_or_insert_with(HashMap::new)
-                        .insert(name.to_string(), now);
+                    guard.get_or_insert_with(HashMap::new).insert(
+                        name.to_string(),
+                        CodexPolled {
+                            stamp: now,
+                            answered: true,
+                        },
+                    );
                 }
                 if matched {
                     if let Ok(mut store) = state.store.lock() {
@@ -9208,9 +9735,40 @@ fn codex_usage_tick_flagged(
                     continue;
                 };
                 if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
-                    guard
-                        .get_or_insert_with(HashMap::new)
-                        .insert(name.to_string(), now);
+                    guard.get_or_insert_with(HashMap::new).insert(
+                        name.to_string(),
+                        CodexPolled {
+                            stamp: now,
+                            answered: true,
+                        },
+                    );
+                }
+            }
+            // No answer (a stall, a timeout, a refused connection, or a body
+            // cut off mid-read) is the one outcome the reset side read must
+            // not re-hit with its own request: the entry below stamps
+            // `answered: false`, the flag the side read's hold-off reads. A
+            // later landing replaces it; a poll discarded after its epoch
+            // moved or its lease lapsed writes nothing, so an older no-answer
+            // entry holds the read off until a poll lands. Any status and an
+            // unreadable JSON body is an answer and stamps `true`.
+            Err(FetchError::Network) => {
+                // Cadence still stamps, only while the epoch has not moved.
+                let Some(_epoch) = crate::usage::epoch_guard_if_current(
+                    &name,
+                    crate::usage::Half::Codex,
+                    epoch_at_spawn,
+                ) else {
+                    continue;
+                };
+                if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
+                    guard.get_or_insert_with(HashMap::new).insert(
+                        name.to_string(),
+                        CodexPolled {
+                            stamp: now,
+                            answered: false,
+                        },
+                    );
                 }
             }
             Err(_) => {
@@ -9223,9 +9781,13 @@ fn codex_usage_tick_flagged(
                     continue;
                 };
                 if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
-                    guard
-                        .get_or_insert_with(HashMap::new)
-                        .insert(name.to_string(), now);
+                    guard.get_or_insert_with(HashMap::new).insert(
+                        name.to_string(),
+                        CodexPolled {
+                            stamp: now,
+                            answered: true,
+                        },
+                    );
                 }
             }
         }
@@ -9807,6 +10369,7 @@ pub(crate) fn spawn_refresher(
     auto_start_queue: crate::usage::AutoStartQueueState,
     weekly_reset_kicks: WeeklyResetKicks,
     claude_resets_memo: ClaudeResetsMemoLock,
+    codex_resets_memo: CodexResetsMemoLock,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -9879,6 +10442,7 @@ pub(crate) fn spawn_refresher(
         kick_blocks,
         weekly_reset_kicks,
         claude_resets_memo,
+        codex_resets_memo,
         auto_start_queue,
         pending_switch,
         pending_switch_off,
@@ -11817,6 +12381,11 @@ const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
 /// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
 /// nothing while avoiding per-scan log spam.
 const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
+// The gate's degrade-to-mint lead must outlast one transient retry, so the
+// degrade lands before the bearer dies. (A bearer that died between two failed
+// re-stamps would still degrade on the next one, but sessions would have sat
+// on an expired bearer in between.)
+const _: () = assert!(crate::oauth::ROLLING_DEGRADE_LEAD_MS as u64 > ROLLING_RETRY_MS);
 /// A Broken verdict (dead chain, no mint to degrade to) and the re-login-shaped
 /// transients change only when the operator acts, so retrying them on the
 /// minutes cadence is pure log noise — they pace on this long leash instead.
@@ -11973,7 +12542,7 @@ pub(super) fn claude_rolling_tick<'g>(
             }
             logline!("clauth: '{name}' credentials changed under a re-stamp hold. Re-checking now");
         }
-        if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+        if !crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64) {
             continue;
         }
         let Some(claim) = claim_scheduler_spend_unless_shutting_down(activity, &name, spend_gate)
@@ -12007,7 +12576,8 @@ pub(super) fn claude_rolling_tick<'g>(
                 // The due re-read (a file read) runs BEFORE the pacing lock is
                 // taken — the rank is a leaf precisely because nothing else,
                 // locks or IO, ever happens under it.
-                let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
+                let still_due =
+                    crate::oauth::rolling_sidecar_restamp_due(config, &name, now as i64);
                 let hold = still_due.then(|| retry_hold(&name, now, kind));
                 if let Ok(mut p) = pacing.lock() {
                     match hold {

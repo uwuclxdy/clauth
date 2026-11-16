@@ -1507,9 +1507,10 @@ fn fanout_warning(
 }
 
 /// What blocks a macOS rotation, and therefore which refusal line the caller
-/// renders. The three causes are distinct operator next-steps: retry a moment
-/// (a launcher's own session), `claude stop` (a background job), or retry once
-/// the named store clears (clauth cannot read it).
+/// renders. The four causes are distinct operator next-steps: retry a moment
+/// (a launcher's own session), `claude stop` (a background job), retry once
+/// the named store clears (clauth cannot read it), or delete the named job dir
+/// (it never clears on its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RotationBlock {
     /// A live `clauth start` marker session holds a store with a refresh token.
@@ -1520,6 +1521,11 @@ pub(crate) enum RotationBlock {
     /// Carries the store dir the refusal names (the global store, or the
     /// account's own tree-local store).
     UnreadableJobStore(PathBuf),
+    /// The job store holds a job dir that never clears on its own, so the
+    /// chains that store covers (every profile's for the global store, the
+    /// account's own for a tree-local one) cannot be judged until it is
+    /// deleted. Carries that job dir.
+    UnreadableJobDir(PathBuf),
 }
 
 /// [`rotation_blocked_by_live_session`] over the two things that strand a
@@ -1578,8 +1584,10 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// read through [`credential_holds_refresh_token`], so a job on a
 /// `session-token.json` sidecar (linked or copied) frees the chain exactly like
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
-/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
-/// profile dir that cannot be resolved, blocks with the store's path named.
+/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or
+/// a profile dir that cannot be resolved, blocks with the store's path
+/// named, or with the job dir named when a stuck one made the store
+/// unreadable.
 ///
 /// The under-the-profile arm cannot see a handed-off per-launch chain tree
 /// correctly: the tree sits under its START profile's dir while the session
@@ -1608,7 +1616,12 @@ fn job_block(name: &ProfileName) -> Option<RotationBlock> {
     };
     let trees = match jobs.unfinished_under(&dir) {
         Ok(trees) => trees,
-        Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
+        Err(refusal) => {
+            return Some(match refusal.stuck_dir {
+                Some(job_dir) => RotationBlock::UnreadableJobDir(job_dir),
+                None => RotationBlock::UnreadableJobStore(refusal.store),
+            });
+        }
     };
     let rows = crate::live_sessions::list();
     let chain_trees: HashSet<PathBuf> = rows
@@ -1782,10 +1795,10 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-// Test seam posing WHICH cause blocks, so the three refusal lines' rendering
+// Test seam posing WHICH cause blocks, so the four refusal lines' rendering
 // paths are drivable from a Linux host. The bool seam above keeps its arms on
-// [`RotationBlock::LiveSession`]; this one covers the two job-store causes the
-// host can only reach on macOS.
+// [`RotationBlock::LiveSession`]; this one covers the job-store causes the host
+// can only reach on macOS.
 #[cfg(test)]
 thread_local! {
     static ROTATION_BLOCK_CAUSE_OVERRIDE: std::cell::RefCell<Option<RotationBlock>> =
@@ -11065,6 +11078,11 @@ pub(crate) fn settings_base(claude_home: &Path, isolation: Isolation) -> Option<
 /// the base and every sibling runtime for the session's lifetime. The two agree
 /// by construction: the syncer writes shared fields back into the base, so this
 /// recompute reproduces the same bytes on the next start instead of undoing it.
+///
+/// A shared copy links the operator's transcript store, so it never launches
+/// without the remembered `cleanupPeriodDays` ([`crate::retention`]): the
+/// number goes back into a keyless operator file before the build reads it,
+/// and into the copy itself when the operator file is missing.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
@@ -11073,15 +11091,6 @@ fn write_merged_settings(
     stale_env_keys: &[String],
 ) -> Result<()> {
     let base = settings_base(claude_home, isolation);
-    let merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
-    let settings_dst = runtime.join("settings.json");
-    // This file carries the api-key profile's top-level `apiKeyHelper` command
-    // string (plus the base_url/model env keys), so it must land 0o600 like
-    // every other clauth-owned write. The raw key itself lives in `config.toml`
-    // (minted per request by the helper); the runtime settings.json is still
-    // operator-sensitive. The write gate also fires when only the mode is wrong
-    // (a byte-identical file an older build left at the umask never self-heals
-    // otherwise).
     // The reconciler only lets a copy it recorded win a pass, so every shared
     // copy this build produces is recorded too: a write here, and an existing
     // byte-identical copy recorded in place. The record lands under the state
@@ -11092,6 +11101,25 @@ fn write_merged_settings(
         Isolation::Shared => crate::settings_sync::written_record_path().ok(),
         Isolation::Isolated => None,
     };
+    let carried_days = match (base.as_deref(), record.as_deref()) {
+        (Some(base), Some(record)) => {
+            crate::lock::with_state_lock(|held| crate::retention::settle(held, base, &[], record))
+                .map(|outcome| outcome.days)?
+        }
+        _ => None,
+    };
+    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    if let Some(days) = carried_days {
+        merged = crate::retention::carry_into(merged, days)?;
+    }
+    let settings_dst = runtime.join("settings.json");
+    // This file carries the api-key profile's top-level `apiKeyHelper` command
+    // string (plus the base_url/model env keys), so it must land 0o600 like
+    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // (minted per request by the helper); the runtime settings.json is still
+    // operator-sensitive. The write gate also fires when only the mode is wrong
+    // (a byte-identical file an older build left at the umask never self-heals
+    // otherwise).
     let carried_rank = record.as_deref().map_or((i64::MIN, 0), |record| {
         settings_carried_rank(record, base.as_deref())
     });

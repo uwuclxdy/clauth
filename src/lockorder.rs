@@ -243,16 +243,22 @@ pub(crate) mod rank {
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         /// Codex poll-cadence memo (`usage::scheduler::CODEX_POLLED_AT`). Taken
-        /// alone by `forget_codex_polled`, and under the epoch guard (160) by the
-        /// codex landing's section 2, which also takes the usage stores (300/350)
-        /// — so it ranks above them all as a leaf.
+        /// alone by `forget_codex_polled` and the reset side read's hold-off
+        /// snapshot, and under the epoch guard (160) by the codex landing's
+        /// section 2, which also takes the usage stores (300/350) — so it ranks
+        /// above them all as a leaf.
         CodexPolled = 1150;
-        /// Claude banked-reset side-read memo (`usage::scheduler`'s
-        /// `ClaudeResetsMemo`, one per scheduler state). The same leaf shape
+        /// Banked-reset side-read memo (`usage::scheduler`'s `ResetsMemo`,
+        /// one per scheduler state, the claude leg's under `ClaudeResets` and
+        /// the codex leg's under `CodexResets`). The same leaf shape
         /// as `CodexPolled`: taken alone by the leg (under `Config`, 400), the
         /// forget and rename paths, and the landing's transition detector, so
         /// it ranks above everything any of those nests with.
         ClaudeResets = 1155;
+        /// The codex banked-reset side-read memo's rank: the twin of
+        /// [`ClaudeResets`] on the codex roster, taken alone by its leg and
+        /// the forget and rename paths.
+        CodexResets = 1156;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true

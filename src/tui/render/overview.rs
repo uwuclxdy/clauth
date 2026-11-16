@@ -1519,6 +1519,11 @@ fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
     }
 }
 
+/// The 5h cell of a plan with no 5h limit: the Usage tab's `no limit on this
+/// plan`, short enough for the cell to hold; a cell under 8 cells draws the
+/// dash instead.
+const NO_FIVE_HOUR_LIMIT: &str = "no limit";
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1824,6 +1829,15 @@ fn render_overview_row(
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
         ))
+    } else if readings
+        .usage_of(&profile.name)
+        .is_some_and(|usage| usage.no_five_hour_limit)
+        && grapheme_cells(NO_FIVE_HOUR_LIMIT) <= widths.five_hour
+    {
+        // Opens the cell where a bar's `[` does; the row pad fills the rest,
+        // so the 7d column keeps its place. A narrower cell falls through to
+        // the dash, since `overview_windows` hides the 5h window under the mark.
+        flatten(vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())])
     } else {
         flatten(window_summary_spans_bracketed(
             five_window.as_ref(),
@@ -2045,7 +2059,9 @@ struct OverviewLong {
 /// LONG window: the 7d window when present, else the provider-marked monthly
 /// quota (an OAuth reading has no monthly, so its 7d-else-first-scoped
 /// fallback stays byte-identical). `None` per slot when no source exists
-/// (renders `—`).
+/// (renders `—`), and in the 5h slot of a plan with no 5h limit: that cell
+/// reads `no limit`, so a 5h window its stored body still carries neither
+/// draws nor sizes the column, as the Usage tab hides it.
 fn overview_windows(
     profile: &Profile,
     readings: &ReadingsSnapshot,
@@ -2062,7 +2078,11 @@ fn overview_windows(
                 monthly: false,
             })
         };
-        return (usage.five_hour.clone(), long);
+        let five = usage
+            .five_hour
+            .clone()
+            .filter(|_| !usage.no_five_hour_limit);
+        return (five, long);
     }
     let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);

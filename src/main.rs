@@ -31,6 +31,7 @@ mod jsonsync;
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
 #[cfg(target_os = "macos")]
 mod keychain;
+mod limit_reset;
 mod list;
 mod live_sessions;
 mod lock;
@@ -60,6 +61,7 @@ mod proxy_check;
 mod proxy_list;
 mod proxy_tokens;
 mod push;
+mod retention;
 mod rex;
 mod runtime;
 mod session_record;
@@ -381,7 +383,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Enable { profile } => cmd_enable(&profile),
-        Command::LimitReset { profile, list, yes } => cmd_limit_reset(&profile, list, yes),
+        // `--list` conflicts with an id, so a listing reaches here with none.
+        Command::LimitReset {
+            profile, id, yes, ..
+        } => cmd_limit_reset(&profile, id.as_deref(), yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json, pid } => match pid {
             Some(pid) => which::run_pid(pid, json),
@@ -523,13 +528,36 @@ fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
 
 /// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
 fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    // `--json` is global on `devices` so `pair` takes it on either side of its
+    // verb; the verbs it does not serve refuse it instead of silently ignoring
+    // it, which a script asking for JSON would read as the bare token.
+    let json_verb = match &cmd {
+        Some(cli::DevicesCommand::Add { .. }) => Some("add"),
+        Some(cli::DevicesCommand::Revoke { .. }) => Some("revoke"),
+        Some(cli::DevicesCommand::AllowSessions { .. }) => Some("allow-sessions"),
+        _ => None,
+    };
+    if json && let Some(verb) = json_verb {
+        return Err(usage_error(format!(
+            "`--json` applies to the listing and to `pair`, not to `devices {verb}`"
+        )));
+    }
     match cmd {
         None => daemon::api::devices::run_list(json),
         Some(cli::DevicesCommand::Pair {
             name,
             control,
             sessions,
-        }) => daemon::api::pairing::run_pair(&name, control, sessions),
+            no_qr,
+        }) => daemon::api::pairing::run_pair(
+            &name,
+            daemon::api::pairing::PairFlags {
+                control,
+                sessions,
+                json,
+                no_qr,
+            },
+        ),
         Some(cli::DevicesCommand::Add {
             name,
             control,
@@ -4033,18 +4061,19 @@ mod feature_coverage;
 #[path = "../tests/inline/cli.rs"]
 mod tests;
 
-/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex or
-/// claude account's banked usage-limit resets ([`usage::codex_reset`] /
-/// [`usage::claude_reset`]). The confirm policy is [`cmd_delete`]'s: the spend
-/// is irreversible, so a spend on a non-TTY stdin or stdout with no `--yes` is
-/// refused, and refused before any request leaves the machine; `--list` never
-/// prompts.
-fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
+/// `clauth limit-reset <name> [<id>] [--list] [--yes|-y]` — list a codex or
+/// claude account's banked usage-limit resets, or spend the one `<id>` names
+/// ([`limit_reset`]). With no id it only lists: no reset is ever picked for
+/// the operator. The confirm policy is [`cmd_delete`]'s: the spend is
+/// irreversible, so a spend on a non-TTY stdin or stdout with no `--yes` is
+/// refused, and refused before any request leaves the machine; a listing
+/// never prompts.
+fn cmd_limit_reset(name: &str, id: Option<&str>, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     limit_reset_with(
         name,
-        list,
+        id,
         yes,
         interactive,
         &usage::codex_reset::ResetUrls::live(),
@@ -4060,15 +4089,15 @@ fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
 /// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
 /// injected, so the refusals and the wire run offline.
 ///
-/// On success stdout's first line is the one-line summary, readable as it
-/// stands, unless a name both rosters hold prints its collision note ahead of
-/// it; every failure is the returned error, or `FailureReported` for an
-/// already-used grant, whose line prints before the re-read. Reads the store
-/// as it stands: a stale token is reported, never refreshed from here, because
-/// the store has one writer and it is not this command.
+/// On a spend's success stdout's first line is the one-line summary, readable
+/// as it stands, unless a name both rosters hold prints its collision note
+/// ahead of it; every failure is the returned error, or `FailureReported` for
+/// an already-used grant, whose line prints before the re-read. Reads the
+/// store as it stands: a stale token is reported, never refreshed from here,
+/// because the store has one writer and it is not this command.
 fn limit_reset_with(
     name: &str,
-    list: bool,
+    id: Option<&str>,
     yes: bool,
     interactive: bool,
     urls: &usage::codex_reset::ResetUrls,
@@ -4079,7 +4108,10 @@ fn limit_reset_with(
     // unknown-profile error. A name both rosters hold says out loud which
     // account the spend lands on.
     let config = load_config()?;
-    if let Some(canonical) = config.canonical_name(name) {
+    let mut surface = CliSpend {
+        confirm: Some(confirm),
+    };
+    let spent = if let Some(canonical) = config.canonical_name(name) {
         let canonical = ProfileName::from(canonical);
         let Some(profile) = config.find(&canonical) else {
             return Err(unknown_profile_error(&config, name));
@@ -4088,368 +4120,81 @@ fn limit_reset_with(
         {
             outln!("{}", codex_collision_note(&canonical, "spends a reset on"));
         }
-        return limit_reset_claude(&config, profile, list, yes, interactive, urls, confirm);
-    }
-    if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
-        return limit_reset_codex(&canonical, list, yes, interactive, urls, confirm);
-    }
-    Err(unknown_profile_error(&config, name))
-}
-
-fn limit_reset_codex(
-    canonical: &str,
-    list: bool,
-    yes: bool,
-    interactive: bool,
-    urls: &usage::codex_reset::ResetUrls,
-    confirm: impl FnOnce(&str) -> Result<bool>,
-) -> Result<()> {
-    use usage::codex_reset as reset;
-    use usage::limit_reset_pending as pending;
-    codex_auth::refuse_if_quarantined(canonical)?;
-    let auth = codex_auth::read_store_auth(canonical);
-    let Some(access_token) = auth.as_ref().and_then(|a| a.access_token()) else {
-        anyhow::bail!(
-            "'{canonical}' has no stored codex login to use a reset with; run `clauth login \
-             {canonical} --codex --browser`"
-        );
-    };
-    let account_id = auth.as_ref().and_then(|a| a.account_id());
-    let fedramp = auth.as_ref().is_some_and(|a| a.is_fedramp());
-    if !list && !yes && !interactive {
-        anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
-    }
-    let profile = ProfileName::from(canonical);
-    // The spend path serializes on the account's limit-reset lock before the
-    // first request, so a second run waits and re-decides on what this one
-    // leaves behind; `--list` spends nothing and never takes it.
-    let _spend_lock = if list {
-        None
+        match id {
+            None => {
+                print_lines(limit_reset::list_claude(&config, profile, urls)?);
+                return Ok(());
+            }
+            Some(id) => limit_reset::spend_claude(
+                &config,
+                profile,
+                id,
+                yes,
+                interactive,
+                urls,
+                &mut surface,
+            )?,
+        }
+    } else if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+        match id {
+            None => {
+                print_lines(limit_reset::list_codex(&canonical, urls)?);
+                return Ok(());
+            }
+            Some(id) => {
+                limit_reset::spend_codex(&canonical, id, yes, interactive, urls, &mut surface)?
+            }
+        }
     } else {
-        Some(pending::LimitResetLock::acquire(&profile)?)
+        return Err(unknown_profile_error(&config, name));
     };
-
-    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
-        .map_err(|e| anyhow::anyhow!(reset::list_failure(canonical, &e)))?;
-    let pending_path = pending::path::<pending::CodexPending>(&profile)?;
-    if list {
-        for line in reset::describe_reset_credits(canonical, &credits) {
-            outln!("{line}");
-        }
-        if let Some(sent_at_ms) = pending::fresh_stamp::<pending::CodexPending>(&pending_path) {
-            outln!("{}", reset::list_pending_note(canonical, sent_at_ms));
-        }
-        return Ok(());
+    if let limit_reset::Spent::Declined(line) = spent {
+        outln!("{line}");
     }
-    let recorded = pending::take_fresh::<pending::CodexPending>(&pending_path)?;
-    let re_send = recorded.is_some();
-    let (credit_id, redeem_request_id, sent_at_ms) = match recorded {
-        Some(record) => {
-            if !yes && !confirm(&reset::re_send_prompt(canonical))? {
-                outln!("{}", reset::declined_re_send_line(canonical));
-                return Ok(());
-            }
-            (
-                record.credit_id,
-                record.redeem_request_id,
-                record.sent_at_ms,
-            )
-        }
-        None => {
-            let Some(credit) = credits.next_to_use() else {
-                anyhow::bail!("{}", reset::no_resets_available(canonical));
-            };
-            if !yes && !confirm(&reset::limit_reset_prompt(canonical, &credits, credit))? {
-                outln!("clauth: aborted. no reset was used on '{canonical}'.");
-                return Ok(());
-            }
-            let redeem_request_id = reset::new_redeem_request_id()?;
-            let sent_at_ms = crate::usage::now_ms();
-            pending::write(
-                &pending_path,
-                &pending::CodexPending {
-                    credit_id: credit.id.clone(),
-                    redeem_request_id: redeem_request_id.clone(),
-                    sent_at_ms,
-                },
-            )?;
-            (credit.id.clone(), redeem_request_id, sent_at_ms)
-        }
-    };
-    let reply = reset::consume_reset_credit_at(
-        &urls.consume,
-        access_token,
-        account_id,
-        fedramp,
-        &redeem_request_id,
-        &credit_id,
-    );
-    let settled = reset::post_settles(re_send, &reply, reset::consume_settled);
-    if settled && let Err(e) = pending::clear(&pending_path) {
-        errln!(
-            "clauth: could not remove {} after the reset settled: {e}",
-            pending_path.display()
-        );
-    }
-    let summary = match reply {
-        Ok(reply) => reset::outcome_line(canonical, &credits, &reply, sent_at_ms)
-            .map_err(|e| anyhow::anyhow!(e))?,
-        Err(e) => {
-            return Err(anyhow::anyhow!(reset::consume_failure(
-                canonical, &e, sent_at_ms, re_send
-            )));
-        }
-    };
-    outln!("{summary}");
-    outln!("clauth: the daemon shows the new usage at its next poll.");
     Ok(())
 }
 
-fn limit_reset_claude(
-    config: &AppConfig,
-    profile: &Profile,
-    list: bool,
-    yes: bool,
-    interactive: bool,
-    urls: &usage::codex_reset::ResetUrls,
-    confirm: impl FnOnce(&str) -> Result<bool>,
-) -> Result<()> {
-    use usage::claude_reset as reset;
-    use usage::limit_reset_pending as pending;
-    actions::refuse_limit_reset_on_proxy(profile)?;
-    let canonical = &profile.name;
-    // A profile clauth holds no claude login for has nothing to spend; a
-    // quarantined chain refuses the way every other claude surface does.
-    // Both land before anything leaves the machine.
-    let Some(access_token) = profile.access_token().filter(|t| !t.is_empty()) else {
-        anyhow::bail!(
-            "'{canonical}' has no stored claude login to use a reset with; run `clauth login \
-             {canonical}`"
-        );
-    };
-    oauth::refuse_if_chain_dead(config, Some(profile), canonical)?;
-    if !list && !yes && !interactive {
-        anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
-    }
-    // The identity the spend runs under, captured beside the token it sends:
-    // the post-spend refresh lands its re-read only while the stored login is
-    // still this one.
-    let identity = usage::spawn_oauth_identity(canonical, access_token);
-    // The spend path serializes on the account's limit-reset lock before the
-    // first request, so a second run waits and re-decides on what this one
-    // leaves behind; `--list` spends nothing and never takes it.
-    let _spend_lock = if list {
-        None
-    } else {
-        Some(pending::LimitResetLock::acquire(canonical)?)
-    };
-
-    let status = reset::read_status_at(&reset::read_url(&urls.claude_origin), access_token)
-        .map_err(|e| anyhow::anyhow!(reset::read_failure(canonical, &e)))?;
-    let pending_path = pending::path::<pending::ClaudePending>(canonical)?;
-    if list {
-        for line in reset::describe_grants(canonical, &status) {
-            outln!("{line}");
-        }
-        if let Some(sent_at_ms) = pending::fresh_stamp::<pending::ClaudePending>(&pending_path) {
-            outln!("{}", reset::list_pending_note(canonical, sent_at_ms));
-        }
-        return Ok(());
-    }
-    let recorded = pending::take_fresh::<pending::ClaudePending>(&pending_path)?;
-    let re_send = recorded.is_some();
-    let (org_uuid, grant_id, request_id, sent_at_ms) = match recorded {
-        Some(record) => {
-            let org_uuid =
-                reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
-                    .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;
-            if !yes && !confirm(&reset::re_send_prompt(canonical))? {
-                outln!("{}", reset::declined_re_send_line(canonical));
-                return Ok(());
-            }
-            (
-                org_uuid,
-                record.grant_id,
-                record.request_id,
-                record.sent_at_ms,
-            )
-        }
-        None => {
-            let grant = match status.try_spend_grant() {
-                Ok(grant) => grant,
-                Err(reset::SpendRefusal::NoNextGrant(status)) => {
-                    anyhow::bail!("{}", reset::no_resets_available(canonical, status))
-                }
-                Err(reset::SpendRefusal::NotUsableNow(grant)) => {
-                    anyhow::bail!("{}", reset::unusable_next_line(canonical, grant))
-                }
-                Err(reset::SpendRefusal::UnsendableId) => {
-                    anyhow::bail!("{}", reset::unsendable_grant_line(canonical))
-                }
-            };
-            let org_uuid =
-                reset::read_org_uuid_at(&reset::org_url(&urls.claude_origin), access_token)
-                    .map_err(|e| anyhow::anyhow!(reset::org_failure(canonical, &e)))?;
-            if !yes && !confirm(&reset::spend_prompt(canonical, &status, grant))? {
-                outln!("clauth: aborted. no reset was used on '{canonical}'.");
-                return Ok(());
-            }
-            let request_id = reset::new_request_id()?;
-            let sent_at_ms = crate::usage::now_ms();
-            pending::write(
-                &pending_path,
-                &pending::ClaudePending {
-                    grant_id: grant.id.clone(),
-                    request_id: request_id.clone(),
-                    sent_at_ms,
-                },
-            )?;
-            (org_uuid, grant.id.clone(), request_id, sent_at_ms)
-        }
-    };
-    let this_send_at_ms = crate::usage::now_ms();
-    let reply = reset::spend_reset_at(
-        &reset::spend_url(&urls.claude_origin, &org_uuid),
-        access_token,
-        &grant_id,
-        &request_id,
-    );
-    let settled = reset::post_settles(re_send, &reply, reset::spend_settled);
-    if settled && let Err(e) = pending::clear(&pending_path) {
-        errln_or_drop!(
-            "clauth: could not remove {} after the reset settled: {e}",
-            pending_path.display()
-        );
-    }
-    // The spend lock is a true leaf (`lockorder`'s `LimitResetSpend`), so it
-    // drops before the refresh, whose state-flock hold is a ranked lock.
-    drop(_spend_lock);
-    // A settled record is gone by here, or still re-sendable when its clear
-    // failed, so the outcome prints before the re-read: a run killed during the
-    // refresh must still have said what it spent. An already-used answer is the
-    // one error outcome that still moved the count: it prints before the
-    // re-read too, and reports through `FailureReported` after it, which
-    // `exit_code` exits without a second line. Every other error outcome
-    // prints after, from `main`'s report of the return.
-    match &reply {
-        Ok(reply) => {
-            let outcome = reset::spend_outcome_line(canonical, reply, sent_at_ms);
-            if let Ok(summary) = &outcome {
-                outln_or_drop!("{summary}");
-                outln_or_drop!("clauth: the daemon shows the new usage at its next poll.");
-            }
-            if reset::spend_moved_the_count(reply) {
-                if let Err(text) = &outcome {
-                    errln_or_drop!("Error: {text}");
-                }
-                refresh_claude_limit_resets(
-                    canonical,
-                    &urls.claude_origin,
-                    access_token,
-                    &identity,
-                    this_send_at_ms,
-                );
-                if outcome.is_err() {
-                    return Err(anyhow::Error::new(FailureReported));
-                }
-                Ok(())
-            } else {
-                outcome.map_err(|e| anyhow::anyhow!(e))?;
-                Ok(())
-            }
-        }
-        Err(e) => Err(anyhow::anyhow!(reset::spend_failure(
-            canonical, e, sent_at_ms, re_send
-        ))),
+fn print_lines(lines: Vec<String>) {
+    for line in lines {
+        outln!("{line}");
     }
 }
 
-/// The post-spend refresh: after a settled spend that moved the count, the
-/// CLI re-reads the account's resets itself and lands what the server says in
-/// the account's `limit_resets.json` under the state flock, so no surface
-/// keeps showing the spent count until the hourly side read. The write and
-/// the delete share the scheduler's side-read gate: a moved or unreadable
-/// login lands nothing and deletes nothing, and a stored count read at or
-/// after this run's send (`sent_at_ms`) stays, since a side read that
-/// already saw that send is the best count clauth holds; a count with no
-/// stamp counts as older and goes. Every failure of the refresh (the re-read,
-/// the store, the drop, the state flock) is named on stderr, one line per
-/// failure, while the spend's outcome line and exit stay what they were. The
-/// caller releases the spend lock first: it is a true leaf (`lockorder`'s
-/// `LimitResetSpend`), and the flock hold below is a ranked lock.
-fn refresh_claude_limit_resets(
-    canonical: &ProfileName,
-    origin: &str,
-    access_token: &str,
-    identity: &usage::OAuthIdentity,
-    sent_at_ms: u64,
-) {
-    match usage::claude_reset::read_status_at(&usage::claude_reset::read_url(origin), access_token)
-    {
-        Ok(status) => {
-            let reading = usage::claude_reset::status_reading(&status);
-            // `None` when the gate kept the reading off a login that moved or
-            // could not be read; otherwise whether the write landed.
-            let stored = crate::lock::with_state_lock(|_held| {
-                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
-                if unreadable || usage::oauth_changed(identity, &disk) {
-                    return Ok(None);
-                }
-                Ok(Some(
-                    crate::profile_cache::write_profile_cache_reported_for(
-                        crate::harness::Harness::Claude,
-                        canonical,
-                        crate::profile_cache::LIMIT_RESETS_FILE,
-                        &reading,
-                    ),
-                ))
-            });
-            match stored {
-                Ok(None) | Ok(Some(true)) => {}
-                Ok(Some(false)) => {
-                    errln!("{}", usage::claude_reset::refresh_store_failure(canonical));
-                }
-                Err(_) => {
-                    errln!("{}", usage::claude_reset::refresh_lock_failure(canonical));
-                }
-            }
+/// The CLI's side of a spend: the `[y/N]` prompt, notes on stderr, and the
+/// outcome printed the moment the reply settles. The outcome lines drop on a
+/// closed reader rather than end the run, since the refresh after them is
+/// still owed.
+struct CliSpend<F> {
+    confirm: Option<F>,
+}
+
+impl<F: FnOnce(&str) -> Result<bool>> limit_reset::SpendSurface for CliSpend<F> {
+    fn confirm(&mut self, prompt: &str) -> Result<bool> {
+        match self.confirm.take() {
+            Some(confirm) => confirm(prompt),
+            None => anyhow::bail!("a limit-reset spend asked twice for one confirmation"),
         }
-        Err(e) => {
-            let drop = match crate::lock::with_state_lock(|_held| {
-                let (disk, unreadable) = usage::read_oauth_for_compare(canonical);
-                if unreadable || usage::oauth_changed(identity, &disk) {
-                    return Ok(usage::claude_reset::RefreshDrop::LoginChanged);
-                }
-                let kept = crate::profile_cache::load_profile_cache::<usage::LimitResets>(
-                    canonical,
-                    crate::profile_cache::LIMIT_RESETS_FILE,
-                )
-                .and_then(|r| r.fetched_at)
-                .is_some_and(|at| at >= sent_at_ms);
-                if kept {
-                    return Ok(usage::claude_reset::RefreshDrop::KeptNewer);
-                }
-                Ok(
-                    if crate::profile_cache::remove_profile_cache_reported(
-                        canonical,
-                        crate::profile_cache::LIMIT_RESETS_FILE,
-                    ) {
-                        usage::claude_reset::RefreshDrop::Dropped
-                    } else {
-                        usage::claude_reset::RefreshDrop::Failed
-                    },
-                )
-            }) {
-                Ok(drop) => drop,
-                Err(_) => usage::claude_reset::RefreshDrop::LockTimedOut,
-            };
-            errln!(
-                "{}",
-                usage::claude_reset::refresh_read_failure(canonical, &e, drop)
-            );
-            if drop == usage::claude_reset::RefreshDrop::Failed {
-                errln!("{}", usage::claude_reset::refresh_drop_failure(canonical));
+    }
+
+    fn note(&mut self, line: &str) {
+        errln_or_drop!("{line}");
+    }
+
+    fn outcome(&mut self, outcome: &std::result::Result<String, String>) {
+        match outcome {
+            Ok(summary) => {
+                outln_or_drop!("{summary}");
+                outln_or_drop!("clauth: the daemon shows the new usage at its next poll.");
             }
+            Err(text) => errln_or_drop!("Error: {text}"),
         }
+    }
+
+    fn refused(&mut self, _reason: &str) {
+        // Only the modal has words of its own for a refusal.
+    }
+
+    fn moved_count(&mut self, _reread_stored: bool) {
+        // The refusal line already names the re-list; the CLI exits here.
     }
 }

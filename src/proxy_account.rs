@@ -1428,11 +1428,63 @@ pub(crate) fn fetch_usage(
     use crate::providers::ThirdPartyError;
     let query = account_query(account).map_err(|_| ThirdPartyError::Parse)?;
     let control = Control::connect(service).map_err(|_| ThirdPartyError::Network)?;
+    let value = usage_body(&control, &format!("/usage?{query}"))?;
+    let block = value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|a| a.get("account").and_then(Value::as_str) == Some(account))
+        })
+        .ok_or(ThirdPartyError::Parse)?;
+    let (stats, dates) = account_stats(block, &|text| control.printable(text))?;
+    if let Some(dates) = dates {
+        ReadDate::record(dates);
+    }
+    Ok(stats)
+}
+
+/// The profile's whole proxy pool, read through `GET /clauth/v1/usage` with
+/// clauth's admin token, once the proxy answered as itself: every account the
+/// proxy holds, the pool-wide totals, one bar per balance pool and one row per
+/// account. The profile's own api key never rides this call — a funnel profile
+/// spends through whichever account the proxy routes to, never one key.
+///
+/// Every failure collapses to a cache-fallback verdict for the same reason
+/// [`fetch_usage`]'s does: the read speaks about clauth's admin token and the
+/// proxy, never about an account's inference key.
+pub(crate) fn fetch_pool_usage(
+    service: &Service,
+) -> std::result::Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    use crate::providers::ThirdPartyError;
+    let control = Control::connect(service).map_err(|_| ThirdPartyError::Network)?;
+    let value = usage_body(&control, "/usage")?;
+    let accounts = value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or(ThirdPartyError::Parse)?;
+    let (stats, dates) = pool_stats(accounts, &|text| control.printable(text))?;
+    if let Some(dates) = dates {
+        ReadDate::record(dates);
+    }
+    Ok(stats)
+}
+
+/// One `/usage` body, read past [`Control::bearer`]'s identity gate, with the
+/// error mapping every control read shares: a 429 keeps the server's
+/// retry-after, any other refusal is its status alone, and a transport or
+/// parse failure gets its own verdict.
+fn usage_body(
+    control: &Control,
+    path: &str,
+) -> std::result::Result<Value, crate::providers::ThirdPartyError> {
+    use crate::providers::ThirdPartyError;
     let bearer = control
         .bearer("Nothing was read")
         .map_err(|_| ThirdPartyError::Network)?;
     let mut response = control_agent(CONTROL_TIMEOUT)
-        .get(&control.url(&format!("/usage?{query}")))
+        .get(&control.url(path))
         .header("authorization", &bearer)
         .call()
         .map_err(|_| ThirdPartyError::Network)?;
@@ -1454,21 +1506,7 @@ pub(crate) fn fetch_usage(
         .limit(BODY_LIMIT)
         .read_to_string()
         .map_err(|_| ThirdPartyError::Network)?;
-    let value: Value = serde_json::from_str(&body).map_err(|_| ThirdPartyError::Parse)?;
-    let block = value
-        .get("accounts")
-        .and_then(Value::as_array)
-        .and_then(|accounts| {
-            accounts
-                .iter()
-                .find(|a| a.get("account").and_then(Value::as_str) == Some(account))
-        })
-        .ok_or(ThirdPartyError::Parse)?;
-    let (stats, dates) = account_stats(block, &|text| control.printable(text))?;
-    if let Some(dates) = dates {
-        ReadDate::record(dates);
-    }
-    Ok(stats)
+    serde_json::from_str(&body).map_err(|_| ThirdPartyError::Parse)
 }
 
 // ── the reading's date ──────────────────────────────────────────────────────
@@ -1524,6 +1562,11 @@ impl Drop for ReadDate {
     fn drop(&mut self) {
         READ_DATE.set(None);
     }
+}
+
+/// An epoch-seconds instant as a [`SystemTime`], saturating before the epoch.
+fn at_epoch(secs: i64) -> SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or_default())
 }
 
 /// One account block of `/usage` as clauth's typed stats, every
@@ -1594,12 +1637,9 @@ fn account_stats(
             oldest_chain = older(oldest_chain);
         }
     }
-    let at = |secs: i64| {
-        std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or_default())
-    };
     let dates = oldest.map(|stalest| ReadDates {
-        stalest: at(stalest),
-        chain: oldest_chain.map(at),
+        stalest: at_epoch(stalest),
+        chain: oldest_chain.map(at_epoch),
     });
     Ok((
         ThirdPartyStats {
@@ -1808,6 +1848,527 @@ fn balance_value(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String
         Some(unit) => format!("{remaining} {}", text(unit)),
     };
     Some(value)
+}
+
+// The pool read's figures: one bar per balance pool, the totals, one row per
+// account.
+
+/// One account block of a whole-pool `/usage` read.
+struct PoolAccount<'a> {
+    id: &'a str,
+    state: &'a str,
+    available: bool,
+    figures: &'a [Value],
+}
+
+/// One `accounts` entry as a [`PoolAccount`]. An entry without the contract's
+/// `available` verdict, its figures or its id fails the whole read: a missing
+/// verdict read as funded, or a nameless row, is a figure nobody published.
+fn pool_account(
+    block: &Value,
+) -> std::result::Result<PoolAccount<'_>, crate::providers::ThirdPartyError> {
+    use crate::providers::ThirdPartyError;
+    Ok(PoolAccount {
+        id: block
+            .get("account")
+            .and_then(Value::as_str)
+            .ok_or(ThirdPartyError::Parse)?,
+        state: block
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        available: block
+            .get("available")
+            .and_then(Value::as_bool)
+            .ok_or(ThirdPartyError::Parse)?,
+        figures: block
+            .get("figures")
+            .and_then(Value::as_array)
+            .ok_or(ThirdPartyError::Parse)?,
+    })
+}
+
+/// The pool-wide counts and sums the totals rows spell, and the stalest
+/// figure's `read_at` that dates the copy.
+#[derive(Default)]
+struct PoolTotals {
+    ready: usize,
+    unread: usize,
+    not_ready: usize,
+    reset_5h: usize,
+    reset_7d: usize,
+    has_reset: bool,
+    claimable: usize,
+    held: usize,
+    has_offer: bool,
+    attempted: i64,
+    failed: i64,
+    has_stats: bool,
+    /// A proxy-published negative count the sum may not include.
+    negative_stats: bool,
+    oldest_read_at: Option<i64>,
+}
+
+impl PoolTotals {
+    fn add(&mut self, account: &PoolAccount<'_>) {
+        if account.available {
+            if account.figures.is_empty() {
+                self.unread += 1;
+            } else {
+                self.ready += 1;
+            }
+        } else {
+            self.not_ready += 1;
+        }
+        for figure in account.figures {
+            if let Some(read_at) = figure
+                .get("read_at")
+                .and_then(Value::as_str)
+                .and_then(crate::usage::iso_to_epoch_secs)
+            {
+                self.oldest_read_at = Some(
+                    self.oldest_read_at
+                        .map_or(read_at, |oldest| oldest.min(read_at)),
+                );
+            }
+            match figure.get("kind").and_then(Value::as_str) {
+                Some("channel") => self.add_channel(figure),
+                Some("offer") => self.add_offer(figure),
+                Some("stats") => self.add_stats(figure),
+                _ => {}
+            }
+        }
+    }
+
+    fn add_channel(&mut self, figure: &Value) {
+        let id = figure.get("id").and_then(Value::as_str);
+        if !matches!(id, Some("reset-5h" | "reset-7d")) {
+            return;
+        }
+        // A channel without its `open` verdict is no count clauth read: its row
+        // stays out rather than printing a fabricated `0 open`.
+        let Some(open) = figure.get("open").and_then(Value::as_bool) else {
+            return;
+        };
+        self.has_reset = true;
+        if open {
+            if id == Some("reset-5h") {
+                self.reset_5h += 1;
+            } else {
+                self.reset_7d += 1;
+            }
+        }
+    }
+
+    fn add_offer(&mut self, figure: &Value) {
+        // An offer without its `items` array states no claim clauth read.
+        let Some(items) = figure.get("items").and_then(Value::as_array) else {
+            return;
+        };
+        self.has_offer = true;
+        for item in items {
+            match item.get("state").and_then(Value::as_str) {
+                Some("available") => self.claimable += 1,
+                Some("claimed") => self.held += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn add_stats(&mut self, figure: &Value) {
+        // Both counters must be integers clauth can add up, and one negative
+        // count poisons the whole sum: the row never prints a total that a
+        // junk count made nonsense.
+        let Some(requests) = figure.get("requests").and_then(Value::as_object) else {
+            return;
+        };
+        let (Some(attempted), Some(failed)) = (
+            requests.get("attempted").and_then(Value::as_i64),
+            requests.get("failed").and_then(Value::as_i64),
+        ) else {
+            return;
+        };
+        self.has_stats = true;
+        if attempted < 0 || failed < 0 {
+            self.negative_stats = true;
+            return;
+        }
+        self.attempted = self.attempted.saturating_add(attempted);
+        self.failed = self.failed.saturating_add(failed);
+    }
+
+    fn rows(&self) -> Vec<crate::providers::StatRow> {
+        let mut rows = vec![stat_row("accounts", self.accounts_value())];
+        if self.has_reset {
+            rows.push(stat_row(
+                "resets",
+                format!("{} open (5h) | {} open (7d)", self.reset_5h, self.reset_7d),
+            ));
+        }
+        if self.has_offer {
+            rows.push(stat_row(
+                "offers",
+                format!("{} claimable | {} held", self.claimable, self.held),
+            ));
+        }
+        if self.has_stats && !self.negative_stats {
+            rows.push(stat_row(
+                "requests",
+                format!(
+                    "{} ({} failed)",
+                    crate::format::group_thousands(self.attempted as f64, 0),
+                    crate::format::group_thousands(self.failed as f64, 0),
+                ),
+            ));
+        }
+        rows
+    }
+
+    fn accounts_value(&self) -> String {
+        let mut value = format!("{} ready", self.ready);
+        if self.not_ready > 0 {
+            value.push_str(&format!(" | {} not ready", self.not_ready));
+        }
+        value.push_str(&format!(" | {} unread", self.unread));
+        value
+    }
+}
+
+fn stat_row(label: &str, value: String) -> crate::providers::StatRow {
+    crate::providers::StatRow {
+        label: label.to_string(),
+        value,
+        kind: crate::providers::StatRowKind::Body,
+        raw: None,
+    }
+}
+
+/// How a balance amount is spelled: a token count compacts (`205M`); every
+/// other amount keeps its exact value, grouped with thousands separators, and
+/// names the unit its figure spells.
+#[derive(Default, PartialEq)]
+enum BalanceUnit {
+    #[default]
+    Tokens,
+    Named(Option<String>),
+}
+
+/// One balance pool: every `balance` figure of one `id` that carries a
+/// positive grant and a left, of the set's unit.
+#[derive(Default)]
+struct BalancePool {
+    label: String,
+    /// The unit the first figure to enter the set named: a figure of another
+    /// unit names another balance and never enters this bar's figures. `None`
+    /// until a figure carries both a positive grant and a left.
+    unit: Option<BalanceUnit>,
+    granted: f64,
+    /// The summed `remaining` of the same figures that published a positive
+    /// grant.
+    left: f64,
+    spent: f64,
+    expiry: Option<(i64, String)>,
+}
+
+/// One bar per balance pool, in the order the pools first appear. A pool with
+/// no finite granted total (or a non-positive one) gets no bar: its share is
+/// not a figure the proxy published. Grant, left, spent, expiry and the bar's
+/// name come from one set — the figures carrying a finite, positive `limit`
+/// AND a finite `remaining`, of the unit the first such figure named — so no
+/// side of the bar, nor its `resets in` countdown, names a figure another side
+/// did not read.
+fn balance_bars(
+    accounts: &[PoolAccount<'_>],
+    text: &dyn Fn(&str) -> String,
+) -> Vec<crate::providers::UsageBar> {
+    let mut pools: Vec<(String, BalancePool)> = Vec::new();
+    for figure in accounts
+        .iter()
+        .flat_map(|account| account.figures)
+        .filter(|figure| figure.get("kind").and_then(Value::as_str) == Some("balance"))
+    {
+        let Some(id) = figure.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let index = match pools.iter().position(|(pool_id, _)| pool_id == id) {
+            Some(index) => index,
+            None => {
+                pools.push((id.to_string(), BalancePool::default()));
+                pools.len() - 1
+            }
+        };
+        let pool = &mut pools[index].1;
+        // A figure naming only one side of the bar, or carrying no positive
+        // grant, is no member of its set: the grant and the left must both be
+        // figures this read produced, so it never fixes the unit, never names
+        // the bar and never times it either.
+        let (Some(limit), Some(remaining)) = (
+            figure
+                .get("limit")
+                .and_then(Value::as_f64)
+                .filter(|limit| limit.is_finite() && *limit > 0.0),
+            figure
+                .get("remaining")
+                .and_then(Value::as_f64)
+                .filter(|remaining| remaining.is_finite()),
+        ) else {
+            continue;
+        };
+        // The first figure to enter the set owns the unit and names the bar: a
+        // figure with no positive grant never fixes either, and another unit's
+        // figure keeps its own account line rather than entering this bar's.
+        let unit = balance_unit(figure, text);
+        if let Some(owned) = pool.unit.as_ref()
+            && *owned != unit
+        {
+            continue;
+        }
+        if pool.unit.is_none() {
+            pool.label = balance_label(figure, text);
+            pool.unit = Some(unit);
+        }
+        // The countdown comes from the same set as the sums.
+        if let Some((epoch, stamp)) = figure
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .and_then(|stamp| crate::usage::iso_to_epoch_secs(stamp).map(|epoch| (epoch, stamp)))
+            && pool
+                .expiry
+                .as_ref()
+                .is_none_or(|(earliest, _)| epoch < *earliest)
+        {
+            pool.expiry = Some((epoch, stamp.to_string()));
+        }
+        pool.granted += limit;
+        pool.left += remaining;
+        pool.spent += figure
+            .get("used")
+            .and_then(Value::as_f64)
+            .filter(|used| used.is_finite())
+            .unwrap_or(limit - remaining);
+    }
+    pools
+        .into_iter()
+        .filter_map(|(_, pool)| {
+            if !(pool.granted.is_finite() && pool.granted > 0.0) {
+                return None;
+            }
+            let unit = pool.unit.as_ref()?;
+            let label = format!(
+                "{} | {} left of {}",
+                pool.label,
+                balance_amount(pool.left, unit),
+                balance_amount(pool.granted, unit),
+            );
+            Some(crate::providers::UsageBar {
+                label,
+                pct: (pool.spent / pool.granted * 100.0).clamp(0.0, 100.0),
+                resets_at: pool.expiry.map(|(_, stamp)| stamp),
+                used: None,
+                total: None,
+                inference_quota: false,
+            })
+        })
+        .collect()
+}
+
+/// A pool bar's label: a bare chain label gains a word so
+/// [`crate::providers::ThirdPartyStats::windows_info`] never reads a balance
+/// as a `5h`/`7d` window and steers the auto-switch with it.
+fn balance_label(figure: &Value, text: &dyn Fn(&str) -> String) -> String {
+    let label = text(
+        figure
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if is_chain_label(&label) {
+        format!("{label} balance")
+    } else {
+        label
+    }
+}
+
+/// A balance figure's amount unit: its currency code, a non-empty
+/// `unit_label`, else the unit's own name. [`BalanceUnit::Tokens`] for a token
+/// count (which compacts); [`BalanceUnit::Named`]`(None)` for a figure naming
+/// no unit at all.
+fn balance_unit(figure: &Value, text: &dyn Fn(&str) -> String) -> BalanceUnit {
+    let unit = figure
+        .get("unit")
+        .and_then(Value::as_str)
+        .filter(|unit| !unit.is_empty());
+    if unit == Some("tokens") {
+        return BalanceUnit::Tokens;
+    }
+    let word = |key: &str| {
+        figure
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|word| !word.is_empty())
+    };
+    BalanceUnit::Named(
+        word("currency")
+            .or_else(|| word("unit_label"))
+            .or(unit)
+            .map(text),
+    )
+}
+
+/// One side of a pool bar's `left of` phrase or a balance line's `left`: a
+/// token count compacts; every other amount keeps its exact value, grouped and
+/// spelled by [`crate::format::format_amount_grouped`], and names the unit
+/// word its figure spells.
+fn balance_amount(amount: f64, unit: &BalanceUnit) -> String {
+    match unit {
+        BalanceUnit::Tokens => crate::format::format_compact(amount),
+        BalanceUnit::Named(Some(word)) => {
+            format!("{} {word}", crate::format::format_amount_grouped(amount))
+        }
+        BalanceUnit::Named(None) => crate::format::format_amount_grouped(amount),
+    }
+}
+
+/// One account's line: its two chain windows always, then every other window,
+/// balance and channel the proxy read for it in source order. A reading with
+/// no figures spells the account's state instead.
+fn pool_account_value(account: &PoolAccount<'_>, text: &dyn Fn(&str) -> String) -> String {
+    if account.figures.is_empty() {
+        return if account.state == "ready" {
+            "no figures".to_string()
+        } else {
+            text(account.state).replace('_', " ")
+        };
+    }
+    let mut parts = Vec::new();
+    for role in ["5h", "7d"] {
+        let pct = account
+            .figures
+            .iter()
+            .find(|figure| {
+                figure.get("kind").and_then(Value::as_str) == Some("window")
+                    && chain_role(figure) == Some(role)
+            })
+            .and_then(window_pct)
+            .unwrap_or_else(|| "-".to_string());
+        parts.push(format!("{role} {pct}"));
+    }
+    for figure in account.figures.iter().filter(|figure| {
+        figure.get("kind").and_then(Value::as_str) == Some("window") && chain_role(figure).is_none()
+    }) {
+        let label = text(
+            figure
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let pct = window_pct(figure).unwrap_or_else(|| "-".to_string());
+        parts.push(format!("{label} {pct}"));
+    }
+    for figure in account
+        .figures
+        .iter()
+        .filter(|figure| figure.get("kind").and_then(Value::as_str) == Some("balance"))
+    {
+        if let Some(part) = balance_part(figure, text) {
+            parts.push(part);
+        }
+    }
+    for figure in account
+        .figures
+        .iter()
+        .filter(|figure| figure.get("kind").and_then(Value::as_str) == Some("channel"))
+    {
+        if let Some(part) = channel_part(figure, text) {
+            parts.push(part);
+        }
+    }
+    parts.join(" | ")
+}
+
+/// A window figure's used share, `None` when it draws no bar: both sides must
+/// map ([`window_use`], which demands a positive limit) and the share is
+/// clamped like the per-account pane's bars.
+fn window_pct(figure: &Value) -> Option<String> {
+    let (used, limit) = window_use(figure)?;
+    Some(crate::format::format_pct(
+        (used / limit * 100.0).clamp(0.0, 100.0),
+    ))
+}
+
+/// A balance figure's `... left` phrase: the same amount spelling the pool
+/// bar uses, so the line and the bar cannot disagree about one figure.
+fn balance_part(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String> {
+    let remaining = figure
+        .get("remaining")
+        .and_then(Value::as_f64)
+        .filter(|remaining| remaining.is_finite())?;
+    Some(format!(
+        "{} left",
+        balance_amount(remaining, &balance_unit(figure, text))
+    ))
+}
+
+/// A channel figure's phrase: its summary when it carries one, else its open
+/// verdict.
+fn channel_part(figure: &Value, text: &dyn Fn(&str) -> String) -> Option<String> {
+    let label = text(
+        figure
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if let Some(summary) = figure.get("summary").and_then(Value::as_str) {
+        return Some(format!("{label} {}", text(summary)));
+    }
+    let open = figure.get("open").and_then(Value::as_bool)?;
+    Some(format!("{label} {}", if open { "open" } else { "closed" }))
+}
+
+/// A whole-pool `/usage` body's `accounts` as the pool's stats: one bar per
+/// balance pool, the pool's totals, then one line per account in source order,
+/// with the [`ReadDates`] of the stalest figure it keeps. Every proxy-supplied
+/// string passes through `text` ([`Control::printable`]).
+pub(crate) fn pool_stats(
+    accounts: &[Value],
+    text: &dyn Fn(&str) -> String,
+) -> std::result::Result<
+    (crate::providers::ThirdPartyStats, Option<ReadDates>),
+    crate::providers::ThirdPartyError,
+> {
+    use crate::providers::{StatRow, StatRowKind, ThirdPartyStats};
+    let accounts = accounts
+        .iter()
+        .map(pool_account)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut totals = PoolTotals::default();
+    for account in &accounts {
+        totals.add(account);
+    }
+    let mut rows = totals.rows();
+    for account in &accounts {
+        rows.push(StatRow {
+            label: text(account.id),
+            value: pool_account_value(account, text),
+            kind: StatRowKind::Body,
+            raw: None,
+        });
+    }
+    let dates = totals.oldest_read_at.map(|stalest| ReadDates {
+        stalest: at_epoch(stalest),
+        chain: None,
+    });
+    Ok((
+        ThirdPartyStats {
+            is_available: accounts.iter().any(|account| account.available),
+            rows,
+            bars: balance_bars(&accounts, text),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+        dates,
+    ))
 }
 
 // ── per-profile settings ────────────────────────────────────────────────────

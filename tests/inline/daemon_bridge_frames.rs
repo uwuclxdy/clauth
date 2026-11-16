@@ -980,7 +980,7 @@ fn asks_reach_subscribers_opened_and_closed() {
         next(&sub, WAIT),
         Some((
             "session.ask".into(),
-            serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null})
+            serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null, "held": false})
         ))
     );
     event(
@@ -996,15 +996,24 @@ fn asks_reach_subscribers_opened_and_closed() {
         ))
     );
 
-    // A control device is paired before `a2` opens, so `a2` is held and its
-    // answer is accepted; an unheld ask is never answerable (SB-19).
+    // A control device is paired and streaming before `a2` opens, so `a2` is
+    // held and its answer is accepted; an unheld ask is never answerable
+    // (SB-19).
     seed_device(DEVICE, Tier::Control, TOKEN);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     event(
         &hub,
         100,
         serde_json::json!({"session": "s-one", "seq": 4, "kind": "ask_opened", "ask": "a2", "tool": "Bash", "input": {}}),
     );
-    next(&sub, WAIT).expect("opened a2");
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.ask".into(),
+            serde_json::json!({"session": "s-one", "ask": "a2", "state": "opened", "tool": "Bash", "input": {}, "agent_id": null, "start_line": null, "held": true})
+        )),
+        "a held ask's frame says so"
+    );
     assert!(matches!(
         hub.answer(
             "s-one",
@@ -1061,7 +1070,7 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
                 {"session": "s-two", "cwd": "/w/app", "interactive": true}
             ],
             "asks": [
-                {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null}
+                {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null, "held": false}
             ],
             "prompts": []
         })
@@ -1103,7 +1112,7 @@ fn an_opened_frame_carries_only_a_positive_start_line() {
             next(&sub, WAIT),
             Some((
                 "session.ask".into(),
-                serde_json::json!({"session": "s-one", "ask": ask, "state": "opened", "tool": "Edit", "input": {}, "agent_id": null, "start_line": carried})
+                serde_json::json!({"session": "s-one", "ask": ask, "state": "opened", "tool": "Edit", "input": {}, "agent_id": null, "start_line": carried, "held": false})
             )),
             "the frame for a posted {posted}"
         );
@@ -1148,6 +1157,42 @@ fn a_reopened_ask_takes_the_line_of_its_new_post() {
         serde_json::json!({"session": "s-one", "seq": 4, "kind": "ask_opened", "ask": "a1", "tool": "Edit", "input": {}, "start_line": 9}),
     );
     assert_eq!(hub.snapshot()["asks"][0]["start_line"], 9);
+}
+
+/// A re-post of an ask already held keeps it held, in the answer to the mod,
+/// on the frame and in the snapshot, even when no control device counts as
+/// connected at the re-post: only a wait's release to the desk clears a hold,
+/// and the mod and the daemon never disagree on it.
+#[test]
+fn a_reposted_held_ask_stays_held_after_the_grace_lapsed() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    start(&hub, 100, "s-one");
+    let sub = hub.subscribe();
+    let control = hub.subscribe_as(Some(&Tier::Control));
+    let opened = |seq: u64| serde_json::json!({"session": "s-one", "seq": seq, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}});
+    let held_frame = Some((
+        "session.ask".into(),
+        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {}, "agent_id": null, "start_line": null, "held": true}),
+    ));
+    event(&hub, 100, opened(2));
+    assert_eq!(
+        next(&sub, WAIT),
+        held_frame,
+        "held while a control stream is open"
+    );
+    drop(control);
+    hub.advance_clock(Duration::from_millis(5_100));
+    let (status, answer) = hub.event(100, opened(3).to_string().as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer["hold"], true,
+        "the mod is told the hold the daemon keeps: {answer}"
+    );
+    assert_eq!(next(&sub, WAIT), held_frame, "a re-post keeps the hold");
+    assert_eq!(hub.snapshot()["asks"][0]["held"], true, "the snapshot too");
 }
 
 /// A `/clear` (the record's id moved) closes the old session for subscribers:
@@ -1211,6 +1256,84 @@ fn a_slow_subscriber_is_dropped_without_blocking() {
     }
     assert_eq!(drained, SUBSCRIBER_BOUND);
     assert!(matches!(sub.try_next(), Err(Dropped)));
+}
+
+/// A control-tier subscriber the hub drops for a full channel counts as that
+/// stream's close at the drop, before its stream reads the drop: the device
+/// still counts as connected for the 5 s grace from there, and not after it.
+#[test]
+fn a_dropped_control_subscriber_closes_at_the_drop() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let sub = hub.subscribe_as(Some(&Tier::Control));
+    start(&hub, 100, "s-one");
+    // One start frame plus SUBSCRIBER_BOUND turn frames: the last one drops it.
+    let last_turn = SUBSCRIBER_BOUND as u64 + 1;
+    for seq in 2..=last_turn {
+        event(
+            &hub,
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "turn_start", "turn": "t"}),
+        );
+    }
+    let hold = |seq: u64, ask: &str| {
+        let opened = serde_json::json!({"session": "s-one", "seq": seq, "kind": "ask_opened", "ask": ask, "tool": "Bash", "input": {}});
+        hub.event(100, opened.to_string().as_bytes()).1["hold"].clone()
+    };
+    assert_eq!(hold(last_turn + 1, "a1"), true, "just dropped");
+    hub.advance_clock(Duration::from_secs(5));
+    assert_eq!(hold(last_turn + 2, "a2"), false, "5 s after the drop");
+    assert!(
+        matches!(sub.try_next(), Ok(Some(_))),
+        "the stream has not read the drop yet"
+    );
+}
+
+/// A wait parked on a held ask wakes when the hub drops the last control
+/// subscriber for a full channel, not only when that stream later lets go of
+/// its subscription (a stream stuck writing to a stalled phone takes up to its
+/// write timeout): it releases once the grace from the drop runs out.
+#[test]
+fn a_full_channel_drop_wakes_a_parked_wait() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    // Kept alive to the end: only the hub's own drop may end this stream.
+    let sub = hub.subscribe_as(Some(&Tier::Control));
+    start(&hub, 100, "s-one");
+    let opened = serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}});
+    assert_eq!(
+        hub.event(100, opened.to_string().as_bytes()).1["hold"],
+        true
+    );
+    let waiter = {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let answer = hub.wait_ask(100, "s-one", "a1", Duration::from_secs(30));
+            (answer, started.elapsed())
+        })
+    };
+    assert!(
+        hub.wait_until_wait_parked(100, "a1", Duration::from_secs(5)),
+        "the wait parked"
+    );
+    for seq in 3..=(SUBSCRIBER_BOUND as u64 + 3) {
+        event(
+            &hub,
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "turn_start", "turn": "t"}),
+        );
+    }
+    let ((status, answer), elapsed) = waiter.join().expect("waiter");
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["remote"], false, "released: {answer}");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the wait answered at {elapsed:?}, not on the drop's grace"
+    );
+    drop(sub);
 }
 
 /// An instance silent past the bound closes for subscribers: its open asks
@@ -1331,10 +1454,10 @@ fn a_subagent_created_after_registration_relays_from_zero() {
     );
 }
 
-/// A mod ask opening a new wait fires one `blocked` push for the session's
-/// account (WP-8): a second ask in the same wait does not, and a later wait —
-/// even back to back — pushes again. The mod is the only push source for its
-/// session, so no pane probe gates it.
+/// A mod ask fires one `blocked` push for the session's account (WP-8): a
+/// second ask while a question is held for the phone does not, and a later
+/// wait — even back to back — pushes again.
+/// The mod is the only push source for its session, so no pane probe gates it.
 #[test]
 fn a_mod_ask_pushes_blocked_once_per_wait() {
     let _home = HomeSandbox::new();
@@ -1347,6 +1470,8 @@ fn a_mod_ask_pushes_blocked_once_per_wait() {
     let hub = Hub::new(true, resolver);
     let (queue, rx) = crate::push::queue_for_tests();
     hub.wire_push(queue);
+    // A live control stream: every ask below is held for the phone.
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
 
     event(
@@ -1372,7 +1497,7 @@ fn a_mod_ask_pushes_blocked_once_per_wait() {
         "a second ask in the same wait pushed again"
     );
 
-    // Close both asks, so the wait ends and the next one announces.
+    // Close both asks, so no held ask is open and the next one announces.
     event(
         &hub,
         100,
@@ -1384,7 +1509,7 @@ fn a_mod_ask_pushes_blocked_once_per_wait() {
         serde_json::json!({"session": "s-one", "seq": 5, "kind": "ask_closed", "ask": "a2", "by": "desk"}),
     );
 
-    // The latch cleared: the next wait announces again.
+    // No held ask is open any more: the next wait announces again.
     event(
         &hub,
         100,
@@ -1403,8 +1528,8 @@ fn a_mod_ask_pushes_blocked_once_per_wait() {
         serde_json::json!({"session": "s-one", "seq": 7, "kind": "ask_closed", "ask": "a3", "by": "desk"}),
     );
 
-    // A back-to-back wait (PROBE-L's shape) announces too: the wait closed and
-    // a new one opened at once, so it is a new wait, not the old one.
+    // A back-to-back wait announces too: the wait closed and
+    // a new one opened at once, beside no held ask.
     event(
         &hub,
         100,
@@ -1419,9 +1544,212 @@ fn a_mod_ask_pushes_blocked_once_per_wait() {
     );
 }
 
+/// An ask that opens while no open question is held for the phone pushes, even
+/// beside an earlier ask that is still open: an unheld or released question
+/// stays open until its tool call settles, long after the desk answered it, so
+/// the latch alone would swallow the next question's push.
+#[test]
+fn an_ask_beside_only_unheld_open_asks_pushes_again() {
+    let _home = HomeSandbox::new();
+    let mut row = crate::testutil::live_row("100-0", "alpha");
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue);
+    // No control stream: every ask is unheld.
+    start(&hub, 100, "s-one");
+
+    let blocked = crate::push::Trigger::SessionBlocked {
+        account: Some("alpha".to_string()),
+    };
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(rx.recv_timeout(WAIT), Ok(blocked.clone()));
+
+    // a1 stays open (its call still runs); a2 opens beside it.
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a2", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(blocked),
+        "an ask beside only unheld open asks did not push"
+    );
+}
+
+/// Once the grace lapsed, no device counts as connected: an ask opening beside
+/// a held ask whose wait has not yet released it pushes, though that ask still
+/// reads held.
+#[test]
+fn an_ask_after_the_grace_lapsed_pushes_beside_an_unreleased_held_ask() {
+    let _home = HomeSandbox::new();
+    let mut row = crate::testutil::live_row("100-0", "alpha");
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue);
+    let stream = hub.subscribe_as(Some(&Tier::Control));
+    start(&hub, 100, "s-one");
+
+    let blocked = crate::push::Trigger::SessionBlocked {
+        account: Some("alpha".to_string()),
+    };
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(rx.recv_timeout(WAIT), Ok(blocked.clone()));
+
+    drop(stream);
+    hub.advance_clock(Duration::from_secs(6));
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a2", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(blocked),
+        "an ask after the grace lapsed did not push beside an unreleased held ask"
+    );
+}
+
+/// A held ask released to the desk by its wait (the phone left mid-question),
+/// then a second ask: the second pushes.
+#[test]
+fn an_ask_after_a_release_to_the_desk_pushes_again() {
+    let _home = HomeSandbox::new();
+    let mut row = crate::testutil::live_row("100-0", "alpha");
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue);
+    let stream = hub.subscribe_as(Some(&Tier::Control));
+    start(&hub, 100, "s-one");
+
+    let blocked = crate::push::Trigger::SessionBlocked {
+        account: Some("alpha".to_string()),
+    };
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(rx.recv_timeout(WAIT), Ok(blocked.clone()));
+
+    drop(stream);
+    hub.advance_clock(Duration::from_secs(6));
+    let (status, answer) = hub.wait_ask(100, "s-one", "a1", WAIT);
+    assert_eq!(
+        (status, answer["remote"].clone(), answer["closed"].clone()),
+        (200, serde_json::json!(false), serde_json::json!(false)),
+        "released: {answer}"
+    );
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a2", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(blocked),
+        "an ask after a release to the desk did not push"
+    );
+}
+
+/// The phone connects after an unheld first ask (it opened on that ask's
+/// push): a held second ask beside the still-open unheld one pushes too.
+#[test]
+fn a_held_ask_beside_only_an_unheld_open_ask_pushes() {
+    let _home = HomeSandbox::new();
+    let mut row = crate::testutil::live_row("100-0", "alpha");
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue);
+    start(&hub, 100, "s-one");
+
+    let blocked = crate::push::Trigger::SessionBlocked {
+        account: Some("alpha".to_string()),
+    };
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(rx.recv_timeout(WAIT), Ok(blocked.clone()));
+
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a2", "tool": "Bash", "input": {}}),
+    );
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(blocked),
+        "a held ask beside only an unheld open ask did not push"
+    );
+}
+
+/// A re-post of an open ask is no new question: beside only unheld asks it
+/// pushes nothing more.
+#[test]
+fn a_reposted_unheld_ask_pushes_once() {
+    let _home = HomeSandbox::new();
+    let mut row = crate::testutil::live_row("100-0", "alpha");
+    row.pid = 100;
+    crate::live_sessions::register(&row).expect("register the session's row");
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let (queue, rx) = crate::push::queue_for_tests();
+    hub.wire_push(queue);
+    start(&hub, 100, "s-one");
+
+    for seq in [2, 3] {
+        event(
+            &hub,
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
+        );
+    }
+    assert_eq!(
+        rx.recv_timeout(WAIT),
+        Ok(crate::push::Trigger::SessionBlocked {
+            account: Some("alpha".to_string())
+        })
+    );
+    assert_eq!(
+        rx.recv_timeout(NONE),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a re-posted ask pushed again"
+    );
+}
+
 /// A mod ask opening before the push queue is wired does not spend its wait:
 /// a second ask in the same wait, after `wire_push`, announces — exactly once
-/// (WP-8, PROBE-N's shape).
+/// (WP-8). Both asks are held, so only the rollback of the
+/// first ask's reservation lets the second announce; breaking the rollback
+/// must red this.
 #[test]
 fn an_ask_opened_before_the_push_queue_is_wired_still_announces() {
     let _home = HomeSandbox::new();
@@ -1432,6 +1760,7 @@ fn an_ask_opened_before_the_push_queue_is_wired_still_announces() {
 
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
 
     // The first ask opens before the push queue exists, so no push is queued.
@@ -1464,11 +1793,11 @@ fn an_ask_opened_before_the_push_queue_is_wired_still_announces() {
     );
 }
 
-/// PROBE-O's shape (WP-8): the decision to announce and the reservation share
-/// one lock hold, so a second ask of the same wait handled between the decision
-/// and the queueing pushes nothing. The push lock is held to park the first
-/// ask's `note_ask_opened` at its send (the queueing), then the second ask runs:
-/// on the pre-fix bytes it re-decides and the wait pushes twice.
+/// The decision to announce and the reservation share one lock hold (WP-8), so
+/// a second held ask handled between the decision and the queueing pushes
+/// nothing. The push lock is held to park the first ask's `note_ask_opened` at
+/// its send (the queueing), then the second ask runs: with the decision and the
+/// reservation split, it re-decides and the wait pushes twice.
 #[test]
 fn a_second_ask_between_the_decision_and_the_queueing_pushes_nothing() {
     let _home = HomeSandbox::new();
@@ -1481,6 +1810,9 @@ fn a_second_ask_between_the_decision_and_the_queueing_pushes_nothing() {
     let hub = Arc::new(Hub::new(true, resolver));
     let (queue, rx) = crate::push::queue_for_tests();
     hub.wire_push(queue);
+    // A live control stream holds both asks: beside a held ask, a second ask
+    // of the same wait never pushes, so only the latch's race can double it.
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
     let sub = hub.subscribe();
 
@@ -1543,9 +1875,9 @@ fn a_second_ask_between_the_decision_and_the_queueing_pushes_nothing() {
     );
 }
 
-/// P22: a device answer closing the last ask ends the wait, so the next wait
-/// pushes again (WP-8, PROBE-P's shape). Breaking the answer's clear
-/// (`announced = false` on the last ask) must red this.
+/// A device answer closing the last ask ends the wait, so the next wait
+/// pushes again (WP-8): with no held ask left open, the next
+/// ask announces whatever the latch reads.
 #[test]
 fn a_device_answer_ends_the_wait_so_the_next_wait_pushes() {
     let _home = HomeSandbox::new();
@@ -1557,11 +1889,13 @@ fn a_device_answer_ends_the_wait_so_the_next_wait_pushes() {
 
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     let (queue, rx) = crate::push::queue_for_tests();
     hub.wire_push(queue);
     start(&hub, 100, "s-one");
 
-    // A control device is paired, so the ask opens held and is answerable.
+    // A control device is paired and streaming, so the ask opens held and is
+    // answerable.
     event(
         &hub,
         100,
@@ -1602,7 +1936,7 @@ fn a_device_answer_ends_the_wait_so_the_next_wait_pushes() {
     );
 }
 
-/// P23: the rollback's generation guard. A reservation on a replaced instance
+/// The rollback's generation guard. A reservation on a replaced instance
 /// must not roll the new instance's latch back. Driven without threads: the
 /// queue is unwired, then `note_ask_opened` is called with the old generation
 /// directly, standing in for the stale rollback. Breaking the generation check
@@ -1619,6 +1953,8 @@ fn a_stale_rollback_with_a_moved_generation_keeps_the_new_wait_announced() {
     let hub = Hub::new(true, resolver);
     let (queue, rx) = crate::push::queue_for_tests();
     hub.wire_push(queue.clone());
+    // A live control stream holds every ask, so only the latch decides b2.
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     start(&hub, 100, "s-one");
 
     let old_generation = hub
@@ -1671,74 +2007,6 @@ fn a_stale_rollback_with_a_moved_generation_keeps_the_new_wait_announced() {
     );
 }
 
-/// P24: the rollback's open-wait guard. A rollback arriving after the wait it
-/// reserved for has closed must not clear the latch — the close already reset
-/// it, so re-clearing would clobber nothing the rollback owns. Driven without
-/// threads: the reservation is re-armed after the close, then `note_ask_opened`
-/// is called directly with the wait closed. Breaking the open-wait check
-/// (`|| true`) must red this.
-#[test]
-fn a_stale_rollback_with_the_wait_already_closed_keeps_the_latch() {
-    let _home = HomeSandbox::new();
-    // The row the hub joins by pid (100) names the account the push carries.
-    let mut row = crate::testutil::live_row("100-0", "alpha");
-    row.pid = 100;
-    crate::live_sessions::register(&row).expect("register the session's row");
-
-    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
-    let hub = Hub::new(true, resolver);
-    let (queue, rx) = crate::push::queue_for_tests();
-    hub.wire_push(queue);
-    start(&hub, 100, "s-one");
-
-    let generation = hub
-        .inner
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .instances
-        .get(&100)
-        .expect("the instance was minted by start")
-        .generation;
-
-    event(
-        &hub,
-        100,
-        serde_json::json!({"session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {}}),
-    );
-    assert!(rx.recv_timeout(WAIT).is_ok(), "a1 never pushed");
-
-    // The desk closes the wait, then the reservation is re-armed: the stale
-    // rollback arrives for a reservation whose wait has since closed.
-    event(
-        &hub,
-        100,
-        serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_closed", "ask": "a1", "by": "desk"}),
-    );
-    *hub.push.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    hub.inner
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .instances
-        .get_mut(&100)
-        .expect("the instance survived the close")
-        .announced = true;
-
-    hub.note_ask_opened(100, generation);
-
-    let announced = hub
-        .inner
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .instances
-        .get(&100)
-        .expect("the instance survived the rollback")
-        .announced;
-    assert!(
-        announced,
-        "the stale rollback cleared a latch the closed wait already owned"
-    );
-}
-
 /// A poll as an instance's first contact registers its transcript like an
 /// event does: rows already in the file stay the history route's, and the
 /// first wake relays only rows written after the poll (SB-11).
@@ -1783,7 +2051,7 @@ fn a_first_contact_refused_as_stale_leaves_no_instance() {
 
     // The refused contact must not have wedged the tail slot: the valid start
     // registers and the first append relays the row.
-    let relays_after = |hub: &Hub, pid: u32, session: &str, path: &PathBuf, uuid: &str| {
+    let relays_after = |hub: &Arc<Hub>, pid: u32, session: &str, path: &PathBuf, uuid: &str| {
         start(hub, pid, session);
         let sub = hub.subscribe();
         let first = line(&row(uuid, "hello"));

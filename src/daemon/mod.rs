@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -65,12 +65,13 @@ use crate::profile::{
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, ClaudeResetsMemoLock, FetchStatus, KickBlocks, LastFetchedAt, LegKey,
-    NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue,
-    SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
-    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo,
-    UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, new_claude_resets_memo, spawn_refresher,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, FetchStatus, KickBlocks,
+    LastFetchedAt, LegKey, NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks,
+    RefetchQueue, SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
+    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, new_claude_resets_memo,
+    new_codex_resets_memo, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -120,6 +121,85 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// The daemon's log beside `status.json`: its stderr and stdout when the TUI
 /// starts it. The run loop caps it by this name.
 const LOG_FILE: &str = "daemon.log";
+
+/// Latch for the retention leg's check-failed line, so a standing failure is
+/// reported once per failure run rather than on every tick. Cleared by the
+/// next clean check, so a recurrence is reported again.
+static RETENTION_CHECK_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The retention leg's cadence: a change event under `~/.claude` drives the
+/// check, and the 30 s fallback (the polling cadence too, when no watch arms)
+/// covers an event the watcher never delivered.
+const RETENTION_TIMINGS: crate::watchdog::Timings = crate::watchdog::Timings {
+    debounce: Duration::from_millis(200),
+    cooldown: Duration::from_millis(500),
+    fallback: Duration::from_secs(30),
+    config_poll: Duration::from_secs(30),
+    credential_poll: Duration::from_secs(30),
+    swap_poll: Duration::from_secs(30),
+};
+
+/// One retention check for the leg: run [`crate::retention::reconcile`] and
+/// latch its failure line, so a standing failure is reported once per failure
+/// run. Cleared by the next clean check, so a recurrence is reported again.
+/// Extracted from the `serve` wiring so the latch has a test.
+fn retention_check() {
+    if let Err(e) = crate::retention::reconcile() {
+        if !RETENTION_CHECK_FAILED.swap(true, Ordering::Relaxed) {
+            logline!("clauth daemon: cleanupPeriodDays check failed: {e:#}");
+        }
+    } else {
+        RETENTION_CHECK_FAILED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The retention leg as a watchdog reconcile: `check` is its config leg, and
+/// it has no credential or swap leg.
+struct RetentionCheck<F>(F);
+
+impl<F: Fn()> crate::watchdog::Reconcile for RetentionCheck<F> {
+    fn config(&self) {
+        (self.0)();
+    }
+    fn credentials(&self) {}
+    fn swap_poll(&self) {}
+}
+
+/// Run `check` once now, then on every change under `claude_home`, on the
+/// watchdog's event loop with its polling fallback, until `shutdown` fires or
+/// disconnects. The session watchdogs put a lost `cleanupPeriodDays` back only
+/// while a `clauth start` session runs; this leg covers a bare `claude` with
+/// no session live. The watch arms before the thread spawns, so a write
+/// landing right after the spawn still raises its event.
+///
+/// Every child counts as a match rather than just `settings.json`: the file is
+/// legitimately absent, and a name-only interest would read every other
+/// `~/.claude` write as an unmatched event, so the dead-filter check would
+/// report a healthy watcher. An open of a child wakes nothing.
+fn spawn_retention_watch(
+    claude_home: &std::path::Path,
+    timings: crate::watchdog::Timings,
+    shutdown: crossbeam_channel::Receiver<()>,
+    check: impl Fn() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let specs = [crate::watchdog::WatchSpec::new(
+        claude_home,
+        crate::watchdog::Interest::AnyChild,
+    )];
+    let watcher = crate::watchdog::try_start(&specs, timings.debounce);
+    std::thread::Builder::new()
+        .name("clauth-retention".into())
+        .spawn(move || {
+            check();
+            crate::watchdog::run_with_watcher(
+                watcher,
+                specs.len(),
+                &shutdown,
+                &timings,
+                &RetentionCheck(check),
+            );
+        })
+}
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
 /// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
@@ -734,6 +814,22 @@ pub(crate) fn serve(
         }
     };
 
+    // Under the singleton's holder alone, like the supervisors above. Detached:
+    // it lives as long as the process, and every write it makes is one atomic
+    // rename under the state flock.
+    let retention = crate::profile::claude_dir().and_then(|claude_home| {
+        spawn_retention_watch(
+            &claude_home,
+            RETENTION_TIMINGS,
+            crossbeam_channel::never(),
+            retention_check,
+        )
+        .context("failed to start the cleanupPeriodDays check")
+    });
+    if let Err(e) = retention {
+        logline!("clauth daemon: {e:#}");
+    }
+
     logline!(
         "clauth daemon: running (status → {})",
         daemon.status_path.display()
@@ -1031,6 +1127,19 @@ fn prior_generated_at() -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `listen` slot the running daemon last published in `status.json`, for
+/// `clauth devices pair`'s link. `None` when no feed is on disk, it does not
+/// parse, or its writer serves no `--listen` API.
+pub(crate) fn published_listen() -> Option<status_json::ListenSlot> {
+    #[derive(serde::Deserialize)]
+    struct Feed {
+        #[serde(default)]
+        listen: Option<status_json::ListenSlot>,
+    }
+    let body = std::fs::read(clauth_dir().ok()?.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice::<Feed>(&body).ok()?.listen
+}
+
 /// Rewrite `status.json` from `config`, unconditionally.
 ///
 /// [`publish_status`]'s core, split out for the one caller that must NOT defer
@@ -1213,7 +1322,14 @@ pub(crate) struct LiveStores {
     /// THIS daemon runs the fetches: a stood-down daemon publishes
     /// `next_refresh_at: null` rather than the mirror's derived stamps.
     pub(crate) fetch_lease: Arc<FetchLease>,
+    /// Where the `--listen` API serves, set once by its bind and read by every
+    /// status write as the `listen` slot. Unset without `--listen`.
+    pub(crate) listen: ListenHandle,
 }
+
+/// The `listen` slot's one writer is the API's bind, once per daemon, so a
+/// set-once cell needs no lock rank.
+pub(crate) type ListenHandle = Arc<OnceLock<status_json::ListenSlot>>;
 
 #[cfg(test)]
 impl Default for LiveStores {
@@ -1235,6 +1351,7 @@ impl Default for LiveStores {
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             fetch_lease: Arc::new(FetchLease::new()),
+            listen: ListenHandle::default(),
         }
     }
 }
@@ -1257,6 +1374,7 @@ pub(crate) struct LiveSnapshot {
     /// taken — the flag every feed writer reads to null a stood-down
     /// daemon's countdowns.
     fetches_here: bool,
+    listen: Option<status_json::ListenSlot>,
 }
 
 impl LiveStores {
@@ -1332,6 +1450,7 @@ impl LiveStores {
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
             fetches_here: self.fetch_lease.fetches_here(),
+            listen: self.listen.get().cloned(),
         }
     }
 }
@@ -1351,6 +1470,7 @@ impl LiveSnapshot {
             usage: &self.usage,
             gateway: self.gateway.as_ref(),
             proxies: Some(&self.proxies),
+            listen: self.listen.as_ref(),
         }
     }
 }
@@ -1911,6 +2031,8 @@ struct Daemon {
     /// The claude banked-reset side read's cadence memo, shared with the
     /// scheduler the same way [`Self::weekly_reset_kicks`] is.
     claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, shared the same way.
+    codex_resets_memo: CodexResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// The fetch lease the scheduler tick holds: the main-loop drains read it
@@ -1984,6 +2106,8 @@ struct Daemon {
     /// The per-proxy slots every proxy supervisor publishes into, read by
     /// every status write as the `proxies` array.
     proxies: proxies::ProxySlots,
+    /// Where the `--listen` API serves once bound, read by every status write.
+    listen: ListenHandle,
     /// The daemon's holds on the per-account background trees.
     background: BackgroundHolds,
     /// Ticks since boot, for the bare-item leg's cadence
@@ -2042,6 +2166,7 @@ impl Daemon {
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             claude_resets_memo: new_claude_resets_memo(),
+            codex_resets_memo: new_codex_resets_memo(),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             // Raised by [`SpendDrain::drain`] when a stop signal arrives, and
             // by `serve` when its API fails to start after `boot`: from then
@@ -2072,6 +2197,7 @@ impl Daemon {
             status_path,
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
+            listen: ListenHandle::default(),
             background: BackgroundHolds::new(),
             #[cfg(target_os = "macos")]
             bare_item_scan_ticks: 0,
@@ -2192,6 +2318,7 @@ impl Daemon {
             Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.weekly_reset_kicks),
             Arc::clone(&self.claude_resets_memo),
+            Arc::clone(&self.codex_resets_memo),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -2332,6 +2459,7 @@ impl Daemon {
             activity: Arc::clone(&self.activity),
             shutting_down: Arc::clone(&self.shutting_down),
             fetch_lease: Arc::clone(&self.fetch_lease),
+            listen: Arc::clone(&self.listen),
         }
     }
 
@@ -2346,6 +2474,7 @@ impl Daemon {
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),

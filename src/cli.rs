@@ -194,25 +194,29 @@ pub(crate) enum Command {
         profile: String,
     },
 
-    /// Spend one of a codex or Claude Code account's banked usage-limit resets
+    /// List a codex or Claude Code account's banked usage-limit resets, or spend one
     ///
-    /// Reopens that account's usage windows now, the reset codex's own `/usage`
-    /// menu offers, or a claude grant Claude Code's own `/limit-reset` offers.
-    /// Prompts `[y/N]` naming the reset it will use (codex: a `codex_rate_limits`
-    /// reset first, then the one that expires first; claude: the grant the
-    /// server names next) unless `--yes`, which a spend on a non-TTY stdin or
-    /// stdout must pass: a used reset cannot be given back. `--list` shows the
-    /// account's resets, spends nothing and never prompts. Uses the profile's
-    /// stored login as it stands and never refreshes it.
+    /// With no id, prints the account's resets as a table, one row per reset
+    /// under the id that spends it, and spends nothing. With an id, spends that
+    /// reset (a codex reset codex's own `/usage` menu offers, or a claude grant
+    /// Claude Code's own `/limit-reset` offers), reopening the windows it covers
+    /// now; nothing picks a reset for you. Prompts `[y/N]` naming the reset
+    /// unless `--yes`, which a spend on a non-TTY stdin or stdout must pass: a
+    /// used reset cannot be given back. While a spend whose answer never
+    /// arrived can still be re-sent, only its own id is accepted, and naming it
+    /// re-sends that request. Uses the profile's stored login as it stands and
+    /// never refreshes it.
     #[command(name = "limit-reset")]
     LimitReset {
-        /// Codex or Claude Code profile to reset.
+        /// Codex or Claude Code profile whose resets to list or spend.
         profile: String,
-        /// Show the account's resets and which one would be used; spend none.
-        #[arg(long, conflicts_with = "yes")]
+        /// The id of the reset to spend, as the listing names it.
+        id: Option<String>,
+        /// List the account's resets and spend none, as with no id.
+        #[arg(long, conflicts_with_all = ["yes", "id"])]
         list: bool,
         /// Skip the confirm prompt. Required on a non-TTY stdin or stdout.
-        #[arg(long, short = 'y')]
+        #[arg(long, short = 'y', requires = "id")]
         yes: bool,
     },
 
@@ -437,10 +441,10 @@ pub(crate) enum Command {
     /// the API while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
-    #[command(args_conflicts_with_subcommands = true)]
     Devices {
-        /// Emit a JSON array instead of the table.
-        #[arg(long)]
+        /// Emit a JSON array instead of the table; with `pair`, a
+        /// {"code","link"} object instead of the bare code.
+        #[arg(long, global = true)]
         json: bool,
         #[command(subcommand)]
         cmd: Option<DevicesCommand>,
@@ -944,8 +948,12 @@ pub(crate) enum DevicesCommand {
     /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
     /// device posts it to `POST /api/v1/pair` on this host's
     /// `clauth daemon --listen` and gets its token in the answer. The code
-    /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
-    /// the code if it is still waiting.
+    /// prints alone on stdout (`clauth devices --json pair` prints
+    /// {"code","link"}) and the wait reports on stderr; Ctrl-C withdraws the
+    /// code if it is still waiting. When stderr is a terminal, a pairing link
+    /// for the app and its QR code print there too: the app's page is
+    /// [serve] app_url (else the one [serve] app_origins entry), the address
+    /// [serve] public_address (else the one a `--listen` daemon publishes).
     Pair {
         /// Name for the device: letters, digits and - _ . @ +.
         name: String,
@@ -957,6 +965,9 @@ pub(crate) enum DevicesCommand {
         /// --control: a view device cannot mint sessions.
         #[arg(long, requires = "control")]
         sessions: bool,
+        /// Print the pairing link without its QR code.
+        #[arg(long)]
+        no_qr: bool,
     },
 
     /// Mint a token for a device on this machine and print it once
