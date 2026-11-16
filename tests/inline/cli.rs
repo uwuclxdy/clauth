@@ -7076,28 +7076,51 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
 
 // ── limit-reset ─────────────────────────────────────────────────────────────────
 
+/// A name alone lists, a name and an id spends that reset, `--list` lists and
+/// takes no id, and `--yes` confirms a spend, so it needs an id to confirm.
 #[test]
-fn limit_reset_takes_list_or_yes_but_not_both() {
-    let Command::LimitReset { profile, list, yes } = command(&["limit-reset", "cx"]) else {
+fn limit_reset_takes_a_name_an_optional_id_and_list_or_yes() {
+    let Command::LimitReset {
+        profile,
+        id,
+        list,
+        yes,
+    } = command(&["limit-reset", "cx"])
+    else {
         panic!("must parse");
     };
-    assert_eq!((profile.as_str(), list, yes), ("cx", false, false));
-    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "-y", "cx"]) else {
+    assert_eq!(
+        (profile.as_str(), id, list, yes),
+        ("cx", None, false, false)
+    );
+    let Command::LimitReset { id, list, yes, .. } = command(&["limit-reset", "-y", "cx", "c-1"])
+    else {
         panic!("must parse");
     };
-    assert_eq!((list, yes), (false, true));
-    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "cx", "--list"]) else {
+    assert_eq!((id.as_deref(), list, yes), (Some("c-1"), false, true));
+    let Command::LimitReset { id, list, yes, .. } = command(&["limit-reset", "cx", "--list"])
+    else {
         panic!("must parse");
     };
-    assert_eq!((list, yes), (true, false));
+    assert_eq!((id, list, yes), (None, true, false));
 
     assert_eq!(
         parse_exit_code(&["limit-reset", "cx", "--list", "--yes"]),
         2,
         "--list spends nothing, so there is nothing for --yes to confirm"
     );
+    assert_eq!(
+        parse_exit_code(&["limit-reset", "cx", "--yes"]),
+        2,
+        "with no id nothing is spent, so there is nothing for --yes to confirm"
+    );
+    assert_eq!(
+        parse_exit_code(&["limit-reset", "cx", "c-1", "--list"]),
+        2,
+        "--list spends nothing, so it takes no id"
+    );
     assert_eq!(parse_exit_code(&["limit-reset"]), 2);
-    assert_eq!(parse_exit_code(&["limit-reset", "cx", "other"]), 2);
+    assert_eq!(parse_exit_code(&["limit-reset", "cx", "c-1", "other"]), 2);
 }
 
 /// A claude profile `cl1`, a codex profile `cx` with a stored login, and a
@@ -7139,27 +7162,30 @@ fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_
     seed_limit_reset_rosters();
     let (listener, urls) = untouched_reset_urls();
 
-    let err = limit_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
+    let err =
+        limit_reset_with("CL1", Some("g"), true, false, &urls, no_prompt).expect_err("claude");
     assert_eq!(
         err.to_string(),
         "'cl1' has no stored claude login to use a reset with; run `clauth login cl1`"
     );
 
-    let err = limit_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
+    let err =
+        limit_reset_with("zz", Some("g"), true, false, &urls, no_prompt).expect_err("unknown");
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
         "profile 'zz' not found\navailable: cl1, codex: cx, cy"
     );
 
-    let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
+    let err =
+        limit_reset_with("cy", Some("g"), true, false, &urls, no_prompt).expect_err("no login");
     assert_eq!(
         err.to_string(),
         "'cy' has no stored codex login to use a reset with; run `clauth login cy --codex --browser`"
     );
 
     crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
-    let err = limit_reset_with("CX", true, false, false, &urls, no_prompt).expect_err("dead chain");
+    let err = limit_reset_with("CX", None, false, false, &urls, no_prompt).expect_err("dead chain");
     assert!(
         err.to_string()
             .starts_with("'cx': codex chain is broken (reused since "),
@@ -7179,7 +7205,8 @@ fn limit_reset_off_a_terminal_without_yes_refuses_before_any_request() {
     seed_limit_reset_rosters();
     let (listener, urls) = untouched_reset_urls();
 
-    let err = limit_reset_with("cx", false, false, false, &urls, no_prompt).expect_err("refused");
+    let err =
+        limit_reset_with("cx", Some("soon"), false, false, &urls, no_prompt).expect_err("refused");
     assert_eq!(
         err.to_string(),
         "refusing to use a reset on 'cx' without confirmation; pass --yes"
@@ -7188,11 +7215,12 @@ fn limit_reset_off_a_terminal_without_yes_refuses_before_any_request() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
-/// End to end against a stub: `--list` only lists (and needs no terminal), a
-/// declined prompt sends nothing, a confirmed one consumes the credit the
-/// prompt named — the one expiring first — under a fresh v4 key, and an
+/// End to end against a stub: a name alone only lists (and needs no
+/// terminal), a declined prompt sends nothing, a confirmed one consumes the
+/// credit its id named under a fresh v4 key and reads the list again, and an
 /// account with nothing available fails without a consume. The request order
-/// is the proof: exactly one POST, right after the confirmed GET.
+/// is the proof: exactly one POST, right after the confirmed GET, and the
+/// re-read after it.
 #[test]
 fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -7202,17 +7230,17 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
     ], "available_count": 2}"#;
     let none = r#"{"credits": [{"id": "soon", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-01-02T00:00:00Z"}], "available_count": 0}"#;
-    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |_path, i| match i {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(6, move |_path, i| match i {
         3 => (200, r#"{"code": "reset", "windows_reset": 2}"#.to_string()),
-        4 => (200, none.to_string()),
+        4 | 5 => (200, none.to_string()),
         _ => (200, two.to_string()),
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cx", true, false, false, &urls, no_prompt).expect("--list lists");
+    limit_reset_with("cx", None, false, false, &urls, no_prompt).expect("--list lists");
 
     let mut asked = String::new();
-    limit_reset_with("cx", false, false, true, &urls, |prompt| {
+    limit_reset_with("cx", Some("soon"), false, true, &urls, |prompt| {
         asked = prompt.to_string();
         Ok(false)
     })
@@ -7222,10 +7250,16 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         "the prompt names the credit it will spend: {asked}"
     );
 
-    limit_reset_with("cx", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+    limit_reset_with("cx", Some("soon"), false, true, &urls, |_| Ok(true))
+        .expect("confirmed spend");
 
-    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("none left");
-    assert_eq!(err.to_string(), "no usage-limit resets available on 'cx'");
+    let err =
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect_err("none left");
+    assert_eq!(
+        err.to_string(),
+        "the usage-limit reset \"soon\" on 'cx' cannot be used now (redeemed), so no reset was \
+         used"
+    );
 
     let seen = handle.join().expect("join stub");
     let lines: Vec<&str> = seen
@@ -7234,10 +7268,10 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         .collect();
     let list = "GET /backend-api/wham/rate-limit-reset-credits HTTP/1.1";
     let consume = "POST /backend-api/wham/rate-limit-reset-credits/consume HTTP/1.1";
-    assert_eq!(lines, [list, list, list, consume, list]);
+    assert_eq!(lines, [list, list, list, consume, list, list]);
     let body: serde_json::Value =
         serde_json::from_str(&crate::testutil::request_body(&seen[3])).expect("json body");
-    assert_eq!(body["credit_id"], "soon", "the earliest-expiring credit");
+    assert_eq!(body["credit_id"], "soon", "the credit the id named");
     let key = body["redeem_request_id"].as_str().expect("a key");
     assert_eq!(
         (key.len(), key.chars().nth(14)),
@@ -7315,12 +7349,13 @@ fn limit_reset_refuses_a_claude_profile_with_no_login_or_no_yes_before_any_reque
     seed_claude_reset_profiles();
     let (listener, urls) = untouched_reset_urls();
 
-    let err = limit_reset_with("cl1", true, false, false, &urls, no_prompt).expect_err("no login");
+    let err = limit_reset_with("cl1", None, false, false, &urls, no_prompt).expect_err("no login");
     assert_eq!(
         err.to_string(),
         "'cl1' has no stored claude login to use a reset with; run `clauth login cl1`"
     );
-    let err = limit_reset_with("cl2", false, false, false, &urls, no_prompt).expect_err("no yes");
+    let err = limit_reset_with("cl2", Some("g-week"), false, false, &urls, no_prompt)
+        .expect_err("no yes");
     assert_eq!(
         err.to_string(),
         "refusing to use a reset on 'cl2' without confirmation; pass --yes"
@@ -7343,38 +7378,43 @@ fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
     let listed = stdout_of(|| {
-        limit_reset_with("CL2", true, false, false, &urls, no_prompt).expect("--list lists");
+        limit_reset_with("CL2", None, false, false, &urls, no_prompt).expect("--list lists");
     });
     assert_eq!(
         listed,
         [
-            "clauth: 'cl2' has 2 limit resets available.",
-            "    Old reset: 1 available, resets 5h",
-            "  * Weekly reset: 1 available, resets 5h and 7d  (used next)",
-            "    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown",
+            "clauth: 'cl2' has 2/3 limit resets available.",
+            "",
+            "  ID      LEFT  STATE     RESETS              EXPIRES  LABEL",
+            "  g-old   1/1   ready     5h                  -        Old reset",
+            "  g-week  1/2   ready     5h, 7d              -        Weekly reset",
+            "  g-cool  1/1   cooldown  5h, seven_day_blue  -        limit reset",
         ]
     );
     // 2027-03-09T07:59:00Z, the fixture's `ends_at` on both grants.
-    let ends = crate::format::local_stamp(1_804_579_140).expect("stamp");
+    let ends = crate::format::local_minute_stamp(1_804_579_140).expect("stamp");
     let real = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("a name alone lists");
     });
+    let pad = " ".repeat(ends.chars().count() - "EXPIRES".len());
     assert_eq!(
         real,
         [
             "clauth: 'cl2' has 2 limit resets available.".to_string(),
+            String::new(),
+            format!("  ID                     LEFT  STATE  RESETS    EXPIRES{pad}  LABEL"),
             format!(
-                "  * New model launch: one Fable reset for Max, Team Premium and Enterprise \
-                 Premium: 1 available, resets 7d fable, expires {ends}  (used next)"
+                "  launch-2610-fable      1/1   ready  7d fable  {ends}  New model launch: one \
+                 Fable reset for Max..."
             ),
             format!(
-                "    New model launch: one more Fable reset at 6 months' tenure: 1 available, \
-                 resets 7d fable, expires {ends}"
+                "  launch-2610-fable-6mo  1/1   ready  7d fable  {ends}  New model launch: one \
+                 more Fable reset at..."
             ),
         ]
     );
     let none = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("--list lists");
     });
     assert_eq!(
         none,
@@ -7420,7 +7460,7 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
 
     let mut asked = String::new();
     let declined = stdout_of(|| {
-        limit_reset_with("cl2", false, false, true, &urls, |prompt| {
+        limit_reset_with("cl2", Some("g-week"), false, true, &urls, |prompt| {
             asked = prompt.to_string();
             Ok(false)
         })
@@ -7434,7 +7474,8 @@ fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
     assert_eq!(declined, ["clauth: aborted. no reset was used on 'cl2'."]);
 
     let used = stdout_of(|| {
-        limit_reset_with("cl2", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+        limit_reset_with("cl2", Some("g-week"), false, true, &urls, |_| Ok(true))
+            .expect("confirmed spend");
     });
     assert_eq!(
         used,
@@ -7522,7 +7563,8 @@ fn limit_reset_sends_a_failed_claude_spend_once() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 500");
+    let err =
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 500");
     let record: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(pending_path("cl2", CLAUDE_PENDING)).expect("the record"),
     )
@@ -7578,7 +7620,7 @@ fn limit_reset_refuses_a_quarantined_claude_login_before_any_request() {
     crate::profile::save_app_state(&state).expect("save state");
     let (listener, urls) = untouched_reset_urls();
 
-    let err = limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect_err("dead");
+    let err = limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect_err("dead");
     assert_eq!(
         err.to_string(),
         "'cl2' usage chain is dead. Run `clauth login cl2` first, then re-run"
@@ -7602,7 +7644,7 @@ fn limit_reset_takes_the_claude_account_when_both_rosters_hold_the_name() {
     );
 
     let lines = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("--list lists");
     });
     assert_eq!(
         lines,
@@ -7636,7 +7678,7 @@ fn limit_reset_takes_a_claude_name_past_an_unreadable_codex_roster() {
     );
 
     let lines = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("--list lists");
     });
     assert_eq!(
         lines,
@@ -7691,7 +7733,7 @@ fn limit_reset_stops_a_claude_spend_before_the_prompt_on_a_failed_read() {
     ];
     for (read, profile, want, sent) in cases {
         let (urls, handle) = reset_stub(sent.len() + 1, read, profile);
-        let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        let err = limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
             .expect_err("refused before the spend");
         assert_eq!(err.to_string(), want);
         assert_eq!(
@@ -7702,43 +7744,44 @@ fn limit_reset_stops_a_claude_spend_before_the_prompt_on_a_failed_read() {
     }
 }
 
-/// The grant the server names next is spent only when it is usable now and
-/// its id fits the pattern Claude Code checks before it sends one; otherwise
-/// nothing beyond the read leaves. The spend decides on the one rule the
-/// count reads (`ResetStatus::try_spend_grant`), so this test asserts the spend
-/// alone: a loosened rule reds it here, where a count assert placed first
-/// would catch the change before the spend ran (the count's own pins are in
-/// `tests/inline/claude_reset.rs`).
+/// A named grant is spent only when the read lists it, the server marks it
+/// usable now and its id fits the pattern Claude Code checks before it sends
+/// one; otherwise nothing beyond the read leaves. The spend decides on the one
+/// rule the count reads (`ResetStatus::try_spend_grant_id`), so this test
+/// asserts the spend alone: a loosened rule reds it here, where a count assert
+/// placed first would catch the change before the spend ran (the count's own
+/// pins are in `tests/inline/claude_reset.rs`).
 #[test]
-fn limit_reset_refuses_a_next_grant_it_cannot_spend() {
+fn limit_reset_refuses_a_grant_it_cannot_spend() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
-    let cooling = CEDAR_EMBER_THREE_GRANTS.replacen(
-        r#""next_grant_id": "g-week""#,
-        r#""next_grant_id": "g-cool""#,
-        1,
-    );
-    let malformed = CEDAR_EMBER_THREE_GRANTS
-        .replacen(r#""id": "g-week""#, r#""id": "G WEEK""#, 1)
-        .replacen(
-            r#""next_grant_id": "g-week""#,
-            r#""next_grant_id": "G WEEK""#,
-            1,
-        );
+    let malformed = CEDAR_EMBER_THREE_GRANTS.replacen(r#""id": "g-week""#, r#""id": "G WEEK""#, 1);
     let cases = [
         (
-            cooling,
-            "the limit reset 'cl2' would use next is unavailable (cooldown), so no reset was used",
+            CEDAR_EMBER_THREE_GRANTS.to_string(),
+            "g-cool",
+            "the limit reset \"g-cool\" on 'cl2' cannot be used now (cooldown), so no reset was \
+             used"
+                .to_string(),
         ),
         (
             malformed,
+            "G WEEK",
             "Anthropic named a limit reset on 'cl2' with an id clauth does not send, so no reset \
-             was used",
+             was used"
+                .to_string(),
+        ),
+        (
+            CEDAR_EMBER_THREE_GRANTS.to_string(),
+            "g-\u{1b}[2Jgone",
+            "'cl2' has no limit reset with the id \"g-\\u{1b}[2Jgone\", so no reset was used; run \
+             `clauth limit-reset cl2` to list its resets"
+                .to_string(),
         ),
     ];
-    for (body, want) in cases {
+    for (body, id, want) in cases {
         let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
-        let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        let err = limit_reset_with("cl2", Some(id), true, false, &urls, no_prompt)
             .expect_err("refused before the spend");
         assert_eq!(err.to_string(), want);
         assert_eq!(
@@ -7761,7 +7804,8 @@ fn limit_reset_names_no_grant_without_control_characters() {
     );
     assert_ne!(body, CEDAR_EMBER_NO_GRANT, "the fixture edit applied");
     let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
-    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("none");
+    let err =
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("none");
     assert_eq!(
         err.to_string(),
         "no limit resets available on 'cl2' (no]52;c;AAAA_grant)"
@@ -8235,7 +8279,7 @@ fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
         },
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 503");
     let pending = pending_path("cl2", CLAUDE_PENDING);
     assert!(pending.is_file(), "an unknown outcome leaves its record");
     #[cfg(unix)]
@@ -8248,7 +8292,8 @@ fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
         assert_eq!(mode & 0o777, 0o600, "the record is the user's alone");
     }
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect("the re-send settles");
     assert!(!pending.exists(), "a settled reply clears the record");
 
     let seen = handle.join().expect("join stub");
@@ -8286,8 +8331,7 @@ fn stored_limit_resets() -> Option<usage::LimitResets> {
 /// re-read answers a body whose two `resets_total: 1` / `resets_left: 1`
 /// grants rise to 3 (the unusable one still adds nothing), so the usable
 /// count is g-old's 3 plus g-week's 1 = 4, and only the re-read's figure
-/// passes. The fixture's next grant is `g-week`, clearing both windows with
-/// no end.
+/// passes; the reading keeps every grant the re-read listed.
 #[test]
 fn limit_reset_lands_the_count_the_server_reads_after_a_claude_spend() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -8316,7 +8360,8 @@ fn limit_reset_lands_the_count_the_server_reads_after_a_claude_spend() {
 
     let before = crate::usage::now_ms();
     let used = stdout_of(|| {
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
     });
     let after = crate::usage::now_ms();
 
@@ -8332,8 +8377,20 @@ fn limit_reset_lands_the_count_the_server_reads_after_a_claude_spend() {
         reading.usable, 4,
         "the re-read's count (3 + 1), never the first read's 2"
     );
-    assert_eq!(reading.clears, ["five_hour", "seven_day"]);
-    assert_eq!(reading.ends_at, None, "the next grant has no end");
+    let left: Vec<(&str, String)> = reading
+        .grants
+        .iter()
+        .map(|g| (g.id.as_str(), g.left_of_total()))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            ("g-old", "3/3".to_string()),
+            ("g-week", "1/2".to_string()),
+            ("g-cool", "3/3".to_string())
+        ],
+        "every grant the re-read listed, as it listed it"
+    );
     let stamp = reading.fetched_at.expect("the read's own stamp");
     assert!(
         (before..=after).contains(&stamp),
@@ -8369,7 +8426,7 @@ fn limit_reset_drops_the_reading_when_the_read_after_a_claude_spend_fails() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
         .expect("the spend succeeded, whatever the re-read did");
 
     assert!(
@@ -8410,7 +8467,8 @@ fn limit_reset_prints_a_claude_spends_outcome_before_the_read_after_it() {
 
     {
         let _guard = out.capture_here();
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
     }
 
     let seen = handle.join().expect("join stub");
@@ -8453,7 +8511,8 @@ fn limit_reset_lands_the_count_when_stdouts_reader_left_after_a_claude_spend() {
     let out = crate::out::OutCapture::reader_gone();
     {
         let _guard = out.capture_here();
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
     }
 
     assert!(out.snapshot().is_empty(), "nobody read those lines");
@@ -8500,7 +8559,7 @@ fn limit_reset_prints_an_already_used_answer_before_the_read_after_it() {
     let result = {
         let _out = out.capture_here();
         let _err = stderr.capture_here();
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
     };
 
     let seen = handle.join().expect("join stub");
@@ -8552,7 +8611,7 @@ fn limit_reset_returns_a_refusal_that_moved_no_count_and_prints_nothing_itself()
     let result = {
         let _out = out.capture_here();
         let _err = stderr.capture_here();
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
     };
 
     let seen = handle.join().expect("join stub");
@@ -8601,7 +8660,7 @@ fn limit_reset_keeps_a_reading_newer_than_the_spend_when_the_read_after_it_fails
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
         .expect("the spend succeeded, whatever the re-read did");
 
     let reading = stored_limit_resets().expect("the newer reading stays");
@@ -8636,7 +8695,7 @@ fn limit_reset_drops_a_reading_older_than_the_resend_when_the_read_after_it_fail
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 503");
     crate::testutil::write_claude_limit_resets(
         "cl2",
         2,
@@ -8648,7 +8707,8 @@ fn limit_reset_drops_a_reading_older_than_the_resend_when_the_read_after_it_fail
     let stderr = crate::out::ErrCapture::new();
     {
         let _err = stderr.capture_here();
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send spent");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("the re-send spent");
     }
 
     assert!(
@@ -8698,13 +8758,14 @@ fn limit_reset_lands_the_count_after_a_resend_the_first_send_already_spent() {
         },
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 503");
     assert_eq!(
         stored_limit_resets().expect("untouched").usable,
         9,
         "a lost spend changes nothing"
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("already used");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("already used");
 
     assert_eq!(stored_limit_resets().expect("a reading").usable, 2);
     let seen = handle.join().expect("join stub");
@@ -8748,7 +8809,7 @@ fn limit_reset_leaves_the_reading_alone_when_a_claude_spend_took_nothing() {
             |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
             move |_| (status, body.to_string()),
         );
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err(body);
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err(body);
 
         assert_eq!(std::fs::read(&file).expect("the reading"), bytes, "{body}");
         let seen = handle.join().expect("join stub");
@@ -8803,7 +8864,8 @@ fn limit_reset_keeps_the_reading_of_a_login_that_moved_during_a_claude_spend() {
         });
         let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
 
         assert_eq!(
             std::fs::read(&file).expect("the reading"),
@@ -8814,28 +8876,45 @@ fn limit_reset_keeps_the_reading_of_a_login_that_moved_during_a_claude_spend() {
     }
 }
 
-/// A record younger than 600 s is what the next spend sends, whatever grant
-/// the read names next.
+/// A record younger than 600 s pins its grant: naming that grant re-sends
+/// the recorded request, naming another is refused before any request with
+/// the line naming the command that re-sends it, and the record stays.
 #[test]
-fn limit_reset_sends_a_fresh_claude_record_instead_of_the_next_grant() {
+fn limit_reset_sends_a_fresh_claude_record_only_for_its_own_grant() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
     write_pending(
         "cl2",
         CLAUDE_PENDING,
         &serde_json::json!({
             "grant_id": "g-old",
             "request_id": "seeded-id",
-            "sent_at_ms": crate::usage::now_ms() - 10_000,
+            "sent_at_ms": sent_at_ms,
         }),
     );
+    let (listener, untouched) = untouched_reset_urls();
+    let err = limit_reset_with("cl2", Some("g-week"), true, false, &untouched, no_prompt)
+        .expect_err("another grant is refused");
+    assert_eq!(
+        err.to_string(),
+        crate::usage::claude_reset::pinned_record_line("cl2", "g-old", sent_at_ms)
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+    assert_nothing_sent(&listener);
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).exists(),
+        "the record stays"
+    );
+
     let (urls, handle) = claude_spend_stub(
         5,
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    limit_reset_with("cl2", Some("g-old"), true, false, &urls, no_prompt)
+        .expect("the re-send settles");
 
     let seen = handle.join().expect("join stub");
     assert_eq!(
@@ -8868,7 +8947,7 @@ fn limit_reset_drops_a_stale_claude_record() {
         |_| (200, CLAUDE_SPENT.to_string()),
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a fresh spend");
 
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
@@ -8896,9 +8975,9 @@ fn limit_reset_keeps_no_claude_record_past_a_refusal() {
         },
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 409");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 409");
     assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a fresh spend");
 
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
@@ -8924,7 +9003,7 @@ fn limit_reset_records_a_claude_spend_before_sending_it() {
         },
     );
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a spend");
 
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
@@ -8941,26 +9020,19 @@ fn limit_reset_records_a_claude_spend_before_sending_it() {
 }
 
 /// A record path clauth cannot read or replace (a directory sits there) stops
-/// the spend with nothing sent.
+/// the spend with nothing sent: the record is checked first, since a record
+/// pins which reset may be sent.
 #[test]
 fn limit_reset_sends_no_claude_spend_it_cannot_record() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_claude_reset_profiles();
     std::fs::create_dir_all(pending_path("cl2", CLAUDE_PENDING)).expect("a dir in the way");
-    let (urls, handle) = claude_spend_stub(
-        3,
-        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
-        |_| (200, CLAUDE_SPENT.to_string()),
-    );
+    let (listener, urls) = untouched_reset_urls();
 
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("no record, no spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("no record, no spend");
 
-    let seen = handle.join().expect("join stub");
-    assert_eq!(
-        request_lines(&seen),
-        [RESET_READ],
-        "the record is checked right after the status read, before the org read"
-    );
+    assert_nothing_sent(&listener);
 }
 
 const CODEX_LIST: &str = "GET /backend-api/wham/rate-limit-reset-credits HTTP/1.1";
@@ -8976,8 +9048,8 @@ const CODEX_SOON_REDEEMED: &str = r#"{"credits": [
 const CODEX_CONSUMED: &str = r#"{"code": "reset", "windows_reset": 2}"#;
 
 /// A consume answered in a shape clauth cannot read has an unknown outcome:
-/// the re-run re-sends the same credit and redeem id, not the credit the list
-/// now names next, and the settled reply clears the record.
+/// the re-run re-sends the same credit and redeem id, and the settled reply
+/// clears the record and reads the list again.
 #[test]
 fn limit_reset_resends_a_codex_consume_whose_reply_was_lost() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -8990,7 +9062,8 @@ fn limit_reset_resends_a_codex_consume_whose_reply_was_lost() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("an unread reply");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+        .expect_err("an unread reply");
     let pending = pending_path("cx", CODEX_PENDING);
     assert!(pending.is_file(), "an unknown outcome leaves its record");
     #[cfg(unix)]
@@ -9003,13 +9076,20 @@ fn limit_reset_resends_a_codex_consume_whose_reply_was_lost() {
         assert_eq!(mode & 0o777, 0o600, "the record is the user's alone");
     }
 
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+        .expect("the re-send settles");
     assert!(!pending.exists(), "a settled reply clears the record");
 
     let seen = handle.join().expect("join stub");
     assert_eq!(
         request_lines(&seen),
-        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST, CODEX_CONSUME]
+        [
+            CODEX_LIST,
+            CODEX_CONSUME,
+            CODEX_LIST,
+            CODEX_CONSUME,
+            CODEX_LIST
+        ]
     );
     let consumes = bodies_of(&seen, CODEX_CONSUME);
     assert_eq!(consumes[0]["credit_id"], "soon");
@@ -9019,21 +9099,32 @@ fn limit_reset_resends_a_codex_consume_whose_reply_was_lost() {
     );
 }
 
-/// A codex record younger than 600 s is what the next consume sends.
+/// A codex record younger than 600 s pins its credit: naming another is
+/// refused before any request, naming it re-sends the recorded consume.
 #[test]
-fn limit_reset_sends_a_fresh_codex_record_instead_of_the_next_credit() {
+fn limit_reset_sends_a_fresh_codex_record_only_for_its_own_credit() {
     let _home = crate::testutil::HomeSandbox::new();
     seed_limit_reset_rosters();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
     write_pending(
         "cx",
         CODEX_PENDING,
         &serde_json::json!({
             "credit_id": "later",
             "redeem_request_id": "seeded-key",
-            "sent_at_ms": crate::usage::now_ms() - 10_000,
+            "sent_at_ms": sent_at_ms,
         }),
     );
-    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+    let (listener, untouched) = untouched_reset_urls();
+    let err = limit_reset_with("cx", Some("soon"), true, false, &untouched, no_prompt)
+        .expect_err("another credit is refused");
+    assert_eq!(
+        err.to_string(),
+        crate::usage::codex_reset::pinned_record_line("cx", "later", sent_at_ms)
+    );
+    assert_nothing_sent(&listener);
+
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, |path, _i| {
         if path.ends_with("/consume") {
             (200, CODEX_CONSUMED.to_string())
         } else {
@@ -9042,7 +9133,8 @@ fn limit_reset_sends_a_fresh_codex_record_instead_of_the_next_credit() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    limit_reset_with("cx", Some("later"), true, false, &urls, no_prompt)
+        .expect("the re-send settles");
 
     let seen = handle.join().expect("join stub");
     assert_eq!(
@@ -9066,10 +9158,186 @@ fn limit_reset_keeps_no_codex_record_past_a_refusal() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 409");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect_err("a 409");
 
     assert!(!pending_path("cx", CODEX_PENDING).exists());
     handle.join().expect("join stub");
+}
+
+/// A codex list read lands under the login it was read for only: a re-login
+/// while the read is in flight leaves no `limit_resets.json`, the same read
+/// under its own login lands one, and a codex forget drops it.
+#[test]
+fn limit_reset_a_codex_list_lands_under_its_own_login_and_forget_drops_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let path = pending_path("cx", crate::profile_cache::LIMIT_RESETS_FILE);
+
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(1, |_, _i| {
+        crate::testutil::write_codex_store(
+            "cx",
+            r#"{ "tokens": {"id_token": "id.other", "access_token": "at.other", "refresh_token": "rt.other", "account_id": "other"} }"#,
+        );
+        (200, CODEX_TWO_AVAILABLE.to_string())
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    crate::limit_reset::list_codex("cx", &urls).expect("the read lists");
+    handle.join().expect("join stub");
+    assert!(
+        !path.is_file(),
+        "a list read for another account than the stored login lands nothing"
+    );
+
+    crate::testutil::write_codex_store("cx", &crate::testutil::codex_auth_body("at.cx", "rt.cx"));
+    let (addr, handle) =
+        crate::testutil::serve_endpoints_raw(1, |_, _i| (200, CODEX_TWO_AVAILABLE.to_string()));
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    crate::limit_reset::list_codex("cx", &urls).expect("the read lists");
+    handle.join().expect("join stub");
+    assert!(
+        path.is_file(),
+        "a list read under its own login lands the credits"
+    );
+
+    crate::usage::forget_disk(
+        &crate::profile::ProfileName::from("cx"),
+        crate::usage::Half::Codex,
+    );
+    assert!(
+        !path.is_file(),
+        "a codex re-login's forget drops the landed list"
+    );
+}
+
+/// A codex login that moved while the spend ran owns the stored list now: a
+/// failed re-read never deletes it, and the note says nothing was touched. The
+/// stub swaps the stored login as the re-read arrives.
+#[test]
+fn limit_reset_keeps_a_codex_list_of_a_login_that_moved_during_the_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    crate::testutil::write_claude_limit_resets("cx", 2, &[], None, 1);
+    let path = pending_path("cx", crate::profile_cache::LIMIT_RESETS_FILE);
+    let bytes = std::fs::read(&path).expect("the seeded list");
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, |path, i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else if i == 2 {
+            crate::testutil::write_codex_store(
+                "cx",
+                r#"{ "tokens": {"id_token": "id.other", "access_token": "at.other", "refresh_token": "rt.other", "account_id": "other"} }"#,
+            );
+            (503, "busy".to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let stderr = crate::out::ErrCapture::new();
+    {
+        let _err = stderr.capture_here();
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+            .expect("the spend settled");
+    }
+
+    assert_eq!(
+        std::fs::read(&path).expect("the list stays"),
+        bytes,
+        "the new login's list is not the old login's to drop"
+    );
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8"),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the stored login changed or could not be read, so nothing was touched\n",
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST]
+    );
+}
+
+/// A side read that landed after this run's send is the best list clauth
+/// holds: a failed re-read keeps it and says so, rather than drop a list the
+/// daemon already saw the spend in.
+#[test]
+fn limit_reset_keeps_a_codex_list_stamped_after_the_spend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let newer = crate::usage::now_ms() + 3_600_000;
+    crate::testutil::write_claude_limit_resets("cx", 2, &[], None, newer);
+    let path = pending_path("cx", crate::profile_cache::LIMIT_RESETS_FILE);
+    let bytes = std::fs::read(&path).expect("the seeded list");
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, |path, i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else if i == 0 {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        } else {
+            (503, "busy".to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let stderr = crate::out::ErrCapture::new();
+    {
+        let _err = stderr.capture_here();
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+            .expect("the spend settled");
+    }
+
+    assert_eq!(
+        std::fs::read(&path).expect("the newer list stays"),
+        bytes,
+        "a list the daemon read after this run's send is not the spend's to drop"
+    );
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8"),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the stored list is newer than the spend, so it stays\n",
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST]
+    );
+}
+
+/// The control: a stored list older than this run's send is dropped after a
+/// failed re-read, and the note says so.
+#[test]
+fn limit_reset_drops_a_codex_list_older_than_the_spend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    crate::testutil::write_claude_limit_resets("cx", 2, &[], None, 1);
+    let path = pending_path("cx", crate::profile_cache::LIMIT_RESETS_FILE);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, |path, i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else if i == 0 {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        } else {
+            (503, "busy".to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let stderr = crate::out::ErrCapture::new();
+    {
+        let _err = stderr.capture_here();
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+            .expect("the spend settled");
+    }
+
+    assert!(!path.exists(), "a list older than this run's send is gone");
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8"),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the stored list was dropped\n",
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST]
+    );
 }
 
 // ── limit-reset re-send fixes (round 2) ──────────────────────────────────────
@@ -9087,7 +9355,8 @@ fn limit_reset_keeps_a_claude_record_past_an_unconfirmed_reply() {
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         move |_| (200, unconfirmed.to_string()),
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("unconfirmed");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("unconfirmed");
     assert!(
         pending_path("cl2", CLAUDE_PENDING).is_file(),
         "an unconfirmed reply keeps its record"
@@ -9111,7 +9380,8 @@ fn limit_reset_keeps_a_claude_record_past_an_unrecognized_result() {
             )
         },
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("unrecognized result");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("unrecognized result");
     assert!(
         pending_path("cl2", CLAUDE_PENDING).is_file(),
         "an unrecognized result keeps its record"
@@ -9136,7 +9406,8 @@ fn limit_reset_clears_a_claude_record_on_a_definite_refusal() {
             )
         },
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a definite refusal");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("a definite refusal");
     assert!(
         !pending_path("cl2", CLAUDE_PENDING).exists(),
         "a definite refusal clears the record"
@@ -9160,7 +9431,8 @@ fn limit_reset_keeps_a_codex_record_past_an_unrecognized_code() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("unrecognized code");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+        .expect_err("unrecognized code");
     assert!(
         pending_path("cx", CODEX_PENDING).is_file(),
         "an unrecognized code keeps its record"
@@ -9184,7 +9456,8 @@ fn limit_reset_clears_a_codex_record_on_a_definite_refusal() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a definite refusal");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+        .expect_err("a definite refusal");
     assert!(
         !pending_path("cx", CODEX_PENDING).exists(),
         "a definite refusal clears the record"
@@ -9215,7 +9488,7 @@ fn limit_reset_declining_a_claude_resend_keeps_the_record_and_says_its_open() {
     );
     let mut prompted = None;
     let out = stdout_of(|| {
-        limit_reset_with("cl2", false, false, true, &urls, |p| {
+        limit_reset_with("cl2", Some("g-old"), false, true, &urls, |p| {
             prompted = Some(p.to_string());
             Ok(false)
         })
@@ -9259,7 +9532,7 @@ fn limit_reset_declining_a_codex_resend_keeps_the_record_and_says_its_open() {
     let urls = usage::codex_reset::ResetUrls::under(&addr);
     let mut prompted = None;
     let out = stdout_of(|| {
-        limit_reset_with("cx", false, false, true, &urls, |p| {
+        limit_reset_with("cx", Some("later"), false, true, &urls, |p| {
             prompted = Some(p.to_string());
             Ok(false)
         })
@@ -9300,13 +9573,13 @@ fn limit_reset_lists_the_claude_pending_note_with_the_deadline() {
         |_| (200, CLAUDE_SPENT.to_string()),
     );
     let out = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("a list");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("a list");
     });
     let at = crate::format::local_stamp((sent_at_ms / 1000) as i64).expect("stamp");
     let deadline =
         crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp");
     let note = format!(
-        "clauth: a limit reset sent at {at} got no answer; run `clauth limit-reset cl2` again \
+        "clauth: a limit reset sent at {at} got no answer; run `clauth limit-reset cl2 g-old` \
          before {deadline} to re-send it."
     );
     assert_eq!(out.last().map(String::as_str), Some(note.as_str()));
@@ -9343,14 +9616,14 @@ fn limit_reset_lists_the_codex_pending_note_with_the_deadline() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
     let out = stdout_of(|| {
-        limit_reset_with("cx", true, false, false, &urls, no_prompt).expect("a list");
+        limit_reset_with("cx", None, false, false, &urls, no_prompt).expect("a list");
     });
     let at = crate::format::local_stamp((sent_at_ms / 1000) as i64).expect("stamp");
     let deadline =
         crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp");
     let note = format!(
-        "clauth: a usage-limit reset sent at {at} got no answer; run `clauth limit-reset cx` \
-         again before {deadline} to re-send it."
+        "clauth: a usage-limit reset sent at {at} got no answer; run `clauth limit-reset cx \
+         later` before {deadline} to re-send it."
     );
     assert_eq!(out.last().map(String::as_str), Some(note.as_str()));
     assert!(
@@ -9382,7 +9655,7 @@ fn limit_reset_lists_no_pending_note_for_an_unsendable_record() {
         |_| (200, CLAUDE_SPENT.to_string()),
     );
     let out = stdout_of(|| {
-        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("a list");
+        limit_reset_with("cl2", None, false, false, &urls, no_prompt).expect("a list");
     });
     assert_eq!(
         out,
@@ -9418,7 +9691,7 @@ fn limit_reset_records_a_codex_consume_before_sending_it() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("a consume");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect("a consume");
     let seen = handle.join().expect("join stub");
     let consumes = bodies_of(&seen, CODEX_CONSUME);
     let record: serde_json::Value = serde_json::from_str(
@@ -9458,7 +9731,8 @@ fn limit_reset_refuses_a_claude_spend_it_cannot_record() {
         },
         |_| (200, CLAUDE_SPENT.to_string()),
     );
-    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("no record");
+    let err = limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+        .expect_err("no record");
     assert!(
         err.to_string()
             .contains("could not record the pending reset in"),
@@ -9492,7 +9766,8 @@ fn limit_reset_refuses_a_codex_consume_it_cannot_record() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("no record");
+    let err =
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect_err("no record");
     assert!(
         err.to_string()
             .contains("could not record the pending reset in"),
@@ -9513,7 +9788,7 @@ fn limit_reset_keeps_no_claude_record_past_a_401() {
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (401, r#"{"error":"stale"}"#.to_string()),
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 401");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect_err("a 401");
     assert!(
         !pending_path("cl2", CLAUDE_PENDING).exists(),
         "a 401 clears the record"
@@ -9534,7 +9809,7 @@ fn limit_reset_keeps_no_codex_record_past_a_401() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 401");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect_err("a 401");
     assert!(
         !pending_path("cx", CODEX_PENDING).exists(),
         "a 401 clears the record"
@@ -9568,7 +9843,8 @@ fn limit_reset_reports_a_failed_clear_after_a_settled_claude_reply() {
     let err_cap = crate::out::ErrCapture::new();
     let err_guard = err_cap.capture_here();
     let out = stdout_of(|| {
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
     });
     drop(err_guard);
     handle.join().expect("join stub");
@@ -9615,7 +9891,8 @@ fn limit_reset_reports_the_count_it_could_not_store_after_a_claude_spend() {
     let err_cap = crate::out::ErrCapture::new();
     let err_guard = err_cap.capture_here();
     let out = stdout_of(|| {
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .expect("a settled spend");
     });
     drop(err_guard);
     handle.join().expect("join stub");
@@ -9649,7 +9926,7 @@ fn limit_reset_drops_a_future_stamped_claude_record() {
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a fresh spend");
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
     assert_eq!(spends.len(), 1);
@@ -9705,7 +9982,8 @@ fn limit_reset_waits_for_another_claude_run_on_the_same_account() {
     );
     let holder = hold_limit_reset_lock("cl2");
     let run = std::thread::spawn(move || {
-        limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+            .map_err(|e| e.to_string())
     });
     std::thread::sleep(LIMIT_RESET_HOLD);
     released.store(true, Ordering::SeqCst);
@@ -9733,7 +10011,7 @@ fn limit_reset_waits_for_another_codex_run_on_the_same_account() {
     seed_limit_reset_rosters();
     let released = Arc::new(AtomicBool::new(false));
     let early = Arc::new(AtomicBool::new(false));
-    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, {
         let released = Arc::clone(&released);
         let early = Arc::clone(&early);
         move |path, _| {
@@ -9750,7 +10028,8 @@ fn limit_reset_waits_for_another_codex_run_on_the_same_account() {
     let urls = usage::codex_reset::ResetUrls::under(&addr);
     let holder = hold_limit_reset_lock("cx");
     let run = std::thread::spawn(move || {
-        limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt)
+            .map_err(|e| e.to_string())
     });
     std::thread::sleep(LIMIT_RESET_HOLD);
     released.store(true, Ordering::SeqCst);
@@ -9762,7 +10041,10 @@ fn limit_reset_waits_for_another_codex_run_on_the_same_account() {
         "the run listed the account while another run held its lock"
     );
     outcome.expect("the waiting run consumes once the lock is free");
-    assert_eq!(request_lines(&seen), [CODEX_LIST, CODEX_CONSUME]);
+    assert_eq!(
+        request_lines(&seen),
+        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST]
+    );
 }
 
 /// `--list` spends nothing, so it never waits on a running spend.
@@ -9778,9 +10060,11 @@ fn limit_reset_lists_while_another_run_holds_the_account() {
     let _holder = hold_limit_reset_lock("cl2");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(
-            limit_reset_with("cl2", true, false, false, &urls, no_prompt)
-                .map_err(|e| e.to_string()),
+        drop(
+            tx.send(
+                limit_reset_with("cl2", None, false, false, &urls, no_prompt)
+                    .map_err(|e| e.to_string()),
+            ),
         );
     });
     rx.recv_timeout(std::time::Duration::from_secs(30))
@@ -9810,7 +10094,7 @@ fn limit_reset_drops_a_claude_record_with_an_unsendable_grant_id() {
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a fresh spend");
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
     assert_eq!(spends[0]["grant_id"], "g-week");
@@ -9837,7 +10121,7 @@ fn limit_reset_drops_a_claude_record_with_an_unsendable_request_id() {
         |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
         |_| (200, CLAUDE_SPENT.to_string()),
     );
-    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt).expect("a fresh spend");
     let seen = handle.join().expect("join stub");
     let spends = bodies_of(&seen, RESET_SPEND);
     assert_ne!(spends[0]["request_id"], "not a key!");
@@ -9867,7 +10151,7 @@ fn limit_reset_drops_a_codex_record_with_an_unsendable_redeem_id() {
         }
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
-    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("a fresh consume");
+    limit_reset_with("cx", Some("soon"), true, false, &urls, no_prompt).expect("a fresh consume");
     let seen = handle.join().expect("join stub");
     let consumes = bodies_of(&seen, CODEX_CONSUME);
     assert_eq!(consumes[0]["credit_id"], "soon");
@@ -9905,7 +10189,8 @@ fn limit_reset_keeps_a_claude_record_past_a_resend_401() {
         |_| (401, r#"{"error":"stale"}"#.to_string()),
     );
 
-    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 401");
+    let err =
+        limit_reset_with("cl2", Some("g-old"), true, false, &urls, no_prompt).expect_err("a 401");
 
     let deadline = resend_deadline(sent_at_ms);
     assert_eq!(
@@ -9954,7 +10239,8 @@ fn limit_reset_keeps_a_codex_record_past_a_resend_401() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 401");
+    let err =
+        limit_reset_with("cx", Some("later"), true, false, &urls, no_prompt).expect_err("a 401");
 
     let deadline = resend_deadline(sent_at_ms);
     assert_eq!(
@@ -9999,7 +10285,8 @@ fn limit_reset_keeps_a_claude_record_past_a_resend_409() {
         |_| (409, r#"{"error":"conflict"}"#.to_string()),
     );
 
-    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 409");
+    let err =
+        limit_reset_with("cl2", Some("g-old"), true, false, &urls, no_prompt).expect_err("a 409");
 
     let deadline = resend_deadline(sent_at_ms);
     assert_eq!(
@@ -10048,7 +10335,8 @@ fn limit_reset_keeps_a_codex_record_past_a_resend_409() {
     });
     let urls = usage::codex_reset::ResetUrls::under(&addr);
 
-    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 409");
+    let err =
+        limit_reset_with("cx", Some("later"), true, false, &urls, no_prompt).expect_err("a 409");
 
     let deadline = resend_deadline(sent_at_ms);
     assert_eq!(
@@ -11503,7 +11791,8 @@ fn limit_reset_prints_one_waiting_line_while_the_lock_is_held() {
         let err_cap = err_cap.clone();
         move || {
             let _guard = err_cap.capture_here();
-            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+            limit_reset_with("cl2", Some("g-week"), true, false, &urls, no_prompt)
+                .map_err(|e| e.to_string())
         }
     });
     await_waiting_line(&err_cap);
@@ -11557,7 +11846,8 @@ fn limit_reset_resends_the_claude_record_another_run_left_while_it_waited() {
         let err_cap = err_cap.clone();
         move || {
             let _guard = err_cap.capture_here();
-            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+            limit_reset_with("cl2", Some("g-old"), true, false, &urls, no_prompt)
+                .map_err(|e| e.to_string())
         }
     });
     await_waiting_line(&err_cap);
@@ -11602,7 +11892,8 @@ fn limit_reset_resends_the_codex_record_another_run_left_while_it_waited() {
         let err_cap = err_cap.clone();
         move || {
             let _guard = err_cap.capture_here();
-            limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+            limit_reset_with("cx", Some("later"), true, false, &urls, no_prompt)
+                .map_err(|e| e.to_string())
         }
     });
     await_waiting_line(&err_cap);
@@ -11632,9 +11923,11 @@ fn refusal_while_locked(name: &'static str) -> String {
     let (_listener, urls) = untouched_reset_urls();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(
-            limit_reset_with(name, false, false, false, &urls, no_prompt)
-                .map_err(|e| e.to_string()),
+        drop(
+            tx.send(
+                limit_reset_with(name, Some("g"), false, false, &urls, no_prompt)
+                    .map_err(|e| e.to_string()),
+            ),
         );
     });
     rx.recv_timeout(std::time::Duration::from_secs(30))

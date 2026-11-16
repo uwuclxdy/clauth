@@ -1520,6 +1520,37 @@ fn several_origins_and_no_app_url_print_the_line_naming_app_url() {
     );
 }
 
+/// A running daemon whose feed holds no `listen` slot gets one line naming a
+/// fix for each common cause, since the feed cannot tell them apart: no
+/// `--listen`, sent to the in-place restart (a plain `clauth daemon --listen`
+/// beside a running daemon exits at once), or a certificate naming no single
+/// DNS host, sent to `[serve] public_address`.
+#[test]
+fn a_daemon_publishing_no_address_prints_the_line_naming_each_fix() {
+    let _home = HomeSandbox::new();
+    let show = Show {
+        json: false,
+        qr: true,
+        terminal: true,
+        columns: None,
+    };
+    let unpublished = Surroundings {
+        listen: None,
+        ..around(serve(Some("https://app.example.net"), &[], None))
+    };
+    let (out, err, code) = announced(show, &unpublished);
+    assert_eq!(out, format!("{code}\n"));
+    assert_eq!(
+        err,
+        format!(
+            "clauth: no pairing link: the running daemon publishes no address (it runs \
+             without --listen, or its certificate names no single DNS host); restart it \
+             with `clauth daemon --replace --listen`, or, if it already listens, set \
+             [serve] public_address to a host:port its certificate covers\n{TTL_LINE}"
+        ),
+    );
+}
+
 /// `--json` carries the link where a script reads it, so a `null` link there
 /// gets the same line naming the key as a terminal run, though stderr is no
 /// terminal; a plain run with no terminal shows no link either way, so it

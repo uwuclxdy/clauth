@@ -89,6 +89,9 @@ struct StubState {
     paste_answer: Value,
     /// The `GET /clauth/v1/usage` body; tests mutate it between legs.
     usage: Value,
+    /// The `account` query every usage read carried, in order: an empty string
+    /// for a whole-pool read.
+    usage_queries: Vec<String>,
     patches: Vec<(String, Value)>,
     deleted: Vec<String>,
     cancelled: bool,
@@ -168,6 +171,7 @@ impl StubState {
             pastes_seen: Vec::new(),
             paste_answer: core(CORE_PENDING),
             usage,
+            usage_queries: Vec::new(),
             patches: Vec::new(),
             deleted: Vec::new(),
             cancelled: false,
@@ -352,7 +356,8 @@ fn handle(
                     .split('&')
                     .find_map(|kv| kv.strip_prefix("account="))
                     .unwrap_or_default();
-                if want != ACCOUNT {
+                s.usage_queries.push(want.to_string());
+                if !want.is_empty() && want != ACCOUNT {
                     return err_body(404, "not_found");
                 }
                 reply(200, s.usage.clone())
@@ -621,6 +626,7 @@ fn leg_state() -> SchedulerState {
         last_history_prune: AtomicU64::new(now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         claude_resets_memo: new_claude_resets_memo(),
+        codex_resets_memo: new_codex_resets_memo(),
         fetcher: crate::providers::fetch_third_party_usage,
         // No reload compare has seen a name yet, so every entry reads as
         // fresh (a name with no snapshot half is never stale): the pins drive
@@ -10105,7 +10111,8 @@ fn limit_reset_on_a_proxy_account_refuses_before_any_request() {
     let (listener, base) = crate::testutil::deaf_listener();
     let urls = crate::usage::codex_reset::ResetUrls::under(&base);
     let refuse = |name: &str, list: bool, yes: bool| {
-        let err = crate::limit_reset_with(name, list, yes, false, &urls, |prompt| {
+        let id = (!list).then_some("g");
+        let err = crate::limit_reset_with(name, id, yes, false, &urls, |prompt| {
             panic!("this path must not prompt, asked: {prompt}")
         })
         .expect_err("refused");
@@ -10618,4 +10625,791 @@ fn the_entry_returns_when_the_slot_key_goes() {
         (Some("env-key".to_string()), None, false),
         "the env-only arm sends the entry alone"
     );
+}
+
+// ── pin 12: the pool read ───────────────────────────────────────────────────
+
+/// A whole-pool `/usage` body: two accounts the proxy has figures for and one
+/// it has read nothing for, every figure stamped `read_at`.
+fn pool_usage_body(read_at: &str) -> Value {
+    json!({"accounts": [
+        {
+            "account": "acct-1", "state": "ready", "available": true,
+            "figures": [
+                {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 10.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 18000,
+                 "resets_at": "2030-01-01T05:00:00Z", "chain": "5h", "read_at": read_at},
+                {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 604800,
+                 "resets_at": "2030-01-05T00:00:00Z", "chain": "7d", "read_at": read_at},
+                {"kind": "window", "id": "quota-30d", "label": "30d window", "used": 25.0,
+                 "limit": 100.0, "unit": "percent", "window_secs": 2592000,
+                 "resets_at": null, "read_at": read_at},
+                {"kind": "balance", "id": "credit", "label": "credit",
+                 "remaining": 204_977_981.0, "limit": 300_000_000.0, "used": 95_022_019.0,
+                 "unit": "tokens", "expires_at": "2030-01-02T01:00:00Z", "read_at": read_at},
+                {"kind": "channel", "id": "off-peak", "label": "off-peak", "open": true,
+                 "read_at": read_at},
+                {"kind": "channel", "id": "coding-plan-renewal", "label": "coding plan renewal",
+                 "open": true, "summary": "renews 2030-02-01", "read_at": read_at},
+                {"kind": "channel", "id": "reset-5h", "label": "5h resets", "open": false,
+                 "summary": "0 available", "read_at": read_at},
+                {"kind": "channel", "id": "reset-7d", "label": "7d resets", "open": true,
+                 "summary": "1 available", "read_at": read_at},
+                {"kind": "stats", "id": "request-stats", "label": "request stats",
+                 "since": "2030-01-01T00:00:00Z",
+                 "requests": {"attempted": 10000, "succeeded": 10000, "failed": 0, "cancelled": 0},
+                 "mean_latency_ms": 840,
+                 "tokens": {"input": 1, "output": 2, "cache_read": 3, "cache_creation": 4},
+                 "read_at": read_at},
+                {"kind": "offer", "id": "claim-offers", "label": "offers", "read_at": read_at,
+                 "items": [{"id": "plan-a", "label": "plan a", "state": "available",
+                            "grants": [{"label": "tokens", "amount": 5.0, "unit": "tokens"}]}]},
+            ],
+        },
+        {
+            "account": "acct-2", "state": "ready", "available": true,
+            "figures": [
+                {"kind": "balance", "id": "credit", "label": "credit",
+                 "remaining": 79_999_980.0, "limit": 100_000_000.0, "used": 20_000_020.0,
+                 "unit": "tokens", "expires_at": "2030-01-03T01:00:00Z", "read_at": read_at},
+                {"kind": "channel", "id": "off-peak", "label": "off-peak", "open": false,
+                 "read_at": read_at},
+                {"kind": "channel", "id": "reset-5h", "label": "5h resets", "open": false,
+                 "summary": "0 available", "read_at": read_at},
+                {"kind": "channel", "id": "reset-7d", "label": "7d resets", "open": false,
+                 "read_at": read_at},
+                {"kind": "stats", "id": "request-stats", "label": "request stats",
+                 "since": "2030-01-01T00:00:00Z",
+                 "requests": {"attempted": 2345, "succeeded": 2344, "failed": 1, "cancelled": 0},
+                 "mean_latency_ms": null,
+                 "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+                 "read_at": read_at},
+            ],
+        },
+        {"account": "acct-3", "state": "ready", "available": true, "figures": []},
+    ]})
+}
+
+/// A profile on the stub's bind with no `[proxy]` record: the funnel profile
+/// an auto-route setup points sessions at.
+fn create_bare_profile_on_disk(config: &mut crate::profile::AppConfig, name: &str, base: &str) {
+    let profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some(base.to_string()),
+        Some(KEY.to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    config.add(profile);
+    crate::profile::save_app_state(&config.state).expect("save state");
+}
+
+/// A profile on a registered proxy's bind with no `[proxy]` record reads the
+/// whole pool: one bar per balance pool carrying the compact grant-versus-left
+/// figure, the pool's totals, one line per account, and a copy dated by its
+/// stalest figure. The admin token authenticates the read; the profile's own
+/// key never rides it.
+#[test]
+fn a_bare_profile_on_a_proxy_bind_reads_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let read_epoch = crate::usage::now_epoch_secs() - 3 * 3600;
+    let read_at = chrono::DateTime::from_timestamp(read_epoch, 0)
+        .unwrap()
+        .to_rfc3339();
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, pool_usage_body(&read_at));
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed");
+    assert!(
+        stats.is_available,
+        "one ready account makes the pool available"
+    );
+
+    assert_eq!(stats.bars.len(), 1, "one bar per declared balance pool");
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "credit | 285M left of 400M");
+    assert!(
+        (bar.pct - 28.755_509_75).abs() < 1e-6,
+        "spent/granted is 28.75550975%, got {}",
+        bar.pct
+    );
+    assert_eq!(
+        bar.resets_at.as_deref(),
+        Some("2030-01-02T01:00:00Z"),
+        "the pool's earliest expiry"
+    );
+    assert_eq!(
+        (bar.used, bar.total),
+        (None, None),
+        "the compact detail replaces the raw amount column"
+    );
+
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "2 ready | 1 unread"),
+            ("resets", "0 open (5h) | 1 open (7d)"),
+            ("offers", "1 claimable | 0 held"),
+            ("requests", "12,345 (1 failed)"),
+            (
+                "acct-1",
+                "5h 10% | 7d 100% | 30d window 25% | 205M left | off-peak open | coding plan renewal renews 2030-02-01 | 5h resets 0 available | 7d resets 1 available"
+            ),
+            (
+                "acct-2",
+                "5h - | 7d - | 80M left | off-peak closed | 5h resets 0 available | 7d resets closed"
+            ),
+            ("acct-3", "no figures"),
+        ]
+    );
+
+    let age = crate::profile_json::cache_age_secs(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("a dated copy");
+    let expected = u64::try_from(crate::usage::now_epoch_secs() - read_epoch).unwrap();
+    assert!(
+        age.abs_diff(expected) <= 1,
+        "the copy is {age} s old, its stalest figure {expected} s"
+    );
+
+    assert_eq!(
+        stub.state().usage_queries,
+        vec![String::new()],
+        "one whole-pool read, no account filter"
+    );
+    assert!(
+        stub.state()
+            .bearered
+            .iter()
+            .any(|line| line == "GET /clauth/v1/usage"),
+        "the admin token carried the read"
+    );
+}
+
+/// A profile carrying a `[proxy]` record keeps its per-account read: the pool
+/// arm answers only a bare endpoint profile on the same bind.
+#[test]
+fn a_recorded_proxy_profile_reads_only_its_own_account() {
+    let (_home, stub, config) = proxy_profile_on_stub(pool_usage_body("2030-01-01T00:00:00Z"));
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    assert_eq!(
+        stub.state().usage_queries,
+        vec![ACCOUNT.to_string()],
+        "the account filter every per-account read carries"
+    );
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the read landed");
+    assert_eq!(
+        stats
+            .bars
+            .iter()
+            .map(|bar| bar.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5h", "7d", "30d window"],
+        "the recorded profile's own account's windows"
+    );
+}
+
+/// A pool with nothing read for it reports no totals rather than a row of
+/// zeros, and an unavailable account reads as its own state.
+#[test]
+fn a_pool_with_no_figures_reports_no_totals_instead_of_zero() {
+    let body = json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": []},
+        {"account": "acct-2", "state": "login_required", "available": false, "figures": []},
+    ]});
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed");
+    assert!(stats.bars.is_empty(), "no granted total, no bar");
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "0 ready | 1 not ready | 1 unread"),
+            ("acct-1", "no figures"),
+            ("acct-2", "login required"),
+        ]
+    );
+}
+
+/// The whole-pool read over `body`, as the funnel profile's cache holds it.
+fn pool_stats_on(body: Value) -> crate::providers::ThirdPartyStats {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+    crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &ProfileName::from("px"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("the pool read landed")
+}
+
+/// One account holding exactly `figures`, ready and available.
+fn pool_account(id: &str, figures: Value) -> Value {
+    json!({"account": id, "state": "ready", "available": true, "figures": figures})
+}
+
+fn figure(value: Value) -> Value {
+    let mut figure = value;
+    figure["read_at"] = json!("2030-01-01T00:00:00Z");
+    figure
+}
+
+/// The bar's left is summed only over the figures that also carried a grant:
+/// an account whose upstream omits its total never makes the bar read a left
+/// no read produced, and the spent share takes `used` over `limit - remaining`.
+#[test]
+fn a_pool_bar_sums_left_only_where_the_grant_was_read() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 100.0, "limit": 100.0, "used": 30.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 150.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "credit | 100 left of 100");
+    assert!(
+        (bar.pct - 30.0).abs() < 1e-6,
+        "spent takes used (30), not limit - remaining (0): {}",
+        bar.pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("150 left")),
+        "the grantless account still names its own left: {:?}",
+        stats.rows
+    );
+}
+
+/// A non-token pool bar spells its unit word beside both amounts, the same
+/// unit its account line names.
+#[test]
+fn a_pool_bar_spells_a_non_token_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "wallet",
+                "remaining": 5.25, "limit": 10.0, "used": 4.75, "unit": "currency",
+                "currency": "CNY"})),
+        ])),
+    ]}));
+    let bar = &stats.bars[0];
+    assert_eq!(bar.label, "wallet | 5.25 CNY left of 10 CNY");
+    assert!((bar.pct - 47.5).abs() < 1e-6, "spent/granted: {}", bar.pct);
+}
+
+/// A figure missing the counters its row prints (a `stats` without `requests`,
+/// a reset channel without `open`, an offer without `items`) never prints a
+/// fabricated zero total.
+#[test]
+fn a_pool_total_without_its_counters_reads_no_row() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "stats", "id": "request-stats", "label": "stats",
+                "since": "2030-01-01T00:00:00Z", "mean_latency_ms": null,
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}})),
+            figure(json!({"kind": "channel", "id": "reset-5h", "label": "5h resets"})),
+            figure(json!({"kind": "offer", "id": "claim-offers", "label": "offers"})),
+        ])),
+    ]}));
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "1 ready | 0 unread"),
+            ("acct-1", "5h - | 7d -")
+        ]
+    );
+}
+
+/// A balance whose bare label names a chain window never becomes one: the
+/// auto-switch reads windows by the exact `5h`/`7d` label, so the pool bar
+/// keeps a word beside it.
+#[test]
+fn a_balance_label_that_names_a_chain_window_never_reads_as_one() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "5h",
+                "remaining": 90.0, "limit": 100.0, "used": 10.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "5h balance | 90 left of 100");
+    assert!(
+        stats.windows_info().is_none(),
+        "no chain window off a balance label"
+    );
+}
+
+/// The account line's window share is clamped and ignores a zero limit, like
+/// the per-account pane's bars.
+#[test]
+fn a_pool_window_percentage_is_clamped() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "window", "id": "quota-5h", "label": "5h window",
+                "used": 150.0, "limit": 100.0, "unit": "percent", "window_secs": 18000,
+                "resets_at": null, "chain": "5h"})),
+            figure(json!({"kind": "window", "id": "quota-7d", "label": "7d window",
+                "used": 10.0, "limit": 0.0, "unit": "percent", "window_secs": 604800,
+                "resets_at": null, "chain": "7d"})),
+        ])),
+    ]}));
+    let line = stats
+        .rows
+        .iter()
+        .find(|row| row.label == "acct-1")
+        .expect("the account line");
+    assert_eq!(line.value, "5h 100% | 7d -");
+}
+
+/// A negative proxy count reads no total rather than a nonsense one.
+#[test]
+fn a_pool_stats_with_a_negative_count_reads_no_row() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "stats", "id": "request-stats", "label": "stats",
+                "since": "2030-01-01T00:00:00Z", "mean_latency_ms": null,
+                "requests": {"attempted": -1500, "succeeded": 0, "failed": -2, "cancelled": 0},
+                "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}})),
+            figure(json!({"kind": "offer", "id": "claim-offers", "label": "offers",
+                "items": [{"id": "p1", "label": "plan", "state": "claimed", "grants": []}]})),
+        ])),
+    ]}));
+    let rows: Vec<(&str, &str)> = stats
+        .rows
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("accounts", "1 ready | 0 unread"),
+            ("offers", "0 claimable | 1 held"),
+            ("acct-1", "5h - | 7d -"),
+        ],
+        "no requests row from a negative count; a claimed item counts as held"
+    );
+}
+
+/// An account block without the contract's `available` verdict lands no copy:
+/// a missing verdict is never read as funded.
+#[test]
+fn an_account_block_without_available_lands_no_copy() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let body = json!({"accounts": [{
+        "account": "acct-1", "state": "ready",
+        "figures": [],
+    }]});
+    let stub = Stub::start(admin, body);
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let state = leg_state();
+    crate::usage::reset_request_slots();
+    run_leg(&state, &config);
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+            &ProfileName::from("px"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+        .is_none(),
+        "nothing landed from a block without `available`"
+    );
+}
+
+/// A remaining with no grant draws no bar, and a pool with no available
+/// account reports itself unavailable: the two guard arms the bars and the
+/// totals hang off.
+#[test]
+fn a_pool_with_no_grant_or_no_available_account_keeps_its_guards() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 500.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert!(stats.bars.is_empty(), "no grant, no bar: {:?}", stats.bars);
+    assert!(
+        stats.is_available,
+        "one available account makes the pool available"
+    );
+
+    let down = json!({"accounts": [
+        {"account": "acct-1", "state": "login_required", "available": false, "figures": []},
+        {"account": "acct-2", "state": "suspended", "available": false, "figures": []},
+    ]});
+    let stats = pool_stats_on(down);
+    assert!(
+        !stats.is_available,
+        "no available account makes the pool unavailable"
+    );
+}
+
+/// One pool id carrying two different units never sums them: the first-seen
+/// unit owns the bar, the other figure stays on its own account line.
+#[test]
+fn a_pool_never_sums_two_units_under_one_grant() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 1_000_000.0, "limit": 2_000_000.0, "used": 1_000_000.0,
+                "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "one bar, the first-seen unit's");
+    assert_eq!(stats.bars[0].label, "credit | 1M left of 2M");
+    assert!(
+        (stats.bars[0].pct - 50.0).abs() < 1e-6,
+        "the USD figure never enters the token pool: {}",
+        stats.bars[0].pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("5 USD left")),
+        "the other unit keeps its own line: {:?}",
+        stats.rows
+    );
+}
+
+/// A granted figure with no remaining reading never counts as unspent: the
+/// bar's grant comes from the figures that also carried a left.
+#[test]
+fn a_grant_without_a_remaining_never_counts_as_unspent() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "limit": 100.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "limit": 50.0, "used": 0.0, "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 50 left of 50");
+}
+
+/// A currency unit with no code falls back to the unit's own word rather than
+/// compacting like a token count.
+#[test]
+fn a_unit_word_that_cannot_be_named_is_still_spelled() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "wallet",
+                "remaining": 5.25, "limit": 10.0, "used": 4.75, "unit": "currency"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "wallet | 5.25 currency left of 10 currency"
+    );
+}
+
+/// The whole-pool read paces on the registered bind's origin, the same key a
+/// per-account read of that proxy takes.
+#[test]
+fn the_pool_read_paces_on_the_proxys_bind_origin() {
+    let service = crate::proxy::Service::parse("stub").unwrap();
+    let base = "http://127.0.0.1:9101".to_string();
+    let pool = crate::providers::ThirdPartyTarget::ProxyPool {
+        service: service.clone(),
+        base_url: base.clone(),
+    };
+    let account = crate::providers::ThirdPartyTarget::Proxy {
+        service,
+        account: ACCOUNT.to_string(),
+        base_url: base,
+    };
+    assert_eq!(pool.throttle_key(), "http://127.0.0.1:9101");
+    assert_eq!(
+        pool.throttle_key(),
+        account.throttle_key(),
+        "both arms serialize on one proxy's requests"
+    );
+}
+
+/// One pool id carrying two units, the mixed unit's figure first: the unit
+/// that owns the bar is the first that carries BOTH a grant and a left, so a
+/// grantless first figure never starves the pool, and the other unit never
+/// enters the sums.
+#[test]
+fn a_pool_never_sums_two_units_whose_figure_counts_first() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 1_000_000.0, "limit": 2_000_000.0, "used": 1_000_000.0,
+                "unit": "tokens"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "one bar, the first counting unit's");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+    assert!(
+        (stats.bars[0].pct - 50.0).abs() < 1e-6,
+        "the token figure never enters the USD pool: {}",
+        stats.bars[0].pct
+    );
+    assert!(
+        stats
+            .rows
+            .iter()
+            .any(|row| row.label == "acct-2" && row.value.ends_with("1M left")),
+        "the other unit keeps its own line: {:?}",
+        stats.rows
+    );
+}
+
+/// A first-seen figure with no grant never fixes the pool's unit: the first
+/// figure carrying both a grant and a left owns it and draws the bar.
+#[test]
+fn a_pool_draws_its_bar_from_the_first_unit_that_counts() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "the counting unit draws the bar");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// A figure outside the bar's set never times it: the countdown comes from the
+/// figures the bar counts.
+#[test]
+fn an_uncounted_figures_expiry_never_times_the_bar() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "unit": "tokens", "expires_at": "2030-01-01T01:00:00Z"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 50.0, "limit": 100.0, "used": 50.0, "unit": "tokens",
+                "expires_at": "2031-01-01T01:00:00Z"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 50 left of 100");
+    assert_eq!(
+        stats.bars[0].resets_at.as_deref(),
+        Some("2031-01-01T01:00:00Z"),
+        "the counted figure's expiry, never the grantless one's"
+    );
+}
+
+/// A `requests` unit is spelled, grouped and never compacted like a token
+/// count: the schema-valid shape the unit fallback exists for.
+#[test]
+fn a_pool_spells_and_groups_a_requests_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 12_345.0, "limit": 20_000.0, "used": 7_655.0,
+                "unit": "requests"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "credit | 12,345 requests left of 20,000 requests"
+    );
+}
+
+/// The entry a bare funnel profile builds carries the pool target with the
+/// profile's own bind, the value the pacing key is derived from.
+#[test]
+fn a_bare_profile_targets_the_pool_on_its_bind() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let admin = mint_admin_token();
+    let stub = Stub::start(admin, json!({"accounts": []}));
+    register_proxy_row(stub.port);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    create_bare_profile_on_disk(&mut config, "px", &stub.base);
+    let profile = crate::profile::load_profile(&ProfileName::from("px")).expect("load profile");
+    let entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+    match entry.target {
+        crate::providers::ThirdPartyTarget::ProxyPool { service, base_url } => {
+            assert_eq!(service.as_str(), "stub");
+            assert_eq!(base_url, stub.base, "the pool target carries the bind");
+        }
+        other => panic!("expected the pool target, got {other:?}"),
+    }
+}
+
+/// A negative and a fractional non-token amount group with the sign outside
+/// the digits: `-1,234.50 USD`, never `-1234.50`.
+#[test]
+fn a_pool_groups_a_negative_and_fractional_amount() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": -1234.5, "limit": 2000.0, "used": 3234.5,
+                "unit": "currency", "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(
+        stats.bars[0].label,
+        "credit | -1,234.50 USD left of 2,000 USD"
+    );
+}
+
+/// A negative amount whose integer digits fill whole groups keeps its sign
+/// ahead of the first group: `-123 USD`, never `-,123 USD`.
+#[test]
+fn a_pool_keeps_the_sign_ahead_of_a_whole_group_negative_amount() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": -123.0, "limit": 2000.0, "used": 2123.0,
+                "unit": "currency", "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | -123 USD left of 2,000 USD");
+}
+
+/// A zero-grant figure never fixes the pool's unit: the first figure carrying
+/// a POSITIVE grant and a left owns the bar.
+#[test]
+fn a_zero_grant_figure_never_fixes_the_pool_unit() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 0.0, "limit": 0.0, "used": 0.0, "unit": "tokens"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars.len(), 1, "the counting unit draws the bar");
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// The bar's name comes from the figure it counts, never a grantless figure
+/// that merely arrived first with the same id.
+#[test]
+fn a_pool_label_comes_from_a_counted_figure() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "grantless label",
+                "remaining": 5.0, "unit": "currency", "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 5 USD left of 10 USD");
+}
+
+/// The first counted figure names the bar: a later counted figure of the same
+/// unit adds to its sums but never renames it.
+#[test]
+fn a_pool_bar_keeps_the_first_counted_figures_label() {
+    let stats = pool_stats_on(json!({"accounts": [
+        pool_account("acct-1", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "credit",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+        pool_account("acct-2", json!([
+            figure(json!({"kind": "balance", "id": "credit", "label": "later label",
+                "remaining": 5.0, "limit": 10.0, "used": 5.0, "unit": "currency",
+                "currency": "USD"})),
+        ])),
+    ]}));
+    assert_eq!(stats.bars[0].label, "credit | 10 USD left of 20 USD");
 }

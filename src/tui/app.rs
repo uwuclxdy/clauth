@@ -70,16 +70,16 @@ use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, ClaudeResetsMemoLock, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt,
-    MemoryStores, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
-    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue,
-    SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, FetchLeg, FetchStatus, KickBlocks,
+    LastFetchedAt, MemoryStores, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender,
+    PendingSwitch, PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity,
+    RefetchQueue, SkippedUnreadable, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
     any_busy, apply_pending_forgets, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
-    collect_tokens, is_idle, mark_activity, new_claude_resets_memo, now_ms, spawn_refresher,
-    switch_gate_in_flight, token_spend_in_flight, windows_maxed,
+    collect_tokens, is_idle, mark_activity, new_claude_resets_memo, new_codex_resets_memo, now_ms,
+    spawn_refresher, switch_gate_in_flight, token_spend_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1766,6 +1766,130 @@ impl NamePromptAction {
     }
 }
 
+/// The `use a limit reset` modal: every reset the account's stored reading
+/// names, the focused one's details, and the spend it runs. Built by
+/// [`limit_reset_form`], which the action menu's item reads too, so the item
+/// shows exactly when the modal has a reset to offer.
+#[derive(Debug, Clone)]
+pub(crate) struct LimitResetForm {
+    pub(crate) name: ProfileName,
+    pub(crate) harness: crate::harness::Harness,
+    /// The count line's value: `3 available`, `0/2 available`.
+    pub(crate) available: String,
+    pub(crate) resets: Vec<ResetChoice>,
+    pub(crate) cursor: usize,
+    /// Whether `use reset` holds the button focus; `cancel` does on open.
+    pub(crate) on_use: bool,
+    /// A fresh pending record's grant or credit id and its refusal line: only
+    /// that reset can be sent until the record's window ends.
+    pub(crate) pinned: Option<(String, String)>,
+    pub(crate) phase: LimitResetPhase,
+    /// The id this form's own spend is sending: a result lands on the form
+    /// only when it names that id. `None` while no spend of this form runs,
+    /// including a form reopened while the account's spend was in flight.
+    pub(crate) spending: Option<String>,
+    /// The pick list's scroll offset, kept across frames so the cursor follows
+    /// the list instead of re-pinning it to the viewport's edge each draw.
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// The largest offset the last render's body allowed, and the frame it
+    /// was computed for: the footer's `↑↓ scroll` hint reads both.
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) scroll_stamp: std::cell::Cell<ScrollStamp>,
+}
+
+/// Where a [`LimitResetForm`]'s spend stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LimitResetPhase {
+    Idle,
+    /// The spend runs on a worker; the modal ignores a second press.
+    Spending,
+    /// The spend was refused; the line names why and that nothing was used.
+    Refused(String),
+}
+
+/// One reset as the modal lists it: its label, its detail rows (`id`,
+/// `resets`, `valid`, `left`, `state`, and `now` where the read names the
+/// headroom), and whether a spend of it can be sent now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResetChoice {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) rows: Vec<(&'static str, String)>,
+    pub(crate) usable: bool,
+    pub(crate) held: bool,
+}
+
+impl LimitResetForm {
+    /// The reset under the cursor.
+    pub(crate) fn focused(&self) -> Option<&ResetChoice> {
+        self.resets
+            .get(self.cursor.min(self.resets.len().saturating_sub(1)))
+    }
+
+    /// The refusal the focused reset reads before anything is sent: a fresh
+    /// record pinning another reset.
+    pub(crate) fn pinned_refusal(&self) -> Option<&str> {
+        let focused = self.focused()?;
+        self.pinned
+            .as_ref()
+            .filter(|(id, _)| *id != focused.id)
+            .map(|(_, line)| line.as_str())
+    }
+
+    /// Whether `use reset` can be pressed: the focused reset is usable now, no
+    /// record pins another, and no spend is running.
+    pub(crate) fn can_use(&self) -> bool {
+        self.phase != LimitResetPhase::Spending
+            && self.pinned_refusal().is_none()
+            && self.focused().is_some_and(|r| {
+                r.usable || self.pinned.as_ref().is_some_and(|(id, _)| *id == r.id)
+            })
+    }
+
+    /// Re-read the count line and rows from `reading`, holding the cursor on
+    /// the same reset by id and re-reading the pending pin from disk: a spend
+    /// that re-landed a reading leaves no row still offering the reset it
+    /// spent, and a settled record no longer pins one.
+    fn reload(&mut self, reading: &crate::usage::LimitResets) {
+        let focused = self.focused().map(|reset| reset.id.clone());
+        let (available, resets) = limit_reset_rows(self.harness, reading);
+        let cursor = focused
+            .and_then(|id| resets.iter().position(|reset| reset.id == id))
+            .unwrap_or_else(|| self.cursor.min(resets.len().saturating_sub(1)));
+        self.available = available;
+        self.resets = resets;
+        self.cursor = cursor;
+        self.pinned = pending_reset_pin(&self.name, self.harness);
+    }
+
+    /// A run that moved the count left no re-landed reading behind: flip the
+    /// spent reset's own row's flag in place so the open-time rows stay but
+    /// `use reset` turns off, and re-read the pin from disk so a settled
+    /// record's stale id cannot re-arm the send. The row is named by id: this
+    /// form may have been reopened while that run was in flight, its cursor
+    /// somewhere else.
+    fn mark_unusable(&mut self, id: &str) {
+        if let Some(reset) = self.resets.iter_mut().find(|reset| reset.id == id) {
+            reset.usable = false;
+        }
+        self.pinned = pending_reset_pin(&self.name, self.harness);
+    }
+
+    /// Settle a form reopened while another spend ran: its rows were built
+    /// before that spend landed, so follow the reading the run stored, or
+    /// turn the spent reset's own row off when it stored none.
+    fn settle_reopened(&mut self, id: &str, moved: bool, reread_stored: bool) {
+        if reread_stored
+            && let Some(reading) =
+                limit_resets_of(std::slice::from_ref(&self.name)).get(self.name.as_str())
+        {
+            self.reload(reading);
+        } else if moved {
+            self.mark_unusable(id);
+        }
+    }
+}
+
 /// Preset picker for `apply preset`. Built-ins lead the list (see
 /// [`crate::presets::list_presets`]), so the cursor's index is the list's index
 /// and nothing has to track the split.
@@ -2405,6 +2529,9 @@ pub(crate) enum ActionMenuAction {
     // Usage
     ToggleEstimates,
     TogglePace,
+    /// Open the focused account's banked resets to spend one; offered only
+    /// while its stored reading names one it still holds.
+    UseLimitReset,
     // Tokens
     TokensPeriodLifetime,
     TokensPeriodDaily,
@@ -2600,6 +2727,7 @@ impl ActionMenuAction {
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
             Self::TogglePace => "toggle pace marker",
+            Self::UseLimitReset => "use a limit reset",
             Self::TokensPeriodLifetime => "period: lifetime",
             Self::TokensPeriodDaily => "period: daily",
             Self::TokensPeriodWeekly => "period: weekly",
@@ -2624,6 +2752,9 @@ pub(crate) enum Modal {
     NamePrompt(NamePromptForm),
     /// Setup menu `apply preset`: pick which preset stamps the account.
     PresetPicker(PresetPickerForm),
+    /// Usage menu `use a limit reset`: pick one of the account's banked resets
+    /// and spend it.
+    LimitReset(LimitResetForm),
     /// `apply preset` over set fields the preset leaves unset: keep or clear.
     PresetApply(PresetApplyForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
@@ -2712,7 +2843,8 @@ fn rotate_blocked_message(name: &str, block: crate::runtime::RotationBlock) -> S
     let suffix = match block {
         crate::runtime::RotationBlock::LiveSession => ROTATE_LIVE_SESSION_MSG,
         crate::runtime::RotationBlock::BackgroundJob => ROTATE_BACKGROUND_SESSION_MSG,
-        crate::runtime::RotationBlock::UnreadableJobStore(_) => ROTATE_UNREADABLE_JOBS_MSG,
+        crate::runtime::RotationBlock::UnreadableJobStore(_)
+        | crate::runtime::RotationBlock::UnreadableJobDir(_) => ROTATE_UNREADABLE_JOBS_MSG,
     };
     format!("'{name}' {suffix}")
 }
@@ -5215,15 +5347,15 @@ fn refresh_codex_rows(app: &mut App) -> bool {
     true
 }
 
-/// The claude accounts' banked-reset readings, off each profile's own
-/// `limit_resets.json` (the scheduler's hourly side read or the CLI's
-/// post-spend refresh), keyed by name.
+/// The named accounts' banked-reset readings, off each profile's own
+/// `limit_resets.json` (a claude account's hourly side read or post-spend
+/// refresh, a codex account's last reset-list read), keyed by name.
 /// Loaded where [`codex_rows`] loads its caches — construction and the
 /// per-tick reload — so a pane reads one snapshot per second, never per frame.
 /// Takes the names, not the config, so the loader itself never reads the
 /// config; only the per-tick reload copies them under the Config guard and
 /// drops it before the file reads below.
-pub(crate) fn claude_resets(
+pub(crate) fn limit_resets_of(
     names: &[crate::profile::ProfileName],
 ) -> HashMap<String, crate::usage::LimitResets> {
     names
@@ -5513,7 +5645,7 @@ const _: () = assert!(
 
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "the TUI's whole screen state: each bool is its own pane's or mode's flag"
+    reason = "unrelated switches, each read on its own"
 )]
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
@@ -5573,6 +5705,8 @@ pub(crate) struct App {
     /// The claude banked-reset side read's cadence memo, shared with the
     /// scheduler the same way [`Self::weekly_reset_kicks`] is.
     pub(crate) claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, shared the same way.
+    pub(crate) codex_resets_memo: CodexResetsMemoLock,
     pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
     /// The #74 degraded cue per profile, written each tick by `apply_usage`
     /// (it reads the DISK cache age) and read by the per-frame snapshot. A
@@ -5913,6 +6047,19 @@ pub(crate) struct App {
     pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
     /// Sender side; cloned into each worker.
     pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
+    /// Finished `use a limit reset` spends, drained each tick.
+    pub(crate) limit_reset_rx: std::sync::mpsc::Receiver<LimitResetResult>,
+    /// Sender side; cloned into each spend worker.
+    pub(crate) limit_reset_tx: std::sync::mpsc::Sender<LimitResetResult>,
+    /// The accounts whose TUI spend still runs: one per account, set when the
+    /// worker spawns, cleared once its result drains. A modal reopened while
+    /// its account's spend is in flight shows `Spending`, so a press cannot
+    /// start a second spend. UI-thread-only.
+    pub(crate) limit_reset_in_flight: HashSet<String>,
+    /// Where a TUI spend's calls go: the live endpoints, and in a test build a
+    /// port nothing answers until a test points it at its own stub, so no test
+    /// can reach a live account.
+    pub(crate) reset_urls: crate::usage::codex_reset::ResetUrls,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -6186,6 +6333,10 @@ pub(crate) struct App {
     /// post-spend refresh). Cached beside `codex_rows` with the same contract:
     /// reloaded on the per-tick poll, never read per frame.
     pub(crate) claude_resets: HashMap<String, crate::usage::LimitResets>,
+    /// The codex accounts' last reset-list readings (each one's
+    /// `limit_resets.json`, landed by `clauth limit-reset` or a TUI spend),
+    /// naming each credit; loaded beside `claude_resets`.
+    pub(crate) codex_resets: HashMap<String, crate::usage::LimitResets>,
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
@@ -6363,6 +6514,7 @@ struct WorkerHandles {
     skipped_unreadable: SkippedUnreadable,
     weekly_reset_kicks: WeeklyResetKicks,
     claude_resets_memo: ClaudeResetsMemoLock,
+    codex_resets_memo: CodexResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -6400,6 +6552,7 @@ impl WorkerHandles {
             skipped_unreadable: Arc::clone(&app.skipped_unreadable),
             weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&app.codex_resets_memo),
             suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
@@ -6562,6 +6715,7 @@ impl App {
         let skipped_unreadable: SkippedUnreadable = Arc::new(RankedMutex::new(HashSet::new()));
         let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
         let claude_resets_memo = new_claude_resets_memo();
+        let codex_resets_memo = new_codex_resets_memo();
         let suppressed_auth_expired: SuppressedAuthExpiredStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
@@ -6655,6 +6809,7 @@ impl App {
         }
 
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
+        let (limit_reset_tx, limit_reset_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
         let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
@@ -6674,7 +6829,7 @@ impl App {
         // tick refreshes the same pair from one read.
         let job_trees = crate::claude_jobs::job_trees();
         let live_sessions = crate::live_sessions::LiveTally::collect_in(&config, &job_trees);
-        let claude_resets = claude_resets(
+        let claude_resets = limit_resets_of(
             &config
                 .profiles
                 .iter()
@@ -6700,6 +6855,8 @@ impl App {
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
         let (codex, codex_landed) = codex_rows_landed();
+        let codex_resets =
+            limit_resets_of(&codex.iter().map(|r| r.name.clone()).collect::<Vec<_>>());
         let mascot_seen = MascotSeen {
             sessions: live_sessions.session_members().cloned(),
             codex_seeded: codex_landed,
@@ -6772,6 +6929,7 @@ impl App {
             skipped_unreadable,
             weekly_reset_kicks,
             claude_resets_memo,
+            codex_resets_memo,
             suppressed_auth_expired,
             stale_cues: HashMap::new(),
             reading_clocks: HashMap::new(),
@@ -6896,6 +7054,18 @@ impl App {
             daemon_control_busy: false,
             daemon_control_rx,
             daemon_control_tx,
+            limit_reset_rx,
+            limit_reset_tx,
+            limit_reset_in_flight: HashSet::new(),
+            reset_urls: if cfg!(test) {
+                crate::usage::codex_reset::ResetUrls {
+                    list: "http://127.0.0.1:9/list".to_string(),
+                    consume: "http://127.0.0.1:9/consume".to_string(),
+                    claude_origin: "http://127.0.0.1:9".to_string(),
+                }
+            } else {
+                crate::usage::codex_reset::ResetUrls::live()
+            },
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             services: ServicesState::default(),
             token_stats: None,
@@ -6984,6 +7154,7 @@ impl App {
             last_finished_speeds_refresh: Instant::now(),
             codex_rows: codex,
             claude_resets,
+            codex_resets,
             last_codex_rows_refresh: Some(Instant::now()),
             shunt_pool: ShuntPool::default(),
             shunt_pool_read_at_ms: None,
@@ -7686,6 +7857,7 @@ impl App {
             h.auto_start_queue,
             h.weekly_reset_kicks,
             h.claude_resets_memo,
+            h.codex_resets_memo,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -7722,6 +7894,7 @@ impl App {
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -22825,6 +22998,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
+        Modal::LimitReset(_) => handle_limit_reset_key(app, key),
         Modal::PresetApply(_) => handle_preset_apply_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::TokenPicker(_) => handle_token_picker_key(app, key),
@@ -23072,7 +23246,17 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                         row_identity = Some(RowIdentity::Pool(identity));
                     }
                 }
-                SetupSelection::Item(MainItemKind::Codex(_)) | SetupSelection::New => {}
+                SetupSelection::Item(MainItemKind::Codex(i)) => {
+                    if let Some(row) = app.codex_rows.get(i)
+                        && limit_reset_form(app).is_some()
+                    {
+                        context = Some(row.name.to_string());
+                    }
+                }
+                SetupSelection::New => {}
+            }
+            if limit_reset_form(app).is_some() {
+                scoped.push(UseLimitReset);
             }
             actions.push(RefreshAll);
             actions.push(ToggleEstimates);
@@ -23508,6 +23692,499 @@ fn account_by_name(app: &App, name: &ProfileName) -> Option<(ProfileName, bool, 
 /// refresh gate asks whether the account has a usage fetch leg, and the
 /// third-party leg fetches generic api-key endpoints too — `is_third_party`
 /// would refuse a litellm row the scheduler refreshes every cadence.
+/// The `use a limit reset` modal for the Usage selection, off the account's
+/// stored reading (a claude account's `limit_resets.json` grants, a codex
+/// account's last list read), or `None` when that reading names no reset the
+/// account still holds: the action menu offers the item exactly when this
+/// builds a form.
+pub(crate) fn limit_reset_form(app: &App) -> Option<LimitResetForm> {
+    use crate::harness::Harness;
+    let (name, harness) = match app.usage_selection() {
+        SetupSelection::Item(MainItemKind::Profile(i)) => {
+            (app.profile_name_at(i)?, Harness::Claude)
+        }
+        SetupSelection::Item(MainItemKind::Codex(i)) => {
+            (app.codex_rows.get(i)?.name.clone(), Harness::Codex)
+        }
+        SetupSelection::Item(MainItemKind::Shunt(..)) | SetupSelection::New => return None,
+    };
+    let reading = match harness {
+        Harness::Claude => app.claude_resets.get(name.as_str())?,
+        Harness::Codex => app.codex_resets.get(name.as_str())?,
+    };
+    let (available, resets) = limit_reset_rows(harness, reading);
+    if !resets.iter().any(|r| r.held) {
+        return None;
+    }
+    Some(LimitResetForm {
+        name,
+        harness,
+        available,
+        resets,
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(ScrollStamp::default()),
+    })
+}
+
+/// The count line and per-reset choices a stored reading gives the modal: the
+/// form opens and a landed spend's re-read both build their rows here, so the
+/// count and the rows always agree.
+fn limit_reset_rows(
+    harness: crate::harness::Harness,
+    reading: &crate::usage::LimitResets,
+) -> (String, Vec<ResetChoice>) {
+    match harness {
+        crate::harness::Harness::Claude => (
+            crate::usage::claude_reset::available_of(
+                reading.usable,
+                reading.banked.unwrap_or(reading.usable),
+            ),
+            claude_reset_choices(reading),
+        ),
+        crate::harness::Harness::Codex => (
+            format!("{} available", reading.usable),
+            codex_reset_choices(reading),
+        ),
+    }
+}
+
+/// The account's fresh pending record, if any, as the reset id it pins and
+/// the line a spend of another reset shows: read from disk, never cached.
+fn pending_reset_pin(
+    name: &ProfileName,
+    harness: crate::harness::Harness,
+) -> Option<(String, String)> {
+    use crate::usage::limit_reset_pending::{ClaudePending, CodexPending, fresh_record, path};
+    match harness {
+        crate::harness::Harness::Claude => path::<ClaudePending>(name)
+            .ok()
+            .and_then(|p| fresh_record::<ClaudePending>(&p))
+            .map(|r| {
+                let line = crate::usage::claude_reset::pinned_record_line(
+                    name.as_str(),
+                    &r.grant_id,
+                    r.sent_at_ms,
+                );
+                (r.grant_id, line)
+            }),
+        crate::harness::Harness::Codex => path::<CodexPending>(name)
+            .ok()
+            .and_then(|p| fresh_record::<CodexPending>(&p))
+            .map(|r| {
+                let line = crate::usage::codex_reset::pinned_record_line(
+                    name.as_str(),
+                    &r.credit_id,
+                    r.sent_at_ms,
+                );
+                (r.credit_id, line)
+            }),
+    }
+}
+
+/// `form` with the account's fresh pending record, if any, pinning its reset:
+/// read once when the modal opens, never on the per-frame menu check.
+pub(crate) fn pin_pending_reset(mut form: LimitResetForm) -> LimitResetForm {
+    form.pinned = pending_reset_pin(&form.name, form.harness);
+    form
+}
+
+/// `until <day>, <time>` off a reset's end, local (`until Dec 10, 23:00`),
+/// the year added when it is not this one (`until Mar 9, 2027, 08:59`).
+fn reset_valid_until(raw: &str) -> Option<String> {
+    use chrono::Datelike as _;
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let shown = if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d, %H:%M")
+    } else {
+        local.format("%b %-d, %Y, %H:%M")
+    };
+    Some(format!("until {shown}"))
+}
+
+/// Every grant a claude reading names, in the server's order, used ones
+/// included (their STATE reads `used`).
+fn claude_reset_choices(reading: &crate::usage::LimitResets) -> Vec<ResetChoice> {
+    use crate::usage::claude_reset::{grant_id_is_sendable, grant_state, headroom, windows_cell};
+    let now = crate::usage::now_epoch_secs();
+    reading
+        .grants
+        .iter()
+        .map(|g| {
+            let windows = windows_cell(g.clears());
+            let mut rows = vec![
+                ("id", crate::format::terminal_safe(&g.id)),
+                (
+                    "resets",
+                    if windows.is_empty() {
+                        "—".to_string()
+                    } else {
+                        windows
+                    },
+                ),
+                (
+                    "valid",
+                    g.ends_at()
+                        .and_then(reset_valid_until)
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("left", g.left_of_total().replacen('/', " of ", 1)),
+                (
+                    "state",
+                    grant_state(g, reading.cooldown_until.as_deref(), reading.at_limit, now),
+                ),
+            ];
+            let weekly = reading
+                .weekly_resets_at
+                .as_deref()
+                .and_then(crate::usage::iso_to_epoch_secs)
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|at| {
+                    format!(
+                        "weekly reset {}",
+                        at.with_timezone(&chrono::Local).format("%b %-d")
+                    )
+                });
+            let now_row: Vec<String> = headroom(g)
+                .map(|(window, left)| format!("{left}% of {window} left"))
+                .into_iter()
+                .chain(weekly)
+                .collect();
+            if !now_row.is_empty() {
+                rows.push(("now", now_row.join(" · ")));
+            }
+            ResetChoice {
+                id: g.id.clone(),
+                label: g.label(),
+                rows,
+                usable: g.resets_left() > 0 && g.is_usable_now() && grant_id_is_sendable(&g.id),
+                held: g.resets_left() > 0,
+            }
+        })
+        .collect()
+}
+
+/// Every credit a codex list read names, in the server's order.
+fn codex_reset_choices(reading: &crate::usage::LimitResets) -> Vec<ResetChoice> {
+    reading
+        .credits
+        .iter()
+        .map(|c| {
+            let valid = match c.expires_at.as_deref() {
+                Some(raw) if !crate::format::shows_nothing(raw) => {
+                    reset_valid_until(raw).unwrap_or_else(|| c.expires_cell())
+                }
+                Some(_) | None => "no expiry".to_string(),
+            };
+            ResetChoice {
+                id: c.id.clone(),
+                label: c.label(),
+                rows: vec![
+                    ("id", crate::format::terminal_safe(&c.id)),
+                    ("resets", c.resets()),
+                    ("valid", valid),
+                    ("left", c.left_of_total().replacen('/', " of ", 1)),
+                    ("state", c.state()),
+                ],
+                usable: c.is_available(),
+                held: c.is_available(),
+            }
+        })
+        .collect()
+}
+
+/// The `use a limit reset` modal's keys: `↑`/`↓` walk the resets (wrapping),
+/// `←`/`→` move the button focus, `↵` runs the focused button (`use reset`
+/// only while [`LimitResetForm::can_use`]), `esc`/`q` close. While a spend
+/// runs every key but `esc`/`q` is ignored, so a second press sends nothing;
+/// closing then leaves the spend to land as a toast.
+fn handle_limit_reset_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::LimitReset(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pop_modal();
+        }
+        _ if form.phase == LimitResetPhase::Spending => {}
+        KeyCode::Up | KeyCode::Down => {
+            let n = form.resets.len().max(1);
+            form.cursor = if key.code == KeyCode::Up {
+                (form.cursor + n - 1) % n
+            } else {
+                (form.cursor + 1) % n
+            };
+            form.phase = LimitResetPhase::Idle;
+        }
+        KeyCode::Left | KeyCode::Right => form.on_use = !form.on_use,
+        KeyCode::Enter if !form.on_use => {
+            app.pop_modal();
+        }
+        KeyCode::Enter if form.can_use() => start_limit_reset(app),
+        _ => {}
+    }
+}
+
+/// What a TUI spend's worker reports, once: the success summary, or the line
+/// naming why nothing was used (or, for an answer that still moved the count,
+/// what the server said). The id is the reset the run spent, so the drain
+/// lands each result only on the modal whose own spend it answers.
+#[derive(Debug)]
+pub(crate) enum LimitResetResult {
+    Used {
+        id: String,
+        name: String,
+        summary: String,
+        /// The run's own re-read stored its reading: only then may the drain
+        /// rebuild a reopened modal's rows from the stored copy.
+        reread_stored: bool,
+    },
+    Refused {
+        id: String,
+        name: String,
+        line: String,
+        /// The reply refused the spend but still moved the count: the drain
+        /// must not offer the spent reset again when the re-read left no
+        /// reading behind.
+        moved_count: bool,
+        /// The run's own re-read stored its reading: only then may the drain
+        /// rebuild the modal's rows from the stored copy.
+        reread_stored: bool,
+    },
+}
+
+/// The TUI's side of a spend: no question (the modal's `use reset` was the
+/// confirmation), notes to the log, and the outcome kept for the drain, with
+/// the server's own reason when its reply refused the spend.
+#[derive(Default)]
+struct TuiSpend {
+    outcome: Option<std::result::Result<String, String>>,
+    refused: Option<String>,
+    moved_count: bool,
+    reread_stored: bool,
+}
+
+impl crate::limit_reset::SpendSurface for TuiSpend {
+    fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    fn note(&mut self, line: &str) {
+        crate::logline::logline!("{line}");
+    }
+
+    fn outcome(&mut self, outcome: &std::result::Result<String, String>) {
+        self.outcome = Some(outcome.clone());
+    }
+
+    fn refused(&mut self, reason: &str) {
+        self.refused = Some(reason.to_string());
+    }
+
+    fn moved_count(&mut self, reread_stored: bool) {
+        self.moved_count = true;
+        self.reread_stored = reread_stored;
+    }
+}
+
+/// Run the focused reset's spend on a worker: the CLI's own spend core, under
+/// `yes`, never on the draw or key thread.
+fn start_limit_reset(app: &mut App) {
+    let Some(Modal::LimitReset(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let Some(id) = form.focused().map(|r| r.id.clone()) else {
+        return;
+    };
+    form.phase = LimitResetPhase::Spending;
+    form.spending = Some(id.clone());
+    app.limit_reset_in_flight.insert(form.name.to_string());
+    let name = form.name.clone();
+    let harness = form.harness;
+    let urls = app.reset_urls.clone();
+    let tx = app.limit_reset_tx.clone();
+    spawn_worker(move || {
+        // One result per spawn, a crashed run included: the drain clears the
+        // in-flight mark off the result, so a run that sent none would leave
+        // the account's modal stuck in `Spending` forever.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_limit_reset(&name, harness, &id, &urls)
+        }))
+        .unwrap_or_else(|_| LimitResetResult::Refused {
+            id: id.clone(),
+            name: name.to_string(),
+            line: NO_OUTCOME_LINE.to_string(),
+            moved_count: false,
+            reread_stored: false,
+        });
+        drop(tx.send(result));
+    });
+}
+
+/// The line for a spend whose outcome nobody reported — a settled run and a
+/// crashed one alike; the pending record keeps a re-send safe.
+const NO_OUTCOME_LINE: &str = "the reset request settled with no outcome to show";
+
+/// One TUI spend, start to finish, folded into what the drain shows.
+fn run_limit_reset(
+    name: &ProfileName,
+    harness: crate::harness::Harness,
+    id: &str,
+    urls: &crate::usage::codex_reset::ResetUrls,
+) -> LimitResetResult {
+    let mut surface = TuiSpend::default();
+    let spent = match harness {
+        crate::harness::Harness::Codex => {
+            crate::limit_reset::spend_codex(name.as_str(), id, true, false, urls, &mut surface)
+        }
+        crate::harness::Harness::Claude => crate::profile::load_config().and_then(|config| {
+            let profile = config
+                .find(name)
+                .ok_or_else(|| anyhow::anyhow!("'{name}' is no longer an account"))?;
+            crate::limit_reset::spend_claude(&config, profile, id, true, false, urls, &mut surface)
+        }),
+    };
+    let id = id.to_string();
+    let name = name.to_string();
+    let moved_count = surface.moved_count;
+    let reread_stored = surface.reread_stored;
+    match (surface.refused, surface.outcome, spent) {
+        (Some(reason), _, _) => LimitResetResult::Refused {
+            id,
+            name,
+            line: crate::limit_reset::server_refused_line(&reason),
+            moved_count,
+            reread_stored,
+        },
+        (None, Some(Ok(summary)), _) => LimitResetResult::Used {
+            id,
+            name,
+            summary: summary.trim_start_matches("clauth: ").to_string(),
+            reread_stored,
+        },
+        (None, Some(Err(line)), _)
+        | (None, None, Ok(crate::limit_reset::Spent::Declined(line))) => {
+            LimitResetResult::Refused {
+                id,
+                name,
+                line,
+                moved_count,
+                reread_stored,
+            }
+        }
+        (None, None, Err(e)) => LimitResetResult::Refused {
+            id,
+            name,
+            line: e.to_string(),
+            moved_count,
+            reread_stored,
+        },
+        // `Sent` always tells its outcome first; this arm keeps the match
+        // total without claiming a spend nobody reported.
+        (None, None, Ok(crate::limit_reset::Spent::Sent)) => LimitResetResult::Refused {
+            id,
+            name,
+            line: NO_OUTCOME_LINE.to_string(),
+            moved_count,
+            reread_stored,
+        },
+    }
+}
+
+/// Land each finished TUI spend: a success closes its modal and toasts the
+/// summary, a refusal stays in the modal in the error colour (or toasts when
+/// the modal was closed meanwhile). A result lands only on the modal whose
+/// own spend it answers (the same account, still `Spending`, and the form's
+/// own sent id), so a spend whose modal was closed never reaches a modal
+/// reopened for the same account; that form only returns to idle, and settles
+/// its rows off the result as an answered modal does. The rows rebuild only
+/// from a reading the same run's re-read stored; a run that stored none keeps
+/// the open-time rows and, when it moved the count, turns the spent reset off.
+/// The stored readings reload so the Usage row follows.
+fn drain_limit_reset(app: &mut App) {
+    while let Ok(result) = app.limit_reset_rx.try_recv() {
+        app.last_codex_rows_refresh = None;
+        let name = match &result {
+            LimitResetResult::Used { name, .. } | LimitResetResult::Refused { name, .. } => {
+                name.clone()
+            }
+        };
+        // The spend this result answers is no longer in flight, wherever the
+        // result lands.
+        app.limit_reset_in_flight.remove(&name);
+        let open = |app: &mut App, name: &str, id: &str| match app.modals.last_mut() {
+            Some(Modal::LimitReset(form))
+                if form.name.as_str() == name
+                    && form.phase == LimitResetPhase::Spending
+                    && form.spending.as_deref() == Some(id)
+                    && form.focused().is_some_and(|r| r.id == id) =>
+            {
+                Some(())
+            }
+            _ => None,
+        };
+        // A form reopened while the account's spend was in flight shows
+        // `Spending` with no spend of its own; once the result it was waiting
+        // on drains, the truthful phase is idle again, so `use reset` runs.
+        let unstick = |app: &mut App, name: &str, id: &str, moved: bool, reread_stored: bool| {
+            if let Some(Modal::LimitReset(form)) = app.modals.last_mut()
+                && form.name.as_str() == name
+                && form.phase == LimitResetPhase::Spending
+                && form.spending.is_none()
+            {
+                form.phase = LimitResetPhase::Idle;
+                form.settle_reopened(id, moved, reread_stored);
+            }
+        };
+        match result {
+            LimitResetResult::Used {
+                id,
+                name,
+                summary,
+                reread_stored,
+            } => {
+                if open(app, &name, &id).is_some() {
+                    app.pop_modal();
+                } else {
+                    unstick(app, &name, &id, true, reread_stored);
+                }
+                app.toast(ToastKind::Success, format!("limit reset used\n{summary}"));
+            }
+            LimitResetResult::Refused {
+                id,
+                name,
+                line,
+                moved_count,
+                reread_stored,
+            } => {
+                if open(app, &name, &id).is_none() {
+                    unstick(app, &name, &id, moved_count, reread_stored);
+                    app.toast(ToastKind::Danger, format!("limit reset not used\n{line}"));
+                    continue;
+                }
+                if let Some(Modal::LimitReset(form)) = app.modals.last_mut() {
+                    form.phase = LimitResetPhase::Refused(line);
+                    if reread_stored {
+                        let stored = limit_resets_of(&[ProfileName::from(name.as_str())]);
+                        if let Some(reading) = stored.get(&name) {
+                            form.reload(reading);
+                        }
+                    } else if moved_count {
+                        form.mark_unusable(&id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
     let name = app.profile_name_at(app.profile_cursor.read())?;
     account_by_name(app, &name)
@@ -23739,6 +24416,18 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
         ActionMenuAction::TogglePace => toggle_show_pace(app),
+        ActionMenuAction::UseLimitReset => {
+            if let Some(form) = limit_reset_form(app) {
+                let mut form = pin_pending_reset(form);
+                // The account's spend still runs on its worker: the reopened
+                // modal shows that state, so a press cannot start a second
+                // spend while the first one is out.
+                if app.limit_reset_in_flight.contains(form.name.as_str()) {
+                    form.phase = LimitResetPhase::Spending;
+                }
+                app.open_modal(Modal::LimitReset(form));
+            }
+        }
         ActionMenuAction::TokensPeriodLifetime => set_token_period(app, TokenPeriod::Lifetime),
         ActionMenuAction::TokensPeriodDaily => set_token_period(app, TokenPeriod::Daily),
         ActionMenuAction::TokensPeriodWeekly => set_token_period(app, TokenPeriod::Weekly),
@@ -30678,8 +31367,8 @@ fn run_capture_overwrite(
             )
             .map(|outcome| {
                 outcome.map(|landed| {
-                    landed.map(|oauth_moved| {
-                        if oauth_moved {
+                    landed.map(|plan_read_due| {
+                        if plan_read_due {
                             crate::usage::expire_profile_ttl(&name);
                         }
                     })
@@ -30788,7 +31477,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                         // disk holds for the
                         // account it names active.
                         let keys = crate::actions::outgoing_env_keys_now(cfg)?;
-                        let oauth_moved = crate::actions::overwrite_captured_profile_held(
+                        let plan_read_due = crate::actions::overwrite_captured_profile_held(
                             cfg, &name, &account, snapshot, false,
                         )??;
                         // This arm activates OUTSIDE `overwrite_captured_profile`,
@@ -30807,17 +31496,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                                 let fresh = crate::profile::read_profile(&name)?;
                                 crate::claude::apply_profile_to_claude_settings(&fresh, &keys)
                             });
-                        Ok((oauth_moved, activated))
+                        Ok((plan_read_due, activated))
                     },
                 )
             };
             #[cfg(test)]
             run_after_adopt_hold_hook();
             let result = match result {
-                Ok(Ok((oauth_moved, activated))) => {
+                Ok(Ok((plan_read_due, activated))) => {
                     // After the hold (the TTL store ranks below the flock),
                     // whether or not the activation landed: the store moved.
-                    if oauth_moved {
+                    if plan_read_due {
                         crate::usage::expire_profile_ttl(&name);
                     }
                     activated
@@ -32763,6 +33452,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_pool_mutations(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
+    drain_limit_reset(app);
     poll_daemon_health(app);
     poll_tps(app);
     poll_finished_speeds(app);
@@ -32873,7 +33563,10 @@ fn poll_codex_rows(app: &mut App) {
         .iter()
         .map(|p| p.name.clone())
         .collect();
-    app.claude_resets = claude_resets(&names);
+    app.claude_resets = limit_resets_of(&names);
+    let codex_names: Vec<crate::profile::ProfileName> =
+        app.codex_rows.iter().map(|r| r.name.clone()).collect();
+    app.codex_resets = limit_resets_of(&codex_names);
 }
 
 /// The codex roster's mascot edges, compared right after each landed refresh
