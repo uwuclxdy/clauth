@@ -45,6 +45,8 @@ A binary install checks GitHub for a newer release in the background whenever th
 
 Any failing step skips the update and writes one line to `~/.clauth/clauth.log`; through step 4 the running binary is left alone. Quitting the TUI gives a running check 5 s to finish, longer only while the new binary is being swapped in; past that the update is dropped silently until the TUI next opens. The check starts when the TUI opens, so turning auto-update off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) takes effect the next time the TUI opens. `CLAUTH_NO_UPDATE=1` turns the whole thing off even when the toggle is on. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
 
+A `clauth daemon` left running restarts itself on the new binary within seconds on Linux and macOS, whether an update or a reinstall replaced it ([Daemon](Daemon#process-model)); a `--listen` daemon whose new binary cannot load the API certificate keeps running the old one and logs the command that restarts it. A daemon still running a release from before that restart, and every daemon on Windows, keeps running the old binary until you restart it with `clauth daemon --replace`.
+
 A binary install on v0.17.0 or older cannot download a current release and never updates itself: replace it once with the latest binary from the releases page (or rerun the install script with `--nocargo`), and updates resume from there.
 
 ## Shell completions

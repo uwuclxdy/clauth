@@ -879,25 +879,6 @@ fn a_running_delete_takes_the_marker_slot_on_its_own_row() {
     );
 }
 
-/// A disabled row flattens the delete's spinner to dim like every other mark on
-/// that row, and the glyph stays.
-#[test]
-fn a_running_delete_on_a_disabled_row_dims_its_spinner() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
-    a.disabled = true;
-    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
-    let mut app = App::new(config);
-    app.deleting = Some(crate::profile::ProfileName::from("a"));
-    app.tick_count = 0;
-    let widths = OverviewWidths::new(80, &app, &readings);
-
-    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    let marker = line.spans.iter().find(|s| s.content == "⠋").unwrap();
-    assert_eq!(marker.style.fg, theme::dim().fg);
-}
-
 /// Marker column: a broken login (×) outranks both the bell (!) and the
 /// active mark (✻) — usage alerts are moot until re-login.
 #[test]
@@ -2488,86 +2469,7 @@ fn credentialed_long_label_clamps_to_kind_width() {
     );
 }
 
-// ── disabled accounts (feature: per-account disable toggle) ──────────────
-
-/// A disabled account's row dims its name (never `name_color`'s active/
-/// inactive branch — a disabled account can never be active) and that is the
-/// row's ONLY change: the `TYPE` column keeps its real oauth/api/tier value,
-/// since a non-type value under a `TYPE` header both lies about the column and
-/// destroys the tier the operator came to read. The label itself lives on the
-/// Usage `status` row and the Setup `status` row. A sibling enabled row in the
-/// same config proves the dimming is per-profile, not global.
-#[test]
-fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
-    a.disabled = true;
-    let (b, mut b_readings) = profile("b", 95.0, 10.0, 3600);
-    // Give both a real FETCHED Pro tier so the TYPE column reads a genuine tier —
-    // this test is about dimming keeping whatever tier is real, not about the
-    // fallback tier a credential-less profile happens to default to.
-    let plan = crate::usage::PlanInfo {
-        tier: crate::usage::PlanTier::Pro,
-        plan_display_name: None,
-        subscription_status: None,
-        codex_plan: None,
-        email: None,
-    };
-    a_readings.usage.get_mut("a").unwrap().plan = Some(plan.clone());
-    b_readings.usage.get_mut("b").unwrap().plan = Some(plan);
-    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
-    let app = App::new(config);
-    let widths = OverviewWidths::new(80, &app, &readings);
-
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    let name_span = disabled_line
-        .spans
-        .iter()
-        .find(|s| s.content.trim_end() == "a")
-        .expect("name span renders");
-    assert_eq!(
-        name_span.style.fg,
-        theme::dim().fg,
-        "a disabled account's name renders dim, not the active/inactive name_color"
-    );
-
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
-    let enabled_name_span = enabled_line
-        .spans
-        .iter()
-        .find(|s| s.content.trim_end() == "b")
-        .expect("name span renders");
-    assert_ne!(
-        enabled_name_span.style.fg,
-        theme::dim().fg,
-        "an enabled account keeps its ordinary name color"
-    );
-
-    // Same profile shape either side of the `disabled` bit, so the type column
-    // must read identically — and must be the real tier, not an empty slot.
-    let kind_field = |line: &Line<'static>| -> String {
-        let chars: Vec<char> = line_text(line).chars().collect();
-        let start = 2 + 2 + widths.name + widths.gap;
-        chars[start..start + widths.kind].iter().collect()
-    };
-    let disabled_kind = kind_field(&disabled_line);
-    assert_eq!(
-        disabled_kind.trim(),
-        "Pro",
-        "the disabled row keeps its real tier value in the TYPE column"
-    );
-    assert_eq!(
-        disabled_kind,
-        kind_field(&enabled_line),
-        "the `disabled` bit changes nothing about the TYPE column"
-    );
-    assert!(
-        !line_text(&disabled_line).contains("disabled"),
-        "no chip anywhere on the row: {}",
-        line_text(&disabled_line)
-    );
-}
+// ── type cell: identity wave and no-data dash ─────────────────────────────
 
 /// A credentialed OAuth profile, so the type cell takes the pulsing branch.
 fn oauth_creds() -> ClaudeCredentials {
@@ -2583,127 +2485,52 @@ fn oauth_creds() -> ClaudeCredentials {
     }
 }
 
-/// A disabled row goes inert END TO END, not just its name: the marker glyph,
-/// the type cell, and both window bars all flatten to `theme::dim()`. The
-/// glyphs and numbers stay — the row never lets state ride on hue alone, and
-/// the figures are the last real reading — it is only the semantic color that
-/// lies once the data is frozen. An enabled sibling in the same config keeps
-/// every hue, which is what proves the flattening is per-row.
+/// A row's identity wave runs, and under `reduce_motion` rests, at the row's
+/// place in the drawn list, not its roster index: two disabled accounts above
+/// `b` draw no row, so `b` draws first. Its sweep starts unstaggered (0ms flat,
+/// 450ms the crest, 1444ms in its rest gap), and a still wave draws the plain
+/// label, which a rest phase taken at roster index 2 would not: that phase
+/// lands mid-sweep for the first drawn row.
 #[test]
-fn disabled_row_flattens_every_semantic_hue_to_dim() {
+fn a_rows_wave_runs_and_rests_at_its_drawn_position() {
     let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (mut a, a_readings) = profile("a", 95.0, 90.0, 3600);
-    a.disabled = true;
-    a.credentials = Some(oauth_creds());
-    let (mut b, b_readings) = profile("b", 95.0, 90.0, 3600);
-    b.credentials = Some(oauth_creds());
-    // Both rows must actually REACH the marker branch, or the flattening
-    // assertion silently skips it: a disabled, non-active, unbroken profile
-    // falls through to a blank marker with no fg to flatten. Marking both
-    // auth-broken puts the `×` (DANGER) on each.
-    let (mut config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
-    config.state.auth_broken.push("a".into());
-    config.state.auth_broken.push("b".into());
-    let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app, &readings);
-
-    let non_dim = |line: &Line<'static>| -> Vec<String> {
-        line.spans
-            .iter()
-            .filter(|s| !s.content.trim().is_empty())
-            .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-            .map(|s| s.content.trim().to_string())
-            .collect()
-    };
-
-    // The one hue a disabled row keeps is the not-current mark: it exists to say
-    // the dim figures beside it are a cached reading, so flattening it would
-    // erase the only cue that they are not current.
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    assert_eq!(
-        non_dim(&disabled_line),
-        vec![NOT_CURRENT_MARK.to_string()],
-        "every colored span on a disabled row flattens to dim but the not-current mark"
-    );
-
-    // The control row must still carry hue, or the assertion above is vacuous.
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
-    assert!(
-        !non_dim(&enabled_line).is_empty(),
-        "control: an enabled row keeps its semantic colors"
-    );
-
-    // The bar figures survive the flattening — dim, not deleted.
-    let text: String = disabled_line
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-    assert!(
-        text.contains("90%"),
-        "the last-known reading stays readable: {text}"
-    );
-}
-
-/// The credentialed type cell's identity-wave is ambient motion, which reads as
-/// "live". A disabled row must render a flat cell instead — so two frames at
-/// different `started_at` elapsed values must be byte-and-style identical. A
-/// surviving pulse would differ between them.
-#[test]
-fn disabled_row_type_cell_does_not_pulse() {
-    let _home = crate::testutil::HomeSandbox::new();
-    // The wave is a Full-tier effect: `identity_wave_spans` returns flat spans
-    // below it. A test build's tier defaults to `Full`, and the sandbox pins it
-    // explicitly, so the wave renders and the disabled-vs-enabled control below
-    // is real.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
-    a.disabled = true;
-    a.credentials = Some(oauth_creds());
+    let hidden = |name: &str| {
+        let (mut p, r) = profile(name, 95.0, 10.0, 3600);
+        p.disabled = true;
+        (p, r)
+    };
     let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
     b.credentials = Some(oauth_creds());
-    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
-
-    // `identity_wave_spans` keys off `App::anim_ms`, so two Apps with different
-    // pinned phases sample different points of the wave. 450ms is the crest of
-    // the 900ms sweep, where the envelope peaks: the phase furthest from the
-    // flat 0ms frame, so a surviving pulse shows up at its widest rather than at
-    // some near-zero lean that rounds back to base.
-    let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
-        let mut app = App::new(config.clone());
-        app.anim_phase_ms = Some(450 * idx as u64);
-        let widths = OverviewWidths::new(110, &app, &readings);
-        render_overview_row(&app, 0, &widths, false, true, &readings)
-            .spans
-            .iter()
-            .map(|s| (s.content.to_string(), s.style.fg))
-            .collect()
-    };
-    assert_eq!(
-        snapshot(0),
-        snapshot(1),
-        "a disabled row must render identically at two wave phases (no pulse)"
+    let (config, readings) = config_with(
+        vec![hidden("x"), hidden("y"), (b, b_readings)],
+        None,
+        vec![],
     );
-
-    // Control: the ENABLED sibling does pulse, so the comparison above is real.
-    let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
-        let mut app = App::new(config.clone());
+    let colors = |still: bool, elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
+        let mut config = config.clone();
+        config.state.reduce_motion = still;
+        let mut app = App::new(config);
         app.anim_phase_ms = Some(elapsed_ms);
         let widths = OverviewWidths::new(110, &app, &readings);
-        render_overview_row(&app, 1, &widths, false, true, &readings)
+        render_overview_row(&app, 2, &widths, false, true, &readings)
             .spans
             .iter()
             .map(|s| s.style.fg)
             .collect()
     };
-    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
-    // first frame, 1444ms its crest.
     assert_ne!(
-        enabled_snapshot(994),
-        enabled_snapshot(1444),
-        "control: an enabled credentialed row's type cell really does animate"
+        colors(false, 0),
+        colors(false, 450),
+        "b, drawn first, starts its sweep unstaggered"
     );
+    for elapsed_ms in [0, 450, 1444] {
+        assert_eq!(
+            colors(true, elapsed_ms),
+            colors(false, 1444),
+            "a still wave draws the plain label at {elapsed_ms}ms"
+        );
+    }
 }
 
 /// `reduce_motion` holds the provider wave still at every phase, while a
@@ -2779,14 +2606,14 @@ const KIND_SPAN: usize = 5;
 
 /// A no-data dash is not a tier, so the identity wave must not carry it: a lone
 /// glyph color-cycling next to the row's static faint dashes reads as live data.
-/// Same two-phase shape as the disabled-row pin above, and the same reason it
-/// needs a control — without one, a harness that never animates anything passes
-/// this as "no pulse".
+/// Two frames at different phases compare equal, beside a control that animates
+/// — without one, a harness that never animates anything passes this as "no
+/// pulse".
 #[test]
 fn no_tier_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
     // The wave is Full-tier only; the test build defaults to `Full` and the
-    // sandbox pins it explicitly. Same guard the disabled-row pin carries.
+    // sandbox pins it explicitly.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     // `something_new` is a claim clauth cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.
@@ -2810,7 +2637,7 @@ fn no_tier_type_cell_does_not_pulse() {
             .collect()
     };
 
-    // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
+    // NOT 450ms, the crest of the sweep. That phase is the
     // one value a ONE-CHARACTER label cannot express. `identity_wave_spans` weights
     // grapheme `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
     // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
@@ -2835,11 +2662,10 @@ fn no_tier_type_cell_does_not_pulse() {
 }
 
 /// The dash joins the other no-data cells at `faint`, but only when it is the
-/// whole cell: a disabled row flattens to `dim` the way it outranks every other
-/// cell state, and a row whose label is a REAL one keeps `dim` however it
-/// reached the un-pulsed branch.
+/// whole cell: a row whose label is a REAL one keeps `dim` however it reached
+/// the un-pulsed branch.
 ///
-/// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
+/// That leg is the one the `no_tier &&` conjunct exists for. An api-key row
 /// on a generic host has a genuine `API` label and no recognized provider, so it
 /// lands in the same un-pulsed branch a no-data dash does; without the conjunct
 /// its label fades to `faint`, which reads as missing data.
@@ -2847,12 +2673,9 @@ fn no_tier_type_cell_does_not_pulse() {
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    let (mut disabled, _disabled_readings) = credentialed_profile("c", "something_new");
-    disabled.disabled = true;
     let (config, readings) = config_with(
         vec![
             credentialed_profile("a", "something_new"),
-            (disabled, _disabled_readings),
             (
                 Profile::new(
                     "d".to_string(),
@@ -2887,14 +2710,7 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     );
     assert_eq!(bare_fg, theme::faint().fg, "a bare dash is a no-data cell");
 
-    let (_, disabled_fg) = cell(1);
-    assert_eq!(
-        disabled_fg,
-        theme::dim().fg,
-        "a disabled row flattens to dim, outranking no-data as it does stale"
-    );
-
-    let api_frames = claude_kind_frames(&mut App::new(config.clone()), 2, false, &readings);
+    let api_frames = claude_kind_frames(&mut App::new(config.clone()), 1, false, &readings);
     let api: String = api_frames[0]
         .iter()
         .map(|(text, _)| text.as_str())
@@ -2921,7 +2737,7 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     // (no credentials rather than no tier), and it fades too — the cell is empty
     // for the same reason, so it reads the same way. This one changed with the
     // no-data dash and had no leg of its own.
-    let (uncredentialed, uncredentialed_fg) = cell(3);
+    let (uncredentialed, uncredentialed_fg) = cell(2);
     assert_eq!(
         uncredentialed.trim_end(),
         "—",
@@ -2931,68 +2747,6 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         uncredentialed_fg,
         theme::faint().fg,
         "a bare dash is a no-data cell whether or not credentials exist"
-    );
-}
-
-/// A disabled account is never polled, so its refresh countdown would tick to
-/// zero and then claim a refresh forever. The slot shows no countdown — at full
-/// width, so no column downstream shifts.
-#[test]
-fn disabled_row_claims_no_refresh_at_full_width() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
-    a.disabled = true;
-    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
-    b.credentials = Some(oauth_creds());
-    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
-    let app = App::new(config);
-    // Both profiles carry a live countdown in the shared map.
-    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
-        m.insert(
-            FetchLeg::OAuth.key(ProfileName::from("a")),
-            now_ms() + 42_000,
-        );
-        m.insert(
-            FetchLeg::OAuth.key(ProfileName::from("b")),
-            now_ms() + 42_000,
-        );
-    }
-    let widths = OverviewWidths::new(110, &app, &readings);
-
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
-    let text =
-        |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
-
-    // Match the countdown by SHAPE (a digit followed by `s`), never by its exact
-    // value: the seconds figure truncates, so a literal "42s" flips to "41s" the
-    // moment a millisecond passes between the insert and the render. Nothing
-    // else on the row can produce that pair — the bar, `10%` and `(1h 0m)` carry
-    // no `s`, and the names are single letters.
-    let has_countdown = |s: &str| -> bool {
-        s.as_bytes()
-            .windows(2)
-            .any(|w| w[0].is_ascii_digit() && w[1] == b's')
-    };
-    // The control proves the countdown is genuinely reachable in this fixture —
-    // without it a blank slot would pass even if the timer never rendered.
-    assert!(
-        has_countdown(&text(&enabled_line)),
-        "control: the enabled row shows its countdown: {}",
-        text(&enabled_line)
-    );
-    assert!(
-        !has_countdown(&text(&disabled_line)),
-        "the disabled row claims no refresh: {}",
-        text(&disabled_line)
-    );
-
-    // Width is preserved, so nothing downstream shifts: the two rows must be
-    // exactly as wide as each other.
-    assert_eq!(
-        text(&disabled_line).chars().count(),
-        text(&enabled_line).chars().count(),
-        "blanking the timer must not collapse the slot"
     );
 }
 
@@ -3011,8 +2765,9 @@ fn mark_spans(line: &Line<'static>) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// A refresh countdown matched by shape (a digit followed by `s`); see
-/// `disabled_row_claims_no_refresh_at_full_width` for why never by value.
+/// A refresh countdown matched by shape (a digit followed by `s`), never by its
+/// exact value: the seconds figure truncates, so a literal `42s` flips to `41s`
+/// the moment a millisecond passes between the insert and the render.
 fn has_refresh_countdown(line: &Line<'static>) -> bool {
     line_text(line)
         .as_bytes()
@@ -3032,40 +2787,35 @@ fn keyless_provider_profile() -> (Profile, ReadingsSnapshot) {
 }
 
 /// Every way an account falls off both fetch legs' work lists while its row
-/// still draws a reading: disabled (OAuth bars, DeepSeek balance), keyless
-/// provider, logged-out OAuth. Each carries one amber `⋯` where the countdown
-/// sits, at both theme tiers, and keeps the row's width. A polled sibling with
-/// a scheduled refresh keeps its countdown and gets no mark.
+/// still draws a reading: keyless provider (window bars, DeepSeek balance),
+/// logged-out OAuth. Each carries one amber `⋯` where the countdown sits, at
+/// both theme tiers, and keeps the row's width. A polled sibling with a
+/// scheduled refresh keeps its countdown and gets no mark.
 #[test]
 fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (mut disabled_oauth, disabled_oauth_readings) = profile("a", 95.0, 10.0, 3600);
-    disabled_oauth.disabled = true;
-    disabled_oauth.credentials = Some(oauth_creds());
     // `profile` builds a credential-less OAuth account: logged out.
     let logged_out = profile("c", 95.0, 10.0, 3600);
-    let (mut disabled_deepseek, disabled_deepseek_readings) = deepseek_profile("d", &["1.71 USD"]);
-    disabled_deepseek.disabled = true;
+    let (mut keyless_deepseek, keyless_deepseek_readings) = deepseek_profile("d", &["1.71 USD"]);
+    keyless_deepseek.api_key = None;
     let (mut polled, polled_readings) = profile("p", 95.0, 10.0, 3600);
     polled.credentials = Some(oauth_creds());
     let (config, readings) = config_with(
         vec![
-            (disabled_oauth, disabled_oauth_readings),
             keyless_provider_profile(),
             logged_out,
-            (disabled_deepseek, disabled_deepseek_readings),
+            (keyless_deepseek, keyless_deepseek_readings),
             (polled, polled_readings),
         ],
         None,
         vec![],
     );
     let unpolled = [
-        (0, "disabled oauth"),
-        (1, "keyless provider"),
-        (2, "logged-out oauth"),
-        (3, "disabled deepseek balance"),
+        (0, "keyless provider"),
+        (1, "logged-out oauth"),
+        (2, "keyless deepseek balance"),
     ];
-    let polled_idx = 4;
+    let polled_idx = 3;
 
     let mut mark_fg_per_tier = Vec::new();
     for tier in [theme::Tier::Full, theme::Tier::Compatible] {
@@ -3074,7 +2824,7 @@ fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
         // Every row holds a scheduled refresh in the shared map, so only the
         // work-list rule can keep a countdown off the unpolled rows.
         if let Ok(mut m) = app.next_refresh_per_profile.lock() {
-            for name in ["a", "c", "p"] {
+            for name in ["c", "p"] {
                 m.insert(
                     FetchLeg::OAuth.key(ProfileName::from(name)),
                     now_ms() + 42_000,
@@ -3219,16 +2969,12 @@ fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
 fn a_row_with_no_reading_or_a_polled_account_gets_no_not_current_mark() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    let (mut disabled_empty, _) = profile("a", 95.0, 10.0, 3600);
-    disabled_empty.disabled = true;
-    disabled_empty.credentials = Some(oauth_creds());
     let (keyless_empty, _) = keyless_provider_profile();
     let (logged_out_empty, _) = profile("c", 95.0, 10.0, 3600);
     let (mut polled_unscheduled, polled_readings) = profile("p", 95.0, 10.0, 3600);
     polled_unscheduled.credentials = Some(oauth_creds());
     let (config, readings) = config_with(
         vec![
-            (disabled_empty, ReadingsSnapshot::default()),
             (keyless_empty, ReadingsSnapshot::default()),
             (logged_out_empty, ReadingsSnapshot::default()),
             (polled_unscheduled, polled_readings),
@@ -3239,11 +2985,10 @@ fn a_row_with_no_reading_or_a_polled_account_gets_no_not_current_mark() {
     let app = App::new(config);
     let widths = OverviewWidths::new(110, &app, &readings);
     for (idx, what) in [
-        (0, "disabled oauth with nothing cached"),
-        (1, "keyless provider with nothing cached"),
-        (2, "logged-out oauth with nothing cached"),
+        (0, "keyless provider with nothing cached"),
+        (1, "logged-out oauth with nothing cached"),
         (
-            3,
+            2,
             "polled oauth with a reading and no refresh scheduled yet",
         ),
     ] {
@@ -3256,7 +3001,7 @@ fn a_row_with_no_reading_or_a_polled_account_gets_no_not_current_mark() {
     }
     // Fixture control: the polled row really draws its reading, so its missing
     // mark is the work-list rule and not an empty row.
-    let polled_line = render_overview_row(&app, 3, &widths, false, true, &readings);
+    let polled_line = render_overview_row(&app, 2, &widths, false, true, &readings);
     assert!(
         line_text(&polled_line).contains("10%"),
         "control: the polled row draws its 5h reading: {}",
@@ -3359,9 +3104,9 @@ fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
         });
     }
     let (mut ds_empty, ds_empty_readings) = deepseek_profile("d0", &[]);
-    ds_empty.disabled = true;
+    ds_empty.api_key = None;
     let (mut ds_balance, ds_balance_readings) = deepseek_profile("d1", &["1.71 USD"]);
-    ds_balance.disabled = true;
+    ds_balance.api_key = None;
     let (config, readings) = config_with(
         vec![
             (keyless, keyless_readings),
@@ -3384,7 +3129,7 @@ fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
 
     for (idx, what) in [
         (0, "keyless provider with stats and no bars"),
-        (1, "disabled deepseek with no balance row"),
+        (1, "keyless deepseek with no balance row"),
     ] {
         let line = row(idx);
         assert!(
@@ -3396,7 +3141,7 @@ fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
     assert_eq!(
         mark_spans(&row(2)).len(),
         1,
-        "control: a disabled deepseek drawing its balance carries the mark: {}",
+        "control: a keyless deepseek drawing its balance carries the mark: {}",
         line_text(&row(2))
     );
 }
@@ -3500,36 +3245,6 @@ fn stale_window_fades_bar_fill_and_percent() {
     assert_eq!(
         stale_bracket.fg, live_bracket.fg,
         "brackets stay dim regardless of staleness"
-    );
-}
-
-/// Disabled always wins: `flatten` runs AFTER the stale fade and overrides
-/// every span to `theme::dim()`, so a disabled + past-reset row must not show
-/// a half-faint/half-dim bar — every span flattens to the same dim hue.
-#[test]
-fn disabled_and_past_reset_row_stays_fully_dim() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (mut a, a_readings) = profile("a", 95.0, 73.0, -60); // disabled + past-reset
-    a.disabled = true;
-    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
-    let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app, &readings);
-
-    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    let non_dim: Vec<String> = line
-        .spans
-        .iter()
-        .filter(|s| !s.content.trim().is_empty())
-        .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
-        .map(|s| s.content.trim().to_string())
-        .collect();
-    // The not-current mark is the one span a disabled row keeps in color: it is
-    // what says the dim figures are a cached reading.
-    assert_eq!(
-        non_dim,
-        vec![NOT_CURRENT_MARK.to_string()],
-        "a disabled row's bar must flatten fully to dim, not stay half-faint"
     );
 }
 
@@ -6747,29 +6462,6 @@ fn peak_marker_renders_on_inactive_rows() {
     assert_eq!(marker.style.fg, theme::warning().fg);
 }
 
-/// A disabled non-active profile on peak hours keeps its `▲` glyph, but the
-/// `hue` closure flattens it to dim like every other marker on a disabled row.
-#[test]
-fn disabled_peak_row_dims_the_marker() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let (mut p, p_readings) = peak_profile("a");
-    p.disabled = true;
-    let (config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
-    let mut app = App::new(config);
-    app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app, &readings);
-    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
-    let text = line_text(&line);
-    assert!(text.contains('▲'), "disabled peak row keeps ▲: {text}");
-    let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
-    assert_eq!(
-        marker.style.fg,
-        theme::dim().fg,
-        "the ▲ dims like every marker on a disabled row"
-    );
-}
-
 /// A profile whose window is never active (off-peak by fixture) keeps its
 /// `✻` and renders no `▲` — off-peak is the resting state and stays clean.
 #[test]
@@ -7399,7 +7091,7 @@ fn pool_row_status_rides_the_existing_row_cues() {
         spare
             .iter()
             .all(|cell| cell.fg == theme::dim().fg.expect("dim color")),
-        "a paused account's name dims like a disabled claude account"
+        "a paused account's name dims like a non-serving row"
     );
 
     let cx_row = rows
@@ -9360,35 +9052,29 @@ fn rows_of_one_provider_crest_out_of_step() {
 }
 
 /// An endpoint clauth does not recognize by type has no reviewed color, so its
-/// type cell stays flat `TEXT_DIM`; so does a disabled account of a recognized
-/// provider. A crested DeepSeek row in the same list is the control.
+/// type cell stays flat `TEXT_DIM`. A crested DeepSeek row in the same list is
+/// the control.
 #[test]
-fn an_unrecognized_or_disabled_provider_row_stays_flat() {
+fn an_unrecognized_provider_row_stays_flat() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let (generic, generic_readings) = third_party_profile(40.0, 20.0);
-    let (mut disabled, disabled_readings) =
-        provider_key_profile("off", "https://api.deepseek.com/anthropic");
-    disabled.disabled = true;
     let (config, readings) = config_with(
         vec![
             (generic, generic_readings),
-            (disabled, disabled_readings),
             provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
         ],
         None,
         vec![],
     );
     let mut app = App::new(config);
-    for (idx, what) in [(0, "an unrecognized endpoint"), (1, "a disabled account")] {
-        assert_eq!(
-            kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings)),
-            vec![theme::text_dim_color()],
-            "{what}'s type cell is flat TEXT_DIM"
-        );
-    }
+    assert_eq!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 0, false, &readings)),
+        vec![theme::text_dim_color()],
+        "an unrecognized endpoint's type cell is flat TEXT_DIM"
+    );
     assert!(
-        kind_cell_hues(&claude_kind_frames(&mut app, 2, false, &readings))
+        kind_cell_hues(&claude_kind_frames(&mut app, 1, false, &readings))
             .iter()
             .any(|&h| h != theme::text_dim_color()),
         "control: the recognized DeepSeek row in the same list crests"
@@ -9835,6 +9521,194 @@ fn each_providers_first_row_crests_apart_from_the_others() {
                 "the first rows of providers {a} and {b} crest {gap} ms apart"
             );
         }
+    }
+}
+
+/// A disabled account draws no Overview row and no count in the panel's
+/// title: the table lists the accounts that can serve.
+#[test]
+fn a_disabled_account_has_no_overview_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, ra) = polled("acct-a", 95.0, 10.0, 3600);
+    let (mut b, rb) = polled("acct-b", 95.0, 10.0, 3600);
+    b.disabled = true;
+    let (c, rc) = polled("acct-c", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(vec![(a, ra), (b, rb), (c, rc)], None, vec![]);
+    let app = App::new(config);
+    let rows = accounts_rows(&app, 110, 8);
+    assert!(
+        rows[0].contains("2 claude"),
+        "the title counts the rows shown: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0],
+        "╭─ ACCOUNTS ────────────────────────────────────────────────────────────────────────────────────── 2 claude ─╮",
+        "the title counts the rows shown"
+    );
+    let table = rows.join("\n");
+    assert!(
+        table.contains("acct-a") && table.contains("acct-c"),
+        "{table}"
+    );
+    assert!(
+        !table.contains("acct-b"),
+        "the disabled account has no row: {table}"
+    );
+}
+
+/// A roster of disabled accounts alone says so, rather than reading as no
+/// roster at all.
+#[test]
+fn every_account_disabled_reads_its_own_empty_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut a, ra) = polled("acct-a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let (config, _readings) = config_with(vec![(a, ra)], None, vec![]);
+    let app = App::new(config);
+    let rows = accounts_rows(&app, 110, 10);
+    let table = rows.join("\n");
+    assert!(
+        table.contains("every claude account is disabled"),
+        "{table}"
+    );
+    assert!(!table.contains("no accounts yet"), "{table}");
+    assert_eq!(
+        rows,
+        [
+            "╭─ ACCOUNTS ─────────────────────────────────────────────────────────────────────────────────────────────────╮",
+            "│                                                                                                            │",
+            "│                                                                                                            │",
+            "│                                    ╭─────────────────────────────────╮                                     │",
+            "│                                    │every claude account is disabled │                                     │",
+            "│                                    │⌥4 to enable one on the setup tab│                                     │",
+            "│                                    ╰─────────────────────────────────╯                                     │",
+            "│                                                                                                            │",
+            "│                                                                                                            │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+        "the empty state names the setup tab as where to enable one"
+    );
+}
+
+/// A harness filter that hides every row draws the filter's own empty table,
+/// as it does with no account disabled: disabling is not what emptied the view,
+/// so the table does not say it was.
+#[test]
+fn a_filter_hiding_every_row_reads_its_own_empty_state_with_accounts_disabled() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut a, ra) = polled("acct-a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let (config, _readings) = config_with(vec![(a, ra)], None, vec![]);
+    let mut app = App::new(config);
+    app.harness_filter = HarnessFilter::Codex;
+    assert!(
+        app.main_items().is_empty(),
+        "fixture control: the codex filter shows no row"
+    );
+    assert_eq!(
+        accounts_rows(&app, 110, 6),
+        [
+            "╭─ ACCOUNTS ─ codex ─────────────────────────────────────────────────────────────────────────────────────────╮",
+            "│     account   type                  5h                          7d                           live  t/s     │",
+            "│                                                                                                            │",
+            "│                                                                                                            │",
+            "│                                                                                                            │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ]
+    );
+}
+
+/// The `5h / balance` header label turns on only for a DeepSeek row the table
+/// draws: a disabled DeepSeek account alone, which has no row, leaves the
+/// column headed `5h`; an enabled one beside the same roster turns it on.
+#[test]
+fn only_a_shown_deepseek_row_turns_on_the_balance_header() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let header = |deepseek_disabled: bool| -> String {
+        let (mut ds, rds) = deepseek_profile("ds", &["1.71 USD"]);
+        ds.disabled = deepseek_disabled;
+        let (config, _readings) = config_with(
+            vec![polled("acct-a", 95.0, 10.0, 3600), (ds, rds)],
+            None,
+            vec![],
+        );
+        accounts_rows(&App::new(config), 110, 6)[1].clone()
+    };
+    assert_eq!(
+        header(true),
+        "│     account   type                  5h                          7d                           live  t/s     │",
+        "a disabled DeepSeek account has no row"
+    );
+    assert_eq!(
+        header(false),
+        "│     account   type                  5h / balance                7d                           live  t/s     │",
+        "control: a shown DeepSeek row"
+    );
+}
+
+/// The columns are sized off the rows the table draws: a disabled account
+/// sizes none of them. The shown row is a DeepSeek account with no balance
+/// cached, so every column it leaves at its narrowest is one the disabled
+/// accounts would widen: the name, both usage columns' readings, bars and
+/// reset stamps, the `↺ N` chip slot and the DeepSeek amount.
+#[test]
+fn a_disabled_account_does_not_size_the_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut long, mut rl) = polled("a-disabled-account-with-a-long-name", 95.0, 100.0, 3600);
+    long.disabled = true;
+    rl.usage
+        .get_mut("a-disabled-account-with-a-long-name")
+        .expect("polled seeds a reading")
+        .seven_day = Some(UsageWindow {
+        utilization: 100.0,
+        resets_at: Some(countdown_reset_in(5 * 86_400)),
+    });
+    let (mut wallet, rw) = deepseek_profile("ds-off", &["123456.78 USD"]);
+    wallet.disabled = true;
+    let shown = || deepseek_profile("ds", &[]);
+    let (alone, _) = config_with(vec![shown()], None, vec![]);
+    let (with_disabled, readings) =
+        config_with(vec![shown(), (long, rl), (wallet, rw)], None, vec![]);
+    let alone = App::new(alone);
+    let mut with_disabled = App::new(with_disabled);
+    with_disabled.claude_resets.insert(
+        "a-disabled-account-with-a-long-name".to_string(),
+        crate::usage::LimitResets {
+            usable: 12345,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        OverviewWidths::new(110, &with_disabled, &readings).name,
+        OverviewWidths::new(110, &alone, &readings).name,
+    );
+    for display in [ResetDisplay::Relative, ResetDisplay::Clock] {
+        for app in [&alone, &with_disabled] {
+            app.config().state.reset_display = Some(display);
+        }
+        for width in [60, 110] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    OverviewWidths::new(width, &with_disabled, &readings)
+                ),
+                format!("{:?}", OverviewWidths::new(width, &alone, &readings)),
+                "{display:?} at {width} cells"
+            );
+        }
+        assert_eq!(
+            format!(
+                "{:?}",
+                OverviewWidths::new(OVERVIEW_MAX_W, &with_disabled, &readings).filled(200)
+            ),
+            format!(
+                "{:?}",
+                OverviewWidths::new(OVERVIEW_MAX_W, &alone, &readings).filled(200)
+            ),
+            "{display:?} past the layout width"
+        );
     }
 }
 

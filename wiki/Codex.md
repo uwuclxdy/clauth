@@ -145,64 +145,70 @@ No refresh revives a dead chain; a new login is the only exit, and the browser f
 
 ## Use a usage-limit reset
 
-A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. A Claude Code account's resets are [below](Codex#a-claude-code-account). The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. A Claude Code account's resets are [below](Codex#a-claude-code-account). The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); listing them and spending one are commands you run, and nothing picks a reset for you:
 
 ```sh
-clauth limit-reset work --list   # the account's resets; spends nothing
-clauth limit-reset work          # spend one, after a [y/N]
+clauth limit-reset work            # the account's resets as a table; spends nothing (--list does the same)
+clauth limit-reset work credit-1   # spend the reset that id names, after a [y/N]
 ```
 
-`--list` prints the count and every reset with its status, expiry and grant time in local time (a status or grant time with nothing to show is left out), `*` marking the one a spend would use:
+The listing prints the count, then a table with one row per reset in the order the server sends them: its ID (the one a spend takes), LEFT (`1/1` while it can be used, `0/1` after), STATE (`ready` for an available reset, any other status as sent, cut to 20 cells, `-` when it sends none), RESETS (`usage windows`, or another reset type as sent), EXPIRES in local time (`no expiry` when it has none) and LABEL (its title cut to 44 cells with `...`, or `usage-limit reset`). Each column is as wide as its widest cell, and the whole table is plain ASCII:
 
 ```
 clauth: 'work' has 2 usage-limit resets available.
-  * Full reset (Weekly + 5 hr): available, expires 2026-10-01 09:00:00, granted 2026-09-01 09:00:00  (used next)
-    usage-limit reset: available, no expiry, granted 2026-09-10 09:00:00
+
+  ID        LEFT  STATE  RESETS         EXPIRES           LABEL
+  credit-1  1/1   ready  usage windows  2026-10-01 09:00  Full reset (Weekly + 5 hr)
+  credit-2  1/1   ready  usage windows  no expiry         usage-limit reset
 ```
 
-A spend uses a codex usage-limit (`codex_rate_limits`) reset before any other kind, and among those the one that expires first (one with no expiry waits until the dated ones are gone), and asks before it sends anything that spends:
+A spend asks before it sends anything that spends:
 
 ```
 clauth: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr), expires 2026-10-01 09:00:00, 1 of 2 available. It reopens the account's usage windows now and cannot be undone. [y/N]
 ```
 
-Once that one is spent, the untitled reset is next; with no title to name, its question opens on its expiry:
+An untitled reset has no title to name, so its question opens on its expiry:
 
 ```
 clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. It reopens the account's usage windows now and cannot be undone. [y/N]
 ```
 
-`--yes` (`-y`) skips the question and is required on a non-TTY stdin or stdout, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` sends nothing: a first spend prints `clauth: aborted. no reset was used on 'work'.`, a declined re-send `clauth: aborted. the earlier reset request on 'work' was not re-sent; its outcome is still unknown.`
+`--yes` (`-y`) skips the question and is required to spend on a non-TTY stdin or stdout, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`; it needs an id, since without one nothing is spent. Anything but `y` or `yes` sends nothing: a first spend prints `clauth: aborted. no reset was used on 'work'.`, a declined re-send `clauth: aborted. the earlier reset request on 'work' was not re-sent; its outcome is still unknown.`
 
 | Outcome | What it prints | Exit |
 |---------|----------------|------|
 | used | `clauth: used a usage-limit reset on 'work': 2 windows reopened, 1 left.`, then `clauth: the daemon shows the new usage at its next poll.` | 0 |
 | nothing to reset | `there is nothing to reset on 'work' right now, so no reset was used` | 1 |
-| none held | `no usage-limit resets available on 'work'` (`--list` prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
+| none held | `no usage-limit resets available on 'work'` (the listing prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
+| an id the list does not name | ``'work' has no usage-limit reset with the id "credit-9", so no reset was used; run `clauth limit-reset work` to list its resets`` (nothing is sent) | 1 |
+| a reset that cannot be used now | `the usage-limit reset "credit-2" on 'work' cannot be used now (redeemed), so no reset was used` (its STATE; nothing is sent) | 1 |
 | taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth limit-reset work --list` to see what is left`` | 1 |
 | token refused | `codex rejected the stored access token for 'work'. The daemon refreshes it for a parked account and codex does for the one in use. Try again after that. No reset was used` | 1 |
 | no answer | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; a re-run before <time> re-sends the same request`` (`<time>` is 10 minutes after the spend, in local time) | 1 |
 | an answer clauth cannot read | ``codex answered the reset request for 'work' in a shape clauth does not read, so the reset may or may not have gone through; a re-run before <time> re-sends the same request`` | 1 |
 
-Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose outcome stays unknown (no answer, a 5xx, or a reply clauth cannot read or that leaves the outcome open) leaves a record, `--list` names it (``clauth: a usage-limit reset sent at <time> got no answer; run `clauth limit-reset work` again before <time> to re-send it.``), and running `clauth limit-reset` again within 10 minutes of that spend re-sends that same request instead of spending another reset. Two runs on one account never spend at once, whichever roster the account is on: a second `clauth limit-reset` on that account prints `clauth: another limit-reset on 'work' is running; waiting for it.` and waits, even while the first sits at its `[y/N]`; it then decides on what the first left, so a record still inside its 10 minutes is offered for a re-send (behind its own `[y/N]` unless `--yes`) instead of spending another reset. `--list` never waits, and neither does a run refused before the lock (no `--yes` on a non-TTY stdin or stdout, no login, a quarantined chain). The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
+Nothing is retried on its own, since a lost answer may still have spent the reset: a spend whose outcome stays unknown (no answer, a 5xx, or a reply clauth cannot read or that leaves the outcome open) leaves a record, the listing names it (``clauth: a usage-limit reset sent at <time> got no answer; run `clauth limit-reset work credit-1` before <time> to re-send it.``), and naming that id again within 10 minutes of that spend re-sends that same request instead of spending another reset. Until then no other reset is spent: naming another id stops before any request with ``a usage-limit reset sent at <time> on 'work' got no answer; run `clauth limit-reset work credit-1` before <time> to re-send it, no other reset is used until then`` (exit 1). Two runs on one account never spend at once, whichever roster the account is on: a second spend on that account prints `clauth: another limit-reset on 'work' is running; waiting for it.` and waits, even while the first sits at its `[y/N]`; it then decides on what the first left, so a record still inside its 10 minutes is re-sent when it names the same id (behind its own `[y/N]` unless `--yes`) and refused when it names another. A listing never waits, and neither does a run refused before the lock (no `--yes` on a non-TTY stdin or stdout, no login, a quarantined chain). Each list read is kept as the account's `limit_resets.json`, which the TUI names every reset from, and a spend that reset reads the list again. The daemon reads the list itself about once an hour per codex account (the claude side read's cadence), so the rail and the modal show the account's credits without a listing first; the same refusals a listing runs (a quarantined chain, no stored login) skip the read. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
 
 ### A Claude Code account
 
-The samples above are a codex account's. A Claude Code account's resets go through the same command, and a spend uses the grant the server names next, the row `--list` marks `*` and `(used next)`. Each `--list` row opens on the grant's label, printed whole with control characters dropped, and counts the grant's resets the server marks usable now against the ones it still holds, spent ones left out: `1 available` when every one is usable, `0/1 available` when none is, and every row reads 0 while the server's next reset cannot be spent. It then names the windows the grant resets (`5h`, `7d`, `7d opus`, `7d sonnet`, `7d fable`, any other as the server sends it, control characters dropped, cut to 40 cells; `nothing` when it names none), then any state the server gives and `, expires <time>` when the grant ends:
+The samples above are a codex account's. A Claude Code account's resets go through the same commands and the same table, each grant under the id a spend of it takes; any grant the server lists can be named, not only the one it would spend next. The count reads the resets a spend can use now, against the ones held when some cannot (`2/3`). LEFT counts the grant's resets left against its total; STATE reads `ready` while the server marks it usable and its id is one a spend sends, `unavailable` for a usable grant whose id is not, `used` once it holds none, `cooldown <time left>` for any other held grant while the account's resets cool down after a spend (`cooldown 4h 46m`), then `paused`, `at limit only` for a grant usable only at a limit the account is under, else the server's own reason cut to 20 cells, else `unavailable`; RESETS names the windows it resets (`5h`, `7d`, `7d opus`, `7d sonnet`, `7d fable`, any other as the server sends it, control characters dropped, cut to 40 cells; `-` when it names none); EXPIRES is its end in local time (`-` when it has none); LABEL its label cut to 44 cells with `...`, control characters dropped:
 
 ```
-clauth: 'home' has 2 limit resets available.
-    Old reset: 1 available, resets 5h
-  * Weekly reset: 1 available, resets 5h and 7d  (used next)
-    limit reset: 0/1 available, resets 5h and seven_day_blue, cooldown
+clauth: 'home' has 3 limit resets available.
+
+  ID                     LEFT  STATE  RESETS        EXPIRES           LABEL
+  full-reset-2611        1/1   ready  7d, 7d fable  2026-12-10 23:00  One full limit reset (November 2026)
+  launch-2610-fable      1/1   ready  7d fable      2027-03-09 08:59  New model launch: one Fable reset for Max...
+  launch-2610-fable-6mo  1/1   ready  7d fable      2027-03-09 08:59  New model launch: one more Fable reset at...
 ```
 
-When the server names no next grant, `--list` prints `clauth: no limit resets available on 'home'.`, with the server's reason in parentheses before the period when it gives one (`clauth: no limit resets available on 'home' (no_grant).`). A next grant the server does not mark usable now refuses the spend and uses nothing: `Error: the limit reset 'home' would use next is unavailable (cooldown), so no reset was used`.
+With no grant listed, the listing prints `clauth: no limit resets available on 'home'.`, with the server's reason in parentheses before the period when it gives one (`clauth: no limit resets available on 'home' (no_grant).`). A spend refuses before anything is sent an id the read does not list (``'home' has no limit reset with the id "g-gone", so no reset was used; run `clauth limit-reset home` to list its resets``) and a listed grant the server does not mark usable now, naming its STATE (`the limit reset "g-cool" on 'home' cannot be used now (cooldown 4h 46m), so no reset was used`). The server can still refuse a grant it lists; its reason then prints the way every refusal in its reply does (`that limit reset on 'home' is unavailable (<reason>), so no reset was used`) and nothing is spent.
 
-A spend's question names the grant, its label cut to 40 cells (an untitled one asks `use a limit reset on 'home'?`) and the same count; short of a limit it adds the most headroom left in a window it resets (`'home' still has 60% of its 7d left.`), and when the server names the weekly reset it closes on `The weekly reset stays <time>.`:
+A spend's question names the grant, its label cut to 40 cells (an untitled one asks `use a limit reset on 'home'?`) and the resets it holds; short of a limit it adds the most headroom left in a window it resets (`'home' still has 60% of its 7d left.`), and when the server names the weekly reset it closes on `The weekly reset stays <time>.`:
 
 ```
-clauth: use the limit reset "Weekly reset" on 'home'? It resets 5h and 7d now and cannot be undone; 1 available on it. [y/N]
+clauth: use the limit reset "One full limit reset (November 2026)" on 'home'? It resets 7d and 7d fable now and cannot be undone; 1 available on it. [y/N]
 ```
 
 ## Managed config

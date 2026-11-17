@@ -168,7 +168,11 @@ strip = true
 # supervisor start-time, argv/env and liveness checks; the `proc_pidinfo` read
 # is shared with the bridge's `parent_pid`); `stderr_file_mode`'s
 # `fcntl`/`fstat` in `daemon/log_rotate.rs`;
-# the inherited signal disposition read in `daemon/gateway.rs`; the test
+# the inherited signal disposition read and `reap_inherited_zombie`'s
+# inherited-child `waitpid` reap in `daemon/gateway.rs`, and
+# `pid_exists`'s `kill(pid, 0)` gone read there (macOS only); the exec
+# handover's descriptor validation, adoption and close-on-exec flipping,
+# and its start-of-serve env removal, in `daemon/mod.rs`; the test
 # sandbox's env mutation, which Rust 2024 made unsafe, and the tests' other
 # raw calls (a held flock, a pty's setup, an euid read, raw sockets, a raw
 # pointer write); and the mod bridge's socket and process reads in
