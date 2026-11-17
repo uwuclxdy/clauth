@@ -2557,9 +2557,13 @@ fn remove_marker_at(path: &Path) {
 /// When `pid` started, as an opaque token two reads of one live process
 /// agree on; `None` for a pid that is gone, a zombie, or unreadable.
 ///
-/// Linux: field 22 of `/proc/<pid>/stat`, clock ticks since boot.
+/// Linux: field 22 of `/proc/<pid>/stat`, clock ticks since boot; `None` for
+/// a thread's id.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    if crate::runtime::pid_is_thread(pid) {
+        return None;
+    }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) is parenthesized and may hold spaces or
     // parens itself, so the fields are counted from its last `)`.

@@ -5533,14 +5533,16 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
 
 // ── per-session decision leg ─────────────────────────────────────────────────
 
-/// One registry row, opted IN and shared-flavor. Tests flip the one field they
-/// are about, so every other value is pinned here rather than per test.
+/// One registry row, opted IN and shared-flavor, its launcher a process no
+/// longer running. Tests flip the one field they are about, so every other
+/// value is pinned here rather than per test.
 fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::LiveSession {
+    let [launcher_pid] = crate::testutil::dead_pids();
     crate::live_sessions::LiveSession {
         session_id: session_id.to_string(),
         start_profile: start_profile.to_string(),
         harness: crate::harness::Harness::Claude,
-        pid: 4242,
+        pid: launcher_pid,
         claude_pid: None,
         launch_families: None,
         started_at: 1_700_000_000_000,
@@ -6076,7 +6078,7 @@ fn moves_off_a_home_that_refuses_credit_with(
     shape: impl FnOnce(&crate::testutil::HomeSandbox) -> Option<std::fs::File>,
 ) -> (usize, bool) {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let probed_names: &[&str] = if probed { &["a"] } else { &[] };
     let config = probed_session_config(&["a", "b"], "fable", probed_names, Some("a"));
     let store = credit_store(&["a", "b"], &[]);
@@ -6131,10 +6133,11 @@ fn a_probed_home_that_refuses_credit_moves_the_session_once() {
 #[test]
 fn a_429_two_rows_join_moves_no_session() {
     let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        let [other_pid] = crate::testutil::dead_pids();
         let mut other = session_row("8101-0", "b");
         other.follows_chain = false;
-        other.claude_pid = Some(77_778);
-        seed_session_record(home, "conv-a", 77_778);
+        other.claude_pid = Some(other_pid);
+        seed_session_record(home, "conv-a", other_pid);
         Some(register_live_row(&other))
     });
     assert_eq!(moved, (0, false));
@@ -6186,12 +6189,13 @@ fn a_429_placed_on_no_one_latches_nothing_beside_a_later_refusal() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
     let _config = session_config_models(&["a", "b"], &[], &[]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
+    let [other_pid] = crate::testutil::dead_pids();
     let mut other = session_row("4243-0", "b");
     other.follows_chain = false;
-    other.claude_pid = Some(77_778);
+    other.claude_pid = Some(other_pid);
     let other_marker = register_live_row(&other);
-    seed_session_record(&home, "conv-a", 77_778);
+    seed_session_record(&home, "conv-a", other_pid);
     record_refusal("a", 60_000);
     let held = refusal_on("a").expect("fixture control: another session's refusal");
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
@@ -6227,7 +6231,7 @@ fn a_429_a_flock_wait_kept_off_the_record_latches_nothing() {
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = credit_store(&["a", "b"], &["a", "b"]);
     let status = all_fresh(&["a", "b"]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -6311,7 +6315,7 @@ fn decision_after_a_refusal_at_home_then(
     then: Option<RefusalStep<'_>>,
 ) -> (Option<String>, Option<usize>) {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = session_store(&[("a", 10.0), ("b", 100.0)]);
     let status = all_fresh(&["a", "b"]);
@@ -6498,7 +6502,7 @@ fn a_turn_after_the_429_in_a_rewritten_file_clears_the_refusal() {
 #[test]
 fn a_clear_after_the_move_keeps_the_refusal_on_record() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
@@ -6552,11 +6556,12 @@ fn a_reused_id_finds_the_refusal_on_record() {
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8300-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     old.launch_families = Some(vec!["fable".to_string()]);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
     assert_eq!(
@@ -6589,7 +6594,7 @@ fn a_reused_id_finds_the_refusal_on_record() {
 #[test]
 fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
@@ -6660,11 +6665,12 @@ fn a_refusal_outlives_the_session_that_was_refused() {
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8700-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let marker = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
     assert!(
@@ -8423,11 +8429,12 @@ fn a_session_whose_claude_exited_places_its_refusal_through_its_row() {
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-d"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9200-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-d", 77_777);
+    seed_session_record(&home, "conv-d", child_pid);
     append_and_tail(&home, "conv-d", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_some(), "the row's join places it");
@@ -8526,12 +8533,13 @@ fn a_row_on_a_login_of_its_own_joins_no_refusal() {
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
     let plain = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9203-0", "a");
     row.pid = plain.pid();
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-o", 77_777);
+    seed_session_record(&home, "conv-o", child_pid);
     append_and_tail(&home, "conv-o", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     let placed = refusal_on("a")
@@ -8669,11 +8677,12 @@ fn a_row_whose_claude_the_service_runs_joins_no_refusal() {
         )
         .unwrap();
     };
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9207-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    record(77_777);
+    record(child_pid);
     append_and_tail(&home, "conv-s", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     let placed = refusal_on("a")
@@ -10135,7 +10144,7 @@ impl Drop for LiveChild {
 #[test]
 fn a_session_moves_on_its_own_spend_cap_429_row() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10160,7 +10169,7 @@ fn a_session_moves_on_its_own_spend_cap_429_row() {
 #[test]
 fn a_429_in_a_different_conversation_does_not_move_the_row() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10190,7 +10199,8 @@ fn a_row_without_a_child_pid_ignores_429s() {
     assert!(row.claude_pid.is_none(), "fixture: no recorded child pid");
     let _marker = register_live_row(&row);
 
-    seed_session_record(&home, "conv-a", 77_777);
+    let [record_pid] = crate::testutil::dead_pids();
+    seed_session_record(&home, "conv-a", record_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
 
@@ -10240,7 +10250,7 @@ fn a_credit_billed_launch_does_not_move_on_a_stale_cap_reading() {
 #[test]
 fn a_429_latched_while_no_target_exists_moves_once_a_member_frees() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10302,7 +10312,7 @@ fn a_fable_passthrough_launch_moves_off_a_capped_account() {
 #[test]
 fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10339,7 +10349,7 @@ fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
 #[test]
 fn a_latched_429_does_not_re_fire_after_the_member_changes() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10391,7 +10401,7 @@ fn a_latched_429_does_not_re_fire_after_the_member_changes() {
 #[test]
 fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_member() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -10419,7 +10429,7 @@ fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_mem
 #[test]
 fn a_429_followed_by_a_successful_turn_is_history() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10598,7 +10608,7 @@ fn write_subagent(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[Stri
 #[test]
 fn a_429_older_than_the_last_swap_does_not_move_the_session() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -10628,7 +10638,7 @@ fn a_429_older_than_the_last_swap_does_not_move_the_session() {
 #[test]
 fn a_latched_429_is_cleared_by_a_later_successful_turn() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10668,7 +10678,7 @@ fn a_latched_429_is_cleared_by_a_later_successful_turn() {
 fn same_file_success_pin(ok_ago: u64, cap_ago: u64) -> (Option<String>, Option<usize>) {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10778,14 +10788,15 @@ fn scan_with_no_target() -> (Option<String>, Option<usize>) {
     decision_of("4242-0")
 }
 
-/// A live row on `a` joined to `conv-a` through its child pid.
-fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
-    let child_pid = 77_777;
+/// A live row on `a` joined to `conv-a` through its child pid: the row's
+/// liveness marker and that pid.
+fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> (std::fs::File, u32) {
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let marker = register_live_row(&row);
     seed_session_record(home, "conv-a", child_pid);
-    marker
+    (marker, child_pid)
 }
 
 /// A clock step back between a 429 and the session's next successful turn: the
@@ -10796,7 +10807,7 @@ fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
 fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     let ok = ok_row_at(now - 602_000);
     write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
@@ -10831,7 +10842,7 @@ fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
 fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -10875,7 +10886,7 @@ fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
 fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     write_conv(
         &home,
         "conv-a",
@@ -10901,7 +10912,7 @@ fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
 fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -10938,7 +10949,7 @@ fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
 fn a_success_replayed_by_a_walk_miss_does_not_drop_a_later_429s_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -10987,7 +10998,7 @@ fn pad_row(c: char) -> String {
 fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11015,7 +11026,7 @@ fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
 fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", &[cap.clone(), pad_row('z')]);
     super::tps_producer_tick(now);
@@ -11043,7 +11054,7 @@ fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
 fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11080,7 +11091,7 @@ fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
 fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11088,7 +11099,9 @@ fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
     assert!(order_row_latched(), "control: the 429 latched");
 
     write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     assert!(record.exists(), "control: the fixture's session record");
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
@@ -11114,14 +11127,14 @@ fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
 fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
     assert!(order_row_latched(), "control: the 429 latched");
 
-    seed_session_record(&home, "conv-b", 77_777);
+    seed_session_record(&home, "conv-b", child_pid);
     super::tps_producer_tick(now + 1_000);
     assert_eq!(
         scan_with_b_free(),
@@ -11154,14 +11167,16 @@ fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
 fn an_unreadable_session_record_keeps_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
     assert!(order_row_latched(), "control: the 429 latched");
 
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     assert!(record.exists(), "control: the fixture's session record");
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
@@ -11180,7 +11195,7 @@ fn an_unreadable_session_record_keeps_the_latch() {
 fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -11225,7 +11240,7 @@ fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
 fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 700_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -11267,7 +11282,7 @@ fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
 fn a_scan_that_skips_the_latch_loses_no_position() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", &[cap.clone(), filler_row()]);
     super::tps_producer_tick(now);
@@ -11277,7 +11292,9 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
     // The shrink re-reads the line in a new life, and this scan never joins
     // the conversation, so it cannot touch the latch.
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
@@ -11288,7 +11305,7 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
 
     // The record returns and a success lands after the 429 in its new life,
     // stamped below it: line order still drops the latch.
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
     super::tps_producer_tick(now + 2_000);
     assert_eq!(
@@ -11307,7 +11324,7 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
 fn the_highest_stamp_across_files_latches_its_429() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     // Main file: the higher-stamped 429 first, the later line (lower stamp)
     // second, then a success after both.
     write_conv(
@@ -11345,7 +11362,7 @@ fn the_highest_stamp_across_files_latches_its_429() {
 #[test]
 fn a_subagent_success_does_not_clear_the_main_loops_429() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11482,7 +11499,7 @@ fn a_fable_session_does_not_walk_home_to_a_capped_soonest_reset_member() {
 #[test]
 fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11543,7 +11560,7 @@ fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move
 #[test]
 fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11570,7 +11587,7 @@ fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
 #[test]
 fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11645,7 +11662,7 @@ fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
 #[test]
 fn the_credit_seen_mark_is_rebuilt_after_a_scheduler_restart() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -12001,7 +12018,7 @@ fn a_session_that_must_leave_a_serving_sink_takes_a_serving_sibling_before_a_dea
 #[test]
 fn a_session_that_must_leave_a_spend_armed_active_takes_a_refusing_member_with_headroom() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
@@ -12118,7 +12135,7 @@ fn a_fable_session_skips_two_capped_gate_off_members_for_the_uncapped_third() {
 #[test]
 fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     // A current stint start: the 429 seeded a beat later postdates it, and the
     // reused row below keeps the SAME stint so the `started_at` key matches —
     // only the empty-scan clear then separates the dead session's mark from
@@ -12183,7 +12200,7 @@ fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
 #[test]
 fn a_non_empty_scan_prunes_the_dead_sessions_latch() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8022-0", "a");
     row.claude_pid = Some(child_pid);
     let marker = register_live_row(&row);
@@ -12264,14 +12281,15 @@ fn an_opus_session_does_not_move_on_another_sessions_429_in_a_shared_conversatio
 #[test]
 fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
     let home = crate::testutil::HomeSandbox::new();
+    let [first_pid, second_pid] = crate::testutil::dead_pids();
     let mut first = session_row("8026-0", "a");
-    first.claude_pid = Some(77_777);
+    first.claude_pid = Some(first_pid);
     let _m1 = register_live_row(&first);
     let mut second = session_row("8027-0", "a");
-    second.claude_pid = Some(88_888);
+    second.claude_pid = Some(second_pid);
     let _m2 = register_live_row(&second);
-    seed_session_record(&home, "conv-a", 77_777);
-    seed_session_record(&home, "conv-b", 88_888);
+    seed_session_record(&home, "conv-a", first_pid);
+    seed_session_record(&home, "conv-b", second_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -12298,7 +12316,7 @@ fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
 #[test]
 fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8028-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12332,7 +12350,7 @@ fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
 #[test]
 fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8029-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12379,7 +12397,7 @@ fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() 
 #[test]
 fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8030-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12415,7 +12433,7 @@ fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
 #[test]
 fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8031-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12449,7 +12467,7 @@ fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
 #[test]
 fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8033-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12481,7 +12499,7 @@ fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
 #[test]
 fn a_429_within_the_in_flight_grace_does_not_latch() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8034-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12513,7 +12531,7 @@ fn a_429_within_the_in_flight_grace_does_not_latch() {
 #[test]
 fn a_429_past_the_in_flight_grace_latches_and_moves() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8035-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12547,7 +12565,7 @@ fn a_429_past_the_in_flight_grace_latches_and_moves() {
 #[test]
 fn a_latched_429_survives_a_same_member_convergence_restamp() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8032-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -30181,12 +30199,13 @@ fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
     other.follows_chain = false;
     other.claude_pid = Some(other_child.pid());
     let _m1 = register_live_row(&other);
+    let [opus_pid] = crate::testutil::dead_pids();
     let mut opus = session_row("8051-0", "a");
-    opus.claude_pid = Some(88_888);
+    opus.claude_pid = Some(opus_pid);
     opus.launch_families = Some(vec!["opus".to_string()]);
     let _m2 = register_live_row(&opus);
     seed_live_session_record(&home, "conv-a", other_child.pid());
-    seed_session_record(&home, "conv-a", 88_888);
+    seed_session_record(&home, "conv-a", opus_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -30210,11 +30229,12 @@ fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
 fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [opus_pid] = crate::testutil::dead_pids();
     let mut opus = session_row("8052-0", "a");
-    opus.claude_pid = Some(88_888);
+    opus.claude_pid = Some(opus_pid);
     opus.launch_families = Some(vec!["opus".to_string()]);
     let _m = register_live_row(&opus);
-    seed_session_record(&home, "conv-a", 88_888);
+    seed_session_record(&home, "conv-a", opus_pid);
     seed_live_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30237,10 +30257,11 @@ fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row()
 #[test]
 fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
     let home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8055-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     let config = session_config_models(&["a", "b"], &[], &["a"]);
@@ -30290,8 +30311,9 @@ fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
 fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8057-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
     row.intended_member = Some("b".to_string());
     row.chain_cursor = Some(1);
@@ -30303,7 +30325,7 @@ fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
         .find_mut(&crate::profile::ProfileName::from("a"))
         .unwrap()
         .preferred = true;
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_live_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30328,10 +30350,11 @@ fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
 fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8058-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     let sessions = home.home().join(".claude/sessions");
     std::fs::write(
         sessions.join(format!("{}.json", other.pid())),
@@ -30358,7 +30381,7 @@ fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
 #[test]
 fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8090-0", "a");
     row.claude_pid = Some(child_pid);
     row.started_at = crate::usage::now_ms().saturating_sub(5_000);
@@ -30382,7 +30405,7 @@ fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
 #[test]
 fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8091-0", "a");
     row.claude_pid = Some(child_pid);
     row.started_at = crate::usage::now_ms().saturating_sub(60_000);
@@ -30408,10 +30431,11 @@ fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
 #[test]
 fn a_reused_id_on_the_same_member_does_not_fire_the_dead_latch() {
     let home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8092-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -30457,10 +30481,11 @@ fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
     let dead_start = crate::testutil::proc_start_of(dead_pid)
         .expect("the zombie's start is still readable before reaping");
     dead.wait().expect("reap");
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8094-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     #[cfg(target_os = "linux")]
     {
         let sessions = home.home().join(".claude/sessions");
@@ -30494,7 +30519,7 @@ fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
 #[test]
 fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8095-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -30533,8 +30558,9 @@ fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
 #[test]
 fn an_unmarked_swapped_row_returns_home() {
     let _home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8096-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
     row.intended_member = Some("b".to_string());
     row.chain_cursor = Some(1);
@@ -30568,10 +30594,11 @@ fn an_unmarked_swapped_row_returns_home() {
 fn a_live_pid_record_with_an_empty_start_does_not_make_the_429_ambiguous() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8197-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30602,10 +30629,11 @@ fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
     let start = crate::testutil::proc_start_of(gone_pid).expect("the child's start");
     gone.kill().expect("kill");
     gone.wait().expect("reap");
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8198-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     let sessions = home.home().join(".claude/sessions");
     std::fs::write(
         sessions.join(format!("{gone_pid}.json")),
@@ -31092,7 +31120,7 @@ fn the_tps_heartbeat_writes_on_the_first_tick_after_a_step_back() {
 fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -31136,7 +31164,7 @@ fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
 fn a_subagent_success_does_not_drop_the_main_files_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -33836,7 +33864,7 @@ fn credit_capped_home_moves_launched(
     launch_families: Option<Vec<String>>,
 ) -> usize {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
     {
         let mut cfg = config.lock().unwrap();
@@ -40766,7 +40794,7 @@ fn a_session_scan_under_a_spent_ticket_records_no_credit_refusal() {
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = credit_store(&["a", "b"], &["a", "b"]);
     let status = all_fresh(&["a", "b"]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);

@@ -1387,3 +1387,21 @@ fn a_wait_after_the_grace_lapsed_releases_at_once() {
     assert_eq!(body_json(&late)["error"], "ask_not_found");
     assert_eq!(hub.snapshot()["asks"][0]["held"], false, "released");
 }
+
+/// A launcher's thread id is no launch: the thread answers with the
+/// `clauth start` argv of its process, so a pid the kernel reissued as one of
+/// a launcher's threads would join that launcher's session row.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launchers_thread_id_is_no_clauth_launch() {
+    let home = HomeSandbox::new();
+    let launcher = crate::testutil::spawn_parked(home.home(), Some("clauth"), &["start"]);
+    let pid = launcher.0.id();
+    let tid = crate::testutil::a_thread_of(pid);
+    let verdicts = (is_clauth_launch(tid), is_clauth_launch(pid));
+    assert_eq!(
+        verdicts,
+        (false, true),
+        "(thread, leader) of a parked `clauth start`"
+    );
+}

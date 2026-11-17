@@ -3534,15 +3534,14 @@ fn is_clauth_launch(pid: u32) -> bool {
         return true;
     }
     use std::os::unix::ffi::OsStrExt;
-    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+    let Some(argv) = crate::runtime::process_argv(pid) else {
         return false;
     };
-    let mut args = cmdline.split(|byte| *byte == 0).filter(|a| !a.is_empty());
-    let (Some(argv0), Some(argv1)) = (args.next(), args.next()) else {
+    let [argv0, argv1, ..] = argv.as_slice() else {
         return false;
     };
     let name = Path::new(std::ffi::OsStr::from_bytes(argv0)).file_name();
-    name == Some(std::ffi::OsStr::new("clauth")) && matches!(argv1, b"start" | b"resume")
+    name == Some(std::ffi::OsStr::new("clauth")) && matches!(argv1.as_slice(), b"start" | b"resume")
 }
 
 #[cfg(target_os = "macos")]

@@ -994,7 +994,10 @@ pub(crate) fn split_stat_lstart(text: &str) -> Option<(&str, &str)> {
 /// counted from the last one: the state letter, then the ppid, then the
 /// start time (field 22 of the full stat). The start is `None` when the
 /// line ends before field 22 (a real `/proc` stat always carries it; only
-/// a short test line does not).
+/// a short test line does not). It asks no thread check itself: the
+/// children listing hands it only ids the `/proc` listing names, which
+/// leaves every non-leader thread out, and [`parent_at`] asks
+/// [`crate::runtime::proc_entry_is_thread`] before calling it.
 #[cfg(target_os = "linux")]
 fn stat_ppid_start_at(root: &Path, pid: u32) -> Option<(u32, Option<String>)> {
     let path = root.join(pid.to_string()).join("stat");
@@ -1008,16 +1011,22 @@ fn stat_ppid_start_at(root: &Path, pid: u32) -> Option<(u32, Option<String>)> {
 }
 
 /// The parent from `<root>/<pid>/stat` — [`stat_ppid_start_at`]'s ppid
-/// half.
+/// half; none for a thread's id.
 #[cfg(target_os = "linux")]
 fn parent_at(root: &Path, pid: u32) -> Option<u32> {
+    if crate::runtime::proc_entry_is_thread(root, pid) {
+        return None;
+    }
     stat_ppid_start_at(root, pid).map(|(ppid, _)| ppid)
 }
 
 /// The NUL-separated argv from `<root>/<pid>/cmdline`, without the trailing
-/// NUL's empty tail.
+/// NUL's empty tail; none for a thread's id.
 #[cfg(target_os = "linux")]
 fn argv_at(root: &Path, pid: u32) -> Option<Vec<String>> {
+    if crate::runtime::proc_entry_is_thread(root, pid) {
+        return None;
+    }
     let path = root.join(pid.to_string()).join("cmdline");
     let bytes =
         crate::runtime::read_regular_capped(&path, crate::runtime::RECORD_READ_CAP).ok()??;

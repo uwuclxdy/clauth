@@ -3356,6 +3356,107 @@ pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
         .map(|info| crate::runtime::format_proc_start(info.pbi_start_tvsec))
 }
 
+/// `N` pids that name no running process: each is a child spawned and reaped
+/// here, never one this process handed out before, so the fixture pids of one
+/// test stay distinct however the OS reissues a freed pid. A made-up literal
+/// can name any process or thread the box runs once the kernel has issued
+/// that number.
+pub(crate) fn dead_pids<const N: usize>() -> [u32; N] {
+    // A leaf: nothing is acquired while it is held, so it never orders
+    // against `HOME_TEST_LOCK`.
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut handed_out = HANDED_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Every child stays unreaped until the last pid is picked, so a pid
+    // refused as handed out cannot come straight back to the next spawn.
+    let mut children = Vec::new();
+    let pids = std::array::from_fn(|_| {
+        loop {
+            #[cfg(unix)]
+            let child = Command::new("true").spawn();
+            #[cfg(windows)]
+            let child = Command::new("cmd").args(["/D", "/C", "exit 0"]).spawn();
+            let child = child.expect("spawn a child to reap");
+            let pid = child.id();
+            children.push(child);
+            if handed_out.insert(pid) {
+                break pid;
+            }
+        }
+    });
+    for mut child in children {
+        child.wait().expect("reap the child");
+    }
+    pids
+}
+
+/// A live thread of the test process that is not its thread-group leader,
+/// parked until drop: linux answers `kill(tid, 0)` and every `/proc/<tid>/…`
+/// file for it as for a process, the shape a recorded pid takes once the
+/// kernel reissues it as another program's thread id.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ParkedThread {
+    pub(crate) tid: u32,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl ParkedThread {
+    pub(crate) fn spawn() -> Self {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|link| link.file_name()?.to_str()?.parse::<u32>().ok());
+            let _ = tid_tx.send(tid);
+            // Returns once the owner releases it or drops the sender.
+            let _ = parked.recv();
+        });
+        let tid = tid_rx
+            .recv()
+            .ok()
+            .flatten()
+            .expect("the parked thread reads its tid off /proc/thread-self");
+        assert_ne!(
+            tid,
+            std::process::id(),
+            "the parked thread is no thread-group leader"
+        );
+        Self {
+            tid,
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ParkedThread {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            // A panic the parked thread raised is dropped: `Drop` never asserts.
+            drop(thread.join());
+        }
+    }
+}
+
+/// A thread of the live process `pid` other than its leader, off
+/// `/proc/<pid>/task`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn a_thread_of(pid: u32) -> u32 {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("list the process's threads")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|tid| *tid != pid)
+        .expect("the process runs a thread besides its leader")
+}
+
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
 /// instantly (the start pre-flight's heal calls them), the session spawn
 /// itself sleeps a bounded five seconds so the poll above can observe the
@@ -4322,23 +4423,25 @@ fn fixture_proxy_parent_parks() {
 }
 
 /// A live re-entered test binary that parks until SIGTERM or its parent's
-/// death, with `leading` as
-/// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
-/// while its environment (readable on macOS only for non-platform binaries)
-/// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
-/// owns its reap; the reaped `Owned` kills and waits on drop.
+/// death, with `arg0` (the binary's path when `None`) and `leading` as its
+/// argv: a live pid whose argv does NOT hold `daemon run` while its
+/// environment (readable on macOS only for non-platform binaries) carries the
+/// tree's `CLAUDE_CONFIG_DIR`, or one posing as a `clauth` subcommand. The
+/// caller records its start and owns its reap; the reaped `Owned` kills and
+/// waits on drop.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
+pub(crate) fn spawn_parked(config_dir: &Path, arg0: Option<&str>, leading: &[&str]) -> Owned {
+    use std::os::unix::process::CommandExt as _;
     let dir = tempfile::tempdir().expect("parked re-entry dir");
     let ready = dir.path().join("ready");
+    let mut cmd = reenter_parked(config_dir, leading, &ready);
+    if let Some(arg0) = arg0 {
+        cmd.arg0(arg0);
+    }
     // The child is owned from the spawn, so a panic during the readiness wait
     // below still kills and reaps it (the `Owned` Drop) instead of leaking a
     // forever-parked process.
-    let child = Owned(
-        reenter_parked(config_dir, leading, &ready)
-            .spawn()
-            .expect("spawn the re-entered test binary"),
-    );
+    let child = Owned(cmd.spawn().expect("spawn the re-entered test binary"));
     // Wait for the park test to write the ready file before returning, so the
     // caller records a pid that is already parked (and the tempdir can drop:
     // the ready path is no longer needed).

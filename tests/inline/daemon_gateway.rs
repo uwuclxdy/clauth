@@ -5666,3 +5666,19 @@ fn a_failed_boot_listing_logs_its_failure() {
     drop(live_child.kill());
     drop(live_child.wait());
 }
+
+/// A thread's id has no start time: its `/proc/<tid>/stat` reads like its
+/// process's, so a marker pid the kernel reissued as another program's thread
+/// id would read as a live process with that thread's start.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_id_has_no_start_time() {
+    let thread = crate::testutil::ParkedThread::spawn();
+    let start = process_start_time(thread.tid);
+    drop(thread);
+    assert_eq!(start, None, "a thread's id reads no start time");
+    assert!(
+        process_start_time(std::process::id()).is_some(),
+        "the leader still reads its start time"
+    );
+}

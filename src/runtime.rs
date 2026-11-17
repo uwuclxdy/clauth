@@ -2513,18 +2513,31 @@ pub(crate) mod namespaced_keychain_ledger {
 
     /// Whether a pid names a running process — `kill(pid, 0)` semantics on
     /// unix: the probe succeeds when the process exists, and `EPERM` (a
-    /// process this user may not signal) still proves existence. False on
-    /// non-unix, where no guarded delete ever runs and every row falls back
-    /// to the age bound.
-    #[allow(unsafe_code)]
+    /// process this user may not signal) still proves existence. On linux a
+    /// thread's id, which `kill` answers as well, reads false
+    /// (`pid_is_thread`). False on non-unix, where no guarded delete
+    /// ever runs and every row falls back to the age bound.
     pub(crate) fn pid_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
+            #[expect(
+                unsafe_code,
+                reason = "kill has no safe std wrapper; signal 0 probes existence and sends nothing"
+            )]
             // SAFETY: `pid` is a plain integer the OS interprets as a process
             // id; signal 0 probes existence and sends nothing (the same shape
             // `start::forward_signal` uses).
             let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            let exists =
+                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            #[cfg(target_os = "linux")]
+            {
+                exists && !super::pid_is_thread(pid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                exists
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8863,13 +8876,52 @@ fn environ_bytes_config_dir_is(environ: &[u8], tree: &Path) -> bool {
     }
 }
 
+/// Whether `<proc_root>/<pid>` is a thread that is not its thread-group
+/// leader. Linux answers `kill(tid, 0)` and every `/proc/<tid>/…` file for
+/// such a thread as for a process (measured 2026-11-17; only the `/proc`
+/// listing leaves it out), so a recorded pid the kernel reissued as another
+/// program's thread id would read as that program. `status` names the leader
+/// in `Tgid` and the entry in `Pid`. False when `status` cannot be read or
+/// parsed (the pid gone, a `hidepid` mount): each reader then keeps the
+/// verdict its own read gives.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_entry_is_thread(proc_root: &Path, pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")) else {
+        return false;
+    };
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(':')?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+    };
+    matches!((field("Tgid"), field("Pid")), (Some(tgid), Some(own)) if tgid != own)
+}
+
+/// [`proc_entry_is_thread`] under the host's `/proc`: every linux per-pid
+/// reader of a recorded pid asks it before trusting a read, except the
+/// daemon's inherited-children reads (`gateway::zombie_start`,
+/// `gateway::probe_inherited`), whose start-time match already refuses a
+/// reused pid. The children listing reads only ids the `/proc` listing
+/// names, which leaves threads out.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_is_thread(pid: u32) -> bool {
+    proc_entry_is_thread(Path::new("/proc"), pid)
+}
+
 /// The process `pid`'s environment as NUL-separated `KEY=value` bytes, read as
 /// the supervisor checks read it: `/proc/<pid>/environ` on linux, the
-/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, and on
-/// every other platform.
+/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, for a
+/// thread's id on linux, and on every other platform.
 pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         std::fs::read(format!("/proc/{pid}/environ")).ok()
     }
     #[cfg(target_os = "macos")]
@@ -8885,10 +8937,13 @@ pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
 
 /// The process `pid`'s argv, argv0 first: `/proc/<pid>/cmdline` on linux with
 /// empty words dropped, the `KERN_PROCARGS2` argv on macOS. `None` where it
-/// cannot be read, and on every other platform.
+/// cannot be read, for a thread's id on linux, and on every other platform.
 pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         Some(
             cmdline
@@ -9266,9 +9321,10 @@ fn supervisor_state(tree: &Path) -> SupervisorState {
 #[cfg(target_os = "linux")]
 fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
     // kill(0) proves the pid still names a process — live, zombie, or a
-    // hidepid-hidden one — without reading /proc. False means the pid is
-    // positively gone (only that counts as dead, never an unreadable or
-    // hidden `/proc/<pid>/stat`).
+    // hidepid-hidden one — and a readable `status` naming another thread-group
+    // leader turns it down as a thread's id. False means the pid is
+    // positively gone or a thread (only that counts as dead, never an
+    // unreadable or hidden `/proc/<pid>/stat`).
     if !namespaced_keychain_ledger::pid_alive(pid) {
         return SupervisorState::Gone;
     }
@@ -9685,9 +9741,12 @@ fn supervisor_argv_and_config_dir_match(pid: u32, tree: &Path) -> bool {
 
 /// Whether the process `pid`'s cmdline holds `daemon` immediately followed by
 /// `run` — the transient supervisor's argv shape (`claude daemon run --origin
-/// transient`, measured).
+/// transient`, measured). False for a thread's id.
 #[cfg(target_os = "linux")]
 fn cmdline_holds_daemon_run(pid: u32) -> bool {
+    if pid_is_thread(pid) {
+        return false;
+    }
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -9700,10 +9759,7 @@ fn cmdline_holds_daemon_run(pid: u32) -> bool {
 /// mismatch is another tree's supervisor.
 #[cfg(target_os = "linux")]
 fn environ_config_dir_is(pid: u32, tree: &Path) -> bool {
-    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
-        return false;
-    };
-    environ_bytes_config_dir_is(&environ, tree)
+    process_environ(pid).is_some_and(|environ| environ_bytes_config_dir_is(&environ, tree))
 }
 
 /// Whether the process `pid` holds the transient supervisor's argv AND its

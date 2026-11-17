@@ -3516,7 +3516,7 @@ fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
     let tree = background_tree(&shim);
     // A live process with the right config dir and the recorded (real) start,
     // but argv that is NOT `daemon run`.
-    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let mut foreign = crate::testutil::spawn_parked(&tree, None, &["not", "a", "supervisor"]);
     let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
     crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
     for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {

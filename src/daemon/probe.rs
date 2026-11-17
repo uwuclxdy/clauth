@@ -797,15 +797,8 @@ pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
 /// operator re-runs against the settled successor rather than signalling blind.
 #[cfg(target_os = "linux")]
 fn pid_is_clauth_daemon(pid: u32) -> bool {
-    // `/proc/<pid>/cmdline` is NUL-separated argv; a gone pid fails the read.
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    cmdline_is_daemon(
-        raw.split(|&b| b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| a.to_vec()),
-    )
+    // A gone pid and a thread's id read no argv.
+    crate::runtime::process_argv(pid).is_some_and(|argv| cmdline_is_daemon(argv.into_iter()))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]

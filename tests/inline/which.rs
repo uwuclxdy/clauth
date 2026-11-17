@@ -2551,6 +2551,23 @@ fn the_host_process_table_reads_the_real_proc_whatever_the_env_says() {
     assert_eq!(argv.first(), std::env::args().next().as_ref());
 }
 
+/// A thread's id is no process in the host table: its `/proc/<tid>/stat` and
+/// `cmdline` read like its process's, so a `--pid` the kernel reissued as
+/// another program's thread id would walk that program's parents.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_process_table_reads_a_thread_id_as_no_process() {
+    let thread = crate::testutil::ParkedThread::spawn();
+    let verdicts = (SystemProcs.parent(thread.tid), SystemProcs.argv(thread.tid));
+    drop(thread);
+    assert_eq!(verdicts, (None, None), "(parent, argv) for a thread's id");
+    let leader = std::process::id();
+    assert!(
+        SystemProcs.parent(leader).is_some() && SystemProcs.argv(leader).is_some(),
+        "the leader still reads its parent and argv"
+    );
+}
+
 /// Plain `which` and `which --pid` print the profile, and nothing at all when
 /// nothing resolves, so a caller's `[ -n "$(clauth which)" ]` reads true only
 /// for a real profile.
