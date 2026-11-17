@@ -2963,7 +2963,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
     assert_eq!(bytes_after_first, bytes_after_second);
 }
 
-/// The backfill's save is independent of `record`'s: on an idle cycle
+/// The backfill's save is independent of `record_covering`'s: on an idle cycle
 /// (watermark already at yesterday, nothing new to record) the done flag and
 /// filled hours must still persist — otherwise the pass re-sweeps the whole
 /// corpus every 90s until a day records.
@@ -2977,8 +2977,8 @@ fn backfill_persists_when_record_has_nothing_new() {
         let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
         iso.get(..10).map(str::to_owned).unwrap_or(iso)
     };
-    // A v1 ledger whose watermark is ALREADY at yesterday: record() has
-    // nothing to advance or write, so its own save never fires.
+    // A v1 ledger whose watermark is ALREADY at yesterday: record_covering()
+    // has nothing to advance or write, so its own save never fires.
     write_v1_ledger(
         &clauth_dir,
         &yesterday,
@@ -3011,8 +3011,8 @@ fn backfill_persists_when_record_has_nothing_new() {
     let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
     let base = TokenStats::default(); // nothing mergeable
     assert!(
-        !ledger.record(&base, &today),
-        "fixture: record() must have nothing to do"
+        !ledger.record_covering(&base, &today, true),
+        "fixture: record_covering() must have nothing to do"
     );
     persist_ledger(
         &claude_dir,
@@ -3020,6 +3020,7 @@ fn backfill_persists_when_record_has_nothing_new() {
         &clauth_dir,
         &base,
         &today,
+        true,
         |_, _| {},
     );
 
@@ -3087,6 +3088,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
         &clauth_dir,
         &TokenStats::default(),
         &today,
+        true,
         |_, _| {},
     );
 
@@ -4200,6 +4202,7 @@ fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
         &clauth_dir,
         &TokenStats::default(),
         "2026-06-20",
+        true,
         |_, _| {},
     );
 
@@ -4243,6 +4246,7 @@ fn persist_ledger_does_not_write_the_speed_ledger() {
         &clauth,
         &base,
         "2026-10-15",
+        true,
         |_, _| {},
     );
 
@@ -5109,7 +5113,12 @@ fn the_first_paint_has_no_advisor_tokens_and_each_merged_view_exactly_one() {
     );
 
     let mut cache = TopUpCache::default();
-    refresh_topup_cache(&claude_dir, Some("2026-06-10"), &mut cache, |_, _| {});
+    refresh_topup_cache(
+        &claude_dir,
+        TopUpCutoff::After("2026-06-10"),
+        &mut cache,
+        |_, _| {},
+    );
     let advisor_in = |s: &TokenStats| {
         s.today.as_ref().map_or(0, |t| {
             t.models
@@ -5131,7 +5140,12 @@ fn the_first_paint_has_no_advisor_tokens_and_each_merged_view_exactly_one() {
     // Today IS the cutoff day: the cutoff day's lines feed today's rollup only
     // (the stats-cache owns that day's history), the later days feed day rows.
     let mut merged = load_base(&claude_dir).expect("base");
-    merge_topup(&mut merged, &cache, Some("2026-06-10"), "2026-06-10");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-10",
+    );
     assert_eq!(advisor_in(&merged), 100);
     assert_eq!(day_input(&merged, "2026-06-10"), 0);
     assert_eq!(day_input(&merged, "2026-06-11"), 100);
@@ -5144,7 +5158,12 @@ fn the_first_paint_has_no_advisor_tokens_and_each_merged_view_exactly_one() {
     // Today is a post-cutoff day: it lands in today's rollup and in its day
     // row, once each; the other post-cutoff day stays a day row only.
     let mut merged = load_base(&claude_dir).expect("base");
-    merge_topup(&mut merged, &cache, Some("2026-06-10"), "2026-06-12");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-12",
+    );
     assert_eq!(advisor_in(&merged), 100);
     assert_eq!(day_input(&merged, "2026-06-11"), 100);
     assert_eq!(day_input(&merged, "2026-06-12"), 100);
@@ -5155,7 +5174,12 @@ fn the_first_paint_has_no_advisor_tokens_and_each_merged_view_exactly_one() {
 
     // Today with no advisor lines: nothing is attributed to it.
     let mut merged = load_base(&claude_dir).expect("base");
-    merge_topup(&mut merged, &cache, Some("2026-06-10"), "2026-06-20");
+    merge_topup(
+        &mut merged,
+        &cache,
+        TopUpCutoff::After("2026-06-10"),
+        "2026-06-20",
+    );
     assert_eq!(advisor_in(&merged), 0);
     assert_eq!(day_input(&merged, "2026-06-11"), 100);
     assert_eq!(day_input(&merged, "2026-06-12"), 100);

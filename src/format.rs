@@ -164,6 +164,16 @@ pub(crate) enum Cause {
     /// `store` is the dir the refusal names (the global store or the account's
     /// own `jobs/`).
     UnreadableJobStoreOnRotatingChain { profile: String, store: String },
+    /// The job store holds a job dir that never clears on its own — a
+    /// record-less dir of no known shape, or a record read whole that fails
+    /// both parses and is older than the mid-create grace — so clauth cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL stuck dir
+    /// blocks every profile on macOS until it is deleted; a tree-local one
+    /// blocks only the profile whose store holds it. Split from
+    /// [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
+    /// help: only deleting the named dir lets the rotation through. The `dir`
+    /// is the job dir, rendered home-relative by the caller.
+    UnreadableJobDirOnRotatingChain { profile: String, dir: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -262,6 +272,11 @@ impl Cause {
             Self::UnreadableJobStoreOnRotatingChain { profile, store } => {
                 format!(
                     "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
+                )
+            }
+            Self::UnreadableJobDirOnRotatingChain { profile, dir } => {
+                format!(
+                    "can't read claude code's background job ({dir}), so '{profile}' is not rotated; delete that dir to rotate"
                 )
             }
             Self::RotationLockHeld(profile) => {
@@ -617,9 +632,10 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
-/// The CLI switch over an unsaved live login whose outgoing account runs on a
+/// A switch over an unsaved live login whose outgoing account runs on a
 /// long-lived token: that account's store cannot take an OAuth login, so the
-/// switch does not offer to save it there.
+/// CLI switch does not offer to save it there and the headless switch's
+/// `Overwrite` default (the plugin, the API) refuses before capturing.
 pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
     format!(
         "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
@@ -1024,11 +1040,20 @@ pub(crate) fn format_pct(pct: f64) -> String {
 /// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
 /// a surface-local twin of this is a drift, not a specialization.
 pub(crate) fn format_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
-    }
+    let decimals = amount_decimals(n);
+    format!("{n:.decimals$}")
+}
+
+/// Whole amounts print bare, fractions at two decimals.
+fn amount_decimals(n: f64) -> usize {
+    if n.fract() == 0.0 { 0 } else { 2 }
+}
+
+/// [`format_amount`], grouped with `,` thousands separators and the sign ahead
+/// of the first group (`-1,234.50`).
+pub(crate) fn format_amount_grouped(n: f64) -> String {
+    let sign = if n < 0.0 { "-" } else { "" };
+    format!("{sign}{}", group_thousands(n.abs(), amount_decimals(n)))
 }
 
 /// A token threshold in its display form: exact millions as `{n}M` (`2M`),
@@ -1042,6 +1067,22 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
         format!("{}k", v / 1000)
     } else {
         v.to_string()
+    }
+}
+
+/// A token amount as the pool bar's compact figure: `7.5B`, `285M`, `12k`.
+pub(crate) fn format_compact(n: f64) -> String {
+    let trim = |scaled: String| {
+        scaled
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    match n.abs() {
+        magnitude if magnitude >= 1e9 => format!("{}B", trim(format!("{:.2}", n / 1e9))),
+        magnitude if magnitude >= 1e6 => format!("{}M", trim(format!("{:.1}", n / 1e6))),
+        magnitude if magnitude >= 1e3 => format!("{:.0}k", n / 1e3),
+        _ => format!("{n:.0}"),
     }
 }
 
@@ -1082,11 +1123,12 @@ pub(crate) fn local_date(epoch: i64) -> Option<String> {
     ))
 }
 
-/// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
-/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
-/// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
-/// --json`'s `updated` — do not route through here.
+/// The LOCAL prose-stamp formatter: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock.
+/// [`local_minute_stamp`] is the listing-cell spelling beside it; any other
+/// spelling of a LOCAL stamp is a bug in its caller, not a new helper. Machine
+/// timestamps that stay UTC by design — the daemon `logline!` prefix and
+/// `clauth sessions --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
     let naive = DateTime::from_timestamp(epoch, 0)?
@@ -1098,6 +1140,22 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.hour(),
         naive.minute(),
         naive.second(),
+    ))
+}
+
+/// [`local_stamp`] without the seconds: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM` in the operator's local wall clock, the shape a listing
+/// cell shows. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_minute_stamp(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{} {:02}:{:02}",
+        local_date(epoch)?,
+        naive.hour(),
+        naive.minute(),
     ))
 }
 

@@ -69,15 +69,23 @@ fn clear_errors_on_a_non_file() {
     assert!(err.to_string().contains("could not remove"), "{err}");
 }
 
-/// `fresh_stamp` is read-only: a stale record is reported absent, never
-/// removed, so `--list` does not mutate the store.
+/// `fresh_record` is read-only: a stale record is reported absent, never
+/// removed, so a listing does not mutate the store; a fresh one comes back
+/// whole, its id included, for the note naming the command that re-sends it.
 #[test]
-fn fresh_stamp_reads_without_removing() {
+fn fresh_record_reads_without_removing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("record.json");
     write(&path, &codex_record(crate::usage::now_ms() - 600_000)).expect("write stale");
-    assert_eq!(fresh_stamp::<CodexPending>(&path), None);
-    assert!(path.exists(), "--list removes nothing");
+    assert!(fresh_record::<CodexPending>(&path).is_none());
+    assert!(path.exists(), "a listing removes nothing");
+    let sent_at_ms = crate::usage::now_ms();
+    write(&path, &codex_record(sent_at_ms)).expect("write fresh");
+    let record = fresh_record::<CodexPending>(&path).expect("a fresh record");
+    assert_eq!(
+        (record.credit_id.as_str(), record.sent_at_ms),
+        (codex_record(sent_at_ms).credit_id.as_str(), sent_at_ms)
+    );
 }
 
 /// The freshness boundary is the record's distance from now on either side:

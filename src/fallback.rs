@@ -717,16 +717,16 @@ pub(crate) enum ActiveBurnRate {
     Supplied(Option<f64>),
 }
 
-/// Burn-aware exhaustion test shared by [`is_exhausted_active_from_usage`] and
-/// [`is_exhausted_projected`] (issue #8 follow-up b, opt-in — off by
-/// default). The static `util_pct >= threshold` check always applies, so
-/// enabling burn-aware can only ever move the switch EARLIER than mode-off,
-/// never later. `None` burn (no history yet, a fresh profile, or a provider
-/// with none) leaves only that static check — never uncovers an account for
-/// lack of data. With a rate, the projection ADDS an earlier trip inside the
-/// `floor_pct.min(threshold)..threshold` band: a heavier burn crosses the 100%
-/// cap before the next poll and switches sooner, a light one runs on since it
-/// won't blow the cap in time. (Above `threshold` the static check has already
+/// Burn-aware exhaustion test behind [`is_exhausted_active_from_usage`]
+/// (opt-in — off by default). The static
+/// `util_pct >= threshold` check always applies, so enabling burn-aware can
+/// only ever move the switch EARLIER than mode-off, never later. `None` burn
+/// (no history yet, a fresh profile, or a provider with none) leaves only that
+/// static check — never uncovers an account for lack of data. With a rate, the
+/// projection ADDS an earlier trip inside the
+/// `floor_pct.min(threshold)..threshold` band: a heavier burn reaches the 100%
+/// cap within the look-ahead and switches sooner, a light one runs on since it
+/// won't reach the cap in time. (Above `threshold` the static check has already
 /// fired, so the band's upper bound is `threshold`; a `floor_pct` set above
 /// `threshold` — the stock default 98 over 95 — just clamps to `threshold` and
 /// burn-aware reduces to static.)
@@ -1221,9 +1221,9 @@ pub(crate) struct ChainSnapshot {
     /// revoked/invalid (AUTH-1). Excluded from every walk pass so a dead token
     /// is never installed unattended.
     pub(crate) broken: Vec<ProfileName>,
-    /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
-    /// gates whether the ACTIVE-side check in `next_auto_switch_target`
-    /// projects ahead of the next poll instead of using the static threshold.
+    /// Snapshot of `AppState::burn_aware_switching` — gates whether the
+    /// ACTIVE-side check in `next_auto_switch_target` also projects ahead,
+    /// beside the static threshold, which still applies.
     pub(crate) burn_aware: bool,
     /// Snapshot of `AppState::walk_order()` (issue #86) — which member each
     /// accept pass lands on. `Chain` is the default and today's walk byte for
@@ -1834,7 +1834,7 @@ fn is_exhausted_active_from_usage(
         // A third-party member's provider window has no burn history to pair
         // (no third-party leg appends `usage_history.jsonl`), so the static
         // threshold decides — never a cross-pool projection of the OAuth leg's
-        // burn onto the provider window (maintainer ruling 2026-09-10).
+        // burn onto the provider window.
         return window.utilization >= member.threshold;
     }
     let rate = match rate {

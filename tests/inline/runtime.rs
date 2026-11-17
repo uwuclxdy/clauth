@@ -4653,6 +4653,168 @@ fn runtime_settings_retightens_a_loose_file_with_current_bytes() {
     });
 }
 
+fn read_settings_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read settings")).expect("parse settings")
+}
+
+/// Build one shared tree from an operator file holding `days`, so the build
+/// remembers it the way production learns it.
+fn remember_through_a_build(root: &Path, claude_home: &Path, days: u64) {
+    fs::write(
+        claude_home.join("settings.json"),
+        serde_json::to_vec(&serde_json::json!({"cleanupPeriodDays": days})).expect("serialize"),
+    )
+    .expect("write operator settings");
+    let runtime = root.join("runtime-remember");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    write_merged_settings(
+        &runtime,
+        claude_home,
+        &make_profile("p"),
+        Isolation::Shared,
+        &[],
+    )
+    .expect("write_merged_settings");
+    assert_eq!(
+        crate::retention::load().expect("load").days,
+        Some(days),
+        "the build remembers the number"
+    );
+}
+
+#[test]
+fn a_shared_build_from_a_keyless_operator_file_puts_the_remembered_number_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let operator = claude_home.join("settings.json");
+        fs::write(&operator, br#"{"theme":"light"}"#).expect("drop the key");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650),
+            "the copy carries the number"
+        );
+        assert_eq!(
+            read_settings_json(&operator),
+            serde_json::json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+            "the operator file gets it back"
+        );
+        assert_eq!(
+            crate::retention::load().expect("load"),
+            crate::retention::Retention {
+                days: Some(3650),
+                question_open: true
+            }
+        );
+    });
+}
+
+#[test]
+fn a_shared_build_with_no_operator_file_carries_the_remembered_number_in_the_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let operator = claude_home.join("settings.json");
+        fs::remove_file(&operator).expect("remove the operator file");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650)
+        );
+        assert!(!operator.exists(), "clauth never creates the operator file");
+        assert!(!crate::retention::load().expect("load").question_open);
+    });
+}
+
+#[test]
+fn an_isolated_build_carries_no_retention_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        remember_through_a_build(tmp.path(), &claude_home, 3650);
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p"),
+            Isolation::Isolated,
+            &[],
+        )
+        .expect("write_merged_settings");
+
+        assert!(
+            read_settings_json(&runtime.join("settings.json"))
+                .get("cleanupPeriodDays")
+                .is_none()
+        );
+    });
+}
+
+/// A retention-record fault (the record path is a directory) never refuses a
+/// shared build: the operator file's own number still reaches the copy. The
+/// sync half of this fault lives in
+/// `a_retention_record_fault_never_stops_the_merge_or_a_build` (settings-sync
+/// tests).
+#[test]
+fn a_retention_record_fault_never_refuses_a_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"cleanupPeriodDays":3650,"theme":"light","env":{}}"#,
+        )
+        .expect("write operator settings");
+        let record = crate::retention::record_path().expect("record path");
+        fs::create_dir_all(record.parent().expect("record dir")).expect("mkdir ~/.clauth");
+        fs::create_dir_all(&record).expect("make the record path a directory");
+        let runtime = tmp.path().join("runtime-build");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        write_merged_settings(
+            &runtime,
+            &claude_home,
+            &make_profile("p1"),
+            Isolation::Shared,
+            &[],
+        )
+        .expect("a retention fault never refuses the build");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["cleanupPeriodDays"],
+            serde_json::json!(3650),
+            "the build still writes its copy"
+        );
+    });
+}
+
 /// Issue #17 systemic finding: a raw copy is born carrying whichever account
 /// was active at seed time, wrong for every non-active profile. Seeding must
 /// strip it so the fresh runtime starts identity-less and Claude Code
@@ -8943,17 +9105,199 @@ fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
             .expect("mkdir the record-less dir");
 
         let jobs = crate::claude_jobs::job_trees();
-        let store = match jobs.unfinished_under(&profiles.join("anyaccount")) {
-            Err(store) => store,
+        let refusal = match jobs.unfinished_under(&profiles.join("anyaccount")) {
+            Err(refusal) => refusal,
             Ok(trees) => panic!(
                 "a global mid-create store must fail the rotation term closed, got {trees:?}"
             ),
         };
         assert_eq!(
-            store,
+            refusal.store,
             std::path::PathBuf::from("~/.claude/jobs"),
             "the refusal names the conventional global store, as every other \
              global-store refusal spells it"
+        );
+        assert_eq!(
+            refusal.stuck_dir, None,
+            "a mid-create dir clears on its own"
+        );
+    });
+}
+
+/// Backdate `path` (a dir or a file) by a day, far past the mid-create grace.
+fn backdate_by_a_day(path: &std::path::Path) {
+    crate::testutil::set_mtime(
+        path,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60),
+    );
+}
+
+/// An EMPTY global job dir older than the mid-create grace is an abandoned
+/// creation, not one in flight: it must not fail the rotation term closed, or
+/// one leftover dir blocks every account's token rotation for good.
+#[test]
+fn an_old_empty_global_job_dir_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("54705843");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        backdate_by_a_day(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Ok(Vec::new()),
+            "an abandoned empty job dir names no job and must not block rotation"
+        );
+    });
+}
+
+/// The staged-only mid-create shape ages out the same way: an old dir holding
+/// only an old `state.json.tmp.*` is an abandoned creation.
+#[test]
+fn an_old_staged_only_global_job_dir_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f6");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        let staged = job.join("state.json.tmp.123.456");
+        fs::write(&staged, b"{").expect("stage a record");
+        backdate_by_a_day(&staged);
+        backdate_by_a_day(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Ok(Vec::new()),
+            "an abandoned staged-only job dir names no job and must not block rotation"
+        );
+    });
+}
+
+/// A YOUNG staged record inside an old dir keeps the shape mid-create: the
+/// newest mtime decides, so a record being written right now still fails the
+/// gate closed.
+#[test]
+fn a_fresh_staged_record_in_an_old_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f7");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        fs::write(job.join("state.json.tmp.123.789"), b"{").expect("stage a record");
+        backdate_by_a_day(&job);
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
+            "a record staged inside the grace is still a creation in flight"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
+        );
+    });
+}
+
+/// A creation a minute old is still in flight, not abandoned: the grace must
+/// cover a creation's write-then-rename with room to spare.
+#[test]
+fn a_minute_old_empty_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f9");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        crate::testutil::set_mtime(
+            &job,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        );
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
+            "a minute-old mid-create dir is a creation in flight and fails closed"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
+        );
+    });
+}
+
+/// An OLD empty global job dir holds no gate that reads the store: the macOS
+/// rotation runs, the account reads idle, and its dead tree is collected.
+/// Driven through the gates themselves, not the store reader alone.
+#[test]
+fn an_old_empty_global_job_dir_blocks_no_gate() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "f169", "runtime-4242-169", "4242-169");
+        let job = tmp.path().join(".claude").join("jobs").join("54705843");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        backdate_by_a_day(&job);
+        let name = crate::profile::ProfileName::from("f169");
+
+        assert_eq!(
+            rotation_block_on(&name, true),
+            None,
+            "the macOS rotation is not refused over an abandoned job dir"
+        );
+        assert!(
+            !has_live_session(&name),
+            "an abandoned job dir keeps no account live"
+        );
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists() && !sessions.exists(),
+            "the dead tree is collected"
+        );
+    });
+}
+
+/// A job dir whose mtime lies in the FUTURE cannot prove its age, so it stays
+/// mid-create and the gate fails closed: a clock stepped back must never read
+/// a creation in flight as abandoned.
+#[test]
+fn a_future_dated_empty_job_dir_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(profiles.join("anyaccount")).expect("mkdir a profile dir");
+        let job = tmp.path().join(".claude").join("jobs").join("0add99f8");
+        fs::create_dir_all(&job).expect("mkdir the record-less dir");
+        crate::testutil::set_mtime(
+            &job,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60),
+        );
+
+        let jobs = crate::claude_jobs::job_trees();
+        assert_eq!(
+            jobs.unfinished_under(&profiles.join("anyaccount")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
+            "a future-dated mid-create dir cannot prove it is old and must fail closed"
+        );
+        assert!(
+            jobs.global_mid_create_store().is_some(),
+            "the store reads mid-create, not unreadable"
         );
     });
 }
@@ -13757,6 +14101,61 @@ fn a_truncating_filesystem_gets_no_receipt_at_all() {
             last_write,
             "precondition: the swap still stamped, so the refusal is the receipt's alone"
         );
+    });
+}
+
+/// The global switch's stamp, keyed the way a swap's is: a legacy
+/// `credentials.json.pending` on the incoming store is settled by its own rule
+/// BEFORE the stamp. Posed on a truncating filesystem, where the stamp lands
+/// with no receipt, so a stamp ahead of the settlement makes the store read as
+/// written after the sidecar and the next load discards the rotation for good.
+#[cfg(unix)]
+#[test]
+fn global_switch_settles_a_pending_sidecar_before_its_stamp() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let a = member("pend-a");
+        let b = member("pend-b");
+        let a_store = member_store(&a);
+        let b_store = member_store(&b);
+        let same = SystemTime::now() - Duration::from_secs(3600);
+        set_mtime(&a_store, same);
+        set_mtime(&b_store, same);
+        // An interrupted commit: the sidecar ties the store, which the rule adopts.
+        let pending = b_store.with_file_name("credentials.json.pending");
+        fs::write(
+            &pending,
+            br#"{"claudeAiOauth":{"accessToken":"at-rotated","refreshToken":"rt-rotated"}}"#,
+        )
+        .expect("stage pending");
+        set_mtime(&pending, same);
+        let name = crate::profile::ProfileName::from;
+
+        crate::claude::force_link_profile_credentials(&name("pend-a")).expect("link a");
+        with_coarse_mtime(|| {
+            crate::claude::force_link_profile_credentials(&name("pend-b")).expect("switch to b");
+        });
+
+        // Read before the load below, which would land a sidecar the switch
+        // left behind and move the mtime itself.
+        let link = crate::claude::claude_credentials_path().expect("creds path");
+        assert_eq!(
+            crate::canonical::identity(&link).expect("resolve link"),
+            crate::canonical::identity(&b_store).expect("resolve b")
+        );
+        assert_ne!(
+            file_mtime(&link),
+            Some(same),
+            "a running session memoized a's mtime; b must not resolve to the same one"
+        );
+
+        let stored = crate::profile::load_profile(&name("pend-b")).expect("load b");
+        assert_eq!(
+            stored.credentials.as_ref().and_then(|c| c.refresh_token()),
+            Some("rt-rotated"),
+            "the sidecar's rotation must survive the switch's stamp"
+        );
+        assert!(!pending.exists(), "the settled sidecar is removed");
     });
 }
 

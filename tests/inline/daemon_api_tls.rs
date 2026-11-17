@@ -12,7 +12,7 @@
 //! itself decides: which files it reads, how it merges the issuer chain, and
 //! what it does when one is missing. Whether the resulting chain and key
 //! actually make a working handshake is a property of the operator's lego
-//! output, checked in the end-to-end run in wiki/Daemon.md, not here.
+//! output, which no test here checks.
 
 use super::*;
 
@@ -287,15 +287,16 @@ fn the_default_certificate_directory_matches_the_platform() {
     }
 }
 
-/// `tls.json` is created on first use, so an operator has a file to edit rather
-/// than a documented path to retype.
+/// `tls.json` is created on a start's first use, so an operator has a file to
+/// edit rather than a documented path to retype.
 #[test]
 fn tls_config_is_written_with_the_platform_default_on_first_use() {
     let _home = HomeSandbox::new();
     let path = clauth_dir().expect("clauth dir").join("tls.json");
     assert!(!path.exists(), "sandbox starts without one");
 
-    let dir = cert_dir().expect("first read creates the file");
+    create_default_tls_config().expect("first use creates the file");
+    let dir = cert_dir().expect("the read takes the default");
     assert_eq!(
         dir,
         default_cert_dir().expect("default"),
@@ -324,6 +325,28 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
     );
 }
 
+/// A read is the whole of `cert_dir`: with no `tls.json`, the answer is the
+/// platform default and nothing is written. The read runs inside the handover
+/// probe's answer, so a write here would edit the home of a binary the probe
+/// only asked a question — and a kill mid-write would leave a staged temp file.
+#[test]
+fn a_read_takes_the_default_without_writing_the_config() {
+    let _home = HomeSandbox::new();
+    let path = clauth_dir().expect("clauth dir").join("tls.json");
+    assert!(!path.exists(), "sandbox starts without one");
+
+    assert_eq!(
+        cert_dir().expect("an absent file reads as the default"),
+        default_cert_dir().expect("default"),
+        "an absent file reads as the platform default"
+    );
+    assert!(
+        !path.exists(),
+        "the read must not create the file: {}",
+        path.display()
+    );
+}
+
 /// `tls.json` inherits the tree's 0600, like every other file clauth writes.
 ///
 /// It holds no key material — it names a directory — but the pin is on the tree
@@ -333,7 +356,7 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
 #[test]
 fn tls_config_is_owner_only() {
     let _home = HomeSandbox::new();
-    cert_dir().expect("first read creates the file");
+    create_default_tls_config().expect("first use creates the file");
     let left = crate::testutil::owner_only_violations(&clauth_dir().expect("clauth dir"));
     assert!(
         left.is_empty(),
@@ -345,9 +368,10 @@ fn tls_config_is_owner_only() {
 fn an_edited_cert_dir_is_honored_across_restarts() {
     let _home = HomeSandbox::new();
     let path = clauth_dir().expect("clauth dir").join("tls.json");
-    cert_dir().expect("create the default");
+    create_default_tls_config().expect("create the default");
 
     std::fs::write(&path, r#"{"schema":1,"cert_dir":"/opt/certs/lego"}"#).expect("edit");
+    create_default_tls_config().expect("a later start leaves an existing file alone");
     assert_eq!(
         cert_dir().expect("read edited"),
         Path::new("/opt/certs/lego"),
@@ -366,8 +390,8 @@ fn an_edited_cert_dir_is_honored_across_restarts() {
 fn a_malformed_tls_config_refuses_rather_than_reverting_to_the_default() {
     let _home = HomeSandbox::new();
     let path = clauth_dir().expect("clauth dir").join("tls.json");
-    // Nothing has created ~/.clauth yet: these cases seed the file directly
-    // instead of letting `cert_dir` write it.
+    // Nothing has created ~/.clauth yet: these cases seed the file directly,
+    // since only the start writes one.
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
 
     for bad in ["{", "", "[]", r#"{"schema":1}"#] {

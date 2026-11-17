@@ -6,9 +6,9 @@
 //! `non-login keys`, `refresh` cadence, `refresh spent` toggle, `context
 //! nudge`, `auto-start queue`, `rotation`, `auto-update`), auto-switch
 //! (`weekly limit`,
-//! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
+//! `switch mode` = burn-aware, `walk order`, the burn-aware
 //! `burn floor`/`burn horizon`
-//! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
+//! tunables it gates, then the `quota spent` halt), then
 //! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
 //! default — real money).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
@@ -30,8 +30,8 @@ use crate::profile::{
 
 use super::super::app::{
     App, BURN_FLOOR_PRESETS, BURN_HORIZON_PRESETS, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState,
-    WEEKLY_PRESETS, format_weekly_pct, parse_context_nudge_tokens, parse_refresh_secs,
-    parse_weekly_pct,
+    WEEKLY_PRESETS, format_weekly_pct, global_config_row_live, parse_context_nudge_tokens,
+    parse_refresh_secs, parse_weekly_pct,
 };
 use super::super::theme::{self, Tier};
 use super::format::truncate;
@@ -54,6 +54,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Read before the config guard below: the predicate takes its own.
+    let any_auto_start = global_config_row_live(app, GlobalConfigRow::AutoStartQueue);
     let rows = {
         let cfg = app.config();
         let state = &cfg.state;
@@ -69,10 +71,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
             auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
-            any_auto_start: cfg.profiles.iter().any(|p| p.has_effective_auto_start()),
+            any_auto_start,
             reset_display: state.reset_display(),
             clock_format: state.clock_format(),
             home_tab: state.home_tab(),
+            reduce_motion: state.reduce_motion,
         }
     };
     let tunables = {
@@ -256,6 +259,7 @@ struct RowState {
     reset_display: ResetDisplay,
     clock_format: ClockFormat,
     home_tab: HomeTab,
+    reduce_motion: bool,
 }
 
 /// The numeric tunables the Config tab's rows render, gathered once per draw.
@@ -278,9 +282,10 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         ..
     } = tunables;
     // The default + units live on the row as a faint span (only when the value
-    // is off its default), so the hint states behavior alone, interpolating the
-    // live value. Rows another toggle makes inert render dimmed and keep their
-    // behavior hint — the dim is the "can't touch this", not a gate clause.
+    // is off its default), so the hint states behavior alone and carries no
+    // number: it picks its words from the live state. Rows another toggle
+    // makes inert render dimmed and keep their behavior hint — the dim is the
+    // "can't touch this", not a gate clause.
     let tip: String = match row {
         GlobalConfigRow::Theme => return None,
         GlobalConfigRow::ResetShape => String::from(match rows.reset_display {
@@ -295,6 +300,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         GlobalConfigRow::HomeTab => String::from(
             "the tab clauth opens on; the first herdr launch opens the services tab with the herdr row selected",
         ),
+        GlobalConfigRow::ReduceMotion => String::from(if rows.reduce_motion {
+            "the mascot and provider names stay still; spinners keep turning"
+        } else {
+            "the mascot reacts to events and provider names shimmer"
+        }),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
             Some(DivergenceChoice::Overwrite) => {
@@ -337,7 +347,7 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "keep using whichever account is active once they're all spent"
         }),
         GlobalConfigRow::BurnAware => String::from(if rows.burn_aware {
-            "switch away once the burn rate would hit 100% before the next check"
+            "switch the active account away at its threshold, or sooner once its burn would reach 100% within the look-ahead"
         } else {
             "switch the active account away once its usage crosses its threshold"
         }),
@@ -350,11 +360,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
                 "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
             }
         }),
-        GlobalConfigRow::BurnFloor => {
-            String::from("never switch away before this share is used, however fast the burn")
-        }
+        GlobalConfigRow::BurnFloor => String::from(
+            "the burn projection never switches below this share; it does nothing at or above an account's threshold",
+        ),
         GlobalConfigRow::BurnHorizon => {
-            String::from("how far ahead to look when guessing the next switch")
+            String::from("how far ahead to look, never past the next usage reading")
         }
         GlobalConfigRow::SpendBudget => String::from(if rows.spend_budget {
             "let a spent account keep working on paid usage, up to its max spend"
@@ -461,6 +471,12 @@ fn detail_row(
                 .collect();
             cycle_row(arrow, "home tab", &options, selected, width)
         }
+        GlobalConfigRow::ReduceMotion => vec![toggle_row(
+            arrow,
+            "reduce motion",
+            rows.reduce_motion,
+            selected,
+        )],
         GlobalConfigRow::RefreshInterval => match editing {
             Some(input) => vec![refresh_edit_line(arrow, input, width)],
             None => refresh_cycle_lines(arrow, refresh_interval_ms, selected, width),

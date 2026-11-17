@@ -210,9 +210,12 @@ fn window_pct(windows: &[Window], label: &str) -> String {
 }
 
 fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
+    // `clauth list` is single-shot: no live lease to consult, so the stamp
+    // derived from the cache keeps its derived form.
     let codex_entries = build_codex_entries(
         &CodexState::load().unwrap_or_default(),
         config.state.refresh_interval_ms,
+        true,
     );
     if entries.is_empty() && codex_entries.is_empty() {
         return "no accounts yet. add one with `clauth login <name>`.\n".to_string();

@@ -221,7 +221,7 @@ impl std::error::Error for GateNeeded {}
 /// [`overwrite_captured_profile_held`]), typed so a caller that frames its
 /// failures by operation can give it the login's head.
 #[derive(Debug)]
-pub(crate) struct CaptureRefused(ProfileName);
+pub(crate) struct CaptureRefused(pub(crate) ProfileName);
 
 impl std::fmt::Display for CaptureRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -691,9 +691,23 @@ pub(crate) fn switch_profile_discard_gated(
 
 /// Force-capture the live login into the account disk names active (mirrored
 /// into `config` under the caller's hold), then require that it landed: a
-/// relink after a capture that wrote nothing would drop the login. Returns
+/// relink after a capture that wrote nothing would drop the login. A diverged
+/// unsaved login on an account running on a long-lived token refuses before
+/// the capture with the long-lived line — that account's store cannot hold an
+/// OAuth login. The capture itself writes nothing for an unsaved login (the
+/// sink's sync matches only a store the login already belongs to), so the
+/// pre-check only picks which refusal sentence appears: without it the
+/// post-check below refuses with the generic unsaved-login text. Returns
 /// whether the OAuth half's stored identity changed.
 pub(crate) fn force_capture_live_login(config: &mut AppConfig) -> Result<bool> {
+    if let Some(active) = config.state.active_profile.as_ref()
+        && live_diverged_and_unsaved(active)?
+        && crate::claude::has_session_token(active)
+    {
+        bail!(DeepRefusal(crate::format::long_lived_cannot_hold_login(
+            active
+        )));
+    }
     let oauth_changed = force_snapshot_active_credentials(config)?;
     if let Some(active) = config.state.active_profile.as_ref()
         && live_diverged_and_unsaved(active)?
@@ -5380,8 +5394,9 @@ fn rollback_first_account_create(
 /// each half's fetch caches are dropped only when that half's stored identity
 /// actually changed (a proven same-account re-login forgets nothing), never
 /// unconditionally. The `/profile` TTL clock describes the old account too, so
-/// it is expired only when the OAuth half changed — a proven same-account
-/// re-login keeps the stamp and its memo — otherwise the swapped-in account's
+/// it is expired when the OAuth half changed — a proven same-account re-login
+/// keeps the stamp and its memo unless its probe corrected a disagreeing
+/// cached plan, which expires it too — otherwise the swapped-in account's
 /// tier stays unfetched (and, with `usage_cache.json` just dropped, unrendered)
 /// for up to an hour. A snapshot carrying a proven identity (an interactive
 /// login's probe) re-anchors the profile here, on the commit — the confirm-gated
@@ -5411,26 +5426,27 @@ pub(crate) fn overwrite_captured_profile_with(
     snapshot: CaptureSnapshot,
     deactivate: bool,
 ) -> Result<Result<()>> {
-    let oauth_moved =
+    let plan_read_due =
         match overwrite_captured_profile_held(config, name, account, snapshot, deactivate)? {
-            Ok(oauth_moved) => oauth_moved,
+            Ok(plan_read_due) => plan_read_due,
             Err(refusal) => return Ok(Err(refusal)),
         };
     // Outside the hold — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
     // `update_profile` leaves the new credentials on disk under the old account's
-    // stamp. Only when the OAuth half actually changed: a proven same-account
-    // re-login keeps the stamp and its memo.
-    if oauth_moved {
+    // stamp. Only when the OAuth half changed or the login corrected the cached
+    // plan: any other proven same-account re-login keeps the stamp and its memo.
+    if plan_read_due {
         crate::usage::expire_profile_ttl(name);
     }
     Ok(Ok(()))
 }
 
 /// [`overwrite_captured_profile_with`]'s write, for a caller that runs it
-/// inside a state flock hold of its own: answers whether the OAuth half
-/// moved, and the caller expires `name`'s `/profile` clock once its hold
-/// releases (the TTL store ranks below the flock). The inner `Err` is
+/// inside a state flock hold of its own: answers whether `name`'s `/profile`
+/// clock must lapse (the OAuth half moved, or a same-account re-login corrected
+/// the cached plan), and the caller expires it once its hold releases (the TTL
+/// store ranks below the flock). The inner `Err` is
 /// [`refuse_relogin_off_proxy`]'s refusal, or [`CaptureRefused`] for a
 /// `config.toml` that cannot say whether `name` is an account on a proxy; each
 /// wrote nothing. With `deactivate` (a capture out of a divergence), the live
@@ -5455,7 +5471,7 @@ pub(crate) fn overwrite_captured_profile_held(
     // login install: the anchor stays exactly as found. Every other overwrite
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
-    let mut oauth_moved = false;
+    let mut plan_read_due = false;
     let mut refusal = Ok(());
     with_state_lock(|held| {
         refusal = refuse_relogin_off_proxy(name);
@@ -5519,6 +5535,7 @@ pub(crate) fn overwrite_captured_profile_held(
         // only when the forget plan dropped the OAuth half (a same-account
         // re-login forgets nothing and keeps its live windows).
         let mut seed_guard = SeedCleanupGuard::new();
+        let mut plan_corrected = false;
         // The overwrite lands on the profile re-read off disk under this hold:
         // the caller's copy predates the login's waits, and every field this
         // overwrite does not set (a ceiling, a threshold, a disable, the env)
@@ -5593,18 +5610,25 @@ pub(crate) fn overwrite_captured_profile_held(
                 credentials.is_some(),
             );
             forget_disk_plan(name, plan);
-            if plan.oauth
-                && let Some(seed) = seed_plan
-            {
-                crate::usage::seed_plan_cache(
-                    name,
-                    seed,
-                    match &anchor {
-                        AnchorAction::Proven(uuid) => Some(uuid),
-                        _ => None,
-                    },
-                );
-                seed_guard.arm(name);
+            let login_uuid = match &anchor {
+                AnchorAction::Proven(uuid) => Some(uuid),
+                _ => None,
+            };
+            match seed_plan {
+                Some(seed) if plan.oauth => {
+                    crate::usage::seed_plan_cache(name, seed, login_uuid);
+                    seed_guard.arm(name);
+                }
+                // A proven re-login onto the same account keeps its windows, but
+                // its plan can still have changed (a resubscribe). No cleanup
+                // guard: the reading is true of this account whether or not the
+                // install goes on to land, and the guard would drop the windows.
+                Some(seed) => {
+                    if let Some(uuid) = login_uuid {
+                        plan_corrected = crate::usage::correct_cached_plan(name, seed, uuid);
+                    }
+                }
+                None => {}
             }
             #[cfg(test)]
             run_seed_order_hook(name.as_str());
@@ -5636,7 +5660,7 @@ pub(crate) fn overwrite_captured_profile_held(
             Ok(plan)
         })?
         .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
-        oauth_moved = plan.oauth;
+        plan_read_due = plan.oauth || plan_corrected;
         note_forget_plan(name, plan);
         if let Some(profile) = config.find_mut(name) {
             profile.base_url = fresh.base_url.clone();
@@ -5717,7 +5741,7 @@ pub(crate) fn overwrite_captured_profile_held(
         }
         saved
     })?;
-    Ok(refusal.map(|()| oauth_moved))
+    Ok(refusal.map(|()| plan_read_due))
 }
 
 /// Blank a profile's OAuth login: drop its stored credentials and per-account

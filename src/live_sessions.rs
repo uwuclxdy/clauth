@@ -390,6 +390,12 @@ pub(crate) struct LiveTally {
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
     unattributed: usize,
+    /// Each registry row's session id and the account the row runs on — the
+    /// row's `current_member`, or its start account before the first swap
+    /// writes one — so a reader can tell a session starting from one moving
+    /// accounts. Bare sessions and background jobs carry no registry id: they
+    /// reach the counts only.
+    session_members: std::collections::BTreeMap<String, String>,
     /// The registry, the bare-marker dir, the job store or a profile dir could
     /// not be listed (it exists but refuses, the OS fails to yield one of its
     /// entries, or `~/.clauth` itself does not resolve), or a running job's
@@ -545,10 +551,12 @@ impl LiveTally {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
         let mut delegates = 0;
+        let mut session_members = std::collections::BTreeMap::new();
         for row in rows {
+            let member = row.current_member.unwrap_or(row.start_profile);
+            session_members.insert(row.session_id, member.clone());
             let is_delegate = usize::from(row.is_delegate);
             delegates += is_delegate;
-            let member = row.current_member.unwrap_or(row.start_profile);
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
             slot.delegates += is_delegate;
@@ -559,6 +567,7 @@ impl LiveTally {
             members: per_member,
             delegates,
             unattributed: 0,
+            session_members,
             unread: false,
         }
     }
@@ -626,6 +635,13 @@ impl LiveTally {
             return None;
         }
         Some(self.delegates)
+    }
+
+    /// Every registry session's id and the account it runs on. `None` when a
+    /// dir or record the tally counts from could not be read, as
+    /// [`LiveTally::total`] is.
+    pub(crate) fn session_members(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        (!self.unread).then_some(&self.session_members)
     }
 }
 

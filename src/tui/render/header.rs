@@ -1,19 +1,27 @@
-//! Top bar: the Clawd mascot on the left; brand, usage gauge and status source
-//! in the text column to the right. The art header is three rows; when the
-//! frame cannot hold the art it falls back to two, carrying the tab bar on the
-//! brand row. [`header_height`] keeps `render::draw`'s layout in step.
+//! Top bar: the mascot on the left; brand, usage gauge and status source in
+//! the text column to the right. The art header is the mascot's own rows;
+//! when the frame cannot hold the art it falls back to two, carrying the tab
+//! bar on the brand row. [`header_height`] keeps `render::draw`'s layout in
+//! step.
 //!
-//! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
-//! and the `[ shunt ]  [ daemon ]` service chips on the right edge. The art
-//! row sheds the tag first, then the shunt chip, then the daemon chip; the
-//! no-art row also carries the tab bar, which collapses to its overflow form
-//! between the tag and the chips. Row 1 carries
-//! the fleet's live-session chip, the tok/s chip, the active-profile usage
-//! gauge with its speed suffix and the status indicator: the account counts
-//! and the harness filter live on the accounts panel's title row, as meta
-//! slots beside the bare `ACCOUNTS` title. Row 1 sheds the tok/s chip first,
-//! then the live chip, then the speed suffix; the gauge's ladder drops the
-//! usage bar before the name.
+//! The info column reads top-down from the mascot's own rows: the brand row
+//! on the first, the status row on the second, the tabs on the last, and any
+//! rows between left blank. The brand row reads `clauth vX.Y.Z` on the left
+//! with the herdr tag between them, and the `[ shunt ]  [ daemon ]` service
+//! chips on the right edge. The brand row sheds the tag first, then the shunt
+//! chip, then the daemon chip; the no-art row also carries the tab bar, which
+//! collapses to its overflow form between the tag and the chips. The status
+//! row carries the fleet's live-session chip, the tok/s chip, the
+//! active-profile usage gauge with its speed suffix and the status indicator:
+//! the account counts and the harness filter live on the accounts panel's
+//! title row, as meta slots beside the bare `ACCOUNTS` title. The status row
+//! places the overdue age last, only in the cells the drawn chips, speed
+//! suffix and gauge leave, so it never pushes anything else out; it can
+//! outlast a chip whose ceiling charge no longer fits. The tok/s chip sheds
+//! first, then the live chip, then the speed suffix; the gauge's ladder drops
+//! the usage bar before the name.
+
+use std::rc::Rc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -22,9 +30,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health};
-use super::super::clawd::{self, CellKind};
 use super::super::theme;
-use super::format::{bar_string_with_cells, fixed_split};
+use super::format::{
+    bar_string_with_cells, fixed_split, past_deadline_age, reading_due_age, relative_age,
+};
 use super::services::health_color;
 use crate::format::format_pct;
 
@@ -81,6 +90,8 @@ const PULSE_SWEEP_MS: u64 = 900;
 const PULSE_REST_MS: u64 = 1700;
 const PULSE_DEPTH: f32 = 0.4;
 const PULSE_CYCLE_MS: u64 = PULSE_SWEEP_MS + PULSE_REST_MS;
+/// A phase inside the pulse's rest gap, where it draws the plain name.
+const PULSE_REST_PHASE_MS: u64 = PULSE_SWEEP_MS;
 /// The identity wave's crest is the provider's own color, not a tint toward it.
 const IDENTITY_DEPTH: f32 = 1.0;
 /// A row's step into the cycle, as a fraction of it: the golden ratio, so any
@@ -91,6 +102,10 @@ const PULSE_STAGGER_FRACTION: f64 = 0.6180339887498949;
 struct GaugeFit {
     name_w: usize,
     bar_cells: usize,
+    /// The cells the overdue age occupies once the drawn row left room for
+    /// it. The age is placed after the layout, whole, so a nonzero value
+    /// always sits beside the full-width bar.
+    age_w: usize,
     visible: bool,
 }
 
@@ -98,6 +113,7 @@ impl GaugeFit {
     const HIDDEN: GaugeFit = GaugeFit {
         name_w: 0,
         bar_cells: 0,
+        age_w: 0,
         visible: false,
     };
 }
@@ -105,6 +121,11 @@ impl GaugeFit {
 struct ActiveGauge {
     name: String,
     pct: Option<f64>,
+    /// The reading's own age (`4m ago`), shown only once its refresh is
+    /// overdue: the deadline published for this instance, or (none published,
+    /// a stuck worker holds the leg) the reading's clock plus the account's
+    /// interval. Only a stamp the reading itself carries dates it.
+    age: Option<String>,
 }
 
 fn active_gauge(app: &App, readings: &ReadingsSnapshot) -> Option<ActiveGauge> {
@@ -119,14 +140,65 @@ fn active_gauge(app: &App, readings: &ReadingsSnapshot) -> Option<ActiveGauge> {
     } else {
         None
     };
+    let age = if profile.is_oauth() {
+        // The gauge dates its figure, so a reading without a stamp stays
+        // undated; a stood-down mirror's past deadline or a stuck worker's
+        // un-published one gates the age in, and the age itself is the
+        // reading's, not the deadline's. The no-deadline arm also reads the
+        // leg's activity: a due account the bootstrap marked Queued (or a
+        // fetch in flight) has a fetch coming, so its cadence date is not
+        // an overdue verdict yet — the same activity the Overview's spinner
+        // arm reads. A leg the scheduler deliberately blanked (a spent-skip,
+        // a suppressed credential, a selected leg on no work list) gates it
+        // out.
+        let (blanked, idle) = {
+            let key = crate::usage::FetchLeg::for_profile(profile).key(profile.name.clone());
+            app.activity
+                .lock()
+                .ok()
+                .map(|states| {
+                    (
+                        crate::usage::countdown_blanked(&states, &key),
+                        crate::usage::selected_activity(&states, profile)
+                            == crate::usage::ProfileActivity::Idle,
+                    )
+                })
+                .unwrap_or((false, false))
+        };
+        readings.read_clock_of(&profile.name).and_then(|at| {
+            let next_refresh = app
+                .next_refresh_per_profile
+                .lock()
+                .ok()
+                .and_then(|m| crate::usage::selected_next_refresh(&m, profile));
+            let interval = crate::usage::usage_interval_ms(profile, cfg.state.refresh_interval_ms);
+            let overdue = match next_refresh {
+                Some(next) => past_deadline_age(app.fetch_lease.fetches_here(), next),
+                None if !blanked && idle => {
+                    reading_due_age(readings.clock_of(&profile.name), interval)
+                }
+                None => None,
+            };
+            overdue.map(|_| relative_age(at))
+        })
+    } else {
+        None
+    };
     Some(ActiveGauge {
         name: name.to_string(),
         pct,
+        age,
     })
 }
 
 fn gauge_tail_w(pct: Option<f64>) -> usize {
     pct.map_or(0, |p| format_pct(p).len().max(GAUGE_PCT_W))
+}
+
+/// The cells the gauge charges for an overdue age: the ` · ` separator plus
+/// the age's own width.
+fn gauge_age_w(age: Option<&str>) -> usize {
+    age.map_or(0, |a| " · ".chars().count() + a.chars().count())
 }
 
 /// Whole-gauge width at a rung. While the bar renders, the percent leads it
@@ -145,7 +217,8 @@ fn gauge_total_w(name_w: usize, bar_cells: usize, pct: Option<f64>) -> usize {
     w
 }
 
-/// Collapse ladder: bar shrinks → bar drops → name truncates → name drops → hide.
+/// Collapse ladder: bar shrinks → bar drops → name truncates → name drops →
+/// hide.
 fn gauge_fit(avail: usize, name_len: usize, pct: Option<f64>) -> GaugeFit {
     if avail < gauge_tail_w(pct) {
         return GaugeFit::HIDDEN;
@@ -175,25 +248,37 @@ fn gauge_fit(avail: usize, name_len: usize, pct: Option<f64>) -> GaugeFit {
     GaugeFit {
         name_w,
         bar_cells,
+        age_w: 0,
         visible: true,
     }
 }
 
-fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> Vec<Span<'static>> {
+fn gauge_spans(
+    fit: GaugeFit,
+    name: &str,
+    pct: Option<f64>,
+    age: Option<&str>,
+    elapsed_ms: u64,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let push_name = |spans: &mut Vec<Span<'static>>, gap: &'static str| {
-        if fit.name_w > 0 {
-            let (nt, _pad) = fixed_split(name, fit.name_w);
-            let style = Style::default().fg(theme::text_color());
-            spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
-            spans.push(Span::raw(gap));
-        }
-    };
+    if fit.name_w > 0 {
+        let (nt, _pad) = fixed_split(name, fit.name_w);
+        let style = Style::default().fg(theme::text_color());
+        spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
+        spans.push(Span::raw(" "));
+    }
     match pct {
         Some(pct) if fit.bar_cells > 0 => {
             let style = Style::default().fg(theme::util_color(pct));
-            push_name(&mut spans, " ");
             spans.push(Span::styled(format_pct(pct), style));
+            // The reading's age, dim like the brackets: the gauge stays
+            // uncolored whatever the fetch state, and only an overdue reading
+            // ever rides here.
+            if fit.age_w > 0
+                && let Some(age) = age
+            {
+                spans.push(Span::styled(format!(" · {age}"), theme::dim()));
+            }
             spans.push(Span::raw(" "));
             spans.push(Span::styled("[", theme::dim()));
             spans.push(Span::styled(
@@ -202,14 +287,11 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
             ));
             spans.push(Span::styled("]", theme::dim()));
         }
-        Some(pct) => {
-            push_name(&mut spans, " ");
-            spans.push(Span::styled(
-                format_pct(pct),
-                Style::default().fg(theme::util_color(pct)),
-            ));
-        }
-        None => push_name(&mut spans, " "),
+        Some(pct) => spans.push(Span::styled(
+            format_pct(pct),
+            Style::default().fg(theme::util_color(pct)),
+        )),
+        None => {}
     }
     spans
 }
@@ -236,15 +318,27 @@ pub(super) fn identity_wave_spans(
     position: usize,
     elapsed_ms: u64,
 ) -> Vec<Span<'static>> {
-    let fraction = (position as f64 * PULSE_STAGGER_FRACTION).fract();
-    let offset = (fraction * PULSE_CYCLE_MS as f64).round() as u64;
     crest_spans(
         label,
         theme::dim(),
         theme::crest_color(provider),
         IDENTITY_DEPTH,
-        elapsed_ms % PULSE_CYCLE_MS + offset,
+        elapsed_ms % PULSE_CYCLE_MS + identity_wave_offset_ms(position),
     )
+}
+
+/// A phase at which `position`'s identity wave sits at the start of its rest
+/// gap, so [`identity_wave_spans`] draws the plain label there. A row held
+/// still under `reduce_motion` samples it.
+pub(super) fn identity_wave_rest_ms(position: usize) -> u64 {
+    (PULSE_SWEEP_MS + PULSE_CYCLE_MS - identity_wave_offset_ms(position) % PULSE_CYCLE_MS)
+        % PULSE_CYCLE_MS
+}
+
+/// One golden-ratio step of the cycle per list position.
+fn identity_wave_offset_ms(position: usize) -> u64 {
+    let fraction = (position as f64 * PULSE_STAGGER_FRACTION).fract();
+    (fraction * PULSE_CYCLE_MS as f64).round() as u64
 }
 
 fn crest_spans(
@@ -294,25 +388,34 @@ fn crest_spans(
 
 // ── Height ───────────────────────────────────────────────────────────────
 
-/// The art's own columns.
-const LOGO_COLS: u16 = 10;
-/// Rows the art header needs: the art's three plus a usable body.
-const ART_MIN_ROWS: u16 = 14;
+/// The columns the header gives the art on top of the mascot's own width:
+/// one padding column before the info column.
+const LOGO_PAD: u16 = 1;
+/// Body rows the art header must leave for a usable body, on top of the
+/// mascot's own rows.
+const ART_BODY_ROWS: u16 = 11;
 
-/// Whether `area` holds the art header: enough rows for the art and a usable
-/// body, and enough columns for the logo slot, the brand, the version and the
-/// daemon chip with the content gap.
-fn art_fits(area: Rect) -> bool {
+/// Whether `area` holds the art header: enough rows for the mascot and a
+/// usable body, and enough columns for the logo slot, the brand, the version
+/// and the daemon chip with the content gap. The mascot reads it too, so it
+/// plays only while the art is drawn.
+pub(crate) fn art_fits(area: Rect) -> bool {
+    let (mascot_cols, mascot_rows) = App::MASCOT_SIZE;
     let brand = BRAND.chars().count();
     let ver = version_label().chars().count();
     let daemon = spans_width(&service_chip("daemon", ratatui::style::Color::Reset));
-    area.height >= ART_MIN_ROWS
-        && usize::from(area.width) >= usize::from(LOGO_COLS) + brand + ver + CONTENT_GAP + daemon
+    area.height >= mascot_rows as u16 + ART_BODY_ROWS
+        && usize::from(area.width)
+            >= mascot_cols + usize::from(LOGO_PAD) + brand + ver + CONTENT_GAP + daemon
 }
 
-/// Header rows `area` gets: three with the art, two without it.
+/// Header rows `area` gets: the mascot's own with the art, two without it.
 pub(super) fn header_height(area: Rect) -> u16 {
-    if art_fits(area) { 3 } else { 2 }
+    if art_fits(area) {
+        App::MASCOT_SIZE.1 as u16
+    } else {
+        2
+    }
 }
 
 // ── Draw ─────────────────────────────────────────────────────────────────
@@ -326,19 +429,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         ..area
     };
     let info_area = if art {
-        let cols: [Rect; 2] =
-            Layout::horizontal([Constraint::Length(LOGO_COLS), Constraint::Min(20)]).areas(header);
+        let cols: [Rect; 2] = Layout::horizontal([
+            Constraint::Length(App::MASCOT_SIZE.0 as u16 + LOGO_PAD),
+            Constraint::Min(20),
+        ])
+        .areas(header);
         draw_logo(frame, cols[0], app);
         cols[1]
     } else {
         header
     };
 
-    let rows: [Rect; 3] = if art {
-        Layout::vertical([Constraint::Length(1); 3]).areas(info_area)
+    // The info column follows the mascot's own rows: the brand row first, the
+    // status row second, the tabs on the last, any rows between left blank.
+    let rows: Rc<[Rect]> = if art {
+        Layout::vertical([Constraint::Length(1); App::MASCOT_SIZE.1]).split(info_area)
     } else {
         let two: [Rect; 2] = Layout::vertical([Constraint::Length(1); 2]).areas(info_area);
-        [two[0], two[1], Rect::default()]
+        Rc::from([two[0], two[1], Rect::default()])
     };
 
     let info_width = rows[0].width as usize;
@@ -367,9 +475,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     // indicator drops whole, head and feed together, since a dot left to
     // render clips the feed mid-word and a half-spelled source says less than
     // none. Its gate is charged the content as rendered, so the content's own
-    // ladder gives way before the indicator does. Narrow widths shed the tok/s
-    // chip first, then the live chip, then the speed suffix, then the gauge's
-    // own ladder, then the indicator.
+    // ladder gives way before the indicator does. Narrow widths shed the
+    // tok/s chip first, then the live chip, then the speed suffix, then the
+    // gauge's own ladder, then the indicator; the overdue age draws only in
+    // the cells that row leaves.
     let row1_width = rows[1].width as usize;
     let feed = "status.claude.ai";
     let status_head = format!("{} ", theme::DOT_ON);
@@ -387,35 +496,42 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     // The gauge's full form is the content with the highest priority after the
     // indicator: the suffix sheds before the gauge's ladder, so the gauge keeps
     // its full form while the suffix can still ride it, and only shrinks once
-    // the suffix is gone.
-    let mut gauge_spans_vec: Vec<Span<'static>> = Vec::new();
+    // the suffix is gone. The age decides nothing here: the row lays out as it
+    // would with no age, so the age can never displace the suffix or a rung.
+    let g = gauge.as_ref();
+    let (name_len, pct, age_w) = g.map_or((0, None, 0), |g| {
+        (
+            Span::raw(g.name.as_str()).width(),
+            g.pct,
+            gauge_age_w(g.age.as_deref()),
+        )
+    });
+    let mut gauge_rung = GaugeFit::HIDDEN;
     let mut keep_suffix = false;
-    if let Some(ref g) = gauge {
-        let name_len = Span::raw(g.name.as_str()).width();
-        let full_fit = gauge_fit(usize::MAX, name_len, g.pct);
-        let full_reserved = gauge_total_w(full_fit.name_w, full_fit.bar_cells, g.pct);
+    if g.is_some() {
+        let full_fit = gauge_fit(usize::MAX, name_len, pct);
+        let full_reserved = gauge_total_w(full_fit.name_w, full_fit.bar_cells, pct);
         if full_reserved + suffix_w <= left_budget {
-            gauge_spans_vec = gauge_spans(full_fit, &g.name, g.pct, app.anim_ms());
+            gauge_rung = full_fit;
             keep_suffix = !suffix.is_empty();
         } else if full_reserved <= left_budget {
-            gauge_spans_vec = gauge_spans(full_fit, &g.name, g.pct, app.anim_ms());
+            gauge_rung = full_fit;
         } else {
-            let fit = gauge_fit(left_budget, name_len, g.pct);
-            if fit.visible {
-                gauge_spans_vec = gauge_spans(fit, &g.name, g.pct, app.anim_ms());
-            }
+            gauge_rung = gauge_fit(left_budget, name_len, pct);
         }
     }
-    let gauge_w: usize = gauge_spans_vec.iter().map(|s| s.width()).sum();
     // The chip shed checks charge the widest the gauge, its speed suffix and
     // each chip can ever render — the full bar rung with the widest percent
     // label, the ` (9999 t/s)` suffix, and the `[ 9999 tok/s ]` /
     // `[ 999+999 live ]` ceilings — so a chip's presence depends on the
     // terminal width and the active account's name only, never on a reading,
-    // speed, rate or count update. The gauge, suffix and chips still render at
-    // their real widths in whatever room the shed checks leave.
-    let (charged_gauge_w, charged_suffix_w) = gauge.as_ref().map_or((0, 0), |g| {
-        let oauth = g.pct.is_some();
+    // speed, rate or count update. The overdue age charges nothing here: it
+    // draws only in the cells the drawn chips, the suffix and the gauge leave,
+    // so an overdue reading never moves a chip. The gauge, suffix and chips
+    // still render at their real widths in whatever room the shed checks
+    // leave.
+    let (charged_gauge_w, charged_suffix_w) = g.map_or((0, 0), |g| {
+        let oauth = pct.is_some();
         let name_w = Span::raw(g.name.as_str()).width().min(GAUGE_NAME_MAX);
         (
             gauge_total_w(
@@ -426,25 +542,63 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
             GAUGE_MAX_SUFFIX_W,
         )
     });
-    let sep_w = if gauge_w > 0 {
+    let sep_w = if gauge_rung.visible {
         " · ".chars().count()
     } else {
         0
     };
-
     // The chips take only what the gauge (and the suffix) leave, so the tok/s
     // chip sheds first, whole with its chip gap, then the live chip, whole with
     // its separator — never costing the gauge a cell.
-    let mut left: Vec<Span<'static>> = Vec::new();
-    if !tps.is_empty()
+    let gap_w = Span::raw(CHIP_GAP).width();
+    let both_chips = !tps.is_empty()
         && LIVE_CHIP_CEILING_W
-            + CHIP_GAP.chars().count()
+            + gap_w
             + TPS_CHIP_CEILING_W
             + sep_w
             + charged_gauge_w
             + charged_suffix_w
-            <= left_budget
-    {
+            <= left_budget;
+    let live_chip = LIVE_CHIP_CEILING_W + sep_w + charged_gauge_w + charged_suffix_w <= left_budget;
+    // The age takes only the cells the drawn row leaves, whole: the chips'
+    // real widths and the kept suffix hold their places first, and the gauge
+    // counts its percent at no less than the label's 4-cell budget, so a
+    // whole percent changing width never makes the age appear or vanish; a
+    // fractional one (`42.37%`) can. No room means no age, never a shed
+    // chip, suffix or gauge rung.
+    if age_w > 0 && gauge_rung.visible && gauge_rung.bar_cells > 0 {
+        let live_w: usize = live.iter().map(|s| s.width()).sum();
+        let tps_w: usize = tps.iter().map(|s| s.width()).sum();
+        let chips_w = if both_chips {
+            live_w + gap_w + tps_w
+        } else if live_chip {
+            live_w
+        } else {
+            0
+        };
+        let row_cells = chips_w
+            + if chips_w > 0 { sep_w } else { 0 }
+            + gauge_total_w(gauge_rung.name_w, gauge_rung.bar_cells, pct)
+            + if keep_suffix { suffix_w } else { 0 };
+        if left_budget.saturating_sub(row_cells) >= age_w {
+            gauge_rung.age_w = age_w;
+        }
+    }
+    let name_ms = if app.config().state.reduce_motion {
+        PULSE_REST_PHASE_MS
+    } else {
+        app.anim_ms()
+    };
+    let gauge_spans_vec = match g {
+        Some(g) if gauge_rung.visible => {
+            gauge_spans(gauge_rung, &g.name, pct, g.age.as_deref(), name_ms)
+        }
+        _ => Vec::new(),
+    };
+    let gauge_w: usize = gauge_spans_vec.iter().map(|s| s.width()).sum();
+
+    let mut left: Vec<Span<'static>> = Vec::new();
+    if both_chips {
         left.extend(live);
         left.push(Span::raw(CHIP_GAP));
         left.extend(tps);
@@ -455,7 +609,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         if keep_suffix {
             left.extend(suffix);
         }
-    } else if LIVE_CHIP_CEILING_W + sep_w + charged_gauge_w + charged_suffix_w <= left_budget {
+    } else if live_chip {
         left.extend(live);
         if gauge_w > 0 {
             left.push(Span::styled(" · ", theme::dim()));
@@ -488,9 +642,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
         rows[1],
     );
 
-    // ── Row 2: tabs (the art header only; without the art they ride row 0) ──
+    // ── Last row: tabs (the art header only; without the art they ride row 0) ──
     if art {
-        super::tabs::draw(frame, rows[2], app);
+        super::tabs::draw(frame, rows[rows.len() - 1], app);
     }
 }
 
@@ -780,43 +934,9 @@ fn shunt_chip_color(app: &App) -> ratatui::style::Color {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let full_sprite = app.clawd.full_sprite;
-    let art = match app.clawd.frame(app.anim_ms()) {
-        Some(current) => clawd::render(current, full_sprite),
-        None => clawd::rest_art(full_sprite),
-    };
-    let lines: Vec<Line<'static>> = art.iter().map(|row| Line::from(row_spans(row))).collect();
+    let lines = app.mascot.draw(app.anim_ms());
     let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, area);
-}
-
-fn row_spans(row: &[(char, CellKind); clawd::COLS]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut glyphs = String::new();
-    let mut run_kind = row[0].1;
-    for &(glyph, kind) in row {
-        if kind != run_kind {
-            spans.push(Span::styled(
-                std::mem::take(&mut glyphs),
-                cell_style(run_kind),
-            ));
-            run_kind = kind;
-        }
-        glyphs.push(glyph);
-    }
-    spans.push(Span::styled(glyphs, cell_style(run_kind)));
-    spans
-}
-
-fn cell_style(kind: CellKind) -> Style {
-    let body = theme::accent_2_color();
-    match kind {
-        CellKind::Empty => Style::default(),
-        CellKind::Body => Style::default().fg(body),
-        CellKind::CutOut => Style::default().fg(body).bg(theme::clawd_cutout_color()),
-        CellKind::Lid => Style::default().fg(theme::clawd_cutout_color()).bg(body),
-        CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
-    }
 }
 
 #[cfg(test)]

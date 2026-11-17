@@ -1376,6 +1376,143 @@ fn the_roster_ranks_a_credit_capped_account_last_while_its_gate_is_on() {
     }
 }
 
+/// Saves a roster of blank accounts: `disabled` ones flagged, `active` global.
+fn save_roster(names: &[&str], disabled: &[&str], active: Option<&str>) {
+    for n in names {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
+        p.disabled = disabled.contains(n);
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        active_profile: active.map(Into::into),
+        ..Default::default()
+    })
+    .expect("save state");
+}
+
+/// The session-start roster, which a model reads as the accounts it can pick
+/// from, leaves a disabled account out.
+#[test]
+fn the_roster_leaves_out_a_disabled_account() {
+    let _home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-on"));
+    let block = build_instructions();
+    assert!(
+        block.contains("- acct-on (global active, this session) [anthropic"),
+        "the enabled account stays on the roster: {block}"
+    );
+    assert!(
+        !block.contains("acct-off"),
+        "the disabled account is off the block: {block}"
+    );
+}
+
+/// Dropping a disabled active account would take the block's identity line
+/// with it, the first thing a global session reads about what it spends.
+#[test]
+fn the_roster_keeps_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("global active: `acct-off`"),
+        "the identity line survives: {block}"
+    );
+    assert!(
+        block.contains("acct-off (global active, this session; disabled)"),
+        "the roster keeps the account behind this session and says it is disabled: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
+/// A runtime session's identity line names the global account too, and a
+/// custom config dir marks it on the roster: neither loses a disabled one.
+#[test]
+fn the_roster_keeps_a_disabled_active_account_in_the_other_session_tiers() {
+    let home = HomeSandbox::new();
+    save_roster(&["acct-on", "acct-off"], &["acct-off"], Some("acct-off"));
+    let runtime = home.home().join(".clauth/profiles/acct-on").join("runtime");
+    let dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-on` (anthropic) · global active: `acct-off`"),
+        "the runtime identity line names the global account: {block}"
+    );
+    assert!(
+        block.contains("acct-off (global active; disabled)"),
+        "a runtime session reads the disabled global account as disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (this session)"),
+        "the enabled runtime account carries no disabled mark: {block}"
+    );
+    drop(dir);
+    let custom = home.home().join("custom-config");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &custom);
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active; disabled)"),
+        "a custom dir still marks the global account and says it is disabled: {block}"
+    );
+}
+
+/// A shared `clauth start` runtime keeps the row and provider of the account
+/// its dir names, whatever that account's flag says: the identity line reads
+/// that row.
+#[test]
+fn the_roster_keeps_the_disabled_account_a_runtime_dir_names() {
+    let home = HomeSandbox::new();
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-on"),
+    );
+    let runtime = home
+        .home()
+        .join(".clauth/profiles/acct-off")
+        .join("runtime");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let block = build_instructions();
+    assert!(
+        block.contains("runtime profile: `acct-off` (anthropic)"),
+        "the identity line keeps its provider: {block}"
+    );
+    assert!(
+        block.contains("acct-off (this session; disabled)"),
+        "the roster keeps this session's own account and says it is disabled: {block}"
+    );
+    assert!(
+        block.contains("acct-on (global active)"),
+        "the enabled global account carries no disabled mark: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+    save_roster(
+        &["acct-on", "acct-off", "acct-spare"],
+        &["acct-off", "acct-spare"],
+        Some("acct-off"),
+    );
+    let block = build_instructions();
+    assert!(
+        block.contains("acct-off (global active, this session; disabled)"),
+        "a runtime on the disabled global account marks both and the flag: {block}"
+    );
+    assert!(
+        !block.contains("acct-spare"),
+        "a disabled account no session runs on stays off: {block}"
+    );
+}
+
 /// An own-endpoint account never spends its usage credits, so its spent cap
 /// must not demote it to `Capped` — the RANK is what the credit gate governs.
 /// The in-test control first pins the same fixture WITHOUT the endpoint as
@@ -4333,6 +4470,7 @@ fn delegate_env_strips_inherited_provider_routing() {
         std::path::Path::new("/cfg"),
         0,
         "sid-1",
+        None,
     );
     let envs = crate::testutil::env_overrides(&cmd);
 
@@ -4375,6 +4513,7 @@ fn delegate_env_strips_the_parent_panes_herdr_session() {
         std::path::Path::new("/cfg"),
         0,
         "s",
+        None,
     );
     let envs = crate::testutil::env_overrides(&cmd);
     for key in [
@@ -4390,7 +4529,15 @@ fn delegate_env_strips_the_parent_panes_herdr_session() {
     let mut caller = HashMap::new();
     caller.insert("HERDR_PANE_ID".to_string(), "w1:p1".to_string());
     let mut cmd = Command::new("claude");
-    apply_delegate_env(&mut cmd, &caller, &[], std::path::Path::new("/cfg"), 0, "s");
+    apply_delegate_env(
+        &mut cmd,
+        &caller,
+        &[],
+        std::path::Path::new("/cfg"),
+        0,
+        "s",
+        None,
+    );
     assert_eq!(
         crate::testutil::env_overrides(&cmd).get("HERDR_PANE_ID"),
         Some(&Some("w1:p1".to_string()))
@@ -4410,6 +4557,7 @@ fn delegate_env_strips_active_profile_custom_env() {
         std::path::Path::new("/cfg"),
         0,
         "s",
+        None,
     );
     let envs = crate::testutil::env_overrides(&cmd);
     assert_eq!(
@@ -4435,6 +4583,11 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         "CLAUTH_DELEGATE_SESSION_ID".to_string(),
         "spoofed-session".to_string(),
     );
+    // nor point the escaped-process sweep at another run's processes,
+    caller.insert(
+        "CLAUTH_DELEGATE_JOB_ID".to_string(),
+        "spoofed-job".to_string(),
+    );
     // and a caller-set max-tokens is respected, not overwritten by the default.
     caller.insert(
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string(),
@@ -4449,6 +4602,7 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         std::path::Path::new("/cfg"),
         0,
         "sid-9",
+        Some("job-9"),
     );
     let envs = crate::testutil::env_overrides(&cmd);
 
@@ -4461,6 +4615,11 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         envs.get("CLAUTH_MCP_DEPTH"),
         Some(&Some("1".to_string())),
         "the depth guard always wins over a caller value",
+    );
+    assert_eq!(
+        envs.get("CLAUTH_DELEGATE_JOB_ID"),
+        Some(&Some("job-9".to_string())),
+        "the run's job id always wins over a caller value",
     );
     assert_eq!(
         envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
@@ -4721,14 +4880,19 @@ fn rendered_secs(text: &str, label: &str) -> u64 {
         .unwrap_or_else(|_| panic!("no figure after {label:?} in: {text}"))
 }
 
-/// The prose of a running check, for the tests that read it.
-fn monitor_text(job_id: &str) -> String {
-    call_monitor(job_id)
+/// The prose of one `monitor` reply, for the tests that read it.
+fn monitor_reply_text(result: &CallToolResult) -> String {
+    result
         .content
         .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .expect("status text")
+}
+
+/// The prose of a running check, for the tests that read it.
+fn monitor_text(job_id: &str) -> String {
+    monitor_reply_text(&call_monitor(job_id))
 }
 
 #[test]
@@ -6473,7 +6637,7 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
             .map(|t| t.text.clone())
             .expect("refusal text"),
         "error: unknown job_id: d-pin-unknown-0 — clauth never minted it (a real id reads \
-         `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
+         `d-<base36-ms>-<pid>-<counter>`); check the id `delegate` handed back"
     );
 
     jobs::write_done_parts(
@@ -7697,7 +7861,7 @@ fn an_unknown_job_id_names_which_cause_it_was() {
 
     let never = unknown_job_reason("not-a-job", now);
     assert!(
-        never.contains("never minted") && never.contains("d-<base36-ms>-<counter>"),
+        never.contains("never minted") && never.contains("d-<base36-ms>-<pid>-<counter>"),
         "an id off the mint shape says so and names the shape: {never}",
     );
 
@@ -7739,7 +7903,8 @@ fn an_unknown_job_id_names_which_cause_it_was() {
     );
     for reason in [&aged_word, &fresh_word] {
         assert!(
-            reason.contains("never have minted it") && reason.contains("d-<base36-ms>-<counter>"),
+            reason.contains("never have minted it")
+                && reason.contains("d-<base36-ms>-<pid>-<counter>"),
             "an id clauth may never have minted is never told it had one: {reason}",
         );
     }
@@ -7822,11 +7987,11 @@ fn an_unknown_id_with_a_delivery_on_record_names_the_delivery() {
     }
 }
 
-/// A dead owner's row lists as `orphaned` — a dead state — in the no-`job_ids`
+/// A dead owner's row lists as `stopped` — a dead state — in the no-`job_ids`
 /// listing, at most one poll after the owner's death, never as `running` off
 /// the stored phase alone.
 #[test]
-fn a_dead_owners_row_lists_as_orphaned_not_running() {
+fn a_dead_owners_row_lists_as_stopped_not_running() {
     let _home = HomeSandbox::new();
     let id = "d-779500-0";
     jobs::write_heartbeat_with_session(
@@ -7856,12 +8021,12 @@ fn a_dead_owners_row_lists_as_orphaned_not_running() {
         .map(|t| t.text.clone())
         .expect("reply text");
     assert!(
-        text.contains(&format!("job `{id}` orphaned")),
+        text.contains(&format!("job `{id}` stopped")),
         "a dead owner's row lists with a dead state, not as running: {text}"
     );
     assert!(
         text.contains("resume with session id `sess-listed-1`"),
-        "the orphaned row keeps its resume sentence: {text}"
+        "the stopped row keeps its resume sentence: {text}"
     );
     assert!(
         jobs::read(id).is_some(),
@@ -7870,10 +8035,11 @@ fn a_dead_owners_row_lists_as_orphaned_not_running() {
 }
 
 /// A corpse whose server died answers the collect with its session id, the
-/// owner-ruled orphan copy — the owner marker makes that fire at the owner's
-/// death rather than a day later.
+/// stop copy — the owner marker makes that fire at the owner's death rather
+/// than a day later, and the sweep keeps the record as a stopped tombstone so
+/// the collect can name the handle it carries.
 #[test]
-fn a_dead_owners_record_answered_by_id_names_the_crash_and_its_handle() {
+fn a_dead_owners_record_answered_by_id_names_the_stop_and_its_handle() {
     let _home = HomeSandbox::new();
     let id = "d-779600-0";
     jobs::write_heartbeat_with_session(
@@ -7898,14 +8064,14 @@ fn a_dead_owners_record_answered_by_id_names_the_crash_and_its_handle() {
     assert_eq!(
         text,
         format!(
-            "error: unknown job_id: {id}. it died without finishing and its record was removed. \
+            "job {id} was stopped when its session exited and left no result. \
              it's still resumable from its session id: sess-orph-owner-1"
         ),
-        "the reply is the owner's orphan copy with the surviving handle: {text}"
+        "the reply is the stop copy with the surviving handle: {text}"
     );
     assert!(
         jobs::read(id).is_none(),
-        "the collect reaped the dead owner's record"
+        "the collect consumed the tombstone it answered"
     );
 }
 
@@ -7960,6 +8126,593 @@ fn a_corpse_polled_past_the_window_is_answered_with_its_session_id_not_the_aged_
         jobs::read(&id).is_none(),
         "the sweep really reaped the record before the wait read it, so the pin \
          drives the real ordering, not a stubbed one"
+    );
+}
+
+/// A collect from a session other than the one a kept corpse is tied to never
+/// takes that session's lost wake away: the record stays for its owner, whose
+/// next turn end still adopts it and wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_lost_wake() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let _ = call_monitor(&id);
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's kept corpse"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the dead job");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A collect of a corpse tied to another session leaves the record and
+/// answers the crashed copy's shared arm — the existing line that reads true
+/// for a record still on disk — so the answer never claims a removal that
+/// did not happen.
+#[test]
+fn a_foreign_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the foreign collect answers the crashed copy, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A foreign corpse that never recorded a session id has no handle to name:
+/// the collect says the job died, no more, and leaves the record for its
+/// owner's wake.
+#[test]
+fn a_foreign_collect_of_a_handleless_corpse_says_it_died_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// The isolated arm of the same answer: a foreign isolated corpse's
+/// transcript left with the throwaway tree, so the collect names no resume
+/// handle it could not honour.
+#[test]
+fn a_foreign_isolated_collect_answers_the_crashed_copy_and_leaves_the_record() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+        "isolated": true,
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the foreign isolated collect answers the isolated arm, whole string: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A server launched outside Claude Code resolves no host session of its
+/// own, so it owns no corpse tied to a session: the collect leaves the
+/// record for the session the corpse is tied to.
+#[test]
+fn a_collect_without_a_host_session_leaves_a_tied_corpse() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUDE_CODE_SESSION_ID", None)]);
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse's id is a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "the sessionless collect answers the crashed copy: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "a sessionless server owns no tied corpse: the record stays"
+    );
+}
+
+/// The batch arm follows the same rule per id: a foreign corpse's row reads
+/// the crashed copy, the record stays, and the batch is an error like the
+/// one-id spelling.
+#[test]
+fn a_batch_collect_leaves_a_foreign_corpse_and_answers_its_row() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor_batch(vec![&id, "d-absent-0"]);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a foreign corpse makes the batch an error, like the one-id spelling"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.starts_with(&format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )),
+        "the foreign row reads the crashed copy, raw like a tombstone's: {text}"
+    );
+    assert!(
+        text.contains("job `d-absent-0` unknown"),
+        "the batch still reports its other rows: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "the batch leaves the record for its owner's wake"
+    );
+}
+
+/// A crashed tombstone tied to `host_session`, with `session_id` as its resume
+/// handle when it has one, written raw as the sweep writes it.
+fn seed_tied_tombstone(id: &str, host_session: &str, session_id: Option<&str>) {
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let mut record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "host_session": host_session,
+    });
+    if let Some(sid) = session_id {
+        record["session_id"] = sid.into();
+    }
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The text of a by-id `monitor` reply, asserting it is a tool error.
+fn monitor_reply(id: &str) -> String {
+    let result = call_monitor(id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a dead job's id is a tool error"
+    );
+    result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text")
+}
+
+/// Another session's collect of a crashed tombstone that never named a
+/// session id says the job died, no more, and leaves the record.
+#[test]
+fn a_foreign_collect_of_a_handleless_tombstone_says_it_died_and_leaves_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", None);
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!("error: job {id} died without finishing and left no result.")
+    );
+    assert!(jobs::read(&id).is_some(), "the record stays for its owner");
+}
+
+/// The owning session's own collect of its tied crashed tombstone claims it:
+/// the owner's copy, raw, and the record is gone, so no later turn end wakes
+/// about a job its model already asked after.
+#[test]
+fn the_owners_collect_of_its_tied_tombstone_claims_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-owner")),
+        )],
+    );
+    let id = jobs::new_job_id(now_ms() - 10_000);
+    seed_tied_tombstone(&id, "sess-owner", Some("d-run-1"));
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        )
+    );
+    assert!(jobs::read(&id).is_none(), "the owner's collect claims it");
+}
+
+/// A dead BLOCKING run's lost wake rides its crashed tombstone; a collect from
+/// another session leaves that tombstone for its owner, whose turn end still
+/// wakes with the lost line.
+#[test]
+fn a_collect_from_another_session_leaves_the_owners_crashed_tombstone() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "CLAUDE_CODE_SESSION_ID",
+                Some(std::ffi::OsStr::new("sess-peer")),
+            ),
+            ("CLAUDE_CODE_ENTRYPOINT", Some(std::ffi::OsStr::new("cli"))),
+        ],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "done",
+        "started_at": now - 10_000,
+        "done_at": now,
+        "crashed": true,
+        "session_id": "d-run-1",
+        "host_session": "sess-owner",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        monitor_reply(&id),
+        format!(
+            "error: job {id} died without finishing and left no result. \
+             it's still resumable from its session id: d-run-1"
+        ),
+        "a foreign collect answers the crashed copy"
+    );
+    assert!(
+        jobs::read(&id).is_some(),
+        "another session's collect leaves the owner's crashed tombstone"
+    );
+
+    let owner_turn_end = crate::hook_note::Payload {
+        event: "Stop".to_string(),
+        session_id: "sess-owner".to_string(),
+        agent_id: None,
+        tool_name: None,
+        source: None,
+        transcript: None,
+    };
+    let watch =
+        turn_end_watch(Some(&owner_turn_end)).expect("the owner's turn end adopts the tombstone");
+    assert_eq!(watch.adopted, std::slice::from_ref(&id));
+    let limits = AwaitLimits {
+        deadline: std::time::Duration::from_secs(60),
+        idle_wake_ms: AWAIT_IDLE_WAKE_SECS * 1000,
+        poll: std::time::Duration::from_millis(5),
+        rescan: std::time::Duration::from_millis(5),
+    };
+    let outcome = await_job_outcomes(&watch, &limits, &|| true, &|_| false);
+    assert_eq!(
+        await_job_wake(&outcome),
+        (
+            2,
+            Some(format!(
+                "delegate job `{id}` ended with its server; its result is lost. \
+                 resume it with `delegate` `session_id: d-run-1`, or run the task again."
+            )),
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// A `monitor` collect on a dead job tied to a session: the collect's own
+/// sweep classifies the corpse as an exit-shaped stop (its record carries the
+/// resume handle), consumes the stopped tombstone and answers the stop copy
+/// with that handle; nothing is left for a later turn end to adopt.
+#[test]
+fn a_collect_of_a_tied_corpse_answers_the_stopped_copy_and_consumes_it() {
+    let home = HomeSandbox::new();
+    // The collect consumes a dead job only when it is the collecting
+    // session's own; pin this collector to the corpse's host session, since
+    // the bare test process resolves no session of its own.
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-kept-1")),
+        )],
+    );
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    let now = now_ms();
+    let id = jobs::new_job_id(now - 10_000);
+    let record = serde_json::json!({
+        "job_id": id,
+        "profile": "acct",
+        "state": "running",
+        "started_at": now - 10_000,
+        "owner_pid": 4242,
+        "session_id": "sess-kept-1",
+        "host_session": "sess-kept-1",
+    });
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc_running_corpses(now);
+    let swept = jobs::read(&id).expect("the collect's own sweep leaves the record");
+    assert!(
+        swept.stopped,
+        "the sweep classifies the tied corpse as the exit's stop"
+    );
+
+    let result = call_monitor(&id);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a corpse's id is still a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} was stopped when its session exited and left no result. \
+             it's still resumable from its session id: sess-kept-1"
+        ),
+        "the collect answers the stopped copy the sweep's classification earns: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "the collect consumed the tombstone it answered"
+    );
+    assert!(
+        !crate::hook_jobs::own_jobs("sess-kept-1", now, None).contains(&id),
+        "no later turn end of the session adopts the job"
     );
 }
 
@@ -8270,18 +9023,32 @@ fn minted_job_ids_round_trip_through_job_id_minted_at() {
 
 #[test]
 fn token_is_job_id_accepts_fresh_and_legacy_and_rejects_bad_shapes() {
-    assert!(token_is_job_id("d-msvr98yv-0"), "a fresh base-36 id");
+    assert!(
+        token_is_job_id("d-msvr98yv-1234-0"),
+        "the current four-part id: base-36 stamp, decimal pid, decimal counter"
+    );
+    assert!(token_is_job_id("d-msvr98yv-0"), "an older three-part id");
     assert!(
         token_is_job_id("d-1786881748135-0"),
         "a legacy decimal stamp is also valid base-36"
     );
     assert!(!token_is_job_id("d-0"), "two segments");
-    assert!(!token_is_job_id("d-abc-1-0"), "four segments");
+    assert!(
+        token_is_job_id("d-abc-1-0"),
+        "four segments: stamp, pid, counter"
+    );
+    assert!(!token_is_job_id("d-abc-1-0-0"), "five segments");
     assert!(!token_is_job_id("d--1"), "empty stamp");
     assert!(!token_is_job_id("d-abc-"), "empty counter");
+    assert!(!token_is_job_id("d-abc-1-"), "empty counter after the pid");
     assert!(!token_is_job_id("d-ABC-1"), "uppercase stamp char");
     assert!(!token_is_job_id("d-ab!c-1"), "non-base-36 stamp char");
     assert!(!token_is_job_id("d-abc-1x"), "non-digit counter");
+    assert!(!token_is_job_id("d-abc-x-0"), "non-digit pid");
+    assert!(
+        !token_is_job_id("d-abc-1-x"),
+        "non-digit counter after a pid"
+    );
     assert!(!token_is_job_id("nope"));
     assert!(!token_is_job_id(""));
 }
@@ -8440,9 +9207,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
     }
 }
 
-/// Slice 4: the description names the uncapped contract, the host Task parking
-/// threshold, the cost of a blocking call, and the fan-out guidance. Dropping
-/// any one during a prose edit would otherwise be silent.
+/// The description names the uncapped contract, the host Task parking
+/// threshold, the cost of a blocking call, the fan-out guidance and the
+/// long-queue recipe. Dropping any one during a prose edit would otherwise be
+/// silent.
 #[test]
 fn the_delegate_description_names_the_usage_contract() {
     let text = tool_entry_text("delegate");
@@ -8460,12 +9228,28 @@ fn the_delegate_description_names_the_usage_contract() {
         "distinct prompts",
         "fans the SAME prompt out",
         "pick the account with `profiles` first",
+        // The long-queue recipe, right after the fan-out sentence it extends.
+        "across accounts. A long queue runs the same way: keep a batch of \
+         `background: true` calls in flight and start the next as each result arrives.",
     ] {
         assert!(
             text.contains(phrase),
             "`delegate` description dropped {phrase:?}: {text}",
         );
     }
+
+    // `tool_entry_text` folds every whitespace run to one space; only the raw
+    // description shows the recipe still shares the fan-out paragraph.
+    let tools = ClauthServer::new().tool_router.list_all();
+    let raw = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .and_then(|t| t.description.as_deref())
+        .expect("the delegate tool carries a description");
+    assert!(
+        raw.contains("across accounts. A long queue runs the same way:"),
+        "the long-queue recipe left the fan-out paragraph: {raw:?}",
+    );
 }
 
 /// `which` folded into `profiles({scope: "session"})`, and the old
@@ -10517,9 +11301,9 @@ fn a_resume_with_the_delivered_id_resolves_the_transcript() {
 fn the_cancel_registry_holds_a_flag_only_while_the_run_is_registered() {
     let id = "d-777000-0";
     assert!(!super::cancel_job(id), "nothing is registered under it yet");
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::new(super::StopFlag::default());
     let guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
-    let read = || flag.load(std::sync::atomic::Ordering::Relaxed);
+    let read = || flag.cancel.load(std::sync::atomic::Ordering::Relaxed);
     assert!(!read(), "registering does not cancel");
     assert!(super::cancel_job(id), "a registered id is held");
     assert!(
@@ -10553,7 +11337,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         serde_json::json!({"profile": "work", "is_error": true, "result": "half an answer"}),
     )
     .unwrap();
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::new(super::StopFlag::default());
     let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
     // Past any clock-sampling noise, so the file's mtime sits strictly before
     // the ask inside the call — without this the wall age can floor to 0 ms
@@ -10565,7 +11349,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         cancel: Some(true),
     });
     assert!(
-        flag.load(std::sync::atomic::Ordering::Relaxed),
+        flag.cancel.load(std::sync::atomic::Ordering::Relaxed),
         "the running loop's own flag is what `cancel: true` sets"
     );
     let text = result
@@ -10681,8 +11465,9 @@ fn cancelling_an_unheld_self_owned_running_record_says_it_is_finishing() {
 }
 
 /// The row's demanded shape: cancel on a job whose server is GONE ends the row.
-/// The note names the gone server; the collect below reaps the record and
-/// answers the orphan copy with the surviving handle.
+/// The note names the gone server; the collect below converts the record to a
+/// stopped tombstone, answers the stop copy with the surviving handle, and
+/// consumes it.
 #[test]
 fn cancelling_a_job_whose_server_is_gone_removes_its_row_and_says_so() {
     let _home = HomeSandbox::new();
@@ -10717,8 +11502,8 @@ fn cancelling_a_job_whose_server_is_gone_removes_its_row_and_says_so() {
         "the old 'earlier server process' hedge is gone; the note names the fact: {text}"
     );
     assert!(
-        text.contains("its record was removed") && text.contains("sess-gone-1"),
-        "the row below renders the orphan copy with the handle: {text}"
+        text.contains("was stopped when its session exited") && text.contains("sess-gone-1"),
+        "the row below renders the stop copy with the handle: {text}"
     );
     assert!(
         jobs::read(id).is_none(),
@@ -10848,12 +11633,12 @@ fn cancelling_an_ownerless_running_record_keeps_the_hedge() {
     );
 }
 
-/// The sweep's tombstone — a crashed blocking run's converted record — is the
-/// `record.crashed` arm of the cancel's dead derivation: its owner is gone, so
-/// the note names the gone server and the row renders the owner's crash copy,
-/// never "already finished" (the tombstone carries no result).
+/// The sweep's tombstone — a stopped blocking run's converted record — is the
+/// dead arm of the cancel's derivation: its owner is gone, so the note names
+/// the gone server and the row renders the stop copy, never "already
+/// finished" (the tombstone carries no result).
 #[test]
-fn cancelling_a_tombstone_names_the_gone_server_and_renders_the_crash_copy() {
+fn cancelling_a_tombstone_names_the_gone_server_and_renders_the_stop_copy() {
     let _home = HomeSandbox::new();
     let id = "d-779450-0";
     jobs::write_heartbeat_with_session(
@@ -10888,8 +11673,8 @@ fn cancelling_a_tombstone_names_the_gone_server_and_renders_the_crash_copy() {
         "a tombstone is the gone-server bucket, never a finished job: {text}"
     );
     assert!(
-        text.contains("died without finishing and left no result") && text.contains("sess-tomb-2"),
-        "the row below renders the owner's crash copy with the handle: {text}"
+        text.contains("was stopped when its session exited") && text.contains("sess-tomb-2"),
+        "the row below renders the stop copy with the handle: {text}"
     );
     assert!(
         jobs::read(id).is_none(),
@@ -10945,7 +11730,7 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
 fn a_refused_job_ids_list_cancels_nothing() {
     let _home = HomeSandbox::new();
     let live = "d-781000-0";
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::new(super::StopFlag::default());
     let _guard = super::CancelGuard::register(live, std::sync::Arc::clone(&flag));
     let mut ids: Vec<String> = (0..256).map(|i| format!("d-{i}-0")).collect();
     ids.push(live.to_string());
@@ -10969,7 +11754,7 @@ fn a_refused_job_ids_list_cancels_nothing() {
         "the refusal is the whole reply: nothing was cancelled to report"
     );
     assert!(
-        !flag.load(std::sync::atomic::Ordering::Relaxed),
+        !flag.cancel.load(std::sync::atomic::Ordering::Relaxed),
         "a list the server refuses must not have stopped a run on its way to being refused"
     );
 }
@@ -11251,10 +12036,12 @@ fn the_delegate_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
         .1;
     assert_eq!(
         tail,
-        "ifisolated&&letOk(claude_home)=crate::profile::claude_dir(){\
-         crate::start::rescue_teardown(runtime.config_dir(),runtime.sessions_dir(),&claude_home);}",
+        "lettranscript_rescued=ifisolated&&letOk(claude_home)=crate::profile::claude_dir(){\
+         let(transcripts,_sidecars)=crate::start::rescue_teardown(runtime.config_dir(),\
+         runtime.sessions_dir(),&claude_home,);transcripts>0}else{false};",
         "between the stamp leg and the end of the teardown region there must be \
-         the rescue leg and nothing else, gated on the isolation alone"
+         the rescue leg — its moved-count verdict bound — and nothing else, \
+         gated on the isolation alone"
     );
 }
 
@@ -11532,8 +12319,8 @@ fn a_blocking_run_is_cancellable_from_its_spawn_and_the_entry_travels_with_the_c
 }
 
 /// The attached half of the same lifecycle: a blocking run whose caller is
-/// still waiting drops the liveness record and the registry entry together at
-/// the finalize, in that order, so the id stops reading held the moment the
+/// still waiting settles its liveness record and retires the registry entry
+/// together at the finalize, so the id stops reading held the moment the
 /// record stops reading live.
 #[test]
 fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_record() {
@@ -11548,10 +12335,97 @@ fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_r
         !super::cancel_job(&id),
         "the entry retires with the liveness record it guarded"
     );
-    assert!(
-        job_files().is_empty(),
-        "and the record itself is gone too: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "the record stays under its liveness spelling only, settled"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
+    );
+}
+
+/// An attached run's finish leaves its outcome on the liveness record it
+/// already owns, and never its result: the caller took that through the join.
+#[test]
+fn an_attached_finish_leaves_its_outcome_on_its_liveness_record() {
+    for (envelope, failed) in [
+        (
+            serde_json::json!({"profile": "work", "result": "the caller got this"}),
+            false,
+        ),
+        (
+            serde_json::json!({"profile": "work", "is_error": true, "result": "refused"}),
+            true,
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        let handoff = super::Handoff::blocking(mint_spec("work"));
+        handoff.mark_spawned();
+        let id = handoff.spec().expect("liveness record").job_id;
+        handoff.finalize(&envelope);
+
+        let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+        let job = listed
+            .iter()
+            .find(|job| job.record.job_id == id)
+            .unwrap_or_else(|| panic!("the finished run is still listed: {envelope}"));
+        assert_eq!(job.kind, jobs::RecordKind::Liveness, "{envelope}");
+        assert!(
+            matches!(job.liveness, jobs::JobLiveness::Done),
+            "the record reads done: {envelope}"
+        );
+        assert_eq!(
+            job.phase(),
+            jobs::JobPhase::Done,
+            "a settled record reads done, never stopped: {envelope}"
+        );
+        assert!(
+            job.record.envelope.is_none() || job.record.envelope == Some(serde_json::Value::Null),
+            "no result rides the settled record: {envelope}"
+        );
+        assert_eq!(super::done_job_failed(&job.record), failed, "{envelope}");
+    }
+}
+
+/// The settled record keeps the session id the run's envelope names, as a
+/// background finish's done record does, so its row keeps the handle.
+#[test]
+fn an_attached_finish_keeps_its_session_id_on_the_settled_record() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({
+        "profile": "work",
+        "session_id": "5e55-0",
+        "result": "the caller got this",
+    }));
+
+    let listed = jobs::list_banded_readable(crate::usage::now_ms()).expect("a readable store");
+    let job = listed
+        .iter()
+        .find(|job| job.record.job_id == id)
+        .expect("the finished run is still listed");
+    assert_eq!(job.record.session_id.as_deref(), Some("5e55-0"));
+}
+
+/// `monitor` asked for an attached run that already finished says so, rather
+/// than calling it still running or unknown.
+#[test]
+fn monitor_on_a_finished_attached_run_says_its_result_went_back_through_the_call() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
+
+    assert_eq!(
+        unknown_job_reason(&id, crate::usage::now_ms()),
+        format!(
+            "job_id {id}: the run finished, its result went back through the call that started it"
+        ),
     );
 }
 
@@ -11646,26 +12520,31 @@ fn an_abandoned_run_with_no_child_yet_mints_nothing_and_stops_instead() {
 /// finalize. The mint sits outside the state lock (so both leaves stay leaves),
 /// which is exactly what makes this window exist.
 #[test]
-fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
+fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_nothing_collectable() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "landed first"}));
-    assert!(
-        job_files().is_empty(),
-        "a run still attached to its caller writes nothing: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "a run still attached to its caller leaves only its settled liveness record"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "and nothing under the id is collectable"
     );
 
     assert!(
         matches!(handoff.hand_off(), super::Abandoned::Kept),
         "and a hand-off reaching a finished run reports nothing to collect",
     );
-    assert!(
-        job_files().is_empty(),
-        "leaving no orphan behind either: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{id}.live.json")],
+        "leaving no collectable orphan behind either"
     );
 
     // The true race — the run landing while its reservation is being minted —
@@ -11674,7 +12553,7 @@ fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
     // that will never finalize.
     let reserved = reserve_job(
         &mint_spec("work"),
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(super::StopFlag::default()),
     )
     .expect("mint the reservation the race would strand");
     let stranded = reserved.spec.job_id.clone();
@@ -11753,13 +12632,13 @@ fn monitor_cannot_collect_a_blocking_run_under_either_spelling() {
 
 /// M9's half of the seam: a blocking run gets a LIVENESS record at its spawn, so
 /// an operator can watch a delegate whose caller is still holding the line — and
-/// the record goes away when that caller takes the envelope, because a record
-/// left behind promises a result nobody will ever collect.
+/// when that caller takes the envelope the record settles as done without it,
+/// under the spelling no `monitor` id reaches, so it promises no second result.
 ///
 /// The mint sits at the spawn rather than at construction because that is the
 /// boundary a child exists at; the pre-spawn arm below is what that buys.
 #[test]
-fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes() {
+fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_collectable_when_it_finishes() {
     let _home = HomeSandbox::new();
     let handoff = super::Handoff::blocking(mint_spec("work"));
     assert!(
@@ -11800,11 +12679,15 @@ fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes(
     assert_eq!(listed[0].kind, jobs::RecordKind::Liveness);
 
     handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
-    assert!(
-        job_files().is_empty(),
-        "the caller took the envelope from the join, so the record retires with \
-         it rather than offering a second delivery: {:?}",
+    assert_eq!(
         job_files(),
+        vec![format!("{}.live.json", spec.job_id)],
+        "the caller took the envelope from the join, so the record settles under \
+         its liveness spelling rather than offering a second delivery"
+    );
+    assert!(
+        jobs::read(&spec.job_id).is_none(),
+        "and the id still collects nothing"
     );
 }
 
@@ -12676,6 +13559,58 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             .unwrap();
         assert_eq!(row[key], serde_json::json!(want), "{id} {key}: {payload}");
     }
+}
+
+/// An orphaned row offers its session id as a resume handle only where
+/// `delegate` accepts it: an isolated run's transcript left with its throwaway
+/// tree, so its row names no resume, while a shared one beside it still does.
+#[test]
+fn the_listing_offers_no_resume_on_an_isolated_orphan() {
+    let _home = HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    // A record whose dead owner left a session id reads `stopped`, so the
+    // orphaned shapes here are the ownerless ones: silence alone classifies
+    // them, and their isolated transcript is as gone as a dead owner's.
+    let started = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    for (id, isolated) in [("d-iso-0", true), ("d-shared-0", false)] {
+        let record = serde_json::json!({
+            "job_id": id,
+            "profile": "acct",
+            "state": "running",
+            "started_at": started,
+            "owner_pid": 0,
+            "session_id": format!("{id}-sid"),
+            "isolated": isolated,
+        });
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let text = monitor_state_text();
+    let line = |id: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no row for {id}:\n{text}"))
+            .trim()
+            .to_string()
+    };
+
+    assert!(
+        line("d-iso-0").starts_with("job `d-iso-0` orphaned on `acct`, last seen "),
+        "{}",
+        line("d-iso-0")
+    );
+    assert!(
+        line("d-shared-0").starts_with(
+            "job `d-shared-0` orphaned on `acct`; resume with session id `d-shared-0-sid`, last seen "
+        ),
+        "{}",
+        line("d-shared-0")
+    );
 }
 
 /// A store at or under the bound says nothing about what it left out.
@@ -14124,5 +15059,4056 @@ fn a_delegate_to_a_keyless_proxy_account_the_load_reads_as_oauth_is_not_refused_
     assert_eq!(
         result.map(|_| "<admitted>".to_string()),
         Ok("<admitted>".to_string())
+    );
+}
+
+// ── exit stop ───────────────────────────────────────────────────────────────
+
+/// A pid no live server holds a marker for, so a record it owns reads as
+/// owned by a server that died: the shape `/exit` leaves when Claude Code
+/// kills `clauth mcp` before it stopped its delegates.
+const DEAD_SERVER_PID: u32 = 999_999_937;
+
+/// Register a bare profile in the sandbox so the real spawn path can run
+/// against the FakeClaude shim: `run_delegate`'s pre-flight passes a plain
+/// non-third-party profile, and nothing reaches a network.
+#[cfg(unix)]
+fn register_delegate_profile(name: &str) {
+    // `ProfileRuntime::acquire` requires the mirror root to exist, the same
+    // fixture the runtime tests build.
+    std::fs::create_dir_all(crate::profile::claude_dir().expect("claude dir"))
+        .expect("mkdir ~/.claude");
+    let profile = crate::profile::Profile::new(name.to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut state = crate::profile::load_config().expect("load config").state;
+    if !state.profiles.iter().any(|n| n == &profile.name) {
+        state.profiles.push(profile.name.as_str().into());
+    }
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Launch one background delegate through the real spawn path, against a
+/// runtime the caller keeps alive for the whole test (a dropped current-thread
+/// runtime waits on the detached task, which runs until the test stops it).
+#[cfg(unix)]
+fn launch_held_delegate(
+    rt: &tokio::runtime::Runtime,
+    profile: &str,
+    isolation: Isolation,
+    extra_args: Vec<String>,
+    origin: super::DelegateOrigin,
+) -> String {
+    launch_held_delegate_with(
+        rt,
+        profile,
+        isolation,
+        extra_args,
+        origin,
+        HashMap::new(),
+        None,
+    )
+}
+
+/// [`launch_held_delegate`] with a caller `env` and a delegate `cwd`.
+#[cfg(unix)]
+fn launch_held_delegate_with(
+    rt: &tokio::runtime::Runtime,
+    profile: &str,
+    isolation: Isolation,
+    extra_args: Vec<String>,
+    origin: super::DelegateOrigin,
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+) -> String {
+    let reserved = reserve_background_job(profile, None, None, isolation, origin)
+        .expect("reserve background job");
+    let job_id = reserved.spec.job_id.clone();
+    rt.block_on(async {
+        launch_background_delegate(
+            profile.to_string(),
+            BackgroundOpts {
+                prompt: std::sync::Arc::from("hello"),
+                model: None,
+                cwd,
+                env,
+                extra_args,
+                resume: None,
+                subagent_type: None,
+                allowed_tools: None,
+                permission_mode: None,
+                result_file: false,
+                isolation,
+                depth: 0,
+            },
+            reserved,
+            None,
+        );
+    });
+    job_id
+}
+
+/// Wait until the shim recorded its own pid and its grandchild's pid, one
+/// line each; fails naming the file's contents on the bound.
+#[cfg(unix)]
+fn wait_for_hold(path: &std::path::Path) -> (u32, u32) {
+    for _ in 0..100 {
+        let lines = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        if lines.len() >= 2 {
+            return (lines[0], lines[1]);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "the shim never recorded its pids: {}; store: {:?}",
+        std::fs::read_to_string(path).unwrap_or_default(),
+        jobs::list(now_ms())
+    );
+}
+
+/// Poll the running record until the spawn's facts (the pinned session id and
+/// the child pid) are stamped, failing by name past the bound — the stamp is a
+/// second write after the spawn, so a single immediate read races it.
+#[cfg(unix)]
+fn wait_for_stamped_record(job_id: &str) -> jobs::JobRecord {
+    for _ in 0..50 {
+        if let Some(record) = jobs::read(job_id)
+            && record.session_id.is_some()
+            && record.child_pid != 0
+        {
+            return record;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "the spawn never stamped the running record: {:?}",
+        jobs::read(job_id)
+    );
+}
+
+/// Poll until the stop's `done` record lands, failing by name past 10 s: the
+/// record is the stop's own finalize, so this waits on the record rather than
+/// on the drain's bound, and the bound covers a supervision-loop tick starved
+/// by box load (measured once at 1.4 s while five concurrent builds ran).
+#[cfg(unix)]
+fn wait_for_stopped_record(job_id: &str) -> jobs::JobRecord {
+    let bound = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(record) = jobs::read(job_id)
+            && record.state == jobs::JobState::Done
+        {
+            return record;
+        }
+        assert!(
+            started.elapsed() < bound,
+            "the stopped record never landed inside {}ms; store: {:?}",
+            bound.as_millis(),
+            jobs::list(now_ms())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The provenance of the record an exit stop landed: the in-process finalize
+/// writes the run's own envelope (`jobs::write_done`), while the sweep's
+/// backstop tombstone writes `envelope: None` with `crashed: true`
+/// (`jobs::sweep`). So the envelope is what separates a stop this process
+/// finalized from a later server's conversion, and asserting it keeps a green
+/// stop tied to the finalize even where the drain itself cannot be asserted.
+#[cfg(unix)]
+fn assert_finalized_not_swept(record: &jobs::JobRecord) {
+    assert!(
+        record.envelope.is_some() && !record.crashed,
+        "the record is the in-process finalize's own write, never the sweep backstop's tombstone: {record:?}"
+    );
+}
+
+/// Whether `pid` still names a live process; a zombie reads dead here, the
+/// same answer the sweep's own start-token predicate gives.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    crate::daemon::gateway::process_start_time(pid).is_some()
+}
+
+/// Poll until `pid` is gone, failing by name past the bound.
+#[cfg(unix)]
+fn assert_process_gone(pid: u32) {
+    let mut gone = false;
+    for _ in 0..100 {
+        if !process_alive(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "the child process {pid} is still alive");
+}
+
+/// A copy of `sleep` under the sandbox, the binary the escaped-process
+/// fixtures run: the real Bash tool refuses a bare `sleep`, and a copy the
+/// test owns names the escaped process exactly. Linux-only: on macOS a
+/// copied `/bin/sleep` keeps its Apple platform signature and the sweep
+/// cannot read its environment, so the macOS fixtures re-enter the test
+/// binary instead (`crate::testutil::spawn_tagged_park`).
+#[cfg(target_os = "linux")]
+fn copied_sleep(home: &std::path::Path) -> std::path::PathBuf {
+    let sleep = home.join("sleep");
+    if !sleep.exists() {
+        std::fs::copy("/bin/sleep", &sleep).expect("copy /bin/sleep");
+    }
+    sleep
+}
+
+/// Spawn the copied sleep tagged with a `CLAUTH_DELEGATE_JOB_ID` the caller
+/// picks, a sibling the sweep's exact match must leave alone; the test kills
+/// it itself. Linux-only, like its one binary ([`copied_sleep`]).
+#[cfg(target_os = "linux")]
+fn spawn_tagged_sleep(bin: &std::path::Path, tag: &str) -> std::process::Child {
+    std::process::Command::new(bin)
+        .arg("600")
+        .env("CLAUTH_DELEGATE_JOB_ID", tag)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn tagged sleep")
+}
+
+/// Wait until the shim recorded a spawned process's pid (one line), failing by
+/// name past the bound.
+#[cfg(target_os = "linux")]
+fn wait_for_recorded_pid(path: &std::path::Path) -> u32 {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Some(pid) = text.lines().next().and_then(|l| l.parse::<u32>().ok())
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "the shim never recorded its escaped process: {}",
+        std::fs::read_to_string(path).unwrap_or_default()
+    );
+}
+
+/// The exit stop's two bounds rest on measurements and must nest: the group
+/// grace has to end before the drain's own bound, and the drain has to fit
+/// inside the host's ~500 ms SIGKILL window after its SIGINT.
+#[cfg(unix)]
+#[test]
+fn the_exit_stop_bounds_nest_inside_the_host_kill_window() {
+    assert!(
+        jobs::GROUP_STOP_GRACE < super::EXIT_STOP_WAIT,
+        "the group grace ends inside the drain's wait: {:?} < {:?}",
+        jobs::GROUP_STOP_GRACE,
+        super::EXIT_STOP_WAIT
+    );
+    assert!(
+        super::EXIT_STOP_WAIT <= Duration::from_millis(450),
+        "the drain fits inside the host's ~500 ms SIGKILL window: {:?}",
+        super::EXIT_STOP_WAIT
+    );
+    assert!(
+        jobs::GROUP_STOP_GRACE >= Duration::from_millis(185),
+        "the group grace covers the measured worst SIGTERM-to-exit of a real `claude -p` (184.8 ms, measured 2026-11-07): {:?}",
+        jobs::GROUP_STOP_GRACE
+    );
+    assert!(
+        jobs::GROUP_STOP_GRACE + Duration::from_millis(100) <= super::EXIT_STOP_WAIT,
+        "the stop's own worst case — the grace plus the loop's 50 ms notice, a 30 ms process walk and a 20 ms poll overshoot — ends inside the drain: {:?} + 100 ms",
+        jobs::GROUP_STOP_GRACE
+    );
+    // The values themselves, not only their nesting: an edit that keeps every
+    // inequality can still move either one.
+    assert_eq!(
+        (jobs::GROUP_STOP_GRACE, super::EXIT_STOP_WAIT),
+        (Duration::from_millis(300), Duration::from_millis(450)),
+        "the grace is 1.6x the measured 184.8 ms worst SIGTERM-to-exit of a real `claude -p` (measured 2026-11-07), and the drain sits 50 ms under the host's ~500 ms SIGKILL"
+    );
+}
+
+/// The in-process stop: driving the exit handler's entry point SIGTERMs the
+/// delegate's whole process group — the child records the TERM, its
+/// grandchild dies with it — and lands a `stopped` record carrying the pinned
+/// handle. The stop returns inside its own bound plus scheduling slack; the
+/// record's envelope pins it to this process's finalize, never the sweep's.
+#[cfg(unix)]
+#[test]
+fn the_exit_stop_signals_the_delegates_group_and_lands_a_stopped_record() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("stop-probe-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("stop-hold.log");
+    fake.set_signal_hold(&hold);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    // The running record carries the pinned handle from the spawn on; polled,
+    // never assumed, since the stamp is a second write after the spawn.
+    let before = wait_for_stamped_record(&job_id);
+    let pinned = before
+        .session_id
+        .clone()
+        .expect("the spawn pinned a session id");
+
+    // The stop is bounded by construction: its loop ends at `EXIT_STOP_WAIT`
+    // whether or not the registry emptied. A loaded box can starve a run's
+    // finalize past that bound, which the record wait below covers; 2 s is
+    // scheduling slack on the loop's last iteration, not a widened contract.
+    let started = std::time::Instant::now();
+    let _drained = stop_all_at_exit();
+    assert!(
+        started.elapsed() <= super::EXIT_STOP_WAIT + Duration::from_secs(2),
+        "the stop returned after {:?}, past its own bound plus 2 s of scheduling slack",
+        started.elapsed()
+    );
+    let after = wait_for_stopped_record(&job_id);
+    assert_eq!(after.state, jobs::JobState::Done);
+    assert!(
+        after.stopped,
+        "the record reads stopped, never done-with-cancelled"
+    );
+    assert_eq!(
+        after.session_id.as_deref(),
+        Some(pinned.as_str()),
+        "the resume handle is the pinned one"
+    );
+    assert_eq!(
+        after
+            .envelope
+            .as_ref()
+            .and_then(|e| e.get("stopped").and_then(|v| v.as_str())),
+        Some("host_exit"),
+        "the envelope marks the stop"
+    );
+
+    // The child recorded the group SIGTERM (a SIGKILL cannot be trapped), and
+    // the grandchild died with the group signal.
+    let log = std::fs::read_to_string(&hold).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l == "TERM"),
+        "the child got the group SIGTERM: {log}"
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// The exit stop's escaped-process sweep: a delegate whose shim backgrounds a
+/// process into its own session — a Bash call's `&` child shape, outside the
+/// delegate's process group — leaves nothing of it after `stop_all_at_exit`.
+/// A process carrying ANOTHER job id's tag, and one whose tag has this run's
+/// id as a prefix, survive untouched.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_exit_stop_sweeps_a_process_the_run_escaped_outside_its_group() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("escape-exit-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("escape-exit-hold.log");
+    fake.set_signal_hold(&hold);
+    let escaped_record = _home.home().join("escape-exit-escaped.log");
+    let sleep = copied_sleep(_home.home());
+    fake.set_escaped_hold(&sleep, &escaped_record);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, _grandchild_pid) = wait_for_hold(&hold);
+    let escaped_pid = wait_for_recorded_pid(&escaped_record);
+
+    let mut sibling_other = spawn_tagged_sleep(&sleep, "d-other-escape-exit");
+    let mut sibling_prefix = spawn_tagged_sleep(&sleep, &format!("{job_id}0"));
+
+    // The drain is NOT asserted here: the loop's own stop spends the grace on
+    // the surviving tagged set before the finalize, which can outrun the
+    // stop's wait under a full-suite load — the sweep this test
+    // pins still lands, and the record it lands is the finalize's own write.
+    stop_all_at_exit();
+    let after = wait_for_stopped_record(&job_id);
+    assert_finalized_not_swept(&after);
+
+    // The verdicts, then the cleanup, then the asserts: a red must not leak
+    // this test's 600 s sleeps.
+    let escaped_gone = !process_alive(escaped_pid);
+    jobs::signal_group(escaped_pid, libc::SIGKILL);
+    let other_alive = process_alive(sibling_other.id());
+    let _ = sibling_other.kill();
+    let _ = sibling_other.wait();
+    let prefix_alive = process_alive(sibling_prefix.id());
+    let _ = sibling_prefix.kill();
+    let _ = sibling_prefix.wait();
+    assert!(escaped_gone, "the escaped process is stopped with the run");
+    assert!(
+        other_alive,
+        "a process carrying another job id's tag is left alone"
+    );
+    assert!(
+        prefix_alive,
+        "a process whose tag has the job id as a prefix is left alone"
+    );
+}
+
+/// A process outside both stops — its own session, a scrubbed environment —
+/// that holds the run's stdout open spends the whole post-exit pipe wait. The
+/// exit drain waits for the stopped record that wait delays, and a record that
+/// lands after `EXIT_STOP_WAIT` is what the host's SIGKILL loses to the next
+/// server's sweep, so the host-exit path's wait has to fit the drain. The shim
+/// exits 200 ms after its TERM, the measured worst SIGTERM-to-exit of a real
+/// `claude -p` (184.8 ms, measured 2026-11-07).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_host_exit_stop_lands_its_record_inside_the_drain_when_a_pipe_holder_survives() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("exit-drain-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("exit-drain-hold.log");
+    fake.set_signal_hold(&hold);
+    fake.set_term_delay("0.2");
+    let unseen_record = _home.home().join("exit-drain-unseen.pid");
+    let sleep = copied_sleep(_home.home());
+    fake.set_unseen_hold(&sleep, &unseen_record);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    // Armed before the waits below: a red in either must not leak the holder.
+    let _holder = crate::testutil::KillOnDrop::for_record(&unseen_record);
+    wait_for_hold(&hold);
+    let _unseen_pid = wait_for_recorded_pid(&unseen_record);
+
+    // The drain's fit is bound through the mechanism, not the drain's own
+    // bool: the host-exit path must take the short pipe-EOF grace — the term
+    // that keeps the stopped record's write inside the drain — and the
+    // counter pins the SELECTION. The selection precedes the record's write
+    // on the same thread, so the delta is read exactly once the record lands
+    // and not a tick earlier: a starved supervision-loop thread would leave
+    // an earlier read at 0.
+    let took_before = super::HOST_EXIT_EOF_GRACE_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    stop_all_at_exit();
+    assert!(
+        started.elapsed() <= super::EXIT_STOP_WAIT + Duration::from_secs(2),
+        "the stop returned after {:?}, past its own bound plus 2 s of scheduling slack",
+        started.elapsed()
+    );
+    let after = wait_for_stopped_record(&job_id);
+    assert_eq!(
+        super::HOST_EXIT_EOF_GRACE_TAKEN.load(std::sync::atomic::Ordering::Relaxed),
+        took_before + 1,
+        "the host-exit path took the short pipe-EOF grace; the full grace would push the stopped record's write past the drain"
+    );
+    assert_eq!(after.state, jobs::JobState::Done);
+    assert!(after.stopped, "the record reads stopped");
+    assert_eq!(
+        after
+            .envelope
+            .as_ref()
+            .and_then(|e| e.get("stopped").and_then(|v| v.as_str())),
+        Some("host_exit"),
+        "the envelope marks the host exit"
+    );
+}
+
+/// A stop's tag walk failure must not change what the run reads: the record
+/// still lands stopped with its host-exit envelope, and the tag's name parks
+/// in the pending marker beside it, so the next startup sweep stops the
+/// escaped processes the failed walk missed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_whose_tag_walk_fails_lands_the_record_and_parks_the_tag() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("stop-walk-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("stop-walk-hold.log");
+    fake.set_signal_hold(&hold);
+    let escaped_record = _home.home().join("stop-walk-escaped.pid");
+    let sleep = copied_sleep(_home.home());
+    fake.set_escaped_hold(&sleep, &escaped_record);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let escaped_guard = crate::testutil::KillOnDrop::for_record(&escaped_record);
+    let (_shim_pid, _grandchild_pid) = wait_for_hold(&hold);
+    let escaped_pid = wait_for_recorded_pid(&escaped_record);
+
+    let started = std::time::Instant::now();
+    let after = {
+        // The seam stays armed until the record lands: the loop's own walk
+        // runs on its own thread, and a tick starved past the drain's wait
+        // would otherwise complete it with the enumeration working again.
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        stop_all_at_exit();
+        assert!(
+            started.elapsed() <= super::EXIT_STOP_WAIT + Duration::from_secs(2),
+            "the stop returned after {:?}, past its own bound plus 2 s of scheduling slack",
+            started.elapsed()
+        );
+        wait_for_stopped_record(&job_id)
+    };
+    assert_eq!(after.state, jobs::JobState::Done);
+    assert!(
+        after.stopped,
+        "the record reads stopped as if the walk had completed"
+    );
+    assert_eq!(
+        after
+            .envelope
+            .as_ref()
+            .and_then(|e| e.get("stopped").and_then(|v| v.as_str())),
+        Some("host_exit"),
+        "the envelope marks the host exit"
+    );
+    assert!(
+        process_alive(escaped_pid),
+        "the failed walk signalled nothing: the escaped process still runs"
+    );
+    let marker = jobs::jobs_dir().unwrap().join(format!("{job_id}.pending"));
+    assert!(
+        marker.exists(),
+        "the failed walk parks the tag's name in the pending marker"
+    );
+
+    // The retry the marker exists for: once the enumeration works, the next
+    // startup sweep stops the escaped process and removes the marker.
+    jobs::gc(now_ms());
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped_pid);
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped_pid);
+    }
+    assert!(escaped_gone, "the startup sweep stops the escaped process");
+    // The sweep killed the holder and the kernel reaped it; signaling that pid
+    // now could hit an unrelated process that reused it.
+    std::mem::forget(escaped_guard);
+    assert!(!marker.exists(), "a completed walk removes the marker");
+}
+
+/// The pinned session id rides the running record from the spawn on, so a
+/// kill at any instant leaves the handle — a pinned `--output-format` run
+/// included, whose beats never fire at all.
+#[cfg(unix)]
+#[test]
+fn a_running_record_carries_the_pinned_session_id_from_the_spawn() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("pin-probe-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("pin-hold.log");
+    fake.set_signal_hold(&hold);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        vec!["--output-format".to_string(), "json".to_string()],
+        super::DelegateOrigin::default(),
+    );
+    wait_for_hold(&hold);
+
+    let mut running = None;
+    for _ in 0..50 {
+        if let Some(record) = jobs::read(&job_id)
+            && record.session_id.is_some()
+            && record.child_pid != 0
+        {
+            running = Some(record);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let running = running.expect("the running record carries the spawn facts");
+    assert_eq!(running.last_output_at, 0, "the pinned format never beats");
+
+    assert!(cancel_job(&job_id), "the id is held");
+    let mut done = None;
+    for _ in 0..50 {
+        if let Some(record) = jobs::read(&job_id)
+            && record.state == jobs::JobState::Done
+        {
+            done = Some(record);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let done = done.expect("the cancel finalizes the record");
+    assert!(!done.stopped, "a cancel keeps the cancelled shape");
+    assert_eq!(
+        done.session_id, running.session_id,
+        "the done record's handle is the pinned id the running record already carried"
+    );
+}
+
+/// Every delegate spawn exports `CLAUTH_DELEGATE_JOB_ID` as the run's own job
+/// id, and a caller-set value for the key is replaced by clauth's own: the
+/// escaped-process sweep keys on that exact tag, so a caller value that
+/// survived would point the stop at another run's processes.
+#[cfg(unix)]
+#[test]
+fn a_delegate_spawn_exports_its_job_id_in_the_childs_env_and_overrides_a_callers_value() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("env-tag-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let dump = _home.home().join("env-dump.txt");
+    fake.set_env_dump(&dump);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate_with(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+        HashMap::from([(
+            "CLAUTH_DELEGATE_JOB_ID".to_string(),
+            "caller-set".to_string(),
+        )]),
+        None,
+    );
+
+    // The dump lands early in the shim's life; poll for it, then read it once.
+    let mut env_dump = String::new();
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(&dump)
+            && text.contains("CLAUTH_DELEGATE_JOB_ID=")
+        {
+            env_dump = text;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The run finishes on its own (the shim exits at once); join it before the
+    // sandbox drops.
+    for _ in 0..50 {
+        if jobs::read(&job_id).is_some_and(|r| r.state == jobs::JobState::Done) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        env_dump
+            .lines()
+            .any(|l| l == format!("CLAUTH_DELEGATE_JOB_ID={job_id}")),
+        "the child's env carries the run's own job id: {env_dump}"
+    );
+    assert!(
+        !env_dump
+            .lines()
+            .any(|l| l == "CLAUTH_DELEGATE_JOB_ID=caller-set"),
+        "a caller-set value is replaced by clauth's own: {env_dump}"
+    );
+}
+
+/// A BLOCKING delegate's spawn carries the same `CLAUTH_DELEGATE_JOB_ID` tag a
+/// background one does: the exit stop and the cancel sweep find a run's
+/// escaped processes by that tag, so a shape that dropped it would leave them
+/// all running.
+#[cfg(unix)]
+#[test]
+fn a_blocking_delegate_spawn_exports_its_job_id() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("env-tag-block-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let dump = _home.home().join("env-dump-block.txt");
+    fake.set_env_dump(&dump);
+    let hold = _home.home().join("env-tag-block-hold.log");
+    fake.set_signal_hold(&hold);
+    let BlockingRun { caller, job_id, .. } = launch_blocking_run(&profile, None);
+    let (_shim_pid, _grandchild_pid) = wait_for_hold(&hold);
+    // The shim writes its env dump before it parks on the hold file, so a
+    // recorded park proves the dump has landed.
+    let env_dump = std::fs::read_to_string(&dump).unwrap_or_default();
+    let tagged = env_dump
+        .lines()
+        .any(|l| l == format!("CLAUTH_DELEGATE_JOB_ID={job_id}"));
+    // The verdict, then the cleanup, then the asserts: a red must not leak the
+    // held shim, which parks until it is stopped.
+    let held = cancel_job(&job_id);
+    let joined = caller.join().is_ok();
+    assert!(held, "the id is held");
+    assert!(joined, "the caller's join resolves");
+    assert!(
+        tagged,
+        "the blocking child's env carries the run's own job id: {env_dump}"
+    );
+}
+
+/// `monitor({cancel: true})` stops the delegate's whole group: a delegate
+/// that backgrounded a long sleep leaves nothing of it behind.
+#[cfg(unix)]
+#[test]
+fn a_cancel_stops_the_delegates_whole_group() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("cancel-group-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("cancel-hold.log");
+    fake.set_signal_hold(&hold);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    assert!(cancel_job(&job_id), "the id is held");
+
+    let mut done = None;
+    for _ in 0..50 {
+        if let Some(record) = jobs::read(&job_id)
+            && record.state == jobs::JobState::Done
+        {
+            done = Some(record);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let done = done.expect("the cancel finalizes the record");
+    assert!(!done.stopped, "a cancel keeps the cancelled shape");
+    assert_eq!(
+        done.envelope.as_ref().and_then(|e| e.get("cancelled")),
+        Some(&serde_json::json!(true))
+    );
+
+    let log = std::fs::read_to_string(&hold).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l == "TERM"),
+        "the group got the SIGTERM, not a bare kill: {log}"
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// A cancel sweeps the run's escaped processes the same way the exit stop
+/// does: after `cancel_job`, a process the run backgrounded into its own
+/// session is gone, and a process carrying another job id's tag — or one
+/// whose tag has this run's id as a prefix — is left alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cancel_also_sweeps_a_process_the_run_escaped_outside_its_group() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("escape-cancel-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("escape-cancel-hold.log");
+    fake.set_signal_hold(&hold);
+    let escaped_record = _home.home().join("escape-cancel-escaped.log");
+    let sleep = copied_sleep(_home.home());
+    fake.set_escaped_hold(&sleep, &escaped_record);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, _grandchild_pid) = wait_for_hold(&hold);
+    let escaped_pid = wait_for_recorded_pid(&escaped_record);
+
+    let mut sibling_other = spawn_tagged_sleep(&sleep, "d-other-escape-cancel");
+    let mut sibling_prefix = spawn_tagged_sleep(&sleep, &format!("{job_id}0"));
+
+    assert!(cancel_job(&job_id), "the id is held");
+    let mut done = None;
+    for _ in 0..50 {
+        if let Some(record) = jobs::read(&job_id)
+            && record.state == jobs::JobState::Done
+        {
+            done = Some(record);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    done.expect("the cancel finalizes the record");
+
+    // The verdicts, then the cleanup, then the asserts: a red must not leak
+    // this test's 600 s sleeps.
+    let escaped_gone = !process_alive(escaped_pid);
+    jobs::signal_group(escaped_pid, libc::SIGKILL);
+    let other_alive = process_alive(sibling_other.id());
+    let _ = sibling_other.kill();
+    let _ = sibling_other.wait();
+    let prefix_alive = process_alive(sibling_prefix.id());
+    let _ = sibling_prefix.kill();
+    let _ = sibling_prefix.wait();
+    assert!(escaped_gone, "the escaped process is stopped with the run");
+    assert!(
+        other_alive,
+        "a process carrying another job id's tag is left alone"
+    );
+    assert!(
+        prefix_alive,
+        "a process whose tag has the job id as a prefix is left alone"
+    );
+}
+
+/// A cancel whose tag walk fails lands the cancelled record as before, and
+/// the tag's name parks in the pending marker: the cancel arm stamps the walk
+/// failure the same way the host-exit arm does, so the marker outlives the
+/// record's collect or Done TTL.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_cancel_whose_tag_walk_fails_lands_the_record_and_parks_the_tag() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("cancel-walk-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("cancel-walk-hold.log");
+    fake.set_signal_hold(&hold);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, _grandchild_pid) = wait_for_hold(&hold);
+
+    // The seam is armed before the cancel and held until the record lands:
+    // the loop's walk runs on its own thread, so only that ordering proves
+    // the walk raced the failure.
+    let done = {
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        assert!(cancel_job(&job_id), "the id is held");
+        wait_for_stopped_record(&job_id)
+    };
+    assert!(!done.stopped, "a cancel keeps the cancelled shape");
+    assert_eq!(
+        done.envelope.as_ref().and_then(|e| e.get("cancelled")),
+        Some(&serde_json::json!(true))
+    );
+    let marker = jobs::jobs_dir().unwrap().join(format!("{job_id}.pending"));
+    assert!(
+        marker.exists(),
+        "the failed walk parks the tag's name in the pending marker"
+    );
+}
+
+/// The auto-delivery hook leaves a stopped record alone: a claim would evict
+/// the one handle the resumed session's note names.
+#[test]
+fn the_await_hook_never_claims_a_stopped_record() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(now_ms() - 5_000);
+    jobs::write_done_parts(
+        &id,
+        "work",
+        now_ms() - 5_000,
+        None,
+        None,
+        false,
+        serde_json::json!({
+            "profile": "work",
+            "result": "stopped mid-run",
+            "stopped": "host_exit",
+            "session_id": "sess-await-stop",
+        }),
+    )
+    .unwrap();
+    assert!(
+        jobs::read(&id).expect("record").stopped,
+        "the producer derived the record flag"
+    );
+
+    let watch = AwaitWatch {
+        held: vec![id.clone()],
+        adopted: Vec::new(),
+        lease: None,
+        session: None,
+    };
+    let outcome = await_job_outcomes(&watch, &AWAIT_LIMITS, &|| true, &|_| false);
+    assert!(outcome.delivered.is_empty(), "nothing is delivered");
+    assert!(
+        outcome.pending.is_empty(),
+        "the id is dropped, not named as still running"
+    );
+    assert!(
+        outcome.dead.is_empty(),
+        "the watcher stays silent: the stopped record is the resume note's to name"
+    );
+    assert!(jobs::read(&id).is_some(), "the record is NOT claimed");
+}
+
+/// The await hook's other stopped shape: a corpse the reader sweep left
+/// `running` on disk (its tag lives) already reads `stopped`, so the hook drops
+/// it instead of naming it as still running — and never claims the record the
+/// resume note names.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_await_hook_never_claims_a_stopped_phase_corpse() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = format!("d-await-corpse-{}", std::process::id());
+    seed_dead_child_corpse(&id, "sess-await-corpse", false, now);
+
+    let watch = AwaitWatch {
+        held: vec![id.clone()],
+        adopted: Vec::new(),
+        lease: None,
+        session: None,
+    };
+    let outcome = await_job_outcomes(&watch, &AWAIT_LIMITS, &|| true, &|_| false);
+    assert!(outcome.delivered.is_empty(), "nothing is delivered");
+    assert!(
+        outcome.pending.is_empty(),
+        "a stopped-phase corpse is dropped, not named as still running: {:?}",
+        outcome.pending
+    );
+    assert!(
+        outcome.dead.is_empty(),
+        "the watcher stays silent: the stopped record is the resume note's to name"
+    );
+    assert!(
+        jobs::read(&id).is_some_and(|r| r.state == jobs::JobState::Running),
+        "the record is NOT claimed, so the resume note and a later sweep still see it"
+    );
+}
+
+/// The sweep's backstop: a dead server's record whose recorded child is still
+/// alive gets that child's group stopped by the sweep, and a recorded pid now
+/// naming a DIFFERENT process (start-token mismatch) is left alone.
+#[cfg(unix)]
+#[test]
+fn the_sweep_backstop_kills_the_recorded_child_and_spares_a_reused_pid() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A real live child in its own process group, the shape the product
+    // spawns.
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+
+    let record = serde_json::json!({
+        "job_id": "d-backstop-0",
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-backstop-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": child.id(),
+        "child_start_token": token,
+    });
+    std::fs::write(
+        dir.join("d-backstop-0.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc(now);
+
+    assert_process_gone(child.id());
+    let _ = child.wait();
+
+    // A recorded pid now naming a DIFFERENT process is left alone.
+    let mut other = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn second sleep");
+    let record = serde_json::json!({
+        "job_id": "d-backstop-1",
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 59_000,
+        "recorded_at": now - 59_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-backstop-1",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": other.id(),
+        "child_start_token": "not-this-process",
+    });
+    std::fs::write(
+        dir.join("d-backstop-1.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc(now);
+
+    assert!(
+        process_alive(other.id()),
+        "a pid the OS reused is left alone"
+    );
+    other.kill().expect("kill the test's own child");
+    let _ = other.wait();
+}
+
+/// The backstop's group KILL after the grace: a recorded child whose group
+/// ignores SIGTERM survives the TERM alone, so only the `group_alive` KILL
+/// clears it.
+#[cfg(unix)]
+#[test]
+fn the_sweep_backstop_kills_a_term_surviving_group_member() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Leader and member ignore TERM (SIG_IGN survives the exec), so the
+    // sweep's SIGTERM alone leaves the group alive. The ready file closes the
+    // install race: the record exists only once the trap is in place.
+    let ready = _home.home().join("backstop-term-ready");
+    let mut leader = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "trap '' TERM; : > \"$1\"; sleep 600",
+            "sh",
+            ready.to_str().expect("ready path"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn TERM-ignoring leader");
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the leader installed its TERM trap");
+    let token = crate::daemon::gateway::process_start_time(leader.id()).expect("start token");
+
+    let record = serde_json::json!({
+        "job_id": "d-backstop-term-0",
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-backstop-term-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": leader.id(),
+        "child_start_token": token,
+    });
+    std::fs::write(
+        dir.join("d-backstop-term-0.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc(now);
+
+    // Poll briefly for the KILL to land, then clear whatever the sweep left:
+    // the red arm must not leak this test's own 600 s sleep.
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut alive = process_alive(leader.id());
+    while alive && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        alive = process_alive(leader.id());
+    }
+    jobs::signal_group(leader.id(), libc::SIGKILL);
+    let _ = leader.wait();
+    assert!(
+        !alive,
+        "the sweep's group KILL clears a group that ignored the SIGTERM"
+    );
+}
+
+/// The startup sweep's backstop also sweeps the dead run's tag: a corpse
+/// whose recorded child still lives, plus a process the run escaped outside
+/// its group (tagged with the corpse's job id), both stop under `jobs::gc`.
+/// The escaped fixture re-enters the test binary: the sweep reads its
+/// environment, and macOS withholds a platform binary's env.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_sweep_backstop_stops_a_dead_runs_escaped_process() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A real live recorded child in its own process group, the shape the
+    // product spawns; the ready file closes the spawn race.
+    let ready = _home.home().join("backstop-escape-ready");
+    let mut leader = std::process::Command::new("sh")
+        .args([
+            "-c",
+            ": > \"$1\"; sleep 600",
+            "sh",
+            ready.to_str().expect("ready path"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn leader");
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the leader exists");
+    let token = crate::daemon::gateway::process_start_time(leader.id()).expect("start token");
+
+    // The run's escaped process: the test's own child, outside the leader's
+    // group, carrying the corpse's exact job id tag. The id carries the test
+    // process's pid: the sweep is box-wide, and a fixed literal would let two
+    // concurrent gates stop each other's escaped process.
+    let job_id = format!("d-backstop-escape-{}-0", std::process::id());
+    let escaped_ready = _home.home().join("backstop-escaped-park-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &escaped_ready);
+    wait_for_parked(&escaped_ready);
+
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-backstop-escape-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": leader.id(),
+        "child_start_token": token,
+    });
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc(now);
+
+    // Poll briefly for the stop to land, then clear whatever the sweep left:
+    // the red arm must not leak this test's 600 s sleeps.
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.id());
+    }
+    let leader_gone = !process_alive(leader.id());
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    jobs::signal_group(leader.id(), libc::SIGKILL);
+    let _ = leader.wait();
+    assert!(
+        leader_gone,
+        "the backstop still stops the recorded child's group"
+    );
+    assert!(
+        escaped_gone,
+        "the backstop stops the run's escaped process too"
+    );
+}
+
+/// The startup sweep's backstop sweeps a dead run's tag even after the
+/// recorded child is gone: a delegate that finished (or died) on its own
+/// after its server died still left the processes it backgrounded outside
+/// its group running, and no later sweep targets that job id. The escaped
+/// fixture re-enters the test binary: the sweep reads its environment, and
+/// macOS withholds a platform binary's env.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_sweep_backstop_sweeps_a_dead_runs_escaped_process_when_the_recorded_child_is_gone() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The run's escaped process: the test's own child, outside any recorded
+    // group, carrying the corpse's exact job id tag. The id carries the test
+    // process's pid: the sweep is box-wide, and a fixed literal would let two
+    // concurrent gates stop each other's escaped process.
+    let job_id = format!("d-backstop-escape-dead-child-{}-0", std::process::id());
+    let escaped_ready = _home.home().join("backstop-dead-child-park-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &escaped_ready);
+    wait_for_parked(&escaped_ready);
+
+    // The delegate child already exited (`0` reads the same way), so the
+    // liveness gate on the recorded child cannot carry the sweep.
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-backstop-escape-dead-child-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": 0,
+    });
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    jobs::gc(now);
+
+    // Poll briefly for the stop to land, then clear whatever the sweep left:
+    // the red arm must not leak this test's own 600 s sleep.
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.id());
+    }
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    assert!(
+        escaped_gone,
+        "the backstop sweeps the escaped process even when the recorded child is gone"
+    );
+}
+
+/// Wait until the re-entered tagged process parked (wrote its ready file).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_parked(ready: &std::path::Path) {
+    for _ in 0..200 {
+        if ready.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "the tagged process never parked: {}",
+        std::fs::read_to_string(ready).unwrap_or_default()
+    );
+}
+
+/// Seed a dead-owner corpse with a pinned session id and a gone recorded
+/// child (`child_pid: 0`), the bytes a server killed mid-run leaves: phase
+/// reads `Stopped` while the disk state stays `running` until a sweep
+/// converts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seed_dead_child_corpse(job_id: &str, sid: &str, isolated: bool, now: u64) {
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": sid,
+        "isolated": isolated,
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": 0,
+    });
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The reader sweep a `monitor` call runs leaves a dead-owner corpse whose
+/// recorded child is gone for the STARTUP sweep while a live process carries
+/// the run's tag: converting it here would retire the only record that names
+/// the tag, and the escaped process would never be stopped. The reader's tag
+/// probe is read-only — no signal, no sleep — so the escaped process is
+/// still alive after the reader, gone after `jobs::gc`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_reader_sweep_leaves_a_tagged_corpse_for_the_startup_sweep() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let job_id = format!("d-reader-tag-{}", std::process::id());
+    let ready = _home.home().join("reader-tag-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &ready);
+    wait_for_parked(&ready);
+    seed_dead_child_corpse(&job_id, "sess-reader-tag", true, now);
+
+    jobs::gc_running_corpses(now);
+    let after_reader = jobs::read(&job_id).expect("the corpse is still on disk");
+    assert_eq!(
+        after_reader.state,
+        jobs::JobState::Running,
+        "the reader sweep leaves the corpse for the startup sweep while its tag lives: {after_reader:?}"
+    );
+    assert!(
+        process_alive(escaped.id()),
+        "the reader sweep signals nothing: the escaped process still runs"
+    );
+
+    jobs::gc(now);
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.id());
+    }
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    assert!(escaped_gone, "the startup sweep stops the escaped process");
+
+    let converted = jobs::read(&job_id).expect("the startup sweep converts the corpse");
+    assert_eq!(
+        converted.state,
+        jobs::JobState::Done,
+        "the tombstone is done"
+    );
+    assert!(converted.stopped, "the tombstone reads stopped");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-reader-tag"),
+        "the conversion keeps the resume handle"
+    );
+}
+
+/// A failed process enumeration is not an empty one: the reader sweep leaves
+/// the corpse for a later startup sweep, because converting it would retire
+/// the tag's only record on a transient read failure.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_reader_sweep_leaves_a_corpse_when_the_enumeration_fails() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let job_id = format!("d-enum-fail-{}", std::process::id());
+    seed_dead_child_corpse(&job_id, "sess-enum-fail", false, now);
+
+    let state_after_reader = {
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        jobs::gc_running_corpses(now);
+        jobs::read(&job_id)
+            .expect("the corpse is still on disk")
+            .state
+    };
+    assert_eq!(
+        state_after_reader,
+        jobs::JobState::Running,
+        "a failed enumeration leaves the corpse for a later sweep"
+    );
+
+    // The retry the leave exists for: once the enumeration works, the startup
+    // sweep converts the corpse and keeps the handle.
+    jobs::gc(now);
+    let converted = jobs::read(&job_id).expect("the startup sweep converts the corpse");
+    assert_eq!(
+        converted.state,
+        jobs::JobState::Done,
+        "the tombstone is done"
+    );
+    assert!(converted.stopped, "the tombstone reads stopped");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-enum-fail"),
+        "the conversion keeps the resume handle"
+    );
+}
+
+/// The startup sweep is a corpse's LAST chance to have its tag stopped: no
+/// later sweep targets a converted record, so a failed process walk must leave
+/// the record Running for the next server's startup sweep instead of retiring
+/// it. Both conversion branches take that leave — the dead owner's
+/// session-carrying corpse the stop walks, and the ownerless liveness corpse
+/// with no stop of its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_startup_sweep_leaves_a_corpse_when_the_enumeration_fails() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * jobs::RUNNING_TTL_MS;
+
+    let stopped_id = format!("d-startup-enum-{}", std::process::id());
+    let stopped_spec = dead_owner_spec(&stopped_id, "work", ancient, jobs::RecordKind::Collectable);
+    jobs::write_heartbeat_with_spawn_facts(
+        &stopped_spec,
+        now - 5_000,
+        "",
+        Some("sess-startup-enum"),
+        0,
+        None,
+    )
+    .expect("write the dead owner's corpse");
+
+    let crashed_id = format!("d-startup-enum-live-{}", std::process::id());
+    let crashed_spec = jobs::RunningSpec {
+        kind: jobs::RecordKind::Liveness,
+        ..running_spec(&crashed_id, "work", ancient)
+    };
+    jobs::write_heartbeat_with_spawn_facts(
+        &crashed_spec,
+        ancient,
+        "",
+        Some("sess-startup-enum-live"),
+        0,
+        None,
+    )
+    .expect("write the ownerless liveness corpse");
+
+    {
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        jobs::gc(now);
+    }
+    assert_eq!(
+        jobs::read(&stopped_id)
+            .expect("the corpse is still on disk")
+            .state,
+        jobs::JobState::Running,
+        "a failed walk leaves the stopped corpse for a later startup sweep"
+    );
+    assert_eq!(
+        jobs::read_liveness(&crashed_id)
+            .expect("the liveness corpse is still on disk")
+            .state,
+        jobs::JobState::Running,
+        "a failed walk leaves the ownerless corpse for a later startup sweep"
+    );
+
+    // The retry the leave exists for: once the enumeration works, the next
+    // startup sweep converts both and keeps their handles.
+    jobs::gc(now);
+    let converted = jobs::read(&stopped_id).expect("the next startup sweep converts the corpse");
+    assert_eq!(converted.state, jobs::JobState::Done);
+    assert!(converted.stopped, "the tombstone reads stopped");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-startup-enum"),
+        "the conversion keeps the resume handle"
+    );
+    let converted_live =
+        jobs::read(&crashed_id).expect("the next startup sweep converts the liveness corpse");
+    assert_eq!(converted_live.state, jobs::JobState::Done);
+    assert!(
+        converted_live.crashed && !converted_live.stopped,
+        "the liveness conversion is the crash tombstone, not a stop"
+    );
+    assert_eq!(
+        converted_live.session_id.as_deref(),
+        Some("sess-startup-enum-live"),
+        "the conversion keeps the resume handle"
+    );
+}
+
+/// The startup sweep's reap of an expired Running COLLECTABLE record retires
+/// the tag's only name, so the reap walks the tag first: a failed walk parks
+/// the tag's name in the pending marker — invisible to every reader — and
+/// the record still goes, as today. The next startup sweep then stops the
+/// escaped process the failed walk missed and removes the marker.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_reap_of_an_expired_running_record_parks_the_tag_on_a_failed_walk() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-reap-tag-{}", std::process::id());
+    let ready = _home.home().join("reap-tag-ready");
+    let escaped = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    jobs::write_heartbeat_with_spawn_facts(
+        &running_spec(&job_id, "work", ancient),
+        ancient,
+        "",
+        None,
+        0,
+        None,
+    )
+    .expect("seed the ownerless silent record");
+
+    {
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        jobs::gc(now);
+    }
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the reap still runs: the record is gone as today"
+    );
+    assert!(
+        process_alive(escaped.0.id()),
+        "the failed walk signalled nothing: the escaped process still runs"
+    );
+    let marker = jobs::jobs_dir().unwrap().join(format!("{job_id}.pending"));
+    assert!(
+        marker.exists(),
+        "the failed walk parks the tag's name in the pending marker"
+    );
+
+    // The retry the marker exists for: once the enumeration works, the next
+    // startup sweep stops the escaped process and removes the marker.
+    jobs::gc(now);
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.0.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.0.id());
+    }
+    assert!(escaped_gone, "the startup sweep stops the escaped process");
+    assert!(!marker.exists(), "a completed walk removes the marker");
+}
+
+/// A record's internal id reaches the marker writer straight off the parsed
+/// JSON, so the writer refuses an unsafe one the way the marker's reader
+/// does: nothing lands outside the store. The reap and the resume removal
+/// read the refusal as "keep the record"; the finalize writes its record
+/// either way.
+#[cfg(unix)]
+#[test]
+fn the_pending_marker_writer_refuses_an_unsafe_job_id() {
+    let _home = HomeSandbox::new();
+    assert!(
+        jobs::write_pending_marker("../x").is_err(),
+        "an unsafe job id is refused"
+    );
+    let outside = jobs::jobs_dir().unwrap().join("../x.pending");
+    assert!(
+        !outside.exists(),
+        "nothing lands outside the jobs dir: {}",
+        outside.display()
+    );
+}
+
+/// The reader arm of the second conversion branch: an ownerless liveness
+/// corpse beside a live process carrying its tag stays `running` after the
+/// reader sweep — the reader cannot prove the tag gone — and converts once a
+/// completed walk on the startup sweep finds no tagged process left.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_reader_leaves_an_ownerless_corpse_while_its_tag_lives() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-reader-ownerless-{}", std::process::id());
+    let ready = _home.home().join("reader-ownerless-ready");
+    let mut escaped = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    let spec = jobs::RunningSpec {
+        kind: jobs::RecordKind::Liveness,
+        ..running_spec(&job_id, "work", ancient)
+    };
+    jobs::write_heartbeat_with_spawn_facts(&spec, ancient, "", None, 0, None)
+        .expect("seed the ownerless liveness corpse");
+
+    jobs::gc_running_corpses(now);
+    let after_reader = jobs::read_liveness(&job_id).expect("the corpse is still on disk");
+    assert_eq!(
+        after_reader.state,
+        jobs::JobState::Running,
+        "the reader leaves the corpse while its tag lives: {after_reader:?}"
+    );
+    assert!(
+        process_alive(escaped.0.id()),
+        "the reader sweep signals nothing: the escaped process still runs"
+    );
+
+    let _ = escaped.0.kill();
+    let _ = escaped.0.wait();
+    jobs::gc(now);
+    assert!(
+        jobs::read_liveness(&job_id).is_none(),
+        "the conversion drops the liveness spelling"
+    );
+    let converted = jobs::read(&job_id).expect("the startup sweep converts the corpse");
+    assert_eq!(
+        converted.state,
+        jobs::JobState::Done,
+        "the tombstone is done"
+    );
+    assert!(
+        converted.crashed && !converted.stopped,
+        "the liveness conversion is the crash tombstone, not a stop"
+    );
+}
+
+/// The reader arm of the reap: an expired collectable record whose owner and
+/// session were never pinned may still have escaped processes carrying its
+/// tag, and retiring it would retire the tag's only name. The reader is
+/// read-only — no signal, no marker — so it reaps only once a completed walk
+/// finds no tagged process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_reader_leaves_an_expired_collectable_record_while_its_tag_lives() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-reader-reap-{}", std::process::id());
+    let ready = _home.home().join("reader-reap-ready");
+    let mut escaped = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    jobs::write_heartbeat_with_spawn_facts(
+        &running_spec(&job_id, "work", ancient),
+        ancient,
+        "",
+        None,
+        0,
+        None,
+    )
+    .expect("seed the ownerless silent record");
+
+    jobs::gc_running_corpses(now);
+    let after_reader = jobs::read(&job_id).expect("the record is still on disk");
+    assert_eq!(
+        after_reader.state,
+        jobs::JobState::Running,
+        "the reader leaves the record while its tag lives: {after_reader:?}"
+    );
+    assert!(
+        process_alive(escaped.0.id()),
+        "the reader sweep signals nothing: the escaped process still runs"
+    );
+    let marker = jobs::jobs_dir().unwrap().join(format!("{job_id}.pending"));
+    assert!(
+        !marker.exists(),
+        "the reader sweep writes no pending marker: it retires nothing, so it owes no retry"
+    );
+
+    let _ = escaped.0.kill();
+    let _ = escaped.0.wait();
+    jobs::gc_running_corpses(now);
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the reader reaps the record once a completed walk finds the tag gone"
+    );
+}
+
+/// A collectable record the reader sweep left on disk for its live tag is a
+/// corpse: `clauth jobs` reads it `orphaned`, so `monitor` answers the crash
+/// copy — never a live run's payload — and the record stays for the startup
+/// sweep whose stop the tag still needs named.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_left_collectable_corpse_answers_the_crash_copy() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let ancient = now - 2 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-left-corpse-{}", std::process::id());
+    let sid = format!("sess-left-corpse-{}", std::process::id());
+    let ready = _home.home().join("left-corpse-ready");
+    let mut parked = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    jobs::write_heartbeat_with_spawn_facts(
+        &running_spec(&job_id, "work", ancient),
+        ancient,
+        "",
+        Some(&sid),
+        0,
+        None,
+    )
+    .expect("seed the ownerless silent record");
+    let expected = format!(
+        "job {job_id} died without finishing and left no result. \
+         it's still resumable from its session id: {sid}"
+    );
+
+    let one = call_monitor(&job_id);
+    assert_eq!(monitor_reply_text(&one), expected);
+    assert_eq!(one.is_error, Some(true), "the crash copy is an error");
+    let batch = call_monitor_batch(vec![job_id.as_str()]);
+    assert_eq!(monitor_reply_text(&batch), expected);
+    // A one-id list answers through the one-id path; two ids reach the batch.
+    let pair = call_monitor_batch(vec![job_id.as_str(), "d-left-absent-0"]);
+    assert_eq!(
+        monitor_reply_text(&pair).lines().next(),
+        Some(expected.as_str()),
+        "the batch answers the left corpse with the crash copy"
+    );
+    assert_eq!(pair.is_error, Some(true));
+    assert_eq!(
+        jobs::list(now_ms())
+            .into_iter()
+            .find(|job| job.record.job_id == job_id)
+            .map(|job| job.phase()),
+        Some(jobs::JobPhase::Orphaned),
+        "`clauth jobs` reads the left corpse as orphaned"
+    );
+    assert_eq!(
+        jobs::read(&job_id).map(|record| record.state),
+        Some(jobs::JobState::Running),
+        "the record stays on disk for the startup sweep"
+    );
+
+    let _ = parked.0.kill();
+    let _ = parked.0.wait();
+}
+
+/// The crash copy's handleless arm, as ruled: a corpse the reader sweep left
+/// for its live tag whose session id was never recorded says so, and the run
+/// cannot be resumed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_left_handleless_corpse_answers_the_ruled_copy() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let ancient = now - 2 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-left-nosid-{}", std::process::id());
+    let ready = _home.home().join("left-nosid-ready");
+    let mut parked = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    jobs::write_heartbeat_with_spawn_facts(
+        &running_spec(&job_id, "work", ancient),
+        ancient,
+        "",
+        None,
+        0,
+        None,
+    )
+    .expect("seed the ownerless silent handleless corpse");
+    let expected = format!(
+        "job {job_id} died without finishing and left no result; \
+         its session id was never recorded, so the run cannot be resumed."
+    );
+
+    let one = call_monitor(&job_id);
+    assert_eq!(monitor_reply_text(&one), expected);
+    assert_eq!(one.is_error, Some(true), "the crash copy is an error");
+    let batch = call_monitor_batch(vec![job_id.as_str()]);
+    assert_eq!(monitor_reply_text(&batch), expected);
+    // A one-id list answers through the one-id path; two ids reach the batch.
+    let pair = call_monitor_batch(vec![job_id.as_str(), "d-left-absent-0"]);
+    assert_eq!(
+        monitor_reply_text(&pair).lines().next(),
+        Some(expected.as_str()),
+        "the batch answers the left corpse with the ruled copy"
+    );
+    assert_eq!(pair.is_error, Some(true));
+    assert_eq!(
+        jobs::list(now_ms())
+            .into_iter()
+            .find(|job| job.record.job_id == job_id)
+            .map(|job| job.phase()),
+        Some(jobs::JobPhase::Orphaned),
+        "`clauth jobs` reads the left corpse as orphaned"
+    );
+    assert_eq!(
+        jobs::read(&job_id).map(|record| record.state),
+        Some(jobs::JobState::Running),
+        "the record stays on disk for the startup sweep"
+    );
+
+    let _ = parked.0.kill();
+    let _ = parked.0.wait();
+}
+
+/// The liveness spelling of a left corpse answers the same crash copy: the
+/// reader sweep kept a blocking run's record for its live tag, so a listing
+/// reads it `orphaned` and `monitor` names the dead run rather than a blocking
+/// delegate that is still going.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_left_blocking_corpse_answers_the_crash_copy() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let ancient = now - 2 * jobs::RUNNING_TTL_MS;
+    let job_id = format!("d-left-blocking-{}", std::process::id());
+    let sid = format!("sess-left-blocking-{}", std::process::id());
+    let ready = _home.home().join("left-blocking-ready");
+    let mut parked = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    let spec = jobs::RunningSpec {
+        kind: jobs::RecordKind::Liveness,
+        ..running_spec(&job_id, "work", ancient)
+    };
+    jobs::write_heartbeat_with_spawn_facts(&spec, ancient, "", Some(&sid), 0, None)
+        .expect("seed the ownerless liveness corpse");
+    let expected = format!(
+        "job {job_id} died without finishing and left no result. \
+         it's still resumable from its session id: {sid}"
+    );
+
+    let one = call_monitor(&job_id);
+    assert_eq!(monitor_reply_text(&one), expected);
+    assert_eq!(one.is_error, Some(true), "the crash copy is an error");
+    let batch = call_monitor_batch(vec![job_id.as_str()]);
+    assert_eq!(monitor_reply_text(&batch), expected);
+    // A one-id list answers through the one-id path; two ids reach the batch.
+    let pair = call_monitor_batch(vec![job_id.as_str(), "d-left-absent-0"]);
+    assert_eq!(
+        monitor_reply_text(&pair).lines().next(),
+        Some(expected.as_str()),
+        "the batch answers the left corpse with the crash copy"
+    );
+    assert_eq!(pair.is_error, Some(true));
+    assert_eq!(
+        jobs::list(now_ms())
+            .into_iter()
+            .find(|job| job.record.job_id == job_id)
+            .map(|job| job.phase()),
+        Some(jobs::JobPhase::Orphaned),
+        "`clauth jobs` reads the left corpse as orphaned"
+    );
+    assert!(
+        jobs::read_liveness(&job_id).is_some(),
+        "the record stays on disk for the startup sweep"
+    );
+
+    let _ = parked.0.kill();
+    let _ = parked.0.wait();
+}
+
+/// A left corpse whose recorded child still runs keeps the running payload:
+/// the run is live, so naming it dead would bury a delegate that is still
+/// working. The tag rides that same child, so the reader sweep leaves the
+/// record here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_left_corpse_with_a_live_recorded_child_keeps_the_running_payload() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let job_id = format!("d-left-child-{}", std::process::id());
+    let ready = _home.home().join("left-child-ready");
+    let mut parked = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    let pid = parked.0.id();
+    let token = crate::daemon::gateway::process_start_time(pid).expect("the child's start token");
+    let spec = dead_owner_spec(&job_id, "work", now - 60_000, jobs::RecordKind::Collectable);
+    jobs::write_heartbeat_with_spawn_facts(
+        &spec,
+        now - 5_000,
+        "",
+        Some("sess-left-child"),
+        pid,
+        Some(&token),
+    )
+    .expect("seed the corpse whose recorded child lives");
+
+    let text = monitor_text(&job_id);
+    assert!(
+        text.starts_with(&format!("job `{job_id}` running on `work`, elapsed ")),
+        "a live recorded child keeps the running payload: {text}"
+    );
+
+    let _ = parked.0.kill();
+    let _ = parked.0.wait();
+}
+
+/// A running corpse tied to ANOTHER session whose recorded child still runs
+/// answers the running payload, never the crash copy: the child is writing
+/// the transcript, so no surface may call its result lost or offer the
+/// resume. Once the child dies, the crash copy answers once.
+#[cfg(unix)]
+#[test]
+fn a_foreign_corpse_with_a_live_recorded_child_answers_the_running_payload() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-peer")),
+        )],
+    );
+    let now = now_ms();
+    let job_id = format!("d-foreign-child-{}", std::process::id());
+    let sid = format!("d-foreign-child-sid-{}", std::process::id());
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let token =
+        crate::daemon::gateway::process_start_time(child.id()).expect("the child's start token");
+    let spec = jobs::RunningSpec {
+        host_session: Some("sess-owner".to_string()),
+        ..dead_owner_spec(&job_id, "work", now - 60_000, jobs::RecordKind::Collectable)
+    };
+    jobs::write_heartbeat_with_spawn_facts(
+        &spec,
+        now - 5_000,
+        "",
+        Some(&sid),
+        child.id(),
+        Some(&token),
+    )
+    .expect("seed the foreign corpse whose recorded child lives");
+
+    let result = call_monitor(&job_id);
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "a live child's corpse is a running check, not a crash error"
+    );
+    let text = monitor_reply_text(&result);
+    assert!(
+        text.starts_with(&format!("job `{job_id}` running on `work`, elapsed ")),
+        "a live recorded child keeps the running payload for a foreign corpse: {text}"
+    );
+    assert!(
+        jobs::read(&job_id).is_some_and(|r| r.state == jobs::JobState::Running),
+        "the record stays on disk for the owner's wake"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = monitor_text(&job_id);
+    assert_eq!(
+        text,
+        format!(
+            "error: job {job_id} died without finishing and left no result. \
+             it's still resumable from its session id: {sid}"
+        ),
+        "the dead child's corpse answers the crash copy once: {text}"
+    );
+    assert!(
+        jobs::read(&job_id).is_some(),
+        "the record stays on disk for its owner's wake"
+    );
+}
+
+/// A crashed tombstone tied to the asking session whose recorded child still
+/// runs is a live run: the by-id collect answers the running payload and
+/// leaves the record, never the crash copy's "result is lost" and its resume
+/// offer. Once the child dies the collect claims the tombstone, and the crash
+/// copy is the one telling.
+#[cfg(unix)]
+#[test]
+fn an_owned_crashed_tombstone_with_a_live_recorded_child_answers_the_running_payload() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "CLAUDE_CODE_SESSION_ID",
+            Some(std::ffi::OsStr::new("sess-owner")),
+        )],
+    );
+    let now = now_ms();
+    let job_id = format!("d-tomb-child-{}", std::process::id());
+    let sid = format!("d-tomb-child-sid-{}", std::process::id());
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let token =
+        crate::daemon::gateway::process_start_time(child.id()).expect("the child's start token");
+    let dir = jobs::jobs_dir().unwrap();
+    crate::profile::mkdir_700(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": job_id,
+            "profile": "work",
+            "state": "done",
+            "started_at": now - 60_000,
+            "done_at": now - 5_000,
+            "crashed": true,
+            "host_session": "sess-owner",
+            "session_id": sid,
+            "owner_pid": 4242,
+            "owner_started_at": 1,
+            "child_pid": child.id(),
+            "child_start_token": token,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let result = call_monitor(&job_id);
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "a live child's tombstone is a running check, not a crash error"
+    );
+    let text = monitor_reply_text(&result);
+    assert!(
+        text.starts_with(&format!("job `{job_id}` running on `work`, elapsed ")),
+        "a live recorded child keeps the running payload for the tombstone: {text}"
+    );
+    assert!(
+        jobs::read(&job_id).is_some(),
+        "the collect leaves the tombstone while the child lives"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        monitor_reply(&job_id),
+        format!(
+            "job {job_id} died without finishing and left no result. \
+             it's still resumable from its session id: {sid}"
+        )
+    );
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the owner's collect of the dead child's tombstone claims it"
+    );
+}
+
+/// The collect's consume gate keys on the recorded child itself, not only on
+/// the tag: a corpse whose recorded child still runs but carries NO tag (an
+/// `env -i` child) is a live delegate — the collect answers the running
+/// payload and leaves the record for the startup sweep's stop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_collect_of_a_corpse_with_a_live_untagged_child_keeps_the_running_payload() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let job_id = format!("d-left-untagged-{}", std::process::id());
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the untagged child");
+    let pid = child.id();
+    let token = crate::daemon::gateway::process_start_time(pid).expect("the child's start token");
+    let spec = dead_owner_spec(&job_id, "work", now - 60_000, jobs::RecordKind::Collectable);
+    jobs::write_heartbeat_with_spawn_facts(
+        &spec,
+        now - 5_000,
+        "",
+        Some("sess-left-untagged"),
+        pid,
+        Some(&token),
+    )
+    .expect("seed the corpse whose recorded child lives untagged");
+
+    let text = monitor_text(&job_id);
+    assert!(
+        text.starts_with(&format!("job `{job_id}` running on `work`, elapsed ")),
+        "a live untagged recorded child keeps the running payload: {text}"
+    );
+    assert!(
+        jobs::read(&job_id).is_some_and(|r| r.state == jobs::JobState::Running),
+        "the collect leaves the record for the startup sweep's stop"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A resume that takes a stopped record sweeps the run's tag before removing
+/// the record: the record still `running` on disk is a corpse no sweep has
+/// converted yet, and once the resume removes it no later sweep targets that
+/// job id — the run's escaped processes would never be stopped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_resume_removal_sweeps_the_corpses_tag_before_removing_the_record() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let job_id = format!("d-resume-tag-{}", std::process::id());
+    let ready = _home.home().join("resume-tag-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &ready);
+    wait_for_parked(&ready);
+    seed_dead_child_corpse(&job_id, "sess-resume-tag", true, now);
+
+    jobs::remove_stopped_with_session("sess-resume-tag", now, now);
+
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.id());
+    }
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    assert!(
+        escaped_gone,
+        "the resume removal sweeps the run's tag: the escaped process is stopped"
+    );
+    assert!(
+        !jobs::list(now).iter().any(|j| j.record.job_id == job_id),
+        "the resume removes the stopped record"
+    );
+}
+
+/// A resume whose removal's tag sweep fails still removes the stopped record
+/// — the resumed session must not be re-named by the stopped note on the
+/// next compaction — and the tag's name parks in the pending marker, where
+/// the next startup sweep stops the escaped process the failed walk missed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_resume_removal_parks_the_tag_when_its_sweep_fails() {
+    let _home = HomeSandbox::new();
+    // The note reads its expiry off the real clock (`hook_jobs::note` ->
+    // `now_ms`), so the seed stamps ride that clock: a 1970 stamp would read
+    // expired and the note would skip the record this fixture needs named.
+    let now = crate::usage::now_ms();
+    let job_id = format!("d-resume-park-{}", std::process::id());
+    let sid = format!("sess-resume-park-{}", std::process::id());
+    let host_session = format!("park-host-{}", std::process::id());
+    let ready = _home.home().join("resume-park-ready");
+    let escaped = crate::testutil::Owned(crate::testutil::spawn_tagged_park(&job_id, &ready));
+    wait_for_parked(&ready);
+    let spec = jobs::RunningSpec {
+        host_session: Some(host_session.clone()),
+        ..dead_owner_spec(&job_id, "work", now - 60_000, jobs::RecordKind::Collectable)
+    };
+    jobs::write_heartbeat_with_spawn_facts(&spec, now - 5_000, "", Some(&sid), 0, None)
+        .expect("seed the stopped corpse through the real writer");
+
+    let before = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session.clone(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("compact".to_string()),
+        transcript: None,
+    });
+    assert!(
+        before.as_deref().is_some_and(|note| note.contains(&job_id)),
+        "fixture control: the note names the stopped record before the resume: {before:?}"
+    );
+
+    {
+        let _fails = crate::runtime::FailLiveProcessEnumeration::new(&_home);
+        jobs::remove_stopped_with_session(&sid, now, now);
+    }
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the removal still runs: the record is gone"
+    );
+    assert!(
+        process_alive(escaped.0.id()),
+        "the failed walk signalled nothing: the escaped process still runs"
+    );
+    let marker = jobs::jobs_dir().unwrap().join(format!("{job_id}.pending"));
+    assert!(
+        marker.exists(),
+        "the failed walk parks the tag's name in the pending marker"
+    );
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("compact".to_string()),
+        transcript: None,
+    });
+    assert!(
+        note.is_none(),
+        "the resumed session is not re-named by the stopped note: {note:?}"
+    );
+
+    // The retry the marker exists for: once the enumeration works, the next
+    // startup sweep stops the escaped process and removes the marker.
+    jobs::gc(now);
+    let deadline = std::time::Instant::now() + jobs::GROUP_STOP_GRACE * 10;
+    let mut escaped_gone = !process_alive(escaped.0.id());
+    while !escaped_gone && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        escaped_gone = !process_alive(escaped.0.id());
+    }
+    assert!(escaped_gone, "the startup sweep stops the escaped process");
+    assert!(!marker.exists(), "a completed walk removes the marker");
+}
+
+/// A collect of a record whose phase reads `Stopped` while its disk state is
+/// still `running` (a corpse the reader sweep left for the startup sweep)
+/// answers the stopped copy, never the running payload — and leaves the
+/// record on disk, so the startup sweep still stops the tag.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_collect_of_a_stopped_phase_running_corpse_answers_the_stopped_copy() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let job_id = format!("d-collect-stopped-{}", std::process::id());
+    let ready = _home.home().join("collect-stopped-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &ready);
+    wait_for_parked(&ready);
+    seed_dead_child_corpse(&job_id, "sess-collect-stopped", true, now);
+
+    let result = call_monitor(&job_id);
+    assert_eq!(result.is_error, Some(true), "a stopped run is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let copy = format!(
+        "job {job_id} was stopped when its session exited and left no result; \
+         its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+    );
+    assert_eq!(
+        text, copy,
+        "the one-id collect answers the stopped copy, never the running payload: {text}"
+    );
+    assert!(
+        jobs::read(&job_id).is_some_and(|r| r.state == jobs::JobState::Running),
+        "the collect leaves the record for the startup sweep's tag stop"
+    );
+
+    // A one-element `job_ids` routes to the one-id spelling, so the batch arm
+    // needs a second id: an unminted one renders the unknown row beside the
+    // stopped one.
+    let other = format!("d-collect-other-{}", std::process::id());
+    let batch = call_monitor_batch(vec![&job_id, &other]);
+    assert_eq!(
+        batch.is_error,
+        Some(true),
+        "a stopped row flags the batch error"
+    );
+    let btext = batch
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        btext.lines().next().unwrap_or_default(),
+        format!("job `{job_id}` failed: {copy}"),
+        "the batch row answers the stopped copy: {btext}"
+    );
+    assert!(
+        !btext.contains("running"),
+        "the batch never answers the running payload for a stopped record: {btext}"
+    );
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+}
+
+/// The liveness-spelling twin of the collect test: a stopped-phase blocking
+/// run's record the reader sweep left on disk (its tag lives) answers
+/// `monitor` with the stopped copy and its handle, never the still-running
+/// line a live blocking run gets — and the record stays for the startup
+/// sweep's tag stop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_monitor_of_a_stopped_phase_liveness_corpse_answers_the_stopped_copy() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let job_id = format!("d-liveness-stopped-{}", std::process::id());
+    let ready = _home.home().join("liveness-stopped-ready");
+    let mut escaped = crate::testutil::spawn_tagged_park(&job_id, &ready);
+    wait_for_parked(&ready);
+    jobs::write_heartbeat_with_session(
+        &dead_owner_spec(&job_id, "work", now - 60_000, jobs::RecordKind::Liveness),
+        now - 5_000,
+        "half",
+        Some("sess-liveness-stopped"),
+    )
+    .unwrap();
+    let live_path = jobs::jobs_dir()
+        .unwrap()
+        .join(format!("{job_id}.live.json"));
+    assert!(
+        live_path.exists(),
+        "fixture: the corpse is in the liveness spelling"
+    );
+
+    let result = call_monitor(&job_id);
+    // A one-element batch routes to the one-id spelling, so the batch arm
+    // needs a second id: an unminted one renders the unknown row beside the
+    // stopped one.
+    let other = format!("d-liveness-other-{}", std::process::id());
+    let batch = call_monitor_batch(vec![&job_id, &other]);
+    // The verdicts, then the cleanup, then the asserts: a red must not leak
+    // the parked fixture.
+    let live_survives = live_path.exists();
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let btext = batch
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("batch text");
+    jobs::gc(now);
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+
+    let copy = format!(
+        "job {job_id} was stopped when its session exited and left no result. \
+         it's still resumable from its session id: sess-liveness-stopped"
+    );
+    assert_eq!(result.is_error, Some(true), "a stopped run is a tool error");
+    assert_eq!(
+        text, copy,
+        "the one-id monitor answers the stopped copy with its handle: {text}"
+    );
+    assert!(
+        live_survives,
+        "the monitor leaves the record for the startup sweep's tag stop"
+    );
+    assert_eq!(
+        batch.is_error,
+        Some(true),
+        "a stopped row flags the batch error"
+    );
+    assert_eq!(
+        btext.lines().next().unwrap_or_default(),
+        format!("job `{job_id}` failed: {copy}"),
+        "the batch row answers the stopped copy: {btext}"
+    );
+    assert!(
+        !btext.contains("running"),
+        "the batch never answers the running payload for a stopped record: {btext}"
+    );
+}
+
+/// An isolated run stopped in-process rescued its transcript first: the
+/// record keeps its salvage envelope (the resume note's resumable shape) and
+/// the transcript landed in the global store, so the pinned id is a real
+/// handle. The envelope's rescue verdict says so, and the note's resumable
+/// split reads that verdict — the positive direction the skipped-rescue twin
+/// cannot bind. Only the backstop yields the not-resumable shape.
+#[cfg(unix)]
+#[test]
+fn an_isolated_stop_rescues_the_transcript_and_the_record_is_resumable() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("iso-stop-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("iso-hold.log");
+    fake.set_signal_hold(&hold);
+    fake.set_transcript();
+    let host_session = format!("rescue-host-{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Isolated,
+        Vec::new(),
+        super::DelegateOrigin {
+            host_session: Some(host_session.clone()),
+            ..super::DelegateOrigin::default()
+        },
+    );
+    wait_for_hold(&hold);
+
+    let before = wait_for_stamped_record(&job_id);
+    let pinned = before.session_id.clone().expect("pinned handle");
+
+    // The drain is NOT asserted here: the rescue teardown can outrun the
+    // stop's wait under a full-suite load, and the record still
+    // lands — the stop's own contract says whatever misses the bound falls
+    // to the sweep backstop.
+    stop_all_at_exit();
+
+    let after = wait_for_stopped_record(&job_id);
+    assert_eq!(after.state, jobs::JobState::Done);
+    assert!(after.stopped, "the record reads stopped");
+    assert_finalized_not_swept(&after);
+    assert!(after.isolated, "the isolation flag survives");
+    assert!(
+        after.envelope.is_some(),
+        "the salvage envelope rides the record: the stop rescued the transcript"
+    );
+    assert_eq!(
+        after
+            .envelope
+            .as_ref()
+            .and_then(|e| e.get("transcript_rescued"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the stop's own verdict says the transcript reached the global store"
+    );
+    assert_eq!(after.session_id.as_deref(), Some(pinned.as_str()));
+
+    // The note's positive direction: a rescued isolated stop is named
+    // resumable with its session id, so a flipped or dropped verdict cannot
+    // ship green.
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegate");
+    assert_eq!(
+        note,
+        format!(
+            "clauth note: a delegate this session started was stopped when the session exited: `{job_id}` on `{profile}`. `delegate` with `session_id: \"{pinned}\"` and `profiles: [\"{profile}\"]` resumes it."
+        )
+    );
+    let rescued = crate::profile::claude_dir()
+        .expect("global claude dir")
+        .join("projects")
+        .join("-fake-cwd")
+        .join(format!("{pinned}.jsonl"));
+    assert!(
+        rescued.exists(),
+        "the transcript was rescued to {}",
+        rescued.display()
+    );
+}
+
+/// The listing names a stopped record by its own word, with the handle and
+/// the stop's own age clause — one exact row in both the JSON row and the
+/// prose line.
+#[test]
+fn the_listing_renders_a_stopped_record_exactly() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-stop.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "D1",
+            "state": "done",
+            "started_at": now - 65_000,
+            "done_at": now - 5_000,
+            "stopped": true,
+            "session_id": "sid-listed",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let rows = payload["jobs"].as_array().unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-stop"))
+        .expect("the stopped row is listed");
+    assert_eq!(
+        row,
+        &serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "D1",
+            "state": "stopped",
+            "since_secs": 5,
+            "session_id": "sid-listed",
+            "resumable": true,
+        })
+    );
+    assert_eq!(
+        render::monitor_state_prose(&payload),
+        "delegates clauth holds:\n  job `d-stop` stopped on `D1`; resume with session id `sid-listed`, stopped 5s ago"
+    );
+}
+
+/// The signal thread drives the one stop entry point, over the three signals
+/// the host sends: a handler that forgot the call would leave the delegates
+/// running to the SIGKILL. Pinned over the source, since the real signal
+/// cannot be posed in-process.
+#[test]
+fn the_exit_handler_signals_drive_the_stop_entry_point() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn install_exit_stop(")
+        .expect("the handler is installed")
+        .1;
+    let signals = body
+        .split_once("Signals::new([")
+        .expect("the signal list")
+        .1
+        .split_once("])")
+        .expect("the list closes")
+        .0;
+    assert_eq!(
+        signals, "SIGINT, SIGTERM, SIGHUP",
+        "all three host signals drive the stop"
+    );
+    let stop = body
+        .split_once("for _signal in signals.forever() {")
+        .expect("the watcher loop")
+        .1
+        .split_once('}')
+        .expect("the loop closes")
+        .0;
+    let dense: String = stop
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        dense, "run_exit_stop();",
+        "each signal runs the stop and nothing else: {dense}"
+    );
+
+    // `run_exit_stop`'s own body: the bounded stop, then the process ends
+    // without dropping the runtime.
+    let wrapper = src
+        .split_once("fn run_exit_stop() {")
+        .expect("the exit stop wrapper exists")
+        .1
+        .split_once("ONCE.call_once(|| {")
+        .expect("the stop runs once")
+        .1
+        .split_once("});")
+        .expect("the once body closes")
+        .0;
+    let dense: String = wrapper
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        dense, "stop_all_at_exit();std::process::exit(0);",
+        "the exit stop runs the bounded stop then ends the process: {dense}"
+    );
+
+    // The serve path installs the handler; a serve that never did would
+    // leave every delegate to the host's SIGKILL.
+    src.split_once("if let Err(e) = install_exit_stop() {")
+        .expect("the serve path installs the exit stop");
+}
+
+// ── exit stop: fast TERM, blocking stop, cap ────────────────────────────────
+
+/// The fast TERM is the exit handler's, not the supervision loop's: the loop's
+/// tick is parked on the test hold, so it cannot check the flag, and a TERM
+/// that still lands in the shim's log can only be the handler's own. The stop
+/// waits out the handler's bound with the loop parked, then the release lets
+/// the loop land the record.
+#[cfg(unix)]
+#[test]
+fn the_exit_stops_fast_term_is_not_the_loops() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("fast-term-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("fast-term-hold.log");
+    fake.set_signal_hold(&hold);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    // Park the loop's next tick and wait on its ack, never on a guessed
+    // schedule: once the ack lands the loop can no longer check the
+    // host-exit flag, so whatever TERM still lands is the handler's fast
+    // TERM. A starved loop thread on a loaded box must not slip a stop past
+    // the hold.
+    let (release, parked) = super::arm_tick_hold();
+    parked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the loop parked on the hold");
+    stop_all_at_exit();
+    // The shim's TERM trap writes asynchronously; poll for the line while the
+    // loop stays parked, bounded from the handler's own wait, so a delayed
+    // write on a loaded box never reds a correct build.
+    let deadline = std::time::Instant::now() + super::EXIT_STOP_WAIT * 8;
+    let log = loop {
+        let log = std::fs::read_to_string(&hold).unwrap_or_default();
+        if log.lines().any(|l| l == "TERM") || std::time::Instant::now() >= deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let fast_term = log.lines().any(|l| l == "TERM");
+    drop(release);
+
+    // The resumed loop lands the record, polled the way the stop tests poll.
+    let after = wait_for_stopped_record(&job_id);
+    assert!(after.stopped, "the record reads stopped");
+    assert!(
+        fast_term,
+        "a TERM arrived while the loop was parked; only the handler could have sent it: {log}"
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// A blocking delegate in flight through the real spawn path: the caller's
+/// join thread (its own runtime, so the join still waits while a test drives
+/// the stop), the job id its mint resolved, and the pinned handle the spawn
+/// stamped. Polled, never assumed: the record is a second write after the
+/// spawn.
+#[cfg(unix)]
+struct BlockingRun {
+    caller: std::thread::JoinHandle<serde_json::Value>,
+    job_id: String,
+    pinned: String,
+}
+
+#[cfg(unix)]
+fn launch_blocking_run(profile: &str, host_session: Option<String>) -> BlockingRun {
+    let mint = super::MintSpec {
+        origin: super::DelegateOrigin {
+            host_session,
+            ..super::DelegateOrigin::default()
+        },
+        ..mint_spec(profile)
+    };
+    let handoff = super::Handoff::blocking(mint);
+    let caller = std::thread::spawn({
+        let handoff = std::sync::Arc::clone(&handoff);
+        let profile = profile.to_string();
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("caller runtime");
+            rt.block_on(async move {
+                let handle = super::spawn_delegate(
+                    profile,
+                    super::BackgroundOpts {
+                        prompt: std::sync::Arc::from("hello"),
+                        model: None,
+                        cwd: None,
+                        env: HashMap::new(),
+                        extra_args: Vec::new(),
+                        resume: None,
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result_file: false,
+                        isolation: Isolation::Shared,
+                        depth: 0,
+                    },
+                    handoff,
+                    None,
+                );
+                handle.await.expect("the task's join resolves")
+            })
+        }
+    });
+    for _ in 0..50 {
+        let spec = handoff.spec();
+        let record = spec.as_ref().and_then(|spec| {
+            jobs::list(now_ms())
+                .into_iter()
+                .find(|j| j.record.job_id == spec.job_id)
+                .map(|j| j.record)
+        });
+        if let (Some(spec), Some(record)) = (spec, record)
+            && let Some(pinned) = record.session_id.clone()
+        {
+            return BlockingRun {
+                caller,
+                job_id: spec.job_id,
+                pinned,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the blocking run never minted a live record with the pinned handle");
+}
+
+/// A BLOCKING delegate stopped at `/exit` leaves a `stopped` record with the
+/// pinned session id — the caller holding the join dies with the process, so
+/// the envelope must land on disk, never vanish with the liveness record —
+/// and the resumed session's note names it.
+#[cfg(unix)]
+#[test]
+fn a_blocking_run_stopped_at_exit_lands_a_stopped_record() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("block-stop-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("block-stop-hold.log");
+    fake.set_signal_hold(&hold);
+    let host_session = format!("b1-host-{}", std::process::id());
+    let BlockingRun {
+        caller,
+        job_id,
+        pinned,
+    } = launch_blocking_run(&profile, Some(host_session.clone()));
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    stop_all_at_exit();
+
+    // Polled like every sibling: the stop returns on its bound as well as on
+    // the finalize, so a single read races the record write on a loaded box.
+    let after = wait_for_stopped_record(&job_id);
+    assert_eq!(after.state, jobs::JobState::Done);
+    assert!(after.stopped, "the record reads stopped");
+    assert_finalized_not_swept(&after);
+    assert_eq!(
+        after.session_id.as_deref(),
+        Some(pinned.as_str()),
+        "the resume handle is the pinned one"
+    );
+
+    // The resumed session's note names it, exactly like a background one.
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegate");
+    assert_eq!(
+        note,
+        format!(
+            "clauth note: a delegate this session started was stopped when the session exited: `{job_id}` on `{profile}`. `delegate` with `session_id: \"{pinned}\"` and `profiles: [\"{profile}\"]` resumes it."
+        )
+    );
+
+    // The awaiting caller still received its envelope through the join.
+    let envelope = caller.join().expect("the caller's join resolves");
+    assert_eq!(
+        envelope.get("stopped").and_then(serde_json::Value::as_str),
+        Some("host_exit"),
+        "the join carries the stopped envelope: {envelope}"
+    );
+
+    let log = std::fs::read_to_string(&hold).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l == "TERM"),
+        "the group got the SIGTERM: {log}"
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// A promote whose liveness source is already gone (a racing hand-off renamed
+/// it first) keeps the collectable record on disk rather than minting a fresh
+/// one without the session id the sweep needs to convert it.
+#[test]
+fn a_promote_with_no_liveness_source_keeps_the_collectable_record() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms().saturating_sub(60_000);
+    let job_id = jobs::new_job_id(started_at);
+    let spec = dead_owner_spec(&job_id, "work", started_at, jobs::RecordKind::Collectable);
+    jobs::write_heartbeat_with_session(&spec, started_at, "half", Some("sid-kept")).unwrap();
+
+    jobs::promote(&spec).unwrap();
+
+    assert_eq!(
+        jobs::read(&job_id).and_then(|record| record.session_id),
+        Some("sid-kept".to_string()),
+        "the promote overwrote the collectable record and dropped its session id"
+    );
+}
+
+/// A process death between the blocking stop's record rename and its done
+/// write leaves a record the next server's sweep converts: the arm PROMOTES
+/// the liveness record (the atomic rename `hand_off` crosses on) before
+/// writing the done one, so neither side of the window is an id with nothing
+/// on disk — the failure mode a remove followed by a write has.
+#[cfg(unix)]
+#[test]
+fn a_blocking_stop_interrupted_after_promote_leaves_a_sweep_convertible_record() {
+    /// Disarms the seam even on a panicking leg, so a red can never leave
+    /// another run's finalize eating this test's armed flag.
+    struct DisarmAfterPromote;
+    impl Drop for DisarmAfterPromote {
+        fn drop(&mut self) {
+            super::DIE_AFTER_PROMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("block-crash-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("block-crash-hold.log");
+    fake.set_signal_hold(&hold);
+    let BlockingRun {
+        caller,
+        job_id,
+        pinned,
+    } = launch_blocking_run(&profile, None);
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    super::DIE_AFTER_PROMOTE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _disarm = DisarmAfterPromote;
+    stop_all_at_exit();
+
+    // The stop returns because the finalize's guard left the registry, which
+    // happens after the promote and before the done write: what is on disk
+    // here is exactly a death in that window.
+    // `stop_all_at_exit` also returns on its own bound, possibly before the
+    // finalize reached the promote, so the record is polled for.
+    let bound = super::EXIT_STOP_WAIT * 16;
+    let started = std::time::Instant::now();
+    let left = loop {
+        if let Some(record) = jobs::read(&job_id) {
+            break record;
+        }
+        assert!(
+            started.elapsed() < bound,
+            "the interrupted stop left no record inside {}ms",
+            bound.as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        left.state,
+        jobs::JobState::Running,
+        "the done write never ran"
+    );
+    assert!(left.envelope.is_none(), "no envelope landed");
+    assert_eq!(
+        left.session_id.as_deref(),
+        Some(pinned.as_str()),
+        "the resume handle survives the window"
+    );
+
+    // Pose the process death the seam stands in for, then run the sweep the
+    // next server would: the collectable running record converts to the
+    // stopped tombstone, it is never reaped.
+    let now = now_ms();
+    let path = jobs::jobs_dir().unwrap().join(format!("{job_id}.json"));
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the promoted record")).unwrap();
+    record["owner_pid"] = serde_json::json!(DEAD_SERVER_PID);
+    record["owner_started_at"] = serde_json::json!(1);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    jobs::gc(now);
+
+    let converted = jobs::read(&job_id).expect("the sweep converts, never reaps");
+    assert_eq!(converted.state, jobs::JobState::Done);
+    assert!(converted.stopped, "the tombstone reads stopped");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some(pinned.as_str()),
+        "the conversion keeps the resume handle"
+    );
+
+    // The test's caller does not die with a process; the seam only stopped
+    // the finalize's disk side, so the join still resolves.
+    let _ = caller.join().expect("the caller's join resolves");
+    assert_process_gone(grandchild_pid);
+}
+
+/// A descendant that ignores the SIGTERM (a backgrounded shell job's shape)
+/// survives it, so the group SIGKILL after the grace must fire whether or not
+/// the leader already exited — after a cancel and after an exit stop alike.
+#[cfg(unix)]
+#[test]
+fn a_term_ignoring_grandchild_is_killed_after_a_cancel_and_an_exit_stop() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("term-ignore-{}", std::process::id());
+    register_delegate_profile(&profile);
+    fake.set_term_ignoring_grandchild();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+
+    let cancel_hold = _home.home().join("ti-cancel-hold.log");
+    fake.set_signal_hold(&cancel_hold);
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, grandchild_c) = wait_for_hold(&cancel_hold);
+    assert!(cancel_job(&job_id), "the id is held");
+    assert_process_gone(grandchild_c);
+
+    let exit_hold = _home.home().join("ti-exit-hold.log");
+    fake.set_signal_hold(&exit_hold);
+    let exit_job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin::default(),
+    );
+    let (_shim_pid, grandchild_e) = wait_for_hold(&exit_hold);
+    // The drain is NOT asserted here: the loop's own stop spends the whole
+    // group grace on the TERM-ignoring member before the finalize, which can
+    // outrun the stop's wait under a full-suite load — the kill
+    // this test pins still lands, and the record it lands is the finalize's
+    // own write.
+    stop_all_at_exit();
+    assert_process_gone(grandchild_e);
+    let after = wait_for_stopped_record(&exit_job_id);
+    assert_finalized_not_swept(&after);
+}
+
+/// The exit stop's fast TERM verifies the recorded pid before signalling: a
+/// registered pid whose start token does not match names a different process
+/// (the reap-to-finalize reuse window) and must survive the stop untouched.
+#[cfg(unix)]
+#[test]
+fn the_exit_stop_spares_a_registered_pid_whose_start_token_mismatches() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let mut other = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn unrelated sleep");
+    let flag = std::sync::Arc::new(super::StopFlag {
+        child_pid: std::sync::atomic::AtomicU32::new(other.id()),
+        child_start_token: std::sync::OnceLock::from("not-this-process".to_string()),
+        ..super::StopFlag::default()
+    });
+    let _guard = super::CancelGuard::register("d-unrelated-0", flag);
+
+    stop_all_at_exit();
+
+    // The verdict, then the cleanup, then the assert: a red must not leak the
+    // 600 s sleep this test spawned.
+    let alive = process_alive(other.id());
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(
+        alive,
+        "a registered pid that does not name the spawned child is left alone"
+    );
+}
+
+/// The owner-gone twin of `the_conversion_never_overwrites_a_finished_result`:
+/// the NEW conversion arm's guard (a dead owner's stale liveness leftover must
+/// not overwrite a finished collectable result) is what this drives, where the
+/// frozen test's ownerless seed only reaches the old branch.
+#[test]
+fn the_owner_gone_conversion_never_overwrites_a_finished_result() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * jobs::RUNNING_TTL_MS;
+    let id = jobs::new_job_id(ancient);
+    jobs::write_heartbeat_with_session(
+        &dead_owner_spec(&id, "work", ancient, jobs::RecordKind::Liveness),
+        now - 5_000,
+        "half",
+        Some("sess-stale-owner"),
+    )
+    .unwrap();
+    jobs::write_done_parts(
+        &id,
+        "work",
+        ancient,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "kept"}),
+    )
+    .unwrap();
+
+    jobs::gc_running_corpses(now);
+
+    let kept = jobs::read(&id).expect("the finished result survives the sweep");
+    assert_eq!(
+        kept.envelope,
+        Some(serde_json::json!({"result": "kept"})),
+        "the envelope is not overwritten"
+    );
+    assert!(
+        !kept.crashed && !kept.stopped,
+        "the conversion did not clobber the finish"
+    );
+    assert!(
+        !jobs::jobs_dir()
+            .unwrap()
+            .join(format!("{id}.live.json"))
+            .exists(),
+        "the stale liveness spelling is dropped",
+    );
+}
+
+/// A `RunningSpec` owned by a dead server (a marker pid nothing holds), the
+/// shape a session's `/exit` leaves when Claude Code kills `clauth mcp`.
+fn dead_owner_spec(
+    job_id: &str,
+    profile: &str,
+    started_at: u64,
+    kind: jobs::RecordKind,
+) -> jobs::RunningSpec {
+    jobs::RunningSpec {
+        job_id: job_id.to_string(),
+        profile: profile.to_string(),
+        started_at,
+        recorded_at: started_at,
+        timeout_secs: 0,
+        idle_secs: Some(300),
+        endpoint: None,
+        provider: None,
+        isolated: false,
+        cwd: None,
+        spawned_by: None,
+        host_session: None,
+        host_pid: 0,
+        kind,
+        owner_pid: DEAD_SERVER_PID,
+        owner_started_at: 1,
+    }
+}
+
+/// An isolated in-process stop whose rescue was SKIPPED (another live isolated
+/// session holds a marker) is named not-resumable: the envelope still rides
+/// the record, but the rescue moved nothing, so the pinned id names a
+/// transcript that never reached the global store.
+#[cfg(unix)]
+#[test]
+fn an_isolated_stop_whose_rescue_is_skipped_is_named_not_resumable() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("iso-skip-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("iso-skip-hold.log");
+    fake.set_signal_hold(&hold);
+    fake.set_transcript();
+    let host_session = format!("m4-host-{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Isolated,
+        Vec::new(),
+        super::DelegateOrigin {
+            host_session: Some(host_session.clone()),
+            ..super::DelegateOrigin::default()
+        },
+    );
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    // Pose another live isolated session: a flock-held marker beside the
+    // run's own, which is exactly what makes `rescue_teardown` skip.
+    let sessions = isolate_sessions_dir(&profile);
+    let marker = std::fs::File::create(sessions.join("peer-marker")).expect("peer marker");
+    marker.try_lock().expect("the peer holds its marker");
+
+    let before = wait_for_stamped_record(&job_id);
+    let pinned = before.session_id.clone().expect("pinned handle");
+
+    stop_all_at_exit();
+
+    let after = wait_for_stopped_record(&job_id);
+    assert!(after.stopped, "the record reads stopped");
+    assert!(after.isolated, "the isolation flag survives");
+    assert!(
+        after.envelope.is_some(),
+        "the salvage envelope rides the record"
+    );
+
+    // The note names the run not-resumable: the envelope's presence is not
+    // the rescue's verdict.
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegate");
+    assert_eq!(
+        note,
+        format!(
+            "clauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `{job_id}` on `{profile}`. `monitor` with its job_id shows what it wrote before it stopped."
+        )
+    );
+
+    // And the transcript never reached the global store.
+    let rescued = crate::profile::claude_dir()
+        .expect("global claude dir")
+        .join("projects")
+        .join("-fake-cwd")
+        .join(format!("{pinned}.jsonl"));
+    assert!(
+        !rescued.exists(),
+        "the rescue was skipped, the transcript stayed in the throwaway tree"
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// The isolated run's live-sessions dir, found by scan: the pair keyed
+/// `sessions-isolated-<sid>` under the profile, whose own marker is flock-held
+/// by the live run.
+#[cfg(unix)]
+fn isolate_sessions_dir(profile: &str) -> std::path::PathBuf {
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles")
+        .join(profile);
+    let found = std::fs::read_dir(&dir)
+        .expect("profile dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("sessions-isolated"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one isolated sessions dir: {found:?}"
+    );
+    found.into_iter().next().expect("the isolated sessions dir")
+}
+
+/// The stdin-EOF exit path runs the same bounded stop the signal path runs:
+/// `run_server`'s transport wait returning without a signal is the one trigger
+/// the handler cannot cover, and skipping it would drop the runtime onto the
+/// detached blocking tasks with no caller left. The wait's RESULT is bound, not
+/// `?`-ed: on unix the stop runs and ends the process before the error is ever
+/// read, and windows runs no stop. Pinned over the source, since the stdio
+/// transport cannot be driven in-process.
+#[test]
+fn the_stdin_eof_path_runs_the_same_bounded_stop() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let tail = src
+        .split_once("let waited = service.waiting().await;")
+        .expect("the serve loop waits on the transport")
+        .1
+        .split_once("Ok(())")
+        .expect("run_server's tail closes")
+        .0;
+    let dense: String = tail
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        dense,
+        "#[cfg(unix)]{ifletErr(e)=&waited{logline!(\"clauth:theMCPtransportfailed:{e}\");}run_exit_stop();}waited?;",
+        "EOF after the transport ends logs a failed transport, runs the exit stop, and never propagates: {dense}"
+    );
+}
+
+/// The stopped note names at most ten delegates and counts the rest with the
+/// result note's own clause, placed before the closing sentence. The isolated
+/// not-resumable sentences count toward the same cap.
+#[test]
+fn past_ten_stopped_delegates_the_rest_are_counted() {
+    let _home = HomeSandbox::new();
+    let session = format!("c1-host-{}", std::process::id());
+    let now = now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..11u64 {
+        let record = serde_json::json!({
+            "job_id": format!("d-stop-{i:02}"),
+            "profile": "D1",
+            "state": "done",
+            "started_at": now - 60_000 - i,
+            "done_at": now - 1_000 - i,
+            "stopped": true,
+            "session_id": format!("sid-{i:02}"),
+            "host_session": session,
+        });
+        std::fs::write(
+            dir.join(format!("d-stop-{i:02}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegates");
+    assert_eq!(
+        note,
+        "clauth note: delegates this session started were stopped when the session exited: `d-stop-00` on `D1` (`session_id: \"sid-00\"`), `d-stop-01` on `D1` (`session_id: \"sid-01\"`), `d-stop-02` on `D1` (`session_id: \"sid-02\"`), `d-stop-03` on `D1` (`session_id: \"sid-03\"`), `d-stop-04` on `D1` (`session_id: \"sid-04\"`), `d-stop-05` on `D1` (`session_id: \"sid-05\"`), `d-stop-06` on `D1` (`session_id: \"sid-06\"`), `d-stop-07` on `D1` (`session_id: \"sid-07\"`), `d-stop-08` on `D1` (`session_id: \"sid-08\"`), `d-stop-09` on `D1` (`session_id: \"sid-09\"`), and 1 more (`clauth jobs` lists them). `delegate` with a `session_id` and its `profiles` resumes one."
+    );
+}
+
+/// One `stopped` record the stopped note names: done on disk with the stop's
+/// flag, its host session, and a session id (the note skips a record without
+/// one). An isolated leg carries no envelope — the sweep tombstone's shape, so
+/// its rescue verdict reads false.
+fn seed_named_stop(now: u64, host_session: &str, index: u64, isolated: bool) {
+    let dir = jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).expect("jobs dir");
+    let record = serde_json::json!({
+        "job_id": format!("d-cap-{index:02}"),
+        "profile": "D1",
+        "state": "done",
+        "started_at": now - 60_000 - index,
+        "done_at": now - 1_000 - index,
+        "stopped": true,
+        "isolated": isolated,
+        "session_id": format!("sid-{index:02}"),
+        "host_session": host_session,
+    });
+    std::fs::write(
+        dir.join(format!("d-cap-{index:02}.json")),
+        serde_json::to_vec(&record).expect("serialize record"),
+    )
+    .expect("write record");
+}
+
+/// The cap's isolated half: a fan-out mixing resumable and isolated legs names
+/// ten across both shapes and counts the rest on the LAST named sentence — the
+/// last isolated one here, per the result note's placement.
+#[test]
+fn a_mixed_stopped_note_caps_the_isolated_legs_too() {
+    let _home = HomeSandbox::new();
+    let session = format!("cap-mix-{}", std::process::id());
+    let now = now_ms();
+    for index in 0..7u64 {
+        seed_named_stop(now, &session, index, false);
+    }
+    for index in 7..12u64 {
+        seed_named_stop(now, &session, index, true);
+    }
+
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegates");
+    assert_eq!(
+        note,
+        "clauth note: delegates this session started were stopped when the session exited: `d-cap-00` on `D1` (`session_id: \"sid-00\"`), `d-cap-01` on `D1` (`session_id: \"sid-01\"`), `d-cap-02` on `D1` (`session_id: \"sid-02\"`), `d-cap-03` on `D1` (`session_id: \"sid-03\"`), `d-cap-04` on `D1` (`session_id: \"sid-04\"`), `d-cap-05` on `D1` (`session_id: \"sid-05\"`), `d-cap-06` on `D1` (`session_id: \"sid-06\"`). `delegate` with a `session_id` and its `profiles` resumes one.\n\nclauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `d-cap-07` on `D1`. `monitor` with its job_id shows what it wrote before it stopped.\n\nclauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `d-cap-08` on `D1`. `monitor` with its job_id shows what it wrote before it stopped.\n\nclauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `d-cap-09` on `D1`, and 2 more (`clauth jobs` lists them). `monitor` with its job_id shows what it wrote before it stopped."
+    );
+}
+
+/// Eleven isolated, unrescued delegates: ten are named, the eleventh is
+/// counted on the tenth isolated sentence.
+#[test]
+fn eleven_isolated_stopped_delegates_cap_at_ten() {
+    let _home = HomeSandbox::new();
+    let session = format!("cap-iso-{}", std::process::id());
+    let now = now_ms();
+    for index in 0..11u64 {
+        seed_named_stop(now, &session, index, true);
+    }
+
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the note names the stopped delegates");
+    let mut expected = String::new();
+    for index in 0..10u64 {
+        if index > 0 {
+            expected.push_str("\n\n");
+        }
+        let clause = if index == 9 {
+            ", and 1 more (`clauth jobs` lists them)"
+        } else {
+            ""
+        };
+        expected.push_str(&format!(
+            "clauth note: an isolated delegate this session started was stopped when the session exited and cannot be resumed: `d-cap-{index:02}` on `D1`{clause}. `monitor` with its job_id shows what it wrote before it stopped."
+        ));
+    }
+    assert_eq!(note, expected);
+}
+
+/// The isolated arm of the stopped collect copy: a collected stopped tombstone
+/// of an isolated run answers the cannot-be-resumed copy and never names the
+/// handle, exactly like the crashed tombstone's split.
+#[test]
+fn a_collected_stopped_tombstone_renders_the_isolated_copy() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = jobs::new_job_id(now - 60_000);
+    // The conversion itself is the seed's writer: a stopped tombstone for an
+    // ISOLATED run, the bytes the sweep really produces.
+    let spec = jobs::RunningSpec {
+        isolated: true,
+        ..dead_owner_spec(&id, "work", now - 60_000, jobs::RecordKind::Collectable)
+    };
+    jobs::write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-stop-iso-9"))
+        .unwrap();
+    jobs::gc_running_corpses(now);
+
+    let result = call_monitor(&id);
+    assert_eq!(result.is_error, Some(true), "a stopped run is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} was stopped when its session exited and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the isolated stopped copy ships, raw: {text}"
+    );
+    assert!(
+        !text.contains("resumable from its session id"),
+        "the resumable promise is the shared arm's alone: {text}"
+    );
+}
+
+/// An isolated stop whose rescue was skipped renders no resume offer in the
+/// listing: the row carries `resumable: false` and the prose line names
+/// nothing to resume, so the listing and the hook note cannot disagree about
+/// one record.
+#[test]
+fn the_listing_names_an_unrescued_isolated_stop_not_resumable() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-unrescued.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-unrescued",
+            "profile": "D1",
+            "state": "done",
+            "started_at": now - 65_000,
+            "done_at": now - 5_000,
+            "stopped": true,
+            "isolated": true,
+            "session_id": "sid-iso-unrescued",
+            "envelope": {
+                "profile": "D1",
+                "is_error": true,
+                "result": "delegate stopped when the session exited, after 0s",
+                "stopped": "host_exit",
+                "transcript_rescued": false,
+                "session_id": "sid-iso-unrescued",
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let row = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-unrescued"))
+        .expect("the stopped row is listed");
+    assert_eq!(
+        row["resumable"],
+        serde_json::json!(false),
+        "the row's resume verdict is the record's own: {row}"
+    );
+    assert_eq!(
+        render::monitor_state_prose(&payload),
+        "delegates clauth holds:\n  job `d-unrescued` stopped on `D1`, stopped 5s ago",
+        "an unrescued isolated stop is never offered a resume"
+    );
+}
+
+/// The collect copy reads the same resume verdict: an in-process isolated
+/// stop whose rescue was skipped (the salvage envelope still rides the
+/// record, text included) answers the cannot-be-resumed copy instead of the
+/// envelope's "pick the run back up", which would promise a resume the
+/// transcript cannot honour. The text the run had written survives.
+#[test]
+fn a_collected_unrescued_isolated_stop_renders_no_resume_offer() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = jobs::new_job_id(now - 60_000);
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": id,
+            "profile": "work",
+            "state": "done",
+            "started_at": now - 60_000,
+            "done_at": now - 5_000,
+            "stopped": true,
+            "isolated": true,
+            "session_id": "sess-iso-unrescued",
+            "envelope": {
+                "profile": "work",
+                "is_error": true,
+                "result": "delegate stopped when the session exited, after 0s. the text it had written is in `partial_result`. pick the run back up with `session_id: \"<session_id>\"`",
+                "partial_result": "half a thought",
+                "stopped": "host_exit",
+                "transcript_rescued": false,
+                "session_id": "sess-iso-unrescued",
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The fold's payload: the stop copy replaces the false resume promise,
+    // and the text the run had written still rides the payload for the paths
+    // that deliver it (the batch's result file).
+    let record = jobs::read(&id).expect("the record is on disk");
+    let (payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
+    assert!(is_error, "a stopped run is a tool error");
+    assert_eq!(
+        payload["result"],
+        serde_json::json!(format!(
+            "job {id} was stopped when its session exited and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        )),
+        "the folded copy is the record's own verdict: {payload}"
+    );
+    assert_eq!(
+        payload["partial_result"],
+        serde_json::json!("half a thought"),
+        "the partial text survives the stop copy: {payload}"
+    );
+    assert!(
+        payload.get("session_id").is_none(),
+        "no handle rides the refusal: {payload}"
+    );
+
+    let result = call_monitor(&id);
+    assert_eq!(result.is_error, Some(true), "a stopped run is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} was stopped when its session exited and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed.; \
+             partial result: half a thought"
+        ),
+        "the collect copy is the record's own verdict, never the salvage promise, and the salvage text rides it: {text}"
+    );
+}
+
+/// A dead server's corpse whose recorded child is still spending reads
+/// `orphaned`, never `stopped`, until the child is gone: the resume note and
+/// the listing both follow the one classification, so a live transcript is
+/// never offered for a resume. Once the child dies, the same record reads
+/// `stopped` with its handle.
+#[cfg(unix)]
+#[test]
+fn a_dead_servers_corpse_with_a_live_child_reads_orphaned_until_the_child_dies() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let host_session = format!("f3-host-{}", std::process::id());
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut child = std::process::Command::new("sleep")
+        .args(["600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    let record = serde_json::json!({
+        "job_id": "d-f3live-0",
+        "profile": "D1",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "host_session": host_session,
+        "session_id": "sess-f3-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": child.id(),
+        "child_start_token": token,
+    });
+    std::fs::write(
+        dir.join("d-f3live-0.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session.clone(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    });
+    let named_while_alive = note.is_some();
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let state_while_alive = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-f3live-0"))
+        .and_then(|r| r["state"].as_str())
+        .map(str::to_string)
+        .expect("the corpse is listed");
+    let prose_while_alive = render::monitor_state_prose(&payload);
+    // The verdicts, then the cleanup, then the assert: a red must not leak
+    // this test's own 600 s sleep.
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        !named_while_alive,
+        "a live child's corpse is not a stop to name: {note:?}"
+    );
+    assert_eq!(
+        state_while_alive, "orphaned",
+        "the listing reads orphaned while the child lives: {payload}"
+    );
+    assert_eq!(
+        prose_while_alive,
+        "delegates clauth holds:\n  job `d-f3live-0` orphaned on `D1`, last seen 5s ago",
+        "an orphaned row whose child is still writing the transcript offers no resume: {prose_while_alive}"
+    );
+
+    // The child gone, the same bytes read `stopped` — no sweep needed, the
+    // classification is the record's own.
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the corpse now reads stopped");
+    assert_eq!(
+        note,
+        "clauth note: a delegate this session started was stopped when the session exited: `d-f3live-0` on `D1`. `delegate` with `session_id: \"sess-f3-0\"` and `profiles: [\"D1\"]` resumes it."
+    );
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let state = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-f3live-0"))
+        .and_then(|r| r["state"].as_str())
+        .expect("the corpse is still listed");
+    assert_eq!(state, "stopped", "the listing follows the classification");
+    assert_eq!(
+        render::monitor_state_prose(&payload),
+        "delegates clauth holds:\n  job `d-f3live-0` stopped on `D1`; resume with session id `sess-f3-0`, stopped 5s ago",
+        "the stopped row's own verdict offers the handle: {payload}"
+    );
+}
+
+/// The backstop's kill never blocks the stdio server's runtime: the reader
+/// sweep a `monitor` call triggers sends no signal and spends no grace, so a
+/// corpse whose recorded child still runs is left for the startup sweep (the
+/// full scope, which runs on its own thread). Measured against a
+/// TERM-ignoring leader: the old reader path slept the whole grace on it.
+#[cfg(unix)]
+#[test]
+fn the_reader_sweep_never_blocks_on_the_backstop_kill() {
+    use std::os::unix::process::CommandExt;
+
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let ready = _home.home().join("f5-ready");
+    let mut child = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "trap '' TERM; : > \"$1\"; sleep 600",
+            "sh",
+            ready.to_str().expect("ready path"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn TERM-ignoring leader");
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the leader installed its TERM trap");
+    let token = crate::daemon::gateway::process_start_time(child.id()).expect("start token");
+    let record = serde_json::json!({
+        "job_id": "d-f5live-0",
+        "profile": "work",
+        "state": "running",
+        "started_at": now - 60_000,
+        "recorded_at": now - 60_000,
+        "last_output_at": now - 5_000,
+        "session_id": "sess-f5-0",
+        "owner_pid": DEAD_SERVER_PID,
+        "owner_started_at": 1,
+        "child_pid": child.id(),
+        "child_start_token": token,
+    });
+    std::fs::write(
+        dir.join("d-f5live-0.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let walks_before = jobs::tag_walk_count();
+    let started = std::time::Instant::now();
+    jobs::gc_running_corpses(now);
+    let reader_took = started.elapsed();
+    let walks_after = jobs::tag_walk_count();
+    assert_eq!(
+        walks_before, walks_after,
+        "the child-alive arm short-circuits before the tag walk: the reader ran no process enumeration"
+    );
+
+    // The verdicts are captured before the startup sweep, which then owns the
+    // kill: the verdict asserts below run after it, so a verdict red cannot
+    // leave this test's own 600 s sleep behind, and the sweep's kill is pinned
+    // here rather than performed by the test.
+    let child_alive = process_alive(child.id());
+    let still_running = jobs::read("d-f5live-0")
+        .map(|r| r.state == jobs::JobState::Running)
+        .unwrap_or(false);
+    // The startup sweep (the full scope) stops the child and converts.
+    jobs::gc(now);
+    assert_process_gone(child.id());
+    let _ = child.wait();
+    assert!(
+        reader_took < jobs::GROUP_STOP_GRACE,
+        "the reader sweep must not spend the backstop's grace on the server's runtime: {reader_took:?}"
+    );
+    assert!(
+        child_alive,
+        "the reader sweep sends no signal: the startup sweep owns the kill"
+    );
+    assert!(
+        still_running,
+        "a corpse with a live child is left for the startup sweep, never converted while its transcript is being written"
+    );
+
+    let converted = jobs::read("d-f5live-0").expect("the startup sweep converts the corpse");
+    assert_eq!(converted.state, jobs::JobState::Done);
+    assert!(converted.stopped, "the tombstone reads stopped");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-f5-0"),
+        "the conversion keeps the resume handle"
+    );
+}
+
+/// A host exit that lands in the pre-spawn window stops the run, never
+/// cancels it: the stop arm sits above the cancel guard (the same flag makes
+/// `is_cancelled` true, and the cause must not read as the caller's cancel).
+/// No child ever existed, so the envelope carries no handle.
+#[test]
+fn a_host_exit_before_the_spawn_reads_stopped_not_cancelled() {
+    let home = HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("stage ~/.claude");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create profile");
+
+    // The real abandonment path, as the cancel twin: nothing spawned, so
+    // nothing is handed off, and the host-exit cause rides the same flag the
+    // stop's entry point sets.
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "fixture control: nothing spawned, so nothing is handed off"
+    );
+    handoff
+        .cancel
+        .host_exit
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let envelope = run_delegate(DelegateOpts {
+        profile: "work",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        resume: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        isolation: Isolation::Isolated,
+        depth: 0,
+        handoff: Some(std::sync::Arc::clone(&handoff)),
+    })
+    .expect("a stop is an envelope, never a transport error");
+
+    assert_eq!(envelope["stopped"], serde_json::json!("host_exit"));
+    assert!(
+        envelope.get("cancelled").is_none(),
+        "a host exit is not the caller's cancel: {envelope}"
+    );
+    assert_eq!(
+        envelope["transcript_rescued"],
+        serde_json::json!(false),
+        "no child ran, so nothing was rescued: {envelope}"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("before it spawned") && reason.contains("was not spent"),
+        "the fact the caller acts on is that nothing was billed: {reason}"
+    );
+    assert!(
+        envelope.get("partial_result").is_none() && envelope.get("session_id").is_none(),
+        "no child ran, so there is nothing to salvage: {envelope}"
+    );
+    assert!(
+        job_files().is_empty(),
+        "a pre-spawn stop mints nothing: {:?}",
+        job_files()
+    );
+}
+
+/// The exit generation: a run constructed BEFORE the exit stop — its flag
+/// missed by the registry snapshot, or never registered at all — still reads
+/// the host exit after `stop_all_at_exit`, and a run constructed AFTER reads
+/// clean. A sticky bool would leak the exit into every later run in this
+/// process (the threaded test fallback runs many tests in one); the
+/// generation compared against the construction-time value keeps the exit to
+/// the runs it stopped.
+#[cfg(unix)]
+#[test]
+fn a_run_born_before_the_exit_reads_host_exit_and_one_born_after_reads_clean() {
+    let _home = HomeSandbox::new();
+    let before = super::Handoff::blocking(mint_spec("work"));
+    assert!(!before.is_host_exit(), "fixture control: no exit yet");
+    assert!(stop_all_at_exit(), "the registry drains");
+    assert!(
+        before.is_host_exit(),
+        "a run the exit stop's snapshot missed reads the exit through the generation"
+    );
+    let after = super::Handoff::blocking(mint_spec("work"));
+    assert!(
+        !after.is_host_exit(),
+        "a run born after the exit reads clean: the generation must not leak across tests"
+    );
+}
+
+/// A `delegate` resume by a stopped record's session id takes the session:
+/// the resume mint removes that stopped record, so a later compaction tells
+/// only what is still unresumed, and a stopped record under another session
+/// id stays.
+#[cfg(unix)]
+#[test]
+fn a_resume_mint_removes_the_stopped_record_it_took() {
+    let _home = HomeSandbox::new();
+    let mut fake = crate::testutil::FakeClaude::new(&_home);
+    let profile = format!("resume-mint-{}", std::process::id());
+    register_delegate_profile(&profile);
+    let hold = _home.home().join("f4-hold.log");
+    fake.set_signal_hold(&hold);
+    let host_session = format!("f4-host-{}", std::process::id());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let job_id = launch_held_delegate(
+        &rt,
+        &profile,
+        Isolation::Shared,
+        Vec::new(),
+        super::DelegateOrigin {
+            host_session: Some(host_session.clone()),
+            ..super::DelegateOrigin::default()
+        },
+    );
+    let (_shim_pid, grandchild_pid) = wait_for_hold(&hold);
+
+    let before = wait_for_stamped_record(&job_id);
+    let pinned = before.session_id.clone().expect("pinned handle");
+    // The stop is bounded by construction: its loop ends at `EXIT_STOP_WAIT`
+    // whether or not the registry emptied. A loaded box can starve a run's
+    // finalize past that bound, which the record wait below covers; 2 s is
+    // scheduling slack on the loop's last iteration, not a widened contract.
+    let started = std::time::Instant::now();
+    let _drained = stop_all_at_exit();
+    assert!(
+        started.elapsed() <= super::EXIT_STOP_WAIT + Duration::from_secs(2),
+        "the stop returned after {:?}, past its own bound plus 2 s of scheduling slack",
+        started.elapsed()
+    );
+    let after = wait_for_stopped_record(&job_id);
+    assert!(after.stopped, "the record reads stopped");
+
+    // A stopped record can still sit in the liveness spelling until the next
+    // sweep converts it; the note names it, so the resume mint must remove the
+    // spelling the record holds, not only the collectable one.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let live_path = dir.join("d-f4-live-0.live.json");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-f4-live-0",
+            "profile": profile,
+            "state": "done",
+            "started_at": now_ms() - 60_000,
+            "done_at": now_ms() - 5_000,
+            "stopped": true,
+            "host_session": host_session,
+            "session_id": pinned,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // A second stopped record under another session id, the same host
+    // session: the note names it before AND after the resume.
+    seed_named_stop(now_ms(), &host_session, 42, false);
+
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session.clone(),
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("both stopped records are named");
+    assert!(
+        note.contains(&job_id) && note.contains("d-f4-live-0") && note.contains("d-cap-42"),
+        "the note names every stop before the resume: {note}"
+    );
+
+    // The transcript the resume resolves: the pinned id under a workspace
+    // slug in the sandbox's global store, the shape `resolve_resume_workspace`
+    // walks.
+    let workspace = _home.home().join("w-f4");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let slug = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects")
+        .join("-w-f4");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    std::fs::write(
+        slug.join(format!("{pinned}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+        ),
+    )
+    .expect("transcript fixture");
+
+    // The resume mint: a real delegate spawn with the pinned id. The hold
+    // pin is cleared for this run (the first run's stop was its one use),
+    // so the default shim exits at once; the fake's drop restores it.
+    unsafe { std::env::remove_var("CLAUDE_SHIM_SIGNAL_HOLD") };
+    let mint = super::MintSpec {
+        // The resume's own start is the call's own mint instant in production;
+        // the fixture's minute-old default would place it BEFORE the run this
+        // resume takes, which is no shape the product can reach.
+        started_at: now_ms(),
+        origin: super::DelegateOrigin::default(),
+        ..mint_spec(&profile)
+    };
+    let handoff = super::Handoff::blocking(mint);
+    let caller = std::thread::spawn({
+        let handoff = std::sync::Arc::clone(&handoff);
+        let profile = profile.clone();
+        let pinned = pinned.clone();
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("caller runtime");
+            rt.block_on(async move {
+                let handle = super::spawn_delegate(
+                    profile,
+                    super::BackgroundOpts {
+                        prompt: std::sync::Arc::from("hello"),
+                        model: None,
+                        cwd: None,
+                        env: HashMap::new(),
+                        extra_args: Vec::new(),
+                        resume: Some(pinned.clone()),
+                        subagent_type: None,
+                        allowed_tools: None,
+                        permission_mode: None,
+                        result_file: false,
+                        isolation: Isolation::Shared,
+                        depth: 0,
+                    },
+                    handoff,
+                    None,
+                );
+                handle.await.expect("the task's join resolves")
+            })
+        }
+    });
+    caller.join().expect("the resume caller joins");
+
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the resume mint removed the stopped record it took"
+    );
+    assert!(
+        !live_path.exists(),
+        "the resume mint removed the liveness-spelling stopped record it took"
+    );
+    let note = crate::hook_jobs::note(&crate::hook_note::Payload {
+        event: "SessionStart".to_string(),
+        session_id: host_session,
+        agent_id: None,
+        tool_name: None,
+        source: Some("resume".to_string()),
+        transcript: None,
+    })
+    .expect("the other stopped record is still named");
+    assert_eq!(
+        note,
+        "clauth note: a delegate this session started was stopped when the session exited: `d-cap-42` on `D1`. `delegate` with `session_id: \"sid-42\"` and `profiles: [\"D1\"]` resumes it."
+    );
+    assert_process_gone(grandchild_pid);
+}
+
+/// A cancel ask on a stopped record is gone-server news, never "already
+/// finished", whichever writer left it: the in-process finalize zeroes the
+/// owner stamp as the server exits, and the sweep's tombstone names a dead
+/// owner. Both are final records whose server is gone, so the cancel copy
+/// cannot disagree with the stop copy about one record.
+#[test]
+fn cancelling_a_stopped_record_names_the_gone_server_like_the_tombstone() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+
+    // The in-process stop's own shape: `write_done` keeps the salvage envelope
+    // and zeroes the owner stamp as the server exits.
+    let in_process = "d-f12-stop-0";
+    jobs::write_done_parts(
+        in_process,
+        "work",
+        now - 60_000,
+        None,
+        None,
+        false,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": true,
+            "result": "delegate stopped when the session exited, after 0s",
+            "stopped": "host_exit",
+            "transcript_rescued": false,
+            "session_id": "sess-f12-0",
+        }),
+    )
+    .unwrap();
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![in_process.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("`{in_process}` was started by a server that is gone."),
+        "an ownerless stopped record is gone-server news, not a hedge: {text}"
+    );
+
+    // The sweep's tombstone, through the conversion that writes it: a dead
+    // owner, no envelope.
+    let tombstone = "d-f12-stop-1";
+    let spec = dead_owner_spec(
+        tombstone,
+        "work",
+        now - 60_000,
+        jobs::RecordKind::Collectable,
+    );
+    jobs::write_heartbeat_with_session(&spec, now - 5_000, "half", Some("sess-f12-1")).unwrap();
+    jobs::gc_running_corpses(now);
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![tombstone.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("`{tombstone}` was started by a server that is gone."),
+        "a swept stopped record is gone-server news, not a hedge: {text}"
     );
 }

@@ -79,6 +79,9 @@ fn build_status_top_level_shape_and_active() {
             "credit_billed_families",
             "gateway",
             "generated_at",
+            // Additive: the address a `--listen` daemon serves on, for the
+            // pairing link.
+            "listen",
             "pending_switch",
             "profiles",
             "proxies",
@@ -88,6 +91,8 @@ fn build_status_top_level_shape_and_active() {
             "wrap_off",
         ],
     );
+    // A body built with no live daemon signals vouches for no listener.
+    assert_eq!(v["listen"], serde_json::Value::Null);
     let profiles = v["profiles"].as_array().unwrap();
     let mut per: Vec<&str> = profiles[0]
         .as_object()
@@ -499,6 +504,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     assert!(none["pending_switch"].is_null());
 
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -510,6 +516,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -546,6 +553,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     let empty_streaks = std::collections::HashMap::new();
     let anchor = 1_780_000_000i64;
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -557,6 +565,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
         v["profiles"]
@@ -666,6 +675,7 @@ fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() 
     let empty_next = HashMap::new();
     let empty_streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -677,6 +687,7 @@ fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() 
         usage: &usage,
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -762,6 +773,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -773,6 +785,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -1047,6 +1060,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
     let empty_status = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1058,6 +1072,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -1119,6 +1134,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     ]);
     let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1130,6 +1146,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1148,6 +1165,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
     let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1159,6 +1177,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1334,6 +1353,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     config.state.refresh_spent_accounts = true;
     write(42.0, threshold_secs + 60);
     let live = LiveSignals {
+        fetches_here: true,
         status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1345,6 +1365,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
@@ -1381,6 +1402,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // derivation has nothing — the live third-party store is the only source.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1392,6 +1414,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1406,6 +1429,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // cache mtime said, which is a freshness claim about a rejected poll.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1417,6 +1441,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -1439,6 +1464,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1450,6 +1476,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -1472,6 +1499,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1483,6 +1511,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     status_value(&config, 300_000, Some(&live), false)["profiles"][0]["fetch_status"].clone()
 }
@@ -1938,7 +1967,7 @@ fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let by_name = |name: &str| {
         entries
             .iter()
@@ -2002,6 +2031,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
     let anchor = 1_780_000_000i64;
     let blocked = [crate::profile::ProfileName::from("b")];
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -2013,6 +2043,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -2249,6 +2280,10 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
         binary_replaced: true,
         binary_removed: true,
+        listen: Some(ListenSlot {
+            host: "box.example.net".to_string(),
+            port: 8443,
+        }),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2371,7 +2406,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"profiles":["#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"listen":{"host":"box.example.net","port":8443},"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2416,6 +2451,7 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: Vec::new(),
         binary_replaced: false,
         binary_removed: false,
+        listen: None,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2423,7 +2459,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"profiles":[]}"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"listen":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2739,6 +2775,7 @@ fn status_body_never_leaks_a_credential() {
     let streaks_map = HashMap::from([("canary-oauth".to_string(), u32::MAX)]);
     let blocked: Vec<ProfileName> = vec!["canary-api".into()];
     let live = LiveSignals {
+        fetches_here: true,
         status: &status_map,
         third_party_status: &third_party_map,
         third_party_streaks: &Default::default(),
@@ -2750,6 +2787,7 @@ fn status_body_never_leaks_a_credential() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let body_live = build_status(&config, 300_000, Some(&live), true);
     let body_live_str =
@@ -3111,9 +3149,9 @@ fn status_schema_agrees_with_the_serialized_body() {
 /// their schemas (`SwitchOk.previous`, `PaneEntry.title`/`agent`/`tag`/
 /// `foreground_process_group_id`/`cwd`/`agent_session_id`, `PaneSession.cwd`,
 /// `SessionsBody.next_before`, `SessionRow.last_ran_profile`/`first_message`/
-/// `last_message` and `HistoryBody.next_before` answer `null`, never a dropped
-/// key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
-/// `HerdrState.reason`) stay optional.
+/// `last_message`/`title`/`git_branch` and `HistoryBody.next_before` answer
+/// `null`, never a dropped key), and the skip-when-absent `Option`s
+/// (`ErrorBody.reason`, `HerdrState.reason`) stay optional.
 #[test]
 fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     use crate::daemon::api::panes::{HerdrState, PaneEntry, PaneSession};
@@ -3164,7 +3202,13 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
         "SessionsBody.next_before is serialized on every answer, so its schema requires it"
     );
     let session_row_required = required(&SessionRow::schema(), "SessionRow");
-    for field in ["last_ran_profile", "first_message", "last_message"] {
+    for field in [
+        "last_ran_profile",
+        "first_message",
+        "last_message",
+        "title",
+        "git_branch",
+    ] {
         assert!(
             session_row_required.iter().any(|name| name == field),
             "SessionRow.{field} is serialized on every answer, so its schema requires it"
@@ -3311,6 +3355,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let empty_status = HashMap::new();
     let empty_streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3322,6 +3367,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3333,6 +3379,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     // Exactly the cap → not yet distrusted.
     let tp_streaks = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3344,6 +3391,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3357,6 +3405,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let oauth_status = HashMap::from([("zai".to_string(), FetchStatus::Cached)]);
     let tp_streaks = HashMap::from([("zai".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &oauth_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3368,6 +3417,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3452,6 +3502,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -3463,6 +3514,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
         usage: &Default::default(),
         gateway: None,
         proxies: Some(&proxies),
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let proxies = v["proxies"].as_array().expect("a proxies array");
@@ -4052,7 +4104,7 @@ fn a_codex_entry_publishes_the_banked_resets_its_poll_read() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let count = |name: &str| {
         entries
             .iter()
@@ -4203,7 +4255,7 @@ fn a_codex_entry_dates_its_banked_resets_by_its_poll() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4262,7 +4314,7 @@ fn a_codex_count_and_its_age_come_from_one_read_of_one_file() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4322,7 +4374,7 @@ fn a_poll_landing_during_a_codex_entrys_build_changes_nothing_in_that_entry() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = &entries.as_array().unwrap()[0];
     assert_eq!(row["limit_resets"], 3);
     assert_eq!(row["limit_resets_read_at"], "2026-09-21T14:13:20+00:00");
@@ -4360,7 +4412,7 @@ fn a_codex_entrys_freshness_reads_the_polls_stamp_over_the_mtime() {
     }
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let status = |name: &str| {
         entries
             .iter()
@@ -4408,7 +4460,7 @@ fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
     std::fs::write(&garbled_path, "not json").expect("garbled cache");
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000)).unwrap();
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
     let row = |name: &str| {
         entries
             .as_array()
@@ -4436,4 +4488,153 @@ fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
             "garbled's {key} dates nothing"
         );
     }
+}
+
+/// A live snapshot whose daemon stood down from the fetch lease publishes
+/// `next_refresh_at: null` even when its live countdown map carries an armed
+/// stamp: the stamp is a mirror's cache-clock estimate, not a countdown this
+/// daemon runs. The holder's arm (the flag true) keeps publishing its live
+/// stamp verbatim — the split the tick's writer and the API republish share.
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_live_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let mut next = std::collections::HashMap::new();
+    next.insert(
+        crate::usage::FetchLeg::OAuth.key(crate::profile::ProfileName::from("work")),
+        crate::usage::now_ms() + interval_ms,
+    );
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+        listen: None,
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    let p = &held["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_string(),
+        "control: the holder publishes its armed stamp, got {p}"
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    let p = &stood["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no countdown it does not run, got {p}"
+    );
+}
+
+/// The codex half of `profiles[]` follows the claude half's null rule: a
+/// stood-down daemon runs no codex poll, so its cache-derived stamp
+/// publishes as `null`, and a holder keeps its own — the split the
+/// single-shot and daemonless writers never join (they keep the derived
+/// stamp).
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_codex_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    crate::testutil::write_codex_roster(&["polled"]);
+    crate::testutil::write_codex_store(
+        "polled",
+        r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("polled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::map_codex_usage(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps"),
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+        listen: None,
+    };
+    let codex_entry = |v: &serde_json::Value| {
+        v["profiles"]
+            .as_array()
+            .expect("profiles publish")
+            .iter()
+            .find(|e| e["harness"] == "codex")
+            .expect("the codex entry publishes")
+            .clone()
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    assert!(
+        codex_entry(&held)["next_refresh_at"].is_string(),
+        "control: the holder publishes its derived stamp, got {}",
+        codex_entry(&held)
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    assert!(
+        codex_entry(&stood)["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no codex countdown it does not run, got {}",
+        codex_entry(&stood)
+    );
+
+    // No live feed at all: the single-shot writer runs no poll either way, so
+    // it keeps the cache-derived stamp instead of publishing a null no daemon
+    // asked for.
+    let single = status_value(&config, interval_ms, None, false);
+    assert!(
+        codex_entry(&single)["next_refresh_at"].is_string(),
+        "a single-shot body keeps the codex entry's derived stamp, got {}",
+        codex_entry(&single)
+    );
 }

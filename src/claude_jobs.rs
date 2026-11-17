@@ -22,14 +22,23 @@
 //! session can re-enter, where only an UNFINISHED job spares. A job dir with no
 //! record is either a removed job's leftover — an empty `tmp/` and/or an
 //! `exit-cause` file — or caught mid-create (an empty dir, or only staged
-//! `state.json.tmp.*` records); neither names a job. A leftover is no job to
-//! any reader. A mid-create dir names no tree yet either, so the live-session
-//! count skips it and keeps counting the store's real records, while every gate
-//! that must not collect a tree a job reads fails closed for it — the tree
-//! itself for a tree-local dir, every tree for the global one, since the record
-//! about to land can name any of them. Any other record-less dir is unreadable
-//! and spares. The settings term ([`JobTrees::spares_settings`]) spares a
-//! spawn-settings file a job's `respawnFlags` name. The rotation term
+//! `state.json.tmp.*` records, newest mtime within [`MID_CREATE_GRACE`];
+//! older reads as a leftover, an unreadable or future mtime stays mid-create);
+//! neither names a job. A leftover is no job to any reader. A mid-create dir
+//! names no tree yet either, so the live-session count skips it and keeps
+//! counting the store's real records, while every gate that must not collect
+//! a tree a job reads fails closed for it — the tree itself for a tree-local
+//! dir, every tree for the global one, since the record about to land can name
+//! any of them. Any other record-less dir is unreadable and spares, and so does
+//! a record that fails both parses. Such a dir is STUCK, since it never clears
+//! on its own, when it is a record-less dir of no known shape (at once) or a
+//! record read whole that fails both parses and whose mtime is older than the
+//! same grace; a younger record, or one whose mtime is unreadable or in the
+//! future, may be a write in progress, and a record the capped read cut short
+//! fails its parse on bytes that may parse whole, so neither is stuck. The
+//! rotation refusal names a stuck job dir. The
+//! settings term ([`JobTrees::spares_settings`]) spares a spawn-settings file
+//! a job's `respawnFlags` name. The rotation term
 //! ([`JobTrees::unfinished_under`]) and the live-session term
 //! ([`JobTrees::unfinished_jobs`]) count only UNFINISHED jobs: a
 //! `stopped`/`done`/`failed` job must not freeze the chain and holds no
@@ -41,6 +50,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -232,6 +242,39 @@ struct UnreadableStore {
     /// closed for the scope; the live-session count skips the dir and counts
     /// the store's other records.
     mid_create: bool,
+    /// The job dir that never clears on its own and made the store unreadable
+    /// ([`StoreReadFault::stuck`]); the rotation refusal names it. `None` for
+    /// every other fault, and for a mid-create store, which clears by itself.
+    stuck_dir: Option<PathBuf>,
+}
+
+/// Why [`read_jobs_dir`] could not read a store.
+#[derive(Debug)]
+struct StoreReadFault {
+    /// The dir the fault is about: the store itself, or the offending job dir.
+    path: PathBuf,
+    /// `path` is a job dir that never clears on its own, so a retry cannot
+    /// help: a record-less dir of neither the leftover nor the mid-create
+    /// shape, or a record read whole that fails both parses and whose own
+    /// mtime is older than [`MID_CREATE_GRACE`]. A younger record, or one
+    /// whose mtime is unreadable or in the future, can be a write in progress,
+    /// and a read cut at [`crate::runtime::RECORD_READ_CAP`] fails both parses
+    /// on bytes that may parse whole; neither is stuck. Every other fault (the
+    /// store or a job dir that cannot be listed, a record that cannot be read,
+    /// a config dir that cannot be resolved) is not stuck either.
+    stuck: bool,
+}
+
+impl StoreReadFault {
+    /// A fault a retry may clear.
+    fn transient(path: PathBuf) -> Self {
+        Self { path, stuck: false }
+    }
+
+    /// A job dir that never clears on its own.
+    fn stuck(path: PathBuf) -> Self {
+        Self { path, stuck: true }
+    }
 }
 
 /// The answer to "which runtime trees and settings files must a sweep or gate
@@ -246,8 +289,15 @@ pub(crate) enum JobTrees {
     /// canonicalized while it might still exist. `offending` is the deep dir a
     /// log line names (never the record's contents); `store` is the store dir
     /// the rotation refusal names (the conventional global store, or the tree's
-    /// `jobs/`).
-    Unreadable { offending: PathBuf, store: PathBuf },
+    /// `jobs/`). `stuck` is true when `offending` is a job dir that never
+    /// clears on its own ([`StoreReadFault::stuck`]): the rotation refusal then
+    /// names `offending` and tells the operator to delete it, instead of
+    /// telling them to retry.
+    Unreadable {
+        offending: PathBuf,
+        store: PathBuf,
+        stuck: bool,
+    },
 }
 
 /// What the job store says about the tree one conversation runs in
@@ -508,35 +558,56 @@ impl JobTrees {
 
     /// The canonical tree paths every UNFINISHED job names UNDER `dir`, so the
     /// rotation gate can read each tree's `.credentials.json` and apply the
-    /// same holds-a-refresh-token narrowing the marker term gets. `Err(store)`
-    /// when the store (or a scoped store under `dir`) is unreadable — fail
-    /// closed: the caller blocks and names the store. A finished job
-    /// (`stopped`/`done`/`failed`) is not mid-task, so it names nothing here;
+    /// same holds-a-refresh-token narrowing the marker term gets. A
+    /// [`StoreRefusal`] when the store (or a scoped store under `dir`) is
+    /// unreadable — fail closed: the caller blocks and names the store, or the
+    /// stuck job dir ([`StoreRefusal::stuck_dir`]) when one made the store
+    /// unreadable. A finished job (`stopped`/`done`/`failed`) is not mid-task,
+    /// so it names nothing here;
     /// an unknown or missing `state` reads unfinished by construction.
     ///
     /// `dir` is canonicalized so it and the set share one spelling; a
     /// `NotFound` canonicalize — the dir is already gone — reads as empty, and
     /// any other failure reads as unreadable, like [`JobTrees::spares`].
-    pub(crate) fn unfinished_under(&self, dir: &Path) -> Result<Vec<PathBuf>, PathBuf> {
+    pub(crate) fn unfinished_under(&self, dir: &Path) -> Result<Vec<PathBuf>, StoreRefusal> {
         match self {
-            JobTrees::Unreadable { store, .. } => Err(store.clone()),
+            JobTrees::Unreadable {
+                store,
+                offending,
+                stuck,
+            } => Err(StoreRefusal {
+                store: store.clone(),
+                stuck_dir: stuck.then(|| offending.clone()),
+            }),
             JobTrees::Named(sets) => {
                 if sets.global_mid_create.is_some() {
                     // The conventional location every other global-store
-                    // refusal names, never this host's absolute path.
-                    return Err(PathBuf::from("~/.claude/jobs"));
+                    // refusal names, never this host's absolute path. A
+                    // mid-create dir clears on its own, so none is stuck.
+                    return Err(StoreRefusal {
+                        store: PathBuf::from("~/.claude/jobs"),
+                        stuck_dir: None,
+                    });
                 }
                 let dir_id = match crate::canonical::identity(dir) {
                     Ok(id) => id,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                    Err(_) => return Err(dir.to_path_buf()),
+                    Err(_) => {
+                        return Err(StoreRefusal {
+                            store: dir.to_path_buf(),
+                            stuck_dir: None,
+                        });
+                    }
                 };
                 if let Some(unreadable) = sets
                     .unreadable
                     .iter()
                     .find(|u| u.scope == dir_id || u.scope.starts_with(&dir_id))
                 {
-                    return Err(unreadable.store.clone());
+                    return Err(StoreRefusal {
+                        store: unreadable.store.clone(),
+                        stuck_dir: unreadable.stuck_dir.clone(),
+                    });
                 }
                 Ok(sets
                     .unfinished
@@ -547,6 +618,17 @@ impl JobTrees {
             }
         }
     }
+}
+
+/// Why [`JobTrees::unfinished_under`] refused: the rotation gate could not
+/// judge the store.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StoreRefusal {
+    /// The store dir the refusal names.
+    pub(crate) store: PathBuf,
+    /// The job dir that never clears on its own and made the store unreadable,
+    /// when one did: the refusal then names it and says to delete it.
+    pub(crate) stuck_dir: Option<PathBuf>,
 }
 
 /// Whether `path`'s canonical identity is named OR lies under a scoped
@@ -685,8 +767,9 @@ impl<'de> serde::de::Visitor<'de> for RespawnFlagsVisitor {
 /// dir's trees. Any job dir whose `state.json` is missing, unreadable, or
 /// unparseable makes its STORE unreadable — EXCEPT a missing record whose dir
 /// is a removed job's leftover or a creation caught mid-create
-/// ([`recordless_job_dir`]): a leftover reads as no job, and a mid-create dir
-/// is skipped while the gates fail closed for it.
+/// ([`recordless_job_dir`]; only while its newest mtime is within
+/// [`MID_CREATE_GRACE`], older reads as a leftover): a leftover reads as no
+/// job, and a mid-create dir is skipped while the gates fail closed for it.
 pub(crate) fn job_trees() -> JobTrees {
     #[cfg(test)]
     JOB_TREES_READS.with(|c| c.set(c.get() + 1));
@@ -713,6 +796,7 @@ pub(crate) fn job_trees() -> JobTrees {
             return JobTrees::Unreadable {
                 offending: PathBuf::from("~/.claude/jobs"),
                 store: PathBuf::from("~/.claude/jobs"),
+                stuck: false,
             };
         }
     };
@@ -721,10 +805,11 @@ pub(crate) fn job_trees() -> JobTrees {
     match read_jobs_dir(&jobs_dir, None, false, &mut sets) {
         Ok(false) => {}
         Ok(true) => sets.global_mid_create = Some(jobs_dir.clone()),
-        Err(offending) => {
+        Err(fault) => {
             return JobTrees::Unreadable {
-                offending,
+                offending: fault.path,
                 store: PathBuf::from("~/.claude/jobs"),
+                stuck: fault.stuck,
             };
         }
     }
@@ -737,11 +822,12 @@ pub(crate) fn job_trees() -> JobTrees {
             return JobTrees::Unreadable {
                 offending: dir.clone(),
                 store: dir,
+                stuck: false,
             };
         }
     };
     for profile in runtime_trees.unreadable_profiles {
-        record_unreadable(&mut sets.unreadable, &profile, &profile, false);
+        record_unreadable(&mut sets.unreadable, &profile, &profile, false, None);
     }
     for tree in runtime_trees.trees {
         let jobs = tree.join("jobs");
@@ -762,13 +848,20 @@ pub(crate) fn job_trees() -> JobTrees {
                 };
                 match read_jobs_dir(&jobs, Some(&owner), isolated, &mut sets) {
                     Ok(false) => {}
-                    Ok(true) => record_unreadable(&mut sets.unreadable, &tree, &jobs, true),
-                    Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
+                    // A mid-create dir clears on its own: never a stuck dir.
+                    Ok(true) => record_unreadable(&mut sets.unreadable, &tree, &jobs, true, None),
+                    Err(fault) => record_unreadable(
+                        &mut sets.unreadable,
+                        &tree,
+                        &jobs,
+                        false,
+                        fault.stuck.then_some(fault.path),
+                    ),
                 }
             }
-            Ok(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
+            Ok(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false, None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false),
+            Err(_) => record_unreadable(&mut sets.unreadable, &tree, &jobs, false, None),
         }
     }
 
@@ -779,12 +872,15 @@ pub(crate) fn job_trees() -> JobTrees {
 /// canonicalized for the spare/block matches, and `store` is the dir the
 /// refusal names. `mid_create` marks a store that was read but held a job dir
 /// caught mid-create — the gates fail closed for the scope, and the
-/// live-session count keeps counting the store's other records.
+/// live-session count keeps counting the store's other records. `stuck_dir` is
+/// the job dir that never clears on its own when one made the store unreadable
+/// ([`StoreReadFault::stuck`]), `None` otherwise.
 fn record_unreadable(
     unreadable: &mut Vec<UnreadableStore>,
     scope: &Path,
     store: &Path,
     mid_create: bool,
+    stuck_dir: Option<PathBuf>,
 ) {
     let scope = match crate::canonical::identity(scope) {
         Ok(id) => id,
@@ -795,6 +891,7 @@ fn record_unreadable(
         scope,
         store: store.to_path_buf(),
         mid_create,
+        stuck_dir,
     });
 }
 
@@ -805,10 +902,13 @@ fn record_unreadable(
 /// keeps only UNFINISHED jobs — a finished job in an isolated tree (which no
 /// session can re-enter) spares nothing and blocks nothing. A missing dir reads
 /// as no jobs; any other failure returns the offending dir, which the caller
-/// maps to a global or scoped unreadable. The record rules are [`job_trees`]'s:
+/// maps to a global or scoped unreadable, with [`StoreReadFault::stuck`] saying
+/// whether the offending job dir never clears on its own. The record rules are
+/// [`job_trees`]'s:
 /// a plain file is no job, a job naming no config dir contributes nothing, and
 /// a record-less dir is a removed job's leftover or a creation caught
-/// mid-create ([`recordless_job_dir`]), both skipped, or unreadable. `Ok(true)`
+/// mid-create (newest mtime within [`MID_CREATE_GRACE`]; older reads as a
+/// leftover; [`recordless_job_dir`]), both skipped, or unreadable. `Ok(true)`
 /// says the store held a mid-create dir, which the caller records so the gates
 /// fail closed for it while the count still reads the store's other records.
 fn read_jobs_dir(
@@ -816,17 +916,20 @@ fn read_jobs_dir(
     owner: Option<&Path>,
     isolated: bool,
     sets: &mut NamedTrees,
-) -> Result<bool, PathBuf> {
+) -> Result<bool, StoreReadFault> {
     let entries = match std::fs::read_dir(jobs_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(jobs_dir.to_path_buf()),
+        Err(_) => return Err(StoreReadFault::transient(jobs_dir.to_path_buf())),
     };
     let mut mid_create = false;
     for entry in entries {
-        let entry = entry.map_err(|_| jobs_dir.to_path_buf())?;
+        let entry = entry.map_err(|_| StoreReadFault::transient(jobs_dir.to_path_buf()))?;
         let job_dir = entry.path();
-        let is_dir = entry.file_type().map_err(|_| job_dir.clone())?.is_dir();
+        let is_dir = entry
+            .file_type()
+            .map_err(|_| StoreReadFault::transient(job_dir.clone()))?
+            .is_dir();
         if !is_dir {
             continue;
         }
@@ -845,9 +948,12 @@ fn read_jobs_dir(
                     mid_create = true;
                     continue;
                 }
-                Ok(RecordlessJobDir::Unknown) | Err(_) => return Err(job_dir.clone()),
+                // Of no known shape: nothing clears it but deleting it.
+                Ok(RecordlessJobDir::Unknown) => return Err(StoreReadFault::stuck(job_dir)),
+                // A dir that cannot be listed may be listable next time.
+                Err(_) => return Err(StoreReadFault::transient(job_dir)),
             },
-            Err(()) => return Err(job_dir.clone()),
+            Err(()) => return Err(StoreReadFault::transient(job_dir)),
         };
         let state: JobState = match serde_json::from_slice(&record) {
             Ok(state) => state,
@@ -862,7 +968,26 @@ fn read_jobs_dir(
                     respawn_flags: RespawnFlags::Unknown,
                     session_id: core.session_id,
                 },
-                Err(_) => return Err(job_dir.clone()),
+                // A record that fails both parses is a write in progress while
+                // it is young (Claude Code falls back to an in-place write when
+                // the rename fails, measured on 2.1.322) and stuck once it is
+                // old. An unreadable or future mtime cannot prove the age, so
+                // it reads young. A read cut at the cap proves nothing either:
+                // its bytes may be a whole record merely over `RECORD_READ_CAP`,
+                // so it reads young too.
+                Err(_) => {
+                    let whole = (record.len() as u64) < crate::runtime::RECORD_READ_CAP;
+                    let old = whole
+                        && std::fs::metadata(job_dir.join("state.json"))
+                            .and_then(|meta| meta.modified())
+                            .ok()
+                            .and_then(|mtime| mtime.elapsed().ok())
+                            .is_some_and(|age| age > MID_CREATE_GRACE);
+                    return Err(StoreReadFault {
+                        path: job_dir,
+                        stuck: old,
+                    });
+                }
             },
         };
         let Some(config_dir) = state.provider_env.and_then(|env| env.claude_config_dir) else {
@@ -876,7 +1001,7 @@ fn read_jobs_dir(
         let tree_id = match crate::canonical::identity(&config_dir) {
             Ok(id) => id,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(job_dir.clone()),
+            Err(_) => return Err(StoreReadFault::transient(job_dir)),
         };
         // A tree-local record names only its own tree; anything else is a
         // stale copy of the old global store.
@@ -942,21 +1067,44 @@ enum RecordlessJobDir {
     /// empty directory, `exit-cause` = a regular file}. `claude rm` can leave
     /// the job's supervisor running, and that supervisor recreates the dir this
     /// way (an empty `tmp/`, then `exit-cause` once signalled); a lone bare
-    /// job's supervisor exits instead. No reader counts it as a job.
+    /// job's supervisor exits instead. A mid-create shape past
+    /// [`MID_CREATE_GRACE`] reads as this too. No reader counts it as a job.
     Removed,
     /// Caught mid-create: an empty dir, or one holding only staged
     /// `state.json.tmp.*` records. Claude Code creates the dir, stages the
     /// record, renames it, and only then creates `tmp/` (measured 5/5, 2.1.308),
     /// so a creation never makes the leftover shape and a `tmp/` holding
     /// anything is neither.
+    ///
+    /// Only while the shape is YOUNG: once its newest mtime is older than
+    /// [`MID_CREATE_GRACE`] by the wall clock it reads as an abandoned creation,
+    /// [`RecordlessJobDir::Removed`]. Without the bound one leftover dir in the
+    /// global store holds every gate closed for good: no macOS rotation, no
+    /// tree collection, no background-session adoption, no MCP-login sync
+    /// write, and every account reads live. The bound's residuals: a creation
+    /// frozen across the grace (a suspended machine) reads abandoned until its
+    /// rename lands; an mtime ahead of this host's clock (a stepped-back clock,
+    /// a network home whose server runs ahead) cannot prove its age and stays
+    /// mid-create until the clock passes it, and a server running behind
+    /// shortens the grace by its skew.
     MidCreate,
     /// Any other record-less dir: unreadable, fail closed.
     Unknown,
 }
 
+/// How long a record-less job dir may keep the mid-create shape before it is
+/// read as an abandoned creation, so a leftover cannot hold the gates closed
+/// for good.
+const MID_CREATE_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// Classify a record-less job dir. A list that cannot be read is `Err`, which
 /// the caller reads as unreadable (fail closed).
 fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
+    // The newest mtime across the dir and its entries: a staged record being
+    // written keeps the shape young even inside an older dir.
+    let mut newest = std::fs::metadata(job_dir)
+        .and_then(|meta| meta.modified())
+        .ok();
     let mut seen = false;
     let mut leftover = true;
     let mut mid_create = true;
@@ -982,11 +1130,24 @@ fn recordless_job_dir(job_dir: &Path) -> io::Result<RecordlessJobDir> {
         if !(staged && file_type.is_file()) {
             mid_create = false;
         }
+        // An entry whose mtime cannot be read could be the young one: `None`
+        // keeps the shape young (fail closed).
+        newest = newest
+            .zip(entry.metadata().and_then(|meta| meta.modified()).ok())
+            .map(|(a, b)| a.max(b));
     }
     if seen && leftover {
         return Ok(RecordlessJobDir::Removed);
     }
     if mid_create {
+        // An unreadable mtime, or one in the future, cannot prove the shape is
+        // old: it stays mid-create (fail closed).
+        let abandoned = newest
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > MID_CREATE_GRACE);
+        if abandoned {
+            return Ok(RecordlessJobDir::Removed);
+        }
         return Ok(RecordlessJobDir::MidCreate);
     }
     Ok(RecordlessJobDir::Unknown)

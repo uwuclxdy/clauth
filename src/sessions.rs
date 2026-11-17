@@ -7,7 +7,8 @@
 //! [`preview`] reads ONE transcript's bounded HEAD and seek-from-end TAIL for
 //! its workspace and message previews — never a full-transcript parse, which
 //! the token subsystem already shows is too heavy to run per index build.
-//! [`build_index`] previews the whole walk; a page previews only its rows.
+//! [`build_index`] previews the whole walk; a page previews only its rows,
+//! through [`preview_labelled`], whose one tail walk also finds the [`Labels`].
 //! [`read_page`] serves one transcript's records backward from a byte cursor
 //! through the same backward line walker the tail preview uses.
 //!
@@ -63,8 +64,9 @@ fn bump_transcript_open() {
 const HEAD_MAX_BYTES: u64 = 256 * 1024;
 /// Initial tail-read window scanned backward for the last user message.
 const TAIL_CHUNK: u64 = 64 * 1024;
-/// Ceiling the tail window grows to when a chunk holds no user line, bounding
-/// the read on a transcript whose tail is all tool traffic.
+/// Ceiling the tail window grows to while a chunk lacks what the walk wants (a
+/// user line, or a row's [`Labels`]), bounding the read on a transcript whose
+/// tail is all tool traffic or that never named itself.
 const TAIL_MAX: u64 = 1024 * 1024;
 /// Byte budget of one history page ([`read_page`]): the page stops adding
 /// older records once the next one would push it past this, except that an
@@ -254,12 +256,24 @@ pub(crate) fn redact_secrets(s: &str) -> String {
 /// yield no user text.
 #[derive(Deserialize)]
 struct TranscriptLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     cwd: Option<String>,
-    #[allow(dead_code)]
-    timestamp: Option<String>,
     message: Option<Message>,
     #[serde(rename = "agentSetting")]
     agent_setting: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
+}
+
+impl TranscriptLine {
+    fn is_user(&self) -> bool {
+        self.message
+            .as_ref()
+            .is_some_and(|msg| msg.role.as_deref() == Some("user"))
+    }
 }
 
 #[derive(Deserialize)]
@@ -291,11 +305,10 @@ struct ContentBlock {
 /// The redacted preview of a line's user text, or `None` when the line is not a
 /// user turn or carries no text (e.g. a `tool_result`-only line).
 fn user_text(line: &TranscriptLine) -> Option<String> {
-    let msg = line.message.as_ref()?;
-    if msg.role.as_deref() != Some("user") {
+    if !line.is_user() {
         return None;
     }
-    let raw = match msg.content.as_ref()? {
+    let raw = match line.message.as_ref()?.content.as_ref()? {
         Content::Text(s) => s.clone(),
         Content::Blocks(blocks) => blocks
             .iter()
@@ -420,24 +433,90 @@ fn read_last_agent(path: &Path) -> Option<String> {
 }
 
 /// The last user message, found by walking the tail's lines backward — never a
-/// full parse. The walk covers at most [`TAIL_MAX`] bytes from the end, so a
-/// transcript whose tail is all tool traffic yields `None`. Fail-soft: any IO
-/// error yields `None`.
+/// full parse.
+#[cfg(test)]
 fn read_last_user_message(path: &Path) -> Option<String> {
-    let mut found = None;
-    lines_before(path, None, TAIL_WINDOW, |_, line| {
-        found = std::str::from_utf8(line)
-            .ok()
-            .and_then(|text| serde_json::from_str::<TranscriptLine>(text).ok())
-            .and_then(|parsed| user_text(&parsed));
-        if found.is_some() {
+    read_tail(path, TailWant::LastMessage).last_message
+}
+
+/// A session's Claude Code name and git branch, off the tail walk that finds
+/// its last user message.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Labels {
+    /// The newest `custom-title` record's name, sanitized like a preview;
+    /// `None` when no such record lies within [`TAIL_MAX`] of the end, or the
+    /// newest one sanitizes to nothing.
+    pub(crate) title: Option<String>,
+    /// The `gitBranch` of the newest user record within [`TAIL_MAX`] of the
+    /// end that names one, with control and bidi characters dropped; `None`
+    /// when no record there names one that survives the drop.
+    pub(crate) git_branch: Option<String>,
+}
+
+/// What a tail walk stops for: the last user message alone, or that plus the
+/// [`Labels`], which can sit further back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailWant {
+    LastMessage,
+    WithLabels,
+}
+
+#[derive(Default)]
+struct Tail {
+    last_message: Option<String>,
+    labels: Labels,
+}
+
+/// One backward walk of the tail's lines, stopping once it holds what `want`
+/// names. The walk covers at most [`TAIL_MAX`] bytes from the end, so a field
+/// whose record lies only further back stays `None` (a tail of pure tool
+/// traffic has no last message). Fail-soft: any IO error yields every field
+/// `None`.
+fn read_tail(path: &Path, want: TailWant) -> Tail {
+    let mut tail = Tail::default();
+    let mut title_seen = false;
+    let walked = lines_before(path, None, TAIL_WINDOW, |_, line| {
+        let labels = &mut tail.labels;
+        let Ok(text) = std::str::from_utf8(line) else {
+            return ControlFlow::Continue(());
+        };
+        // Past the last message and branch only a `custom-title` record is
+        // left to find, so every other line skips the parse.
+        let title_only = tail.last_message.is_some() && labels.git_branch.is_some();
+        if title_only && !text.contains("\"custom-title\"") {
+            return ControlFlow::Continue(());
+        }
+        let Ok(parsed) = serde_json::from_str::<TranscriptLine>(text) else {
+            return ControlFlow::Continue(());
+        };
+        if tail.last_message.is_none() {
+            tail.last_message = user_text(&parsed);
+        }
+        if want == TailWant::WithLabels {
+            if !title_seen && parsed.kind.as_deref() == Some("custom-title") {
+                title_seen = true;
+                labels.title = parsed.custom_title.as_deref().and_then(preview_of);
+            }
+            if labels.git_branch.is_none() && parsed.is_user() {
+                labels.git_branch = parsed
+                    .git_branch
+                    .as_deref()
+                    .map(crate::format::terminal_safe)
+                    .filter(|branch| !branch.is_empty());
+            }
+        }
+        let done = tail.last_message.is_some()
+            && (want == TailWant::LastMessage || (title_seen && labels.git_branch.is_some()));
+        if done {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         }
-    })
-    .ok()?;
-    found
+    });
+    match walked {
+        Ok(()) => tail,
+        Err(_) => Tail::default(),
+    }
 }
 
 /// How far a backward line walk reads: its first window, doubled whenever a
@@ -656,20 +735,31 @@ pub(crate) fn newest_first(a: (SystemTime, &str), b: (SystemTime, &str)) -> std:
 /// the tail. Best-effort: an unreadable file yields an empty workspace and no
 /// previews rather than dropping the session, whose id came from the filename.
 pub(crate) fn preview(entry: Walked) -> SessionInfo {
+    preview_until(entry, TailWant::LastMessage).0
+}
+
+/// [`preview`] plus the row's [`Labels`], off the same tail walk; it reads on
+/// past the last user message until it holds them or reaches [`TAIL_MAX`].
+pub(crate) fn preview_labelled(entry: Walked) -> (SessionInfo, Labels) {
+    preview_until(entry, TailWant::WithLabels)
+}
+
+fn preview_until(entry: Walked, want: TailWant) -> (SessionInfo, Labels) {
     let head = read_head(&entry.path);
-    let last_message = read_last_user_message(&entry.path);
-    SessionInfo {
+    let tail = read_tail(&entry.path, want);
+    let info = SessionInfo {
         id: entry.id,
         workspace: head.workspace,
         path: entry.path,
         updated: entry.updated,
         first_message: head.first_message,
-        last_message,
+        last_message: tail.last_message,
         source: entry.source,
         tokens: None,
         cost: None,
         last_ran_profile: None,
-    }
+    };
+    (info, tail.labels)
 }
 
 /// Recursively collect `*.jsonl` paths under `dir` (depth-capped). A symlinked

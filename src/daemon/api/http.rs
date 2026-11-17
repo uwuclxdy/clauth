@@ -39,6 +39,10 @@ pub(crate) struct Request {
     pub(crate) query: String,
     /// The `Authorization: Bearer <token>` value, if one was presented.
     pub(crate) bearer: Option<String>,
+    /// Whether any `Authorization` line was presented, whatever it held. A
+    /// presented bearer decides alone, so the ticket arm runs only when none
+    /// was: `bearer` alone cannot tell a line holding no bearer from no line.
+    pub(crate) authorization_seen: bool,
     /// The `If-None-Match` value, verbatim including its quotes. It is compared
     /// against a tag this server produced, so any normalizing would have to be
     /// done identically on both sides to be worth doing; the status routes —
@@ -67,6 +71,9 @@ pub(crate) struct WsHeaders {
     pub(crate) protocol: Option<String>,
     pub(crate) key: Option<String>,
     pub(crate) version: Option<String>,
+    /// What `Sec-WebSocket-Protocol` offered, every line of it, reduced to
+    /// what the upgrade reads: a ticket's digest, never its text.
+    pub(crate) offer: super::ticket::Offer,
 }
 
 /// The browser half of a [`Request`]. Defaults to "not from a page".
@@ -77,7 +84,7 @@ pub(crate) struct CrossOrigin {
     /// answer to a preflight is the same for every method.
     pub(crate) asks_method: bool,
     /// The connection loop found `origin` present and outside a non-empty
-    /// `[serve] app_origins`, so a bearer gets no handler.
+    /// `[serve] app_origins`, so neither a bearer nor a ticket gets a handler.
     pub(crate) refused: bool,
 }
 
@@ -192,6 +199,13 @@ impl Cors {
 }
 
 impl Request {
+    /// Whether any `Authorization` line was presented, a bearer or not. A
+    /// parsed bearer implies one; a hand-built request that sets `bearer` alone
+    /// counts as one.
+    pub(crate) fn presented_authorization(&self) -> bool {
+        self.authorization_seen || self.bearer.is_some()
+    }
+
     /// Whether the body is declared `application/json`, parameters and case
     /// aside. A page cannot send that type without passing a preflight first.
     pub(crate) fn sends_json(&self) -> bool {
@@ -413,6 +427,7 @@ impl<S: Read> RequestReader<S> {
         };
 
         let mut bearer = None;
+        let mut authorization_seen = false;
         let mut if_none_match = None;
         let mut content_length: Option<usize> = None;
         let mut close_requested = false;
@@ -438,6 +453,7 @@ impl<S: Read> RequestReader<S> {
                 content_length = Some(value);
             }
             if header.name.eq_ignore_ascii_case("authorization") {
+                authorization_seen = true;
                 bearer = std::str::from_utf8(header.value)
                     .ok()
                     .and_then(strip_bearer)
@@ -486,6 +502,9 @@ impl<S: Read> RequestReader<S> {
             {
                 ws.version = Some(value.trim().to_string());
             }
+            if header.name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                ws.offer.see(header.value);
+            }
             if header.name.eq_ignore_ascii_case("origin") {
                 cross_origin.origin.see(header.value);
             }
@@ -518,6 +537,7 @@ impl<S: Read> RequestReader<S> {
             path,
             query,
             bearer,
+            authorization_seen,
             if_none_match,
             body,
             // HTTP/1.1 persists by default; HTTP/1.0 does not unless asked.
@@ -559,7 +579,7 @@ fn parse_content_length(value: &[u8]) -> Option<usize> {
 
 /// Strip leading and trailing OWS — ASCII space and horizontal tab, per RFC
 /// 9110 — and nothing else.
-fn trim_ows(mut value: &[u8]) -> &[u8] {
+pub(super) fn trim_ows(mut value: &[u8]) -> &[u8] {
     while let [b' ' | b'\t', rest @ ..] = value {
         value = rest;
     }
@@ -851,15 +871,23 @@ pub(crate) fn accept_key(client_key: &str) -> Option<String> {
 
 /// The `101 Switching Protocols` head that opens an upgraded connection. No
 /// `Content-Length` — the rest of the connection is the upgraded protocol, not
-/// a body this server could frame.
-pub(crate) fn write_upgrade_head<W: Write>(w: &mut W, accept: &str) -> std::io::Result<()> {
-    let head = format!(
+/// a body this server could frame. `selected` is a constant of this crate,
+/// never an offered value, so no request byte reaches the head.
+pub(crate) fn write_upgrade_head<W: Write>(
+    w: &mut W,
+    accept: &str,
+    selected: Option<&'static str>,
+) -> std::io::Result<()> {
+    let mut head = format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\
-         \r\n"
+         Sec-WebSocket-Accept: {accept}\r\n"
     );
+    if let Some(protocol) = selected {
+        head.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+    }
+    head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.flush()
 }

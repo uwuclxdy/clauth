@@ -1507,9 +1507,10 @@ fn fanout_warning(
 }
 
 /// What blocks a macOS rotation, and therefore which refusal line the caller
-/// renders. The three causes are distinct operator next-steps: retry a moment
-/// (a launcher's own session), `claude stop` (a background job), or retry once
-/// the named store clears (clauth cannot read it).
+/// renders. The four causes are distinct operator next-steps: retry a moment
+/// (a launcher's own session), `claude stop` (a background job), retry once
+/// the named store clears (clauth cannot read it), or delete the named job dir
+/// (it never clears on its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RotationBlock {
     /// A live `clauth start` marker session holds a store with a refresh token.
@@ -1520,6 +1521,11 @@ pub(crate) enum RotationBlock {
     /// Carries the store dir the refusal names (the global store, or the
     /// account's own tree-local store).
     UnreadableJobStore(PathBuf),
+    /// The job store holds a job dir that never clears on its own, so the
+    /// chains that store covers (every profile's for the global store, the
+    /// account's own for a tree-local one) cannot be judged until it is
+    /// deleted. Carries that job dir.
+    UnreadableJobDir(PathBuf),
 }
 
 /// [`rotation_blocked_by_live_session`] over the two things that strand a
@@ -1578,8 +1584,10 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// read through [`credential_holds_refresh_token`], so a job on a
 /// `session-token.json` sidecar (linked or copied) frees the chain exactly like
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
-/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
-/// profile dir that cannot be resolved, blocks with the store's path named.
+/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or
+/// a profile dir that cannot be resolved, blocks with the store's path
+/// named, or with the job dir named when a stuck one made the store
+/// unreadable.
 ///
 /// The under-the-profile arm cannot see a handed-off per-launch chain tree
 /// correctly: the tree sits under its START profile's dir while the session
@@ -1608,7 +1616,12 @@ fn job_block(name: &ProfileName) -> Option<RotationBlock> {
     };
     let trees = match jobs.unfinished_under(&dir) {
         Ok(trees) => trees,
-        Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
+        Err(refusal) => {
+            return Some(match refusal.stuck_dir {
+                Some(job_dir) => RotationBlock::UnreadableJobDir(job_dir),
+                None => RotationBlock::UnreadableJobStore(refusal.store),
+            });
+        }
     };
     let rows = crate::live_sessions::list();
     let chain_trees: HashSet<PathBuf> = rows
@@ -1782,10 +1795,10 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-// Test seam posing WHICH cause blocks, so the three refusal lines' rendering
+// Test seam posing WHICH cause blocks, so the four refusal lines' rendering
 // paths are drivable from a Linux host. The bool seam above keeps its arms on
-// [`RotationBlock::LiveSession`]; this one covers the two job-store causes the
-// host can only reach on macOS.
+// [`RotationBlock::LiveSession`]; this one covers the job-store causes the host
+// can only reach on macOS.
 #[cfg(test)]
 thread_local! {
     static ROTATION_BLOCK_CAUSE_OVERRIDE: std::cell::RefCell<Option<RotationBlock>> =
@@ -5345,8 +5358,15 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 /// ([`SessionSwap::retouch_after_item_leg`]), which only follows a stamp a
 /// [`SwapPlan`] already keyed: the `.pending` resolution the plan stands for
 /// ran before that first stamp, and the receipt it left resolves the
-/// re-stamp's displaced value back to the store's real write time.
-fn stamp_store(member: &ProfileName, store: &Path, memoized: Option<SystemTime>) -> Result<()> {
+/// re-stamp's displaced value back to the store's real write time. Also
+/// reached by the global switch's relinks
+/// (`claude::keep_repoint_visible`), which run the same `load_profile` first
+/// when a `.pending` stands beside the store.
+pub(crate) fn stamp_store(
+    member: &ProfileName,
+    store: &Path,
+    memoized: Option<SystemTime>,
+) -> Result<()> {
     // Through the resolver, not the raw mtime: on a swap BACK onto a member the
     // value being displaced is that member's own earlier stamp, and a receipt
     // recording a stamp as a write time hands the readers the exact answer this
@@ -8889,6 +8909,103 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Test seam: [`live_process_pids`] answers `None` for the guard's lifetime —
+/// the failure a `read_dir("/proc")` error, a `ps` spawn or exit error, or
+/// undecodable `ps` output produces — so a test can drive the reader's leave
+/// decision through the enumeration-failure arm. Armed through the RAII
+/// [`FailLiveProcessEnumeration`] guard, cleared on drop so an arm that never
+/// reached the enumeration cannot leak into a sibling test.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static FAIL_LIVE_PROCESS_ENUMERATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`live_process_pids`] failure for the guard's
+/// lifetime, clearing it on drop even if the test panics. It BORROWS the
+/// [`HomeSandbox`](crate::testutil::HomeSandbox) for the reason
+/// `profile::FailAppStateSave` does: the override is a process-global
+/// serialized by `HOME_TEST_LOCK`, which the home sandbox holds, so dropping
+/// the home first is E0505 at compile time instead of a race nothing checks.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct FailLiveProcessEnumeration<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl<'a> FailLiveProcessEnumeration<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_LIVE_PROCESS_ENUMERATION.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for FailLiveProcessEnumeration<'_> {
+    fn drop(&mut self) {
+        FAIL_LIVE_PROCESS_ENUMERATION.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Every live process id on the box, for the escaped-process sweep's
+/// enumeration: the numeric `/proc` entries on linux, `ps -axo pid=` on macOS
+/// (a child read with no bound of its own: `ps` exits on its own, but
+/// `.output()` waits for it however long that takes). `None` — plus one log
+/// line — on a failure: a stop finds nothing to signal, and a reader leaves
+/// the record it would otherwise convert, so a later startup sweep retries.
+/// Unix-only, like its one caller.
+#[cfg(unix)]
+pub(crate) fn live_process_pids() -> Option<Vec<u32>> {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if FAIL_LIVE_PROCESS_ENUMERATION.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_dir("/proc") {
+            Ok(entries) => Some(
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                    .collect(),
+            ),
+            Err(e) => {
+                logline!(
+                    "clauth: enumerating processes failed, the tagged-process sweep cannot see its targets: {e}"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = match std::process::Command::new("ps")
+            .args(["-axo", "pid="])
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                logline!(
+                    "clauth: `ps -axo pid=` failed, the tagged-process sweep cannot see its targets"
+                );
+                return None;
+            }
+        };
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            logline!(
+                "clauth: `ps -axo pid=` output was not utf-8, the tagged-process sweep cannot see its targets"
+            );
+            return None;
+        };
+        Some(
+            text.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect(),
+        )
+    }
+}
+
 /// Whether the process `pid` is Claude Code's background service, by the
 /// supervisor's argv (`claude daemon run`), read as the supervisor checks read
 /// it. False where argv cannot be read, and on every other platform.
@@ -8918,6 +9035,18 @@ pub(crate) fn environ_sets(environ: &[u8], key: &str) -> bool {
             .and_then(|rest| rest.strip_prefix(b"="))
             .is_some_and(|value| !value.is_empty())
     })
+}
+
+/// Whether NUL-separated env bytes hold one entry equal to `key=value`
+/// exactly. The escaped-process sweep matches on this: a key-presence or
+/// prefix match would signal a process tagged with a DIFFERENT job id that
+/// merely shares a prefix. Unix-only, like its one caller.
+#[cfg(unix)]
+pub(crate) fn environ_entry_equals(environ: &[u8], key: &str, value: &str) -> bool {
+    let mut entry = key.as_bytes().to_vec();
+    entry.push(b'=');
+    entry.extend_from_slice(value.as_bytes());
+    environ.split(|b| *b == 0).any(|kv| kv == entry.as_slice())
 }
 
 /// `daemon.lock`'s `pid` + `procStart`. The lock is a CONTENT file, not a
@@ -10850,6 +10979,11 @@ pub(crate) fn settings_base(claude_home: &Path, isolation: Isolation) -> Option<
 /// the base and every sibling runtime for the session's lifetime. The two agree
 /// by construction: the syncer writes shared fields back into the base, so this
 /// recompute reproduces the same bytes on the next start instead of undoing it.
+///
+/// A shared copy links the operator's transcript store, so it never launches
+/// without the remembered `cleanupPeriodDays` ([`crate::retention`]): the
+/// number goes back into a keyless operator file before the build reads it,
+/// and into the copy itself when the operator file is missing.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
@@ -10858,15 +10992,6 @@ fn write_merged_settings(
     stale_env_keys: &[String],
 ) -> Result<()> {
     let base = settings_base(claude_home, isolation);
-    let merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
-    let settings_dst = runtime.join("settings.json");
-    // This file carries the api-key profile's top-level `apiKeyHelper` command
-    // string (plus the base_url/model env keys), so it must land 0o600 like
-    // every other clauth-owned write. The raw key itself lives in `config.toml`
-    // (minted per request by the helper); the runtime settings.json is still
-    // operator-sensitive. The write gate also fires when only the mode is wrong
-    // (a byte-identical file an older build left at the umask never self-heals
-    // otherwise).
     // The reconciler only lets a copy it recorded win a pass, so every shared
     // copy this build produces is recorded too: a write here, and an existing
     // byte-identical copy recorded in place. The record lands under the state
@@ -10877,6 +11002,25 @@ fn write_merged_settings(
         Isolation::Shared => crate::settings_sync::written_record_path().ok(),
         Isolation::Isolated => None,
     };
+    let carried_days = match (base.as_deref(), record.as_deref()) {
+        (Some(base), Some(record)) => {
+            crate::lock::with_state_lock(|held| crate::retention::settle(held, base, &[], record))
+                .map(|outcome| outcome.days)?
+        }
+        _ => None,
+    };
+    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    if let Some(days) = carried_days {
+        merged = crate::retention::carry_into(merged, days)?;
+    }
+    let settings_dst = runtime.join("settings.json");
+    // This file carries the api-key profile's top-level `apiKeyHelper` command
+    // string (plus the base_url/model env keys), so it must land 0o600 like
+    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // (minted per request by the helper); the runtime settings.json is still
+    // operator-sensitive. The write gate also fires when only the mode is wrong
+    // (a byte-identical file an older build left at the umask never self-heals
+    // otherwise).
     let carried_rank = record.as_deref().map_or((i64::MIN, 0), |record| {
         settings_carried_rank(record, base.as_deref())
     });

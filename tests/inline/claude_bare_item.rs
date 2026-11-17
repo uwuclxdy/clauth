@@ -209,6 +209,83 @@ fn a_writer_replaces_an_item_that_strands_nothing() {
     assert!(lines.snapshot().is_empty(), "{:?}", lines.snapshot());
 }
 
+/// No roster at all: the state a first capture's relink runs in, since the
+/// roster names the new profile only after the link (#158).
+fn empty_roster() {
+    crate::profile::save_app_state(&crate::profile::AppState::default()).expect("persist state");
+}
+
+/// #158: the first capture saves the Keychain login into its new profile,
+/// then installs that profile over the item before the roster names it. The
+/// roster search alone finds no store holding the login; the install's own
+/// source does, so the write strands nothing and goes ahead, unlogged.
+#[test]
+fn a_first_capture_installs_over_the_login_it_just_saved() {
+    let _home = HomeSandbox::new();
+    empty_roster();
+    let item = pair("live-acc", "live-ref", 1000);
+    profile_holding("main", &item, None);
+    let source = read_json(&store("main"));
+    let guard_lines = crate::logline::LogLines::new();
+    let guard_capture = guard_lines.capture_here();
+    assert!(
+        !bare_item_may_be_replaced(&item, None),
+        "the roster search alone misses the new profile's store"
+    );
+    drop(guard_capture);
+    assert_eq!(guard_lines.snapshot(), vec![LEFT.to_string()]);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    assert!(bare_item_may_take_source(&item, &source, None));
+    drop(capture);
+    assert!(lines.snapshot().is_empty(), "{:?}", lines.snapshot());
+}
+
+/// A second capture of another login installs the same way: its store holds
+/// the item's login, whichever profile the roster already names.
+#[test]
+fn a_second_capture_of_another_login_installs_over_it() {
+    let _home = HomeSandbox::new();
+    profile_holding("main", &pair("main-acc", "main-ref", 1000), None);
+    roster(&["main"], "main");
+    let item = pair("work-acc", "work-ref", 2000);
+    profile_holding("work", &item, None);
+    assert!(bare_item_may_take_source(
+        &item,
+        &read_json(&store("work")),
+        None
+    ));
+    let mint = serde_json::json!({ "claudeAiOauth": { "accessToken": "mint-acc" } });
+    assert!(
+        bare_item_may_take_source(&mint, &mint, None),
+        "a mint matches on its access token"
+    );
+}
+
+/// The source's own login is no licence to replace a different one: a create
+/// whose store holds another login than the item's still refuses while no
+/// store saved the item's, roster or not, and says so.
+#[test]
+fn an_install_that_would_orphan_an_unsaved_login_still_refuses() {
+    let _home = HomeSandbox::new();
+    empty_roster();
+    profile_holding("main", &pair("fresh-acc", "fresh-ref", 3000), None);
+    let unsaved = pair("live-acc", "live-ref", 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let replaceable = bare_item_may_take_source(&unsaved, &read_json(&store("main")), None);
+    drop(capture);
+    assert!(!replaceable);
+    assert_eq!(lines.snapshot(), vec![LEFT.to_string()]);
+    let same_access = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "live-acc", "refreshToken": "other-ref" }
+    });
+    assert!(
+        !bare_item_may_take_source(&unsaved, &same_access, None),
+        "a rotating pair matches on its refresh token alone"
+    );
+}
+
 /// Every real writer of the bare item runs the guard over the bytes it
 /// replaces, and every switch, sign-out and guarded-relink entry settles the
 /// item before it takes the state flock: the macOS glue cannot build here,
@@ -225,8 +302,12 @@ fn every_bare_item_writer_runs_the_guard_and_settles_first() {
     };
     let mirror = body("fn keychain_mirror_source(");
     assert!(
+        mirror.contains("bare_item_may_take_source(item, &store, placed)"),
+        "the relink's install guards the item it replaces"
+    );
+    assert!(
         mirror.contains("bare_item_may_be_replaced(item, placed)"),
-        "the relink's install and sign-out guard the item they replace"
+        "the relink's sign-out guards the item it replaces"
     );
     assert!(
         body("pub(crate) fn clear_claude_credentials(")

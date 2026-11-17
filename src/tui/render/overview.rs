@@ -13,11 +13,12 @@ use super::super::theme::{self, CrestProvider};
 use super::chain::reason_marker;
 use super::format::{
     NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, bar_fits, cue_style, duration_label,
-    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_in_secs,
-    reset_resume, reset_room, reset_suffix_worst, spinner_frame, spinner_style, truncate,
-    window_label, window_summary_spans_bracketed,
+    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, overdue_label,
+    past_deadline_age, reading_due_age, reset_in_secs, reset_resume, reset_room,
+    reset_suffix_worst, spinner_frame, spinner_style, truncate, window_label,
+    window_summary_spans_bracketed,
 };
-use super::header::identity_wave_spans;
+use super::header::{identity_wave_rest_ms, identity_wave_spans};
 use super::panes::{
     bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
     select_line, wrap_words,
@@ -29,8 +30,8 @@ use crate::format::format_pct;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
-    LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs,
-    now_ms, selected_next_refresh, switch_grade_kick_lifts,
+    FetchStatus, LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration,
+    now_epoch_secs, now_ms, selected_next_refresh, switch_grade_kick_lifts, usage_interval_ms,
 };
 use std::collections::HashSet;
 
@@ -134,11 +135,12 @@ fn more_members_line(hidden: usize) -> Line<'static> {
 
 /// The accounts panel's title-right meta: one count per harness — every
 /// harness whatever the filter shows, since the counts describe the rows the
-/// table lists, never the view. A roster with no accounts drops out of the
-/// words; with all empty there is nothing to count and no slot renders.
+/// table lists, never the view; a disabled account has no row, so no count.
+/// A roster with no accounts drops out of the words; with all empty there is
+/// nothing to count and no slot renders.
 fn harness_counts(app: &App) -> String {
     let mut terms: Vec<String> = Vec::new();
-    let claude_n = app.config().profiles.len();
+    let claude_n = app.config().enabled_profiles().count();
     if claude_n > 0 {
         terms.push(format!("{claude_n} claude"));
     }
@@ -185,13 +187,32 @@ fn draw_overview_accounts(
             ShuntPool::NotRead(_) => true,
             ShuntPool::Absent => false,
         };
-    if app.config().profiles.is_empty() && codex.is_empty() && !shunt_draws {
+    // A disabled account draws no row, so a roster of disabled accounts alone
+    // leaves the claude rows as empty as no roster at all; it says which. A
+    // filter hiding the claude rows is what empties them then, so the filter's
+    // own empty table draws instead.
+    let (roster_n, shown_n) = {
+        let cfg = app.config();
+        (cfg.profiles.len(), cfg.enabled_profiles().count())
+    };
+    let all_disabled = roster_n > 0 && shown_n == 0 && app.harness_filter.shows_claude();
+    if (roster_n == 0 || all_disabled) && codex.is_empty() && !shunt_draws {
         app.overview_selector.offset.set(0);
         app.overview_selector.viewport.set(0);
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        if all_disabled {
+            empty_state(
+                frame,
+                inner,
+                "every claude account is disabled",
+                "\u{2325}4",
+                "to enable one on the setup tab",
+            );
+        } else {
+            empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        }
         return;
     }
 
@@ -209,8 +230,11 @@ fn draw_overview_accounts(
     let items = app.main_items();
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
-    let reset_fmt = ResetFmt::from_state(&app.config().state);
-    let entries = app.band_entries(app.harness_filter);
+    let (reset_fmt, still) = {
+        let cfg = app.config();
+        (ResetFmt::from_state(&cfg.state), cfg.state.reduce_motion)
+    };
+    let entries = app.band_entries(app.harness_filter, true);
     let ranges = App::heading_ranges(&entries);
 
     // One pass over the shared band walk builds both the rendered rows and the
@@ -245,12 +269,16 @@ fn draw_overview_accounts(
             BandEntry::Item(item) => {
                 starts.push(rendered);
                 let line = match *item {
-                    MainItemKind::Profile(_) => {
-                        render_overview_row(app, flat, &widths, flat == sel, focused, readings)
+                    MainItemKind::Profile(idx) => {
+                        render_overview_row(app, idx, &widths, flat == sel, focused, readings)
                     }
-                    MainItemKind::Codex(idx) => {
-                        render_codex_row(&codex[idx], flat, &widths, flat == sel, app.anim_ms())
-                    }
+                    MainItemKind::Codex(idx) => render_codex_row(
+                        &codex[idx],
+                        flat,
+                        &widths,
+                        flat == sel,
+                        wave_phase_ms(still, app.anim_ms(), flat),
+                    ),
                     MainItemKind::Shunt(pi, ai) => {
                         let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
                             rows.push(ListItem::new(Line::from("")));
@@ -293,12 +321,14 @@ struct OverviewWidths {
     /// `TPS_W` when the per-account speed column fits, `0` when it is dropped
     /// (the fill restores it whole once the slack covers its slot).
     tps: usize,
-    /// The rows' trailing `↺ N` chip slot (gap + the widest visible chip text
-    /// across codex and claude rows), charged whenever a visible row of either
-    /// kind carries a banked reset and the row has room for it; `0` when none
-    /// does or the chip sheds whole, so the renderer drops the chip instead of
-    /// clipping it mid-glyph. One shared slot: a chip never clips and sheds
-    /// the same way on both kinds.
+    /// The `↺ N` chip slot right behind the last usage column, ahead of `live`
+    /// and `t/s` (gap + the widest visible chip text across codex and claude
+    /// rows), charged whenever a visible row of either kind carries a banked
+    /// reset and the row has room for it; `0` when none does or the chip
+    /// sheds whole, so the renderer drops the chip instead of clipping it
+    /// mid-glyph. One shared slot every row kind and the header pad: a chip
+    /// never clips, sheds the same way on both kinds, and the columns after
+    /// it stay aligned.
     chip_w: usize,
     /// Name cells the chip's charge took at the laid-out width (the uncharged
     /// name minus the laid-out one). Past [`OVERVIEW_MAX_W`] the slack restores
@@ -463,7 +493,7 @@ const GAP_MIN: usize = 2;
 const OVERVIEW_MAX_W: u16 = 122;
 
 /// The gaps of a table row, each named by the column it opens. The `↺ N`
-/// chip's gap is not one: the chip trails the row at its laid-out width.
+/// chip's gap is not one: the chip slot keeps its laid-out width.
 #[derive(Debug, Clone, Copy)]
 enum Gap {
     Kind,
@@ -497,8 +527,9 @@ impl OverviewWidths {
     /// t/s columns come back whole, once the slack covers each one's slot
     /// (its gap plus the column), live before t/s, and the split waits for
     /// them — a pending slot withholds everything past the name and the
-    /// stamps, so no bar or gap ever shrinks. The deferred chip comes
-    /// back the same way, after t/s. What is left then splits a third to the
+    /// stamps, so no bar or gap ever shrinks. The deferred chip slot comes
+    /// back the same way, after t/s, into its place behind the last usage
+    /// column. What is left then splits a third to the
     /// 5h and 7d bars that actually draw (a lone bar takes the whole third,
     /// none the whole slack) and the rest over the gaps, the leftmost gaps
     /// taking a cell each where it does not divide evenly. The row then
@@ -586,17 +617,17 @@ impl OverviewWidths {
 
     fn build(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
+        // Sized off the rows the table draws: a disabled account has none.
         let max_name = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
         let fmt = ResetFmt::from_state(&app.config().state);
         let shows_clock = fmt.shows_clock();
         let claude_labels = if app.harness_filter.shows_claude() {
-            LabelWidths::of(app.config().profiles.iter().map(|p| {
+            LabelWidths::of(app.config().enabled_profiles().map(|p| {
                 let (five, seven) = overview_windows(p, readings);
                 // A DeepSeek row's 5h cell holds its balance, not a reading.
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
@@ -653,8 +684,7 @@ impl OverviewWidths {
         };
         let claude_chip_text = if app.harness_filter.shows_claude() {
             app.config()
-                .profiles
-                .iter()
+                .enabled_profiles()
                 .filter_map(|p| app.claude_resets.get(p.name.as_str()))
                 .map(|r| r.usable)
                 .filter(|count| *count > 0)
@@ -837,8 +867,7 @@ impl OverviewWidths {
 
         let deepseek_amount_w = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
@@ -878,7 +907,8 @@ impl OverviewWidths {
     /// The width the table's widest row draws at these columns, before the
     /// `↺ N` chip: the cursor and bell prefix, every column and its gap, and
     /// the timer slot. The widest row the layout can draw is this plus
-    /// [`Self::chip_w`], since the chip rides past the row's last column.
+    /// [`Self::chip_w`], the chip slot every row carries behind its last
+    /// usage column.
     fn row_width(&self) -> usize {
         fixed_overview_width_cols(
             self.name,
@@ -939,7 +969,7 @@ fn column_facts(app: &App, readings: &ReadingsSnapshot) -> ColumnFacts {
         }
     };
     if app.harness_filter.shows_claude() {
-        for profile in &app.config().profiles {
+        for profile in app.config().enabled_profiles() {
             let (five_window, seven_window) = overview_windows(profile, readings);
             // A DeepSeek row's 5h cell holds its balance, not a window; every
             // other row draws the column's bar shape even with no reading (the
@@ -1200,6 +1230,7 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
             theme::label(),
         ));
     }
+    push_chip_slot(&mut spans, widths, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
@@ -1209,6 +1240,39 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
         spans.push(Span::styled(fixed("t/s", widths.tps), theme::label()));
     }
     Line::from(spans)
+}
+
+/// The `↺ N` banked-reset chip slot, right behind the last usage column drawn
+/// and ahead of `live` and `t/s`: the same [`OverviewWidths::chip_w`] cells on
+/// every row kind and the header, so the columns after it line up whether a
+/// row carries a chip or not, and a reset count never sits under `live` or
+/// `t/s`. `count` is the row's banked reset count, `None` for a blank slot;
+/// nothing while the slot is not charged.
+fn push_chip_slot(spans: &mut Vec<Span<'static>>, widths: &OverviewWidths, count: Option<i64>) {
+    if widths.chip_w == 0 {
+        return;
+    }
+    let text_w = widths.chip_w.saturating_sub(widths.gap);
+    spans.push(Span::raw(" ".repeat(widths.gap)));
+    match count {
+        Some(count) => {
+            let (chip, pad) = fixed_split(&format!("↺ {count}"), text_w);
+            spans.push(Span::styled(chip, theme::dim()));
+            spans.push(Span::raw(pad));
+        }
+        None => spans.push(Span::raw(" ".repeat(text_w))),
+    }
+}
+
+/// The phase a row's identity wave samples: the animation clock, or under
+/// `reduce_motion` the row's rest gap, where the wave draws the plain label.
+/// Only the wave's phase stills: the row's spinners turn on the tick count.
+fn wave_phase_ms(still: bool, anim_ms: u64, position: usize) -> u64 {
+    if still {
+        identity_wave_rest_ms(position)
+    } else {
+        anim_ms
+    }
 }
 
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
@@ -1222,7 +1286,7 @@ fn render_codex_row(
     position: usize,
     widths: &OverviewWidths,
     selected: bool,
-    anim_ms: u64,
+    wave_ms: u64,
 ) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
@@ -1260,7 +1324,7 @@ fn render_codex_row(
                 &clamped,
                 CrestProvider::Codex,
                 position,
-                anim_ms,
+                wave_ms,
             ));
             spans.push(Span::raw(pad));
         }
@@ -1286,10 +1350,7 @@ fn render_codex_row(
         spans.push(gap(widths, Gap::SevenDay));
         spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
-    // The chip trails the columns — after the live slot's width, so a dim
-    // reset count can never sit under `live` and read as a session count, and
-    // after the t/s slot's width when that column is present, so it can never
-    // sit under `t/s` and read as that row's speed.
+    push_chip_slot(&mut spans, widths, row.resets);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1297,12 +1358,6 @@ fn render_codex_row(
     if widths.tps > 0 {
         spans.push(gap(widths, Gap::Tps));
         spans.push(Span::raw(" ".repeat(widths.tps)));
-    }
-    if widths.chip_w > 0
-        && let Some(count) = row.resets
-    {
-        spans.push(Span::raw(" ".repeat(widths.gap)));
-        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
 }
@@ -1377,7 +1432,7 @@ fn render_pool_row(
     spans.push(gap(widths, Gap::Timer));
     spans.push(timer);
     // Flatten the bar's threshold colors and reset countdown to dim for a
-    // paused/disabled row, the same pass the claude row applies.
+    // paused/disabled row.
     let flatten = |mut spans: Vec<Span<'static>>| {
         if disabled {
             for s in &mut spans {
@@ -1425,6 +1480,7 @@ fn render_pool_row(
             " ".repeat(widths.seven_day.saturating_sub(seven_len)),
         ));
     }
+    push_chip_slot(&mut spans, widths, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1481,6 +1537,11 @@ fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
     }
 }
 
+/// The 5h cell of a plan with no 5h limit: the Usage tab's `no limit on this
+/// plan`, short enough for the cell to hold; a cell under 8 cells draws the
+/// dash instead.
+const NO_FIVE_HOUR_LIMIT: &str = "no limit";
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1499,9 +1560,14 @@ fn render_overview_row(
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
+    // The row's place in the drawn list, the step its crest staggers by: the
+    // claude rows lead the list, less every disabled account, which has none.
+    let position = cfg.profiles[..idx]
+        .iter()
+        .filter(|p| !p.is_disabled())
+        .count();
 
     let active = cfg.is_active(&profile.name);
-    let disabled = profile.is_disabled();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
@@ -1533,32 +1599,36 @@ fn render_overview_row(
     let timer_span = if not_current {
         // An unpolled row drawing a cached reading carries the amber `⋯` where a
         // polled row would count down to its next refresh: the figures beside it
-        // are last-known, and no fetch leg currently refreshes them (a re-enable,
-        // a login or a key puts the profile back on a list). Styled directly
-        // rather than through `hue`, so a disabled row keeps this one hue while
-        // every other span still flattens to dim.
+        // are last-known, and no fetch leg currently refreshes them (a login or
+        // a key puts the profile back on a list).
         Span::styled(
             format!("{:>inner$} ", NOT_CURRENT_MARK, inner = inner),
             theme::warning(),
         )
-    } else if disabled {
-        // A disabled account is filtered out of the scheduler's polling set
-        // (`AppConfig::enabled_profiles`), and `publish_countdowns` republishes
-        // the `next_refresh_per_profile` map from the work-list snapshots on
-        // every tick, so its entry is dropped rather than left to tick to zero.
-        // With no reading to mark stale, blank the slot rather than claim a
-        // countdown, keeping its width so no column shifts. The spinner goes too —
-        // nothing can be in flight for a profile nothing polls.
-        Span::raw(" ".repeat(TIMER_SLOT))
     } else if token_refused {
         Span::raw(" ".repeat(TIMER_SLOT))
+    } else if !app.fetch_lease.fetches_here()
+        && readings.status_of(&profile.name) == Some(FetchStatus::AuthExpired)
+    {
+        // A dead credential the holder suppresses blanks its countdown there;
+        // this instance's work list still holds the entry and derives a stamp
+        // of its own, which must not draw one either — the suppressed account
+        // has no next attempt to count down to, so the slot stays blank on a
+        // stood-down mirror alike.
+        Span::raw(" ".repeat(TIMER_SLOT))
     } else {
-        let activity = app
+        let (activity, blanked) = app
             .activity
             .lock()
             .ok()
-            .map(|activity| crate::usage::selected_activity(&activity, profile))
-            .unwrap_or(ProfileActivity::Idle);
+            .map(|states| {
+                let key = crate::usage::FetchLeg::for_profile(profile).key(profile.name.clone());
+                (
+                    crate::usage::selected_activity(&states, profile),
+                    crate::usage::countdown_blanked(&states, &key),
+                )
+            })
+            .unwrap_or((ProfileActivity::Idle, false));
         let next_refresh = app
             .next_refresh_per_profile
             .lock()
@@ -1571,17 +1641,59 @@ fn render_overview_row(
             let style = spinner_style(activity);
             Span::styled(format!("{frame:>inner$} ", inner = inner), style)
         } else {
-            let secs_str = next_refresh.map(|next_ms| {
-                let now = now_ms();
-                let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
-                format!("{secs}s")
-            });
-            match secs_str {
-                Some(s) => Span::styled(
-                    format!("{:>inner$} ", s, inner = inner),
-                    cue_style(cue, theme::faint()),
+            // The reading clock the no-deadline arm derives its due time from:
+            // the reading's own stamp (OAuth), else the per-tick cache clock
+            // (third-party's mtime, an undatable OAuth body's mtime).
+            let reading_clock = readings.clock_of(&profile.name);
+            let overdue_age = match next_refresh {
+                // A published deadline past on this instance: on a fetching
+                // one the spinner above already took it, so only a stood-down
+                // mirror reaches here, and its stamp is a cache estimate —
+                // nothing is coming, so the slot reads how far past due the
+                // reading is instead of a countdown frozen at `0s`.
+                Some(next) => past_deadline_age(app.fetch_lease.fetches_here(), next),
+                // No deadline published and the scheduler published no
+                // deliberate blank: a stuck worker holds the leg, so the
+                // reading dates its own refresh and the slot reads the age
+                // past `clock + interval`. A deliberately blanked leg (a
+                // spent-skip, a suppressed credential, a selected leg on no
+                // work list) keeps its blank slot.
+                None if !blanked => reading_due_age(
+                    reading_clock,
+                    usage_interval_ms(profile, cfg.state.refresh_interval_ms),
                 ),
-                None => Span::raw(" ".repeat(TIMER_SLOT)),
+                None => None,
+            };
+            if let Some(age) = overdue_age {
+                // Red while the account's last fetch failed or its credential
+                // is dead, amber otherwise. Read the status directly: the
+                // bars' fetch cue gates on the OAuth shape, which would amber
+                // a failed endpoint account's overdue age.
+                let style = if matches!(
+                    readings.status_of(&profile.name),
+                    Some(FetchStatus::Failed | FetchStatus::AuthExpired)
+                ) {
+                    theme::danger()
+                } else {
+                    theme::warning()
+                };
+                Span::styled(
+                    format!("{:>inner$} ", overdue_label(age), inner = inner),
+                    style,
+                )
+            } else {
+                let secs_str = next_refresh.map(|next_ms| {
+                    let now = now_ms();
+                    let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
+                    format!("{secs}s")
+                });
+                match secs_str {
+                    Some(s) => Span::styled(
+                        format!("{:>inner$} ", s, inner = inner),
+                        cue_style(cue, theme::faint()),
+                    ),
+                    None => Span::raw(" ".repeat(TIMER_SLOT)),
+                }
             }
         }
     };
@@ -1593,11 +1705,6 @@ fn render_overview_row(
     let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
-    // A disabled row flattens every semantic hue to dim — the whole row reads as
-    // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
-    // mark/`▲` still distinguish themselves without the color.
-    let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: a running delete (its spinner) > canceled subscription
     // or organization refusal (⊖) > broken login (×) > token danger (⊘) > bell
     // (!) > active (✻ / its working frame / ⏣ / ⥋) > peak hours (▲). A refused
@@ -1610,30 +1717,27 @@ fn render_overview_row(
     // authenticates as beats a schedule the Usage tab's pricing row already names.
     let auth_broken = cfg.is_auth_broken(&profile.name);
     if app.deleting.as_ref() == Some(&profile.name) {
-        spans.push(Span::styled(
-            spinner_frame(app.tick_count),
-            hue(theme::accent()),
-        ));
+        spans.push(Span::styled(spinner_frame(app.tick_count), theme::accent()));
         spans.push(Span::raw(" "));
     } else if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
-        spans.push(Span::styled("⊖", hue(theme::danger())));
+        spans.push(Span::styled("⊖", theme::danger()));
         spans.push(Span::raw(" "));
     } else if auth_broken {
         spans.push(Span::styled(
             theme::dead_credential_glyph(),
-            hue(theme::danger()),
+            theme::danger(),
         ));
         spans.push(Span::raw(" "));
     } else if token_danger {
-        spans.push(Span::styled("⊘", hue(theme::danger())));
+        spans.push(Span::styled("⊘", theme::danger()));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.is_ringing(profile.name.as_str()) {
-        spans.push(Span::styled("!", hue(theme::danger())));
+        spans.push(Span::styled("!", theme::danger()));
         spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
             active_mark(app, profile),
-            hue(Style::default().fg(theme::accent_2_color())),
+            Style::new().fg(theme::accent_2_color()),
         ));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
@@ -1641,22 +1745,13 @@ fn render_overview_row(
         // so an active profile on peak hours keeps its mark and the `▲` reads
         // "this other account is on the surcharged rate right now". The
         // pricing row on the Usage tab names the schedule and the flip.
-        spans.push(Span::styled("▲", hue(theme::warning())));
+        spans.push(Span::styled("▲", theme::warning()));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    // A disabled account can never be active (the disable action itself
-    // refuses on an active target), so dim always wins over `name_color`.
-    let ns = bold_when(
-        if disabled {
-            theme::dim()
-        } else {
-            name_color(active)
-        },
-        selected && focused,
-    );
+    let ns = bold_when(name_color(active), selected && focused);
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths, Gap::Kind));
@@ -1666,21 +1761,20 @@ fn render_overview_row(
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
     // The identity wave is ambient MOTION, which reads as "this thing is live".
-    // A disabled or quarantined account is not, so it renders the same flat dim
-    // cell an unrecognized provider gets — dimming the crest would still animate.
+    // A quarantined account is not, so it renders the same flat dim cell an
+    // unrecognized provider gets — dimming the crest would still animate.
     if let Some(provider) = crest_provider(profile)
-        && !disabled
         && !auth_broken
         && !no_tier
     {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        spans.extend(identity_wave_spans(&clamped, provider, idx, app.anim_ms()));
+        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), position);
+        spans.extend(identity_wave_spans(&clamped, provider, position, wave_ms));
         spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
-        // whole cell. A disabled row still flattens to dim, outranking no-data
-        // the way it outranks stale.
-        let style = if no_tier && !disabled {
+        // whole cell.
+        let style = if no_tier {
             theme::faint()
         } else {
             theme::dim()
@@ -1706,30 +1800,23 @@ fn render_overview_row(
         )
     };
     let reset_fmt = ResetFmt::from_state(&cfg.state);
-    // Flatten the bar's threshold colors and drain-colored reset countdown to dim
-    // for a disabled row. The NUMBERS stay — they're the last real reading and
-    // still informative; it's the semantic hue that lies once the data is frozen.
-    // Post-processed here rather than threaded through
-    // `window_summary_spans_bracketed`: that helper lives in the shared
-    // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
-    // future caller the way a new parameter would. Widths are unaffected (the
-    // pad math measures display cells, not styles).
-    let flatten = |mut spans: Vec<Span<'static>>| {
-        if disabled {
-            for s in &mut spans {
-                s.style = theme::dim();
-            }
-        }
-        spans
-    };
     let five_spans = if profile.provider == Some(Provider::DeepSeek) {
-        flatten(deepseek_balance_cell(
+        deepseek_balance_cell(
             widths.five_hour,
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
-        ))
+        )
+    } else if readings
+        .usage_of(&profile.name)
+        .is_some_and(|usage| usage.no_five_hour_limit)
+        && grapheme_cells(NO_FIVE_HOUR_LIMIT) <= widths.five_hour
+    {
+        // Opens the cell where a bar's `[` does; the row pad fills the rest,
+        // so the 7d column keeps its place. A narrower cell falls through to
+        // the dash, since `overview_windows` hides the 5h window under the mark.
+        vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())]
     } else {
-        flatten(window_summary_spans_bracketed(
+        window_summary_spans_bracketed(
             five_window.as_ref(),
             widths.five_hour,
             widths.claude_labels.five,
@@ -1740,7 +1827,7 @@ fn render_overview_row(
             0,
             widths.five_bar_grow,
             widths.fill,
-        ))
+        )
     };
     let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
@@ -1774,16 +1861,19 @@ fn render_overview_row(
         );
         if seven_monthly && seven_bar {
             // The header stays `7d`, so the cell names the window itself.
-            // Inserted BEFORE the disabled-row flatten so a disabled monthly
-            // row dims it with the rest of the cell.
             seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
         }
-        let seven_spans = flatten(seven_cell);
-        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
+        let seven_len: usize = seven_cell.iter().map(|s| grapheme_cells(&s.content)).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
-        spans.extend(seven_spans);
+        spans.extend(seven_cell);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
+    let resets = app
+        .claude_resets
+        .get(profile.name.as_str())
+        .map(|r| i64::from(r.usable))
+        .filter(|n| *n > 0);
+    push_chip_slot(&mut spans, widths, resets);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(live_cell(
@@ -1795,19 +1885,6 @@ fn render_overview_row(
         spans.push(gap(widths, Gap::Tps));
         spans.push(tps_cell(app, &profile.name, widths.tps));
     }
-    // The banked-reset chip trails the columns on claude rows exactly as it
-    // does on codex rows: the shared slot above, so it sheds the same way and
-    // never sits under `live` or `t/s`.
-    if widths.chip_w > 0
-        && let Some(count) = app
-            .claude_resets
-            .get(profile.name.as_str())
-            .map(|r| r.usable)
-            .filter(|n| *n > 0)
-    {
-        spans.push(Span::raw(" ".repeat(widths.gap)));
-        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
-    }
 
     Line::from(spans)
 }
@@ -1815,8 +1892,7 @@ fn render_overview_row(
 /// The row's speed cell: the account's live speed off a fresh producer, blank
 /// when absent (never a dash standing in for a figure clauth did not read).
 /// Right-aligned to the column, and a figure ≥ 10 000 abbreviates to whole `k`
-/// (`12k`) so the column never clips a number into `…`. Already the `TEXT_DIM`
-/// tier a disabled row flattens to, so it needs no `hue` pass of its own.
+/// (`12k`) so the column never clips a number into `…`.
 fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
     let speed = app
         .fresh_tps()
@@ -1839,8 +1915,7 @@ fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
 /// names the one profile a bare `claude` authenticates as; an account can
 /// carry either, both, or neither.
 /// That is why the header reads `live` and not `active` — `active` is the
-/// active mark's sense app-wide. Already the `TEXT_DIM` tier a disabled row
-/// flattens to, so it needs no `hue` pass of its own.
+/// active mark's sense app-wide.
 fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
@@ -1860,8 +1935,7 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
 /// column header and the per-row cell both swap to carry it.
 fn any_deepseek(app: &App) -> bool {
     app.config()
-        .profiles
-        .iter()
+        .enabled_profiles()
         .any(|p| p.provider == Some(Provider::DeepSeek))
 }
 
@@ -1956,7 +2030,9 @@ struct OverviewLong {
 /// LONG window: the 7d window when present, else the provider-marked monthly
 /// quota (an OAuth reading has no monthly, so its 7d-else-first-scoped
 /// fallback stays byte-identical). `None` per slot when no source exists
-/// (renders `—`).
+/// (renders `—`), and in the 5h slot of a plan with no 5h limit: that cell
+/// reads `no limit`, so a 5h window its stored body still carries neither
+/// draws nor sizes the column, as the Usage tab hides it.
 fn overview_windows(
     profile: &Profile,
     readings: &ReadingsSnapshot,
@@ -1973,7 +2049,11 @@ fn overview_windows(
                 monthly: false,
             })
         };
-        return (usage.five_hour.clone(), long);
+        let five = usage
+            .five_hour
+            .clone()
+            .filter(|_| !usage.no_five_hour_limit);
+        return (five, long);
     }
     let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);
@@ -2340,8 +2420,8 @@ fn projected_switch(app: &App, key_rejected: &HashSet<ProfileName>) -> Option<(S
     let action = projection.action?;
     let usage = projection.active_usage.as_ref()?.five_hour.as_ref()?;
     // In-memory rate (`history_cache`) — no disk read under any guard. A
-    // third-party member has no burn history to pair with its provider window
-    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    // third-party member has no burn history to pair with its provider window,
+    // so no rate and no projection.
     let eta_secs = burn_rate_eta(
         projection.active_rate,
         usage.utilization,
