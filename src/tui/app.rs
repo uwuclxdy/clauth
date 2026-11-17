@@ -5788,6 +5788,14 @@ pub(crate) struct App {
     /// another tab lands the Overview there for free while a codex/pool row
     /// stays put; a filter merely hides it, so the round trip restores it.
     pub(crate) overview_remembered: Option<MainItemKind>,
+    /// The disabled claude account the shared selection named when the
+    /// Overview was entered over it, with the shared cursor's move count right
+    /// after the entry placed the cursor: the Overview gives a disabled
+    /// account no row, so while it shows, its highlight and its actions take a
+    /// shown row. Leaving the Overview puts the selection back on the held
+    /// account while the count still equals the recorded one, so a visit costs
+    /// Usage and Setup nothing; a cursor move on the Overview drops it.
+    overview_held: Option<(ProfileName, u64)>,
     pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
@@ -6949,6 +6957,7 @@ impl App {
             overview_selector: ListView::default(),
             overview_cursor: 0,
             overview_remembered: None,
+            overview_held: None,
             usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
@@ -7303,6 +7312,10 @@ impl App {
         } else {
             let home: Tab = self.config().state.home_tab().into();
             self.tab = home;
+            // Before the first frame: a disabled account at the roster's head
+            // has no Overview row, so the highlight and the shared selection
+            // both land on the first shown row before any key reads them.
+            self.place_overview_cursor();
         }
         self
     }
@@ -8637,17 +8650,23 @@ impl App {
 
     // ── Main list ────────────────────────────────────────────────────────────
 
-    /// The Overview's visible item list under its current harness filter.
+    /// The Overview's visible item list under its current harness filter,
+    /// with no row for a disabled account.
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        self.main_items_for(self.harness_filter)
+        self.main_items_for(self.harness_filter, true)
     }
 
     /// The flat item list for `filter`: the [`App::band_entries`] items in
     /// walk order. One producer with the filter as a parameter — the Overview
-    /// passes its filter, Setup passes [`HarnessFilter::All`] — so the two
-    /// lists can never drift.
-    pub(crate) fn main_items_for(&self, filter: HarnessFilter) -> Vec<MainItemKind> {
-        self.band_entries(filter)
+    /// passes its filter and hides disabled accounts, Setup passes
+    /// [`HarnessFilter::All`] and lists them — so the two lists can never
+    /// drift.
+    pub(crate) fn main_items_for(
+        &self,
+        filter: HarnessFilter,
+        hide_disabled: bool,
+    ) -> Vec<MainItemKind> {
+        self.band_entries(filter, hide_disabled)
             .into_iter()
             .filter_map(|entry| match entry {
                 BandEntry::Item(item) => Some(item),
@@ -8662,19 +8681,34 @@ impl App {
     /// walk — the Overview's `draw_overview_accounts` and Setup's `draw_selector`
     /// derive their rows, headings, spacers and order from it, and each lifts a
     /// heading only while a row under it holds focus via [`App::heading_ranges`].
-    pub(crate) fn band_entries(&self, filter: HarnessFilter) -> Vec<BandEntry> {
-        let claude_count = if filter.shows_claude() {
-            self.profile_count()
+    /// With `hide_disabled` (the Overview) a disabled claude account gets no
+    /// row: it serves nothing, and Setup, which lists it, is where it is
+    /// enabled again.
+    pub(crate) fn band_entries(
+        &self,
+        filter: HarnessFilter,
+        hide_disabled: bool,
+    ) -> Vec<BandEntry> {
+        let claude: Vec<usize> = if filter.shows_claude() {
+            let cfg = self.config();
+            (0..cfg.profiles.len())
+                .filter(|&i| !(hide_disabled && cfg.profiles[i].is_disabled()))
+                .collect()
         } else {
-            0
+            Vec::new()
         };
+        let claude_count = claude.len();
         let codex_count = if filter.shows_codex() {
             self.codex_rows.len()
         } else {
             0
         };
         let mut entries = Vec::new();
-        entries.extend((0..claude_count).map(|i| BandEntry::Item(MainItemKind::Profile(i))));
+        entries.extend(
+            claude
+                .into_iter()
+                .map(|i| BandEntry::Item(MainItemKind::Profile(i))),
+        );
         if codex_count > 0 {
             if claude_count > 0 {
                 entries.push(BandEntry::Spacer);
@@ -8812,10 +8846,10 @@ impl App {
         self.main_items().get(self.overview_cursor).copied()
     }
 
-    /// Setup's flat item list: the Overview's items under the all-filter. Its
-    /// `len()` is the trailing `+ new` row.
+    /// Setup's flat item list: the Overview's items under the all-filter, a
+    /// disabled account included. Its `len()` is the trailing `+ new` row.
     pub(crate) fn setup_items(&self) -> Vec<MainItemKind> {
-        self.main_items_for(HarnessFilter::All)
+        self.main_items_for(HarnessFilter::All, false)
     }
 
     /// What Setup's selector has selected: a harness item, or the trailing
@@ -9276,6 +9310,18 @@ impl App {
         }
     }
 
+    /// Whether `item` is a disabled claude account, which the Overview hides.
+    fn is_disabled_item(&self, item: MainItemKind) -> bool {
+        match item {
+            MainItemKind::Profile(i) => self
+                .config()
+                .profiles
+                .get(i)
+                .is_some_and(Profile::is_disabled),
+            MainItemKind::Codex(_) | MainItemKind::Shunt(..) => false,
+        }
+    }
+
     /// Whether the item universe still holds `item` (regardless of filter). A
     /// row is gone only when its own list was read and lacks it; an unread
     /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
@@ -9295,10 +9341,12 @@ impl App {
 
     /// Place the Overview cursor on the remembered item's row when the current
     /// view shows it; on row 0 when the item still exists but the filter hides
-    /// it (`c` never writes it); when the item set no longer holds it, or
-    /// nothing is remembered, keep the cursor's index clamped to the view and
-    /// remember the item now there. Identity stays by (kind, index); a
-    /// remembered claude row is `profile_cursor` itself, never a stored copy.
+    /// it (`c` never writes it); when the item set no longer holds it, the item
+    /// is a disabled account (which has no row there), or nothing is
+    /// remembered, keep the cursor's index clamped to the view and remember the
+    /// item now there, so a row just disabled hands the cursor to the row that
+    /// took its place. Identity stays by (kind, index); a remembered claude row
+    /// is `profile_cursor` itself, never a stored copy.
     fn place_overview_cursor(&mut self) {
         if self.tab != Tab::Overview {
             return;
@@ -9315,7 +9363,7 @@ impl App {
             self.overview_cursor = idx;
         } else {
             match remembered {
-                Some(item) if self.holds_item(item) => {
+                Some(item) if self.holds_item(item) && !self.is_disabled_item(item) => {
                     self.overview_cursor = 0;
                 }
                 _ => {
@@ -9325,6 +9373,33 @@ impl App {
             }
         }
         self.sync_overview_profile_selection();
+    }
+
+    /// The disabled account the shared selection names: the Overview gives it
+    /// no row, so the entry placement moves the shared cursor onto a shown
+    /// row, and [`App::overview_held`] puts the selection back on leave.
+    fn hidden_claude_selection(&self) -> Option<ProfileName> {
+        let cursor = self.profile_cursor.read();
+        if !self.is_disabled_item(MainItemKind::Profile(cursor)) {
+            return None;
+        }
+        self.profile_name_at(cursor)
+    }
+
+    /// Leaving the Overview: put the shared selection back on the account
+    /// [`App::overview_held`] holds, unless the cursor moved since the entry.
+    fn restore_overview_held(&mut self) {
+        let Some((name, moves)) = self.overview_held.take() else {
+            return;
+        };
+        if moves != self.profile_cursor.count() {
+            return;
+        }
+        let held = self.config().profiles.iter().position(|p| p.name == name);
+        if let Some(idx) = held {
+            self.profile_cursor.set(idx);
+            self.reload_selected_note();
+        }
     }
 
     /// The placement invariant: while the Overview shows and its cursor rests
@@ -9351,10 +9426,11 @@ impl App {
             self.sync_overview_profile_selection();
             self.note_overview_delete_selection();
             // A selection change on another tab replaces a held-but-hidden
-            // identity in both slots: the read must not restore it over this
-            // pick.
+            // identity in both slots, and the disabled account the Overview
+            // was entered over: neither must come back over this pick.
             self.setup.clear();
             self.usage.clear();
+            self.overview_held = None;
             // And drops a pending pool landing: the user moved on, so the
             // re-read must not yank the Overview onto the added row.
             self.pending_pool_landing = None;
@@ -10842,6 +10918,9 @@ fn suspend_source(app: &mut App) {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
+    if app.tab == Tab::Overview && tab != Tab::Overview {
+        app.restore_overview_held();
+    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
@@ -10852,8 +10931,16 @@ fn switch_tab(app: &mut App, tab: Tab) {
     if tab == Tab::Overview && app.overview_remembered.is_none() {
         app.overview_remembered = Some(MainItemKind::Profile(app.profile_cursor.read()));
     }
+    let held = if tab == Tab::Overview {
+        app.hidden_claude_selection()
+    } else {
+        None
+    };
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
+    if let Some(name) = held {
+        app.overview_held = Some((name, app.profile_cursor.count()));
+    }
     match tab {
         Tab::Overview => {}
         Tab::Usage => {
@@ -19217,9 +19304,21 @@ fn main_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return None;
     };
+    // The account trades places with the next claude row the Overview shows:
+    // a disabled account between the two has no row, and a move past it alone
+    // would read as a move that did nothing.
+    let shown: Vec<usize> = app
+        .main_items()
+        .into_iter()
+        .filter_map(|item| match item {
+            MainItemKind::Profile(i) => Some(i),
+            MainItemKind::Codex(_) | MainItemKind::Shunt(..) => None,
+        })
+        .collect();
+    let at = shown.iter().position(|&i| i == idx)?;
     let new_idx = match delta.signum() {
-        -1 if idx > 0 => idx - 1,
-        1 if idx + 1 < app.config().profiles.len() => idx + 1,
+        -1 if at > 0 => shown[at - 1],
+        1 if at + 1 < shown.len() => shown[at + 1],
         _ => return None,
     };
     Some((idx, new_idx))
@@ -19251,7 +19350,15 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         return;
     }
     app.profile_cursor.set(new_idx);
-    app.move_overview_cursor(new_idx);
+    // The moved row's place in the Overview's list, apart from its roster
+    // index by every disabled account above it.
+    if let Some(row) = app
+        .main_items()
+        .iter()
+        .position(|&item| item == MainItemKind::Profile(new_idx))
+    {
+        app.move_overview_cursor(row);
+    }
     app.note_delete_selection(moved);
 }
 
@@ -29972,6 +30079,9 @@ fn toggle_profile_disabled(app: &mut App, name: &ProfileName, direction: Disable
     match result {
         Ok(true) => {
             app.refresh_tokens();
+            // The Overview hides a disabled account: its row goes (or comes
+            // back) now, so the cursor settles before the next key reads it.
+            app.place_overview_cursor();
             app.toast(ToastKind::Success, format!("{} '{name}'", direction.verb()));
         }
         Ok(false) => app.toast(
