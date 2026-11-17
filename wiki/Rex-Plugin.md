@@ -26,7 +26,7 @@ Rex's own rules pick the files: `REX_CONFIG` names `init.lua` when set, else `$X
 
 Install and uninstall read `init.lua` the way Rex's Lua (gopher-lua) lexes it, so a marker or a `require` inside a comment or a string is neither, and a line comment ends at a lone `\r` as at a `\n`. A marker counts only as a comment that starts its line, and each begin line has to reach its end line before the next begin. A file whose markers do not pair up that way, or that Rex's Lua could not load either (a string or a long comment that never closes), is refused before either command changes anything, naming the line.
 
-Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone; any spelling of the call counts, `require "clauth"` or one split over lines too. An `init.lua` that is itself a symlink, such as one into a dotfiles checkout, is written in place, so the link and the file's mode stay.
+Install refuses to overwrite a `clauth/` directory it did not write, and a symlink there (the development setup: a link onto a checkout of `rex-plugin/`). If your `init.lua` already has its own `require("clauth")`, for example to pass options, install leaves the file alone; `require "clauth"` and a call split over lines count too, but a `pcall(require, "clauth")` or a `require(m)` through a variable does not: install then appends its block, whose `setup{}` runs again with no options. An `init.lua` that is itself a symlink, such as one into a dotfiles checkout, is written in place, so the link and the file's mode stay.
 
 ## Updates
 
