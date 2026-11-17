@@ -53,6 +53,8 @@ fn the_usage_hints_advertise_the_note_key() {
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,

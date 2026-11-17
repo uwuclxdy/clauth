@@ -2252,6 +2252,19 @@ pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::
 /// `subtext0`, `#a6adc8`).
 pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
 
+/// Runs `f` on the local calendar day, again whenever the day turned while it
+/// ran, so a pin seeded off `today` and a render reading its own clock always
+/// agree on the day, a run straddling local midnight included.
+pub(crate) fn on_one_local_day<T>(mut f: impl FnMut(chrono::NaiveDate) -> T) -> T {
+    loop {
+        let today = chrono::Local::now().date_naive();
+        let out = f(today);
+        if chrono::Local::now().date_naive() == today {
+            return out;
+        }
+    }
+}
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
@@ -2270,6 +2283,8 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
