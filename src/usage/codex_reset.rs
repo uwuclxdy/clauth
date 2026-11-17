@@ -813,10 +813,6 @@ pub(crate) struct TableRow {
     pub(crate) label: String,
 }
 
-/// The widest ID cell before it is cut: 40 cells keep whole every id Claude
-/// Code's pattern allows and every codex credit id the tests hold.
-const ID_CELLS: usize = 40;
-
 /// The widest LABEL cell before it is cut; a longer title ends `...` inside
 /// these cells, so the column's own width stays bounded.
 const LABEL_CELLS: usize = 44;
@@ -824,13 +820,14 @@ const LABEL_CELLS: usize = 44;
 /// The listing's table: a header row, then one row per reset. Every column but
 /// LABEL is padded to its widest cell, header included, two spaces between
 /// columns and two before the first; LABEL closes the row cut to
-/// [`LABEL_CELLS`], a longer title ending `...`. Plain ASCII, as every line the
-/// CLI prints.
+/// [`LABEL_CELLS`], a longer title ending `...`. The ID cell is never cut: it
+/// is the text a spend takes back, and a codex credit id runs past 40 cells.
+/// Plain ASCII, as every line the CLI prints.
 pub(crate) fn reset_table(rows: impl Iterator<Item = TableRow>) -> Vec<String> {
     let rows: Vec<[String; 6]> = rows
         .map(|r| {
             [
-                cap_drawn(&terminal_safe(&r.id), ID_CELLS),
+                terminal_safe(&r.id),
                 r.left,
                 r.state,
                 if r.resets.is_empty() {
