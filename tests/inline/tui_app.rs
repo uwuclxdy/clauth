@@ -61895,6 +61895,41 @@ fn a_self_update_raises_no_second_replaced_binary_toast() {
     );
 }
 
+/// A higher major release the updater found toasts one warning in these two
+/// lines, once per run however many versions arrive.
+#[test]
+fn a_higher_major_release_toasts_the_approved_warning() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.update_results = rx;
+    let before = app.toasts.len();
+    tx.send(crate::update::UpdateEvent::MajorAvailable(
+        "1.0.0".to_string(),
+    ))
+    .expect("send");
+    super::on_tick(&mut app);
+    tx.send(crate::update::UpdateEvent::MajorAvailable(
+        "1.0.1".to_string(),
+    ))
+    .expect("send");
+    super::on_tick(&mut app);
+    let told: Vec<_> = app
+        .toasts
+        .iter()
+        .skip(before)
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        told,
+        vec![(
+            super::ToastKind::Warning,
+            "v1.0.0 is out\nnot installed automatically: read the release note"
+        )],
+        "one toast per run, holding the first version read"
+    );
+}
+
 /// A removal read while this TUI's own self-update holds its mark (a Windows
 /// self-update renames the exe away before it renames the new one in) stays
 /// quiet and latches nothing, so a removal still there once the mark clears

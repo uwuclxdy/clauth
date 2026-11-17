@@ -249,6 +249,38 @@ fn spawn_returns_no_handle_and_closes_the_channel_when_saved_off() {
     });
 }
 
+// ── spawn's thread-start failure ───────────────────────────────────────────
+
+/// A thread the OS refuses to start is a logged `None`, never a panic: the
+/// calling thread's capture holds exactly the failure line and the failed
+/// start leaves no handle.
+#[test]
+fn a_refused_update_thread_start_logs_once_and_returns_no_handle() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+    let message = "Resource temporarily unavailable (os error 11)";
+    let _refused = SpawnErrorSandbox::new(&home, message);
+    let lines = crate::logline::LogLines::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = {
+        let _capture = lines.capture_here();
+        spawn(tx, true)
+    };
+    assert!(thread.is_none(), "a refused start leaves no handle");
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "update check failed: cannot start the update thread: {message}"
+        )],
+        "one line, exact wording"
+    );
+    assert_eq!(
+        rx.try_recv().err(),
+        Some(std::sync::mpsc::TryRecvError::Disconnected),
+        "the refused start drops the sender"
+    );
+}
+
 // ── derive_sums_url ────────────────────────────────────────────────────────
 
 #[test]
@@ -379,6 +411,28 @@ fn is_newer_compares_versions_as_numbers() {
             is_newer(tag, current),
             expected,
             "{case}: is_newer({tag:?}, {current:?})"
+        );
+    }
+}
+
+/// The major gate reads the leading major number alone, so a tag the full
+/// parse rejects still counts when its major is higher; a tag whose leading
+/// number does not parse never is.
+#[test]
+fn is_higher_major_reads_the_leading_major_alone() {
+    let cases = [
+        ("v1.0.0", true, "a parseable higher major"),
+        ("v1.0.0-rc.1", true, "a prerelease of a higher major"),
+        ("1.0", true, "a two-part higher major"),
+        ("v0.20.0-rc.1", false, "a same-major prerelease"),
+        ("v0.19.0", false, "the same version"),
+        ("garbage", false, "an unreadable tag"),
+    ];
+    for (tag, expected, case) in cases {
+        assert_eq!(
+            is_higher_major(tag, "0.19.0"),
+            expected,
+            "{case}: is_higher_major({tag:?}, \"0.19.0\")"
         );
     }
 }
@@ -629,13 +683,14 @@ fn platform_asset() -> &'static str {
     asset_name().expect("every target the suite runs on ships a release asset")
 }
 
-/// A newer release listing one asset for this platform at `size`, served from
-/// `<base>/dl/<asset>`, so its sums file is `<base>/dl/sha256sums.txt`.
+/// A newer same-major release (a higher major is never downloaded) listing one
+/// asset for this platform at `size`, served from `<base>/dl/<asset>`, so its
+/// sums file is `<base>/dl/sha256sums.txt`.
 fn listing(base: &str, size: Option<u64>) -> String {
     let asset = platform_asset();
     let size = size.map(|n| format!(",\"size\":{n}")).unwrap_or_default();
     format!(
-        "{{\"tag_name\":\"v999.0.0\",\"assets\":[{{\"name\":\"{asset}\",\"browser_download_url\":\"{base}/dl/{asset}\"{size}}}]}}"
+        "{{\"tag_name\":\"v0.999.0\",\"assets\":[{{\"name\":\"{asset}\",\"browser_download_url\":\"{base}/dl/{asset}\"{size}}}]}}"
     )
 }
 
@@ -793,7 +848,7 @@ fn a_newer_release_without_this_platforms_asset_logs_one_line() {
     let (base, seen) = serve_paths(|_| {
         vec![(
             "/releases/latest".to_owned(),
-            json_reply("{\"tag_name\":\"v999.0.0\",\"assets\":[]}"),
+            json_reply("{\"tag_name\":\"v0.999.0\",\"assets\":[]}"),
         )]
     });
     let (lines, _, sent) = run_whole_check(&base, Duration::from_secs(5));
@@ -1116,5 +1171,615 @@ fn a_panicking_replace_clears_the_mark() {
     assert!(
         !replaced_by_self_update(),
         "and the mark clears as it unwinds"
+    );
+}
+
+// ── the 0.19.0 updater: major gate, once-per-version lines, hourly loop ─────
+
+/// A throwaway minisign key pair made for these tests (`minisign -G -W`, its
+/// secret key deleted after signing): this key authenticates
+/// [`FIXTURE_SUMS`] through [`FIXTURE_SIG`], so a whole check can install
+/// without the pinned release key.
+const FIXTURE_PUBKEY: &str = "RWQruHmINY+pA/OHCzu0kAzJY9ztjuOqdUoKkwHtVaplRRHs6C6YV9n1";
+
+/// The release asset every fixture listing serves; its SHA-256 is the hex in
+/// [`FIXTURE_SUMS`] (`sha256sum`, hand-run).
+const FIXTURE_ASSET: &[u8] = b"clauth 0.19.1 test binary";
+
+/// One sums line per shipped platform asset, all over [`FIXTURE_ASSET`], so
+/// one signature serves every OS the suite runs on.
+const FIXTURE_SUMS: &str = "\
+713ad070c37a7c00affb754f91ba9591949c2023decff4053eea29c41214d61b  clauth-linux-x86_64
+713ad070c37a7c00affb754f91ba9591949c2023decff4053eea29c41214d61b  clauth-macos-x86_64
+713ad070c37a7c00affb754f91ba9591949c2023decff4053eea29c41214d61b  clauth-macos-aarch64
+713ad070c37a7c00affb754f91ba9591949c2023decff4053eea29c41214d61b  clauth-windows-x86_64.exe
+";
+
+/// `minisign -S` over [`FIXTURE_SUMS`] with the [`FIXTURE_PUBKEY`] pair.
+const FIXTURE_SIG: &str = "untrusted comment: signature from minisign secret key
+RUQruHmINY+pA+JcylFATi3yCEVoJlPODZADg2rzZrjz9kEGwhQB0i4jVXzKj7CG0mSW4JN5Ky+BX4F9FTupitGHfIOyfH6xeAw=
+trusted comment: clauth updater test fixture
+el1IOzUf+nYVIwSutDWbAWU6iO++JJZnXCCikBwQokAXLUkdVNd6pIxLoCUrf2DFYB58/Kkednn7rPo9eUvDBA==
+";
+
+/// The fixture pair verifies on its own, so a check that refuses it fails for
+/// the reason its test names, never for a bad fixture.
+#[test]
+fn the_fixture_signature_verifies_the_fixture_sums() {
+    verify_minisign(FIXTURE_PUBKEY, FIXTURE_SUMS.as_bytes(), FIXTURE_SIG)
+        .expect("the fixture pair verifies");
+    assert_eq!(
+        find_expected_sha(FIXTURE_SUMS, platform_asset()).as_deref(),
+        Some(sha256_hex(FIXTURE_ASSET).as_str())
+    );
+}
+
+/// Every route a release tagged `tag` needs for a whole install: the listing,
+/// the sums file, its signature and this platform's asset, so a check that
+/// downloads finds every request answered.
+fn release_routes(base: &str, tag: &str) -> Vec<(String, Route)> {
+    let asset = platform_asset();
+    let listing = format!(
+        "{{\"tag_name\":\"{tag}\",\"assets\":[{{\"name\":\"{asset}\",\"browser_download_url\":\"{base}/dl/{asset}\",\"size\":{}}}]}}",
+        FIXTURE_ASSET.len()
+    );
+    vec![
+        ("/releases/latest".to_owned(), json_reply(&listing)),
+        (
+            "/dl/sha256sums.txt".to_owned(),
+            Route::Reply(ok_reply(FIXTURE_SUMS.len(), FIXTURE_SUMS.as_bytes())),
+        ),
+        (
+            "/dl/sha256sums.txt.minisig".to_owned(),
+            Route::Reply(ok_reply(FIXTURE_SIG.len(), FIXTURE_SIG.as_bytes())),
+        ),
+        (
+            format!("/dl/{asset}"),
+            Route::Reply(ok_reply(FIXTURE_ASSET.len(), FIXTURE_ASSET)),
+        ),
+    ]
+}
+
+/// An updater running as `current` that trusts the fixture key and counts its
+/// replace calls in `replaced`, never touching the test binary.
+fn fixture_updater(
+    current: &'static str,
+    can_self_install: bool,
+    replaced: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Updater {
+    let count = std::sync::Arc::clone(replaced);
+    Updater {
+        current,
+        public_key: FIXTURE_PUBKEY,
+        can_self_install,
+        replace: Box::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+        ..Updater::new()
+    }
+}
+
+/// One event as a comparable word: `UpdateEvent` carries no `PartialEq`.
+fn describe(event: &UpdateEvent) -> String {
+    match event {
+        UpdateEvent::Installed(v) => format!("installed {v}"),
+        UpdateEvent::Available(v) => format!("available {v}"),
+        UpdateEvent::MajorAvailable(v) => format!("major {v}"),
+    }
+}
+
+/// Runs `checks` checks of one `updater` against `<base>/releases/latest` on a
+/// thread with a log capture, and hands the updater back with the captured
+/// lines and every event sent, in order.
+fn run_checks(updater: Updater, base: &str, checks: usize) -> (Updater, Vec<String>, Vec<String>) {
+    let url = format!("{base}/releases/latest");
+    ends_within(Duration::from_secs(30), move || {
+        let mut updater = updater;
+        let lines = crate::logline::LogLines::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate = ReplaceGate::new();
+        let agent = metadata_agent(Duration::from_secs(5));
+        {
+            let _guard = lines.capture_here();
+            for _ in 0..checks {
+                updater.check(&tx, &url, &agent, &gate);
+            }
+        }
+        let events = rx.try_iter().map(|e| describe(&e)).collect();
+        (updater, lines.snapshot(), events)
+    })
+}
+
+/// Runs one check of `updater` on the CALLING thread, with a log capture
+/// installed there: the plugin-host self-exe seam is per-thread, so a test
+/// that pins it cannot hand its check to [`run_checks`]'s thread.
+#[cfg(unix)]
+fn run_one_check_here(updater: &mut Updater, base: &str) -> (Vec<String>, Vec<String>) {
+    let url = format!("{base}/releases/latest");
+    let lines = crate::logline::LogLines::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate = ReplaceGate::new();
+    let agent = metadata_agent(Duration::from_secs(5));
+    {
+        let _guard = lines.capture_here();
+        updater.check(&tx, &url, &agent, &gate);
+    }
+    let events = rx.try_iter().map(|e| describe(&e)).collect();
+    (lines.snapshot(), events)
+}
+
+/// The line a higher major release is told by.
+const MAJOR_LINE: &str = "v1.0.0 is out and is not installed automatically: read its release note, then update by hand (https://github.com/uwuclxdy/clauth/releases/tag/v1.0.0)";
+
+/// A release whose major version is higher than the running binary's is never
+/// downloaded, on a build that can self-install and on a cargo build alike:
+/// the listing is the only request, the approved line is logged once per
+/// version, and one `MajorAvailable` event carries the version.
+#[test]
+fn a_higher_major_release_downloads_nothing_and_says_so_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    for can_self_install in [true, false] {
+        let case = format!("can_self_install = {can_self_install}");
+        let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, seen) = serve_paths(|base| release_routes(base, "v1.0.0"));
+        let updater = fixture_updater("0.19.0", can_self_install, &replaced);
+        let (_, lines, events) = run_checks(updater, &base, 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/releases/latest".to_owned(), "/releases/latest".to_owned()],
+            "{case}: each check reads the listing and nothing else"
+        );
+        assert_eq!(lines, vec![MAJOR_LINE.to_owned()], "{case}: one line");
+        assert_eq!(events, vec!["major 1.0.0".to_owned()], "{case}: one event");
+        assert_eq!(replaced.load(Ordering::SeqCst), 0, "{case}: no replace");
+    }
+}
+
+/// A higher major tagged as a prerelease the full version parse rejects is
+/// still a major release: told once per version by the tag as the listing
+/// spells it, and downloaded never.
+#[test]
+fn a_prerelease_of_a_higher_major_is_told_once_with_the_tag_as_listed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, seen) = serve_paths(|base| release_routes(base, "v1.0.0-rc.1"));
+    let updater = fixture_updater("0.19.0", true, &replaced);
+    let (_, lines, events) = run_checks(updater, &base, 2);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/releases/latest".to_owned(), "/releases/latest".to_owned()],
+        "each check reads the listing and nothing else"
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "v1.0.0-rc.1 is out and is not installed automatically: read its release note, \
+             then update by hand (https://github.com/uwuclxdy/clauth/releases/tag/v1.0.0-rc.1)"
+                .to_owned()
+        ],
+        "one line, naming the tag as listed"
+    );
+    assert_eq!(events, vec!["major 1.0.0-rc.1".to_owned()], "one event");
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no replace");
+}
+
+/// A newer same-major release installs through the verified path once: the
+/// second check, in a process whose own binary the first one replaced,
+/// downloads nothing and says nothing more.
+#[test]
+fn a_same_major_release_installs_once_and_says_so() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, seen) = serve_paths(|base| release_routes(base, "v0.19.1"));
+    let updater = fixture_updater("0.19.0", true, &replaced);
+    let (_, lines, events) = run_checks(updater, &base, 2);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "/releases/latest".to_owned(),
+            "/dl/sha256sums.txt".to_owned(),
+            "/dl/sha256sums.txt.minisig".to_owned(),
+            format!("/dl/{}", platform_asset()),
+            "/releases/latest".to_owned(),
+        ]
+    );
+    assert_eq!(replaced.load(Ordering::SeqCst), 1, "one replace");
+    assert_eq!(lines, vec!["updated to v0.19.1".to_owned()]);
+    assert_eq!(events, vec!["installed 0.19.1".to_owned()]);
+}
+
+/// A process whose binary on disk was replaced since its start (here posed as
+/// another process's install) installs nothing more until it restarts: a newer
+/// same-major release is neither downloaded nor announced, while a higher
+/// major is still told.
+#[test]
+fn a_process_whose_binary_was_replaced_installs_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let (base, seen) = serve_paths(|base| release_routes(base, "v0.19.1"));
+    let updater = Updater {
+        binary_changed: Box::new(|| true),
+        ..fixture_updater("0.19.0", true, &replaced)
+    };
+    let (updater, lines, events) = run_checks(updater, &base, 1);
+    assert_eq!(*seen.lock().unwrap(), vec!["/releases/latest".to_owned()]);
+    assert_eq!(lines, Vec::<String>::new());
+    assert_eq!(events, Vec::<String>::new());
+
+    let (base, _) = serve_paths(|base| release_routes(base, "v1.0.0"));
+    let (_, lines, events) = run_checks(updater, &base, 1);
+    assert_eq!(lines, vec![MAJOR_LINE.to_owned()]);
+    assert_eq!(events, vec!["major 1.0.0".to_owned()]);
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no replace");
+}
+
+/// A binary that changes on disk after the download began installs nothing:
+/// the changed-binary rule is read again after the hash check, so bytes
+/// fetched before another process's install never replace its binary.
+#[test]
+fn a_binary_that_changes_during_the_download_installs_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&reads);
+    let (base, seen) = serve_paths(|base| release_routes(base, "v0.19.1"));
+    let updater = Updater {
+        binary_changed: Box::new(move || counted.fetch_add(1, Ordering::SeqCst) > 0),
+        ..fixture_updater("0.19.0", true, &replaced)
+    };
+    let (_, lines, events) = run_checks(updater, &base, 1);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "/releases/latest".to_owned(),
+            "/dl/sha256sums.txt".to_owned(),
+            "/dl/sha256sums.txt.minisig".to_owned(),
+            format!("/dl/{}", platform_asset()),
+        ],
+        "the release is downloaded whole before the second read refuses the replace"
+    );
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no replace");
+    assert_eq!(lines, Vec::<String>::new(), "no line");
+    assert_eq!(events, Vec::<String>::new(), "no event");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the rule is read before the download and again after the hash check"
+    );
+}
+
+/// A process whose own binary on disk changed under it (something other than
+/// its own self-update) installs nothing more: `Updater::new()`'s own
+/// disk-change predicate, driven through the plugin-host seam with a real
+/// replace of the recorded file.
+#[cfg(unix)]
+#[test]
+fn a_binary_replaced_on_disk_installs_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    let _self = crate::plugin_host::SelfExeOverride::pin(Some(recorded.as_path()));
+    let replacement =
+        crate::testutil::write_shim(home.home(), "self-exe-replacement", "exit 0 # replaced");
+    std::fs::rename(&replacement, &recorded).expect("rename-replace the recorded file");
+
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, seen) = serve_paths(|base| release_routes(base, "v0.19.1"));
+    let mut updater = fixture_updater("0.19.0", true, &replaced);
+    let (lines, events) = run_one_check_here(&mut updater, &base);
+    assert_eq!(*seen.lock().unwrap(), vec!["/releases/latest".to_owned()]);
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no replace");
+    assert_eq!(lines, Vec::<String>::new(), "no line");
+    assert_eq!(events, Vec::<String>::new(), "no event");
+}
+
+/// A build that cannot self-install (a cargo build, or no prebuilt asset) logs
+/// `update available` once per version: a repeat check of the same version is
+/// silent, a newer one is told again.
+#[test]
+fn a_build_that_cannot_self_install_says_update_available_once_per_version() {
+    let _home = crate::testutil::HomeSandbox::new();
+    reset_self_update_mark_for_test();
+    let _clear = ClearMarkAtEnd;
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let (base, seen) = serve_paths(|base| release_routes(base, "v0.19.1"));
+    let updater = fixture_updater("0.19.0", false, &replaced);
+    let (updater, lines, events) = run_checks(updater, &base, 2);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/releases/latest".to_owned(), "/releases/latest".to_owned()],
+        "nothing is downloaded"
+    );
+    assert_eq!(lines, vec!["update available: v0.19.1".to_owned()]);
+    assert_eq!(events, vec!["available 0.19.1".to_owned()]);
+
+    let (base, _) = serve_paths(|base| release_routes(base, "v0.19.2"));
+    let (_, lines, events) = run_checks(updater, &base, 1);
+    assert_eq!(lines, vec!["update available: v0.19.2".to_owned()]);
+    assert_eq!(events, vec!["available 0.19.2".to_owned()]);
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no replace");
+}
+
+/// The loop every daemon and TUI runs: a check at its start and after each
+/// hour's wait (the wait is injected, so no test sleeps an hour), skipped
+/// while the toggle reads off, which sends no request.
+#[test]
+fn the_loop_checks_at_start_and_after_each_hour_while_enabled() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (base, seen) = serve_paths(|_| {
+        vec![(
+            "/releases/latest".to_owned(),
+            json_reply("{\"tag_name\":\"v0.0.1\",\"assets\":[]}"),
+        )]
+    });
+    let url = format!("{base}/releases/latest");
+    let waits = ends_within(Duration::from_secs(30), move || {
+        let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut updater = fixture_updater("0.19.0", true, &replaced);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let gate = ReplaceGate::new();
+        let agent = metadata_agent(Duration::from_secs(5));
+        let mut enabled = [true, false, true].into_iter();
+        let mut waits = Vec::new();
+        run_loop(
+            &mut updater,
+            &tx,
+            &url,
+            &agent,
+            &gate,
+            || enabled.next().expect("one toggle read per round"),
+            |interval| {
+                waits.push(interval);
+                waits.len() < 3
+            },
+        );
+        waits
+    });
+    assert_eq!(waits, vec![Duration::from_secs(3600); 3]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/releases/latest".to_owned(), "/releases/latest".to_owned()],
+        "the round read off sends no request"
+    );
+}
+
+/// The loop's toggle is read fresh each round from the saved `[update]`
+/// table and `CLAUTH_NO_UPDATE`, so turning `auto-update` off stops a running
+/// daemon's or TUI's next check.
+#[test]
+fn the_loop_toggle_reads_the_saved_setting_and_the_env_fresh() {
+    let home = crate::testutil::HomeSandbox::new();
+    {
+        let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+        assert!(updates_enabled_now(), "nothing saved reads on");
+        let mut state = crate::profile::load_app_state().expect("load state");
+        state.update.auto_update = false;
+        crate::profile::save_app_state(&state).expect("save off");
+        assert!(!updates_enabled_now(), "saved off reads off");
+        state.update.auto_update = true;
+        crate::profile::save_app_state(&state).expect("save on");
+        assert!(updates_enabled_now(), "saved on again reads on");
+    }
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[("CLAUTH_NO_UPDATE", Some(std::ffi::OsStr::new("1")))],
+    );
+    assert!(!updates_enabled_now(), "CLAUTH_NO_UPDATE=1 reads off");
+}
+
+/// The loop `spawn`'s thread runs composes the saved toggle and the gate's
+/// stop-aware wait: a stopped gate gives one round per call, and the round
+/// reads the toggle from disk, so an off round sends no request at all.
+#[test]
+fn the_hourly_loop_reads_the_saved_toggle_through_the_production_composition() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+    let replaced = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (base, seen) = serve_paths(|_| {
+        vec![(
+            "/releases/latest".to_owned(),
+            json_reply("{\"tag_name\":\"v0.0.1\",\"assets\":[]}"),
+        )]
+    });
+    let url = format!("{base}/releases/latest");
+    let agent = metadata_agent(Duration::from_secs(5));
+    let gate = ReplaceGate::new();
+    gate.stop();
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.update.auto_update = false;
+    crate::profile::save_app_state(&state).expect("save off");
+    run_hourly(
+        &mut fixture_updater("0.19.0", true, &replaced),
+        &tx,
+        &url,
+        &agent,
+        &gate,
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Vec::<String>::new(),
+        "the round read off sends no request"
+    );
+
+    state.update.auto_update = true;
+    crate::profile::save_app_state(&state).expect("save on");
+    run_hourly(
+        &mut fixture_updater("0.19.0", true, &replaced),
+        &tx,
+        &url,
+        &agent,
+        &gate,
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/releases/latest".to_owned()],
+        "the round read on reads the listing"
+    );
+    assert_eq!(replaced.load(Ordering::SeqCst), 0, "no release to install");
+
+    // The wait half: an unstopped gate sits out the hour after its round, and
+    // the exit wait's stop ends it.
+    let gate = Arc::new(ReplaceGate::new());
+    let shared = Arc::clone(&gate);
+    let handle = std::thread::spawn(move || {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        run_hourly(
+            &mut fixture_updater("0.19.0", true, &replaced),
+            &tx,
+            &url,
+            &agent,
+            &shared,
+        );
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the round never read the listing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Only a false green can come of this settle: a loop that ends after its
+    // round has finished long before it passes.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!handle.is_finished(), "the loop ended after one round");
+    let started = Instant::now();
+    UpdateThread { handle, gate }.wait_on_exit(Duration::from_secs(30));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stop ends the hour's wait"
+    );
+}
+
+/// An updater that never installs; the loops below never let it check.
+fn idle_updater() -> Updater {
+    Updater {
+        current: "0.19.0",
+        public_key: "",
+        can_self_install: false,
+        binary_changed: Box::new(|| false),
+        replace: Box::new(|_| Err(std::io::Error::other("no replace in this test"))),
+        ..Updater::new()
+    }
+}
+
+/// A loop sleeping out its hour between checks ends as soon as the exit wait
+/// asks: the quit is held for well under `detach_after`, the thread itself
+/// returns, and no round runs after the stop.
+#[test]
+fn the_exit_wait_ends_a_loop_sleeping_between_checks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let gate = Arc::new(ReplaceGate::new());
+    let shared = Arc::clone(&gate);
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&rounds);
+    let (asleep_tx, asleep_rx) = std::sync::mpsc::channel();
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        run_loop(
+            &mut idle_updater(),
+            &tx,
+            "http://127.0.0.1:9/releases/latest",
+            &metadata_agent(Duration::from_secs(1)),
+            &shared,
+            || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+            |interval| {
+                asleep_tx.send(()).expect("the test holds the receiver");
+                shared.sleep_unless_stopped(interval)
+            },
+        );
+        let _ = ended_tx.send(());
+    });
+    asleep_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the loop reached its hour's sleep");
+
+    let started = Instant::now();
+    UpdateThread { handle, gate }.wait_on_exit(Duration::from_secs(30));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "a sleeping loop holds the exit: {took:?}"
+    );
+    assert_eq!(
+        ended_rx.recv_timeout(Duration::from_secs(2)),
+        Ok(()),
+        "the loop itself ends, not only the wait"
+    );
+    assert_eq!(rounds.load(Ordering::SeqCst), 1, "no round after the stop");
+}
+
+/// The production wait sits out its interval when nothing asks it to stop,
+/// and returns at once, ending the loop, once a stop was asked.
+#[test]
+fn the_loop_wait_sits_out_its_interval_unless_stopped() {
+    let gate = ReplaceGate::new();
+    let started = Instant::now();
+    assert!(
+        gate.sleep_unless_stopped(Duration::from_millis(200)),
+        "an unstopped wait lets the loop go on"
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(200),
+        "the wait sits out its interval: {took:?}"
+    );
+
+    gate.stop();
+    let started = Instant::now();
+    assert!(
+        !gate.sleep_unless_stopped(Duration::from_secs(10)),
+        "a stopped wait ends the loop"
+    );
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "a stopped wait returns at once: {took:?}"
+    );
+}
+
+/// The daemon's spawn starts the loop its saved toggle allows: saved on, the
+/// loop thread starts; saved off, it does not. The line is the spawn's own
+/// verdict, so a stand-in for the `spawn` call, or for the toggle it passes,
+/// reds here.
+#[test]
+fn the_daemon_spawn_starts_the_loop_the_saved_toggle_allows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _guard = lines.capture_here();
+        spawn_for_daemon();
+        let mut state = crate::profile::load_app_state().expect("load state");
+        state.update.auto_update = false;
+        crate::profile::save_app_state(&state).expect("save off");
+        spawn_for_daemon();
+    }
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "the update spawn ran (loop started: true)".to_owned(),
+            "the update spawn ran (loop started: false)".to_owned(),
+        ]
     );
 }

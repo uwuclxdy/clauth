@@ -953,9 +953,10 @@ pub(crate) enum GlobalConfigRow {
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
     /// Background self-update (`AppState.update.auto_update`) — ON by default.
-    /// The binary updater reads it at next launch, the daemon's herdr leg on
-    /// its next reload, a new MCP server at startup (`check on launch`; no
-    /// live process is cancelled). The row renders the persisted value and
+    /// Every running update loop reads it before its next hourly check (a
+    /// daemon or TUI that started with it off runs no loop until it restarts),
+    /// the daemon's herdr leg on its next reload, a new MCP server at startup.
+    /// The row renders the persisted value and
     /// stays editable even under `CLAUTH_NO_UPDATE=1`, which still disables
     /// every leg until the env var goes. ENUMERATED on/off, ⏎ mirrors space.
     AutoUpdate,
@@ -5913,7 +5914,8 @@ pub(crate) struct App {
     /// width at which the Overview accounts row still reads whole (the binding
     /// surface; the Fallback picker and blurb fit narrower).
     pub(crate) below_width_floor: bool,
-    /// Startup update check result; drained in `on_tick`. Silent on errors.
+    /// The update loop's results, each version once; drained in `on_tick`.
+    /// Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
@@ -6049,6 +6051,8 @@ pub(crate) struct App {
     /// each kind toasts once per run, never on a probe made while this
     /// process's own self-update holds its mark.
     pub(crate) own_toasted_kinds: ToastedKinds,
+    /// Whether this run already toasted a higher major release.
+    pub(crate) major_release_toasted: bool,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -6773,7 +6777,7 @@ impl App {
             }
         }
 
-        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
+        // Start the hourly update loop; each result lands in `update_results`, toasted from `on_tick`.
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
         let update_handle = update::spawn(update_sender, config.state.update.auto_update);
 
@@ -7066,6 +7070,7 @@ impl App {
             daemon_binary_replaced_since_ms: None,
             daemon_toasted_kinds: ToastedKinds::default(),
             own_toasted_kinds: ToastedKinds::default(),
+            major_release_toasted: false,
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -21482,9 +21487,9 @@ fn toggle_preemptive_rotation(app: &mut App) {
 }
 
 /// Flip the background self-update (`[update].auto_update`, default on). Same
-/// persistence shape as `toggle_preemptive_rotation`; `check on launch` timing
-/// — the binary updater reads the flag at next launch, the daemon's herdr leg
-/// on its next reload, a new MCP server at startup. The row stays live under
+/// persistence shape as `toggle_preemptive_rotation`; every running update
+/// loop reads the saved flag before its next hourly check, the daemon's herdr
+/// leg on its next reload, a new MCP server at startup. The row stays live under
 /// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
 /// env var keeps overriding it until it goes.
 fn toggle_auto_update(app: &mut App) {
@@ -33338,6 +33343,15 @@ pub(crate) fn on_tick(app: &mut App) {
                     ),
                 );
             }
+            UpdateEvent::MajorAvailable(v) => {
+                if !app.major_release_toasted {
+                    app.major_release_toasted = true;
+                    app.toast(
+                        ToastKind::Warning,
+                        format!("v{v} is out\nnot installed automatically: read the release note"),
+                    );
+                }
+            }
         }
     }
 
@@ -35139,7 +35153,7 @@ pub(crate) struct Shutdown {
     config: ConfigHandle,
     /// The scheduler's tick thread once bootstrap started it.
     scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
-    /// The update check thread; `None` when the saved toggle is off.
+    /// The update loop's thread; `None` when updates were off at start.
     update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
     /// How many times the shutdown's body started.
     #[cfg(test)]
@@ -35215,9 +35229,9 @@ impl Shutdown {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Wait up to 5 s for the update check to finish, detaching a
-        // still-running check after that (a slow download shouldn't delay TUI
-        // exit) — but a running replace step is waited for, up to
+        // End the update loop: one sleeping between checks ends at once, a
+        // check in flight gets up to 5 s, detached after that (a slow download
+        // shouldn't delay TUI exit) — but a running replace step is waited for, up to
         // `update::REPLACE_WAIT_CAP` (60 s) past those 5 s, so this shutdown
         // path strands the self-replace's staged file beside the binary only
         // behind a replace that outlasts that cap.

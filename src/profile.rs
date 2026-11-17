@@ -1336,10 +1336,10 @@ fn origin_host_is_lowercase_name(host: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateSettings {
-    /// Run the background update work (default on): the binary check on
-    /// launch and the daemon's remote herdr reinstall. `CLAUTH_NO_UPDATE=1`
-    /// still disables every leg even when this is on — the env kill-switch
-    /// stays authoritative.
+    /// Run the background update work (default on): the hourly update check of
+    /// every daemon and TUI and the daemon's remote herdr reinstall.
+    /// `CLAUTH_NO_UPDATE=1` still disables every leg even when this is on — the
+    /// env kill-switch stays authoritative.
     pub(crate) auto_update: bool,
 }
 

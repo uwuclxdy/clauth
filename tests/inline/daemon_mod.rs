@@ -11151,6 +11151,53 @@ fn daemon_serve_child_for_stop_tests() {
     );
 }
 
+/// The daemon start reaches the update spawn: `serve` calls
+/// `update::spawn_for_daemon()` before its run loop, and a test build's loop
+/// returns before any request, so the spawn's own line is the only trace it
+/// leaves, naming its start gate's verdict. Deleting the spawn leaves the line
+/// unsaid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_daemon_start_runs_the_update_spawn() {
+    const SPAWN_LINE: &str = "the update spawn ran (loop started: false)";
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let child = crate::testutil::Owned(
+        crate::testutil::serve_stop_child_command(child_home.path(), &stub.base, stderr)
+            .spawn()
+            .expect("spawn the serve child"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log
+            .lines()
+            .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == SPAWN_LINE))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon start never reached the update spawn; its log: {log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The stub holds the child's first token POST inline, so the child goes
+    // first and the stub is released before its thread joins.
+    drop(child);
+    stub.release();
+    drop(stub.finish());
+}
+
 /// The real [`serve`] waits out the scheduler's token spend before dying of the
 /// SIGTERM a stop sent: a child holding an in-flight refresh gets SIGTERM, the
 /// drain refuses new spends and waits (bounded by `SPEND_DRAIN_BOUND`) for the

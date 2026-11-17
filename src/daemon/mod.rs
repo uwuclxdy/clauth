@@ -2042,6 +2042,7 @@ pub(crate) fn serve(
     if let Err(e) = retention {
         logline!("clauth daemon: {e:#}");
     }
+    crate::update::spawn_for_daemon();
 
     logline!(
         "clauth daemon: running (status → {})",
