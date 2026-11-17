@@ -619,6 +619,67 @@ fn string_escapes_decode_as_rex_reads_them() {
     );
 }
 
+/// Lua's file loader skips a `#` first line through its `\n`, a lone `\r` on
+/// it included: a long comment after that `\r` opens nothing, so the block
+/// under it loads, and a require there loads nothing.
+#[test]
+fn a_hash_first_line_ends_only_at_a_newline() {
+    let block = block();
+    let text = format!("#!/usr/bin/env rex\r--[[ note\n{block}-- ]]\n");
+    assert_eq!(read(&text).blocks, vec![(2, 4)]);
+    assert_eq!(unwire(&text), "#!/usr/bin/env rex\r--[[ note\n-- ]]\n");
+    assert!(!loads("#!/usr/bin/env rex\rrequire(\"clauth\").setup{}\n"));
+    assert!(loads("#!/usr/bin/env rex\nrequire(\"clauth\").setup{}\n"));
+}
+
+/// A number's exponent takes its sign and the byte after it, as Rex's lexer
+/// scans it, so a `--` right after `1e` opens no comment: the require after it
+/// is code that still loads the plugin.
+#[test]
+fn a_dash_dash_an_exponent_swallows_opens_no_comment() {
+    let block = block();
+    let refusal = read(&format!(
+        "local x = 1e-- require(\"clauth\").setup{{}}\n{block}"
+    ))
+    .still_loaded()
+    .expect("refused");
+    assert_eq!((refusal.why, refusal.line), (Why::NamesClauth, 1));
+    assert_eq!(
+        read(&format!("local x = 1 -- require(\"clauth\")\n{block}")).still_loaded(),
+        None
+    );
+}
+
+/// A number is one token that ends where Rex's lexer ends it: a hex number
+/// takes hex digits only, an exponent takes its sign and then any one byte (a
+/// `\r\n` pair as one), and a `..` or `...` is one token, so a digit after it
+/// starts a number of its own.
+#[test]
+fn a_number_ends_where_rex_ends_it() {
+    let starts = |text: &str| {
+        read(text)
+            .tokens
+            .iter()
+            .map(|token| token.at)
+            .collect::<Vec<_>>()
+    };
+    for (text, at) in [
+        ("1e", vec![0]),
+        (".5e-", vec![0]),
+        ("1..x", vec![0, 2, 3]),
+        ("0x1Fg", vec![0, 4]),
+        ("1e\"x\"\"", vec![0, 3, 4]),
+        ("1e-\r\n5 x", vec![0, 7]),
+        ("1e-\n\r5 x", vec![0, 7]),
+        ("a...5 x", vec![0, 1, 4, 6]),
+        ("a....0x1r", vec![0, 1, 4, 6]),
+        ("a..0x1require", vec![0, 1, 3, 6]),
+    ] {
+        assert_eq!(starts(text), at, "{text:?}");
+    }
+    assert!(loads("x = a..0x1require(\"clauth\").setup{}\n"));
+}
+
 #[test]
 fn install_writes_the_plugin_and_wires_init_lua() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -997,18 +1058,33 @@ fn a_hand_written_require_of_a_linked_checkout_does_not_block_uninstall() {
 
 /// A stand-in watcher: a child whose argv names `tag-watch.lua`, the way
 /// start-watch.sh's `rex do ... tag-watch.lua` does. The loop keeps sh from
-/// exec-ing into `sleep`, which would drop the name from the argv.
+/// exec-ing into `sleep`, which would drop the name from the argv. Returns
+/// once the process table shows that argv: the spawn can return while the
+/// kernel is still building the child's new image, whose argv reads empty
+/// until then, so a watcher check made at once would take it for another
+/// program.
 #[cfg(unix)]
 fn fake_watcher() -> std::process::Child {
     // Null stdio: the TERM stops `sh`, but its `sleep` lives on for up to a
     // second, and holding the test's stdout it would read as a leak.
-    std::process::Command::new("sh")
+    let child = std::process::Command::new("sh")
         .args(["-c", "while :; do sleep 1; done", "tag-watch.lua"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn fake watcher")
+        .expect("spawn fake watcher");
+    let mut guard = crate::testutil::ReapChild(Some(child));
+    let pid = guard.0.as_ref().expect("the child is present").id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !runs_watcher(pid, &crate::which::SystemProcs) {
+        assert!(
+            Instant::now() < deadline,
+            "the fake watcher's argv never showed tag-watch.lua"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    guard.0.take().expect("the child is present")
 }
 
 #[cfg(unix)]
@@ -1133,20 +1209,23 @@ fn a_watcher_that_will_not_stop_keeps_its_pidfile() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let state = tmp.path().join("state");
     // The script touches `ready` once its trap is set: a TERM sent before
-    // `sh` reached the `trap` would kill it, as it did 2 runs in 3 on Linux.
+    // `sh` reaches the `trap` kills it.
     let ready = tmp.path().join("ready");
-    let mut stubborn = std::process::Command::new("sh")
-        .args([
-            "-c",
-            "trap '' TERM; : >\"$1\"; while :; do sleep 1; done",
-            "tag-watch.lua",
-        ])
-        .arg(&ready)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn stubborn watcher");
+    let mut reap = crate::testutil::ReapChild(Some(
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap '' TERM; : >\"$1\"; while :; do sleep 1; done",
+                "tag-watch.lua",
+            ])
+            .arg(&ready)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stubborn watcher"),
+    ));
+    let stubborn = reap.0.as_mut().expect("the child is present");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
         assert!(Instant::now() < deadline, "the trap was never set");
@@ -1166,8 +1245,6 @@ fn a_watcher_that_will_not_stop_keeps_its_pidfile() {
         "it ignored the TERM"
     );
     assert!(pidfile.exists(), "its pidfile stays");
-    let _ = stubborn.kill();
-    let _ = stubborn.wait();
 }
 
 /// The watcher list is read before the prompt. A pid that has since stopped

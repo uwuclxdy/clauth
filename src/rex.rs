@@ -439,9 +439,10 @@ enum Marker {
     End,
 }
 
-/// What clauth keeps of a token: names, string values and markers. The
-/// rest of the code is one `Punct` per byte, which is enough to tell a
-/// `require(` from a `require` that something else follows.
+/// What clauth keeps of a token: names, string values, numbers and markers.
+/// The rest of the code is one `Punct` per byte, a `..` or `...` one in all,
+/// which is enough to tell a `require(` from a `require` that something else
+/// follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Lexeme {
     Name(String),
@@ -449,6 +450,8 @@ enum Lexeme {
     Str(Vec<u8>),
     /// One of clauth's marker lines: a `--` comment that starts its line.
     Marker(Marker),
+    /// A number, one token however many bytes it spans.
+    Number,
     Punct(u8),
 }
 
@@ -466,9 +469,11 @@ struct Token {
 fn lex(text: &str) -> Result<Vec<Token>, (Why, usize)> {
     let src = text.as_bytes();
     let mut tokens = Vec::new();
-    // Lua skips a first line that starts with `#`, as `#!/usr/bin/env lua`.
+    // Lua's file loader skips a first line that starts with `#`, as
+    // `#!/usr/bin/env lua`, reading it up to a `\n` only: a lone `\r` on it
+    // does not end it.
     let mut at = if src.first() == Some(&b'#') {
-        line_end(src, 0)
+        src.iter().position(|&b| b == b'\n').unwrap_or(src.len())
     } else {
         0
     };
@@ -523,6 +528,16 @@ fn lex(text: &str) -> Result<Vec<Token>, (Why, usize)> {
                     .count();
                 Lexeme::Name(text[start..at].to_string())
             }
+            b'.' if src.get(at + 1) == Some(&b'.') => {
+                at += if src.get(at + 2) == Some(&b'.') { 3 } else { 2 };
+                Lexeme::Punct(c)
+            }
+            c if c.is_ascii_digit()
+                || (c == b'.' && src.get(at + 1).is_some_and(u8::is_ascii_digit)) =>
+            {
+                at = number_end(src, at);
+                Lexeme::Number
+            }
             c => {
                 at += 1;
                 Lexeme::Punct(c)
@@ -531,6 +546,44 @@ fn lex(text: &str) -> Result<Vec<Token>, (Why, usize)> {
         tokens.push(Token { lexeme, at: start });
     }
     Ok(tokens)
+}
+
+/// Past the number starting at `at`, a digit or a `.` before one, as
+/// gopher-lua's `scanNumber` scans it: a hex number takes hex digits only,
+/// and an exponent mark takes its sign, then the next byte whatever it is (a
+/// `\r\n` or `\n\r` pair as one), so `1e--` is one number and opens no
+/// comment.
+fn number_end(src: &[u8], at: usize) -> usize {
+    let digits = |from: usize| {
+        from + src[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    if src[at] == b'0' && matches!(src.get(at + 1), Some(b'x' | b'X')) {
+        let hex = src[at + 2..]
+            .iter()
+            .take_while(|b| b.is_ascii_hexdigit())
+            .count();
+        return at + 2 + hex;
+    }
+    let mut end = digits(at + 1);
+    if src.get(end) == Some(&b'.') {
+        end = digits(end + 1);
+    }
+    if matches!(src.get(end), Some(b'e' | b'E')) {
+        end += 1;
+        if matches!(src.get(end), Some(b'+' | b'-')) {
+            end += 1;
+        }
+        end = match src.get(end) {
+            Some(b'\n' | b'\r') => past_line_end(src, end),
+            Some(_) => end + 1,
+            None => end,
+        };
+        end = digits(end);
+    }
+    end
 }
 
 /// The level of the long bracket opening at `at` (`[[` is 0, `[==[` is 2),
