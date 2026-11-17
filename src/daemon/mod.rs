@@ -65,12 +65,13 @@ use crate::profile::{
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, ClaudeResetsMemoLock, FetchStatus, KickBlocks, LastFetchedAt, LegKey,
-    NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue,
-    SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
-    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo,
-    UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, new_claude_resets_memo, spawn_refresher,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, FetchStatus, KickBlocks,
+    LastFetchedAt, LegKey, NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks,
+    RefetchQueue, SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
+    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, new_claude_resets_memo,
+    new_codex_resets_memo, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -2030,6 +2031,8 @@ struct Daemon {
     /// The claude banked-reset side read's cadence memo, shared with the
     /// scheduler the same way [`Self::weekly_reset_kicks`] is.
     claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, shared the same way.
+    codex_resets_memo: CodexResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// The fetch lease the scheduler tick holds: the main-loop drains read it
@@ -2163,6 +2166,7 @@ impl Daemon {
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
             claude_resets_memo: new_claude_resets_memo(),
+            codex_resets_memo: new_codex_resets_memo(),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             // Raised by [`SpendDrain::drain`] when a stop signal arrives, and
             // by `serve` when its API fails to start after `boot`: from then
@@ -2314,6 +2318,7 @@ impl Daemon {
             Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.weekly_reset_kicks),
             Arc::clone(&self.claude_resets_memo),
+            Arc::clone(&self.codex_resets_memo),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -2469,6 +2474,7 @@ impl Daemon {
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
             claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),

@@ -66,6 +66,10 @@ pub(super) fn draw(
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input, toast_rects),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form, toast_rects),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
+        Modal::LimitReset(form) => {
+            draw_limit_reset(frame, area, form, app.tick_count);
+            form.scroll_stamp.set(stamp(area, app));
+        }
         Modal::PresetApply(form) => {
             draw_preset_apply(frame, area, form);
             form.scroll.stamp.set(stamp(area, app));
@@ -2168,6 +2172,86 @@ fn draw_name_field(
             toast_rects,
         },
     );
+}
+
+/// The widest reset label the pick list shows before it cuts with `…`.
+const RESET_LABEL_CELLS: usize = 44;
+
+/// `USE A LIMIT RESET`: the account and its count, one pick row per reset,
+/// the focused reset's static key/value rows, then the spend's state — a
+/// spinner while it runs, its refusal (or a fresh record's pin on another
+/// reset) in the error colour — over `cancel` and `use reset`, the latter
+/// faint while it cannot be pressed.
+fn draw_limit_reset(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &super::super::app::LimitResetForm,
+    tick: u64,
+) {
+    use super::super::app::LimitResetPhase;
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("{} · {}", form.name, form.available),
+            theme::body(),
+        )),
+        Line::from(""),
+    ];
+    let cursor = form.cursor.min(form.resets.len().saturating_sub(1));
+    for (i, reset) in form.resets.iter().enumerate() {
+        lines.push(option_line(
+            i == cursor,
+            truncate(&reset.label, RESET_LABEL_CELLS),
+        ));
+    }
+    if let Some(reset) = form.focused() {
+        lines.push(Line::from(""));
+        for (key, value) in &reset.rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<10}"), theme::label()),
+                Span::styled(value.clone(), theme::body()),
+            ]));
+        }
+    }
+    let state = match &form.phase {
+        LimitResetPhase::Spending => Some(Line::from(Span::styled(
+            format!("{} using the reset", spinner_frame(tick)),
+            theme::accent(),
+        ))),
+        LimitResetPhase::Refused(line) => {
+            Some(Line::from(Span::styled(line.clone(), theme::danger())))
+        }
+        LimitResetPhase::Idle => form
+            .pinned_refusal()
+            .map(|line| Line::from(Span::styled(line.to_string(), theme::danger()))),
+    };
+    if let Some(state) = state {
+        lines.push(Line::from(""));
+        lines.push(state);
+    }
+    let use_label = " use reset ";
+    let use_button = if form.can_use() {
+        modal_button(use_label, form.on_use)
+    } else {
+        Span::styled(use_label, theme::faint())
+    };
+    let buttons = Line::from(vec![
+        modal_button(" cancel ", !form.on_use),
+        Span::raw(" "),
+        use_button,
+    ]);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "USE A LIMIT RESET",
+        BodyLine::all(lines),
+        0,
+        Some((2 + cursor..3 + cursor, &form.scroll, FocusEnd::Head)),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
+    form.max_scroll.set(d.max_scroll);
 }
 
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`

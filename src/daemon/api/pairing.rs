@@ -8,6 +8,7 @@
 //!
 //! One code is live at a time: minting a new one replaces it.
 
+use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -879,33 +880,39 @@ struct PairJson<'a> {
 /// The line saying why `pair` shows no link, naming the key that fixes it.
 fn no_link_line(link: &PairLink, around: &Surroundings) -> Option<String> {
     let serve = around.serve.as_ref().ok();
-    let why = match link {
+    let why: Cow<'static, str> = match link {
         PairLink::Link(_) => return None,
-        PairLink::NoAddress => "the running daemon publishes no `--listen` address and [serve] \
-                                public_address is unset"
-            .to_owned(),
+        PairLink::NoAddress => "the running daemon publishes no address (it runs without \
+                                --listen, or its certificate names no single DNS host); \
+                                restart it with `clauth daemon --replace --listen`, or, if \
+                                it already listens, set [serve] public_address to a \
+                                host:port its certificate covers"
+            .into(),
         PairLink::NoAppUrl => "[serve] app_url is unset and [serve] app_origins lists no \
                                origin; set [serve] app_url to the app's page"
-            .to_owned(),
+            .into(),
         PairLink::SeveralOrigins => "[serve] app_origins lists several origins; set [serve] \
                                      app_url to the one that is the app's page"
-            .to_owned(),
+            .into(),
         PairLink::BadAppUrl(fault) => format!(
             "[serve] app_url {:?} does not count: {fault}",
             serve
                 .and_then(|serve| serve.app_url.as_deref())
                 .unwrap_or_default()
-        ),
+        )
+        .into(),
         PairLink::HttpOrigin(origin) => format!(
             "the one [serve] app_origins entry {origin:?} is plain http, which a phone cannot \
              open; set [serve] app_url to the app's https page"
-        ),
+        )
+        .into(),
         PairLink::BadPublicAddress(fault) => format!(
             "[serve] public_address {:?} does not count: {fault}",
             serve
                 .and_then(|serve| serve.public_address.as_deref())
                 .unwrap_or_default()
-        ),
+        )
+        .into(),
     };
     Some(format!("clauth: no pairing link: {why}"))
 }

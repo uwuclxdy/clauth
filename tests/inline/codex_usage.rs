@@ -151,8 +151,14 @@ fn banked_reset_credits_ride_the_same_body() {
     .expect("parses");
     let resets = info.limit_resets.expect("a reset reading");
     assert_eq!(resets.usable, 3);
-    assert!(resets.clears.is_empty(), "{:?}", resets.clears);
-    assert_eq!(resets.ends_at, None);
+    assert!(resets.grants.is_empty(), "{:?}", resets.grants);
+    assert!(resets.credits.is_empty(), "{:?}", resets.credits);
+    assert_eq!(resets.banked, None);
+    assert_eq!(
+        serde_json::to_string(&resets).expect("serializes"),
+        r#"{"usable":3}"#,
+        "a codex poll's reading carries its count alone, so its cache bytes do not change"
+    );
 
     let none = map_usage(r#"{"plan_type": "plus"}"#, 1_600_000_000).expect("parses");
     assert!(none.limit_resets.is_none(), "no count read is no reading");
