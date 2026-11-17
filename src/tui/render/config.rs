@@ -18,7 +18,7 @@ use super::super::app::{
     new_form_draft, pool_auth_label,
 };
 use super::super::theme;
-use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
+use super::format::{NO_DATA, grapheme_cells, middle_truncate, spinner_frame, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
     cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
@@ -477,18 +477,35 @@ impl Snap {
     }
 }
 
+/// The tail the `picker` value carries while the picker hides Claude Code's
+/// built-in lineup; the first part to shed in a short value column.
+const PICKER_REPLACES: &str = " (replaces built-in)";
+
 /// The Setup header's `picker` value: `none` without a live row, else
-/// `N option(s)`, plus ` (replaces built-in)` when `replace_built_in` is true.
+/// `N option(s)`, plus [`PICKER_REPLACES`] when `replace_built_in` is true.
 fn picker_summary(picker: Option<&crate::profile::ModelPicker>) -> String {
-    let n = picker.map_or(0, |mp| mp.live_options().len());
+    let n = picker.map_or(0, |mp| mp.live_options().count());
     let Some(mp) = picker.filter(|_| n > 0) else {
         return "none".to_string();
     };
     let mut out = format!("{n} option{}", if n == 1 { "" } else { "s" });
     if mp.replace_built_in == Some(true) {
-        out.push_str(" (replaces built-in)");
+        out.push_str(PICKER_REPLACES);
     }
     out
+}
+
+/// `summary` fitted to `width` cells: whole when it fits, else without
+/// [`PICKER_REPLACES`] and ending in `…`, else cut to end in `…`.
+fn fit_picker_summary(summary: &str, width: usize) -> String {
+    if grapheme_cells(summary) <= width {
+        return summary.to_string();
+    }
+    let count = summary.strip_suffix(PICKER_REPLACES).unwrap_or(summary);
+    if count.len() < summary.len() && grapheme_cells(count) < width {
+        return format!("{count}…");
+    }
+    truncate(count, width)
 }
 
 fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
@@ -1232,12 +1249,14 @@ fn draw_settings_rows(
 
     // Read-only: no row, focus stop or editor. Hand-edited in `config.toml`.
     if !is_new_form {
+        let key = key_cell("picker", DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+        let value_w = usize::from(inner.width).saturating_sub(grapheme_cells(&key));
         lines.push(Line::from(vec![
+            Span::styled(key, theme::label()),
             Span::styled(
-                key_cell("picker", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-                theme::label(),
+                fit_picker_summary(&snap.model_picker, value_w),
+                theme::dim(),
             ),
-            Span::styled(snap.model_picker.clone(), theme::dim()),
         ]));
     }
 

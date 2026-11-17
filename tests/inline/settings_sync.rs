@@ -501,9 +501,9 @@ fn advisor_model_stays_exactly_where_it_was() {
     );
 }
 
-// P-6.1: each member keeps its own `modelPicker`; shared keys still propagate.
+// Each member keeps its own `modelPicker`; shared keys still propagate.
 #[test]
-fn ac06_model_picker_stays_per_member_while_shared_keys_sync() {
+fn model_picker_stays_per_member_while_shared_keys_sync() {
     let custom_env = BTreeSet::new();
     assert_eq!(
         key_role(KeyPath::Top("modelPicker"), &custom_env),

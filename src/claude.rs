@@ -6312,18 +6312,7 @@ fn apply_profile_to_claude_settings_inner(
     before: &[&BTreeMap<String, String>],
 ) -> Result<()> {
     let path = claude_settings_path()?;
-
-    let has_anything = profile.base_url.is_some()
-        || profile.api_key.is_some()
-        || !profile.env.is_empty()
-        || !profile.models.is_empty()
-        || profile.effort.is_some()
-        || profile
-            .model_picker
-            .as_ref()
-            .is_some_and(|p| !p.live_options().is_empty())
-        || !prev_env_keys.is_empty();
-    if !has_anything && !path.exists() {
+    let Some(build) = live_settings_build(&path, profile, prev_env_keys, before)? else {
         // No live file: nothing an earlier clauth wrote can sit in it, so only
         // the stamp lands, naming the marker this apply saw.
         if !saved_base_env_path()?.exists() {
@@ -6334,10 +6323,44 @@ fn apply_profile_to_claude_settings_inner(
             write_saved_base_env(&stamp)?;
         }
         return Ok(());
-    }
-
-    let build = build_settings(Some(&path), profile, prev_env_keys, Some(before))?;
+    };
     land_live_settings(&path, Some(build.content), &build.record)
+}
+
+/// [`apply_profile_to_claude_settings_inner`]'s build, `None` where the apply
+/// lands no build at all: a profile with nothing to write over no live file,
+/// which only stamps the record.
+fn live_settings_build(
+    path: &Path,
+    profile: &Profile,
+    prev_env_keys: &[String],
+    before: &[&BTreeMap<String, String>],
+) -> Result<Option<SettingsBuild>> {
+    let has_anything = profile.base_url.is_some()
+        || profile.api_key.is_some()
+        || !profile.env.is_empty()
+        || !profile.models.is_empty()
+        || profile.effort.is_some()
+        || profile
+            .model_picker
+            .as_ref()
+            .is_some_and(|p| p.live_options().next().is_some())
+        || !prev_env_keys.is_empty();
+    if !has_anything && !path.exists() {
+        return Ok(None);
+    }
+    build_settings(Some(path), profile, prev_env_keys, Some(before)).map(Some)
+}
+
+/// Refuse what [`apply_profile_to_claude_settings`] would refuse before it
+/// writes anything: the same live build, its record read included, and none
+/// where that apply would land no build. A caller that must settle the live
+/// apply's refusals before an irreversible step runs this first; a failed
+/// write is not decided here.
+pub(crate) fn refuse_live_apply_build(profile: &Profile, prev_env_keys: &[String]) -> Result<()> {
+    let path = claude_settings_path()?;
+    drop(live_settings_build(&path, profile, prev_env_keys, &[])?);
+    Ok(())
 }
 
 /// Switch-off's half of a switch away, run after the credentials and the active
@@ -6346,7 +6369,8 @@ fn apply_profile_to_claude_settings_inner(
 /// value, or leaves when the user had none, and a listed key a profile field
 /// sets leaves, exactly as a switch onto an account without them would. The
 /// keys the departing account's profile fields wrote (endpoint, models,
-/// `apiKeyHelper`) stay as it wrote them.
+/// `modelPicker`, `apiKeyHelper`) stay as it wrote them, and so do their
+/// record entries.
 ///
 /// Errors when `settings.json` or the record cannot be read or written,
 /// leaving the live file as it was. The caller treats that as a failed
@@ -6372,7 +6396,7 @@ pub(crate) fn release_saved_base_env(
         None => serde_json::Map::new(),
     };
     let unchanged = env.clone();
-    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]))?;
+    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]), false)?;
     let content = if env == unchanged {
         None
     } else {
@@ -6426,13 +6450,15 @@ fn land_live_settings(path: &Path, content: Option<String>, record: &RecordPlan)
     Ok(())
 }
 
-/// What clauth knows about one custom env key a profile's `[env]` covers in
-/// `~/.claude/settings.json`: the user's own value from before the first cover
-/// (`base`, `None` when the key was absent) and the SHA-256 hex digest of the
-/// JSON value clauth last wrote over it (`wrote`), compared for equality
-/// only, so a covering account's value (which can be a secret) never lands
-/// here. A live value other than `wrote` is the user's (or Claude Code's),
-/// whatever the record says.
+/// What clauth knows about one key it writes into `~/.claude/settings.json`: a
+/// custom env key a profile's `[env]` covers, or a recorded top-level key
+/// ([`recorded_top_level`]). `base` is the user's own value from before the
+/// first cover (`None` when the key was absent; a top-level entry keeps none,
+/// since its key leaves rather than going back), and `wrote` the
+/// [`wrote_digest`] of the JSON value clauth last wrote there, compared for
+/// equality only, so a covering account's value (which can be a secret) never
+/// lands here. A live value other than `wrote` is the user's (or Claude
+/// Code's), whatever the record says.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct BaseEnvEntry {
     #[serde(
@@ -6459,8 +6485,14 @@ impl BaseEnvEntry {
     }
 }
 
+/// The SHA-256 hex digest of `value` with every object's keys sorted, so a
+/// writer that reorders the keys of a value clauth wrote leaves it clauth's
+/// (`serde_json` keeps file order here). A string's digest is that of its
+/// JSON form, as every record written before the sort holds.
 fn wrote_digest(value: &serde_json::Value) -> String {
-    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 /// A present `base` field, a JSON `null` included, is the user's value; only a
@@ -6471,7 +6503,9 @@ fn present_value<'de, D: serde::Deserializer<'de>>(
     serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
-/// Every [`BaseEnvEntry`], keyed by env key, under a version stamp. Lives in
+/// Every [`BaseEnvEntry`], keyed by env key (`keys`) or by top-level key
+/// (`top`, absent while empty, so a record with none keeps the shape it had
+/// before top-level entries existed), under a version stamp. Lives in
 /// `~/.clauth/base-env.json` (0o600, read and written under the state flock)
 /// and is never deleted once written: the stamp says every cover since was
 /// landed by a clauth that records it. `active` is the account the last live
@@ -6492,6 +6526,8 @@ struct SavedBaseEnv {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migrating: bool,
     keys: BTreeMap<String, BaseEnvEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    top: BTreeMap<String, BaseEnvEntry>,
 }
 
 const SAVED_BASE_ENV_VERSION: u32 = 1;
@@ -6503,6 +6539,7 @@ impl Default for SavedBaseEnv {
             active: None,
             migrating: false,
             keys: BTreeMap::new(),
+            top: BTreeMap::new(),
         }
     }
 }
@@ -6683,10 +6720,12 @@ struct OutgoingValues<'a> {
     roster: Option<OutgoingDisk>,
 }
 
-/// Accounts' env maps as disk holds them. `unreadable`: some account no
-/// longer reads, so its values are unknown.
+/// Accounts' env maps as disk holds them, and the [`wrote_digest`] of each
+/// recorded top-level value they write ([`recorded_top_level`]).
+/// `unreadable`: some account no longer reads, so its values are unknown.
 struct OutgoingDisk {
     envs: Vec<BTreeMap<String, String>>,
+    tops: Vec<BTreeMap<&'static str, String>>,
     unreadable: bool,
 }
 
@@ -6694,11 +6733,20 @@ impl OutgoingDisk {
     fn read(profiles: impl Iterator<Item = Result<Profile>>) -> Self {
         let mut disk = Self {
             envs: Vec::new(),
+            tops: Vec::new(),
             unreadable: false,
         };
         for profile in profiles {
             match profile {
-                Ok(profile) => disk.envs.push(profile.env),
+                Ok(profile) => {
+                    disk.tops.push(
+                        recorded_top_level(&profile)
+                            .into_iter()
+                            .filter_map(|(key, value)| Some((key, wrote_digest(&value?))))
+                            .collect(),
+                    );
+                    disk.envs.push(profile.env);
+                }
                 Err(_) => disk.unreadable = true,
             }
         }
@@ -6717,6 +6765,7 @@ impl<'a> OutgoingValues<'a> {
     fn new(before: &'a [&'a BTreeMap<String, String>], listed: &'a [String]) -> Self {
         let disk = (!before.is_empty()).then(|| OutgoingDisk {
             envs: Vec::new(),
+            tops: Vec::new(),
             unreadable: false,
         });
         Self {
@@ -6758,6 +6807,17 @@ impl<'a> OutgoingValues<'a> {
             return Ok(true);
         }
         Ok(self.roster()?.envs.iter().any(holds))
+    }
+
+    /// Whether any account on the roster writes `live` under the recorded
+    /// top-level `key`, compared by [`wrote_digest`].
+    fn any_account_top(&mut self, key: &str, live: &serde_json::Value) -> Result<bool> {
+        let live = wrote_digest(live);
+        Ok(self
+            .roster()?
+            .tops
+            .iter()
+            .any(|tops| tops.get(key) == Some(&live)))
     }
 
     /// Whether some outgoing account's own value under `key` is `live`.
@@ -6880,9 +6940,11 @@ enum Found {
 }
 
 /// The record a live apply lands around its write: `captured` with each new
-/// or re-based entry, `landed` with every change.
+/// or re-based entry, `landed` with every change. `judge` is how the apply
+/// judged the live values the record does not name.
 struct RecordPlan {
     found: Found,
+    judge: Judge,
     captured: SavedBaseEnv,
     landed: SavedBaseEnv,
 }
@@ -6906,13 +6968,15 @@ struct SettingsBuild {
 /// A live apply reads the record whenever it exists, to stamp it; a sibling's
 /// build only when `env` holds a key the account lacks, the only kind an
 /// entry can change. One that does not parse refuses the build only when a
-/// covered key, or a leaving key `prev_env_keys` lists and `env` holds, needs
-/// a decision.
+/// covered key, a leaving key `prev_env_keys` lists and `env` holds, or a
+/// recorded top-level key (`top_needed`, [`settle_top_level`]) needs a
+/// decision.
 fn settle_custom_env(
     env: &mut serde_json::Map<String, serde_json::Value>,
     profile_env: &BTreeMap<String, String>,
     prev_env_keys: &[String],
     live: Option<&[&BTreeMap<String, String>]>,
+    top_needed: bool,
 ) -> Result<RecordPlan> {
     let covering: Vec<(&String, &String)> = match live {
         Some(_) => profile_env
@@ -6922,7 +6986,8 @@ fn settle_custom_env(
         None => Vec::new(),
     };
     let leaving = |key: &str| !profile_env.contains_key(key) && keeps_base_value(key);
-    let needed = !covering.is_empty()
+    let needed = top_needed
+        || !covering.is_empty()
         || prev_env_keys
             .iter()
             .any(|key| leaving(key) && env.contains_key(key));
@@ -7029,9 +7094,78 @@ fn settle_custom_env(
     }
     Ok(RecordPlan {
         found,
+        judge,
         captured,
         landed,
     })
+}
+
+/// The top-level `settings.json` keys a live apply records, each with the
+/// value `profile` writes there (`None`: the apply removes the key).
+/// `model` and `advisorModel` still set or remove unrecorded.
+fn recorded_top_level(profile: &Profile) -> [(&'static str, Option<serde_json::Value>); 1] {
+    [(
+        "modelPicker",
+        profile.model_picker.as_ref().and_then(model_picker_json),
+    )]
+}
+
+/// Settle the recorded top-level `key` of a live apply's `settings` to `own`,
+/// the value the incoming account writes: an account's own value always
+/// lands, over whatever the file held. With none, the live value leaves only
+/// while it is clauth's: the value `key`'s entry names, or, judged as the env
+/// entries are, one some account on the roster writes, which is how a value
+/// with no entry (written before the record covered `key`) reads as clauth's.
+/// Once the record speaks for the live file ([`Judge::Recorded`]), a value
+/// with no entry is the user's, as an env value is. A value clauth did not
+/// write stays. The entry follows the crash-guard shape of the env entries:
+/// the pre-write names `own` and keeps the digest of clauth's value still
+/// live as `pending`; the update after the live write lands `own` alone, or
+/// retires the entry when `own` is `None`.
+fn settle_top_level(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    own: Option<serde_json::Value>,
+    outgoing: &mut OutgoingValues<'_>,
+    record: &mut RecordPlan,
+) -> Result<()> {
+    let entry = record.captured.top.get(key);
+    let clauths = match (settings.get(key), entry) {
+        (None, _) => false,
+        (Some(live), Some(entry)) if entry.wrote_live(live) => true,
+        (Some(_), Some(_)) if record.judge != Judge::Unseen => false,
+        (Some(_), None) if record.judge == Judge::Recorded => false,
+        (Some(live), Some(_) | None) => outgoing.any_account_top(key, live)?,
+    };
+    match own {
+        Some(value) => {
+            let landed = BaseEnvEntry {
+                base: None,
+                wrote: wrote_digest(&value),
+                pending: None,
+            };
+            let next = BaseEnvEntry {
+                pending: settings
+                    .get(key)
+                    .filter(|_| clauths)
+                    .map(wrote_digest)
+                    .filter(|digest| *digest != landed.wrote),
+                ..landed.clone()
+            };
+            if entry != Some(&next) {
+                record.captured.top.insert(key.to_string(), next);
+            }
+            record.landed.top.insert(key.to_string(), landed);
+            settings.insert(key.to_string(), value);
+        }
+        None => {
+            if clauths {
+                settings.remove(key);
+            }
+            record.landed.top.remove(key);
+        }
+    }
+    Ok(())
 }
 
 /// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
@@ -7212,27 +7346,26 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// else `{"options": [...]}` plus `replaceBuiltInOptions` when set. Optional
 /// row fields appear only when the row sets them.
 fn model_picker_json(picker: &ModelPicker) -> Option<serde_json::Value> {
-    let live = picker.live_options();
-    if live.is_empty() {
-        return None;
-    }
-    let options: Vec<serde_json::Value> = live
-        .into_iter()
-        .map(|row| {
+    let options: Vec<serde_json::Value> = picker
+        .live_options()
+        .map(|(model, row)| {
             let mut o = serde_json::Map::new();
-            o.insert("model".into(), row.model.into());
-            if let Some(v) = row.label {
-                o.insert("label".into(), v.into());
-            }
-            if let Some(v) = row.description {
-                o.insert("description".into(), v.into());
-            }
-            if let Some(v) = row.behaves_as {
-                o.insert("behavesAs".into(), v.into());
+            o.insert("model".into(), model.into());
+            for (key, value) in [
+                ("label", &row.label),
+                ("description", &row.description),
+                ("behavesAs", &row.behaves_as),
+            ] {
+                if let Some(value) = value {
+                    o.insert(key.into(), value.as_str().into());
+                }
             }
             serde_json::Value::Object(o)
         })
         .collect();
+    if options.is_empty() {
+        return None;
+    }
     let mut out = serde_json::Map::new();
     if let Some(replace) = picker.replace_built_in {
         out.insert("replaceBuiltInOptions".into(), replace.into());
@@ -7251,9 +7384,10 @@ fn model_picker_json(picker: &ModelPicker) -> Option<serde_json::Value> {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The top-level `modelPicker` follows the
-/// same rule: set from the profile's `[model_picker]` when it has a live row,
-/// removed otherwise. The profile's effort rides
+/// previous profile's model routing. The top-level `modelPicker` is set from
+/// the profile's `[model_picker]` when it has a live row; without one, a
+/// runtime copy holds none, and the live file loses only the value clauth
+/// wrote ([`settle_top_level`]). The profile's effort rides
 /// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
 /// profile's own `[env]` entry outranking the `effort` field
 /// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
@@ -7307,12 +7441,18 @@ fn build_settings(
         settings["env"] = serde_json::json!({});
     }
 
+    let top_level = recorded_top_level(profile);
+    let top_needed = live.is_some()
+        && top_level
+            .iter()
+            .any(|(key, own)| own.is_some() || settings.get(key).is_some());
+
     let env = settings["env"]
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
     let session_env = session_env(profile);
-    let record = settle_custom_env(env, &session_env, prev_env_keys, live)?;
+    let mut record = settle_custom_env(env, &session_env, prev_env_keys, live, top_needed)?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -7391,14 +7531,27 @@ fn build_settings(
             obj.remove("advisorModel");
         }
     }
-    // `modelPicker` is clauth-owned the same way: the profile's live rows
-    // replace whatever the base held, and a profile without any removes it.
-    match profile.model_picker.as_ref().and_then(model_picker_json) {
-        Some(picker) => {
-            obj.insert("modelPicker".into(), picker);
+    // The recorded keys (`modelPicker`): the live file removes only the value
+    // clauth wrote, while a runtime copy is clauth's own file, so it holds
+    // the account's value or none.
+    match live {
+        Some(before) => {
+            let mut outgoing = OutgoingValues::new(before, prev_env_keys);
+            for (key, own) in top_level {
+                settle_top_level(obj, key, own, &mut outgoing, &mut record)?;
+            }
         }
         None => {
-            obj.remove("modelPicker");
+            for (key, own) in top_level {
+                match own {
+                    Some(value) => {
+                        obj.insert(key.into(), value);
+                    }
+                    None => {
+                        obj.remove(key);
+                    }
+                }
+            }
         }
     }
     // `effortLevel` is Claude Code's own key (its `/effort` command writes it

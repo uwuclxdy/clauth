@@ -8582,11 +8582,14 @@ fn an_appended_table_goes_after_the_files_trailing_root_comment() {
     assert_eq!(parsed.console.token.as_deref(), Some("t0k"), "{after}");
 }
 
-/// A table field added to `ProfileConfig` without a writer arm fails: the
-/// modelled table key set is pinned against the model's serialized tables, so a
-/// 4th table the completeness test would otherwise never read reds here.
-/// `model_picker` is read-only to clauth (hand-edited), so its writer is the
-/// typed-equality check and a save never edits it.
+/// A table field added to `ProfileConfig` reds here until it is listed: the
+/// table key set is pinned against the model's serialized tables, and this is
+/// the only pin on a new table. `a_save_writes_every_modelled_field_from_an_empty_file`
+/// checks the fields its body sets, so a field left unset there passes with
+/// no writer arm. `model_picker` is listed by hand with no writer arm: a save
+/// never writes it, so that test leaves the profile's picker unset, and
+/// `a_save_leaves_the_model_picker_block_byte_identical` pins that a save
+/// keeps the table as written.
 #[test]
 fn every_profile_config_table_is_modelled() {
     let config = ProfileConfig {
@@ -8648,7 +8651,8 @@ fn every_profile_config_table_is_modelled() {
 /// file, a profile with every field off its default, one save, and the reloaded
 /// `ProfileConfig` equals the canonical one the writer builds from that profile.
 /// A field `apply_config_edits` skips stays absent on disk and the equality
-/// fails.
+/// fails. `model_picker` stays unset: no save writes it
+/// (`every_profile_config_table_is_modelled`).
 #[test]
 fn a_save_writes_every_modelled_field_from_an_empty_file() {
     let _home = HomeSandbox::new();
@@ -8945,7 +8949,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "model_picker",
-            "bb720e928f81efb70ae020299fbca5f00518a86c302b424777c6a98f05b4640a",
+            "81a00007755b11e59d986ee145ba8e0d9b3442d079d921aa94be80787d76eb73",
         ),
     ]
     .into_iter()
@@ -11586,7 +11590,7 @@ fn a_codex_roster_edit_keeps_the_open_bracket_comment_on_the_bracket_line() {
     assert_eq!(back.profiles(), [ProfileName::from("home")].as_slice());
 }
 
-// ---- [model_picker] in the profile config (plan clauth-model-picker, T-1) ----
+// ---- [model_picker] in the profile config ----
 
 const PICKER_ROWS: &str = "[[model_picker.options]]\n\
 model = \"kimi-k3.1-pro-uncensored\"\n\
@@ -11649,19 +11653,19 @@ fn picker_span(body: &str) -> &str {
     &body[start..end]
 }
 
-// P-1.1: a [model_picker] table with two rows loads into Profile::model_picker.
+// A [model_picker] table with two rows loads into Profile::model_picker.
 #[test]
-fn ac01_p_1_1_model_picker_table_loads_into_the_profile() {
+fn a_model_picker_table_loads_into_the_profile() {
     let _home = HomeSandbox::new();
     raw_config("mp11", &picker_block());
     let profile = load_profile(&ProfileName::from("mp11")).unwrap();
     assert_eq!(profile.model_picker, Some(expected_picker()));
 }
 
-// P-1.2: a save that changes an unrelated scalar leaves the [model_picker]
-// block, comment above it included, byte-identical.
+// A save that changes an unrelated scalar leaves the [model_picker] block,
+// comment above it included, byte-identical.
 #[test]
-fn ac01_p_1_2_a_save_leaves_the_model_picker_block_byte_identical() {
+fn a_save_leaves_the_model_picker_block_byte_identical() {
     let _home = HomeSandbox::new();
     let body = format!("effort = \"low\"\nlast_resort = true\n\n{}", picker_block());
     let path = raw_config("mp12", &body);
@@ -11681,10 +11685,10 @@ fn ac01_p_1_2_a_save_leaves_the_model_picker_block_byte_identical() {
     );
 }
 
-// P-1.3: a row with no `model` loads as a blank model; live_options drops
-// blank rows and trims the rest.
+// A row with no `model` loads as a blank model; live_options drops blank rows
+// and trims the rest.
 #[test]
-fn ac01_p_1_3_a_row_without_model_loads_blank_and_live_options_drops_it() {
+fn a_row_without_model_loads_blank_and_live_options_drops_it() {
     let _home = HomeSandbox::new();
     raw_config(
         "mp13",
@@ -11704,13 +11708,12 @@ fn ac01_p_1_3_a_row_without_model_loads_blank_and_live_options_drops_it() {
             picker_option("  glm-5.3  ", None, None, None),
         ],
     };
-    let live = picker.live_options();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].model, "glm-5.3");
+    let live: Vec<&str> = picker.live_options().map(|(model, _)| model).collect();
+    assert_eq!(live, ["glm-5.3"]);
 }
 
-/// Saves `profile` twice around `clear`/`restore` edits and asserts the
-/// picker span of the file is `span` after each save.
+/// Saves `profile` twice around `clear`/`restore` edits and asserts each save
+/// changed the file while the picker span of the file stays `span`.
 fn assert_picker_span_survives(
     name: &str,
     body: &str,
@@ -11723,6 +11726,7 @@ fn assert_picker_span_survives(
     clear(&mut profile);
     save_profile(&profile).unwrap();
     let after_clear = std::fs::read_to_string(&path).unwrap();
+    assert_ne!(after_clear, body, "the clear reached the file");
     assert_eq!(
         picker_span(&after_clear),
         span,
@@ -11731,6 +11735,7 @@ fn assert_picker_span_survives(
     restore(&mut profile);
     save_profile(&profile).unwrap();
     let after_restore = std::fs::read_to_string(&path).unwrap();
+    assert_ne!(after_restore, after_clear, "the restore reached the file");
     assert_eq!(
         picker_span(&after_restore),
         span,
@@ -11742,10 +11747,10 @@ fn assert_picker_span_survives(
     );
 }
 
-// P-1.4: clearing and re-setting [models] or [env] around the user's picker
-// leaves the picker span byte-identical after each save.
+// Clearing and re-setting [models] or [env] around the user's picker leaves
+// the picker span byte-identical after each save.
 #[test]
-fn ac01_p_1_4_clearing_and_resetting_a_table_keeps_the_picker_span() {
+fn clearing_and_resetting_a_table_keeps_the_picker_span() {
     let _home = HomeSandbox::new();
     let models_first = format!(
         "[models]\nopus = \"kimi-k3.1-pro-uncensored\"\n\n{}",
@@ -11788,9 +11793,9 @@ fn ac01_p_1_4_clearing_and_resetting_a_table_keeps_the_picker_span() {
     );
 }
 
-// P-1.5: Silk's camelCase key names load through the serde aliases.
+// Claude Code's camelCase key names load through the serde aliases.
 #[test]
-fn ac01_p_1_5_camel_case_keys_load_through_the_aliases() {
+fn camel_case_picker_keys_load_through_the_aliases() {
     let _home = HomeSandbox::new();
     raw_config(
         "mp15",
@@ -11808,23 +11813,61 @@ fn ac01_p_1_5_camel_case_keys_load_through_the_aliases() {
     );
 }
 
+// A field written in both spellings is one serde field written twice, so the
+// file does not parse; a save names the table and the doubled field, as it
+// names `kick_timer` beside `auto_start`, and writes nothing.
+#[test]
+fn a_save_over_a_picker_field_in_both_spellings_names_it() {
+    let _home = HomeSandbox::new();
+    for (name, body, key) in [
+        (
+            "mpflag",
+            "[model_picker]\nreplace_built_in = true\nreplaceBuiltInOptions = true\n",
+            "model_picker.replaceBuiltInOptions",
+        ),
+        (
+            "mprow",
+            "[model_picker]\n\n[[model_picker.options]]\nmodel = \"m\"\nbehaves_as = \"a\"\nbehavesAs = \"b\"\n",
+            "model_picker.options.behavesAs",
+        ),
+        (
+            "mpinline",
+            "[model_picker]\noptions = [{ model = \"x\", behaves_as = \"a\", behavesAs = \"b\" }]\n",
+            "model_picker.options.behavesAs",
+        ),
+    ] {
+        let path = raw_config(name, body);
+        assert!(
+            load_profile(&ProfileName::from(name)).is_err(),
+            "control: {key} beside its other spelling does not load"
+        );
+        let mut profile = Profile::new(name.to_string(), None, None);
+        profile.disabled = true;
+        assert_save_refused(&profile, &path, body, key);
+    }
+}
+
 const PICKER_DOC: &str = "# Per-account /model picker, written as Claude Code's `modelPicker` setting\n\
-# in this profile's settings.json. `replace_built_in = true` hides the\n\
-# built-in model list; each [[model_picker.options]] row is one entry\n\
-# (`model`, optional `label`, `description`, `behaves_as`). A switch to an\n\
-# account without a picker removes it. clauth never edits this table.\n";
+# in this profile's settings.json. Each [[model_picker.options]] row is one\n\
+# entry (`model`, optional `label`, `description`, `behaves_as`), and the\n\
+# table is written only while one row has a `model`. With\n\
+# `replace_built_in = true` the picker shows only the Default row and these\n\
+# entries; false or unset adds them after the built-in lineup. A switch to an\n\
+# account without a picker removes only the picker clauth wrote. A save\n\
+# never edits this table; creating an account over a leftover config.toml\n\
+# replaces it.\n";
 
 const PICKER_EXAMPLE: &str = "# [model_picker]\n\
 # replace_built_in = true\n\
 #\n\
 # [[model_picker.options]]\n\
-# model = \"glm-5.3-uncensored\"\n\
-# label = \"GLM-5.3\"\n";
+# model = \"<model id>\"\n\
+# label = \"My model\"\n";
 
-// P-7.1: a fresh render with no picker ends with a blank line, the doc block,
-// then the commented example, after the [env] doc block and its example.
+// A fresh render with no picker ends with a blank line, the doc block, then
+// the commented example, after the [env] doc block and its example.
 #[test]
-fn ac07_p_7_1_a_fresh_render_ends_with_the_picker_doc_and_example() {
+fn a_fresh_render_ends_with_the_picker_doc_and_example() {
     let profile = Profile::new("p".to_string(), None, None);
     assert!(profile.model_picker.is_none());
     let rendered = render_config_toml(&profile);
@@ -11836,10 +11879,10 @@ fn ac07_p_7_1_a_fresh_render_ends_with_the_picker_doc_and_example() {
     );
 }
 
-// P-7.2: a render for the P-1.1 profile holds a live table that parses back to
-// the same picker.
+// A render for a two-row picker holds a live table that parses back to the
+// same picker.
 #[test]
-fn ac07_p_7_2_a_render_with_a_picker_holds_the_live_table() {
+fn a_render_with_a_picker_holds_the_live_table() {
     let mut profile = Profile::new("p".to_string(), None, None);
     profile.model_picker = Some(expected_picker());
     let rendered = render_config_toml(&profile);
@@ -11856,9 +11899,9 @@ fn ac07_p_7_2_a_render_with_a_picker_holds_the_live_table() {
     assert_eq!(parsed.model_picker, Some(expected_picker()));
 }
 
-// P-7.3: a save into a file with no [model_picker] and no example adds neither.
+// A save into a file with no [model_picker] and no example adds neither.
 #[test]
-fn ac07_p_7_3_a_save_adds_no_picker_table_or_example_to_an_older_file() {
+fn a_save_adds_no_picker_table_or_example_to_an_older_file() {
     let _home = HomeSandbox::new();
     let body = "# mine\neffort = \"low\"\nlast_resort = true\n\n[models]\nopus = \"x\"\n";
     let path = raw_config("mp73", body);
@@ -11872,7 +11915,7 @@ fn ac07_p_7_3_a_save_adds_no_picker_table_or_example_to_an_older_file() {
     );
 }
 
-// ---- wiki Configuration page documents [model_picker] (plan clauth-model-picker, T-5) ----
+// ---- the wiki Configuration page documents [model_picker] ----
 
 /// The first ```toml fenced block of `md` whose first line is `[model_picker]`.
 fn first_model_picker_toml_block(md: &str) -> Option<String> {
@@ -11892,9 +11935,10 @@ fn first_model_picker_toml_block(md: &str) -> Option<String> {
     None
 }
 
-// P-9.1: the wiki silk example parses, and the prose, field table and key-table row are present.
+// The wiki silk example parses, and the prose, field table and key-table row
+// are present.
 #[test]
-fn ac09_wiki_silk_example_parses() {
+fn the_wiki_silk_example_parses_and_its_rules_are_written() {
     #[derive(serde::Deserialize)]
     struct WikiBlock {
         model_picker: ModelPicker,
@@ -11916,6 +11960,10 @@ fn ac09_wiki_silk_example_parses() {
             "deepseek-v4.1-flash-1017-uncensored",
             "DeepSeek V4.1 Flash 1017",
         ),
+        (
+            "deepseek-v4.1-flash-1017-fast-uncensored",
+            "DeepSeek V4.1 Flash 1017 Fast",
+        ),
         ("glm-5.3-uncensored", "GLM-5.3"),
         ("glm-5.3-flash-uncensored", "GLM-5.3 Flash"),
         ("hy4-uncensored", "Hy4"),
@@ -11927,9 +11975,12 @@ fn ac09_wiki_silk_example_parses() {
     assert_eq!(pairs, want);
 
     for sentence in [
-        "An account with no picker strips `modelPicker` from the `settings.json` a switch or a start writes: a switch removes it from `~/.claude/settings.json` itself, including one you set by hand, and a start leaves it out of the session's copy.",
+        "A switch onto an account with no picker removes only the `modelPicker` clauth wrote into `~/.claude/settings.json`: one you set by hand, or edited after clauth wrote it, stays.",
+        "An account with a picker writes its own over whatever the file held.",
+        "A `clauth start` session's copy of `settings.json` is clauth's own, so an account with no picker starts with none in it.",
         "Claude Code honors `modelPicker` only from managed settings, `--settings` or the SDK, and user settings, and the highest-precedence of those that defines it wins outright, with no merging.",
-        "Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions` does not load.",
+        "Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions`, or a row holding both `behaves_as` and `behavesAs`, does not load, and clauth refuses to write that `config.toml`, naming the field written twice.",
+        "A save never edits the table; creating an account over a leftover `config.toml` replaces the leftover's table with the new account's, or removes it when the new account has none.",
     ] {
         assert!(
             wiki.contains(sentence),

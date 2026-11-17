@@ -3511,10 +3511,10 @@ fn picker_row(model: &str) -> crate::profile::ModelPickerOption {
     }
 }
 
-// P-8.1: picker_summary returns `none` for no table or no live row, `N option`
-// for one, `N options` for more, and the replaces suffix only for Some(true).
+// picker_summary returns `none` for no table or no live row, `N option` for
+// one, `N options` for more, and the replaces suffix only for Some(true).
 #[test]
-fn ac08_picker_summary_counts_live_rows_and_names_the_replace_flag() {
+fn picker_summary_counts_live_rows_and_names_the_replace_flag() {
     use crate::profile::ModelPicker;
     assert_eq!(picker_summary(None), "none");
     let empty = ModelPicker::default();
@@ -3560,11 +3560,11 @@ fn ac08_picker_summary_counts_live_rows_and_names_the_replace_flag() {
     );
 }
 
-// P-8.1 (read-only): the picker line is not an editable row or focus stop. The
+// The picker line is read-only: not an editable row or focus stop. The
 // editable rows are identical with a five-row picker and with none, and the
 // header still carries the line.
 #[test]
-fn ac08_picker_line_is_not_an_editable_row_or_focus_stop() {
+fn the_picker_line_is_not_an_editable_row_or_focus_stop() {
     let five = crate::profile::ModelPicker {
         replace_built_in: Some(true),
         options: ["a", "b", "c", "d", "e"].map(picker_row).to_vec(),
@@ -3584,10 +3584,10 @@ fn ac08_picker_line_is_not_an_editable_row_or_focus_stop() {
     );
 }
 
-// P-8.2: two live rows and replace_built_in = Some(true) render the picker
-// line, key padded to the 16-cell key cell, then the summary.
+// Two live rows and replace_built_in = Some(true) render the picker line, key
+// padded to the 16-cell key cell, then the summary.
 #[test]
-fn ac08_setup_header_shows_the_picker_count_and_replace_flag() {
+fn the_setup_header_shows_the_picker_count_and_replace_flag() {
     let rows = picker_header(Some(crate::profile::ModelPicker {
         replace_built_in: Some(true),
         options: vec![picker_row("glm-5.3"), picker_row("kimi-k3")],
@@ -3600,13 +3600,103 @@ fn ac08_setup_header_shows_the_picker_count_and_replace_flag() {
     );
 }
 
-// P-8.3: no [model_picker] renders `picker` followed by `none`.
+// No [model_picker] renders `picker` followed by `none`.
 #[test]
-fn ac08_setup_header_shows_none_without_a_picker() {
+fn the_setup_header_shows_none_without_a_picker() {
     let rows = picker_header(None);
     assert!(
         rows.iter().any(|r| r.trim_end() == "picker          none"),
         "the header carries the picker line reading none:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The whole frame at `w`x`h` on the Setup tab, a saved account holding
+/// `picker` selected.
+fn picker_frame(picker: Option<crate::profile::ModelPicker>, w: u16, h: u16) -> Vec<String> {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.model_picker = picker;
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let state = AppState {
+        profiles: vec![name],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save the roster");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The frame row's text from its first word on, the border and padding cut.
+fn row_from_first_word(row: &str) -> &str {
+    row.trim_matches(|c: char| c == ' ' || c == '│')
+}
+
+// At a width where the whole value does not fit, the picker value sheds
+// ` (replaces built-in)` and ends in `…`; narrower, the count itself ends in
+// `…`. It never stops mid-word with no mark.
+#[test]
+fn a_short_picker_value_ends_in_an_ellipsis() {
+    let five = crate::profile::ModelPicker {
+        replace_built_in: Some(true),
+        options: ["a", "b", "c", "d", "e"].map(picker_row).to_vec(),
+    };
+    // The detail's value column is the width less 4 cells of border and
+    // padding and the 16-cell key: 29 cells at 49 columns.
+    for (w, want) in [
+        (49, "picker          5 options (replaces built-in)"),
+        (48, "picker          5 options…"),
+        (28, "picker          5 optio…"),
+    ] {
+        let rows = picker_frame(Some(five.clone()), w, 40);
+        let line = rows
+            .iter()
+            .map(|r| row_from_first_word(r))
+            .find(|r| r.starts_with("picker "))
+            .unwrap_or_else(|| panic!("[{w} cols] no picker line:\n{}", rows.join("\n")));
+        assert_eq!(line, want, "[{w} cols]\n{}", rows.join("\n"));
+    }
+}
+
+// The `+ new` form shows no `picker` line.
+#[test]
+fn the_new_account_form_shows_no_picker_line() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(app.profile_count());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    // Desktop width: the selector shares each row with the detail, so a word
+    // is looked for anywhere in the row.
+    let has_word = |word: &str| {
+        rows.iter()
+            .any(|r| r.split([' ', '│']).any(|token| token == word))
+    };
+    assert!(
+        has_word("type"),
+        "control: the form is drawn:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !has_word("picker"),
+        "the new-account form has no picker line:\n{}",
         rows.join("\n")
     );
 }
