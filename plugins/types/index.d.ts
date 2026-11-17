@@ -50,7 +50,11 @@ export type ClauthDelegateRow = {
   startedAt: number
   /** Epoch ms the run ended; 0 while live or when unknown. */
   endedAt: number
-  /** The record's last line of assistant text. */
+  /** Epoch ms of the run's last output; 0 when the record names none. */
+  lastOutputAt: number
+  /** The record's tail of assistant text, as the record has it. Never drawn
+   *  (a cut tail starts mid-word); stored so a record whose only change is new
+   *  text still differs from the stored rows and rewrites them. */
   tail: string
   /** The delegate's own transcript file, null when the record lacks its
    *  session id or working directory. */
@@ -59,11 +63,37 @@ export type ClauthDelegateRow = {
   isNoticed: boolean
 }
 
-/** The delegate whose transcript the pane shows, and that transcript's last
- *  lines. */
+/** One entry of a delegate's transcript as the pane draws it. Each carries
+ *  its anchor key, which the pane's scroll window holds its place by across
+ *  reads: a call's is its own id, the rest their entry's uuid with the
+ *  block's index. */
+export type ClauthTranscriptItem =
+  /** A tool call as Claude Code draws it (`Bash(cargo test)`), with its
+   *  result's summary once it came back: its first lines, and how many more
+   *  it holds. */
+  | { key: string; kind: 'call'; call: string; result: string[] | null; more: number; isError: boolean }
+  /** One message of the delegate's own, its lines as written (markdown). */
+  | { key: string; kind: 'said'; lines: string[] }
+  /** A prompt the delegate was given after its first. */
+  | { key: string; kind: 'asked'; text: string }
+  /** Why there is nothing to draw: no transcript, or none written yet. */
+  | { key: string; kind: 'note'; text: string }
+
+/** The delegate the pane's detail shows: its name, its model, its tool calls
+ *  and the end of its transcript. */
 export type ClauthDelegateView = {
   id: string
-  lines: string[]
+  /** The first line of the delegate's own prompt, empty when the
+   *  transcript's head names none. */
+  name: string
+  /** The transcript entry holding that prompt, which the header shows in its
+   *  place; empty while unknown. */
+  promptId: string
+  /** The model of its newest message, empty before it wrote one. */
+  model: string
+  /** How many tool calls the whole transcript holds; null when uncounted. */
+  toolCalls: number | null
+  items: ClauthTranscriptItem[]
 }
 
 declare module 'claude-code' {
@@ -80,7 +110,8 @@ declare module 'claude-code' {
       /** Every delegate this session spawned, finished ones kept after clauth
        *  drops their records, newest first. */
       delegates: Shaped<ClauthDelegateRow[]>
-      /** The delegates pane's transcript view, null on the list. */
+      /** The delegate the pane's detail shows, null until the pane opens on
+       *  one and again once it closes. */
       delegateView: Shaped<ClauthDelegateView | null>
     }
   }
