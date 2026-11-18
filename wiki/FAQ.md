@@ -22,7 +22,7 @@
 
 **Is there an MCP server for switching accounts from inside a chat?** Yes. Install the plugin, then a live session can call `profiles`, `switch_profile`, or `delegate` a whole prompt to another account. [Claude Code plugin](Claude-Code-Plugin).
 
-**How do I stop clauth updating itself?** `CLAUTH_NO_UPDATE=1`. A cargo install never self-replaces anyway.
+**How do I stop clauth updating itself?** Turn off the Config tab's `auto-update` row: every running daemon and TUI skips its checks from the next hourly one on. `CLAUTH_NO_UPDATE=1` does the same for each process that has it in its own environment. A cargo install never self-replaces anyway. [Install](Install#updates).
 
 ## When something looks wrong
 

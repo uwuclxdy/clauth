@@ -8,7 +8,7 @@ Report privately through GitHub: open the repo's **Security** tab and pick **Rep
 
 ## Supported versions
 
-Only the latest release. Binary installs stay current through the verified auto-updater below, except that an install on v0.17.0 or older must download a newer release by hand once; `cargo` installs update with `cargo install clauth`.
+Only the latest release. Binary installs stay current within their major version through the verified auto-updater below; a new major version is installed by hand, and so is the first newer release on an install at v0.17.0 or older; `cargo` installs update with `cargo install clauth`.
 
 ## Data at rest
 
@@ -83,7 +83,7 @@ Every request clauth makes, and what rides along with it, except requests to a s
 
 | Endpoint | When | Carries |
 |----------|------|---------|
-| `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check when the TUI opens: the release listing on every install, the sums, signature and asset on binary installs only | no credentials, just a `User-Agent` |
+| `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check by the running `clauth daemon` and every TUI, each at its start and then hourly: the release listing on every install, the sums, signature and asset on binary installs only, for a newer release of the same major version | no credentials, just a `User-Agent` |
 | `platform.claude.com/v1/oauth/token` | token refresh ahead of expiry, on a rejected request, and on `t` force-rotate | your stored refresh token |
 | `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser or shown as a link for you to open anywhere | no credentials; a PKCE challenge + random `state` |
 | `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange; a pasted code sends Claude Code's hosted redirect URI and the same `state` | the one-time auth code + PKCE verifier (mints a fresh token pair) |
@@ -168,17 +168,17 @@ Nothing else sends inference or writes to your account. The only inference claut
 
 ## Auto-update verification
 
-Binary installs check for a newer release in the background whenever the TUI opens, unless auto-update is off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) or `CLAUTH_NO_UPDATE=1` is set. Every step fails closed, so if any of them errors the update is skipped and one line saying so goes to `~/.clauth/clauth.log`; through step 4 the running binary stays put:
+The running `clauth daemon` and every TUI check for a newer release in the background, each once at its start and then every hour, unless auto-update is off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) or `CLAUTH_NO_UPDATE=1` is set; a binary install replaces itself with a newer release of the same major version. Every step fails closed, so if any of them errors the update is skipped and one line saying so goes to `~/.clauth/clauth.log` (a daemon writes it to its own log); through step 4 the running binary stays put:
 
-1. Ask the GitHub releases API for the latest tag; stop if it isn't newer. A newer release that lists no asset for this platform, or lists it above 256 MiB, stops the update here.
+1. Ask the GitHub releases API for the latest tag; stop if it isn't newer. A release of a higher major version (0.x to 1.0) stops here on every install and is never downloaded: the log names it and links its release page. A process whose binary was replaced or removed on disk since it started (an update by this or another clauth process, a reinstall, a rebuild) stops here too, and says nothing of a newer same-major release. A newer release that lists no asset for this platform, or lists it above 256 MiB, stops the update here.
 2. Download `sha256sums.txt`. A fetch error stops here (no integrity, no update).
 3. Download `sha256sums.txt.minisig` and check it against a minisign public key pinned at compile time. A missing or bad signature stops the update. The key is a constant, so nothing at runtime can swap it out.
 4. Download the platform asset, refusing any body larger than the size the release lists, and check its SHA-256 against the now-trusted sums file. A mismatch stops the update.
-5. Write it into a fresh temp directory (owner-only on Linux and macOS), then self-replace. On Linux and macOS a copy lands beside the binary and is renamed over it in one step. On Windows the running binary is renamed aside before the new one is copied in, so a failure or a kill in between leaves no `clauth.exe` at its path until you reinstall. The new binary takes over on the next launch.
+5. Check the binary on disk again, and stop without a log line if it was replaced or removed since step 1. Otherwise write the asset into a fresh temp directory (owner-only on Linux and macOS), then self-replace. On Linux and macOS a copy lands beside the binary and is renamed over it in one step. On Windows the running binary is renamed aside before the new one is copied in, so a failure or a kill in between leaves no `clauth.exe` at its path until you reinstall. The new binary takes over on the next launch; a running daemon on Linux and macOS re-executes into it within seconds when the new binary can take over a running daemon, and otherwise keeps running the old one and logs why. A daemon on Windows, or one started from v0.18.2 or older, keeps running the old binary until `clauth daemon --replace`.
 
-Each releases-API, sums and signature request gives up after 35 s end to end. The asset download gets 35 s plus its listed size at 16 KiB/s, so a link averaging 16 KiB/s or more finishes and a slower or stalled one gives up; the next TUI open tries again.
+Each releases-API, sums and signature request gives up after 35 s end to end. The asset download gets 35 s plus its listed size at 16 KiB/s, so a link averaging 16 KiB/s or more finishes and a slower or stalled one gives up; the next hourly check tries again.
 
-`cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never replaced. Auto-update off or `CLAUTH_NO_UPDATE=1` turns the whole thing off.
+`cargo` installs (binary under `~/.cargo/bin`), and platforms with no prebuilt release binary, are told an update exists but never replaced. Auto-update off or `CLAUTH_NO_UPDATE=1` turns the whole thing off. Each check reads the saved toggle first, so turning it off stops the next check of every running daemon and TUI; one that found it off when its first check was due (a `--standby` first checks at its takeover) checks nothing until it restarts. `CLAUTH_NO_UPDATE=1` counts only for a process whose environment holds it (a daemon the TUI starts inherits the TUI's).
 
 Releases are signed in CI with a passwordless minisign key kept as a GitHub Actions secret; the signing step writes the key to disk and deletes it on exit. The public half is pinned in `src/update.rs`.
 
@@ -225,7 +225,7 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 | Switch | Effect |
 |--------|--------|
 | auto-update off (the Config tab row, `[update] auto_update = false`) | disables all background update checks, self-replacement, and the herdr-plugin reinstall |
-| `CLAUTH_NO_UPDATE=1` | the same, even when auto-update is on |
+| `CLAUTH_NO_UPDATE=1` | the same, even when auto-update is on, for each process whose own environment sets it |
 | `non-login keys` off (the Config tab row, `preserve_non_login_keys = false`) | clauth stops saving what Claude Code keeps beside a login (a design login) into that account's store and stops carrying MCP-server logins into a setup token's `session-token.json`, and a macOS sign-out drops a design login from the Keychain item again |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
 | `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket and sending Web Push, whatever the flags say |

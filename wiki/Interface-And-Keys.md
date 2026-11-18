@@ -166,7 +166,7 @@ A saved Claude Code account's rows:
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart (a plan with no 5h limit takes no turn) | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
-| `auto-update` | checks for updates when the TUI opens, unless `CLAUTH_NO_UPDATE=1` | on |
+| `auto-update` | checks for updates hourly, unless `CLAUTH_NO_UPDATE=1`: the running daemon and every TUI read this setting before each check, and one that found it off when its first check was due checks nothing until it restarts ([Install](Install#updates)) | on |
 | `weekly limit` | chain-wide 7d exhaustion line (a monthly-only account's 30d quota gates on it instead), 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | lowest projected-switch point, no effect at or above an account's threshold: 97 / 98 / 99 / 100% | `98%` |
