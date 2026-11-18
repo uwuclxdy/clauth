@@ -3132,6 +3132,37 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
     );
 }
 
+/// `⇧↑↓` counts the rows the reorder reaches, never the roster: beside a
+/// disabled account, which has no Overview row, one shown account has no
+/// neighbour to swap with and two do.
+#[test]
+fn the_overview_footer_counts_the_rows_the_reorder_reaches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let footer = |names: &[&str]| {
+        let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from("off"));
+        off.disabled = true;
+        let shown = names
+            .iter()
+            .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: std::iter::once(off).chain(shown).collect(),
+        });
+        app.tab = Tab::Overview;
+        settled_footer(&app, 80, 24)
+    };
+    assert_eq!(
+        footer(&["p1"]),
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit",
+        "one shown row beside a disabled account"
+    );
+    assert_eq!(
+        footer(&["p1", "p2"]),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit",
+        "two shown rows beside a disabled account"
+    );
+}
+
 /// An empty Models list advertises no row key: `↑↓` moves nothing there.
 #[test]
 fn an_empty_models_list_advertises_no_row_keys() {

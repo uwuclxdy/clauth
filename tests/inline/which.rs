@@ -2584,3 +2584,52 @@ fn the_plain_answer_is_the_profile_or_nothing() {
         "Windows refuses which --pid"
     );
 }
+
+/// The macOS `ps` row parser keeps the column's own spelling: `ps` pads a
+/// single-digit day ("Nov  3"), and the token the readers compare is the
+/// column trimmed, so collapsing the padding would change the stored token
+/// and break a marker written by a released binary after an update.
+#[cfg(unix)]
+#[test]
+fn the_ps_parsers_keep_the_released_start_token_spelling() {
+    // A padded single-digit day: the token keeps the column's internal
+    // double space, exactly as the released reader stored it.
+    assert_eq!(
+        parse_ps_children_row("  123   45 Mon Nov  3 10:11:12 2025", 45),
+        Some((123, "Mon Nov  3 10:11:12 2025".to_string())),
+        "a padded day keeps its column spelling"
+    );
+    // A two-digit day: no padding, the same trimmed column.
+    assert_eq!(
+        parse_ps_children_row("123 45 Mon Nov 13 10:11:12 2025", 45),
+        Some((123, "Mon Nov 13 10:11:12 2025".to_string())),
+        "a two-digit day keeps its column spelling"
+    );
+    // A row whose ppid is not the daemon's is not a child.
+    assert_eq!(
+        parse_ps_children_row("123 46 Mon Nov 13 10:11:12 2025", 45),
+        None,
+        "a foreign ppid is not a child"
+    );
+    // The stat/lstart reader split: the same spelling, so the readers and
+    // the capture produce one token.
+    assert_eq!(
+        split_stat_lstart("Ss   Mon Nov  3 10:11:12 2025"),
+        Some(("Ss", "Mon Nov  3 10:11:12 2025")),
+        "the reader split keeps the column's spelling"
+    );
+}
+
+/// The macOS listing filter never admits the lister's own row (`ps -ax`
+/// lists the lister itself): its pid is dropped, or every per-tick zombie
+/// read would re-list it for the daemon's life.
+#[cfg(unix)]
+#[test]
+fn the_ps_children_filter_never_lists_the_lister() {
+    let text = "555 999 Mon Nov  3 10:11:12 2025\n777 999 Mon Nov  3 10:11:13 2025\n";
+    assert_eq!(
+        parse_ps_children_rows(text, 555, 999),
+        vec![(777, "Mon Nov  3 10:11:13 2025".to_string())],
+        "the lister's own row is filtered out"
+    );
+}

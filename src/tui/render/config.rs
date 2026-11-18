@@ -78,7 +78,7 @@ pub(super) fn draw_band_selector(
     // Compute the band walk, the flat item list and the cursor position BEFORE
     // the config guard: all three read the profile count under their own short
     // guard, and `RankedMutex` refuses a nested acquisition of the same rank.
-    let entries = app.band_entries(HarnessFilter::All);
+    let entries = app.band_entries(HarnessFilter::All, false);
     let items = app.setup_items();
     let pos = selected_flat;
     let cfg = app.config();
