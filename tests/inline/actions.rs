@@ -2447,7 +2447,7 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the switch then reads"
@@ -2814,7 +2814,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (mut config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the capture then reads"
@@ -2884,7 +2884,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (mut config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the commit then reads"
@@ -7343,7 +7343,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
     };
     save_app_state(&config.state).expect("persist state");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     let after: serde_json::Value =
@@ -7549,7 +7549,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
     };
     save_app_state(&config.state).expect("persist state");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     assert!(

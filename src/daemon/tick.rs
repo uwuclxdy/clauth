@@ -635,7 +635,7 @@ impl super::Daemon {
         // The account the switch moves off, for its log line.
         let mut switched_from = None;
         let result = {
-            #[allow(
+            #[expect(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
@@ -668,20 +668,23 @@ impl super::Daemon {
             // log names the two apart without threading the cause through the
             // switch action.
             let returning = cfg.is_home_today(&target, &key_rejected);
-            let from = cfg.state.active_profile.as_ref();
-            if from != Some(&target) {
-                switched_from = Some((
-                    from.and_then(|f| cfg.find(f)).cloned(),
-                    cfg.state.weekly_switch_threshold_pct(),
-                ));
-            }
+            let chain_weekly = cfg.state.weekly_switch_threshold_pct();
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
                 // The AUTH-1 gate ran above (`ensure_installable_from_main_loop`).
-                let changed = switch_profile_locked_gated(&mut cfg, &target, true)?;
-                Ok((returning, changed))
+                let outcome = switch_profile_locked_gated(&mut cfg, &target, true)?;
+                // The account left is the one `profiles.toml` named under the
+                // switch's own hold, never this process's copy read before it:
+                // a peer switch can land between the two.
+                if outcome.left.as_ref() != Some(&target) {
+                    switched_from = Some((
+                        outcome.left.as_ref().and_then(|f| cfg.find(f)).cloned(),
+                        chain_weekly,
+                    ));
+                }
+                Ok((returning, outcome.changed))
             })
         };
         match result {
@@ -872,14 +875,11 @@ impl super::Daemon {
         if !self.fetch_lease.fetches_here() {
             return;
         }
-        let (active, left, chain_weekly) = {
-            let Some(cfg) = self.config.lock().ok() else {
-                return;
-            };
-            let active = cfg.state.active_profile.as_deref().map(ProfileName::from);
-            let left = active.as_ref().and_then(|a| cfg.find(a)).cloned();
-            (active, left, cfg.state.weekly_switch_threshold_pct())
-        };
+        let active = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|c| Option::clone(&c.state.active_profile));
         let Some(active) = active else {
             return; // already off
         };
@@ -913,18 +913,23 @@ impl super::Daemon {
         // taken first, held across the locked switch-off, and dropped before
         // the gated republish below.
         let result = {
-            #[allow(
+            #[expect(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|_held| {
+            crate::lock::with_state_lock(|held| {
+                // The account left is the one `profiles.toml` names under the
+                // switch-off's own hold, never this process's copy read before
+                // it: a peer switch can land between the two.
+                let left = crate::actions::mirror_active_on_disk(&mut cfg, held)?
+                    .and_then(|a| cfg.find(&a).cloned());
                 let changed = switch_off_locked(&mut cfg)?;
-                Ok(changed)
+                Ok((changed, left, cfg.state.weekly_switch_threshold_pct()))
             })
         };
         match result {
-            Ok(changed) => {
+            Ok((changed, left, chain_weekly)) => {
                 if changed {
                     crate::claude_json::strip_home_oauth_account();
                 }

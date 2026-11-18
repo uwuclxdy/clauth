@@ -166,6 +166,14 @@ fn active_of(d: &Daemon) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A peer's switch: `profiles.toml` names `name` active while the daemon's
+/// config copy still names the account it loaded.
+fn peer_switches_active_to(name: Option<&str>) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.active_profile = name.map(Into::into);
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
 /// The drain marks the daemon's own skip store; the refresher's scan must read
 /// the SAME `Arc`, or a mark is invisible to every scan and N4 returns while the
 /// suite stays green. The drain's lease guard must read the same `FetchLease`
@@ -771,6 +779,53 @@ fn drain_pending_switch_logs_an_undated_third_party_reading() {
         lines.snapshot().iter().any(|l| l
             == "clauth daemon: auto-switched to 'oauth' from 'tp'; 'tp' read 5h 97% (line 95%) at an unknown time"),
         "a third-party reading with no cache file is undated: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer's switch landing after the daemon loaded its config must not change
+/// what the line reports: the account left is the one `profiles.toml` names
+/// under the switch's own hold, never the process's older copy.
+#[test]
+fn drain_pending_switch_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "beta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(Some("beta"));
+
+    stage_switch(&daemon, "gamma");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("gamma"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'gamma' from 'beta'; 'beta' read 5h 92% (line 95%) 4m ago"),
+        "the line names the account the switch's own hold left: {:?}",
         lines.snapshot()
     );
 }
@@ -1902,6 +1957,111 @@ fn drain_pending_switch_off_logs_the_left_account_and_its_reading() {
         lines.snapshot().iter().any(|l| l
             == "clauth daemon: switched off: all accounts spent; 'alpha' read 5h 100% (line 95%) 4m ago"),
         "the wrap-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer's switch landing after the daemon loaded its config must not change
+/// what the wrap-off line reports: the account left is the one `profiles.toml`
+/// names under the switch-off's own hold.
+#[test]
+fn drain_pending_switch_off_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "beta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(Some("beta"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: switched off: all accounts spent; 'beta' read 5h 100% (line 95%) 4m ago"),
+        "the wrap-off line names the account its hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A wrap-off `profiles.toml` already made is no switch-off of this process's:
+/// the line keeps the bare shape instead of reporting a reading for an account
+/// it did not turn off.
+#[test]
+fn drain_pending_switch_off_logs_no_reading_when_disk_is_already_off() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(None);
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth daemon: switched off: all accounts spent"),
+        "a wrap-off the disk already made logs the bare line: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains("'alpha' read")),
+        "the line reports no reading for an account this process did not turn off: {:?}",
         lines.snapshot()
     );
 }

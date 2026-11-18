@@ -2816,34 +2816,33 @@ pub(crate) fn picked_usage(
 /// ([`crate::profile_json::oauth_age`]); a third-party account's is the write
 /// time of the cache file its figures land in, the clock
 /// [`crate::profile_json::ProfileWindows`] dates it by. `None` when nothing dates
-/// the reading. Each store is locked once and released, so the caller holds no
-/// config guard across this.
+/// the reading. Only the half the account's figures come from is locked, once
+/// and released, so the caller holds no config guard across this.
 pub(crate) fn picked_reading(
     profile: &Profile,
     store: &UsageStore,
     third_party_store: &ThirdPartyUsageStore,
 ) -> (Option<UsageInfo>, Option<u64>) {
-    let oauth = store
-        .lock()
-        .ok()
-        .and_then(|s| s.get(profile.name.as_str()).cloned());
-    let stats = third_party_store
-        .lock()
-        .ok()
-        .and_then(|s| s.get(profile.name.as_str()).cloned());
-    let third_party = profile.usage_cache_is_third_party();
-    let age_secs = if third_party {
-        crate::profile_json::cache_age_secs(
+    let name = profile.name.as_str();
+    if profile.usage_cache_is_third_party() {
+        let usage = third_party_store
+            .lock()
+            .ok()
+            .and_then(|s| picked_usage(true, None, s.get(name)));
+        let age_secs = crate::profile_json::cache_age_secs(
             &profile.name,
             crate::profile_json::usage_cache_file(profile),
-        )
+        );
+        (usage, age_secs)
     } else {
-        crate::profile_json::oauth_age(oauth.as_ref(), crate::usage::now_ms()).secs()
-    };
-    (
-        picked_usage(third_party, oauth.as_ref(), stats.as_ref()),
-        age_secs,
-    )
+        let usage = store
+            .lock()
+            .ok()
+            .and_then(|s| picked_usage(false, s.get(name), None));
+        let age_secs =
+            crate::profile_json::oauth_age(usage.as_ref(), crate::usage::now_ms()).secs();
+        (usage, age_secs)
+    }
 }
 
 /// The in-memory twin of `profile_json::windows_of`: the chain walk's usage
@@ -3784,6 +3783,7 @@ pub(crate) fn auto_switch_if_needed(
                             &ProfileName::from(target.clone()),
                             true,
                         )?
+                        .changed
                     }
                     crate::profile::StoredLogin::HoldsNone
                     | crate::profile::StoredLogin::Unknown => {

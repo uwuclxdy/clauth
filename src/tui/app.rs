@@ -7849,16 +7849,15 @@ impl App {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
+                let target = ProfileName::from(target);
                 let key_rejected = self.key_rejected_names();
-                let returned = self
-                    .config()
-                    .is_home_today(&ProfileName::from(target.clone()), &key_rejected);
+                let returned = self.config().is_home_today(&target, &key_rejected);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
                     format!("auto-switched to '{target}'")
                 };
-                log_auto_switch(self, before.as_ref(), &ProfileName::from(target.clone()));
+                log_auto_switch(self, before.as_ref(), &target);
                 self.toast(ToastKind::Warning, msg);
             }
             Some(SwitchAction::Off) => {
@@ -20342,14 +20341,19 @@ fn finalize_switch(
     let result = switch_profile_gated(&app.config, name, gated);
     clear_activity(&app.activity, name);
     match result {
-        Ok(_switched) => {
-            // A queued switch is the chain's own move: leave its line in
-            // clauth.log, which outlives the toast below.
-            if queued {
-                log_auto_switch(app, outgoing.as_ref(), name);
-            }
+        Ok(outcome) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            // A queued switch is the chain's own move: leave its line in
+            // clauth.log, which outlives the toast below. The account named is
+            // the one the switch's own hold found active, never `outgoing`,
+            // the copy read before it.
+            if queued {
+                log_auto_switch(app, outcome.left.as_ref(), name);
+            }
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
@@ -20409,12 +20413,10 @@ fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
 
 /// Log a chain switch-off ([`crate::fallback::switch_off_log_line`]) with the
 /// account it left and that account's last reading. Only a switch-off the chain
-/// decided is logged this way.
+/// decided is logged this way. A switch-off that left no account — disk already
+/// switched off — logs the bare line, the shape the daemon's twin writes.
 fn log_switch_off(app: &App, left: Option<&ProfileName>) {
-    let Some(left) = left else {
-        return;
-    };
-    let (left_profile, left_usage, left_age_secs) = left_reading(app, Some(left));
+    let (left_profile, left_usage, left_age_secs) = left_reading(app, left);
     let line = {
         let cfg = app.config();
         crate::fallback::switch_off_log_line(
@@ -20444,10 +20446,13 @@ fn perform_switch_off(app: &mut App) {
     };
     let result = switch_off(&app.config);
     match result {
-        Ok(()) => {
-            log_switch_off(app, Some(&active));
+        Ok(departed) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            log_switch_off(app, departed.as_ref());
             app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
