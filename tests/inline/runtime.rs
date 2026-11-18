@@ -4716,7 +4716,8 @@ fn a_shared_build_from_a_keyless_operator_file_puts_the_remembered_number_back()
             crate::retention::load().expect("load"),
             crate::retention::Retention {
                 days: Some(3650),
-                question_open: true
+                question_open: true,
+                spawn_files: std::collections::BTreeMap::new()
             }
         );
     });

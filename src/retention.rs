@@ -9,7 +9,19 @@
 //! can bring a lost number back, so clauth keeps its own copy in
 //! `~/.clauth/settings-retention.json` and writes it back wherever the key goes
 //! missing: the operator file, every live shared runtime copy, and every shared
-//! build. An isolated tree links no store and gets nothing.
+//! build; every shared launch also passes it on its spawn `--settings`. An
+//! isolated tree links no store and gets nothing.
+//!
+//! The record also lists every spawn file a shared launch wrote — number or
+//! not — each with the launch's floor (a delegate's own valid number, which
+//! the larger-number rule never undercuts; none for an operator launch). A
+//! background job's `respawnFlags` carry its launch's `--settings` file
+//! (measured 2026-10-20, Claude Code 2.1.304), so a respawn reads it again:
+//! the check rewrites each listed file when the number changes — the larger
+//! of the remembered number and the floor — drops the entries whose file is
+//! gone, and `remove it` rewrites each to its floor before the record goes. A
+//! value the operator passed on their own `clauth start -- --settings` is
+//! never registered, so it is never rewritten.
 //!
 //! Only a positive integer is remembered — whatever its JSON spelling (`3650`,
 //! `3650.0`, `3.65e3`) — the one shape Claude Code's schema takes, and a key
@@ -24,7 +36,7 @@
 //! forget the number, and a clauth predating this module rewrites it without
 //! the field.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,11 +61,11 @@ const KEY: &str = "cleanupPeriodDays";
 /// report again on every check.
 static RECORD_FAULT_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// The files whose put-back last failed, so a write fault that stays is
-/// reported once per process rather than on every check. Per file: a put-back
-/// landing in one file must not re-arm the line for another that still fails.
-/// A file leaves the set when a rewrite of it lands, so a recurrence is
-/// reported again.
+/// The files whose put-back or keep-current rewrite last failed, so a write
+/// fault that stays is reported once per process rather than on every check.
+/// Per file: a put-back landing in one file must not re-arm the line for
+/// another that still fails. A file leaves the set when a rewrite of it lands
+/// or a read finds it already current, so a recurrence is reported again.
 static PUT_BACK_FAILURES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// What clauth remembers about the operator's transcript retention.
@@ -66,6 +78,13 @@ pub(crate) struct Retention {
     /// Whether a put-back is waiting for the operator's keep-or-remove answer.
     #[serde(default)]
     pub(crate) question_open: bool,
+    /// Every spawn `--settings` file a shared launch wrote, each with its
+    /// floor: a delegate's own valid number, so a later change to the number
+    /// never undercuts it, `None` for an operator launch. The check rewrites
+    /// these files when the number changes; a record without the field reads
+    /// and writes the same bytes as one with it empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) spawn_files: BTreeMap<PathBuf, Option<u64>>,
 }
 
 /// `~/.clauth/settings-retention.json`.
@@ -78,12 +97,166 @@ pub(crate) fn record_path() -> Result<PathBuf> {
 /// # Errors
 ///
 /// The record cannot be read or does not parse.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no caller outside the tests reads the record yet")
-)]
 pub(crate) fn load() -> Result<Retention> {
     read_record(&record_path()?)
+}
+
+/// Whether `config_dir` names a shared runtime tree: one whose `projects`
+/// links the operator's store. The name check is the whole axis — an isolated
+/// tree's dir name marks it before any file is read.
+pub(crate) fn is_shared(config_dir: &Path) -> bool {
+    config_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(crate::runtime::is_shared_runtime_dir_name)
+}
+
+/// The number a launch on `config_dir` may carry on its spawn `--settings`:
+/// the operator file's own valid `cleanupPeriodDays`, else the remembered one;
+/// `None` for an isolated tree, which links no store and reads neither, and
+/// for a shared one with neither. This is the pre-check that keeps a launch
+/// that writes no spawn file off the state flock, and the fallback number when
+/// the flock cannot be taken; a launch that carries a number decides it fresh
+/// under the flock in [`carry_into_spawn_file`]. A record fault carries no
+/// number and is reported once.
+pub(crate) fn launch_days(config_dir: &Path) -> Option<u64> {
+    if !is_shared(config_dir) {
+        return None;
+    }
+    // The operator file's own valid number first, as the tree build keeps it:
+    // the record can lag it (a write that failed when the number was raised),
+    // and this flag outranks the tree's copy.
+    let operator = claude_dir()
+        .ok()
+        .and_then(|dir| read_member(&dir.join("settings.json")))
+        .and_then(|home| home.obj.get(KEY).and_then(valid_days));
+    operator.or_else(|| load().unwrap_or_else(|e| record_read_fault(&e)).days)
+}
+
+/// What one locked launch-carry ([`carry_into_spawn_file`]) produced.
+#[derive(Debug)]
+pub(crate) enum CarryOutcome {
+    /// The spawn file was written — with the decided number, or without one —
+    /// and registered in the record with its floor.
+    Carried,
+    /// Nothing was written: nothing is registered, and the caller's own
+    /// settings stand.
+    Nothing,
+    /// The spawn-file write failed inside the hold: nothing is registered;
+    /// the caller refuses a delegate while the decided number is due, and any
+    /// other launch goes on as if no number was carried.
+    WriteFailed(std::io::Error),
+    /// The state flock could not be taken: nothing is registered, and the
+    /// caller writes the file with the number it already read. The fault is
+    /// reported once through the record-fault latch.
+    LockedOut,
+}
+
+/// Decide the number a shared launch carries on its spawn `--settings` and
+/// register the file that holds it, in ONE state-flock hold with the write
+/// itself: a settle pass landing between the decision and the registration
+/// would leave this launch's file at the number the pass just changed, which
+/// a respawn would then read. `write` serializes the caller's settings object
+/// into `settings_file` under the same hold, with the decided number when one
+/// was decided, and returns whether it wrote the file. A shared launch
+/// registers its spawn file with or without a number, so a number learned
+/// later reaches a repairs-only file too; an isolated tree writes and records
+/// nothing. A record fault never refuses the launch: a record that cannot be
+/// read or parsed carries no remembered number, registers nothing and is never
+/// overwritten; a registration write that fails is reported once through the
+/// record-fault latch and the launch goes on.
+pub(crate) fn carry_into_spawn_file(
+    config_dir: &Path,
+    settings_file: &Path,
+    floor: Option<u64>,
+    write: impl FnOnce(Option<u64>) -> std::io::Result<bool>,
+) -> CarryOutcome {
+    match with_state_lock(|_held| {
+        let number = launch_days(config_dir);
+        // Only the name check tells an isolated tree from a shared one with
+        // nothing remembered, and an isolated tree carries and records
+        // nothing.
+        if number.is_none() && !is_shared(config_dir) {
+            return Ok(CarryOutcome::Nothing);
+        }
+        match write(number) {
+            // The caller declined: nothing to write, nothing to register.
+            Ok(false) => return Ok(CarryOutcome::Nothing),
+            Ok(true) => {}
+            Err(e) => return Ok(CarryOutcome::WriteFailed(e)),
+        }
+        register_spawn_file(settings_file, floor);
+        Ok(CarryOutcome::Carried)
+    }) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            record_fault(format_args!(
+                "clauth: {e:#}; the spawn settings file {} is not registered, so it is not \
+                 kept current",
+                settings_file.display()
+            ));
+            CarryOutcome::LockedOut
+        }
+    }
+}
+
+/// The caller's own `cleanupPeriodDays` in a settings object: the raw value
+/// when the key is present, valid or not; `None` when absent. An operator
+/// launch's own value wins over any remembered number and is never
+/// registered, so a check never rewrites it.
+pub(crate) fn own_retention(map: &Map<String, Value>) -> Option<&Value> {
+    map.get(KEY)
+}
+
+/// Fold a launch's decided number into the settings object it writes: the
+/// caller's own valid number stays when it is at least `days` — a delegate's
+/// own value is a floor under the remembered number — and any other own
+/// value, an invalid one included, plus an absent key, give way to `days`.
+pub(crate) fn apply_launch_days(map: &mut Map<String, Value>, days: u64, own_valid: Option<u64>) {
+    if own_valid.is_none_or(|own| own < days) {
+        map.insert(KEY.to_owned(), Value::from(days));
+    }
+}
+
+/// Record `file` as one a shared launch wrote, with its floor: the check
+/// rewrites the file when the number changes, and `remove` strips it. Called
+/// under the held state flock. A record that cannot be read or parsed
+/// registers nothing and is never overwritten; a write that fails is reported
+/// once through the record-fault latch and the launch goes on.
+fn register_spawn_file(file: &Path, floor: Option<u64>) {
+    let Ok(record) = record_path() else {
+        return;
+    };
+    let mut stored = match read_record(&record) {
+        Ok(stored) => stored,
+        Err(e) => {
+            record_fault(format_args!(
+                "clauth: {e:#}; {} is not kept current",
+                file.display()
+            ));
+            return;
+        }
+    };
+    if stored.spawn_files.get(file) == Some(&floor) {
+        return;
+    }
+    stored.spawn_files.insert(file.to_path_buf(), floor);
+    let Ok(bytes) = serde_json::to_vec_pretty(&stored) else {
+        record_fault(format_args!(
+            "clauth: failed to serialize the retention record {}; {} is not kept current",
+            record.display(),
+            file.display()
+        ));
+        return;
+    };
+    match crate::profile::atomic_write_600(&record, bytes) {
+        Ok(()) => RECORD_FAULT_WARNED.store(false, Ordering::Relaxed),
+        Err(e) => record_fault(format_args!(
+            "clauth: failed to write the retention record {}: {e:#}; {} is not kept current",
+            record.display(),
+            file.display()
+        )),
+    }
 }
 
 /// The stat snapshot from the last [`reconcile`] pass that settled; the daemon
@@ -93,12 +266,15 @@ static LAST_RECONCILED: Mutex<Option<Vec<MemberSnapshot>>> = Mutex::new(None);
 /// One check of the operator file and every live shared copy, under the state
 /// flock: the daemon's leg, which runs with no `clauth start` session live.
 ///
-/// The check sits behind a stat fast path over every file it reads (the
-/// operator file, each live shared copy, the retention record), in the shape
-/// of [`crate::jsonsync::run_with_cache`]: a wake whose inputs still read
-/// those stats checks nothing. Only a pass that skipped no merge and wrote or
-/// failed to write nothing keys it, so the next wake after any other pass
-/// re-reads every file.
+/// The check sits behind a stat fast path over the operator file, each live
+/// shared copy and the retention record, in the shape of
+/// [`crate::jsonsync::run_with_cache`]: a wake whose inputs still read those
+/// stats checks nothing. The registered spawn files are read too but are not
+/// keyed: only clauth writes them, and a change to the number they follow
+/// moves the operator file or the record. Only a pass that skipped no merge,
+/// wrote or failed to write nothing, and could read and parse every spawn file
+/// it had a number for keys it, so the next wake after any other pass re-reads
+/// every file.
 ///
 /// # Errors
 ///
@@ -129,30 +305,48 @@ pub(crate) fn reconcile() -> Result<()> {
 /// The operator's `remove it` answer: the key leaves the operator file and
 /// every live shared copy, and the number and its question are forgotten.
 ///
-/// The key goes before the record does, so a write that fails leaves the
-/// number remembered and the next pass puts it back rather than losing it.
-/// A member Claude Code rewrites while this runs is re-read and retried, at
-/// most three tries per member; one that keeps moving fails the whole remove
-/// naming that file, with the record untouched, so the caller can say it
-/// failed and ask again. A member that exists but cannot be read or does not
-/// parse counts as moving too — its key may well still be there, and skipping
-/// it would report success while a later merge flows the key back; it is
-/// re-read after a pause of at most 100 ms, so a copy caught mid-write has
-/// time to land, and the failure names whichever state the last read saw.
-/// Only a member that is not there is skipped: nothing to remove; any other
-/// stat error fails the remove, for the same reason.
+/// The record is read first, before any member is touched: it names the spawn
+/// files that still carry the number, so a record that cannot be read or does
+/// not parse fails the remove naming it, changing nothing — stripping the key
+/// while armed spawn files stay armed would report a removal that never
+/// happened. The key goes before the record does, so a write that fails
+/// leaves the number remembered and the next pass puts it back rather than
+/// losing it. A member Claude Code rewrites while this runs is re-read and
+/// retried, at most three tries per member; one that keeps moving fails the
+/// whole remove naming that file, with the record untouched, so the caller
+/// can say it failed and ask again. A member that exists but cannot be read
+/// or does not parse counts as moving too — its key may well still be there,
+/// and skipping it would report success while a later merge flows the key
+/// back; it is re-read after a pause of at most 100 ms, so a copy caught
+/// mid-write has time to land, and the failure names whichever state the last
+/// read saw. Only a member that is not there is skipped: nothing to remove;
+/// any other stat error fails the remove, for the same reason.
+///
+/// Each registered spawn file is rewritten to its floor — the key removed
+/// when it has none — before the record goes, so a respawn reading one does
+/// not re-arm the operator's cutoff. A file that is gone is skipped, and a
+/// rewrite that cannot land fails the remove naming that file, with the
+/// record kept, like a member that keeps moving.
 ///
 /// # Errors
 ///
 /// A path cannot be resolved, the flock cannot be taken, a member cannot be
-/// statted, a write fails, or a member kept changing or stayed unreadable
-/// across three tries.
+/// statted, a write fails, the record cannot be read or does not parse, or a
+/// member kept changing or stayed unreadable across three tries.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "no surface offers the remove answer yet")
 )]
 pub(crate) fn remove() -> Result<()> {
     with_state_lock(|_held| {
+        let record = record_path()?;
+        let stored = read_record(&record).with_context(|| {
+            format!(
+                "{} cannot be read or does not parse, so cleanupPeriodDays was not removed; \
+                 the key may still be there",
+                record.display()
+            )
+        })?;
         let operator = claude_dir()?.join("settings.json");
         let sync_record = crate::settings_sync::written_record_path()?;
         for path in crate::settings_sync::known_paths()? {
@@ -207,7 +401,44 @@ pub(crate) fn remove() -> Result<()> {
                 }
             }
         }
-        let record = record_path()?;
+        for (path, floor) in &stored.spawn_files {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to read {}, so its cleanupPeriodDays was not removed; \
+                             the key may still be there",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&bytes) else {
+                anyhow::bail!(
+                    "{} cannot be read or does not parse, so its cleanupPeriodDays was not \
+                     removed; the key may still be there",
+                    path.display()
+                );
+            };
+            match *floor {
+                Some(floor) => {
+                    obj.insert(KEY.to_owned(), Value::from(floor));
+                }
+                None => {
+                    obj.shift_remove(KEY);
+                }
+            }
+            let json = Value::Object(obj).to_string();
+            crate::profile::atomic_write_600(path, json.as_bytes()).with_context(|| {
+                format!(
+                    "failed to write {}, so its cleanupPeriodDays was not removed; \
+                     the key may still be there",
+                    path.display()
+                )
+            })?;
+        }
         match std::fs::remove_file(&record) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -226,9 +457,10 @@ pub(crate) struct SettleOutcome {
     /// the operator file clears it: a merge after it could strip the key from
     /// the copies that already got it back.
     pub(crate) merge_ok: bool,
-    /// Whether this pass wrote a file or failed to: a settings put-back, a
-    /// record write. A stat key taken before such a pass describes bytes the
-    /// pass replaced, or a write still owed, so no caller caches it.
+    /// Whether this pass wrote a file, failed to, or could not read or parse a
+    /// spawn file it keeps current: a settings put-back, a spawn-file rewrite,
+    /// a record write. A stat key taken before such a pass describes bytes the
+    /// pass replaced, or work still owed, so no caller caches it.
     pub(crate) attempted_write: bool,
 }
 
@@ -270,7 +502,14 @@ pub(crate) fn settle_passes(operator: &Path) -> u64 {
 /// this pass only; the copies still get their put-back. A failed copy put-back
 /// reports once and the pass goes on — the merge refusal keeps that copy from
 /// winning while keyless, and a keyed operator file's win writes the key back
-/// into it anyway. A failed write of any kind marks the pass
+/// into it anyway. Registered spawn files follow the decided number here too
+/// (the record's `spawn_files`): a gone file drops its entry, and a file with
+/// no number to keep in it is left as it is. When there is a number, a file
+/// that cannot be read or is not an object keeps its entry, stays as it is,
+/// and reports once, and a rewrite that fails keeps the entry and reports
+/// once, so a later pass retries; a file found already current clears its
+/// fault latch. A file the check had a number for that cannot be read or
+/// parsed, and a failed write of any kind, marks the pass
 /// [`SettleOutcome::attempted_write`], so the next wake retries it.
 ///
 /// # Errors
@@ -291,7 +530,7 @@ pub(crate) fn settle(
             .entry(operator.to_path_buf())
             .or_insert(0) += 1;
     }
-    let stored = remembered_for_pass(&record);
+    let stored = read_record(&record).unwrap_or_else(|e| record_read_fault(&e));
     let mut on_disk = stored.clone();
     let mut next = stored;
     let mut operator_value: Option<Value> = None;
@@ -303,10 +542,8 @@ pub(crate) fn settle(
                 if let Some(days) = valid_days(value)
                     && next.days != Some(days)
                 {
-                    next = Retention {
-                        days: Some(days),
-                        question_open: false,
-                    };
+                    next.days = Some(days);
+                    next.question_open = false;
                 }
                 operator_value = Some(value.clone());
             }
@@ -370,6 +607,66 @@ pub(crate) fn settle(
             }
         }
     }
+    // The spawn files a shared launch wrote follow the number here: a
+    // background job's `respawnFlags` carry its launch's `--settings` file
+    // (measured 2026-10-20, Claude Code 2.1.304), so a respawn reads it again,
+    // and one left at an old number sweeps the store at the old cutoff. A
+    // file the GC collected drops its entry instead of being written back.
+    // With no number to keep in it, a file is read only for that drop and
+    // left alone: nothing is owed. With a number, a file that cannot be read
+    // or is not a JSON object keeps its entry, stays as it is, is reported
+    // once through the rewrite-fault latch, like a failed rewrite, and marks
+    // the pass uncacheable, so a later pass retries. A file found already
+    // current leaves the latch, so a fault that returns is reported again.
+    let mut gone = Vec::new();
+    for (path, floor) in &next.spawn_files {
+        // The wanted value is the larger of the decided number and the
+        // delegate's floor. With neither, the file stays as it is: a check
+        // never takes a number away, and a delegate's own value, even one
+        // Claude Code's schema refuses, is the caller's; only `remove` strips.
+        let wanted = next.days.max(*floor);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                gone.push(path.clone());
+                continue;
+            }
+            Err(e) => {
+                if wanted.is_some() {
+                    attempted_write = true;
+                    spawn_rewrite_failure(path, &e.into());
+                }
+                continue;
+            }
+        };
+        let Some(wanted) = wanted.map(Value::from) else {
+            continue;
+        };
+        let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&bytes) else {
+            attempted_write = true;
+            spawn_rewrite_failure(path, &anyhow::anyhow!("it does not hold a JSON object"));
+            continue;
+        };
+        if obj.get(KEY) != Some(&wanted) {
+            obj.insert(KEY.to_owned(), wanted);
+            attempted_write = true;
+            // Compact JSON, as the launch wrote the file.
+            let json = Value::Object(obj).to_string();
+            if let Err(e) = crate::profile::atomic_write_600(path, json.as_bytes()) {
+                spawn_rewrite_failure(path, &e.into());
+                continue;
+            }
+        }
+        // Current, or a rewrite landed: a fault this file had is over, so one
+        // that returns is reported again.
+        PUT_BACK_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
+    }
+    for path in gone {
+        next.spawn_files.remove(&path);
+    }
     attempted_write |= persist(&record, &mut on_disk, &next);
     Ok(SettleOutcome {
         days: next.days,
@@ -390,18 +687,20 @@ pub(crate) fn carry_into(settings: String, days: u64) -> Result<String> {
     let obj = value
         .as_object_mut()
         .context("the built settings.json is not an object")?;
-    if obj.contains_key(KEY) {
-        return Ok(settings);
+    match obj.entry(KEY) {
+        serde_json::map::Entry::Occupied(_) => Ok(settings),
+        serde_json::map::Entry::Vacant(slot) => {
+            slot.insert(Value::from(days));
+            serde_json::to_string_pretty(&value).context("failed to serialize settings.json")
+        }
     }
-    obj.insert(KEY.to_owned(), Value::from(days));
-    serde_json::to_string_pretty(&value).context("failed to serialize settings.json")
 }
 
 /// The number Claude Code's schema takes: a positive integer, whatever its
 /// JSON spelling (`3650`, `3650.0`, `3.65e3` all parse to the integer 3650 in
 /// Claude Code's `JSON.parse` + zod `int().positive()` chain, which accepts
 /// every integral JSON number).
-fn valid_days(value: &Value) -> Option<u64> {
+pub(crate) fn valid_days(value: &Value) -> Option<u64> {
     let Value::Number(number) = value else {
         return None;
     };
@@ -424,20 +723,18 @@ fn read_record(path: &Path) -> Result<Retention> {
     })
 }
 
-/// [`read_record`] for a check: a record that cannot be read or parsed
-/// remembers nothing, is reported once, and is rewritten only once the
-/// operator file holds a valid number, which would replace whatever it held.
-fn remembered_for_pass(path: &Path) -> Retention {
-    match read_record(path) {
-        Ok(record) => record,
-        Err(e) => {
-            record_fault(format_args!(
-                "clauth: {e:#}; cleanupPeriodDays is not put back until \
-                 ~/.claude/settings.json holds a number again"
-            ));
-            Retention::default()
-        }
-    }
+/// A record read for a check or a launch: a record that cannot be read or
+/// parsed remembers nothing, is reported once through [`record_fault`], and is
+/// rewritten once the operator file holds a valid number. The line names what
+/// is lost while the operator file holds no number — the put-back and the
+/// launch carry — and that sessions already running keep the number they hold.
+fn record_read_fault(e: &anyhow::Error) -> Retention {
+    record_fault(format_args!(
+        "clauth: {e:#}; clauth forgot the cleanupPeriodDays it remembered, so \
+         while ~/.claude/settings.json holds no number it is neither put back nor passed to a \
+         launch, and sessions already running keep the number they hold now"
+    ));
+    Retention::default()
 }
 
 /// Report one record fault under [`RECORD_FAULT_WARNED`]: the first of a run
@@ -468,6 +765,22 @@ fn put_back_failure(path: &Path, e: &anyhow::Error) {
     if first {
         logline!(
             "clauth: failed to put cleanupPeriodDays back into {}: {e:#}",
+            path.display()
+        );
+    }
+}
+
+/// Report one failed keep-current rewrite into `path` under
+/// [`PUT_BACK_FAILURES`], with its own line: the number was not missing there,
+/// only stale, so "put back" would misdescribe the write.
+fn spawn_rewrite_failure(path: &Path, e: &anyhow::Error) {
+    let first = PUT_BACK_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    if first {
+        logline!(
+            "clauth: failed to keep cleanupPeriodDays current in {}: {e:#}",
             path.display()
         );
     }

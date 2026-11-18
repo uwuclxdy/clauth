@@ -81,6 +81,11 @@ const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
 /// ceiling (the prompt becomes one `-p` argv element), so a file that passes can
 /// always be handed to `claude`, and far above any real reusable prompt.
 const PROMPT_FILE_CAP: u64 = 64 * 1024;
+/// The refusal for a `prompt` whose text starts with `-`: `run_delegate` passes
+/// the prompt as the word after `-p`, a boolean flag, so claude parses a
+/// leading `-` as an option.
+const PROMPT_LEADING_DASH_REFUSAL: &str =
+    "`prompt` cannot start with `-`: claude would read it as an option";
 /// Cap on one `profiles` fan-out. Each target is a real usage window with no
 /// undo, so a runaway list is bounded here.
 const MAX_FANOUT: usize = 8;
@@ -891,6 +896,9 @@ pub(crate) struct DelegateArgs {
     /// A path that does not resolve is refused by name — it is never sent to
     /// the delegate as literal text.
     ///
+    /// A prompt whose text starts with `-`, typed or read from a file, is
+    /// refused: claude would read it as an option.
+    ///
     /// Text works the same way as prompting Claude Code; mention a file with
     /// `@path/file` to pull it directly into the delegate's context, `/skill`
     /// to invoke a skill, and so on. This is the only thing it receives from
@@ -972,6 +980,11 @@ pub(crate) struct DelegateArgs {
     /// `--session-id`, `--resume`, `--fork-session`, `--from-pr` and
     /// `--teleport` are refused: clauth pins the session id and exports it as
     /// `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
+    /// `--managed-settings` is refused too: it is Claude Code's SDK-only policy
+    /// tier, which outranks every setting clauth passes.
+    /// A `--settings` after `--` or as another flag's value is refused, and so
+    /// is one clauth cannot read or merge while it carries a
+    /// `cleanupPeriodDays` for the shared transcript store.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -1382,6 +1395,9 @@ flight and start the next as each result arrives."
                 "`prompt` must be given: the task text, or a path to a prompt file",
             ));
         };
+        if raw_prompt.starts_with('-') {
+            return Ok(delegate_refusal(PROMPT_LEADING_DASH_REFUSAL));
+        }
         // The `--agent` shadow rule: a typed flag and its raw `args` spelling are
         // the same decision spelled twice, so refuse rather than guess
         // precedence. The same shape the later typed flags reuse.
@@ -1429,6 +1445,50 @@ flight and start the next as each result arrives."
                  `--from-pr` or `--teleport`: clauth pins the delegate's session id and \
                  exports it as `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` \
                  argument",
+            ));
+        }
+        // `--managed-settings` reaches Claude Code's policy tier, which merges
+        // above the flag tier clauth's own `--settings` rides, so a model's
+        // value there could shorten the shared store's retention. Every word is
+        // scanned, not just the option slice: claude's parser and clauth's can
+        // disagree on where options end (a `--` one takes as a value flag's
+        // value), and claude then reads a word clauth called an operand as an
+        // option.
+        if args
+            .as_ref()
+            .is_some_and(|a| words_carry_flag(a, "--managed-settings"))
+        {
+            return Ok(delegate_refusal(
+                "`args` cannot carry `--managed-settings`: it is Claude Code's SDK-only policy \
+                 tier, which outranks every setting clauth passes",
+            ));
+        }
+        // A `--settings` with no word left to take ends clauth's own walk with
+        // `Err`, and that walk is the one that merges a delegate's settings into
+        // clauth's file. Claude's parser refuses such an argv, and the
+        // passthrough a failed walk falls back to would hand over every earlier
+        // `--settings` word as the model wrote it, merged into nothing.
+        if args
+            .as_ref()
+            .is_some_and(|a| crate::cc_exempt::fold_settings_args(a).is_err())
+        {
+            return Ok(delegate_refusal(
+                "`args` cannot end in a `--settings` with no value: claude would refuse it",
+            ));
+        }
+        // A `--settings` before clauth's end of options is merged into the file
+        // it passes. Claude Code 2.1.326's own early settings reader takes the
+        // last `--settings` hit and skips a word only after a flag it knows
+        // exactly, so any `--settings` word clauth did not merge can win over
+        // that file: it is refused wherever it sits, after `--` or as another
+        // flag's value included.
+        if args
+            .as_ref()
+            .is_some_and(|a| args_hold_unmerged_settings(a))
+        {
+            return Ok(delegate_refusal(
+                "`args` cannot carry a `--settings` after `--` or as another flag's value: \
+                 claude would read it in place of the settings clauth passes",
             ));
         }
         // The result mode is a closed set: unset means inline, `"file"` means
@@ -4207,10 +4267,25 @@ fn sets_output_format(extra_args: &[String]) -> bool {
 /// equals spelling (`--flag=value`). The typed-arg shadow rules refuse on this
 /// rather than guessing precedence between a typed flag and its raw twin.
 fn args_carry_flag(args: &[String], flag: &str) -> bool {
-    crate::start::claude_option_args(args).iter().any(|a| {
-        a.strip_prefix(flag)
+    words_carry_flag(crate::start::claude_option_args(args), flag)
+}
+
+/// True when any word of `words` is `flag` or its equals spelling
+/// (`--flag=value`), whatever position clauth's option parser gives it.
+fn words_carry_flag(words: &[String], flag: &str) -> bool {
+    words.iter().any(|word| {
+        word.strip_prefix(flag)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
     })
+}
+
+/// True when raw `args` holds a `--settings` word clauth's own walk did not
+/// merge: one [`crate::cc_exempt::fold_settings_args`] leaves in its output. A
+/// walk that ends in `Err` (a `--settings` with no word left to take) is
+/// refused before this check, so only an `Ok` walk is read here.
+fn args_hold_unmerged_settings(args: &[String]) -> bool {
+    crate::cc_exempt::fold_settings_args(args)
+        .is_ok_and(|(_, clean)| words_carry_flag(&clean, "--settings"))
 }
 
 /// What the stdout reader keeps from a streamed delegate. The transcript runs to
@@ -4894,6 +4969,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // `stream-json` refuses to run under `-p` without `--verbose`;
     // `--include-partial-messages` adds the token deltas.
     let streaming = !sets_output_format(&opts.extra_args);
+    // stdin stays null: claude 2.1.327 takes settings and managed settings from
+    // a piped stdin's initialize line (`--initialize-fields=settings`,
+    // `--managed-settings-in-initialize`), whose content no scan of `args` sees.
     command
         .args(["-p", opts.prompt])
         .stdout(Stdio::piped())
@@ -4929,7 +5007,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         command.args(["--permission-mode", mode]);
     }
     if let Some(id) = opts.resume {
-        command.args(["--resume", id]);
+        // One word, so an id starting with `-` is never read as an option
+        // (claude's own launches pass `--resume=<id>` the same way).
+        command.arg(format!("--resume={id}"));
     } else {
         // the pinned id is what CLAUTH_DELEGATE_SESSION_ID names, so a hook
         // exemption keyed on that var scopes to exactly this session
@@ -4956,12 +5036,13 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         runtime.config_dir(),
         &settings_cwd,
         &opts.extra_args,
+        crate::cc_exempt::ArgsFrom::Model,
         &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
         Some(&crate::cc_exempt::hook_command(
             crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND,
         )),
         &settings_file,
-    ) {
+    )? {
         logline!("{warning}");
     }
 
@@ -6029,19 +6110,24 @@ fn prompt_is_path(prompt: &str, cwd: Option<&str>) -> bool {
 /// Read a path-shaped `prompt`. An absolute path is read where it points, with
 /// no cwd containment (the caller named it absolutely); a relative one resolves
 /// under the delegate's `cwd` with the containment checks a caller-supplied
-/// path needs.
+/// path needs. A text starting with `-` is refused.
 fn read_prompt_path(cwd: Option<&str>, raw: &str) -> std::result::Result<String, String> {
     let path = std::path::Path::new(raw);
-    if path.is_absolute() {
+    let text = if path.is_absolute() {
         let real = crate::canonical::identity(path).map_err(|e| {
             format!(
                 "prompt `{}` does not resolve: {e}; check the path or pass text",
                 echo_path(raw)
             )
         })?;
-        return read_resolved_prompt(&real, raw);
+        read_resolved_prompt(&real, raw)?
+    } else {
+        read_prompt_file(cwd, raw)?
+    };
+    if text.starts_with('-') {
+        return Err(PROMPT_LEADING_DASH_REFUSAL.to_string());
     }
-    read_prompt_file(cwd, raw)
+    Ok(text)
 }
 
 /// Join a relative path onto `base` lexically, resolving `.` and `..` without

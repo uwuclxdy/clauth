@@ -8589,12 +8589,17 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     }
 }
 
-/// The per-spawn `--settings` file for the CC permission exemption
+/// The per-spawn `--settings` file for the CC permission exemption and a
+/// shared launch's remembered `cleanupPeriodDays`
 /// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
 /// (the profile dir), not inside it, so the fake-mode mirror never publishes
 /// it into `~/.claude` and `settings_sync` (which reconciles only
-/// `settings.json`) never reads it. Unique per session id; kept while
-/// [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
+/// `settings.json`) never reads it. A launch that carries the number into
+/// this file registers it in the retention record, which rewrites the file
+/// when the number changes — a delegate's own value sits as a floor under the
+/// remembered number, and a value the operator passed on their own
+/// `clauth start -- --settings` is never registered. Unique per session id;
+/// kept while [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
 pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
     // The name carries the session's flavor so GC can find its marker: an
     // isolated session's marker lives in `sessions-isolated-<sid>`, a shared
