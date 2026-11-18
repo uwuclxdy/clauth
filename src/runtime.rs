@@ -14484,6 +14484,19 @@ enum ConvergePrior {
     Teardown,
 }
 
+/// Land a fake-mode session copy's bytes in the profile store through the
+/// synced owner-only writer: the store is what the rotation and capture
+/// machinery read, and it holds a single-use refresh token, so a power loss
+/// must not bring it back as its old bytes. The session-side copy keeps
+/// [`copy_file`], whose sync per file the bulk `~/.claude` mirror cannot
+/// afford.
+fn publish_copy_to_store(copy: &Path, store: &Path) -> Result<()> {
+    let bytes =
+        std::fs::read(copy).with_context(|| format!("failed to read {}", copy.display()))?;
+    crate::profile::atomic_write_600(store, bytes)
+        .with_context(|| format!("failed to write {}", store.display()))
+}
+
 /// Converge the profile store and a fake-mode home's `auth.json` copy at a
 /// session boundary; content-equal is a no-op. The chain's own event decides:
 /// the later `last_refresh` wins, mtime only where a side has no parseable
@@ -14501,7 +14514,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
         (true, false) => copy_file(store, copy),
         // The store must never lag a chain that exists only in the copy: the
         // rotation and capture machinery read the STORE.
-        (false, true) => copy_file(copy, store),
+        (false, true) => publish_copy_to_store(copy, store),
         (true, true) => {
             if files_match(store, copy).unwrap_or(false) {
                 return Ok(());
@@ -14514,7 +14527,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
                 },
             };
             if copy_wins {
-                copy_file(copy, store)
+                publish_copy_to_store(copy, store)
             } else {
                 copy_file(store, copy)
             }

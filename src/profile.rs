@@ -3383,8 +3383,9 @@ pub(crate) fn read_validated_handle(
 }
 
 /// Durable: the temp's bytes are synced before the rename and, on Unix, the
-/// directory after it ([`publish_temp`]), so the new file outlasts a power
-/// loss or a kernel panic as well as a crashed process.
+/// directory after it ([`publish_temp`]), so on Unix the new file outlasts a
+/// power loss or a kernel panic as well as a crashed process; on Windows the
+/// bytes are flushed but nothing flushes the rename.
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     atomic_write_with(path, |f| {
         use std::io::Write;
@@ -3433,6 +3434,12 @@ fn publish_temp(
     #[cfg(test)]
     let durable = durable && TEST_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
     let written = write(&mut f).and_then(|()| if durable { f.sync_all() } else { Ok(()) });
+    #[cfg(test)]
+    let written = if durable {
+        written.and_then(|()| take_sync_fault(path))
+    } else {
+        written
+    };
     drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(tmp);
@@ -3471,9 +3478,11 @@ fn publish_temp(
 
 /// Whether a test build's durable writes sync. Off by default: the suite
 /// writes thousands of stores, and on macOS each sync is an `F_FULLFSYNC`,
-/// which made the write-heavy modules' tests about seven times slower.
-/// Nothing a test reads tells a synced file from an unsynced one, so only the
-/// tests that drive the sync path itself turn this on ([`sync_in_tests`]).
+/// which made the write-heavy modules' tests about seven times slower
+/// (17.3 s against 117.8 s with the syncs on, measured on macOS on
+/// 2026-11-16). Nothing a test reads tells a synced file from an unsynced
+/// one, so only the tests that drive the sync path itself turn this on
+/// ([`sync_in_tests`]).
 #[cfg(test)]
 static TEST_SYNCS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3654,6 +3663,35 @@ fn take_dating_fault(path: &Path) -> std::io::Result<()> {
         .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
     if planted {
         Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The paths whose next durable write fails at its sync step, as a failing
+/// disk's `sync_all` would; each fault fires once.
+#[cfg(test)]
+static SYNC_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_sync(path: &Path) {
+    if let Ok(mut faults) = SYNC_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The sync's result in a test build: an armed fault answers in place of the
+/// real call's, so the writer's handling of a failed sync is what a test
+/// exercises.
+#[cfg(test)]
+fn take_sync_fault(path: &Path) -> std::io::Result<()> {
+    let planted = SYNC_FAULTS
+        .lock()
+        .is_ok_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted sync fault"))
     } else {
         Ok(())
     }

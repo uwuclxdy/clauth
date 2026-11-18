@@ -435,10 +435,14 @@ fn a_failed_store_write_leaves_the_code_live() {
 #[cfg(unix)]
 #[test]
 fn a_failed_directory_sync_leaves_the_code_live() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let _home = HomeSandbox::new();
     let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let dir = clauth_dir().expect("dir");
+    if std::fs::metadata(&dir).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any directory");
+        return;
+    }
     let mode = std::fs::metadata(&dir).expect("mode").permissions();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("drop read");
     let redeemed = redeem(pending.code());

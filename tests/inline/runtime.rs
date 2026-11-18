@@ -17087,6 +17087,59 @@ fn fake_convergence_breaks_a_full_tie_by_the_boundarys_prior() {
     );
 }
 
+/// Every arm that writes the STORE lands through the synced owner-only
+/// writer: a sync fault planted on the store's path fails the converge and
+/// leaves the store's bytes as they were. The session-side copy keeps the
+/// unsynced mirror, so the same fault on the copy's path does not stop a
+/// store→copy converge.
+#[test]
+fn fake_convergence_writes_the_store_through_the_synced_writer() {
+    crate::profile::sync_in_tests();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store.json");
+    let copy = tmp.path().join("copy.json");
+    let store_bytes = stamped_auth("2026-09-16T10:00:00Z", "rt.store");
+    let copy_bytes = stamped_auth("2026-09-16T11:00:00Z", "rt.copy");
+
+    // The `copy_wins` arm: the session rotated later, so the store takes the
+    // copy's bytes through a synced write whose planted failure keeps the
+    // store's old bytes.
+    fs::write(&store, &store_bytes).expect("write store");
+    fs::write(&copy, &copy_bytes).expect("write copy");
+    crate::profile::fail_next_sync(&store);
+    let err = converge_fake_codex_auth(&store, &copy, ConvergePrior::Build)
+        .expect_err("the store write's planted sync failure propagates");
+    assert!(format!("{err:#}").contains("planted sync fault"), "{err:#}");
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        store_bytes.as_bytes(),
+        "a failed store sync keeps the store's old bytes"
+    );
+
+    // The store-only arm writes the store too.
+    fs::remove_file(&store).expect("remove store");
+    crate::profile::fail_next_sync(&store);
+    let err = converge_fake_codex_auth(&store, &copy, ConvergePrior::Build)
+        .expect_err("the store-only arm's planted sync failure propagates");
+    assert!(format!("{err:#}").contains("planted sync fault"), "{err:#}");
+    assert!(!store.exists(), "a failed store sync leaves no store");
+
+    // The mirror stays unsynced: the same fault on the copy's path never
+    // fires on a store→copy converge, which keeps [`copy_file`]'s unsynced
+    // publish.
+    let store_bytes2 = stamped_auth("2026-09-16T12:00:00Z", "rt.store2");
+    fs::write(&store, &store_bytes2).expect("write store");
+    fs::write(&copy, &copy_bytes).expect("write copy");
+    crate::profile::fail_next_sync(&copy);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Teardown)
+        .expect("the session-side mirror never syncs");
+    assert_eq!(
+        fs::read(&copy).expect("read copy"),
+        store_bytes2.as_bytes(),
+        "the store's later rotation still reaches the unsynced copy"
+    );
+}
+
 /// A crashed session's per-session home is collected once its marker reads
 /// dead — and the bare durable store is never touched, whatever GC runs.
 #[test]

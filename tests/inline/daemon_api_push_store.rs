@@ -99,10 +99,14 @@ fn a_key_file_that_does_not_parse_is_never_minted_over() {
 /// directory sync that fails fails the subscription write and the key mint.
 #[test]
 fn a_failed_directory_sync_fails_the_subscription_write_and_the_key_mint() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let _home = HomeSandbox::new();
     let dir = clauth_dir().expect("dir");
     crate::profile::mkdir_700(&dir).expect("mkdir");
+    if std::fs::metadata(&dir).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any directory");
+        return;
+    }
     let mode = std::fs::metadata(&dir).expect("mode").permissions();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("drop read");
     let written = with_state_lock(|held| write_store(held, &Store::empty()));
@@ -111,6 +115,23 @@ fn a_failed_directory_sync_fails_the_subscription_write_and_the_key_mint() {
     let err = written.expect_err("the directory sync's failure fails the subscription write");
     assert!(format!("{err:#}").contains("failed to flush"), "{err:#}");
     let err = minted.expect_err("the directory sync's failure fails the key mint");
+    assert!(format!("{err:#}").contains("failed to flush"), "{err:#}");
+}
+
+/// The flush's own failure, planted in place of the directory's sync, fails
+/// the subscription write and the key mint: a swallow of the sync's result
+/// cannot ship green. Runs as root too, where the chmod fixture above skips.
+#[test]
+fn a_planted_directory_sync_fault_fails_the_subscription_write_and_the_key_mint() {
+    let _home = HomeSandbox::new();
+    let store = store_path().expect("path");
+    devices::fail_next_dir_sync(&store);
+    let written = with_state_lock(|held| write_store(held, &Store::empty()));
+    let err = written.expect_err("the planted directory sync failure fails the subscription write");
+    assert!(format!("{err:#}").contains("failed to flush"), "{err:#}");
+    let key = key_path().expect("path");
+    devices::fail_next_dir_sync(&key);
+    let err = vapid_key().expect_err("the planted directory sync failure fails the key mint");
     assert!(format!("{err:#}").contains("failed to flush"), "{err:#}");
 }
 

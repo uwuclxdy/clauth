@@ -6409,6 +6409,36 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
 
+/// A sync fault planted on one path fails that path's write the way a failing
+/// disk's `sync_all` does: the error propagates, the destination keeps its old
+/// bytes and no temp is left. The fault is per path and one-shot, so a sibling
+/// file's write never sees it and the armed path's next write lands.
+#[test]
+fn a_planted_sync_fault_keeps_the_old_bytes_and_leaves_no_temp() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    let sibling = dir.join("other.json");
+    std::fs::write(&path, b"old").unwrap();
+
+    fail_next_sync(&path);
+    let err = atomic_write_600(&path, b"new").expect_err("the planted sync failure propagates");
+    assert_eq!(err.to_string(), "planted sync fault");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["settings.json"], "a temp stayed behind");
+
+    atomic_write_600(&sibling, b"sibling").expect("the fault is per path");
+    atomic_write_600(&path, b"new").expect("the fault is one-shot");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+}
+
 /// The synced writers and the unsynced one land the same file: the new bytes
 /// over the old ones, owner-only on Unix whatever the old file's mode, and no
 /// temp left beside it. The syncs run for real here ([`sync_in_tests`]), but
