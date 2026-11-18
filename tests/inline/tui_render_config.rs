@@ -575,6 +575,61 @@ fn the_effort_hint_says_whether_the_account_holds_an_effort() {
     }
 }
 
+#[test]
+fn the_effort_hint_names_the_table_or_env_override() {
+    let mut snap = Snap::blank("acct");
+    snap.has_model_effort = true;
+    assert_eq!(
+        row_hint(ConfigRow::Effort, &snap, "").as_deref(),
+        Some("[model_effort] supplies levels for its configured models")
+    );
+    snap.per_model_effort = true;
+    snap.env
+        .push(("CLAUDE_CODE_EFFORT_LEVEL".into(), "max".into()));
+    assert_eq!(
+        row_hint(ConfigRow::Effort, &snap, "high").as_deref(),
+        Some("CLAUDE_CODE_EFFORT_LEVEL in [env] overrides the account's effort levels")
+    );
+}
+
+#[test]
+fn invalid_model_effort_renders_a_red_value_and_an_inline_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut snap = Snap::blank("acct");
+    snap.per_model_effort = true;
+    snap.invalid_effort_entry = true;
+    snap.effort = "max".into();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    term.draw(|frame| {
+        draw_settings_rows(
+            frame,
+            Rect::new(0, 0, 80, 8),
+            &app,
+            &[ConfigRow::Effort],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: true,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
+    let buffer = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buffer);
+    let (y, x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, row)| row.find("max").map(|x| (y, row[..x].chars().count())))
+        .unwrap();
+    assert_eq!(Some(buffer[(x as u16, y as u16)].fg), theme::danger().fg);
+    assert_eq!(rows[y + 1].trim(), "└ low, medium, high or xhigh");
+}
+
 /// The set-effort hint at an 80-column terminal: the detail pane is narrower
 /// than the copy, so the hint word-wraps onto a second line — every word stays
 /// whole and in order, nothing clips.

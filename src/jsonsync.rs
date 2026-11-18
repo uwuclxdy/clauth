@@ -258,14 +258,12 @@ fn run_stamp_error_hook() -> std::io::Result<()> {
     }
 }
 
-/// Where a key sits in a synced document. The walk is one level deep, so
-/// [`KeyPath::Nested`] is only ever asked about keys of a top-level object whose
-/// own rule was [`KeyRule::Nested`]. It names that object (`parent`), so two
-/// nested objects (`env`, `modelSettings`) never share a rule.
+/// Where a key sits in a synced document. Only a nested rule descends.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum KeyPath<'a> {
     Top(&'a str),
     Nested { parent: &'a str, key: &'a str },
+    Leaf { parent: &'a str, key: &'a str },
 }
 
 /// What the syncer does with one key.
@@ -276,8 +274,7 @@ pub(crate) enum KeyRule {
     Shared,
     /// Every member keeps its own value; the winner's never propagates.
     PerProfile,
-    /// Object-valued: descend and rule its keys one by one. Meaningless on a
-    /// [`KeyPath::Nested`] key and treated as [`KeyRule::Shared`] there.
+    /// Object-valued: descend and rule its keys one by one.
     Nested,
 }
 
@@ -734,60 +731,76 @@ fn merge_member(
     target: &Map<String, Value>,
     rule: &impl Fn(KeyPath<'_>) -> KeyRule,
 ) -> Map<String, Value> {
-    let mut merged = target.clone();
-    // Per-profile keys are the target's own; nested ones survive the top-level
-    // pass and are filtered key-by-key below.
-    merged.retain(|k, _| rule(KeyPath::Top(k)) != KeyRule::Shared || winner.contains_key(k));
-    for (k, v) in winner {
-        if rule(KeyPath::Top(k)) == KeyRule::Shared {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
+    merge_object(
+        Some(winner),
+        target,
+        &|key| rule(KeyPath::Top(key)),
+        true,
+        &|parent, winner, target| {
+            merge_object(
+                winner,
+                target,
+                &|key| rule(KeyPath::Nested { parent, key }),
+                false,
+                &|_, winner, target| {
+                    merge_object(
+                        winner,
+                        target,
+                        &|key| rule(KeyPath::Leaf { parent, key }),
+                        false,
+                        &|_, _, _| Map::new(),
+                    )
+                },
+            )
+        },
+    )
+}
 
-    // Nested objects, over the union of both sides' keys so the winner can add
-    // and drop shared entries without disturbing the target's own.
-    let mut nested_keys: Vec<String> = Vec::new();
-    for k in merged.keys().chain(winner.keys()) {
-        if rule(KeyPath::Top(k)) == KeyRule::Nested && !nested_keys.iter().any(|n| n == k) {
-            nested_keys.push(k.clone());
+/// Keep the target's per-profile keys and take shared keys from the winner,
+/// including deletions. A malformed winner object cannot replace local values.
+fn merge_object(
+    winner: Option<&Map<String, Value>>,
+    target: &Map<String, Value>,
+    rule: &impl Fn(&str) -> KeyRule,
+    keep_nested_empty: bool,
+    descend: &impl Fn(&str, Option<&Map<String, Value>>, &Map<String, Value>) -> Map<String, Value>,
+) -> Map<String, Value> {
+    let mut merged = target.clone();
+    merged.retain(|key, _| {
+        rule(key) != KeyRule::Shared || winner.is_some_and(|w| w.contains_key(key))
+    });
+    let mut nested = Vec::new();
+    for key in target.keys() {
+        if rule(key) == KeyRule::Nested {
+            nested.push(key);
         }
     }
-    for key in nested_keys {
-        let winner_value = winner.get(&key);
-        // A winner whose value is not an object cannot be merged key-by-key, and
-        // copying it wholesale would erase every per-profile key the target
-        // holds under it — the exact thing this rule exists to protect. Leave
-        // the target alone; the writers that produce these files reject the
-        // shape outright (`build_claude_settings_json`), so it is a hand-edit or
-        // a truncation that still parsed, and the next tick self-heals.
-        if winner_value.is_some_and(|v| !v.is_object()) {
+    for (key, value) in winner.into_iter().flatten() {
+        match rule(key) {
+            KeyRule::Shared => {
+                merged.insert(key.clone(), value.clone());
+            }
+            KeyRule::Nested if !target.contains_key(key) => nested.push(key),
+            _ => {}
+        }
+    }
+    let empty = Map::new();
+    for key in nested {
+        let incoming = winner.and_then(|w| w.get(key));
+        if incoming.is_some_and(|value| !value.is_object()) {
             continue;
         }
-        let winner_obj = winner_value.and_then(Value::as_object);
-        let target_obj = merged.get(&key).and_then(Value::as_object).cloned();
-        if winner_obj.is_none() && target_obj.is_none() {
-            continue; // neither side holds an object here — leave the target as is
+        let incoming = incoming.and_then(Value::as_object);
+        let local = target.get(key).and_then(Value::as_object);
+        if incoming.is_none() && local.is_none() {
+            continue;
         }
-        let mut nested = target_obj.unwrap_or_default();
-        nested.retain(|nk, _| {
-            rule(KeyPath::Nested {
-                parent: &key,
-                key: nk,
-            }) == KeyRule::PerProfile
-                || winner_obj.is_some_and(|w| w.contains_key(nk))
-        });
-        if let Some(winner_obj) = winner_obj {
-            for (nk, nv) in winner_obj {
-                if rule(KeyPath::Nested {
-                    parent: &key,
-                    key: nk,
-                }) != KeyRule::PerProfile
-                {
-                    nested.insert(nk.clone(), nv.clone());
-                }
-            }
+        let value = descend(key, incoming, local.unwrap_or(&empty));
+        if !keep_nested_empty && value.is_empty() && !incoming.is_some_and(Map::is_empty) {
+            merged.remove(key);
+        } else {
+            merged.insert(key.clone(), Value::Object(value));
         }
-        merged.insert(key, Value::Object(nested));
     }
     merged
 }

@@ -240,6 +240,8 @@ struct Snap {
     effort: String,
     /// The `model` row names one model, so the `effort` row edits its level.
     per_model_effort: bool,
+    invalid_effort_entry: bool,
+    has_model_effort: bool,
     opus: String,
     sonnet: String,
     haiku: String,
@@ -429,6 +431,8 @@ impl Snap {
             model: String::new(),
             effort: String::new(),
             per_model_effort: false,
+            invalid_effort_entry: false,
+            has_model_effort: false,
             opus: String::new(),
             sonnet: String::new(),
             haiku: String::new(),
@@ -555,6 +559,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 model: text(&p.models.default),
                 effort: crate::model_effort::row_level(p).unwrap_or_default(),
                 per_model_effort: crate::model_effort::selected_model(&p.models).is_some(),
+                invalid_effort_entry: crate::model_effort::invalid_selected_entry(p),
+                has_model_effort: !p.model_effort.is_empty(),
                 opus: text(&p.models.opus),
                 sonnet: text(&p.models.sonnet),
                 haiku: text(&p.models.haiku),
@@ -1235,7 +1241,13 @@ fn draw_settings_rows(
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
         let input = row_input(draft, snap, *row);
-        let row_lines = detail_row(
+        let invalid_effort = *row == ConfigRow::Effort
+            && if is_editing || is_new_form {
+                crate::model_effort::invalid_row_level(snap.per_model_effort, &input.value)
+            } else {
+                snap.invalid_effort_entry
+            };
+        let mut row_lines = detail_row(
             *row,
             selected,
             is_editing,
@@ -1244,6 +1256,13 @@ fn draw_settings_rows(
             &input,
             inner.width as usize,
         );
+        if invalid_effort {
+            for (index, line) in row_lines.iter_mut().enumerate() {
+                for span in line.spans.iter_mut().skip(if index == 0 { 2 } else { 1 }) {
+                    span.style = span.style.patch(theme::danger());
+                }
+            }
+        }
         // The tooltip this row carries when focused: its behaviour hint, kept
         // while a text field edits; the bell threshold, a numeric row, swaps
         // in its range tooltip while typing; a name/create refusal renders the
@@ -1263,6 +1282,9 @@ fn draw_settings_rows(
                 }
             }
             ConfigRow::Create => snap.create_refusal.clone(),
+            ConfigRow::Effort if invalid_effort => {
+                Some(crate::model_effort::ROW_LEVELS_HINT.into())
+            }
             _ => None,
         };
         let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
@@ -1298,14 +1320,14 @@ fn draw_settings_rows(
             });
             line_idx += 1;
         }
-        if selected || is_editing {
+        if selected || is_editing || invalid_effort {
             line_idx += tip_len;
             lines.extend(tip_lines);
         }
         if selected || is_editing {
             focus.1 = line_idx as usize;
         }
-        block_ends.push(if selected || is_editing {
+        block_ends.push(if selected || is_editing || invalid_effort {
             line_idx as usize
         } else {
             (line_idx + tip_len) as usize
@@ -1406,11 +1428,22 @@ fn row_hint(row: ConfigRow, snap: &Snap, value: &str) -> Option<String> {
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
         ConfigRow::AdvisorModel => "server-side advisor model in this account",
+        ConfigRow::Effort
+            if snap
+                .env
+                .iter()
+                .any(|(key, value)| key == "CLAUDE_CODE_EFFORT_LEVEL" && !value.is_empty()) =>
+        {
+            "CLAUDE_CODE_EFFORT_LEVEL in [env] overrides the account's effort levels"
+        }
         ConfigRow::Effort if snap.per_model_effort && value.trim().is_empty() => {
             "no level for this model: /effort and Claude Code's default apply"
         }
         ConfigRow::Effort if snap.per_model_effort => {
             "reasoning effort for this model in this account"
+        }
+        ConfigRow::Effort if value.trim().is_empty() && snap.has_model_effort => {
+            "[model_effort] supplies levels for its configured models"
         }
         ConfigRow::Effort if value.trim().is_empty() => {
             "no effort set: /effort and Claude Code's default apply"
@@ -1718,7 +1751,11 @@ fn detail_row(
         }
         // The `model` row's shape: the fixed cycle at rest, a plain text field
         // while typing a custom value.
-        ConfigRow::Effort if !editing => {
+        ConfigRow::Effort
+            if !editing
+                && !snap.invalid_effort_entry
+                && !crate::model_effort::invalid_row_level(snap.per_model_effort, &input.value) =>
+        {
             return effort_cycle_lines(arrow, &input.value, selected, width, snap.per_model_effort);
         }
         ConfigRow::Effort => {

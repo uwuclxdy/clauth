@@ -121,11 +121,8 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
 ///   every key any profile declares in its own `config.toml` `[env]` and every
 ///   key `~/.clauth/base-env.json` records as covered.
-/// - inside `modelSettings`, a model whose level any account pins
-///   ([`crate::model_effort::resolved`]) or `~/.clauth/model-effort.json`
-///   still covers, matched by its canonical name: that level is the
-///   account's. Every other model's settings (a `/effort` on a model no
-///   account pins) stay shared.
+/// - inside `modelSettings`, only the `effortLevel` of a model any account
+///   pins or the base-env record covers stays per-profile.
 ///
 /// `custom_env` is the union across ALL profiles, not just the member's own
 /// owner, and that is REQUIRED — not merely the conservative choice.
@@ -145,13 +142,17 @@ fn key_role(path: KeyPath<'_>, keys: &PerProfileKeys) -> KeyRule {
         KeyPath::Nested {
             parent: "modelSettings",
             key,
-        } => {
-            if crate::model_effort::is_pinned(&keys.models, key) {
-                KeyRule::PerProfile
-            } else {
-                KeyRule::Shared
-            }
-        }
+        } if crate::model_effort::is_pinned(&keys.models, key) => KeyRule::Nested,
+        KeyPath::Nested {
+            parent: "modelSettings",
+            ..
+        } => KeyRule::Shared,
+        KeyPath::Leaf {
+            parent: "modelSettings",
+            key: "effortLevel",
+            ..
+        } => KeyRule::PerProfile,
+        KeyPath::Leaf { .. } => KeyRule::Shared,
         KeyPath::Nested { key, .. } => {
             if MANAGED_ENV_KEYS.contains(&key) || keys.env.contains(key) {
                 KeyRule::PerProfile
@@ -164,7 +165,7 @@ fn key_role(path: KeyPath<'_>, keys: &PerProfileKeys) -> KeyRule {
 
 /// The nested keys every member keeps as its own: `env` keys any profile
 /// declares or the base-env record covers, and `modelSettings` models (by
-/// canonical name) any profile pins or the per-model record covers.
+/// model key) any profile pins or the per-model record covers.
 #[derive(Debug, Default)]
 pub(crate) struct PerProfileKeys {
     pub(crate) env: BTreeSet<String>,
@@ -225,7 +226,7 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
 }
 
 /// [`per_profile_env_keys`] plus the `modelSettings` models every profile
-/// pins and `~/.clauth/model-effort.json` covers, read in the same walk and
+/// pins and `~/.clauth/base-env.json` covers, read in the same walk and
 /// failing closed the same way.
 fn per_profile_keys() -> Option<PerProfileKeys> {
     let mut keys = BTreeSet::new();
@@ -326,20 +327,16 @@ fn per_profile_keys() -> Option<PerProfileKeys> {
             }
         }
     }
-    // A key the active account covers stays per-profile while its record
-    // entry lives, though a hand edit dropped it from that `config.toml`.
-    match crate::claude::saved_base_env_keys() {
-        Ok(covered) => keys.extend(covered),
+    // Covers survive a config edit until the recorded values are restored.
+    match crate::claude::saved_profile_keys() {
+        Ok((covered_env, covered_models)) => {
+            keys.extend(covered_env);
+            models.extend(covered_models);
+        }
         Err(_) => {
             let path = crate::claude::saved_base_env_path().ok()?;
             return warn_paused(&path, "does not parse");
         }
-    }
-    // Likewise a level the per-model record still covers in the live file.
-    let record = crate::model_effort::record_path().ok()?;
-    match crate::model_effort::read_record_at(&record) {
-        Ok(found) => models.extend(found.into_iter().flat_map(|record| record.ids.into_keys())),
-        Err(_) => return warn_paused(&record, "does not parse"),
     }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
     Some(PerProfileKeys { env: keys, models })

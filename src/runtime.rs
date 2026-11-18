@@ -65,7 +65,7 @@
 //! profile's delete does the same for its own trees first
 //! ([`rescue_profile_trees`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,7 +76,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::claude::{build_claude_settings_json, create_symlink};
+use crate::claude::{build_runtime_settings_json, create_symlink};
 use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
@@ -5324,19 +5324,13 @@ pub(crate) fn swap_target_precondition(
 struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]: its `[env]` entry when present,
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]: its `[env]` entry when present,
     /// else the field, else `""`), carried into the swap's settings.json
     /// rewrite. The converge branch mints `None`:
     /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
     /// new, so no caller reads the field there.
     effort: Option<String>,
-    /// The outgoing member's per-model levels
-    /// ([`crate::model_effort::resolved`]), read before the swap: the levels
-    /// the handover takes back out of the session. While an item retry is
-    /// armed these are the retry's outgoing levels, since its handover never
-    /// ran. `None` when unreadable (or on the converge branch).
-    outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
 /// Move the mtime of the store the credential link is about to resolve to.
@@ -5681,15 +5675,11 @@ struct SwapItemRetry {
     member: ProfileName,
     store: PathBuf,
     previous_store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]), written into the session's
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]), written into the session's
     /// settings.json once the item legs land (on macOS the handover write is
     /// deferred to that point). `None` (the adopting read failed) writes `""`.
     effort: Option<String>,
-    /// The outgoing member's per-model levels, as [`SwapPlan`] carries them;
-    /// an adopted retry, whose swap is gone, reads them from the member whose
-    /// store `previous_store` is ([`levels_of_store`]).
-    outgoing_levels: Option<BTreeMap<String, String>>,
 }
 
 /// A [`SwapItemRetry`] in the cell, with its backoff: the attempt it next
@@ -5779,25 +5769,7 @@ fn adopted_item_retry(
         store: canonical.to_path_buf(),
         previous_store: previous_store.to_path_buf(),
         effort,
-        outgoing_levels: levels_of_store(previous_store),
     })
-}
-
-/// The per-model levels ([`crate::model_effort::resolved`]) of the member
-/// whose own credential store `store` is: the outgoing side of a swap whose
-/// item legs never landed, whose levels the session's settings.json still
-/// carries. `None` when `store` is no member's own store or the member's
-/// config does not read.
-fn levels_of_store(store: &Path) -> Option<BTreeMap<String, String>> {
-    let name = store.parent()?.file_name()?.to_str()?;
-    let member = ProfileName::from(name);
-    let own = profile_dir(&member).ok()?.join(store.file_name()?);
-    if crate::canonical::identity(&own).ok()? != crate::canonical::identity(store).ok()? {
-        return None;
-    }
-    crate::profile::read_profile(&member)
-        .ok()
-        .map(|profile| crate::model_effort::resolved(&profile))
 }
 
 /// One-shot shutdown gate for a session's swap executor: `begin` is a Release
@@ -6189,7 +6161,6 @@ impl SessionSwap {
                 member: intended,
                 store,
                 effort: None,
-                outgoing_levels: None,
             });
         }
         let store = swap_target_precondition(&intended, &self.launch, models)?;
@@ -6200,26 +6171,10 @@ impl SessionSwap {
         // this load can still refuse `ProfileUnreadable`.
         let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        // The levels the session's settings.json carries now: while an item
-        // retry is armed its swap's handover never ran, so they are still the
-        // retry's outgoing member's, not the member the cell names.
-        let armed_outgoing = self.cell().item_retry.as_ref().map(|armed| {
-            armed
-                .target
-                .outgoing_levels
-                .clone()
-                .or_else(|| levels_of_store(&armed.target.previous_store))
-        });
-        let outgoing_levels = armed_outgoing.unwrap_or_else(|| {
-            crate::profile::read_profile(&ProfileName::from(self.member()))
-                .ok()
-                .map(|outgoing| crate::model_effort::resolved(&outgoing))
-        });
         Ok(SwapPlan {
             member: intended,
             store,
-            effort: Some(crate::claude::effective_effort(&profile)),
-            outgoing_levels,
+            effort: Some(crate::claude::live_effort(&profile)),
         })
     }
 
@@ -6424,20 +6379,10 @@ impl SessionSwap {
             // that may still read the outgoing member's pair must not run at
             // the incoming member's effort.
             #[cfg(not(target_os = "macos"))]
-            self.write_effort_env(
-                &plan.member,
-                plan.effort.as_deref(),
-                plan.outgoing_levels.as_ref(),
-                record.as_deref(),
-            );
+            self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
             #[cfg(target_os = "macos")]
             if !crate::keychain::enabled() {
-                self.write_effort_env(
-                    &plan.member,
-                    plan.effort.as_deref(),
-                    plan.outgoing_levels.as_ref(),
-                    record.as_deref(),
-                );
+                self.write_effort_env(&plan.member, plan.effort.as_deref(), record.as_deref());
             }
             Ok(SwapOutcome::Swapped)
         })?;
@@ -6481,7 +6426,6 @@ impl SessionSwap {
                 store: plan.store.clone(),
                 previous_store,
                 effort: plan.effort.clone(),
-                outgoing_levels: plan.outgoing_levels.clone(),
             });
             let legs = match &target {
                 Some(target) => self.run_swap_item_legs(target),
@@ -6495,12 +6439,7 @@ impl SessionSwap {
                 // layer onto: what the session reads moved, so the row's
                 // verdict follows.
                 Ok(()) => {
-                    self.land_item_legs(
-                        &plan.member,
-                        &plan.store,
-                        plan.effort.as_deref(),
-                        plan.outgoing_levels.as_ref(),
-                    );
+                    self.land_item_legs(&plan.member, &plan.store, plan.effort.as_deref());
                 }
                 Err(failure) => {
                     let (failed, rerun, retried) = failure.describe();
@@ -6537,13 +6476,7 @@ impl SessionSwap {
     /// caller owns (`read_profile`, the under-hold form); an unreadable member
     /// hands over the carrier alone. Best-effort — a failure is logged naming
     /// the session dir and the swap stands, per the handover's contract.
-    fn write_effort_env(
-        &self,
-        member: &ProfileName,
-        effort: Option<&str>,
-        outgoing_levels: Option<&BTreeMap<String, String>>,
-        record: Option<&Path>,
-    ) {
+    fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
         let levels = match crate::profile::read_profile(member) {
             Ok(profile) => Some(crate::model_effort::resolved(&profile)),
             Err(e) => {
@@ -6563,10 +6496,7 @@ impl SessionSwap {
             effort.unwrap_or(""),
             levels
                 .as_ref()
-                .map(|incoming| crate::model_effort::Handover {
-                    incoming,
-                    outgoing: outgoing_levels,
-                }),
+                .map(|incoming| (incoming, self.isolation == Isolation::Shared)),
         ) {
             logline!(
                 "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",
@@ -6587,13 +6517,7 @@ impl SessionSwap {
     /// hold (a `security` leg must never span the flock) so the record merge
     /// cannot race the settings sync's persist — the same lock the in-hold
     /// rewrite rides on every other platform.
-    fn land_item_legs(
-        &self,
-        member: &ProfileName,
-        store: &Path,
-        effort: Option<&str>,
-        outgoing_levels: Option<&BTreeMap<String, String>>,
-    ) {
+    fn land_item_legs(&self, member: &ProfileName, store: &Path, effort: Option<&str>) {
         self.repoint_row_store(member, store);
         self.retouch_after_item_leg(member, store);
         // The written-copy record the settings reconciler keys echoes on: the
@@ -6607,7 +6531,7 @@ impl SessionSwap {
             Isolation::Isolated => None,
         };
         if let Err(e) = with_state_lock(|_held| {
-            self.write_effort_env(member, effort, outgoing_levels, record.as_deref());
+            self.write_effort_env(member, effort, record.as_deref());
             Ok(())
         }) {
             logline!(
@@ -7110,12 +7034,7 @@ impl SessionSwap {
         match leg(&armed.target) {
             SwapItemLeg::Landed => {
                 let target = &armed.target;
-                self.land_item_legs(
-                    &target.member,
-                    &target.store,
-                    target.effort.as_deref(),
-                    target.outgoing_levels.as_ref(),
-                );
+                self.land_item_legs(&target.member, &target.store, target.effort.as_deref());
                 logline!(
                     "clauth: session {} finished its swap onto {}: its per-session Keychain leg \
                      landed on a swap-poll retry",
@@ -7751,14 +7670,14 @@ impl ProfileRuntime {
                     // the re-armed legs land: the swap that armed them is gone,
                     // so its plan's value is unrecoverable, and the adoption
                     // reads the member's current one instead — the value a
-                    // launch on it would carry (`effective_effort`: its `[env]`
+                    // running session uses (`live_effort`: its `[env]`
                     // entry or the field). The read-only form is the under-hold
                     // one: `load_profile` may rewrite `config.toml` and adopt a
                     // legacy `.pending` sidecar, both through the state flock
                     // this hold already owns.
                     let effort = crate::profile::read_profile(&member)
                         .ok()
-                        .map(|profile| crate::claude::effective_effort(&profile));
+                        .map(|profile| crate::claude::live_effort(&profile));
                     item_retry =
                         adopted_item_retry(launch_store.as_deref(), &canonical, &member, effort);
                 }
@@ -11108,7 +11027,8 @@ fn write_merged_settings(
         }
         _ => None,
     };
-    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    let (mut merged, levels) =
+        build_runtime_settings_json(base.as_deref(), profile, stale_env_keys)?;
     if let Some(days) = carried_days {
         merged = crate::retention::carry_into(merged, days)?;
     }
@@ -11150,6 +11070,7 @@ fn write_merged_settings(
                 .context("failed to write runtime settings.json")?;
         }
     }
+    crate::model_effort::RuntimeLevels::write(&settings_dst, levels, Default::default())?;
     Ok(())
 }
 
@@ -11510,6 +11431,34 @@ pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
         }
     }
     out
+}
+
+/// Refresh the effort carrier of managed sessions on the globally active
+/// account after a Setup edit. The caller holds the state lock.
+pub(crate) fn update_live_effort(profile: &Profile) {
+    let effort = crate::claude::live_effort(profile);
+    let levels = crate::model_effort::resolved(profile);
+    let written = crate::settings_sync::written_record_path().ok();
+    for live in sessions_on_member(live_session_runtime_dirs(), &profile.name) {
+        let shared = live
+            .runtime
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_shared_runtime_dir_name);
+        let record = if shared { written.as_deref() } else { None };
+        if let Err(e) = crate::claude::set_settings_effort(
+            &live.runtime.join("settings.json"),
+            record,
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            &effort,
+            Some((&levels, shared)),
+        ) {
+            logline!(
+                "clauth: session {} could not take the updated effort: {e:#}",
+                live.session
+            );
+        }
+    }
 }
 
 /// Whether a daemon-side writer may adopt the unowned per-session item of

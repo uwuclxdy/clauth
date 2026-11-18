@@ -25,21 +25,14 @@
 //!   record says a switch wrote there for some account, so a session never
 //!   inherits another account's levels;
 //! - the live `~/.claude/settings.json` on a switch ([`apply_live`]), through
-//!   `~/.clauth/model-effort.json`. Before covering a level the user set with
-//!   `/effort`, the record saves it (`base`); a switch to an account that does
-//!   not pin the model, or a switch-off, puts it back (or removes the key when
-//!   there was none) unless the user changed the value meanwhile. The entry
-//!   carries `pending` across the window between the record's pre-write and
-//!   the live write, as `base-env.json`'s entries do, so a failed live write
-//!   never turns the previous account's value into the user's.
+//!   `~/.clauth/base-env.json`, which saves the user's levels and restores
+//!   them when the account stops covering them.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
+use crate::claude::BaseEnvEntry;
 use crate::profile::{ModelSettings, Profile};
 
 /// The values Claude Code's `modelSettings.<model>.effortLevel` schema takes.
@@ -51,6 +44,20 @@ const TIERS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 /// Whether `value` is a level Claude Code keeps per model.
 pub(crate) fn is_level(value: &str) -> bool {
     LEVELS.contains(&value)
+}
+
+pub(crate) const ROW_LEVELS_HINT: &str = "low, medium, high or xhigh";
+
+pub(crate) fn invalid_row_level(per_model: bool, value: &str) -> bool {
+    let value = value.trim();
+    per_model && !value.is_empty() && !is_level(value)
+}
+
+pub(crate) fn invalid_selected_entry(profile: &Profile) -> bool {
+    selected_model(&profile.models)
+        .and_then(|model| selected_entries(profile, model).into_iter().next())
+        .and_then(|key| profile.model_effort.get(&key))
+        .is_some_and(|level| !is_level(level.trim()))
 }
 
 /// The one model an account's `model` row names, or `None` when it names
@@ -75,17 +82,21 @@ pub(crate) fn row_level(profile: &Profile) -> Option<String> {
     let Some(model) = selected_model(&profile.models) else {
         return profile.effort.clone();
     };
-    // The level a launch lands for the model (a table entry or the scalar),
-    // else the first entry at all, so a value Claude Code would drop still
-    // shows, else the scalar.
-    if let Some(level) = resolved(profile).remove(&settings_key(&profile.models, model)) {
-        return Some(level);
-    }
     selected_entries(profile, model)
         .first()
         .and_then(|key| profile.model_effort.get(key))
-        .or(profile.effort.as_ref())
         .cloned()
+        .or_else(|| selected_level(profile))
+        .or_else(|| profile.effort.clone())
+}
+
+pub(crate) fn selected_level(profile: &Profile) -> Option<String> {
+    let model = selected_model(&profile.models)?;
+    let key = settings_key(&profile.models, model);
+    let mut levels = resolved(profile);
+    levels
+        .remove(&key)
+        .or_else(|| tier_of(&key).and_then(|tier| levels.remove(tier)))
 }
 
 /// The `[model_effort]` keys that land on the same `modelSettings` key as
@@ -101,7 +112,7 @@ pub(crate) fn selected_entries(profile: &Profile, model: &str) -> Vec<String> {
 }
 
 /// The order in which `[model_effort]` keys claim their `modelSettings` key:
-/// the selected model's own spelling first, then the table's order. The first
+/// the selected model's own spelling first, then alphabetical order. The first
 /// valid entry for a key wins, in [`resolved_parts`] and on the effort row
 /// alike.
 fn entry_order<'a>(
@@ -114,124 +125,48 @@ fn entry_order<'a>(
     keys
 }
 
-/// The `modelSettings` key clauth writes for a `model` value: a tier with a
-/// `[models]` row resolves to that row's model id, a tier with none stays its
-/// alias (Claude Code resolves an alias key to the tier's current model), and
-/// any other value is a model id. Ids go through [`canonical_model_id`].
+/// Use a configured model id as written. Claude Code resolves aliases and
+/// canonicalizes model ids when it reads settings.
 pub(crate) fn settings_key(models: &ModelSettings, model: &str) -> String {
     let model = model.trim();
-    let lower = model.to_ascii_lowercase();
-    if TIERS.contains(&lower.as_str()) {
-        return match models.field(&lower).map(|id| id.trim()) {
-            Some(id) if !id.is_empty() => canonical_model_id(id),
-            _ => lower,
-        };
+    let alias = model.to_ascii_lowercase();
+    if TIERS.contains(&alias.as_str()) {
+        return models
+            .field(&alias)
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&alias)
+            .to_owned();
     }
-    canonical_model_id(model)
+    model.to_owned()
 }
 
-/// A Claude model id's provider and suffix spellings: an optional path, an
-/// optional Bedrock `region.anthropic.` prefix, then the `claude-` name with an
-/// optional `-fast` / `-latest` trailer, `-YYYYMMDD` / `@YYYYMMDD` date and
-/// `-vN[:N]` version. The lazy name stops at the trailer (group 2), which
-/// [`canonical_model_id`] puts back when the name carries no version number
-/// (`claude-opus-latest`).
-#[allow(clippy::expect_used, reason = "the model-id pattern is a literal")]
-static CLAUDE_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(
-        r"^(?:.*/)?(?:[a-z-]+\.)?(?:anthropic\.)?(claude-[a-z0-9.-]*?)(-fast|-latest)?(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?(?:@\d{8})?$",
-    )
-    .expect("the model-id pattern is a literal")
-});
-
-/// The name Claude Code keys `modelSettings` by, for a model id. Claude Code
-/// maps a Claude model's dated, `-vN`, `[1m]`/`[2m]`, Bedrock and Vertex
-/// spellings to one canonical name, and within one settings file an exact
-/// canonical key beats any other spelling of the same model, so a level
-/// clauth writes under a raw `[models]` id would lose to the user's own
-/// `/effort` entry. A dotted version (`claude-sonnet-4.5`) folds to its
-/// dashed form too, and so does a `-latest` or `-fast` trailer after a
-/// versioned name (`claude-sonnet-4-5-latest` keys as `claude-sonnet-4-5`, as
-/// Claude Code 2.1.316's `hfs` trailer rule reads it), and Sonnet 4 / Opus 4
-/// take their catalog id ([`catalog_id`]). Any other id (a gateway's own
-/// model, or `claude-opus-latest`, which names no version) is left as written
-/// apart from a trailing `[1m]`, as Claude Code leaves it.
-pub(crate) fn canonical_model_id(id: &str) -> String {
-    let id = id.trim();
-    let lower = id.to_ascii_lowercase();
-    let bare = lower
-        .strip_suffix("[1m]")
-        .or_else(|| lower.strip_suffix("[2m]"))
-        .unwrap_or(&lower);
-    if let Some(caps) = CLAUDE_ID.captures(bare) {
-        let name = dash_versions(&caps[1]);
-        let trailer = caps.get(2).map_or("", |m| m.as_str());
-        let name = if trailer.is_empty() || VERSIONED_NAME.is_match(&name) {
-            name
-        } else {
-            format!("{name}{trailer}")
-        };
-        return catalog_id(name);
-    }
-    match lower.strip_suffix("[1m]") {
-        Some(_) => id[..id.len() - "[1m]".len()].to_string(),
-        None => id.to_string(),
-    }
+fn tier_of(key: &str) -> Option<&str> {
+    let name = key.strip_prefix("claude-")?;
+    let (tier, _) = name.split_once('-')?;
+    TIERS.contains(&tier).then_some(tier)
 }
 
-/// A Claude model name in the grammar Claude Code 2.1.316 parses a version
-/// from (its `d`): `claude-<family>-<major>[-<minor>]`, or the legacy
-/// `claude-<major>[-<minor>]-<family>`, with one- or two-digit numbers. Only
-/// such a name loses a `-latest` / `-fast` trailer; an unknown id such as
-/// `claude-custom-123-latest` keeps it, as Claude Code keeps it.
-#[allow(
-    clippy::expect_used,
-    reason = "the versioned-name pattern is a literal"
-)]
-static VERSIONED_NAME: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^claude-(?:[a-z]+-\d{1,2}(?:-\d{1,2})?|\d{1,2}(?:-\d{1,2})?-[a-z]+)$")
-        .expect("the versioned-name pattern is a literal")
-});
-
-/// The catalog id Claude Code keys a model by where it differs from the
-/// folded name: Claude Code 2.1.316's catalog names Sonnet 4 and Opus 4
-/// `claude-sonnet-4-0` and `claude-opus-4-0` (every other catalog id is its
-/// folded first-party name).
-fn catalog_id(name: String) -> String {
-    match name.as_str() {
-        "claude-sonnet-4" | "claude-opus-4" => format!("{name}-0"),
-        _ => name,
-    }
-}
-
-/// `claude-sonnet-4.5` → `claude-sonnet-4-5`: a dot between two digits is a
-/// version separator Claude Code spells with a dash.
-fn dash_versions(name: &str) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let between_digits = *c == '.'
-                && i > 0
-                && chars[i - 1].is_ascii_digit()
-                && chars.get(i + 1).is_some_and(char::is_ascii_digit);
-            if between_digits { '-' } else { *c }
-        })
-        .collect()
-}
-
-/// Whether a `modelSettings` key belongs to a model some account pins:
-/// `pinned` holds [`resolved`] keys (canonical ids, or a tier alias without a
-/// `[models]` row). An alias pin covers every Claude id of its tier, since
-/// Claude Code's `/effort` writes the tier's current model under its
-/// canonical id, which clauth cannot name.
 pub(crate) fn is_pinned(pinned: &std::collections::BTreeSet<String>, key: &str) -> bool {
-    let key = canonical_model_id(key);
-    pinned.contains(&key)
-        || TIERS
-            .iter()
-            .any(|tier| pinned.contains(*tier) && key.starts_with(&format!("claude-{tier}-")))
+    pinned.contains(key) || tier_of(key).is_some_and(|tier| pinned.contains(tier))
+}
+
+/// A user's exact tier key takes precedence over an alias in Claude Code.
+/// Cover existing tier keys as well, preserving explicit exact-id entries.
+pub(crate) fn expand_tier_levels(
+    settings: &serde_json::Map<String, serde_json::Value>,
+    levels: &mut BTreeMap<String, String>,
+) {
+    if let Some(models) = settings
+        .get("modelSettings")
+        .and_then(serde_json::Value::as_object)
+    {
+        for key in models.keys() {
+            if let Some(level) = tier_of(key).and_then(|tier| levels.get(tier)).cloned() {
+                levels.entry(key.clone()).or_insert(level);
+            }
+        }
+    }
 }
 
 /// The account's per-model levels, keyed by the `modelSettings` key clauth
@@ -265,7 +200,6 @@ pub(crate) fn resolved_parts(
     // The scalar is the selected model's level only where no table entry for
     // that model landed.
     if let Some(selected) = selected_model(models)
-        && !model_effort.contains_key(selected)
         && let Some(level) = effort.map(str::trim)
         && is_level(level)
     {
@@ -284,105 +218,6 @@ pub(crate) fn invalid(profile: &Profile) -> Vec<&str> {
         .filter(|(model, level)| !model.trim().is_empty() && !is_level(level.trim()))
         .map(|(model, _)| model.as_str())
         .collect()
-}
-
-/// One model's level as clauth covers it: the user's own `effortLevel` from
-/// before the first cover (`base`, `None` when the key was absent), the level
-/// clauth wrote (`wrote`), and the level clauth's live value still has while a
-/// pre-write has already moved `wrote` on (`pending`), dropped once the live
-/// write lands.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Entry {
-    #[serde(
-        default,
-        deserialize_with = "present_value",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) base: Option<serde_json::Value>,
-    pub(crate) wrote: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pending: Option<String>,
-}
-
-/// A present `base` field, a JSON `null` included, is the user's value; only a
-/// missing one reads as `None`.
-fn present_value<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<serde_json::Value>, D::Error> {
-    serde::Deserialize::deserialize(deserializer).map(Some)
-}
-
-/// The levels a switch covers in the live `~/.claude/settings.json`, keyed by
-/// `modelSettings` key, under a version stamp: `~/.clauth/model-effort.json`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Record {
-    v: u32,
-    #[serde(default)]
-    pub(crate) ids: BTreeMap<String, Entry>,
-}
-
-const RECORD_VERSION: u32 = 1;
-
-impl Default for Record {
-    fn default() -> Self {
-        Self {
-            v: RECORD_VERSION,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-/// `~/.clauth/model-effort.json`, the record of the levels a switch wrote into
-/// the live `~/.claude/settings.json`.
-pub(crate) fn record_path() -> Result<PathBuf> {
-    Ok(crate::profile::clauth_dir()?.join("model-effort.json"))
-}
-
-/// Read a record file, `None` when it does not exist. One that does not parse,
-/// or names another version, is an error, never an empty record: an empty read
-/// would give up the user's levels it holds.
-pub(crate) fn read_record_at(path: &std::path::Path) -> Result<Option<Record>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let context = || {
-        format!(
-            "{} holds the per-model effort levels clauth covers; repair it (removing it gives those levels up)",
-            path.display()
-        )
-    };
-    let record: Record = crate::profile::read_json_file(path).with_context(context)?;
-    if record.v != RECORD_VERSION {
-        return Err(crate::format::parse_error(path.display(), None)).with_context(context);
-    }
-    Ok(Some(record))
-}
-
-/// Write a record file (0o600; `~/.clauth` holds it under the state flock).
-pub(crate) fn write_record_at(path: &std::path::Path, record: &Record) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(record).context("failed to serialize effort record")?;
-    crate::profile::atomic_write_600(path, bytes)
-        .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// Who a covered model's live `effortLevel` belongs to.
-#[derive(Debug, PartialEq)]
-enum Owner {
-    /// clauth wrote it: the user's own level is the entry's `base`.
-    Clauth(Option<serde_json::Value>),
-    /// The user set or deleted it after clauth's write.
-    User,
-}
-
-fn owner(entry: &Entry, live: Option<&serde_json::Value>) -> Owner {
-    match live.and_then(serde_json::Value::as_str) {
-        Some(level) if level == entry.wrote || entry.pending.as_deref() == Some(level) => {
-            Owner::Clauth(entry.base.clone())
-        }
-        _ => Owner::User,
-    }
 }
 
 /// The live `effortLevel` under `modelSettings.<id>`.
@@ -453,36 +288,92 @@ fn set_level(
 pub(crate) fn apply_runtime(
     settings: &mut serde_json::Map<String, serde_json::Value>,
     levels: &BTreeMap<String, String>,
-) -> Result<()> {
-    if settings.contains_key("modelSettings")
-        && let Some(record) = read_record_at(&record_path()?)?
-    {
-        for (id, entry) in &record.ids {
-            if let Owner::Clauth(base) = owner(entry, level_of(settings, id)) {
-                set_level(settings, id, base)?;
+    path: Option<&std::path::Path>,
+) -> Result<BTreeMap<String, String>> {
+    if settings.contains_key("modelSettings") {
+        let saved = crate::claude::saved_model_effort()?;
+        for (id, entry) in saved {
+            if level_of(settings, &id).is_some_and(|live| entry.wrote_live(live)) {
+                set_level(settings, &id, entry.base)?;
             }
         }
     }
+    let mut levels = levels.clone();
+    expand_tier_levels(settings, &mut levels);
+    write_levels(settings, &levels).with_context(|| {
+        let path = path.map_or_else(|| "settings.json".into(), |path| path.display().to_string());
+        format!("fix or remove modelSettings in {path}")
+    })?;
+    Ok(levels)
+}
+
+fn write_levels(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+    levels: &BTreeMap<String, String>,
+) -> Result<()> {
     for (id, level) in levels {
         set_level(settings, id, Some(level.as_str().into()))?;
     }
     Ok(())
 }
 
-/// The per-model half of a swap's effort handover: the incoming account's
-/// levels and, when it could be read, the outgoing account's.
-pub(crate) struct Handover<'a> {
-    pub(crate) incoming: &'a BTreeMap<String, String>,
-    pub(crate) outgoing: Option<&'a BTreeMap<String, String>>,
+/// Applied levels follow the runtime through adoption and Keychain retries.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct RuntimeLevels {
+    current: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    previous: BTreeMap<String, String>,
+}
+
+impl RuntimeLevels {
+    fn path(settings: &std::path::Path) -> std::path::PathBuf {
+        settings.with_file_name(".clauth-model-effort.json")
+    }
+
+    pub(crate) fn read(
+        path: &std::path::Path,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<BTreeMap<String, String>> {
+        let path = Self::path(path);
+        let record: Self = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        Ok(record
+            .previous
+            .into_iter()
+            .chain(record.current)
+            .filter(|(id, level)| {
+                level_of(settings, id).and_then(serde_json::Value::as_str) == Some(level)
+            })
+            .collect())
+    }
+
+    pub(crate) fn write(
+        path: &std::path::Path,
+        current: BTreeMap<String, String>,
+        previous: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let path = Self::path(path);
+        if current.is_empty() && previous.is_empty() && !path.exists() {
+            return Ok(());
+        }
+        let record = Self { current, previous };
+        crate::profile::atomic_write_600(&path, serde_json::to_vec(&record)?)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
 }
 
 /// A swapped session's levels: a model the outgoing account pinned
-/// (`outgoing`, its [`resolved`] levels) and the incoming one does not goes
+/// (as recorded in the runtime) and the incoming one does not goes
 /// back to what a fresh launch would write (`fresh`, the live file after
 /// [`apply_runtime`]) while the session still holds the outgoing level; a level
 /// the user changed or deleted in the session stays. The incoming account's
-/// `levels` then land. `outgoing` is `None` when the outgoing account could not
-/// be read: only the incoming levels land then.
+/// `levels` then land.
 pub(crate) fn hand_over(
     runtime: &mut serde_json::Map<String, serde_json::Value>,
     fresh: &serde_json::Map<String, serde_json::Value>,
@@ -495,111 +386,40 @@ pub(crate) fn hand_over(
             set_level(runtime, id, level_of(fresh, id).cloned())?;
         }
     }
-    for (id, level) in levels {
-        set_level(runtime, id, Some(level.as_str().into()))?;
-    }
-    Ok(())
+    write_levels(runtime, levels)
 }
 
-/// The record a live apply lands around its write: `found` as read (`None`
-/// when absent), `captured` with every new or moved entry, `landed` with every
-/// change.
-pub(crate) struct LivePlan {
-    found: Option<Record>,
-    captured: Record,
-    landed: Record,
-}
-
-/// Land `levels` (the incoming account's, empty on a switch-off) in the live
-/// `~/.claude/settings.json` object and plan the record around it. A covered
-/// model the incoming account does not pin goes back to its `base` while
-/// clauth's level is still live; a level the user changed or deleted stays as
-/// the user left it. Either way its entry retires once the live write lands.
-/// A pinned model keeps its entry's `base` while clauth owns the live value,
-/// and otherwise takes the live value (the user's) as its new `base`.
-///
-/// A record that does not parse fails the apply before anything is written.
+/// Update the same pre-write and landed maps that guard custom env values.
 pub(crate) fn apply_live(
     settings: &mut serde_json::Map<String, serde_json::Value>,
     levels: &BTreeMap<String, String>,
-) -> Result<LivePlan> {
-    let found = read_record_at(&record_path()?)?;
-    let record = found.clone().unwrap_or_default();
-    let mut captured = record.clone();
-    let mut landed = record.clone();
-    for (id, entry) in &record.ids {
-        if levels.contains_key(id) {
-            continue;
-        }
-        if let Owner::Clauth(base) = owner(entry, level_of(settings, id)) {
-            set_level(settings, id, base)?;
-        }
-        landed.ids.remove(id);
-    }
-    for (id, level) in levels {
-        let live = level_of(settings, id).cloned();
-        let held = record.ids.get(id);
-        let (base, pending) = match held.map(|entry| owner(entry, live.as_ref())) {
-            // The live value is clauth's (`wrote`, or a `pending` an earlier
-            // failed takeover left): it stays recognisable until this write
-            // lands, whichever account wrote it.
-            Some(Owner::Clauth(base)) => {
-                let pending = live
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|live| *live != level)
-                    .map(str::to_string);
-                (base, pending)
+    captured: &mut BTreeMap<String, BaseEnvEntry>,
+    landed: &mut BTreeMap<String, BaseEnvEntry>,
+) -> Result<()> {
+    let mut levels = levels.clone();
+    expand_tier_levels(settings, &mut levels);
+    for (id, entry) in captured.iter() {
+        if !levels.contains_key(id) {
+            if level_of(settings, id).is_some_and(|live| entry.wrote_live(live)) {
+                set_level(settings, id, entry.base.clone())?;
             }
-            Some(Owner::User) | None => (live, None),
-        };
-        captured.ids.insert(
-            id.clone(),
-            Entry {
-                base: base.clone(),
-                wrote: level.clone(),
-                pending,
-            },
-        );
-        landed.ids.insert(
-            id.clone(),
-            Entry {
-                base,
-                wrote: level.clone(),
-                pending: None,
-            },
-        );
-        set_level(settings, id, Some(level.as_str().into()))?;
-    }
-    Ok(LivePlan {
-        found,
-        captured,
-        landed,
-    })
-}
-
-impl LivePlan {
-    /// The pre-write, before the live file: every new or moved entry, so a
-    /// crash before the live write still names clauth's values.
-    pub(crate) fn land_before(&self) -> Result<()> {
-        if self.found.as_ref() != Some(&self.captured)
-            && (self.found.is_some() || !self.captured.ids.is_empty())
-        {
-            write_record_at(&record_path()?, &self.captured)?;
-        }
-        Ok(())
-    }
-
-    /// The post-write, after the live file landed: retirements and dropped
-    /// `pending` digests. Best-effort, as the live write already landed.
-    pub(crate) fn land_after(&self) {
-        if self.landed == self.captured {
-            return;
-        }
-        if let Err(e) = record_path().and_then(|path| write_record_at(&path, &self.landed)) {
-            crate::logline::logline!("clauth: {e:#}");
+            landed.remove(id);
         }
     }
+    for (id, level) in &levels {
+        let live = level_of(settings, id).cloned();
+        let value = serde_json::Value::String(level.clone());
+        let owned = captured
+            .get(id)
+            .filter(|entry| live.as_ref().is_some_and(|live| entry.wrote_live(live)));
+        let base = owned.map_or_else(|| live.clone(), |entry| entry.base.clone());
+        let (next, settled) =
+            BaseEnvEntry::capture(base, &value, live.as_ref().filter(|_| owned.is_some()));
+        captured.insert(id.clone(), next);
+        landed.insert(id.clone(), settled);
+        set_level(settings, id, Some(value))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

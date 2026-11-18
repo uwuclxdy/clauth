@@ -826,51 +826,36 @@ fn custom_env_keys_are_unioned_across_every_profile() {
     );
 }
 
-/// A model whose level any account pins stays per-profile, matched by its
-/// canonical name, so the `[1m]` or dated spelling `/effort` might write is
-/// held too; a model no account pins keeps syncing.
 #[test]
-fn a_pinned_models_level_stays_per_profile_under_any_spelling() {
+fn only_a_pinned_models_effort_stays_per_profile() {
     let home = HomeSandbox::new();
-    write_config(home.home(), "p2", "[model_effort]\nsonnet = \"xhigh\"\n");
-    write_config(
-        home.home(),
-        "p1",
-        "effort = \"high\"\n[models]\ndefault = \"opus\"\nopus = \"claude-opus-4-5-20251101[1m]\"\n",
-    );
-    let keys = per_profile_keys().expect("every config.toml parses");
-    let rule = |key| {
-        key_role(
-            KeyPath::Nested {
-                parent: "modelSettings",
-                key,
-            },
-            &keys,
-        )
-    };
-    for spelling in [
-        "claude-opus-4-5",
-        "claude-opus-4-5[1m]",
-        "claude-opus-4-5-20251101",
-        "sonnet",
-    ] {
-        assert_eq!(rule(spelling), KeyRule::PerProfile, "{spelling}");
-    }
-    assert_eq!(rule("claude-haiku-4-5"), KeyRule::Shared);
+    write_config(home.home(), "p", "[model_effort]\nopus = \"high\"\n");
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "low", "autoCompactWindow": 200000},
+            "haiku": {"effortLevel": "medium"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "high", "maxEffortLevel": "xhigh"},
+            "haiku": {"effortLevel": "low"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    let after = read_json(&runtime);
     assert_eq!(
-        key_role(KeyPath::Top("modelSettings"), &keys),
-        KeyRule::Nested
-    );
-    assert_eq!(
-        key_role(
-            KeyPath::Nested {
-                parent: "env",
-                key: "sonnet"
-            },
-            &keys
-        ),
-        KeyRule::Shared,
-        "an env key is never ruled by the model set"
+        after,
+        serde_json::json!({
+            "modelSettings": {
+                "claude-opus-4-5": {"effortLevel": "high", "autoCompactWindow": 200000},
+                "haiku": {"effortLevel": "medium"}
+            }
+        })
     );
 }
 
@@ -879,10 +864,10 @@ fn a_pinned_models_level_stays_per_profile_under_any_spelling() {
 #[test]
 fn a_model_only_the_record_covers_stays_per_profile_and_a_torn_record_pauses() {
     let _home = HomeSandbox::new();
-    let record = crate::model_effort::record_path().unwrap();
+    let record = crate::claude::saved_base_env_path().unwrap();
     crate::profile::atomic_write_600(
         &record,
-        r#"{"v":1,"ids":{"claude-opus-4-5":{"base":"low","wrote":"high"}}}"#,
+        r#"{"v":2,"keys":{},"model_effort":{"claude-opus-4-5":{"base":"low","wrote":"digest"}}}"#,
     )
     .unwrap();
     let keys = per_profile_keys().expect("the record parses");

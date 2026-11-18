@@ -365,8 +365,8 @@ pub(crate) struct Profile {
     /// no single model (unset or `opusplan`) it is written as
     /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json`, the carrier a running
     /// CC 2.1.317 re-reads live, and covers every model. Under a specific model
-    /// a value in [`MODEL_EFFORT_LEVELS`] counts as that model's level instead
-    /// ([`per_model_effort`]); `max` or a custom value keeps the env carrier.
+    /// a value in [`crate::model_effort::LEVELS`] counts as that model's level instead
+    /// ([`Self::model_effort`]); `max` or a custom value keeps the env carrier.
     /// Unset = the key written empty.
     pub(crate) effort: Option<String>,
     /// Per-model reasoning effort, keyed by a `model` row value (a tier alias
@@ -7138,8 +7138,9 @@ fn push_scalar_doc(out: &mut String, key: &str) {
             out.push_str("# its profile directory and credentials stay on disk untouched.\n");
         }
         "effort" => {
-            out.push_str("# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n");
-            out.push_str("# (`effortLevel` is Claude Code's own key).\n");
+            out.push_str("# Reasoning effort for this account. With one model selected, low, medium,\n");
+            out.push_str("# high and xhigh set that model's level unless [model_effort] sets it.\n");
+            out.push_str("# Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n");
         }
         _ => unreachable!("no doc block for modelled scalar {key}"),
     }
@@ -7236,8 +7237,8 @@ fn push_model_effort_doc(out: &mut String) {
     out.push_str("# opus, sonnet, haiku) or a model id. Each is written as that model's\n");
     out.push_str("# modelSettings effortLevel, so /model and `claude --model` keep it.\n");
     out.push_str("# Takes low, medium, high or xhigh; Claude Code ignores any other value.\n");
-    out.push_str("# An account-wide effort (above, or CLAUDE_CODE_EFFORT_LEVEL in [env])\n");
-    out.push_str("# overrides every entry.\n");
+    out.push_str("# A non-empty account-wide effort or CLAUDE_CODE_EFFORT_LEVEL in [env]\n");
+    out.push_str("# overrides every entry. With one model selected, its scalar level is a fallback.\n");
 }
 
 fn model_effort_doc() -> String {

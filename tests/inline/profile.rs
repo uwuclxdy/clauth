@@ -3218,10 +3218,11 @@ fn the_config_comment_names_the_effort_carrier() {
     let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
     assert!(
         rendered.contains(concat!(
-            "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
-            "# (`effortLevel` is Claude Code's own key).\n",
+            "# Reasoning effort for this account. With one model selected, low, medium,\n",
+            "# high and xhigh set that model's level unless [model_effort] sets it.\n",
+            "# Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n",
         )),
-        "the comment names the key and its one carrier: {rendered}"
+        "the comment describes model and account-wide effort: {rendered}"
     );
     assert!(
         rendered.contains("# effort = \"high\"\n"),

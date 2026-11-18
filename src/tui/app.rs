@@ -26940,6 +26940,19 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         .unwrap_or(true);
     if is_new {
         if let Some(d) = app.config_draft.as_mut() {
+            if field == ConfigRow::Effort
+                && crate::model_effort::invalid_row_level(
+                    crate::model_effort::names_one_model(d.model.trimmed()),
+                    d.effort.trimmed(),
+                )
+            {
+                return CommitResult::Refused;
+            }
+            if field == ConfigRow::Model
+                && let Some(seed) = &d.field_seed
+            {
+                reseed_new_effort(&mut d.effort, seed.trim(), d.model.trimmed());
+            }
             d.active = None;
             // A name edit retires the refusals the old name carried.
             if field == ConfigRow::Name {
@@ -27071,15 +27084,7 @@ fn commit_effort_field(app: &mut App) -> bool {
         cfg.find(&name)
             .is_some_and(|p| crate::model_effort::selected_model(&p.models).is_some())
     };
-    if per_model && !raw.is_empty() && !crate::model_effort::is_level(&raw) {
-        app.toast(
-            ToastKind::Warning,
-            format!(
-                "effort not saved\na model's own level is one of {}; set `model` to default \
-                 for an account-wide value",
-                crate::model_effort::LEVELS.join(", ")
-            ),
-        );
+    if crate::model_effort::invalid_row_level(per_model, &raw) {
         return false;
     }
     let effort = (!raw.is_empty()).then_some(raw);
@@ -27303,6 +27308,7 @@ fn cycle_model(app: &mut App) {
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
             let next = next_model_preset(d.model.trimmed_some().as_deref()).unwrap_or_default();
+            reseed_new_effort(&mut d.effort, d.model.trimmed(), &next);
             d.model = InputState::new(&next);
         }
         return;
@@ -27340,6 +27346,15 @@ fn cycle_model(app: &mut App) {
                 escape_control(&error_toast_detail(&e))
             ),
         ),
+    }
+}
+
+/// A new draft has no saved effort for a different model. The account-wide
+/// row still refers to the same value across default and opusplan.
+fn reseed_new_effort(effort: &mut InputState, previous: &str, next: &str) {
+    use crate::model_effort::names_one_model;
+    if previous != next && (names_one_model(previous) || names_one_model(next)) {
+        *effort = InputState::new("");
     }
 }
 
@@ -28471,21 +28486,13 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return;
     }
-    // The same refusal the saved account's effort row gives: under a selected
-    // model the row is that model's level, which has no `max` or custom form.
-    if crate::model_effort::selected_model(&models).is_some()
-        && effort
-            .as_deref()
-            .is_some_and(|level| !crate::model_effort::is_level(level))
-    {
-        app.toast(
-            ToastKind::Warning,
-            format!(
-                "account not created\na model's own level is one of {}; set `model` to default \
-                 for an account-wide value",
-                crate::model_effort::LEVELS.join(", ")
-            ),
-        );
+    if crate::model_effort::invalid_row_level(
+        crate::model_effort::selected_model(&models).is_some(),
+        effort.as_deref().unwrap_or_default(),
+    ) {
+        if let Some(index) = config_row_index(app, ConfigRow::Effort) {
+            app.config_action_cursor = index;
+        }
         return;
     }
     // A fresh login becomes the active one when none is, linking the live

@@ -69899,6 +69899,37 @@ mod effort_row {
     }
 
     #[test]
+    fn the_new_account_model_reseeds_effort_and_refuses_invalid_edits_inline() {
+        use super::super::{CommitResult, commit_config_field, cycle_model};
+
+        let _home = HomeSandbox::new();
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(app.profile_count());
+        enter_config_detail(&mut app);
+
+        let draft = app.config_draft.as_mut().expect("draft");
+        draft.effort = InputState::new("max");
+        draft.model = InputState::new("");
+        cycle_model(&mut app);
+        let draft = app.config_draft.as_mut().expect("draft");
+        assert_eq!(draft.model.value, "fable");
+        assert_eq!(draft.effort.value, "");
+        draft.effort = InputState::new("max");
+        draft.active = Some(ConfigRow::Effort);
+        assert!(matches!(
+            commit_config_field(&mut app, ConfigRow::Effort),
+            CommitResult::Refused
+        ));
+        let draft = app.config_draft.as_ref().expect("draft");
+        assert_eq!(draft.active, Some(ConfigRow::Effort));
+        assert_eq!(draft.effort.value, "max");
+    }
+
+    #[test]
     fn the_new_account_form_refuses_max_under_a_selected_model() {
         let _home = HomeSandbox::new();
         let mut app = App::new(AppConfig {

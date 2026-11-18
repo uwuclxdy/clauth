@@ -2011,11 +2011,9 @@ pub(crate) fn edit_profile_model(
     })
 }
 
-/// Persist a profile's effort: `edit` changes what disk holds now, so the
-/// fields the caller does not touch keep a peer's edit to them. Re-applies to
-/// the live `~/.claude/settings.json` when the profile is active, so a running
-/// `claude` picks the new effort up on its next settings read. Mirrors
-/// [`edit_profile_model`].
+/// Persist a profile's effort against the current config on disk. For the
+/// active profile, update the live carrier so running Claude sessions see the
+/// selected model's new level on their next settings read.
 ///
 /// The slot `edit` sees is the Setup row's ([`crate::model_effort::row_level`]):
 /// while the `model` row names one model, that model's level, which lands in
@@ -2057,6 +2055,7 @@ pub(crate) fn edit_profile_effort(
         if active {
             let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
             apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+            crate::runtime::update_live_effort(&fresh);
         }
         Ok(())
     })

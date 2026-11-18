@@ -6318,7 +6318,6 @@ fn apply_profile_to_claude_settings_inner(
         || !profile.models.is_empty()
         || profile.effort.is_some()
         || !profile.model_effort.is_empty()
-        || crate::model_effort::record_path()?.exists()
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
         // No live file: nothing an earlier clauth wrote can sit in it, so only
@@ -6334,12 +6333,7 @@ fn apply_profile_to_claude_settings_inner(
     }
 
     let build = build_settings(Some(&path), profile, prev_env_keys, Some(before))?;
-    land_live_settings(
-        &path,
-        Some(build.content),
-        &build.record,
-        build.model_effort.as_ref(),
-    )
+    land_live_settings(&path, Some(build.content), &build.record)
 }
 
 /// Switch-off's half of a switch away, run after the credentials and the active
@@ -6348,7 +6342,8 @@ fn apply_profile_to_claude_settings_inner(
 /// value, or leaves when the user had none, and a listed key a profile field
 /// sets leaves, exactly as a switch onto an account without them would. The
 /// keys the departing account's profile fields wrote (endpoint, models,
-/// `apiKeyHelper`) stay as it wrote them.
+/// `apiKeyHelper`) stay as it wrote them. A carrier holding a covered model
+/// level is also cleared.
 ///
 /// Errors when `settings.json` or the record cannot be read or written,
 /// leaving the live file as it was. The caller treats that as a failed
@@ -6375,7 +6370,24 @@ pub(crate) fn release_saved_base_env(
     };
     let unchanged_env = env.clone();
     let unchanged = settings.clone();
-    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]))?;
+    let mut record = settle_custom_env(
+        &mut env,
+        &BTreeMap::new(),
+        prev_env_keys,
+        Some(&[]),
+        settings.get("modelSettings").is_some(),
+    )?;
+    // The per-model cover can also be live through the selected model's env
+    // carrier. Release the carrier when it still holds a covered level.
+    if env.get("CLAUDE_CODE_EFFORT_LEVEL").is_some_and(|value| {
+        record
+            .captured
+            .model_effort
+            .values()
+            .any(|entry| entry.wrote_live(value))
+    }) {
+        env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "".into());
+    }
     let obj = settings
         .as_object_mut()
         .context("settings.json is not an object")?;
@@ -6383,13 +6395,13 @@ pub(crate) fn release_saved_base_env(
         obj.insert("env".into(), env.into());
     }
     // A switch-off pins no model: every level a switch covered goes back.
-    let model_effort = crate::model_effort::apply_live(obj, &BTreeMap::new())?;
+    apply_live_model_effort(obj, &BTreeMap::new(), &mut record, &path)?;
     let content = if settings == unchanged {
         None
     } else {
         Some(serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")?)
     };
-    land_live_settings(&path, content, &record, Some(&model_effort))
+    land_live_settings(&path, content, &record)
 }
 
 /// Write a live build and its record. The stamp and every new or changed
@@ -6402,15 +6414,7 @@ pub(crate) fn release_saved_base_env(
 /// leave a live value its entry does not name, which reads as the user's and
 /// keeps the account's value as theirs. The marker written before it would
 /// end an older clauth's evidence over a live file this apply never wrote.
-///
-/// The per-model record (`model_effort`) lands the same way around the same
-/// write: its pre-write before, its retirements after.
-fn land_live_settings(
-    path: &Path,
-    content: Option<String>,
-    record: &RecordPlan,
-    model_effort: Option<&crate::model_effort::LivePlan>,
-) -> Result<()> {
+fn land_live_settings(path: &Path, content: Option<String>, record: &RecordPlan) -> Result<()> {
     let saves_first = match &record.found {
         Found::Absent => true,
         Found::Read(saved) => record.captured != *saved,
@@ -6418,9 +6422,6 @@ fn land_live_settings(
     };
     if saves_first {
         write_saved_base_env(&record.captured)?;
-    }
-    if let Some(plan) = model_effort {
-        plan.land_before()?;
     }
     if let Some(content) = content {
         #[cfg(test)]
@@ -6441,9 +6442,6 @@ fn land_live_settings(
         // Best-effort: the live write already landed.
         logline!("clauth: {e:#}");
     }
-    if let Some(plan) = model_effort {
-        plan.land_after();
-    }
     Ok(())
 }
 
@@ -6455,13 +6453,13 @@ fn land_live_settings(
 /// here. A live value other than `wrote` is the user's (or Claude Code's),
 /// whatever the record says.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct BaseEnvEntry {
+pub(crate) struct BaseEnvEntry {
     #[serde(
         default,
         deserialize_with = "present_value",
         skip_serializing_if = "Option::is_none"
     )]
-    base: Option<serde_json::Value>,
+    pub(crate) base: Option<serde_json::Value>,
     wrote: String,
     /// The digest clauth's value in the live file still has while a pre-write
     /// has already moved `wrote` on (a takeover, or an edit of the covering
@@ -6473,8 +6471,29 @@ struct BaseEnvEntry {
 }
 
 impl BaseEnvEntry {
+    pub(crate) fn capture(
+        base: Option<serde_json::Value>,
+        value: &serde_json::Value,
+        owned_live: Option<&serde_json::Value>,
+    ) -> (Self, Self) {
+        let wrote = wrote_digest(value);
+        let pending = owned_live
+            .map(wrote_digest)
+            .filter(|digest| *digest != wrote);
+        let landed = Self {
+            base,
+            wrote,
+            pending: None,
+        };
+        let captured = Self {
+            pending,
+            ..landed.clone()
+        };
+        (captured, landed)
+    }
+
     /// Whether `live` is a value clauth wrote under this entry.
-    fn wrote_live(&self, live: &serde_json::Value) -> bool {
+    pub(crate) fn wrote_live(&self, live: &serde_json::Value) -> bool {
         let digest = wrote_digest(live);
         digest == self.wrote || self.pending.as_ref() == Some(&digest)
     }
@@ -6513,9 +6532,11 @@ struct SavedBaseEnv {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     migrating: bool,
     keys: BTreeMap<String, BaseEnvEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_effort: BTreeMap<String, BaseEnvEntry>,
 }
 
-const SAVED_BASE_ENV_VERSION: u32 = 1;
+const SAVED_BASE_ENV_VERSION: u32 = 2;
 
 impl Default for SavedBaseEnv {
     fn default() -> Self {
@@ -6524,6 +6545,7 @@ impl Default for SavedBaseEnv {
             active: None,
             migrating: false,
             keys: BTreeMap::new(),
+            model_effort: BTreeMap::new(),
         }
     }
 }
@@ -6532,13 +6554,20 @@ pub(crate) fn saved_base_env_path() -> Result<PathBuf> {
     Ok(crate::profile::clauth_dir()?.join("base-env.json"))
 }
 
-/// The env keys the record holds an entry for: each is covered in the live
-/// file until its entry retires, whatever the accounts' `config.toml` now
-/// says. Keys only; no saved value leaves this module. An absent record holds
-/// none; one that does not parse is an error, never an empty set.
-pub(crate) fn saved_base_env_keys() -> Result<BTreeSet<String>> {
+pub(crate) fn saved_profile_keys() -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     Ok(read_saved_base_env()?
-        .map(|saved| saved.keys.into_keys().collect())
+        .map(|saved| {
+            (
+                saved.keys.into_keys().collect(),
+                saved.model_effort.into_keys().collect(),
+            )
+        })
+        .unwrap_or_default())
+}
+
+pub(crate) fn saved_model_effort() -> Result<BTreeMap<String, BaseEnvEntry>> {
+    Ok(read_saved_base_env()?
+        .map(|saved| saved.model_effort)
         .unwrap_or_default())
 }
 
@@ -6552,12 +6581,12 @@ fn read_saved_base_env() -> Result<Option<SavedBaseEnv>> {
     }
     let context = || {
         format!(
-            "{} holds the ~/.claude/settings.json env values your profiles' [env] keys cover; repair it (removing it gives those values up)",
+            "{} holds env values and per-model effort levels covered in ~/.claude/settings.json; repair it (removing it gives those values up)",
             path.display()
         )
     };
     let saved: SavedBaseEnv = read_json_file(&path).with_context(context)?;
-    if saved.v != SAVED_BASE_ENV_VERSION {
+    if saved.v != SAVED_BASE_ENV_VERSION && !(saved.v == 1 && saved.model_effort.is_empty()) {
         return Err(crate::format::parse_error(path.display(), None)).with_context(context);
     }
     Ok(Some(saved))
@@ -6908,12 +6937,32 @@ struct RecordPlan {
     landed: SavedBaseEnv,
 }
 
-/// A settings build, plus its record plans; `model_effort` is `Some` for a
-/// build that lands in `~/.claude/settings.json`.
+/// A settings build and its record plan.
 struct SettingsBuild {
     content: String,
+    runtime_levels: BTreeMap<String, String>,
     record: RecordPlan,
-    model_effort: Option<crate::model_effort::LivePlan>,
+}
+
+fn apply_live_model_effort(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+    levels: &BTreeMap<String, String>,
+    record: &mut RecordPlan,
+    path: &Path,
+) -> Result<()> {
+    if levels.is_empty() && record.captured.model_effort.is_empty() {
+        return Ok(());
+    }
+    crate::model_effort::apply_live(
+        settings,
+        levels,
+        &mut record.captured.model_effort,
+        &mut record.landed.model_effort,
+    )
+    .with_context(|| format!("fix or remove modelSettings in {}", path.display()))?;
+    record.captured.v = SAVED_BASE_ENV_VERSION;
+    record.landed.v = SAVED_BASE_ENV_VERSION;
+    Ok(())
 }
 
 /// Settle the custom keys of `env` (a settings `env` object) for an account
@@ -6936,6 +6985,7 @@ fn settle_custom_env(
     profile_env: &BTreeMap<String, String>,
     prev_env_keys: &[String],
     live: Option<&[&BTreeMap<String, String>]>,
+    needs_model_record: bool,
 ) -> Result<RecordPlan> {
     let covering: Vec<(&String, &String)> = match live {
         Some(_) => profile_env
@@ -6945,7 +6995,8 @@ fn settle_custom_env(
         None => Vec::new(),
     };
     let leaving = |key: &str| !profile_env.contains_key(key) && keeps_base_value(key);
-    let needed = !covering.is_empty()
+    let needed = needs_model_record
+        || !covering.is_empty()
         || prev_env_keys
             .iter()
             .any(|key| leaving(key) && env.contains_key(key));
@@ -7005,21 +7056,8 @@ fn settle_custom_env(
             LiveOwner::User => live_value.cloned(),
             LiveOwner::Missing => None,
         };
-        let landed_entry = BaseEnvEntry {
-            base,
-            wrote: wrote_digest(&value.as_str().into()),
-            pending: None,
-        };
-        // The pre-write keeps the digest of the clauth value still live
-        // until the live write lands; the update after it drops it.
-        let live_digest = live_value
-            .filter(|_| clauths)
-            .map(wrote_digest)
-            .filter(|digest| *digest != landed_entry.wrote);
-        let next = BaseEnvEntry {
-            pending: live_digest,
-            ..landed_entry.clone()
-        };
+        let (next, landed_entry) =
+            BaseEnvEntry::capture(base, &value.as_str().into(), live_value.filter(|_| clauths));
         if entry != Some(&next) {
             captured.keys.insert(key.clone(), next);
         }
@@ -7220,9 +7258,7 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
 /// The account-wide effort a launch on `profile` carries in
 /// `CLAUDE_CODE_EFFORT_LEVEL`: the profile's own `[env]` entry when present
 /// (the builder's "profile env last" pass lets it win over the field), else
-/// the `effort` field, else `""` — the one rule shared by the settings builder
-/// and every swap-side handover, so a moved live session gets exactly what a
-/// fresh launch on the member would write.
+/// the `effort` field, else `""`.
 ///
 /// While the `model` row names one model, an `effort` Claude Code keeps per
 /// model is that model's level instead ([`crate::model_effort::resolved`]) and
@@ -7238,6 +7274,16 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
         Some(_) if crate::model_effort::is_level(effort.trim()) => String::new(),
         _ => effort,
     }
+}
+
+/// A running session rereads the env carrier. Its per-model table was
+/// loaded at startup, so hand over the selected model's configured level here.
+pub(crate) fn live_effort(profile: &Profile) -> String {
+    let launch = effective_effort(profile);
+    if profile.env.contains_key("CLAUDE_CODE_EFFORT_LEVEL") || !launch.is_empty() {
+        return launch;
+    }
+    crate::model_effort::selected_level(profile).unwrap_or_default()
 }
 
 /// The account's per-model levels for a build, logging (once per account and
@@ -7282,11 +7328,10 @@ fn model_effort_levels(profile: &Profile) -> BTreeMap<String, String> {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The profile's effort rides
-/// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
-/// profile's own `[env]` entry outranking the `effort` field
-/// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
-/// carrier; `effortLevel` is Claude Code's own key and is never written here.
+/// previous profile's model routing. Per-model levels are written under
+/// `modelSettings.<model>.effortLevel`. Fresh runtimes use
+/// [`effective_effort`] for the env carrier. A live settings write uses
+/// [`live_effort`] so a running session can pick up the selected model's level.
 ///
 /// `base` is the settings file to merge onto; `None` (or a missing path) starts
 /// from an empty object — used for an isolated runtime that must carry no
@@ -7297,6 +7342,15 @@ pub(crate) fn build_claude_settings_json(
     prev_env_keys: &[String],
 ) -> Result<String> {
     Ok(build_settings(base, profile, prev_env_keys, None)?.content)
+}
+
+pub(crate) fn build_runtime_settings_json(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+) -> Result<(String, BTreeMap<String, String>)> {
+    let build = build_settings(base, profile, prev_env_keys, None)?;
+    Ok((build.content, build.runtime_levels))
 }
 
 /// The `[env]` a session on `profile` carries. A proxy account, its `[proxy]`
@@ -7336,12 +7390,15 @@ fn build_settings(
         settings["env"] = serde_json::json!({});
     }
 
+    let levels = model_effort_levels(profile);
+    let needs_model_record =
+        live.is_some() && (!levels.is_empty() || settings.get("modelSettings").is_some());
     let env = settings["env"]
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
     let session_env = session_env(profile);
-    let record = settle_custom_env(env, &session_env, prev_env_keys, live)?;
+    let mut record = settle_custom_env(env, &session_env, prev_env_keys, live, needs_model_record)?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -7386,7 +7443,12 @@ fn build_settings(
     // same value.
     env.insert(
         "CLAUDE_CODE_EFFORT_LEVEL".into(),
-        effective_effort(profile).into(),
+        if live.is_some() {
+            live_effort(profile)
+        } else {
+            effective_effort(profile)
+        }
+        .into(),
     );
 
     // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key,
@@ -7423,13 +7485,11 @@ fn build_settings(
     // Per-model levels ride `modelSettings.<model>.effortLevel`, the key
     // Claude Code's `/effort` writes; the live file lands them through the
     // record so a level the user set comes back on a switch away.
-    let levels = model_effort_levels(profile);
-    let model_effort = match live {
-        Some(_) => Some(crate::model_effort::apply_live(obj, &levels)?),
-        None => {
-            crate::model_effort::apply_runtime(obj, &levels)?;
-            None
-        }
+    let runtime_levels = if let Some(path) = base.filter(|_| live.is_some()) {
+        apply_live_model_effort(obj, &levels, &mut record, path)?;
+        BTreeMap::new()
+    } else {
+        crate::model_effort::apply_runtime(obj, &levels, base)?
     };
 
     // An api-key profile mints its key via CC's top-level `apiKeyHelper`
@@ -7459,7 +7519,7 @@ fn build_settings(
         content: serde_json::to_string_pretty(&settings)
             .context("failed to serialize settings.json")?,
         record,
-        model_effort,
+        runtime_levels,
     })
 }
 
@@ -7497,7 +7557,7 @@ pub(crate) fn set_settings_effort(
     record: Option<&Path>,
     key: &str,
     value: &str,
-    levels: Option<crate::model_effort::Handover<'_>>,
+    levels: Option<(&BTreeMap<String, String>, bool)>,
 ) -> Result<()> {
     let meta = std::fs::metadata(settings_path)
         .with_context(|| format!("failed to stat {}", settings_path.display()))?;
@@ -7520,15 +7580,12 @@ pub(crate) fn set_settings_effort(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
     env.insert(key.into(), value.into());
-    if let Some(crate::model_effort::Handover {
-        incoming: levels,
-        outgoing,
-    }) = levels
-    {
+    let mut applied = None;
+    if let Some((levels, shared)) = levels {
         let mut handed = settings.clone();
-        let handover = (|| -> Result<()> {
+        let handover = (|| -> Result<BTreeMap<String, String>> {
             let live = claude_settings_path()?;
-            let mut fresh: serde_json::Value = if live.exists() {
+            let mut fresh: serde_json::Value = if shared && live.exists() {
                 read_json_file(&live)?
             } else {
                 serde_json::json!({})
@@ -7536,18 +7593,30 @@ pub(crate) fn set_settings_effort(
             let fresh = fresh
                 .as_object_mut()
                 .context("settings.json is not an object")?;
-            crate::model_effort::apply_runtime(fresh, levels)?;
-            crate::model_effort::hand_over(
-                handed
-                    .as_object_mut()
-                    .context("settings.json is not an object")?,
-                fresh,
-                levels,
-                outgoing,
-            )
+            crate::model_effort::apply_runtime(fresh, &BTreeMap::new(), Some(&live))?;
+            let runtime = handed
+                .as_object_mut()
+                .context("settings.json is not an object")?;
+            let outgoing = crate::model_effort::RuntimeLevels::read(settings_path, runtime)?;
+            let mut incoming = levels.clone();
+            crate::model_effort::expand_tier_levels(runtime, &mut incoming);
+            crate::model_effort::expand_tier_levels(fresh, &mut incoming);
+            crate::model_effort::hand_over(runtime, fresh, &incoming, Some(&outgoing))?;
+            // Keep the settings file's previous level recognizable until this write lands.
+            if incoming != outgoing {
+                crate::model_effort::RuntimeLevels::write(
+                    settings_path,
+                    incoming.clone(),
+                    outgoing,
+                )?;
+            }
+            Ok(incoming)
         })();
         match handover {
-            Ok(()) => settings = handed,
+            Ok(incoming) => {
+                settings = handed;
+                applied = Some(incoming);
+            }
             Err(e) => logline!(
                 "clauth: {} took the effort but not the per-model levels: {e:#}",
                 settings_path.display()
@@ -7570,7 +7639,14 @@ pub(crate) fn set_settings_effort(
         true,
         None,
     )
-    .with_context(|| format!("failed to write {}", settings_path.display()))
+    .with_context(|| format!("failed to write {}", settings_path.display()))?;
+    if let Some(applied) = applied
+        && let Err(e) =
+            crate::model_effort::RuntimeLevels::write(settings_path, applied, BTreeMap::new())
+    {
+        logline!("clauth: {e:#}");
+    }
+    Ok(())
 }
 
 /// Whether the outgoing snapshot would read the active profile's own unreadable
