@@ -5785,8 +5785,10 @@ pub(crate) struct App {
     /// a clamp) returns the cursor to it where the item set still holds it. A
     /// claude row is remembered as `profile_cursor` itself (the stored index
     /// is ignored, never a copy), a codex or pool row literally, so a pick on
-    /// another tab lands the Overview there for free while a codex/pool row
-    /// stays put; a filter merely hides it, so the round trip restores it.
+    /// another tab lands the Overview there for free (a disabled account, which
+    /// has no row there, excepted: the placement clamps and
+    /// [`App::overview_held`] keeps the pick) while a codex/pool row stays put;
+    /// a filter merely hides it, so the round trip restores it.
     pub(crate) overview_remembered: Option<MainItemKind>,
     /// The disabled claude account the shared selection named when the
     /// Overview was entered over it, with the shared cursor's move count right
@@ -9403,8 +9405,9 @@ impl App {
     }
 
     /// The disabled account the shared selection names: the Overview gives it
-    /// no row, so the entry placement moves the shared cursor onto a shown
-    /// row, and [`App::overview_held`] puts the selection back on leave.
+    /// no row, so the entry placement moves the shared cursor onto the shown
+    /// claude row it lands on (a codex or pool landing leaves it), and
+    /// [`App::overview_held`] puts the selection back on leave.
     fn hidden_claude_selection(&self) -> Option<ProfileName> {
         let cursor = self.profile_cursor.read();
         if !self.is_disabled_item(MainItemKind::Profile(cursor)) {
@@ -19335,9 +19338,10 @@ fn activate_main_item(app: &mut App) {
     }
 }
 
-/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the account under the
-/// Overview cursor between, `None` off an account row or at that end of the
-/// roster.
+/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` moves the account under the
+/// Overview cursor between: its own and the next claude row the Overview
+/// shows that way, past any disabled account; `None` off a claude row or
+/// at that end of the shown claude rows.
 fn main_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return None;
