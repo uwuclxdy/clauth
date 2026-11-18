@@ -646,7 +646,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         assert_eq!(status, 200, "{answer}");
     };
     bridge_event(serde_json::json!({
-        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]
     }));
 
     let sink = SharedSink::new();
@@ -708,7 +708,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         .expect("a snapshot frame");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&snapshot.2).expect("snapshot json")["sessions"],
-        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true}])
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}])
     );
     let ask = frames
         .iter()

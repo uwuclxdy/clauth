@@ -1445,8 +1445,8 @@ test('CL3: the clear end goes out under the ended id, and the new id start carri
   expect(bridge.events.filter(b => b.kind === 'end').map(b => b.session)).toEqual(['sid-1'])
   const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, ...rest }) => rest)
   expect(starts).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
-    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
+    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
+    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
   ])
 })
 
@@ -2017,13 +2017,13 @@ test('PQ8: a delivered prompt is reported by its id, and one with no id reports 
   expect(promptReports(bridge)).toEqual([{ prompt: 'p7', state: 'delivered' }])
 })
 
-test('PQ9: the start event tells the daemon this mod reports prompt outcomes', async ($, on) => {
+test('PQ9: the start event tells the daemon this mod reports prompt outcomes and takes notes', async ($, on) => {
   const { clock, bridge } = setup(on)
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const starts = bridge.events.filter(e => e.kind === 'start')
   expect(starts.map(({ seq, ...rest }) => rest)).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true },
+    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true, caps: ['notes'] },
   ])
 })
 
@@ -2066,6 +2066,20 @@ test('PQ15: every poll tells the daemon this mod reports prompt outcomes', async
   expect(polls.length).toBeGreaterThan(1)
   for (const f of polls) {
     expect(f.url).toContain('prompt_reports=1')
+  }
+})
+
+// A restarted daemon meets a live mod by its poll first, so every poll names
+// the mod's capabilities as well as its start.
+test('PQ23: every poll tells the daemon this mod takes notes', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(1)
+  for (const f of polls) {
+    expect(/[?&]caps=notes(&|$)/.test(f.url)).toBe(true)
   }
 })
 

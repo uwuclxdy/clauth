@@ -979,3 +979,38 @@ fn a_flagged_poll_over_the_socket_turns_prompt_ids_on() {
         "a flagged poll left ids off"
     );
 }
+
+/// A restarted daemon first meets a live mod by its poll, so the poll's
+/// `caps` query (names joined by commas), read through the real `serve` path,
+/// sets the instance's capabilities, and each poll replaces them: a later poll
+/// with none (an older mod after a module reload) leaves none.
+#[test]
+fn a_polls_caps_set_the_instances_caps_and_each_poll_replaces_them() {
+    let _home = HomeSandbox::new();
+    let me = std::process::id();
+    let events = AtomicUsize::new(0);
+    let parked = AtomicUsize::new(0);
+
+    let (_t, r) = table(&[(me, instance("s-self", "1"))]);
+    let hub = Hub::new(true, r);
+    let out = serve_poll_once(
+        &hub,
+        &events,
+        &parked,
+        "session=s-self&prompt_reports=1&caps=notes,teleport",
+    );
+    assert!(out.starts_with("HTTP/1.1 200"), "{out:?}");
+    assert_eq!(
+        hub.snapshot()["sessions"][0]["caps"],
+        serde_json::json!(["notes"]),
+        "a poll's caps set the instance's"
+    );
+
+    let out = serve_poll_once(&hub, &events, &parked, "session=s-self&prompt_reports=1");
+    assert!(out.starts_with("HTTP/1.1 200"), "{out:?}");
+    assert_eq!(
+        hub.snapshot()["sessions"][0]["caps"],
+        serde_json::json!([]),
+        "a poll with no caps leaves none"
+    );
+}

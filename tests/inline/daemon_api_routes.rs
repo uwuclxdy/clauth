@@ -1763,8 +1763,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             &mut produced,
         );
         // An open question ask refuses a decision (the wrong form), an answer
-        // naming none of its questions, then an empty one, keeping the ask
-        // open for all three.
+        // naming none of its questions, an empty one, then a note its mod
+        // (one declaring no capabilities) would drop, keeping the ask open
+        // for all four.
         let question = serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "ask_opened", "ask": "q2", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
         assert_eq!(
             ctx_bridge
@@ -1779,6 +1780,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             r#"{"decision":"allow"}"#,
             r#"{"answers":{"Which color?":"blue"}}"#,
             r#"{"answers":{"Which colour?":""}}"#,
+            r#"{"answers":{"Which colour?":"blue"},"notes":{"Which colour?":"darker"}}"#,
         ] {
             let refused = call(
                 &ctx_bridge,
@@ -5421,13 +5423,12 @@ fn status_serves_the_banked_resets_each_account_read() {
     assert_eq!(count("alpha"), 2, "alpha reached the route");
 }
 
-/// `SessionRow`'s `via`/`lacks` stay optional (the 2026-10-16 additive-field
-/// ruling): documented, but absent from `required`, so a generated client never
-/// types them as required.
+/// `SessionRow`'s additive `via`/`lacks`/`caps` stay optional: documented, but
+/// absent from `required`, so a generated client never types them as required.
 #[test]
-fn session_row_keeps_via_and_lacks_optional() {
+fn session_row_keeps_its_reach_fields_optional() {
     let required = served_required("SessionRow");
-    for additive in ["via", "lacks"] {
+    for additive in ["via", "lacks", "caps"] {
         assert!(
             documents("SessionRow", additive),
             "SessionRow documents {additive}"

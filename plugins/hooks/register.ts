@@ -74,6 +74,11 @@ const MAX_PROMPT_TRIES = 3
 // The `session.end` reasons the process survives: 2.1.322's types give both
 // `clear` and `resume` as the process going on under another session id.
 const CONTINUING_ENDS = new Set(['clear', 'resume'])
+// The capabilities this mod declares to the daemon, on its `start` and on every
+// poll (a restarted daemon meets a live mod by its poll first). The daemon
+// refuses a phone note to a session whose mod does not name `notes`, so a note
+// is refused rather than dropped by a mod that cannot apply it.
+const CAPS = ['notes'] as const
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
@@ -825,7 +830,7 @@ async function doPoll($: EngineInterface): Promise<void> {
     try {
       res = await fetchBridge(
         $,
-        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1`,
+        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1&caps=${CAPS.join(',')}`,
         'GET',
       )
     } catch {
@@ -2212,7 +2217,7 @@ export const register: Register = on => {
     interruptedTurn = null
     await loadPrompts($)
     await $.state.set(HELD, null)
-    startFields = { cwd: e.cwd, interactive: e.isInteractive, prompt_reports: true }
+    startFields = { cwd: e.cwd, interactive: e.isInteractive, prompt_reports: true, caps: [...CAPS] }
     void postEvent($, 'start', startFields)
     startPollLoop($)
     return next(e)

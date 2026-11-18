@@ -48,7 +48,7 @@ fn ncmds(answer: &(u16, serde_json::Value)) -> usize {
 }
 
 fn start(hub: &Hub, pid: u32, session: &str) {
-    let body = json!({"session": session, "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true});
+    let body = json!({"session": session, "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]});
     assert_eq!(ev(hub, pid, body).0, 200, "start for {session} from {pid}");
 }
 
@@ -224,7 +224,7 @@ fn a_transient_unreadable_record_keeps_the_instance() {
     );
     assert_eq!(opened.1["hold"], true);
     t.lock().unwrap().remove(&me);
-    let _ = hub.live_session_ids();
+    drop(hub.live_session_caps());
     t.lock().unwrap().insert(me, instance("s1", &start));
     let _ = hub.poll(me, "s1", Duration::ZERO);
     let queued = matches!(
