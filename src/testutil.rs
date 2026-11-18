@@ -4470,14 +4470,14 @@ pub(crate) struct FakeSupervisor {
     pub(crate) proc_start: String,
 }
 
-/// Reaps the child it owns when [`FakeSupervisor::spawn`] panics between the
-/// spawn and the `FakeSupervisor` hand-back (the readiness assert or the
-/// start-time read). Drop never asserts — the reaping is best-effort, exactly
-/// like [`FakeSupervisor`]'s own.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-struct ReapChild(Option<std::process::Child>);
+/// Kills and reaps the child it owns on drop, so a test or helper that
+/// panics between the spawn and its own cleanup (a readiness assert, a
+/// later check) leaves no process looping. Drop never asserts — the reaping
+/// is best-effort, exactly like [`FakeSupervisor`]'s own.
+#[cfg(all(test, unix))]
+pub(crate) struct ReapChild(pub(crate) Option<std::process::Child>);
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, unix))]
 impl Drop for ReapChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {

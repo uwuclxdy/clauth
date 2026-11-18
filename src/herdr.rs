@@ -1019,9 +1019,10 @@ fn short_commit(commit: &str) -> &str {
 }
 
 /// The one kill-on-deadline reap loop: [`bounded_output`] spawns and hands
-/// its child here, and the heal's install and remote probe spawn their own so
-/// a failed spawn is named at the call site rather than read as a timeout.
-fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
+/// its child here, and the heal's install and remote probe, and `clauth rex`'s
+/// config reload, spawn their own so a failed spawn is named at the call site
+/// rather than read as a timeout.
+pub(crate) fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -1105,8 +1106,8 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines.
-fn confirm(question: &str, yes: bool) -> Result<bool> {
+/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines. `clauth rex` shares it.
+pub(crate) fn confirm(question: &str, yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }

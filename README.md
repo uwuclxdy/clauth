@@ -187,6 +187,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [REST API](https://github.com/uwuclxdy/clauth/wiki/REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server, `delegate` in full, answering a session from your phone |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
+| [Rex plugin](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) | experimental: Claude Code panes through clauth in Rex, the dashboard, the per-pane account label |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |
 | [Codex](https://github.com/uwuclxdy/clauth/wiki/Codex) | ChatGPT logins as codex profiles: capture, sessions, the codex chain |
 | [Security](https://github.com/uwuclxdy/clauth/wiki/Security) | where credentials live and how they move |
