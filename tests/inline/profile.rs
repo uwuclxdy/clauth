@@ -6481,10 +6481,10 @@ fn a_synced_dated_write_still_lands_its_mtime() {
 }
 
 /// The unsynced writer stays on the files a tick rewrites and the next tick
-/// rebuilds: `status.json` (the daemon's tick and its post-switch publish),
-/// `tps_cache.json` and `tps_attribution.json`. A new call anywhere else, a
+/// rebuilds (`status.json`, `tps_cache.json`). A new call anywhere else, a
 /// credential store above all, has to change this list, and so has to say why
-/// that file may come back empty after a power loss.
+/// that file may come back empty after a power loss. The scan reads call sites
+/// by name: an alias or a function pointer to the writer is invisible to it.
 #[test]
 fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -6508,16 +6508,110 @@ fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer() {
         }
     }
     calls.sort();
-    assert_eq!(
-        calls,
-        [
-            ("daemon/mod.rs".to_string(), 2),
-            ("tps.rs".to_string(), 1),
-            ("usage/scheduler.rs".to_string(), 1),
-        ],
-        "the unsynced writer's callers moved"
-    );
+    let expected: Vec<(String, usize)> = UNSYNCED_WRITERS
+        .iter()
+        .map(|(module, count, _)| ((*module).to_string(), *count))
+        .collect();
+    assert_eq!(calls, expected, "the unsynced writer's callers moved");
 }
+
+/// The documents that name the unsynced writer's files name exactly the files
+/// in `UNSYNCED_WRITERS`: `SECURITY.md`'s writes bullet, the writer's own doc
+/// comment, and the scan test's above. Each text is read for the backticked
+/// `.json` names it holds, in any order, so a third backticked name anywhere
+/// in it reds; a bare, unbackticked name is invisible to the extractor. The
+/// bullet is located by its "skip both syncs" sentence, so a reword keeps the
+/// check green only while that sentence stays, and the two doc blocks by the
+/// functions they document; a name in prose elsewhere in `SECURITY.md` falls
+/// outside the window. The expected names come from the table the scan pins,
+/// so a caller added there reds here until these documents name its file too.
+#[test]
+fn the_documents_name_the_same_files_as_the_unsynced_writer() {
+    // Controls: the extractor reads the two in either order, flags a third,
+    // and ignores a backticked path that is not a store, so a scan that read
+    // nothing could not keep this green.
+    assert_eq!(
+        json_names("files `status.json`, `tps_cache.json`"),
+        ["status.json", "tps_cache.json"]
+    );
+    assert_eq!(
+        json_names("files `tps_cache.json`, `status.json`"),
+        ["tps_cache.json", "status.json"]
+    );
+    assert_eq!(
+        json_names("files `status.json`, `tps_attribution.json`"),
+        ["status.json", "tps_attribution.json"]
+    );
+    assert_eq!(
+        json_names("`credentials.json.staged` at `0600`"),
+        Vec::<&str>::new()
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let security = std::fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let security_bullet = security
+        .lines()
+        .find(|line| line.contains("skip both syncs"))
+        .expect("SECURITY.md's writes bullet");
+    let profile = std::fs::read_to_string(root.join("src/profile.rs")).unwrap();
+    let writer_doc = doc_comment_above(&profile, "pub(crate) fn atomic_write_600_fast(");
+    let this_file = std::fs::read_to_string(root.join("tests/inline/profile.rs")).unwrap();
+    let scan_doc = doc_comment_above(
+        &this_file,
+        "fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer()",
+    );
+    let mut expected: Vec<&str> = UNSYNCED_WRITERS.iter().map(|(_, _, file)| *file).collect();
+    expected.sort_unstable();
+    expected.dedup();
+    for (label, text) in [
+        ("SECURITY.md", security_bullet),
+        ("atomic_write_600_fast's doc comment", writer_doc.as_str()),
+        ("the caller scan's doc comment", scan_doc.as_str()),
+    ] {
+        let mut names = json_names(text);
+        names.sort_unstable();
+        assert_eq!(names, expected, "{label}");
+    }
+}
+
+/// The backticked names ending in `.json` that `text` holds, in order.
+fn json_names(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            Path::new(token)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect()
+}
+
+/// The `///` block above the line holding `anchor`, its markers stripped, its
+/// attributes skipped and its lines joined.
+fn doc_comment_above(text: &str, anchor: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(anchor))
+        .expect("the anchored line");
+    let mut doc: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("///") || line.starts_with("#["))
+        .filter(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches("///").trim())
+        .collect();
+    doc.reverse();
+    doc.join(" ")
+}
+
+/// The unsynced writer's call sites, per module and count, and the file each
+/// rebuilds. Ordered by module, as the scan sorts them.
+const UNSYNCED_WRITERS: &[(&str, usize, &str)] = &[
+    ("daemon/mod.rs", 2, "status.json"),
+    ("usage/scheduler.rs", 1, "tps_cache.json"),
+];
 
 // ── a profile's id: what a login in flight lands by ──────────────────────────
 

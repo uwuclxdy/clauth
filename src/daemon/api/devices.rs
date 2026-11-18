@@ -417,18 +417,18 @@ pub(crate) fn seed_for_tests(name: &str, tier: Tier, token: &str) -> Result<()> 
     })
 }
 
+/// Flush the directory entry the atomic writer's rename landed in: the file's
+/// own bytes are already synced by [`atomic_write_600`], and the rename lives
+/// in the directory, so only its sync makes the new name outlast a crash. A
+/// failed sync fails the write. Unix only; elsewhere there is no directory
+/// sync to take.
 pub(super) fn sync_to_disk(path: &Path) -> std::io::Result<()> {
-    // Opened for writing: `FlushFileBuffers` wants a writable handle on Windows.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .sync_all()?;
-    // The rename lives in the directory entry, so only the directory's sync
-    // makes it outlast a crash.
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

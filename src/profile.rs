@@ -3494,7 +3494,7 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
 }
 
 /// [`atomic_write_600`] without the syncs, for a file rewritten every tick
-/// that the next tick rebuilds (`status.json`, the speed caches): a sync costs
+/// that the next tick rebuilds (`status.json`, `tps_cache.json`): a sync costs
 /// milliseconds on macOS, where it flushes the drive's cache (`F_FULLFSYNC`),
 /// and one a second buys such a file nothing. Readers still see old or new,
 /// never partial; a power loss can leave it empty until its next write.

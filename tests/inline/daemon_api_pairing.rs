@@ -427,6 +427,31 @@ fn a_failed_store_write_leaves_the_code_live() {
     assert!(paired(&redeem(pending.code()).expect("retry")));
 }
 
+/// The strict flush after the store write is what stands between the list and
+/// the code's deletion: a directory sync that fails fails the redemption, and
+/// `pairing.json` stays. The store's bytes have landed by then, so a retry
+/// finds the name taken and mints nothing; the code's survival is what this
+/// holds.
+#[cfg(unix)]
+#[test]
+fn a_failed_directory_sync_leaves_the_code_live() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
+    let dir = clauth_dir().expect("dir");
+    let mode = std::fs::metadata(&dir).expect("mode").permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("drop read");
+    let redeemed = redeem(pending.code());
+    std::fs::set_permissions(&dir, mode).expect("restore");
+    let err = redeemed.expect_err("the directory sync's failure propagates");
+    assert!(format!("{err:#}").contains("failed to flush"), "{err:#}");
+    let live = live_pairing().expect("the code must survive a store write that did not land");
+    assert_eq!(
+        live.attempts_left, CODE_ATTEMPTS,
+        "the right code cost nothing"
+    );
+}
+
 // ── redemption over the route ───────────────────────────────────────────────
 
 /// PA-3: however many requests race one right code, exactly one mints.

@@ -413,6 +413,86 @@ fn what_a_newer_build_wrote_survives_a_rewrite() {
     assert_eq!(found.tier, Tier::Unknown("readonly".to_string()));
 }
 
+// ── the flush after a write ─────────────────────────────────────────────────
+
+/// A test cannot make one real fsync fail alone, so the flush's strictness is
+/// pinned at its source: inside `sync_to_disk`, the directory's open and its
+/// sync both keep their `?`, on one line or split across two. A rewrite that
+/// keeps the open strict and makes the sync best-effort would otherwise ship
+/// green; one that makes both best-effort is caught by the chmod fixtures too.
+/// The predicate matches those two spellings; another spelling of the same
+/// calls, or a helper that moves the flush out of `sync_to_disk`, needs the
+/// pin widened.
+#[test]
+fn the_store_flush_propagates_a_failed_directory_sync() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/api/devices.rs"),
+    )
+    .expect("the devices source");
+    assert!(
+        fn_body(&source, "not_a_function").is_none(),
+        "the body locator reads the function it names"
+    );
+    let body = fn_body(&source, "sync_to_disk").expect("the flush's body");
+    // Controls: both `?`s on one line and split across two; and each
+    // best-effort rewrite the pin must refuse.
+    assert!(propagates_the_flush(
+        "std::fs::File::open(dir)?.sync_all()?;"
+    ));
+    assert!(propagates_the_flush(
+        "let dir = std::fs::File::open(dir)?;\ndir.sync_all()?;"
+    ));
+    assert!(!propagates_the_flush(
+        "let dir = std::fs::File::open(dir)?;\nlet _ = dir.sync_all();"
+    ));
+    assert!(!propagates_the_flush(
+        "let dir = std::fs::File::open(dir).ok();\ndir.sync_all()?;"
+    ));
+    assert!(
+        propagates_the_flush(body),
+        "sync_to_disk must propagate the directory open's and the sync's error"
+    );
+}
+
+/// Whether `body` propagates both the directory open's and the sync's errors.
+fn propagates_the_flush(body: &str) -> bool {
+    body.contains("File::open(dir)?") && body.contains("sync_all()?")
+}
+
+/// The body of `fn <name>` in `text`, up to its closing brace at the left
+/// margin.
+fn fn_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let at = text.find(&format!("fn {name}("))?;
+    let rest = &text[at..];
+    let end = rest.find("\n}\n")?;
+    Some(&rest[..end])
+}
+
+/// The atomic writer already synced the store's bytes, so the flush after it
+/// is the directory entry alone: a store file this process could no longer
+/// open for writing still flushes, and a directory it cannot read still fails
+/// the flush.
+#[cfg(unix)]
+#[test]
+fn the_flush_after_a_store_write_syncs_the_directory_not_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    let dir = path.parent().expect("parent").to_path_buf();
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    std::fs::write(&path, b"{}").expect("plant the store");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+
+    sync_to_disk(&path).expect("the flush needs no writable file");
+
+    let mode = std::fs::metadata(&dir).expect("mode").permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("drop read");
+    let flushed = sync_to_disk(&path);
+    std::fs::set_permissions(&dir, mode).expect("restore");
+    let err = flushed.expect_err("a directory it cannot read fails the flush");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
 // ── legacy import ───────────────────────────────────────────────────────────
 
 /// The upgrade path: the bytes the tray already holds authenticate as the
