@@ -3452,3 +3452,161 @@ fn rolling_switch_button_dims_on_a_disabled_account_or_a_dead_login() {
         );
     }
 }
+
+/// The Setup header rendered through `build_snap` for a saved account
+/// holding `picker`, at 60 cells.
+fn picker_header(picker: Option<crate::profile::ModelPicker>) -> Vec<String> {
+    picker_header_and_rows(picker).0
+}
+
+/// `picker_header`, plus the editable `config_rows` the same app exposes, so a
+/// test can show the read-only picker line adds no row or focus stop.
+fn picker_header_and_rows(
+    picker: Option<crate::profile::ModelPicker>,
+) -> (Vec<String>, Vec<ConfigRow>) {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.model_picker = picker;
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let state = AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save the roster");
+    let app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    let snap = build_snap(&app, &app.readings_snapshot(), true);
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
+    (
+        crate::testutil::buffer_rows(term.backend().buffer()),
+        crate::tui::app::config_rows(&app),
+    )
+}
+
+fn picker_row(model: &str) -> crate::profile::ModelPickerOption {
+    crate::profile::ModelPickerOption {
+        model: model.to_string(),
+        ..Default::default()
+    }
+}
+
+// P-8.1: picker_summary returns `none` for no table or no live row, `N option`
+// for one, `N options` for more, and the replaces suffix only for Some(true).
+#[test]
+fn ac08_picker_summary_counts_live_rows_and_names_the_replace_flag() {
+    use crate::profile::ModelPicker;
+    assert_eq!(picker_summary(None), "none");
+    let empty = ModelPicker::default();
+    assert_eq!(picker_summary(Some(&empty)), "none");
+    let blank_only = ModelPicker {
+        replace_built_in: Some(true),
+        options: vec![picker_row(""), picker_row("   ")],
+    };
+    assert_eq!(picker_summary(Some(&blank_only)), "none");
+    let one = ModelPicker {
+        replace_built_in: None,
+        options: vec![picker_row("a"), picker_row(" ")],
+    };
+    assert_eq!(picker_summary(Some(&one)), "1 option");
+    let two = ModelPicker {
+        replace_built_in: Some(false),
+        options: vec![picker_row("a"), picker_row("b")],
+    };
+    assert_eq!(picker_summary(Some(&two)), "2 options");
+    let two_replace = ModelPicker {
+        replace_built_in: Some(true),
+        options: vec![picker_row("a"), picker_row("b")],
+    };
+    assert_eq!(
+        picker_summary(Some(&two_replace)),
+        "2 options (replaces built-in)"
+    );
+    let one_replace = ModelPicker {
+        replace_built_in: Some(true),
+        options: vec![picker_row("a")],
+    };
+    assert_eq!(
+        picker_summary(Some(&one_replace)),
+        "1 option (replaces built-in)"
+    );
+    let five_replace = ModelPicker {
+        replace_built_in: Some(true),
+        options: ["a", "b", "c", "d", "e"].map(picker_row).to_vec(),
+    };
+    assert_eq!(
+        picker_summary(Some(&five_replace)),
+        "5 options (replaces built-in)"
+    );
+}
+
+// P-8.1 (read-only): the picker line is not an editable row or focus stop. The
+// editable rows are identical with a five-row picker and with none, and the
+// header still carries the line.
+#[test]
+fn ac08_picker_line_is_not_an_editable_row_or_focus_stop() {
+    let five = crate::profile::ModelPicker {
+        replace_built_in: Some(true),
+        options: ["a", "b", "c", "d", "e"].map(picker_row).to_vec(),
+    };
+    let (rows_with, editable_with) = picker_header_and_rows(Some(five));
+    let (_, editable_without) = picker_header_and_rows(None);
+    assert!(
+        rows_with
+            .iter()
+            .any(|r| r.trim_end() == "picker          5 options (replaces built-in)"),
+        "the header carries the five-row picker line:\n{}",
+        rows_with.join("\n")
+    );
+    assert_eq!(
+        editable_with, editable_without,
+        "a picker adds no editable row or focus stop"
+    );
+}
+
+// P-8.2: two live rows and replace_built_in = Some(true) render the picker
+// line, key padded to the 16-cell key cell, then the summary.
+#[test]
+fn ac08_setup_header_shows_the_picker_count_and_replace_flag() {
+    let rows = picker_header(Some(crate::profile::ModelPicker {
+        replace_built_in: Some(true),
+        options: vec![picker_row("glm-5.3"), picker_row("kimi-k3")],
+    }));
+    assert!(
+        rows.iter()
+            .any(|r| r.trim_end() == "picker          2 options (replaces built-in)"),
+        "the header carries the picker line:\n{}",
+        rows.join("\n")
+    );
+}
+
+// P-8.3: no [model_picker] renders `picker` followed by `none`.
+#[test]
+fn ac08_setup_header_shows_none_without_a_picker() {
+    let rows = picker_header(None);
+    assert!(
+        rows.iter().any(|r| r.trim_end() == "picker          none"),
+        "the header carries the picker line reading none:\n{}",
+        rows.join("\n")
+    );
+}

@@ -95,6 +95,51 @@ effort  = "high"      # CLAUDE_CODE_EFFORT_LEVEL, the session's reasoning effort
 
 It takes `low`, `medium`, `high`, `xhigh` or `max`, or any custom value, passed through verbatim. Every value rides `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the one effort carrier a running Claude Code re-reads live, so a set effort outranks `/effort` in the session — and clauth never writes `effortLevel`, which stays Claude Code's own key. An unset `effort` writes the env key empty, so `/effort` and Claude Code's default apply, and a live session moved to another account takes that account's effort within seconds. A `CLAUDE_CODE_EFFORT_LEVEL` exported in your shell is dropped at `clauth start` and delegate spawns, so it reaches neither. Every switch and launch rewrites `CLAUDE_CODE_EFFORT_LEVEL` in the settings file it writes, so a value you set there by hand is replaced by the account's effort, or by the empty value when it has none — set the account's `effort`, or its `[env]` key, instead. A `CLAUDE_CODE_EFFORT_LEVEL` in an account's own `[env]` outranks its `effort`.
 
+### Model picker
+
+An account can carry a `[model_picker]` table that becomes Claude Code's `modelPicker` setting, the list the `/model` picker offers. `replace_built_in` says whether the list replaces Claude Code's built-in entries. Each `[[model_picker.options]]` row is one entry, with a `model` id, a `label`, a `description` and a `behaves_as` (the built-in model the entry acts like). This example is the one silkcompute.com documents for Claude Code (<https://silkcompute.com/docs/claude-code>):
+
+```toml
+[model_picker]
+replace_built_in = true
+
+[[model_picker.options]]
+model = "kimi-k3.1-pro-uncensored"
+label = "Kimi K3.1 Pro"
+
+[[model_picker.options]]
+model = "deepseek-v4.1-flash-1017-uncensored"
+label = "DeepSeek V4.1 Flash 1017"
+
+[[model_picker.options]]
+model = "glm-5.3-uncensored"
+label = "GLM-5.3"
+
+[[model_picker.options]]
+model = "glm-5.3-flash-uncensored"
+label = "GLM-5.3 Flash"
+
+[[model_picker.options]]
+model = "hy4-uncensored"
+label = "Hy4"
+```
+
+The fields map to Claude Code's `modelPicker` like this:
+
+| `config.toml` | Claude Code `modelPicker` |
+|---|---|
+| `replace_built_in` | `replaceBuiltInOptions` |
+| `model` | `options[].model` |
+| `label` | `options[].label` |
+| `description` | `options[].description` |
+| `behaves_as` | `options[].behavesAs` |
+
+The camelCase spellings (`replaceBuiltInOptions`, `behavesAs`) are accepted as aliases. Write each field in one spelling only: a table holding both `replace_built_in` and `replaceBuiltInOptions` does not load. Blank rows are dropped, and a table with no live row counts as unset. A malformed `[model_picker]` (a wrong type, or `options` that is not an array of tables) stops that account's `config.toml` from loading, as any broken key does.
+
+An account with no picker strips `modelPicker` from the `settings.json` a switch or a start writes: a switch removes it from `~/.claude/settings.json` itself, including one you set by hand, and a start leaves it out of the session's copy. Claude Code honors `modelPicker` only from managed settings, `--settings` or the SDK, and user settings, and the highest-precedence of those that defines it wins outright, with no merging.
+
+clauth never edits the table, and only a newly created `config.toml` carries its commented example. A `clauth start` session moved by auto-switch keeps the picker its runtime copy was started with, since the swap rewrites only the effort key. Whether a running Claude Code picks up a changed `modelPicker` is not confirmed, so restart the session to be sure. A switch-off leaves the last account's `modelPicker` in place, as it does `model` and `advisorModel`.
+
 ## Presets
 
 A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Five ship built in:
@@ -251,6 +296,7 @@ clauth edits `config.toml` in place: a save changes only the keys whose setting 
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active; when one replaces a value your own `settings.json` held, clauth saves that value, and a switch to an account without the key puts it back unless you changed or deleted it meanwhile (never for a key clauth sets from an endpoint, model or effort field; a value an older clauth replaced before an update was never saved, so that key is removed instead, and while an older clauth still runs and switches, a value you deleted can come back); on a proxy account holding an api key, its `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` stay in `config.toml` and reach no session, so the account counts as one without those two keys; its sessions get its own key through `apiKeyHelper` |
 | `effort` | string | none | the account's reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` or a custom value; every value rides `CLAUDE_CODE_EFFORT_LEVEL` in settings.json ([above](Configuration#model-routing)). The Setup tab's `effort` row edits it |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent`, `advisor` |
+| `[model_picker]` | table | `{}` | `replace_built_in`, `[[model_picker.options]]` (`model`, `label`, `description`, `behaves_as`) |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
 

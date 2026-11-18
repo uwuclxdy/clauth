@@ -307,6 +307,7 @@ fn oauth_profile(
     };
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,
@@ -359,6 +360,7 @@ fn oauth_profile(
 
 fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) {
     let profile = Profile {
+        model_picker: None,
         name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some(
@@ -400,6 +402,7 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
 fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) {
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,

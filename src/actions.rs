@@ -4500,6 +4500,7 @@ pub(crate) fn duplicate_profile(
         profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
+        profile.model_picker = src.model_picker.clone();
         profile.effort = src.effort.clone();
         profile.fallback_threshold = src.fallback_threshold;
         profile.weekly_threshold = src.weekly_threshold;

@@ -281,6 +281,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
     };
     (
         Profile {
+            model_picker: None,
             name: "tp".into(),
             base_url: Some("https://api.example.com".into()),
             api_key: Some("k".into()),
@@ -350,6 +351,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
     };
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: Some("https://api.deepseek.com/anthropic".into()),
             api_key: Some("k".into()),
@@ -432,6 +434,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
     };
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,
@@ -2390,6 +2393,7 @@ fn gap_widening_never_clips_the_row() {
 fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, ReadingsSnapshot) {
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,
