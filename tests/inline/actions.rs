@@ -17556,7 +17556,7 @@ fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
     assert!(switch_profile_locked(&mut config, &a).is_ok());
     assert_eq!(
         base_env_record(),
-        serde_json::json!({ "v": 1, "active": "a", "keys": {} }),
+        serde_json::json!({ "v": 1, "active": "a", "keys": {}, "models": {} }),
         "stamped at the first apply, naming the account it saw active"
     );
     seed_user_endpoint();
@@ -17571,7 +17571,7 @@ fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
     assert_eq!(
         base_env_record(),
-        serde_json::json!({ "v": 1, "active": "b", "keys": {} }),
+        serde_json::json!({ "v": 1, "active": "b", "keys": {}, "models": {} }),
         "the last entry retired, the stamp stays"
     );
 }
@@ -23246,4 +23246,279 @@ fn a_rename_of_a_record_with_no_directory_never_adopts_a_codex_store() {
         ["cd-old"],
         "the record keeps its name"
     );
+}
+
+// ── model keys across a switch: clauth removes only what it wrote ───────────
+
+/// Every settings key a `[models]` row writes, with whether it rides `env`.
+const SWITCHED_MODEL_KEYS: [(&str, bool); 7] = [
+    ("model", false),
+    ("advisorModel", false),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", true),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", true),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", true),
+    ("ANTHROPIC_DEFAULT_FABLE_MODEL", true),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", true),
+];
+
+/// Give `name` a row for every model key on disk, each `"{tag}-{key}"`.
+fn give_every_model_row(name: &crate::profile::ProfileName, tag: &str) {
+    crate::profile::update_profile_config(name, |p| {
+        let row = |key: &str| Some(format!("{tag}-{key}"));
+        let models = &mut p.models;
+        models.default = row("model");
+        models.advisor = row("advisorModel");
+        models.opus = row("ANTHROPIC_DEFAULT_OPUS_MODEL");
+        models.sonnet = row("ANTHROPIC_DEFAULT_SONNET_MODEL");
+        models.haiku = row("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+        models.fable = row("ANTHROPIC_DEFAULT_FABLE_MODEL");
+        models.subagent = row("CLAUDE_CODE_SUBAGENT_MODEL");
+        Ok(())
+    })
+    .expect("edit rows")
+    .expect("on roster");
+}
+
+/// Each live model key's value, in [`SWITCHED_MODEL_KEYS`] order.
+fn live_models() -> Vec<Option<String>> {
+    let live = live_settings();
+    SWITCHED_MODEL_KEYS
+        .iter()
+        .map(|&(key, in_env)| {
+            let held = if in_env {
+                live["env"].get(key)
+            } else {
+                live.get(key)
+            };
+            held.and_then(|v| v.as_str()).map(str::to_string)
+        })
+        .collect()
+}
+
+fn models_tagged(tag: &str) -> Vec<Option<String>> {
+    SWITCHED_MODEL_KEYS
+        .iter()
+        .map(|(key, _)| Some(format!("{tag}-{key}")))
+        .collect()
+}
+
+/// Hand-edit one live model key, as a `/model` pick or an editor would.
+fn set_live_model(key: &str, value: &str) {
+    let in_env = SWITCHED_MODEL_KEYS
+        .iter()
+        .any(|&(model_key, in_env)| in_env && model_key == key);
+    if in_env {
+        set_live_env(key, Some(value));
+        return;
+    }
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = live_settings();
+    live[key] = serde_json::json!(value);
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("hand-edit live settings");
+}
+
+/// Switch onto `rows` from `other` with clauth's apply behind it: the
+/// captures leave `rows` active without one.
+fn land_on_rows(
+    config: &mut AppConfig,
+    rows: &crate::profile::ProfileName,
+    other: &crate::profile::ProfileName,
+) {
+    assert!(switch_profile_locked(config, other).expect("switch away"));
+    assert!(switch_profile_locked(config, rows).expect("switch onto the rows"));
+}
+
+fn set_every_live_model(tag: &str) {
+    for (key, _) in SWITCHED_MODEL_KEYS {
+        set_live_model(key, &format!("{tag}-{key}"));
+    }
+}
+
+/// A preset's model ids written by a switch onto `a` leave on the switch to
+/// `b`, which has no rows, and come back with the switch to `a`.
+#[test]
+fn a_presets_model_ids_never_follow_a_switch_onto_an_account_without_rows() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_every_model_row(&a, "preset");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    assert_eq!(live_models(), models_tagged("preset"), "control: a's rows");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_models(), vec![None; 7], "a's ids leave with a");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_models(), models_tagged("preset"));
+}
+
+/// A model the user set (a `/model` pick, a hand edit) under every key
+/// survives a switch onto an account without rows, a row still writes over
+/// it, and the value the row wrote leaves on the next switch.
+#[test]
+fn a_model_the_user_set_survives_a_switch_and_a_row_still_overwrites_it() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_every_model_row(&a, "a");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    set_every_live_model("mine");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_models(),
+        models_tagged("mine"),
+        "the user's values stay"
+    );
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_models(), models_tagged("a"), "a's rows overwrite them");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_models(), vec![None; 7]);
+}
+
+/// Clearing a row on the active account removes the value its row wrote and
+/// keeps one the user set under another key since.
+#[test]
+fn clearing_a_row_on_the_active_account_removes_only_what_the_row_wrote() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_every_model_row(&a, "a");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    set_live_model("CLAUDE_CODE_SUBAGENT_MODEL", "mine");
+    edit_profile_model(&mut config, &a, |m| {
+        m.default = None;
+        m.subagent = None;
+    })
+    .expect("clear two rows");
+    let live = live_models();
+    assert_eq!(live[0], None, "the `default` row's value leaves");
+    assert_eq!(
+        live[6].as_deref(),
+        Some("mine"),
+        "the user's subagent stays"
+    );
+    assert_eq!(
+        live[1].as_deref(),
+        Some("a-advisorModel"),
+        "a set row stays"
+    );
+}
+
+/// A model key an account's own `[env]` carries is judged by the same rule:
+/// its value leaves with the account, a value the user changed it to stays.
+#[test]
+fn an_env_carried_model_key_leaves_only_while_it_holds_the_accounts_value() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert(
+            "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
+            "a-env".to_string(),
+        );
+        p.env.insert(
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+            "a-env".to_string(),
+        );
+        Ok(())
+    })
+    .expect("edit env")
+    .expect("on roster");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    set_live_model("CLAUDE_CODE_SUBAGENT_MODEL", "mine");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    let live = live_models();
+    assert_eq!(live[2], None, "a's unchanged `[env]` value leaves");
+    assert_eq!(live[6].as_deref(), Some("mine"), "the user's change stays");
+}
+
+/// The upgrade: a model key the record holds no entry for (no record at all,
+/// or one written before it recorded models) is clauth's when the outgoing
+/// account's own row is its value, and the user's otherwise.
+fn an_unrecorded_model_is_judged_by_the_outgoing_accounts_rows(forget: impl FnOnce()) {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_every_model_row(&a, "a");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    forget();
+    set_live_model("model", "pick");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    let mut expected = vec![None; 7];
+    expected[0] = Some("pick".to_string());
+    assert_eq!(live_models(), expected);
+    assert_eq!(
+        base_env_record()["models"],
+        serde_json::json!({}),
+        "the switch records models from now on"
+    );
+}
+
+#[test]
+fn with_no_record_an_upgrade_removes_only_the_outgoing_accounts_rows() {
+    an_unrecorded_model_is_judged_by_the_outgoing_accounts_rows(forget_base_env_record);
+}
+
+#[test]
+fn a_record_without_models_removes_only_the_outgoing_accounts_rows() {
+    an_unrecorded_model_is_judged_by_the_outgoing_accounts_rows(|| {
+        let mut record = base_env_record();
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("models")
+            .expect("control: models recorded");
+        std::fs::write(base_env_path(), record.to_string()).expect("write record");
+    });
+}
+
+/// After a clauth that predates the model entries switched (the marker moved
+/// with no record), a live value equal to any account's own row is clauth's,
+/// and one no account writes stays the user's.
+#[test]
+fn an_older_clauths_switch_leaves_its_model_rows_clauths() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    give_every_model_row(&a, "a");
+    give_every_model_row(&c, "c");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    set_every_live_model("c");
+    set_live_model("advisorModel", "mine");
+    old_clauth_switches(&mut config, &c, None);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    let mut expected = vec![None; 7];
+    expected[1] = Some("mine".to_string());
+    assert_eq!(live_models(), expected);
+}
+
+/// The upgrade's first removal, its live write failing: the record it
+/// pre-wrote already names the outgoing account's values it was removing, so
+/// the retry still reads them as clauth's though the record now holds models.
+#[test]
+fn a_failed_first_removal_after_the_upgrade_still_removes_on_the_retry() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_every_model_row(&a, "a");
+    let mut config = crate::profile::load_config().expect("read");
+    land_on_rows(&mut config, &a, &b);
+    let mut record = base_env_record();
+    record
+        .as_object_mut()
+        .expect("record object")
+        .remove("models")
+        .expect("control: models recorded");
+    std::fs::write(base_env_path(), record.to_string()).expect("write record");
+    {
+        let _fault = crate::claude::FailLiveSettingsWrite::new(&home);
+        switch_profile_locked(&mut config, &b).expect_err("the live write fails");
+    }
+    assert_eq!(live_models(), models_tagged("a"), "control: nothing landed");
+    assert!(
+        base_env_record().get("models").is_some(),
+        "control: the pre-write recorded models"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("retry"));
+    assert_eq!(live_models(), vec![None; 7]);
 }
