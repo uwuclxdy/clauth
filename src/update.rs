@@ -59,34 +59,31 @@ impl Drop for ApiUrlSandbox<'_> {
     }
 }
 
-/// Test-only thread-start failure seam: the OS error message
-/// [`start_update_thread`] hands back in place of starting the update thread,
-/// so a test drives [`spawn`]'s failure arm without exhausting the process's
-/// threads. Serialized by `HOME_TEST_LOCK`, held through `HomeSandbox`.
-#[cfg(test)]
-static SPAWN_ERROR_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// Test-only RAII over [`SPAWN_ERROR_OVERRIDE`], cleared on drop; it borrows
-/// the `HomeSandbox` for the reason [`ApiUrlSandbox`] does.
-#[cfg(test)]
-pub(crate) struct SpawnErrorSandbox<'a>(std::marker::PhantomData<&'a crate::testutil::HomeSandbox>);
-
-#[cfg(test)]
-impl<'a> SpawnErrorSandbox<'a> {
-    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox, message: &str) -> Self {
-        if let Ok(mut guard) = SPAWN_ERROR_OVERRIDE.lock() {
-            *guard = Some(message.to_string());
-        }
-        Self(std::marker::PhantomData)
-    }
+// Test-only thread-start refusal switch, armed on the calling thread by
+// `fail_update_spawns`: while armed, `start_update_thread` poses the OS's
+// refusal with a stack size no kernel grants, so a test drives `spawn`'s
+// failure arm without exhausting the process's threads.
+#[cfg(all(test, unix))]
+thread_local! {
+    static SPAWN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
-impl Drop for SpawnErrorSandbox<'_> {
+/// Refuse the update-thread spawns on this thread, posing the one failure a
+/// test cannot (the box always has threads left). The returned guard disarms
+/// it on drop.
+#[cfg(all(test, unix))]
+pub(crate) fn fail_update_spawns() -> UpdateSpawnFailArm {
+    SPAWN_REFUSED.with(|refused| refused.set(true));
+    UpdateSpawnFailArm
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct UpdateSpawnFailArm;
+
+#[cfg(all(test, unix))]
+impl Drop for UpdateSpawnFailArm {
     fn drop(&mut self) {
-        if let Ok(mut guard) = SPAWN_ERROR_OVERRIDE.lock() {
-            *guard = None;
-        }
+        SPAWN_REFUSED.with(|refused| refused.set(false));
     }
 }
 
@@ -414,17 +411,20 @@ fn run_hourly(
 }
 
 /// Start the update thread (`clauth-upd`), or hand back the error the OS
-/// refused it with. A test build may force that error through
-/// [`SpawnErrorSandbox`], so the failure arm is reachable without exhausting
+/// refused it with. A test build on unix may pose that refusal through
+/// [`fail_update_spawns`], so its failure arm is reachable without exhausting
 /// the box's threads.
 fn start_update_thread(body: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle<()>> {
-    #[cfg(test)]
-    if let Some(message) = SPAWN_ERROR_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
-        return Err(io::Error::other(message));
-    }
-    std::thread::Builder::new()
-        .name("clauth-upd".into())
-        .spawn(body)
+    #[cfg(all(test, unix))]
+    let builder = if SPAWN_REFUSED.with(std::cell::Cell::get) {
+        // No kernel grants a stack this size, so the real `spawn` refuses.
+        std::thread::Builder::new().stack_size(usize::MAX)
+    } else {
+        std::thread::Builder::new()
+    };
+    #[cfg(not(all(test, unix)))]
+    let builder = std::thread::Builder::new();
+    builder.name("clauth-upd".into()).spawn(body)
 }
 
 /// Spawn the update loop ([`run_hourly`]): a check now and one each hour, each

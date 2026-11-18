@@ -3600,8 +3600,9 @@ pub(crate) fn spawn_stop_thread<T: Send + 'static>(
     let theirs = Arc::clone(&slot);
     #[cfg(all(test, unix))]
     let builder = if probe_seam::stop_spawn_refused() {
-        // No kernel grants a stack this size: the real `spawn` error a
-        // thread limit gives, posed on demand.
+        // No kernel grants a stack this size: the real `spawn` refusal is
+        // `EINVAL` (Invalid argument (os error 22) on linux, measured
+        // 2026-11-18), not a thread limit's `EAGAIN`; posed on demand.
         std::thread::Builder::new().stack_size(usize::MAX)
     } else {
         std::thread::Builder::new()

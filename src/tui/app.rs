@@ -35153,7 +35153,8 @@ pub(crate) struct Shutdown {
     config: ConfigHandle,
     /// The scheduler's tick thread once bootstrap started it.
     scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
-    /// The update loop's thread; `None` when updates were off at start.
+    /// The update loop's thread; `None` when updates were off at start or the
+    /// thread could not start.
     update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
     /// How many times the shutdown's body started.
     #[cfg(test)]

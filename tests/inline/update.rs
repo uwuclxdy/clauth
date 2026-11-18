@@ -255,11 +255,16 @@ fn spawn_returns_no_handle_and_closes_the_channel_when_saved_off() {
 /// calling thread's capture holds exactly the failure line and the failed
 /// start leaves no handle.
 #[test]
+#[cfg(unix)]
 fn a_refused_update_thread_start_logs_once_and_returns_no_handle() {
     let home = crate::testutil::HomeSandbox::new();
     let _env = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
-    let message = "Resource temporarily unavailable (os error 11)";
-    let _refused = SpawnErrorSandbox::new(&home, message);
+    let _refused = fail_update_spawns();
+    let os_error = std::thread::Builder::new()
+        .stack_size(usize::MAX)
+        .spawn(|| {})
+        .expect_err("no kernel grants this stack size")
+        .to_string();
     let lines = crate::logline::LogLines::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let thread = {
@@ -270,7 +275,7 @@ fn a_refused_update_thread_start_logs_once_and_returns_no_handle() {
     assert_eq!(
         lines.snapshot(),
         vec![format!(
-            "update check failed: cannot start the update thread: {message}"
+            "update check failed: cannot start the update thread: {os_error}"
         )],
         "one line, exact wording"
     );
