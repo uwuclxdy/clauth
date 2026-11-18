@@ -15,7 +15,8 @@ use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::logline::logline;
 use crate::profile::{ProfileName, load_config, reload_fingerprint};
 use crate::usage::{
-    PendingSwitchTarget, current_key_rejected_names, is_idle, now_ms, queued_switch_away_is_stale,
+    PendingSwitchTarget, UsageInfo, current_key_rejected_names, is_idle, now_ms,
+    queued_switch_away_is_stale,
 };
 
 use super::{SwitchBackoff, active_diverged_unsaved, switch_backoff_ms};
@@ -736,44 +737,6 @@ impl super::Daemon {
     /// gate owns (the gate's give-up branch is the one that closes it). A change
     /// of target resets the backoff. The decision (target + cause) is re-queued
     /// whole so a later repair still invalidates it at dispatch.
-    /// The log line of an auto-switch from `from` onto `target`
-    /// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last
-    /// reading. Called with no config guard held: the usage stores rank
-    /// below it.
-    fn auto_switch_log_line(
-        &self,
-        from: Option<&crate::profile::Profile>,
-        target: &ProfileName,
-        returning: bool,
-        chain_weekly: f64,
-    ) -> String {
-        let from_usage = from.and_then(|p| {
-            let oauth = self
-                .usage_store
-                .lock()
-                .ok()
-                .and_then(|s| s.get(p.name.as_str()).cloned());
-            let stats = self
-                .third_party_usage_store
-                .lock()
-                .ok()
-                .and_then(|s| s.get(p.name.as_str()).cloned());
-            crate::fallback::picked_usage(
-                p.usage_cache_is_third_party(),
-                oauth.as_ref(),
-                stats.as_ref(),
-            )
-        });
-        crate::fallback::auto_switch_log_line(
-            "clauth daemon",
-            from,
-            target.as_str(),
-            returning,
-            from_usage.as_ref(),
-            chain_weekly,
-        )
-    }
-
     fn fail_switch(&mut self, decision: &PendingSwitchTarget, now: u64, reason: &str) {
         let target = decision.target.as_str();
         let (attempts, retry_until) = match &self.switch_backoff {
@@ -797,6 +760,59 @@ impl super::Daemon {
             retry_until,
         });
         self.requeue_quiet(decision);
+    }
+
+    /// The log line of an auto-switch from `from` onto `target`
+    /// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading
+    /// and how long ago it read it. Called with no config guard held: the usage
+    /// stores rank below it.
+    fn auto_switch_log_line(
+        &self,
+        from: Option<&crate::profile::Profile>,
+        target: &ProfileName,
+        returning: bool,
+        chain_weekly: f64,
+    ) -> String {
+        let (from_usage, from_age_secs) = self.left_reading(from);
+        crate::fallback::auto_switch_log_line(
+            "clauth daemon",
+            from,
+            target.as_str(),
+            returning,
+            from_usage.as_ref(),
+            from_age_secs,
+            chain_weekly,
+        )
+    }
+
+    /// The log line of a wrap-off ([`crate::fallback::switch_off_log_line`])
+    /// with the account it left and that account's last reading. Called with no
+    /// config guard held: the usage stores rank below it.
+    fn switch_off_log_line(
+        &self,
+        from: Option<&crate::profile::Profile>,
+        chain_weekly: f64,
+    ) -> String {
+        let (from_usage, from_age_secs) = self.left_reading(from);
+        crate::fallback::switch_off_log_line(
+            "clauth daemon",
+            from,
+            from_usage.as_ref(),
+            from_age_secs,
+            chain_weekly,
+        )
+    }
+
+    /// The reading behind a chain-move log line for `from`, and the age of the
+    /// clock that dates it.
+    fn left_reading(
+        &self,
+        from: Option<&crate::profile::Profile>,
+    ) -> (Option<UsageInfo>, Option<u64>) {
+        let Some(from) = from else {
+            return (None, None);
+        };
+        crate::fallback::picked_reading(from, &self.usage_store, &self.third_party_usage_store)
     }
 
     /// [`Self::fail_switch`] for a wait that is no failure (a bare-item
@@ -856,11 +872,14 @@ impl super::Daemon {
         if !self.fetch_lease.fetches_here() {
             return;
         }
-        let active = self
-            .config
-            .lock()
-            .ok()
-            .and_then(|c| c.state.active_profile.as_ref().cloned());
+        let (active, left, chain_weekly) = {
+            let Some(cfg) = self.config.lock().ok() else {
+                return;
+            };
+            let active = cfg.state.active_profile.as_deref().map(ProfileName::from);
+            let left = active.as_ref().and_then(|a| cfg.find(a)).cloned();
+            (active, left, cfg.state.weekly_switch_threshold_pct())
+        };
         let Some(active) = active else {
             return; // already off
         };
@@ -913,7 +932,8 @@ impl super::Daemon {
                 // Drain the switch-off's own forgets; the write is left
                 // unadopted, so the next tick's reload re-reads disk.
                 self.apply_forgets();
-                logline!("clauth daemon: switched off: all accounts spent");
+                let line = self.switch_off_log_line(left.as_ref(), chain_weekly);
+                logline!("{line}");
                 if changed {
                     crate::daemon::publish_status(&self.config);
                 }

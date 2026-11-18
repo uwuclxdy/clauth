@@ -76,16 +76,18 @@ pub(crate) fn threshold_in_range(value: f64) -> bool {
 /// The log line a chain move of the global account leaves behind: the account
 /// it landed on, the one it left (`from`, when it still resolves), and what
 /// that one last read (`from_usage`) against its 5h and weekly lines
-/// (`chain_weekly` is the chain-wide weekly line). A toast vanishes with the
-/// TUI, so without this line a window that still ran out leaves no trace of
-/// when (or whether) the chain moved off it. `role` is the process prefix
-/// ([`crate::logline::role`]); `returning` names a move onto the home account.
+/// (`chain_weekly` is the chain-wide weekly line) with how long ago it read it
+/// (`from_age_secs`). A toast vanishes with the TUI, so without this line a
+/// window that still ran out leaves no trace of when (or whether) the chain
+/// moved off it. `role` is the process prefix ([`crate::logline::role`]);
+/// `returning` names a move onto the home account.
 pub(crate) fn auto_switch_log_line(
     role: &str,
     from: Option<&Profile>,
     to: &str,
     returning: bool,
     from_usage: Option<&UsageInfo>,
+    from_age_secs: Option<u64>,
     chain_weekly: f64,
 ) -> String {
     let moved = if returning {
@@ -96,6 +98,43 @@ pub(crate) fn auto_switch_log_line(
     let Some(from) = from else {
         return format!("{role}: {moved} '{to}'");
     };
+    let read = read_with_age(from, from_usage, from_age_secs, chain_weekly);
+    format!(
+        "{role}: {moved} '{to}' from '{0}'; '{0}' read {read}",
+        from.name
+    )
+}
+
+/// The log line a switch-off leaves once every account is spent: the account it
+/// left and its last reading ([`auto_switch_log_line`]'s reading half). Both
+/// processes write the one shape, so a wrap-off says the same in either log.
+pub(crate) fn switch_off_log_line(
+    role: &str,
+    from: Option<&Profile>,
+    from_usage: Option<&UsageInfo>,
+    from_age_secs: Option<u64>,
+    chain_weekly: f64,
+) -> String {
+    let Some(from) = from else {
+        return format!("{role}: switched off: all accounts spent");
+    };
+    let read = read_with_age(from, from_usage, from_age_secs, chain_weekly);
+    format!(
+        "{role}: switched off: all accounts spent; '{0}' read {read}",
+        from.name
+    )
+}
+
+/// What a chain-move log line reports for the account it left: each figure
+/// against its line, then how long ago the reading was taken. A reading with no
+/// figure reads `nothing` and carries no age; one with figures but no clock says
+/// the time is unknown, never implying the figures are current.
+fn read_with_age(
+    from: &Profile,
+    from_usage: Option<&UsageInfo>,
+    from_age_secs: Option<u64>,
+    chain_weekly: f64,
+) -> String {
     let five = from_usage.and_then(|u| u.five_hour.as_ref()).map(|w| {
         format!(
             "5h {:.0}% (line {:.0}%)",
@@ -109,16 +148,14 @@ pub(crate) fn auto_switch_log_line(
             let line = member_weekly_line(from, chain_weekly);
             format!("{label} {:.0}% (line {line:.0}%)", w.utilization)
         });
-    let read: Vec<String> = five.into_iter().chain(long).collect();
-    let read = if read.is_empty() {
-        "nothing".to_string()
-    } else {
-        read.join(", ")
-    };
-    format!(
-        "{role}: {moved} '{to}' from '{0}'; '{0}' read {read}",
-        from.name
-    )
+    let read = five.into_iter().chain(long).collect::<Vec<_>>().join(", ");
+    if read.is_empty() {
+        return "nothing".to_string();
+    }
+    match from_age_secs {
+        Some(secs) => format!("{read} {}", crate::format::humanize_age(secs)),
+        None => format!("{read} at an unknown time"),
+    }
 }
 
 /// Parse a typed threshold, valid only inside [`threshold_in_range`].
@@ -2772,6 +2809,41 @@ pub(crate) fn picked_usage(
     } else {
         oauth.cloned()
     }
+}
+
+/// The reading a chain-move log line reports for `profile`, paired with how long
+/// ago it was read. An OAuth account's age is its fetch stamp
+/// ([`crate::profile_json::oauth_age`]); a third-party account's is the write
+/// time of the cache file its figures land in, the clock
+/// [`crate::profile_json::ProfileWindows`] dates it by. `None` when nothing dates
+/// the reading. Each store is locked once and released, so the caller holds no
+/// config guard across this.
+pub(crate) fn picked_reading(
+    profile: &Profile,
+    store: &UsageStore,
+    third_party_store: &ThirdPartyUsageStore,
+) -> (Option<UsageInfo>, Option<u64>) {
+    let oauth = store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(profile.name.as_str()).cloned());
+    let stats = third_party_store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(profile.name.as_str()).cloned());
+    let third_party = profile.usage_cache_is_third_party();
+    let age_secs = if third_party {
+        crate::profile_json::cache_age_secs(
+            &profile.name,
+            crate::profile_json::usage_cache_file(profile),
+        )
+    } else {
+        crate::profile_json::oauth_age(oauth.as_ref(), crate::usage::now_ms()).secs()
+    };
+    (
+        picked_usage(third_party, oauth.as_ref(), stats.as_ref()),
+        age_secs,
+    )
 }
 
 /// The in-memory twin of `profile_json::windows_of`: the chain walk's usage

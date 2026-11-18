@@ -7862,6 +7862,7 @@ impl App {
                 self.toast(ToastKind::Warning, msg);
             }
             Some(SwitchAction::Off) => {
+                log_switch_off(self, before.as_ref());
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
@@ -20365,43 +20366,62 @@ fn finalize_switch(
     }
 }
 
+/// Resolve the account behind a chain-move log line and the reading it left.
+/// The config guard holds a clone and nothing else, and is dropped before either
+/// store is locked: the stores rank below `Config`.
+fn left_reading(
+    app: &App,
+    from: Option<&ProfileName>,
+) -> (Option<Profile>, Option<UsageInfo>, Option<u64>) {
+    let profile = from.and_then(|f| app.config().find(f).cloned());
+    let Some(profile) = profile else {
+        return (None, None, None);
+    };
+    let (usage, age_secs) =
+        crate::fallback::picked_reading(&profile, &app.usage_store, &app.third_party_usage_store);
+    (Some(profile), usage, age_secs)
+}
+
 /// Log an auto-switch the chain made from `from` to `to`
-/// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading. A
-/// move onto the account already active logs nothing. The usage stores are
-/// read and released before the config guard is taken, as they rank below it.
+/// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading and
+/// how long ago it read it. A move onto the account already active logs
+/// nothing.
 fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
     if from == Some(to) {
         return;
     }
-    let oauth = from.and_then(|f| {
-        app.usage_store
-            .lock()
-            .ok()
-            .and_then(|s| s.get(f.as_str()).cloned())
-    });
-    let stats = from.and_then(|f| {
-        app.third_party_usage_store
-            .lock()
-            .ok()
-            .and_then(|s| s.get(f.as_str()).cloned())
-    });
+    let (from_profile, from_usage, from_age_secs) = left_reading(app, from);
     let key_rejected = app.key_rejected_names();
     let line = {
         let cfg = app.config();
-        let from_profile = from.and_then(|f| cfg.find(f));
-        let from_usage = from_profile.and_then(|p| {
-            crate::fallback::picked_usage(
-                p.usage_cache_is_third_party(),
-                oauth.as_ref(),
-                stats.as_ref(),
-            )
-        });
         crate::fallback::auto_switch_log_line(
             crate::logline::role(crate::logline::stamped()),
-            from_profile,
+            from_profile.as_ref(),
             to.as_str(),
             cfg.is_home_today(to, &key_rejected),
             from_usage.as_ref(),
+            from_age_secs,
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
+}
+
+/// Log a chain switch-off ([`crate::fallback::switch_off_log_line`]) with the
+/// account it left and that account's last reading. Only a switch-off the chain
+/// decided is logged this way.
+fn log_switch_off(app: &App, left: Option<&ProfileName>) {
+    let Some(left) = left else {
+        return;
+    };
+    let (left_profile, left_usage, left_age_secs) = left_reading(app, Some(left));
+    let line = {
+        let cfg = app.config();
+        crate::fallback::switch_off_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            left_profile.as_ref(),
+            left_usage.as_ref(),
+            left_age_secs,
             cfg.state.weekly_switch_threshold_pct(),
         )
     };
@@ -20425,6 +20445,7 @@ fn perform_switch_off(app: &mut App) {
     let result = switch_off(&app.config);
     match result {
         Ok(()) => {
+            log_switch_off(app, Some(&active));
             app.refresh_tokens();
             app.apply_forgets();
             app.refresh_unsaved_live_login();

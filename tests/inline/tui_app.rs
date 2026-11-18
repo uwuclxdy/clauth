@@ -3032,6 +3032,7 @@ fn on_tick_logs_a_queued_auto_switch_with_the_left_reading() {
         UsageInfo {
             five_hour: Some(boot_window(92.0)),
             seven_day: Some(boot_window(70.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
             ..UsageInfo::default()
         },
     );
@@ -3061,8 +3062,8 @@ fn on_tick_logs_a_queued_auto_switch_with_the_left_reading() {
     );
     assert!(
         lines.snapshot().iter().any(|l| l
-            == "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 92% (line 90%), 7d 70% (line 98%)"),
-        "the landed auto-switch is logged with what the left account read: {:?}",
+            == "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 92% (line 90%), 7d 70% (line 98%) 4m ago"),
+        "the landed auto-switch is logged with what the left account read and how long ago: {:?}",
         lines.snapshot()
     );
 }
@@ -23192,8 +23193,81 @@ fn bootstrap_one_shot_logs_the_switch_off_a_fresh_exhausted_active() {
     );
     assert!(
         lines.snapshot().iter().any(|l| l
-            == "clauth: auto-switched to 'spare' from 'spent'; 'spent' read 5h 100% (line 95%)"),
-        "the startup switch is logged with what the left account read: {:?}",
+            == "clauth: auto-switched to 'spare' from 'spent'; 'spent' read 5h 100% (line 95%) at an unknown time"),
+        "the startup switch is logged with what the left account read, and that nothing dates it: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// [`bootstrap_app`]'s wrap-off shape: one maxed member with the chain set to
+/// switch off when spent, so the startup one-shot turns everything off.
+fn bootstrap_off_app(_home: &crate::testutil::HomeSandbox) -> App {
+    use super::{StartupSignal, drain_startup_signals};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+
+    let mut spent = Profile::new(BOOT_SPENT.to_string(), None, None);
+    spent.credentials = Some(creds_ra("rt-spent", "at-spent"));
+    save_profile(&spent).expect("save profile");
+    write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
+
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some(BOOT_SPENT.into()),
+            profiles: vec![BOOT_SPENT.into()],
+            fallback_chain: vec![BOOT_SPENT.into()],
+            switch_off_when_spent: true,
+            ..AppState::default()
+        },
+        profiles: vec![spent],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+
+    {
+        let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+        store.insert(
+            BOOT_SPENT.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(100.0)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    app.usage_status
+        .lock()
+        .expect("usage_status mutex poisoned")
+        .insert(BOOT_SPENT.to_string(), FetchStatus::Fresh);
+
+    // The test scheduler never ticks, as in `bootstrap_app`.
+    app.shutting_down.store(true, Ordering::SeqCst);
+    app.startup_sender
+        .send(StartupSignal::BootstrapDone)
+        .expect("send bootstrap signal");
+    drain_startup_signals(&mut app);
+    app
+}
+
+/// The startup one-shot's wrap-off is the chain's own move too, so it leaves
+/// the same reading line the daemon's does.
+#[test]
+fn bootstrap_one_shot_logs_the_wrap_off_with_the_left_reading() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_off_app(&home)
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        None,
+        "precondition: the startup one-shot switched off",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'spent' read 5h 100% (line 95%) 4m ago"),
+        "the startup wrap-off names the left account, its reading and the reading's age: {:?}",
         lines.snapshot()
     );
 }
@@ -63934,6 +64008,44 @@ fn the_settle_runs_on_a_worker_and_holds_the_write() {
     );
     assert_eq!(active_on_disk(), None, "the settled sign-out ran");
     assert!(app.modals.is_empty(), "nothing to ask");
+}
+
+/// The chain's own switch-off leaves the same reading line in clauth.log that
+/// every other chain move does: its toast is gone with the TUI.
+#[test]
+fn drain_pending_switch_off_logs_the_left_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(97.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *app.pending_switch_off.lock().expect("flag") = true;
+        drain_pending_switch_off(&mut app);
+        // The gate holds the write on its settle; landing the answer resumes
+        // it, and the resumed write is the one that switches off.
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'work' read 5h 97% (line 95%) 4m ago"),
+        "the chain's switch-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
 }
 
 /// `s` with a profile cached with the login's account saves the login into
