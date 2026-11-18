@@ -11266,6 +11266,253 @@ fn a_parked_fixture_child_exits_when_its_parent_is_sigkilled() {
     crate::testutil::assert_child_exits(child, &start, "the parked fixture child");
 }
 
+// ── E2E `serve` re-exec ──────────────────────────────────────────────────────
+
+/// The env var carrying the child's home dir into the re-entered re-exec test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REEXEC_CHILD_HOME_ENV: &str = "CLAUTH_TEST_REEXEC_CHILD_HOME";
+/// The env var carrying the recorded-binary path (the scratch file the parent
+/// replaces mid-run) into the re-entered re-exec test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REEXEC_BIN_ENV: &str = "CLAUTH_TEST_REEXEC_BIN";
+
+/// The re-entry target for the E2E re-exec test: with the marker env absent
+/// (the normal suite run) it passes instantly; with it present it pins this
+/// process's recorded self-exe at the parent's scratch file and runs the real
+/// [`super::serve`], whose run loop re-execs — and aborts once the exec of
+/// the non-executable file fails — after the parent replaces that file.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn daemon_serve_child_for_reexec_test() {
+    let Some(home) = std::env::var_os(REEXEC_CHILD_HOME_ENV) else {
+        return;
+    };
+    let bin = std::env::var_os(REEXEC_BIN_ENV).expect("the parent set the recorded binary path");
+    // A SIGKILLed fixture parent runs no `Drop`: watch the pid this child
+    // started under and exit once the reparent moves it, so no `serve` process
+    // outlives its fixture parent.
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
+    crate::profile::set_home_override(std::path::PathBuf::from(home));
+    let _pin = crate::plugin_host::SelfExeOverride::pin(Some(std::path::Path::new(&bin)));
+    drop(super::serve(
+        super::StartMode::ExitIfRunning,
+        None,
+        &super::api::tls::CertSource::Lego,
+    ));
+}
+
+/// The run loop's stand-down end to end: the real `serve` child reads its
+/// own binary as replaced on two consecutive checks, probes the
+/// replacement (an executable stub that never answers the hidden flag and
+/// counts its own invocations), and stands down — same pid, still serving,
+/// `binary_replaced` still true in status.json, the verdict line logged
+/// once, no re-executing line, and no second probe while the file stays
+/// the same. A loop that re-exec'd into the stub would die (the stub
+/// exits 0), which reds here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_run_loop_stands_down_on_a_replacement_that_cannot_take_the_handover() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let bin = scratch.path().join("clauth");
+    let probes = scratch.path().join("probes");
+    let stub = |body: &str| format!("#!/bin/sh\necho x >> '{}'\n{body}\n", probes.display());
+    std::fs::write(&bin, stub("exit 0")).expect("write the recorded binary");
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::tests::daemon_serve_child_for_reexec_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("CLAUTH_NO_UPDATE", "1")
+        .env(REEXEC_CHILD_HOME_ENV, child_home.path())
+        .env(REEXEC_BIN_ENV, &bin)
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = crate::testutil::Owned(cmd.spawn().expect("spawn the serve child"));
+
+    // The child pins its recorded self-exe before `serve`, so the first
+    // `status.json` write proves the pin is installed: the replace below
+    // then reads as replaced, never as the recorded identity.
+    let status_path = child_home.path().join(".clauth/status.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !status_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote status.json"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The replacement: the probe can spawn it (executable), and it answers
+    // nothing — not capable. Each spawn appends one line to the probes file.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub executable");
+    std::fs::write(&bin, stub("exit 0 # replaced")).expect("replace the recorded binary");
+
+    // The stand-down: after two ticks (arm + due) and the probe, the child
+    // is still alive with the same pid, and keeps rewriting the feed.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        child.0.try_wait().ok().flatten().is_none(),
+        "the daemon never exec'd the stub: it kept its pid and kept running"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).expect("status.json"))
+            .expect("status.json parses");
+    assert_eq!(
+        status["binary_replaced"], true,
+        "the feed keeps naming the replacement: {status}"
+    );
+    let rewritten = std::fs::metadata(&status_path)
+        .expect("status.json")
+        .modified()
+        .expect("the mtime");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let rewritten_after = std::fs::metadata(&status_path)
+        .expect("status.json")
+        .modified()
+        .expect("the mtime");
+    assert!(
+        rewritten_after > rewritten,
+        "the daemon kept serving: the feed kept moving"
+    );
+    // One probe, and none on the checks after the stand-down.
+    assert_eq!(
+        std::fs::read_to_string(&probes).map_or(0, |text| text.lines().count()),
+        1,
+        "the one replacement probed once, never on every check"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let verdict = format!(
+        "clauth daemon: {} does not understand the restart handover; keeping this image running until a manual restart",
+        bin.display()
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == verdict))
+            .count(),
+        1,
+        "the verdict line logged once: {log}"
+    );
+    assert!(
+        !log.lines().any(|l| l.contains("re-executing")),
+        "no re-executing line after a stand-down: {log}"
+    );
+}
+
+/// The run loop's capable path end to end: a replacement that answers the
+/// hidden flag still gets the stop and the exec. The probe's spawn is
+/// counted by the stub's flag arm, the exec keeps the child's pid, and the
+/// stub's exec'd run (the daemon's argv, no flag) exits 1, which the
+/// parent observes as the daemon's exit. The re-executing line logs, no
+/// stand-down line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_run_loop_reexecs_into_a_replacement_that_answers_the_probe() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let bin = scratch.path().join("clauth");
+    let answers = scratch.path().join("answers");
+    let stub = format!(
+        "#!/bin/sh\nfor last; do :; done\nif [ \"$1\" = \"daemon\" ] && [ \"$last\" = \"{}\" ]; \
+         then printf '{}'; echo y >> '{}'; exit 0; fi\nexit 1\n",
+        crate::daemon::EXEC_HANDOVER_FLAG,
+        crate::daemon::EXEC_HANDOVER_TOKEN,
+        answers.display()
+    );
+    std::fs::write(&bin, &stub).expect("write the recorded binary");
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::tests::daemon_serve_child_for_reexec_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("CLAUTH_NO_UPDATE", "1")
+        .env(REEXEC_CHILD_HOME_ENV, child_home.path())
+        .env(REEXEC_BIN_ENV, &bin)
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = crate::testutil::Owned(cmd.spawn().expect("spawn the serve child"));
+
+    // The child pins its recorded self-exe before `serve`, so the first
+    // `status.json` write proves the pin is installed: the replace below
+    // then reads as replaced, never as the recorded identity.
+    let status_path = child_home.path().join(".clauth/status.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !status_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote status.json"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The replacement: executable (the probe must be able to spawn it),
+    // then rewritten (a new identity).
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub executable");
+    std::fs::write(&bin, format!("{stub}# replaced\n")).expect("replace the recorded binary");
+
+    // The probe runs, the stop and the exec follow: the stub's exec'd run
+    // exits 1, and the pid is the one the child was spawned with.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                panic!("the child never finished the re-exec");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => panic!("waiting on the serve child failed: {e}"),
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the exec'd stub ran with the daemon's argv and exited 1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&answers).map_or(0, |text| text.lines().count()),
+        1,
+        "the capability probe spawned the replacement once"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let due = format!(
+        "clauth daemon: its binary was replaced; re-executing {}",
+        bin.display()
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == due)),
+        "the due line logged: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|l| l.contains("does not understand the restart handover")),
+        "no stand-down line on the capable path: {log}"
+    );
+}
+
 // ── reload operator-log + stale-bearer pins ──────────────────────────────────
 
 fn reload_lines(daemon: &mut Daemon) -> Vec<String> {

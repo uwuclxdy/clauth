@@ -10698,7 +10698,8 @@ fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
     crate::profile::save_profile(&acct).expect("save profile");
     crate::testutil::register_names(&["acct"]);
     let mut app = app_with(vec![acct]);
-    app.tab = Tab::Overview;
+    // The Usage tab: the Overview has no row for a disabled account.
+    app.tab = Tab::Usage;
     app.profile_cursor.set(0);
 
     pick_menu_entry(&mut app, "disable account");
@@ -10749,7 +10750,8 @@ fn a_menu_pick_runs_its_own_direction_after_a_peer_flipped_the_account() {
     crate::profile::save_profile(&acct).expect("save profile");
     crate::testutil::register_names(&["acct"]);
     let mut app = app_with(vec![acct]);
-    app.tab = Tab::Overview;
+    // The Usage tab: the Overview has no row for a disabled account.
+    app.tab = Tab::Usage;
     app.profile_cursor.set(0);
     let disabled = |app: &App| app.config().find(&name).unwrap().is_disabled();
 
@@ -23520,6 +23522,8 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -61016,9 +61020,9 @@ fn plugin_card_carries_daemon_line(app: &App) -> bool {
 
 /// A fresh daemon feed saying `binary_replaced: true` raises one warning toast
 /// per run, tints the Services tab until it is visited, and puts a line on the
-/// plugin card that holds exactly while the feed says so. The daemon probe's
-/// own cadence drives all three: the test never recomputes the card itself
-/// after the first seed.
+/// plugin card that holds exactly while the feed says so — each after the
+/// replaced grace. The daemon probe's own cadence drives all of it: the test
+/// never recomputes the card itself after the first seed.
 #[test]
 fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     use crate::daemon::DaemonHealth;
@@ -61044,12 +61048,25 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     );
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace the first true reading raises nothing"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     assert_eq!(
         daemon_replaced_toasts(&app),
         vec![super::ToastKind::Warning],
-        "the first true reading toasts once, in the warning tone"
+        "the grace end toasts once, in the warning tone"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61091,8 +61108,14 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
         "the toast is once per run, never once per entry"
     );
     assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "a re-rise holds the line until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
+    poll_and_land(&mut app);
+    assert!(
         plugin_card_carries_daemon_line(&app),
-        "the line returns with the flag"
+        "the line returns with the flag once the grace ends"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61139,6 +61162,8 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     write_binary_feed(&now(), false, false);
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
 
     write_binary_feed(&now(), true, true);
     poll_and_land(&mut app);
@@ -61172,8 +61197,15 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a replaced read after a removal holds until its grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
         Some(super::ToastKind::Warning),
-        "a kind flip re-tints the Services tab"
+        "the kind flip re-tints the Services tab once its grace ends"
     );
     let detail = plugin_card_detail(&app);
     assert!(
@@ -61211,6 +61243,219 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
         ),
         (1, 1),
         "each kind toasts at most once per run"
+    );
+}
+
+/// A fresh daemon read as replaced only briefly — a daemon mid-re-exec —
+/// raises nothing: the toast and card line wait out a grace of continuous
+/// replaced reads, so the advice is not shouted over the daemon's own
+/// restart.
+#[test]
+fn a_daemon_read_replaced_briefly_raises_nothing() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "the quiet was not a failed probe: the feed reads live"
+    );
+}
+
+/// A daemon that died while the grace ran — the re-exec failed and nothing
+/// restarts it — raises nothing: a dead daemon already shows as not running,
+/// so no toast, no card line and no Services tint, on the death read and on
+/// the read after it.
+#[test]
+fn a_daemon_that_died_under_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the grace still holds the advice while the daemon lives"
+    );
+
+    drop(lock);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the death under the grace raises no toast"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "no card line for a dead daemon"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "no Services tint for a dead daemon"
+    );
+
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the read after the death stays quiet too"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "and no card line appears later"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "and no Services tint appears later"
+    );
+}
+
+/// A daemon that flipped the feed back to false within the grace — the
+/// re-exec happened — raises nothing, and a later replaced read restarts the
+/// full grace rather than continuing the old one.
+#[test]
+fn a_daemon_that_flipped_back_within_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the re-exec'd daemon raises nothing"
+    );
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "a fresh replaced read restarts the full grace"
+    );
+}
+
+/// A flip back to false inside the grace restarts it in full: the old
+/// grace's end raises nothing, and the advice waits a whole grace from the
+/// next replaced read.
+#[test]
+fn a_flip_back_within_the_grace_restarts_it_in_full() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 5_000);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 6_000);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the old grace's end raises nothing once a flip back restarted it"
+    );
+    app.daemon_now_override = Some(t0 + 16_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the advice raises a whole grace after the next replaced read"
+    );
+}
+
+/// A feed held at `binary_replaced` true continuously for the grace raises
+/// today's exact toast and card line and tints the Services tab. The grace
+/// clock is the TUI's own wall-clock read — the `tps` cache-age precedent's
+/// override — so the test advances it without sleeping; the feed's own
+/// freshness still reads the real clock.
+#[test]
+fn a_daemon_held_on_a_replaced_binary_past_the_grace_raises_the_advice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "still nothing one ms before the grace ends"
+    );
+
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the grace end raises today's exact toast, in the warning tone"
+    );
+    assert!(plugin_card_carries_daemon_line(&app), "and the card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "and the Services tab takes the warning tint"
     );
 }
 
@@ -61625,9 +61870,9 @@ fn a_stale_daemons_replaced_flag_raises_nothing() {
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 }
 
-/// Each rise of the daemon's flag tints the Services tab again, though the
-/// toast stays once per run: a daemon replaced, restarted, then replaced
-/// again is news each time.
+/// Each rise of the daemon's flag tints the Services tab again once its own
+/// grace ends, though the toast stays once per run: a daemon replaced,
+/// restarted, then replaced again is news each time.
 #[test]
 fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -61641,7 +61886,11 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     super::switch_tab(&mut app, super::Tab::Services);
     super::switch_tab(&mut app, super::Tab::Overview);
@@ -61654,6 +61903,13 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     );
 
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the second rise holds its tint until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -69663,6 +69919,8 @@ fn a_hung_rex_plugin_read_leaves_the_first_paint_unblocked() {
             "plugin: not installed".to_string(),
             "watcher: not running".to_string(),
             "experimental: may change in any release".to_string(),
+            String::new(),
+            format!("  {}", crate::tui::render::prose::cmd("clauth rex install")),
         ]
     );
     super::join_test_workers();
@@ -70069,6 +70327,326 @@ mod effort_row {
             "duplicate_profile copies the effort"
         );
     }
+}
+
+/// A saved claude account for the Overview's disabled-row tests.
+fn saved_account(name: &str, disabled: bool) -> crate::profile::Profile {
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.disabled = disabled;
+    crate::profile::save_profile(&profile).expect("save profile");
+    profile
+}
+
+/// A disabled account has no Overview row: the cursor steps from the row
+/// above it to the row below, while Setup still lists it.
+#[test]
+fn the_overview_cursor_steps_over_a_disabled_account() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    app.tab = Tab::Overview;
+    assert_eq!(
+        app.main_items(),
+        [MainItemKind::Profile(0), MainItemKind::Profile(2)]
+    );
+    assert_eq!(
+        app.setup_items(),
+        [
+            MainItemKind::Profile(0),
+            MainItemKind::Profile(1),
+            MainItemKind::Profile(2)
+        ],
+        "Setup still lists the disabled account"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.overview_cursor, 1);
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "the cursor steps past the hidden account onto c"
+    );
+}
+
+/// Shift+arrow on the Overview trades places with the next row it shows: a
+/// disabled account between the two has no row, so the move passes it rather
+/// than spend the press on a swap nothing shows, and the cursor follows the
+/// moved row to its place in the list.
+#[test]
+fn an_overview_reorder_passes_a_hidden_disabled_account() {
+    use super::{KeyEvent, KeyModifiers, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    app.tab = Tab::Overview;
+    let order = |app: &App| -> Vec<String> {
+        app.config()
+            .profiles
+            .iter()
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    // `a` on row 0 trades places with `c`, past the hidden `b`.
+    handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    assert_eq!(order(&app), ["b", "c", "a"]);
+    assert_eq!(app.overview_cursor, 1, "the cursor rides the moved row");
+    assert_eq!(app.profile_cursor.read(), 2);
+    // And back up past `c`, `b` still where it was.
+    handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    assert_eq!(order(&app), ["b", "a", "c"]);
+    assert_eq!(app.overview_cursor, 0);
+    assert_eq!(app.profile_cursor.read(), 1);
+}
+
+/// Disabling the highlighted account from the Overview's `a` menu takes its
+/// row away and hands the cursor to the row that took its place.
+#[test]
+fn disabling_the_highlighted_overview_row_hands_the_cursor_to_the_next() {
+    use super::{Modal, handle_key, run_confirm_action};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", false),
+        saved_account("c", false),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.profile_cursor.read(), 1, "fixture control: on b");
+    pick_menu_entry(&mut app, "disable account");
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("disabling raises a confirm");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+    assert_eq!(app.main_items().len(), 2, "b's row is gone");
+    assert_eq!(app.overview_cursor, 1);
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "the cursor rests on c, which took b's row"
+    );
+}
+
+/// A visit to the Overview keeps the shared selection. Usage selects the
+/// disabled `b`, which has no Overview row, so while the Overview shows its
+/// highlight and its actions name a shown row; back on Usage, and on Setup,
+/// `b` is still the selection.
+#[test]
+fn a_visit_to_the_overview_keeps_a_disabled_selection() {
+    use super::{MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    let b = SetupSelection::Item(MainItemKind::Profile(1));
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_selection(), b, "fixture control: Usage selects b");
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(0)));
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "the Overview's actions name the highlighted row"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.usage_selection(), b, "Usage still selects b");
+    handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.setup_selection(), b, "Setup reads b too");
+}
+
+/// A move on the Overview is a pick, onto a codex row too: the disabled
+/// selection the visit started over does not come back when it ends.
+#[test]
+fn a_move_on_the_overview_ends_the_kept_disabled_selection() {
+    use super::{MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![saved_account("a", false), saved_account("b", true)]);
+    app.codex_rows = vec![super::CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(1)),
+        "fixture control: Usage selects b"
+    );
+    handle_key(&mut app, alt_digit('1'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Codex(0)),
+        "fixture control: the move lands on the codex row"
+    );
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(0)),
+        "the claude row the Overview held, never b"
+    );
+}
+
+/// A visit to the Overview keeps the shared selection even when the Overview
+/// remembers a codex row its filter hides: the entry placement moves the shared
+/// cursor onto a shown row, and leaving puts the selection back on the disabled
+/// account the visit started over.
+#[test]
+fn a_visit_keeps_a_disabled_selection_when_a_hidden_codex_row_is_remembered() {
+    use super::{HarnessFilter, MainItemKind, SetupSelection, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    app.codex_rows = vec![super::CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.overview_remembered,
+        Some(MainItemKind::Codex(0)),
+        "fixture control: the Overview remembers the codex row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.harness_filter,
+        HarnessFilter::Claude,
+        "fixture control: `c` filters the list to claude"
+    );
+    assert_eq!(
+        app.main_items(),
+        [MainItemKind::Profile(0), MainItemKind::Profile(2)],
+        "fixture control: the filter hides the remembered codex row"
+    );
+
+    let b = SetupSelection::Item(MainItemKind::Profile(1));
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.usage_selection(), b, "fixture control: Usage selects b");
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(
+        app.profile_cursor.read(),
+        0,
+        "fixture control: the entry placement moves off b"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(app.usage_selection(), b, "Usage still selects b");
+    handle_key(&mut app, alt_digit('4'));
+    assert_eq!(app.setup_selection(), b, "Setup reads b too");
+}
+
+/// A roster change on the Overview moves the shared cursor off the held
+/// disabled account: leaving keeps the row the change placed there, not the
+/// account the visit started over.
+#[test]
+fn a_mid_visit_roster_change_ends_the_kept_disabled_selection() {
+    use super::{MainItemKind, Modal, SetupSelection, handle_key, run_confirm_action};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        saved_account("a", false),
+        saved_account("b", true),
+        saved_account("c", false),
+    ]);
+    handle_key(&mut app, alt_digit('2'));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(1)),
+        "fixture control: Usage selects the disabled b"
+    );
+
+    handle_key(&mut app, alt_digit('1'));
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(0)),
+        "fixture control: the visit parks on a"
+    );
+    assert!(
+        app.overview_held
+            .as_ref()
+            .is_some_and(|(name, _)| name.as_str() == "b"),
+        "fixture control: the visit holds the disabled b"
+    );
+
+    // Disabling the highlighted `a` takes its row away and re-places the shared
+    // cursor on `c`, which took its place.
+    pick_menu_entry(&mut app, "disable account");
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("disabling raises a confirm");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+    assert_eq!(
+        app.main_items(),
+        [MainItemKind::Profile(2)],
+        "fixture control: a's row is gone"
+    );
+    assert_eq!(
+        app.profile_cursor.read(),
+        2,
+        "fixture control: the change re-placed the shared cursor on c"
+    );
+
+    handle_key(&mut app, alt_digit('2'));
+    assert_eq!(
+        app.usage_selection(),
+        SetupSelection::Item(MainItemKind::Profile(2)),
+        "the row that took a's place, never the held b"
+    );
+}
+
+/// At startup the Overview's highlight and the shared selection agree before
+/// any tick: with the first account disabled both sit on the first shown row,
+/// and the `a` menu acts on it.
+#[test]
+fn startup_places_the_shared_selection_on_the_first_shown_row() {
+    use super::MainItemKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_unlinked_profiles(vec![saved_account("a", true), saved_account("b", false)])
+        .with_herdr_mode(false);
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "fixture control: the Overview is home"
+    );
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    assert_eq!(app.profile_cursor.read(), 1);
+    let menu = super::build_action_menu(&app);
+    assert_eq!(menu.context.as_deref(), Some("b"), "the menu names b");
+    assert!(
+        menu.items.iter().any(|i| i.label == "disable account")
+            && menu.items.iter().all(|i| i.label != "enable account"),
+        "the menu acts on the enabled b"
+    );
 }
 
 // ── `switch to a rolling token` row ─────────────────────────────────────────
@@ -75319,12 +75897,62 @@ fn a_daemon_on_a_replaced_binary_makes_the_mascot_peek() {
         None,
         "a plain feed moved the mascot"
     );
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
     poll_and_land(&mut app);
     assert_eq!(
         app.mascot.playing_anim(),
-        Some(crate::tui::clawd::Anim::Peek)
+        None,
+        "the first replaced read moved the mascot inside the grace"
     );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the mascot moved one ms before the grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Peek),
+        "a daemon held on a replaced binary for the whole grace never made the mascot peek"
+    );
+}
+
+#[test]
+fn a_daemon_that_re_execs_inside_the_grace_never_makes_the_mascot_peek() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    mascot_idle_at(&mut app, 30_000);
+    feed(false);
+    poll_and_land(&mut app);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the replaced read before the re-exec moved the mascot"
+    );
+    app.daemon_now_override = Some(t0 + 2_000);
+    feed(false);
+    for at in [2_000, 9_999, 10_000, 12_000, 20_000] {
+        app.daemon_now_override = Some(t0 + at);
+        poll_and_land(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "the mascot moved {at} ms after a replaced read its daemon re-exec cleared"
+        );
+    }
 }
 
 #[test]

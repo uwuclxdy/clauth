@@ -19991,6 +19991,99 @@ fn pid_liveness_reads_self_alive_and_a_reaped_child_dead() {
     );
 }
 
+/// A thread's id is no process: linux answers `kill(tid, 0)` and every
+/// `/proc/<tid>/…` file for a thread as it does for a process (the tid is only
+/// missing from the `/proc` listing), so a recorded pid the kernel reissued as
+/// another program's thread id must read as no live process, with no
+/// environment, argv or parent to read. The thread-group leader stays a live
+/// process with an environment, so a reader that refuses everything fails too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_id_reads_as_no_process() {
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let link = fs::read_link("/proc/thread-self").expect("read /proc/thread-self");
+        let tid: u32 = link
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse().ok())
+            .expect("/proc/thread-self ends in the tid");
+        tid_tx.send(tid).expect("send the tid");
+        let _ = release_rx.recv();
+    });
+    let tid = tid_rx.recv().expect("the thread reports its tid");
+    let leader = std::process::id();
+    assert_ne!(tid, leader, "the spawned thread is no thread-group leader");
+    let thread_files_read = fs::read(format!("/proc/{tid}/environ")).is_ok();
+    let verdicts = (
+        namespaced_keychain_ledger::pid_alive(tid),
+        process_environ(tid).is_some(),
+        process_argv(tid).is_some(),
+        crate::session_record::parent_pid(tid),
+    );
+    release_tx.send(()).expect("release the thread");
+    thread.join().expect("join the thread");
+    assert!(thread_files_read, "the live thread's /proc entry reads");
+    assert_eq!(
+        verdicts,
+        (false, false, false, None),
+        "(pid_alive, environ read, argv read, parent) for a thread's tid"
+    );
+    assert!(
+        namespaced_keychain_ledger::pid_alive(leader),
+        "the leader reads alive"
+    );
+    assert!(
+        process_environ(leader).is_some(),
+        "the leader's environment reads"
+    );
+}
+
+/// A supervisor's thread id is no supervisor: the thread answers with the
+/// parked `daemon run` process's argv, environment and liveness, so a recorded
+/// supervisor pid the kernel reissued as one of its threads would verify as
+/// this tree's supervisor and draw the SIGTERM, which linux delivers to the
+/// whole process. The leader still verifies as the tree's supervisor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_supervisors_thread_id_reads_as_no_supervisor() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4243-2");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    let tid = crate::testutil::a_thread_of(sup.pid);
+    let tid_start = crate::testutil::proc_start_of(tid).expect("the thread's start");
+    crate::testutil::write_daemon_lock(&tree, tid, &tid_start);
+    let verdicts = (
+        supervisor_state(&tree),
+        matches!(
+            supervisor_liveness_at_start(tid, &tid_start),
+            SupervisorLiveness::Gone
+        ),
+        process_is_claude_service(tid),
+    );
+    assert_eq!(
+        verdicts,
+        (SupervisorState::Gone, true, false),
+        "(verify, liveness gone, claude service) for a supervisor's thread id"
+    );
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    assert_eq!(
+        supervisor_state(&tree),
+        SupervisorState::Ours {
+            pid: sup.pid,
+            start: sup.proc_start.clone(),
+        },
+        "the leader verifies as the tree's supervisor"
+    );
+}
+
 /// A spawned delete child must never run unguarded: the pid stamp's
 /// not-found arm fails closed — the witnessing runner kills the child on the
 /// hook's error, so a row the consult already swept (the hook's own flock

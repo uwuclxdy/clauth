@@ -288,9 +288,11 @@ fn current_holder_identity() -> Result<DaemonIdentity, NoHolder> {
 
 /// Write a hold naming the daemon that holds the singleton now. The TUI's
 /// transient "stop the gateway" writes it; that daemon honours it and any
-/// later daemon ignores and removes it, so a restart clears it by
-/// construction. Errors when no daemon holds the singleton, its pid sidecar is
-/// unreadable, or its start time cannot be read.
+/// later daemon ignores and removes it, so a start as a new process clears it
+/// by construction. A self-update re-exec keeps the pid and its start time, so
+/// the hold survives it, as it survived an update before the re-exec. Errors
+/// when no daemon holds the singleton, its pid sidecar is unreadable, or its
+/// start time cannot be read.
 pub(crate) fn write_hold() -> Result<()> {
     let identity = current_holder_identity()?;
     let path = hold_path()?;

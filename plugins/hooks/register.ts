@@ -1,8 +1,10 @@
 // One Claude Code session bridged to the clauth daemon over its same-user unix
 // socket, so a paired phone can answer the session's permission asks and steer
-// it without owning the desk's keystrokes. Beside that, a pane lists the
-// session's clauth delegates off clauth's job files, with each one's
-// transcript, a stop, and a notice as each one finishes.
+// it without owning the desk's keystrokes. Beside that, the session's clauth
+// delegates, read off clauth's job files, draw as a row of chips above the
+// prompt and in a pane that lists them beside the chosen one's transcript,
+// which the person scrolls back through, with a stop and a notice as each one
+// finishes.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer, ToolCallResult } from 'claude-code'
 import type {
@@ -10,6 +12,7 @@ import type {
   ClauthDelegateView,
   ClauthDelegateWord,
   ClauthQueuedPrompt,
+  ClauthTranscriptItem,
 } from '../types'
 
 // One event body, in bytes: past it the daemon refuses 413, so an ask whose
@@ -97,10 +100,10 @@ const DELEGATES_COMMAND = 'delegates'
 // The job store's read cadence, kept only while a delegate of this session is
 // live: new ones come from a `delegate` call, which restarts it.
 const DELEGATES_TICK_MS = 2000
-// The hint line's own store read: the first draw after this long asks for one
+// The band's own store read: the first draw after this long asks for one
 // while the ticks are stopped, so a job minted outside a delegate call lands
 // without a store listing on every draw.
-const HINT_SCAN_MS = 1000
+const BAND_SCAN_MS = 1000
 // A blocking run's record: liveness only, beside the collectable `<id>.json`.
 const LIVE_SUFFIX = '.live.json'
 const LIVE_WORDS: readonly ClauthDelegateWord[] = ['running', 'blocking']
@@ -125,21 +128,82 @@ const PROJECT_SLUG_MAX = 200
 // A transcript is read from its end: one `.jsonl` passes 4 MiB, and one tool
 // result can fill a line of its own, so the bound is bytes, not lines.
 const TRANSCRIPT_TAIL_BYTES = 512 * 1024
+// The delegate's prompt is the transcript's first user entry: a long run has
+// long pushed it out of the tail, so its name is read from the file's start.
+const TRANSCRIPT_HEAD_BYTES = 256 * 1024
 const TRANSCRIPT_READ_TIMEOUT_MS = 5000
-const TRANSCRIPT_LINES = 200
+// A message's first lines, at most, as a card shows them.
+const MESSAGE_LINES = 12
+// A message card's text rows at most, and a tool result's lines before its
+// `… +N lines`.
+const CARD_ROWS = 4
+const RESULT_LINES = 3
+// A tool call as the transcript records it, matched across the whole file
+// when the end read does not hold all of it.
+const TOOL_USE_MARK = '"type":"tool_use"'
 const TRANSCRIPT_LINE_CHARS = 400
 const NO_TRANSCRIPT = 'no transcript to show'
 const EMPTY_TRANSCRIPT = 'nothing in the transcript yet'
+// Claude Code's model word for a message it wrote itself (an API error, an
+// interrupt), never the model a delegate runs.
+const SYNTHETIC_MODEL = '<synthetic>'
+
+// The band and the pane's running mark is Claude Code's spinner: its glyphs
+// for the terminal, forward then back, one frame per 120 ms off the clock
+// (Claude Code 2.1.325's bundle, measured 2026-11-14). Its 120 ms pick is
+// ghostty's set off `TERM` alone, and one set for every other terminal (same
+// bundle, measured 2026-11-17).
+const SPINNER_GLYPHS = {
+  ghostty: ['·', '✢', '✳', '✶', '✻', '✻'],
+  other: ['·', '✢', '*', '✶', '✻', '✽'],
+} as const
+type SpinnerKind = keyof typeof SPINNER_GLYPHS
+const spinnerFrames = (kind: SpinnerKind): readonly string[] => [
+  ...SPINNER_GLYPHS[kind],
+  ...[...SPINNER_GLYPHS[kind]].reverse(),
+]
+const MARK_FRAME_MS = 120
+const LEAD_DOT = '●'
+// The band's lead dot as Claude Code draws it: drawn always, its gray fading
+// to half-dim and back over one 2 s cycle, one colour per frame. The gray is
+// the dark theme's `inactive` (`inactive:"rgb(153,153,153)"`, 2.1.325's
+// bundle) and the dim end that colour mixed with black at 0.5
+// (`Aw(G,P,0.5)`, its `P={r:0,g:0,b:0}` declared beside it, same bundle,
+// rounds each channel).
+const DOT_FADE_MS = 2000
+const DOT_GRAY = { r: 153, g: 153, b: 153 }
+const DOT_HALF = { r: 77, g: 77, b: 77 }
+const dotColour = (now: number): string => {
+  // Claude Code's ramp over the cycle, inverted so the full gray starts it:
+  // `1-(1-Math.cos(2*Math.PI*t/K))/2`, K = 2000.
+  const level = (1 + Math.cos((2 * Math.PI * now) / DOT_FADE_MS)) / 2
+  const channel = (half: number, full: number): number => Math.round(half + (full - half) * level)
+  return `#${[channel(DOT_HALF.r, DOT_GRAY.r), channel(DOT_HALF.g, DOT_GRAY.g), channel(DOT_HALF.b, DOT_GRAY.b)]
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('')}`
+}
+// clauth's accent and its theme's background (catppuccin mocha's base).
+const ACCOUNT_BLUE = '#43abe5'
+const PANE_BG = '#1e1e2e'
+const LIST_TITLE_COLOR = '#d97757'
+// The spaces between the band's control, each chip and its `+N`.
+const BAND_GAP = '   '
+// The pane's split: the list's share of the body, its bounds, and the width
+// below which neither half draws a frame.
+const LIST_SHARE = 0.32
+const LIST_MIN_COLUMNS = 12
+const LIST_MAX_COLUMNS = 40
+const FRAMED_MIN_COLUMNS = 60
 
 // The rows' fields follow clauth's job record: bump a shape when they change,
 // so a reload declines what the older module stored.
 const DELEGATES = atom({ plugin: 'clauth', key: 'delegates' } as const, [] as ClauthDelegateRow[], {
-  shape: 'delegates-1',
+  shape: 'delegates-2',
 })
 const DELEGATE_VIEW = atom(
   { plugin: 'clauth', key: 'delegateView' } as const,
   null as ClauthDelegateView | null,
-  { shape: 'delegate-view-1' },
+  { shape: 'delegate-view-4' },
 )
 
 const encoder = new TextEncoder()
@@ -215,11 +279,38 @@ let lastNoteAt = new Map<string, number>()
 // rather than every tick; the viewed transcript's stamp does the same for it.
 let jobsDir: string | null = null
 let projectsDir: string | null = null
+// The home directory a transcript's paths show as `~`; null where it is `/`.
+let homeDir: string | null = null
 let delegatesTimer: Timer | null = null
 let delegateScanInFlight: Promise<void> | null = null
 let delegateCallsInFlight = 0
 let jobFileStamps = new Map<string, string>()
 let viewStamp: string | null = null
+// Bumped by each choice of the delegate the pane shows and by its close: a
+// transcript read that settles under an older count shows a choice since
+// replaced.
+let viewChoice = 0
+// Above zero while a choice's reads are in flight: the refresh's no-view
+// branch skips, so a tick landing inside them never chooses a delegate of
+// its own. Settled on every exit of the choice, a throw included, so one
+// failed choice never silences the branch for the pane's life.
+let pendingChoice = 0
+// The pane's transcript window: its top row, held as the item that row sits
+// in (its key) and the row within it; null while the window follows the end.
+// A delegate choice or a pane reopen puts it back at the end; new output
+// leaves a scrolled window where it was, resolved by that key when the items
+// are read again (a result landing on a call grows it below the rows above,
+// and its key never changes).
+let transcriptScroll: { id: string; anchor: { key: string; row: number } | null } = { id: '', anchor: null }
+// The sizes the last pane draw used, which the scroll hook moves windows by:
+// the transcript's rows, the card width its layout counts, the list's columns.
+let drawnTranscriptRows = 1
+let drawnCardWidth = 1
+let drawnListWidth = 1
+// The list's own window: its top row, clamped to its entries at each draw. A
+// pane close puts it back at the top; choosing a delegate leaves it, so the
+// chosen entry stays where the press found it.
+let listScrollTop = 0
 let monitorServer: string = MONITOR_SERVERS.mcp__plugin_clauth_clauth__delegate
 let monitorTool: DelegateTool | null = null
 // The live rows whose record file last moved, when, its owner, and the newest
@@ -237,23 +328,24 @@ const priorSessions = new Set<string>()
 // The live rows a `/clear` took out of `$.state`, held until the store read
 // that merges them back commits its rows.
 let carriedRows: ClauthDelegateRow[] = []
-// When the hint line last asked for a store read.
-let hintScanAt = 0
+// When the band last asked for a store read.
+let bandScanAt = 0
+// The redraw due at the marks' next change, while a drawing shows a live run.
+let frameTimer: Timer | null = null
+// The spinner's frames as Claude Code picks them: ghostty's off `TERM` at the
+// session's start, else every other terminal's.
+let spinner: readonly string[] = spinnerFrames('other')
 // Whether this host's `ps` answers the owner probe's form: null until asked.
 let psFormWorks: boolean | null = null
-// Whether each surface docks a pane beside the transcript, the fact every
-// drawing's viewport carries. Kept per surface: one session may draw on
-// several at once, and a single value would be whichever surface drew last.
-const surfaceLayouts = new Map<string, boolean>()
 // Bumped at each session end: a store read that settles under an older epoch
 // belongs to a conversation that is gone.
 let sessionEpoch = 0
 let sessionEnding = false
-// The delegate call whose one unasked open is spent. A call that finds the
-// pane already open spends it too, so a close during the call is not undone
-// when the call settles.
-let delegateCallGen = 0
-let autoOpenGen = -1
+// The tool calls whose permission ask or question is up now, and the delegate
+// the pane showed when the first of them closed it; null while no dialog has
+// closed the pane.
+const dialogCalls = new Set<string>()
+let paneBeforeDialog: { focus: string | null } | null = null
 // When this process's session started: a record first seen finished but whose
 // run ended before this was told in its own conversation.
 let deliveredSince = 0
@@ -1015,13 +1107,6 @@ type JsonObject = Record<string, unknown>
 
 const isLive = (word: ClauthDelegateWord): boolean => LIVE_WORDS.includes(word)
 
-// The layout fact a drawing hands over, keyed by the surface that drew; the
-// events that open a pane carry none of their own.
-const noteLayout = (surface: string, viewport: { isFullscreen?: boolean } | undefined): void => {
-  if (viewport?.isFullscreen === true) surfaceLayouts.set(surface, true)
-  else if (viewport?.isFullscreen === false) surfaceLayouts.set(surface, false)
-}
-
 const textOf = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 const epochMsOf = (value: unknown): number =>
@@ -1066,12 +1151,6 @@ function elapsedOf(row: ClauthDelegateRow, now: number): string | null {
   if (row.startedAt === 0) return null
   const end = isLive(row.word) ? now : row.endedAt
   return formatElapsed(Math.floor((end - row.startedAt) / 1000))
-}
-
-// The words a row and its view's head show: id, account, state, time.
-function delegateSummary(row: ClauthDelegateRow, now: number): string {
-  const elapsed = elapsedOf(row, now)
-  return [row.id, row.profile, row.word, ...(elapsed === null ? [] : [elapsed])].join('  ')
 }
 
 async function readJsonObject($: EngineInterface, path: string): Promise<JsonObject | null> {
@@ -1123,6 +1202,7 @@ function delegateRowOf(record: JsonObject, isBlocking: boolean, now: number): Cl
     word,
     startedAt: epochMsOf(record.started_at),
     endedAt: isLive(word) ? 0 : endedAtOf(record, now),
+    lastOutputAt: epochMsOf(record.last_output_at),
     tail: textOf(record.tail),
     transcript:
       sessionId === '' || cwd === '' || projectsDir === null
@@ -1359,13 +1439,10 @@ async function scanDelegates($: EngineInterface): Promise<void> {
   // Committed only once the rows are stored: a write that failed leaves every
   // record read this scan owed to the next one.
   commitStamps()
-  // Raised before the open: an unasked open that fails must not drop this
-  // scan's notices, whose rows are already stored as told.
   for (const row of finished) {
     const elapsed = elapsedOf(row, now)
     $.ui.toast(`delegate ${row.id} on ${row.profile} ${row.word}${elapsed === null ? '' : ` after ${elapsed}`}`)
   }
-  if (live) await autoOpenDelegates($, epoch)
 }
 
 // The store's one read in flight: a tick and a delegate call share it.
@@ -1396,9 +1473,10 @@ function stopDelegatesTimer(): void {
   delegatesTimer = null
 }
 
-// One tick: the store read, the viewed transcript read where it grew, and
-// the live rows' time redrawn. With nothing live and no call that could
-// start a run, the ticks stop until the next `delegate` call.
+// One tick: the store read, then the viewed transcript read where it grew.
+// The drawings showing a live run redraw on their own (`scheduleFrame`). With
+// nothing live and no call that could start a run, the ticks stop until the
+// next `delegate` call.
 async function delegatesTick($: EngineInterface): Promise<void> {
   try {
     const epoch = sessionEpoch
@@ -1410,47 +1488,116 @@ async function delegatesTick($: EngineInterface): Promise<void> {
     if (epoch !== sessionEpoch) return
     const rows = await read($, DELEGATES)
     await refreshDelegateView($, rows)
-    if (rows.some(row => isLive(row.word))) $.ui.invalidate('ui.render')
-    else if (delegateCallsInFlight === 0) stopDelegatesTimer()
+    if (!rows.some(row => isLive(row.word)) && delegateCallsInFlight === 0) stopDelegatesTimer()
   } catch {
     // A failed tick changes nothing; the next one reads again.
   }
 }
 
+// One line as the pane draws it: whitespace runs folded, and a line past the
+// bound cut at its end, never its start.
 const oneLine = (s: string): string => {
   const flat = s.replace(/\s+/g, ' ').trim()
   return flat.length > TRANSCRIPT_LINE_CHARS ? `${flat.slice(0, TRANSCRIPT_LINE_CHARS - 1)}…` : flat
 }
 
-// One content block as a line: text as written, a tool call as its name and
-// input; every other block (a tool's result, thinking) is left out.
-function blockLine(block: unknown, lead: string): string[] {
-  const fields = objectOf(block)
-  if (fields === null) return []
-  if (fields.type === 'text') {
-    const said = oneLine(textOf(fields.text))
-    return said === '' ? [] : [`${lead}${said}`]
+const firstLineOf = (s: string): string => oneLine(s.split('\n').find(line => line.trim() !== '') ?? '')
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// A directory as a whole path where a word starts: `/work/a` in `/work/a/x`
+// and `cd /work/a`, never in `/work/ab` or `/x/work/a`. The slash after it,
+// when one follows, is the pattern's one group.
+const dirPatterns = new Map<string, RegExp>()
+function dirPattern(dir: string): RegExp {
+  const known = dirPatterns.get(dir)
+  if (known !== undefined) return known
+  const pattern = new RegExp(`(?<![\\w./-])${escapeRegExp(dir)}(/|(?![^/\\s"']))`, 'g')
+  dirPatterns.set(dir, pattern)
+  return pattern
+}
+
+// Paths as Claude Code draws them: one under the delegate's working directory
+// relative to it, one elsewhere under home as `~/…`.
+function pathsShown(s: string, cwd: string): string {
+  const dir = cwd.replace(/\/+$/, '')
+  const local = dir === '' ? s : s.replace(dirPattern(dir), (_whole, slash: string) => (slash === '/' ? '' : '.'))
+  return homeDir === null ? local : local.replace(dirPattern(homeDir), (_whole, slash: string) => `~${slash}`)
+}
+
+// The one argument a built-in tool's call shows in its parentheses, as
+// Claude Code shows Bash's command and Read's path; any other tool shows its
+// arguments as `key: value` pairs.
+const TOOL_CALL_ARGS: Readonly<Record<string, string>> = {
+  Bash: 'command',
+  Read: 'file_path',
+  Write: 'file_path',
+  Edit: 'file_path',
+  MultiEdit: 'file_path',
+  NotebookEdit: 'notebook_path',
+  Glob: 'pattern',
+  Grep: 'pattern',
+  WebFetch: 'url',
+  WebSearch: 'query',
+  Task: 'description',
+  Agent: 'description',
+  Skill: 'skill',
+}
+
+// A tool call as Claude Code draws it: `Bash(cargo test)`,
+// `Read(src/lib.rs)`, an MCP tool as `server - tool (MCP)(key: value)`.
+function toolCallText(name: string, input: unknown, cwd: string): string {
+  const fields = objectOf(input) ?? {}
+  const argKey = TOOL_CALL_ARGS[name]
+  const primary = argKey === undefined ? undefined : fields[argKey]
+  const args =
+    typeof primary === 'string'
+      ? collapseLines(primary)
+      : Object.entries(fields)
+          .map(([key, value]) => `${key}: ${oneLineJson(value)}`)
+          .join(', ')
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name)
+  const shown = mcp === null ? name : `${mcp[1]} - ${mcp[2]} (MCP)`
+  return oneLine(args === '' ? shown : `${shown}(${pathsShown(args, cwd)})`)
+}
+
+const linesOf = (text: string): string[] => text.split('\n').filter(line => line.trim() !== '')
+
+const plural = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? '' : 's'}`
+
+// A tool result as Claude Code sums it up under its call: a Read as how many
+// lines it read (the count the engine records beside the result, else the
+// result's own lines), any other as its first lines and how many more follow.
+function resultSummary(
+  tool: string,
+  block: JsonObject,
+  recorded: unknown,
+  cwd: string,
+): { result: string[]; more: number } {
+  const content = block.content
+  const text = Array.isArray(content)
+    ? content.map(part => (objectOf(part)?.type === 'text' ? textOf(objectOf(part)?.text) : '')).join('\n')
+    : textOf(content)
+  const lines = linesOf(text)
+  if (tool === 'Read' && block.is_error !== true) {
+    const numLines = objectOf(objectOf(recorded)?.file)?.numLines
+    return { result: [`Read ${plural(typeof numLines === 'number' ? numLines : lines.length, 'line')}`], more: 0 }
   }
-  if (fields.type === 'tool_use') return [oneLine(`⚙ ${textOf(fields.name)} ${oneLineJson(fields.input ?? {})}`)]
-  return []
+  if (lines.length === 0) return { result: ['(No content)'], more: 0 }
+  return {
+    result: lines.slice(0, RESULT_LINES).map(line => oneLine(pathsShown(line, cwd))),
+    more: Math.max(0, lines.length - RESULT_LINES),
+  }
 }
 
-// One transcript entry as the lines the view shows: the prompts a delegate
-// was given (`›`), its replies and its tool calls.
-function entryLines(entry: JsonObject): string[] {
-  const type = entry.type
-  if (type !== 'user' && type !== 'assistant') return []
-  const lead = type === 'user' ? '› ' : ''
-  const content = objectOf(entry.message)?.content
-  if (typeof content === 'string') return blockLine({ type: 'text', text: content }, lead)
-  if (!Array.isArray(content)) return []
-  return content.flatMap(block => blockLine(block, lead))
-}
+// A message's first lines as written, whitespace runs folded, blank lines
+// left out.
+const messageLines = (text: string): string[] => linesOf(text).map(oneLine).slice(0, MESSAGE_LINES)
 
-// A transcript's end as lines; the first entry, cut by the byte bound, does
-// not parse and is left out.
-function transcriptLines(jsonl: string): string[] {
-  const lines: string[] = []
+// A transcript's entries that parse: the first line of a byte-bounded read is
+// cut, and a line still being written is not whole.
+function transcriptEntries(jsonl: string): JsonObject[] {
+  const entries: JsonObject[] = []
   for (const raw of jsonl.split('\n')) {
     let entry: JsonObject | null
     try {
@@ -1458,45 +1605,222 @@ function transcriptLines(jsonl: string): string[] {
     } catch {
       continue
     }
-    if (entry !== null) lines.push(...entryLines(entry))
+    if (entry !== null) entries.push(entry)
   }
-  return lines.slice(-TRANSCRIPT_LINES)
+  return entries
 }
 
-async function readTranscript($: EngineInterface, path: string): Promise<string[]> {
+// An entry's content as blocks: a plain string is one text block.
+function contentBlocks(entry: JsonObject): JsonObject[] {
+  const content = objectOf(entry.message)?.content
+  if (typeof content === 'string') return [{ type: 'text', text: content }]
+  if (!Array.isArray(content)) return []
+  return content.map(objectOf).filter(block => block !== null)
+}
+
+// A user entry the person or a caller wrote. The engine's own (a skill load's
+// injected text, a compaction summary) is not a prompt the delegate was given.
+const isPrompt = (entry: JsonObject): boolean =>
+  entry.type === 'user' && entry.isMeta !== true && entry.isCompactSummary !== true
+
+type CallItem = Extract<ClauthTranscriptItem, { kind: 'call' }>
+
+type TranscriptRead = { items: ClauthTranscriptItem[]; model: string; toolCalls: number }
+
+// A transcript's end as the pane draws it: each tool call with its result's
+// summary, each message of the delegate's own, and the prompts it was given
+// after the one the header shows (`promptId`); with the model of its newest
+// message and how many tool calls the read holds. Every item carries its
+// anchor key, so the scroll window's place survives a reread: the entry's
+// uuid with the block's index (the line's place in the read when the entry
+// named none), a tool call's own id.
+function transcriptOf(jsonl: string, promptId: string): TranscriptRead {
+  const items: ClauthTranscriptItem[] = []
+  const calls = new Map<string, { item: CallItem; tool: string }>()
+  let model = ''
+  let toolCalls = 0
+  let at = 0
+  for (const raw of jsonl.split('\n')) {
+    const lineAt = at
+    at += raw.length + 1
+    let entry: JsonObject | null
+    try {
+      entry = objectOf(JSON.parse(raw))
+    } catch {
+      continue
+    }
+    if (entry === null) continue
+    const uuid = textOf(entry.uuid)
+    const cwd = textOf(entry.cwd)
+    const blocks = contentBlocks(entry)
+    let blockIndex = 0
+    const keyOf = (kind: string): string =>
+      uuid === '' ? `${kind}:${lineAt}:${blockIndex}` : `${kind}:${uuid}:${blockIndex}`
+    if (entry.type === 'assistant') {
+      const by = textOf(objectOf(entry.message)?.model)
+      if (by !== '' && by !== SYNTHETIC_MODEL) model = by
+      for (const block of blocks) {
+        blockIndex += 1
+        if (block.type === 'text') {
+          const lines = messageLines(textOf(block.text))
+          if (lines.length > 0) items.push({ kind: 'said', key: keyOf('s'), lines })
+        } else if (block.type === 'tool_use') {
+          const tool = textOf(block.name)
+          const id = textOf(block.id)
+          const item: CallItem = {
+            kind: 'call',
+            key: id === '' ? keyOf('c') : `c:${id}`,
+            call: toolCallText(tool, block.input, cwd),
+            result: null,
+            more: 0,
+            isError: false,
+          }
+          toolCalls += 1
+          items.push(item)
+          calls.set(id, { item, tool })
+        }
+      }
+    } else if (isPrompt(entry)) {
+      const isHeaderPrompt = promptId !== '' && textOf(entry.uuid) === promptId
+      // The engine records one result's own summary beside its entry.
+      const recorded = blocks.filter(block => block.type === 'tool_result').length === 1 ? entry.toolUseResult : undefined
+      for (const block of blocks) {
+        blockIndex += 1
+        if (block.type === 'text' && !isHeaderPrompt) {
+          const text = oneLine(collapseLines(textOf(block.text)))
+          if (text !== '') items.push({ kind: 'asked', key: keyOf('a'), text })
+        } else if (block.type === 'tool_result') {
+          const call = calls.get(textOf(block.tool_use_id))
+          if (call !== undefined) {
+            Object.assign(call.item, resultSummary(call.tool, block, recorded, cwd))
+            call.item.isError = block.is_error === true
+          }
+        }
+      }
+    }
+  }
+  return { items, model, toolCalls }
+}
+
+// The delegate's own prompt off its transcript's head: the first line of the
+// first prompt it was given, and the entry that holds it.
+function promptOf(jsonl: string): { name: string; id: string } {
+  for (const entry of transcriptEntries(jsonl)) {
+    if (!isPrompt(entry)) continue
+    const text = contentBlocks(entry).find(block => block.type === 'text')
+    if (text !== undefined) return { name: firstLineOf(textOf(text.text)), id: textOf(entry.uuid) }
+  }
+  return { name: '', id: '' }
+}
+
+// How many tool calls a whole transcript holds, counted where it lies: the
+// file can pass what one read may copy in. Null when the count failed.
+async function countToolCalls($: EngineInterface, path: string): Promise<number | null> {
   try {
-    const run = await $.process.run(['tail', '-c', String(TRANSCRIPT_TAIL_BYTES), path], {
+    const run = await $.process.run(['grep', '-o', '-F', TOOL_USE_MARK, path], {
       timeoutMs: TRANSCRIPT_READ_TIMEOUT_MS,
     })
-    if (run.exitCode !== 0) return [NO_TRANSCRIPT]
-    const lines = transcriptLines(run.stdout)
-    return lines.length === 0 ? [EMPTY_TRANSCRIPT] : lines
+    // grep's exit 1 is a clean read that matched nothing.
+    if (run.exitCode === 1 && run.stdout === '') return 0
+    if (run.exitCode !== 0 || run.isStdoutTruncated) return null
+    return linesOf(run.stdout).length
   } catch {
-    return [NO_TRANSCRIPT]
+    return null
   }
 }
 
-// The view's transcript, read again only when its file changed since. A pane
-// the engine dropped as `unload` (its drawing threw) runs no closer hook, so
-// the view can outlive it: nothing draws it, so nothing here reads its file.
-async function refreshDelegateView($: EngineInterface, rows: readonly ClauthDelegateRow[]): Promise<void> {
-  if (!(await $.ui.panes()).some(pane => pane.id === DELEGATES_PANE)) return
-  const view = await read($, DELEGATE_VIEW)
-  if (view === null) return
-  const path = rows.find(row => row.id === view.id)?.transcript ?? null
-  if (path === null) return
-  const stamp = await fileStamp($, path)
-  if (stamp === null || stamp === viewStamp) return
-  const lines = await readTranscript($, path)
-  viewStamp = stamp
-  await update($, DELEGATE_VIEW, cur => (cur?.id === view.id ? { id: view.id, lines } : cur))
+// A reader's output over a transcript, null when it could not read it.
+async function readTranscriptPart($: EngineInterface, argv: readonly string[]): Promise<string | null> {
+  try {
+    const run = await $.process.run(argv, { timeoutMs: TRANSCRIPT_READ_TIMEOUT_MS })
+    return run.exitCode === 0 ? run.stdout : null
+  } catch {
+    return null
+  }
 }
 
-async function openDelegateView($: EngineInterface, id: string): Promise<void> {
-  const path = (await read($, DELEGATES)).find(row => row.id === id)?.transcript ?? null
-  viewStamp = path === null ? null : await fileStamp($, path)
-  const lines = path === null ? [NO_TRANSCRIPT] : await readTranscript($, path)
-  await update($, DELEGATE_VIEW, () => ({ id, lines }))
+const noteItems = (text: string): ClauthTranscriptItem[] => [{ kind: 'note', key: 'note:0', text }]
+
+// One delegate's view, read now: the end of its transcript, its prompt off
+// the head unless an earlier read of the same delegate found it, and its tool
+// calls counted over the whole file when the end read holds less than all.
+async function readDelegateView(
+  $: EngineInterface,
+  row: ClauthDelegateRow,
+  known: ClauthDelegateView | null,
+): Promise<ClauthDelegateView> {
+  const kept = known?.id === row.id ? known : null
+  const before: ClauthDelegateView = {
+    id: row.id,
+    name: kept?.name ?? '',
+    promptId: kept?.promptId ?? '',
+    model: kept?.model ?? '',
+    toolCalls: kept?.toolCalls ?? null,
+    items: noteItems(NO_TRANSCRIPT),
+  }
+  const path = row.transcript
+  if (path === null) return before
+  const head = before.name === '' ? await readTranscriptPart($, ['head', '-c', String(TRANSCRIPT_HEAD_BYTES), path]) : null
+  const prompt = head === null ? { name: before.name, id: before.promptId } : promptOf(head)
+  const end = await readTranscriptPart($, ['tail', '-c', String(TRANSCRIPT_TAIL_BYTES), path])
+  if (end === null) return { ...before, name: prompt.name, promptId: prompt.id }
+  const read = transcriptOf(end, prompt.id)
+  const isWhole = bodyBytes(end) < TRANSCRIPT_TAIL_BYTES
+  return {
+    id: row.id,
+    name: prompt.name,
+    promptId: prompt.id,
+    model: read.model === '' ? before.model : read.model,
+    toolCalls: isWhole ? read.toolCalls : await countToolCalls($, path),
+    items: read.items.length === 0 ? noteItems(EMPTY_TRANSCRIPT) : read.items,
+  }
+}
+
+// The view's transcript, read again only when its file changed since; an
+// open pane showing no delegate of this session's rows lands on the newest.
+// A pane the engine dropped as `unload` (its drawing threw) runs no closer
+// hook, so the view can outlive it: nothing draws it, so nothing here reads
+// its file.
+async function refreshDelegateView($: EngineInterface, rows: readonly ClauthDelegateRow[]): Promise<void> {
+  if (!(await isPaneOpen($))) return
+  const view = await read($, DELEGATE_VIEW)
+  const row = view === null ? undefined : rows.find(candidate => candidate.id === view.id)
+  if (view === null || row === undefined) {
+    if (pendingChoice > 0) return
+    await chooseDelegate($, null)
+    return
+  }
+  if (row.transcript === null) return
+  const stamp = await fileStamp($, row.transcript)
+  if (stamp === null || stamp === viewStamp) return
+  const choice = viewChoice
+  const next = await readDelegateView($, row, view)
+  if (choice !== viewChoice) return
+  viewStamp = stamp
+  await update($, DELEGATE_VIEW, cur => (cur?.id === view.id ? next : cur))
+}
+
+// Shows one delegate in the pane's detail, the newest when none is named or
+// the named one is not listed, its transcript read now.
+async function chooseDelegate($: EngineInterface, id: string | null): Promise<void> {
+  pendingChoice += 1
+  viewChoice += 1
+  // A new choice, a list press on the one shown included, lands the window
+  // back at the end.
+  transcriptScroll = { id: '', anchor: null }
+  const choice = viewChoice
+  try {
+    const rows = await read($, DELEGATES)
+    const row = rows.find(candidate => candidate.id === id) ?? rows[0]
+    if (row === undefined) return
+    const stamp = row.transcript === null ? null : await fileStamp($, row.transcript)
+    const view = await readDelegateView($, row, await read($, DELEGATE_VIEW))
+    if (choice !== viewChoice) return
+    viewStamp = stamp
+    await update($, DELEGATE_VIEW, () => view)
+  } finally {
+    pendingChoice -= 1
+  }
 }
 
 // The cancel a blocking delegate call settled on: its envelope's word, and
@@ -1574,50 +1898,272 @@ async function stopDelegate($: EngineInterface, row: ClauthDelegateRow): Promise
   $.ui.toast(`could not stop ${id}`)
 }
 
-function openDelegatesPane($: EngineInterface) {
-  return $.ui.open({ id: DELEGATES_PANE, title: DELEGATES_TITLE })
+// Opens the pane on one delegate, the newest when none is named. The surface
+// paints the body clauth's background too, under the tree's own fill.
+async function openDelegatesPane($: EngineInterface, focus: string | null = null) {
+  const opened = await $.ui.open({ id: DELEGATES_PANE, title: DELEGATES_TITLE, backgroundColor: PANE_BG })
+  // The open stands whether the choice succeeds: a choice that throws leaves
+  // the pane on the delegate it showed before, its window back at the end, a
+  // fresh open on the newest delegate with no transcript, so the failure
+  // reaches the person as a toast, never as a failed open.
+  await chooseDelegate($, focus).catch(() => $.ui.toast('could not show a delegate in the pane'))
+  return opened
 }
 
-// Whether an unasked open may land here: only where the pane is a sidebar on
-// every surface the session draws on. The API's own example opens only on
-// `isFullscreen === true`, and a surface that has not said, or a session that
-// draws on none, is not a yes.
-const docksPane = async ($: EngineInterface): Promise<boolean> => {
-  const surfaces = await $.session.surfaces()
-  return surfaces.length > 0 && surfaces.every(surface => surfaceLayouts.get(surface) === true)
+const isPaneOpen = async ($: EngineInterface): Promise<boolean> =>
+  (await $.ui.panes()).some(pane => pane.id === DELEGATES_PANE)
+
+// A permission ask or a question comes up for a tool call: the pane, if open,
+// closes for it and keeps which delegate it showed. A failure leaves the pane
+// as it stands rather than holding up the dialog.
+async function closePaneForDialog($: EngineInterface, call: string | undefined): Promise<void> {
+  if (call === undefined || dialogCalls.has(call)) return
+  dialogCalls.add(call)
+  if (paneBeforeDialog !== null) return
+  try {
+    if (!(await isPaneOpen($))) return
+    paneBeforeDialog = { focus: (await read($, DELEGATE_VIEW))?.id ?? null }
+    await $.ui.close({ id: DELEGATES_PANE })
+  } catch {
+    paneBeforeDialog = null
+  }
 }
 
-// The one unasked open a delegate call gets: the scan that sees its run opens
-// the pane while the call holds the turn, so a blocking run can be watched and
-// stopped, and a call no scan caught still opens it once it settles. A call
-// that finds the pane already open spends its open, and a close during the
-// call is the person's, not an invitation to reopen it at the settle. A scan
-// whose conversation has ended since it started opens nothing.
-async function autoOpenDelegates($: EngineInterface, epoch: number | null = null): Promise<void> {
-  const stale = (): boolean => epoch !== null && epoch !== sessionEpoch
-  if (stale() || delegateCallsInFlight === 0 || autoOpenGen === delegateCallGen) return
-  if (!(await docksPane($))) return
-  if (stale()) return
-  autoOpenGen = delegateCallGen
-  if ((await $.ui.panes()).some(pane => pane.id === DELEGATES_PANE)) return
-  if (stale()) return
-  await openDelegatesPane($)
+// A tool call settled, its dialog with it: once no other dialog is up, the
+// pane a dialog closed opens again on the delegate it showed. A pane the
+// person opened in the meantime is left as they have it.
+async function reopenPaneAfterDialog($: EngineInterface, call: string | undefined): Promise<void> {
+  if (call === undefined || !dialogCalls.delete(call) || dialogCalls.size > 0) return
+  const before = paneBeforeDialog
+  paneBeforeDialog = null
+  if (before === null) return
+  try {
+    if (!(await isPaneOpen($))) await openDelegatesPane($, before.focus)
+  } catch {
+    // A refused open leaves the pane closed; the band and `/delegates` open it.
+  }
 }
 
-// After a delegate call: the store read fresh, then the pane opened unless
-// this session has no delegate to list.
-async function showDelegates($: EngineInterface): Promise<void> {
-  await scanDelegatesFresh($)
-  if ((await read($, DELEGATES)).length === 0) return
-  await autoOpenDelegates($)
+const delegatesCount = (count: number): string => (count === 1 ? '1 delegate' : `${count} delegates`)
+
+// The cells a string takes: one per code point, as the marks and accounts
+// drawn here do.
+const cellsOf = (s: string): number => [...s].length
+
+// The band's current batch, newest first: the delegates whose runs overlap
+// back from the live ones, which is every delegate since the band last read
+// all done; null once every run has ended.
+function currentBatch(rows: readonly ClauthDelegateRow[]): ClauthDelegateRow[] | null {
+  if (!rows.some(row => isLive(row.word))) return null
+  let batch: ClauthDelegateRow[] = []
+  let reach = -Infinity
+  for (const row of [...rows].sort((a, b) => a.startedAt - b.startedAt)) {
+    if (row.startedAt > reach) batch = []
+    batch.push(row)
+    reach = Math.max(reach, isLive(row.word) ? Infinity : row.endedAt)
+  }
+  return batch.reverse()
 }
 
-// The hint line's control: the live count while a run goes, as the engine's
-// own pills count theirs, else the bare name, so it stays once all finished.
-function delegatesControlLabel(rows: readonly ClauthDelegateRow[]): string {
-  const live = rows.filter(row => isLive(row.word)).length
-  if (live === 0) return 'delegates'
-  return live === 1 ? '1 delegate' : `${live} delegates`
+type MarkProps = { children: string; color?: string; dimColor?: boolean }
+
+// A delegate's state mark: Claude Code's spending mark cycling in its orange
+// while the run goes, a green check once done, a dim square for a stop, a red
+// cross for a run that died.
+function markOf(row: ClauthDelegateRow, now: number): MarkProps {
+  if (isLive(row.word)) {
+    const frame = Math.floor(now / MARK_FRAME_MS) % spinner.length
+    return { children: spinner[frame] ?? SPINNER_GLYPHS.other[0], color: 'claude' }
+  }
+  if (row.word === 'done') return { children: '✓', color: 'success' }
+  if (row.word === 'stopped' || row.word === 'cancelled') return { children: '■', dimColor: true }
+  return { children: '✗', color: 'error' }
+}
+
+// A chip's cells: its mark, its account and its age, a space between each.
+function chipCells(row: ClauthDelegateRow, now: number): number {
+  const age = elapsedOf(row, now)
+  return 2 + cellsOf(row.profile) + (age === null ? 0 : 1 + cellsOf(age))
+}
+
+// How many of the batch's chips fit the band after its lead dot and count
+// control, leaving room for the `+N` that counts the rest.
+function chipsThatFit(batch: readonly ClauthDelegateRow[], now: number, columns: number): number {
+  let used = cellsOf(`${LEAD_DOT} [ ${delegatesCount(batch.length)} ]`)
+  for (const [i, row] of batch.entries()) {
+    const left = batch.length - i - 1
+    const more = left === 0 ? 0 : BAND_GAP.length + cellsOf(`+${left}`)
+    const width = BAND_GAP.length + chipCells(row, now)
+    if (used + width + more > columns) return i
+    used += width
+  }
+  return batch.length
+}
+
+// Asks for a redraw at the marks' next frame: the spending mark's next frame
+// and the dot's fade both step on it. Only a drawing that shows a live run
+// asks, so the redraws end with the last live run or the last drawing.
+function scheduleFrame($: EngineInterface, now: number): void {
+  if (frameTimer !== null) return
+  const wait = MARK_FRAME_MS - (now % MARK_FRAME_MS)
+  frameTimer = $.clock.after(wait, () => {
+    frameTimer = null
+    $.ui.invalidate('ui.render')
+  })
+}
+
+// A drawing may not write state, so the band's store read runs as its own
+// event on the clock: a job minted outside a delegate call lands in the store,
+// and its write redraws the band. The ticks already read while a row is live;
+// with them stopped, one draw a second asks.
+function askStoreFromBand($: EngineInterface, now: number): void {
+  if (delegatesTimer !== null || now - bandScanAt < BAND_SCAN_MS) return
+  bandScanAt = now
+  $.clock.after(0, () => void scanDelegatesOnce($))
+}
+
+// The pane's list width: a third of the body, within its bounds.
+const listColumns = (bodyColumns: number): number =>
+  Math.min(LIST_MAX_COLUMNS, Math.max(LIST_MIN_COLUMNS, Math.floor(bodyColumns * LIST_SHARE)))
+
+// A run of a message's text in one style.
+type Span = { text: string; bold?: true; italic?: true; code?: true }
+
+const INLINE_MARKDOWN = /\*\*(.+?)\*\*|__(.+?)__|`([^`]+)`|\*([^*\s][^*]*?)\*/g
+
+// A line's inline markdown as spans: `**bold**`, `__bold__`, `*italic*` and
+// `` `code` `` drawn in their style, their marks left out.
+function inlineSpans(text: string): Span[] {
+  const spans: Span[] = []
+  let at = 0
+  for (const match of text.matchAll(INLINE_MARKDOWN)) {
+    const start = match.index
+    if (start > at) spans.push({ text: text.slice(at, start) })
+    const [whole, strong, under, code, emphasis] = match
+    if (strong !== undefined || under !== undefined) spans.push({ text: strong ?? under ?? '', bold: true })
+    else if (code !== undefined) spans.push({ text: code, code: true })
+    else spans.push({ text: emphasis ?? '', italic: true })
+    at = start + whole.length
+  }
+  if (at < text.length) spans.push({ text: text.slice(at) })
+  return spans
+}
+
+// A message line's markdown as spans: a heading bold, a list item led by `•`
+// or its number, a quote by `│`, then its inline marks.
+function markdownSpans(line: string): Span[] {
+  const heading = /^#{1,6}\s+(.*)$/.exec(line)
+  if (heading !== null) return inlineSpans(heading[1] ?? '').map(span => ({ ...span, bold: true }))
+  const item = /^([-*+]|\d+[.)])\s+(.*)$/.exec(line)
+  if (item !== null) {
+    const lead = item[1] ?? ''
+    return [{ text: /^\d/.test(lead) ? `${lead} ` : '• ' }, ...inlineSpans(item[2] ?? '')]
+  }
+  const quote = /^>\s?(.*)$/.exec(line)
+  if (quote !== null) return [{ text: '│ ' }, ...inlineSpans(quote[1] ?? '')]
+  return inlineSpans(line)
+}
+
+const spanCells = (spans: readonly Span[]): number => spans.reduce((sum, span) => sum + cellsOf(span.text), 0)
+
+// The first `cells` of a line's spans, then `…`.
+function cutSpans(spans: readonly Span[], cells: number): Span[] {
+  const cut: Span[] = []
+  let left = Math.max(0, cells)
+  for (const span of spans) {
+    if (left <= 0) break
+    const chars = [...span.text]
+    cut.push({ ...span, text: chars.slice(0, left).join('') })
+    left -= chars.length
+  }
+  return [...cut, { text: '…' }]
+}
+
+type Card = { lines: Span[][]; rows: number }
+
+// A message as its card draws it: its lines wrapped at `width` within
+// `rows`, a message past them cut at its end with `…`. A line that would fill
+// the last row with more to come is cut there instead, so the `…` shows. A
+// fenced code block (lines opening and closing with ```) draws its lines
+// verbatim, the fence lines themselves left out.
+function cardOf(lines: readonly string[], width: number, rows: number): Card {
+  const shown: Span[][] = []
+  let used = 0
+  let fenced = false
+  for (const [i, line] of lines.entries()) {
+    if (/^```/.test(line)) {
+      fenced = !fenced
+      continue
+    }
+    const room = rows - used
+    if (room <= 0) break
+    const spans = fenced ? [{ text: line }] : markdownSpans(line)
+    const need = Math.max(1, Math.ceil(spanCells(spans) / width))
+    const isLast = i === lines.length - 1 || lines.slice(i + 1).every(rest => /^```/.test(rest))
+    if (need < room || (need === room && isLast)) {
+      shown.push(spans)
+      used += need
+      continue
+    }
+    shown.push(cutSpans(spans, room * width - 1))
+    used = rows
+  }
+  return { lines: shown, rows: used }
+}
+
+// The rows a call draws on: the call, its result lines and their `… +N`.
+const callRows = (item: Extract<ClauthTranscriptItem, { kind: 'call' }>): number =>
+  1 + (item.result === null ? 0 : item.result.length + (item.more > 0 ? 1 : 0))
+
+// One transcript item in the row layout the scroll hook and the pane's draw
+// share: its rows at `width`, the card a message lays out as, and the row it
+// starts on, so a window moved by the one lands where the other lays it out.
+type LayoutEntry = { item: ClauthTranscriptItem; key: string; card: Card | null; rows: number; start: number }
+
+function layoutOf(items: readonly ClauthTranscriptItem[], width: number): LayoutEntry[] {
+  const layout: LayoutEntry[] = []
+  let start = 0
+  for (const item of items) {
+    let card: Card | null = null
+    let rows: number
+    if (item.kind === 'said') {
+      card = cardOf(item.lines, Math.max(1, width), CARD_ROWS)
+      rows = 2 + card.rows
+    } else {
+      rows = item.kind === 'call' ? callRows(item) : 1
+    }
+    layout.push({ item, key: item.key, card, rows, start })
+    start += rows
+  }
+  return layout
+}
+
+// The row a window anchored at `anchor` starts on, null when its item left
+// the read.
+function resolveAnchorTop(layout: readonly LayoutEntry[], anchor: { key: string; row: number }): number | null {
+  const entry = layout.find(entry => entry.key === anchor.key)
+  if (entry === undefined) return null
+  return entry.start + Math.min(anchor.row, entry.rows - 1)
+}
+
+// The entry whose rows span `top`; the caller holds `top` inside the layout.
+function entryAt(layout: readonly LayoutEntry[], top: number): LayoutEntry {
+  for (const entry of layout) if (top < entry.start + entry.rows) return entry
+  return layout[layout.length - 1]!
+}
+
+// A card's lines from `from` inner rows in through `to`: a window whose top
+// edge cut into the card draws its tail, the border and first lines above the
+// cut left out.
+function cardSlice(card: Card, width: number, from: number, to: number): Span[][] {
+  const kept: Span[][] = []
+  let at = 0
+  for (const line of card.lines) {
+    const need = Math.max(1, Math.ceil(spanCells(line) / width))
+    if (at >= from && at < to) kept.push(line)
+    at += need
+  }
+  return kept
 }
 
 export const register: Register = on => {
@@ -1638,6 +2184,11 @@ export const register: Register = on => {
     socketPath = `${home}/.clauth/bridge.sock`
     jobsDir = `${home}/.clauth/jobs`
     projectsDir = `${home}/.claude/projects`
+    homeDir = home.replace(/\/+$/, '') || null
+    // Claude Code's own pick: ghostty's spinner off `TERM`, else every other
+    // terminal's.
+    const isGhostty = (await $.env.get('TERM')) === 'xterm-ghostty'
+    spinner = spinnerFrames(isGhostty ? 'ghostty' : 'other')
     try {
       await $.command.register({
         name: DELEGATES_COMMAND,
@@ -1645,7 +2196,7 @@ export const register: Register = on => {
       })
     } catch {
       // A refused name leaves the pane reachable from a delegate call and the
-      // hint line; the bridge below must still start.
+      // band; the bridge below must still start.
     }
     // The ids a `/clear` ended and the rows it carried belong to the
     // conversation that ended; a session that starts fresh owns neither. No
@@ -1676,6 +2227,9 @@ export const register: Register = on => {
     sessionEnding = true
     try {
       lastNoteAt.clear()
+      // A dialog of the ended conversation reopens no pane in the next one.
+      dialogCalls.clear()
+      paneBeforeDialog = null
       // A prompt queued for this conversation must not reach the next one. The
       // daemon reports each dropped prompt itself once it takes the end. The
       // epoch moves before the state write, so a poll reply landing while it
@@ -1765,7 +2319,11 @@ export const register: Register = on => {
   // A result's `context` reaches the model as a PostToolUse hook's
   // `additionalContext` did, one reminder after the result.
   on('tool.call', async ($, e, next) => {
-    const settled = await next(e).finally(() => closeUnheldAsks($, e.tool_use_id))
+    const settled = await next(e).finally(() => {
+      closeUnheldAsks($, e.tool_use_id)
+      // Not awaited: the reopen's transcript read must not hold the result.
+      void reopenPaneAfterDialog($, e.tool_use_id)
+    })
     // PostToolUse fired for an answered call alone: a refusal or an error
     // carries no note and spends no window.
     if (settled.deny !== undefined || settled.isError === true) return settled
@@ -1812,6 +2370,8 @@ export const register: Register = on => {
       const v = await next(e)
       if (v.decision !== 'ask') return v
       if (!interactive) return v
+      // The ask is a dialog only for a real call (a bare query opens none).
+      await closePaneForDialog($, e.tool_use_id)
       const ask = mintAskId()
       const turn = turnId
       const opened = await postAskOpened($, ask, e.tool, e.input, e.agentId)
@@ -1834,11 +2394,11 @@ export const register: Register = on => {
         // The desk's settle of the call closes it, after the engine's dialog
         // and the call's run; a bare query has no call and closes here.
         closeUnheldAskWhenSettled($, ask, opened.session, e.tool_use_id)
-        return v
       }
-      if (outcome.type === 'loss') return v
       if (outcome.type === 'allow') return { decision: 'allow' }
       if (outcome.type === 'deny') return { decision: 'deny' }
+      // The ask still needs the engine's own chain: its allow reopens the
+      // pane at `tool.run`, a deny at the call's settle.
       return v
     },
   ).catch(async ($, e, next) => (next.called ? next(e) : { decision: 'ask' }))
@@ -1848,6 +2408,9 @@ export const register: Register = on => {
     { tool: 'AskUserQuestion' },
     async ($, e, next) => {
       if (inert || !interactive) return next(e)
+      // The question is a dialog however it is answered; the call's settle
+      // reopens the pane.
+      await closePaneForDialog($, e.tool_use_id)
       const ask = mintAskId()
       const turn = turnId
       const opened = await postAskOpened($, ask, 'AskUserQuestion', e.questions, e.agentId)
@@ -1885,11 +2448,76 @@ export const register: Register = on => {
     },
   ).catch(($, e, next) => next(e))
 
+  // A call allowed and about to run (the engine fires `tool.run` after
+  // whoever settled its ask, never for a refusal): the pane a dialog closed
+  // opens again before the tool's run ends. A denied call and a question
+  // reopen at the call's settle.
+  on('tool.run', async ($, e, next) => {
+    if (e.tool !== 'AskUserQuestion') void reopenPaneAfterDialog($, e.tool_use_id)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // The band's one row: a held check's desk row while one is held, else the
+  // session's delegates. Its chips are pressed by a click in fullscreen and by
+  // ctrl+x tab then Enter on the main screen.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    noteLayout(e.surface, e.viewport)
     const { value: row } = await $.state.get(HELD)
-    if (!row) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    if (!row) {
+      const now = await $.clock.now()
+      askStoreFromBand($, now)
+      const rows = await read($, DELEGATES)
+      if (rows.length === 0 || e.props.hasSurvey) return next(e)
+      const batch = currentBatch(rows)
+      if (batch === null) {
+        return Box({
+          marginTop: 1,
+          flexDirection: 'row',
+          columnGap: 1,
+          children: [
+            Text({ color: 'inactive', dimColor: true, children: LEAD_DOT }),
+            Button({
+              key: 'delegates',
+              dimColor: true,
+              label: delegatesCount(rows.length),
+              onPress: () => void openDelegatesPane($),
+            }),
+            Text({ dimColor: true, children: 'done' }),
+          ],
+        })
+      }
+      if (!e.props.isCollapsed) scheduleFrame($, now)
+      const fit = chipsThatFit(batch, now, e.props.bodyColumns)
+      const chips = batch.slice(0, fit).flatMap(chip => {
+        const age = elapsedOf(chip, now)
+        return [
+          Text({ children: BAND_GAP }),
+          Button({
+            key: `chip-${chip.id}`,
+            plain: true,
+            onPress: () => void openDelegatesPane($, chip.id),
+            children: [
+              Text(markOf(chip, now)),
+              ' ',
+              Text({ color: ACCOUNT_BLUE, children: chip.profile }),
+              ...(age === null ? [] : [' ', Text({ dimColor: true, children: age })]),
+            ],
+          }),
+        ]
+      })
+      const hidden = batch.length - fit
+      return Box({
+        marginTop: 1,
+        flexDirection: 'row',
+        children: [
+          Text({ color: dotColour(now), children: LEAD_DOT }),
+          Text({ children: ' ' }),
+          Button({ key: 'delegates', label: delegatesCount(batch.length), onPress: () => void openDelegatesPane($) }),
+          ...chips,
+          ...(hidden === 0 ? [] : [Text({ dimColor: true, children: `${BAND_GAP}+${hidden}` })]),
+        ],
+      })
+    }
     const line1 = `  ${row.tool}  ${row.desc}`
     const line2 =
       row.kind === 'decision'
@@ -1912,27 +2540,23 @@ export const register: Register = on => {
       flexDirection: 'column',
       children: [Text({ wrap: 'truncate-end', children: line1 }), line2],
     })
-  })
+  }).catch(($, e, next) => next(e))
 
-  // A delegate call starts the store's ticks before it runs, so the run shows
-  // while its call holds the turn: the scan that sees it opens the pane, and
-  // a call whose run no scan caught still opens it once it settles.
+  // A delegate call starts the store's ticks before it runs, so the run lands
+  // in the band while its call holds the turn. It opens no pane: only the
+  // band and `/delegates` do.
   on('tool.call', { tool: DELEGATE_TOOLS }, async ($, e, next) => {
     if (inert) return next(e)
     monitorTool = e.tool as DelegateTool
     monitorServer = MONITOR_SERVERS[monitorTool]
     delegateCallsInFlight += 1
-    delegateCallGen += 1
     startDelegatesTimer($)
     try {
-      // A pane the person already holds needs no unasked open, and a close
-      // during this call is theirs to keep.
-      if ((await $.ui.panes().catch(() => [])).some(pane => pane.id === DELEGATES_PANE)) autoOpenGen = delegateCallGen
       const settled = await next(e)
       // A cancel is the call's own settle, not the record: the liveness file
       // is gone before the envelope comes back, so this must be read here.
       await noteCancelledDelegate($, settled)
-      if (settled.deny === undefined && settled.isError !== true) await showDelegates($)
+      if (settled.deny === undefined && settled.isError !== true) await scanDelegatesFresh($)
       return settled
     } finally {
       delegateCallsInFlight -= 1
@@ -1941,8 +2565,7 @@ export const register: Register = on => {
 
   // The person asked, so the pane opens at any width and with no delegate
   // yet: its empty list says there is none.
-  on('command.run', { command: DELEGATES_COMMAND }, async ($, e) => {
-    noteLayout('terminal', e.presentation)
+  on('command.run', { command: DELEGATES_COMMAND }, async $ => {
     // The ticks run only while a row is live, so a job minted outside this
     // module's own delegate calls is invisible until a read: ask for one now.
     await scanDelegatesFresh($)
@@ -1950,49 +2573,14 @@ export const register: Register = on => {
     return { text: opened.isPlaced ? 'delegates pane open' : `delegates pane waits: ${opened.reason}` }
   }).catch(() => ({ text: 'could not open the delegates pane' }))
 
-  // The engine's line stays its own node on its own row, so its pills keep
-  // counting; the control sits on the row beneath it once the session has had
-  // a delegate. Only the fullscreen terminal reports clicks, so on the main
-  // screen the control could never be pressed.
-  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    noteLayout(e.surface, e.viewport)
-    // A drawing may not write state, so the read runs as its own event on the
-    // clock: a job minted outside a delegate call lands in the store, and its
-    // write redraws this line with the control on it. The ticks already read
-    // while a row is live; with them stopped, one draw a second asks.
-    const now = await $.clock.now()
-    if (delegatesTimer === null && now - hintScanAt >= HINT_SCAN_MS) {
-      hintScanAt = now
-      $.clock.after(0, () => void scanDelegatesOnce($))
-    }
-    const rows = await read($, DELEGATES)
-    if (rows.length === 0 || e.viewport?.isFullscreen === false) return next(e)
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const engine = await next(e)
-    return Box({
-      flexDirection: 'column',
-      children: [
-        engine,
-        Box({
-          flexDirection: 'row',
-          children: [
-            Text({ dimColor: true, children: ' · ' }),
-            Button({
-              key: 'delegates',
-              plain: true,
-              dimColor: true,
-              label: delegatesControlLabel(rows),
-              onPress: () => void openDelegatesPane($),
-            }),
-          ],
-        }),
-      ],
-    })
-  })
-
-  // A closed pane drops the transcript view with it: the refresh stops
-  // reading a transcript nothing draws, and a reopen lands on the list.
+  // A closed pane drops the chosen delegate with it: the refresh stops
+  // reading a transcript nothing draws, a choice still being read lands
+  // nowhere, and a reopen lands on the newest delegate. A close for a dialog
+  // keeps its delegate apart (`paneBeforeDialog`), and its reopen lands there.
   on('ui.close', { id: DELEGATES_PANE }, async ($, e, next) => {
+    viewChoice += 1
+    transcriptScroll = { id: '', anchor: null }
+    listScrollTop = 0
     if ((await read($, DELEGATE_VIEW)) !== null) {
       viewStamp = null
       await update($, DELEGATE_VIEW, () => null)
@@ -2000,51 +2588,314 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // One `ui.scroll` over the pane: the wheel over the list column moves the
+  // list's own window, every other move (the transcript's side, a scroll key
+  // with no pointer) the transcript's, toward the older or the newer by the
+  // rows the move stands for (a page key one window, below), clamped at
+  // either end. The answer `{}` leaves the engine's own window at 0, and the
+  // move lands in `$.ui.invalidate`.
+  on('ui.scroll', { requestId: DELEGATES_PANE }, async ($, e) => {
+    const view = await read($, DELEGATE_VIEW)
+    if (view === null) return {}
+    if (e.pointer !== undefined && e.pointer.column < drawnListWidth) {
+      // The draw clamps the window to the entries it holds.
+      listScrollTop += e.by
+    } else {
+      const layout = layoutOf(view.items, drawnCardWidth)
+      const totalRows = layout.length === 0 ? 0 : layout[layout.length - 1]!.start + layout[layout.length - 1]!.rows
+      const endTop = Math.max(0, totalRows - drawnTranscriptRows)
+      // The window's base: following the end starts at `endTop` (a tick down
+      // stays there, one up lands one row above it); an anchor that left the
+      // read moves on from the oldest item, row 0.
+      const base =
+        transcriptScroll.id === view.id && transcriptScroll.anchor !== null
+          ? (resolveAnchorTop(layout, transcriptScroll.anchor) ?? 0)
+          : endTop
+      // A page key arrives with no pointer and the body's rows, Home and End
+      // with no pointer and their `contentRows`, which is that same number
+      // because the tree fits the body; the transcript's own window is shorter
+      // by the header, the status line and their blank rows. So a pointer-less
+      // move of more than one row moves exactly the rows the transcript shows,
+      // never the body's taller count; a wheel tick carries its pointer cell
+      // and a one-row move keeps `by`.
+      const step = e.pointer === undefined && Math.abs(e.by) > 1 ? Math.sign(e.by) * Math.max(1, drawnTranscriptRows) : e.by
+      const top = Math.min(Math.max(base + step, 0), endTop)
+      if (top >= endTop) {
+        transcriptScroll = { id: view.id, anchor: null }
+      } else {
+        const entry = entryAt(layout, top)
+        transcriptScroll = { id: view.id, anchor: { key: entry.key, row: top - entry.start } }
+      }
+    }
+    $.ui.invalidate('ui.render')
+    return {}
+  }).catch(() => ({}))
+
+  // The pane: every delegate of the session listed beside the chosen one's
+  // detail, a header naming it and telling its state over its transcript
+  // drawn as Claude Code draws one, all on clauth's background filling the
+  // body. A permission ask or a question closes the pane; under any other
+  // cover that may take the keys (`/model`, a search) it draws none of them.
   on('ui.render', { component: 'Pane', requestId: DELEGATES_PANE }, async ($, e) => {
-    noteLayout(e.surface, e.viewport)
     const { Box, Text, Button } = $.ui.resolve(e)
+    const { bodyColumns } = e.props
+    const bodyRows = e.props.scroll.bodyRows
+    const body = { backgroundColor: PANE_BG, width: bodyColumns, minHeight: bodyRows }
+    if (e.props.isPromptCovered === true) return Box({ ...body, children: [] })
     const rows = await read($, DELEGATES)
+    const newest = rows[0]
+    if (newest === undefined) {
+      return Box({ ...body, children: [Text({ dimColor: true, children: 'no delegates in this session yet' })] })
+    }
     const view = await read($, DELEGATE_VIEW)
     const now = await $.clock.now()
-    const viewed = view === null ? undefined : rows.find(row => row.id === view.id)
-    const back = () => void update($, DELEGATE_VIEW, () => null)
-    const stop = (row: ClauthDelegateRow) => () => void stopDelegate($, row)
+    if (rows.some(row => isLive(row.word))) scheduleFrame($, now)
+    const chosen = rows.find(row => row.id === view?.id) ?? newest
+    const shown = view?.id === chosen.id ? view : null
+    const isFramed = bodyColumns >= FRAMED_MIN_COLUMNS
+    const frame = isFramed
+      ? { borderStyle: 'round', borderColor: 'promptBorder', paddingLeft: 1, paddingRight: 1 }
+      : {}
+    const listWidth = listColumns(bodyColumns)
+    const detailWidth = Math.max(1, bodyColumns - listWidth - (isFramed ? 4 : 0))
 
-    if (view !== null && viewed !== undefined) {
-      const room = Math.max(1, e.props.scroll.bodyRows - 2)
-      const controls = [Button({ key: 'back', plain: true, hotkey: 'b', label: 'back', onPress: back })]
-      if (isLive(viewed.word)) {
-        controls.push(Text({ children: '   ' }), Button({ key: 'stop', plain: true, hotkey: 's', label: 'stop', onPress: stop(viewed) }))
-      }
-      return Box({
-        flexDirection: 'column',
+    const entries = rows.map(row => {
+      const isChosen = row.id === chosen.id
+      const age = elapsedOf(row, now)
+      return Button({
+        key: row.id,
+        plain: true,
+        onPress: () => void chooseDelegate($, row.id),
         children: [
-          Text({ wrap: 'truncate-end', children: delegateSummary(viewed, now) }),
-          ...view.lines.slice(-room).map(line => Text({ dimColor: true, wrap: 'truncate-end', children: line })),
-          Box({ children: controls }),
+          Text(isChosen ? { color: ACCOUNT_BLUE, bold: true, children: '❯ ' } : { color: 'subtle', children: '  ' }),
+          Text(markOf(row, now)),
+          ' ',
+          Text({ color: ACCOUNT_BLUE, bold: isChosen, children: row.profile }),
+          ...(age === null ? [] : [' ', Text({ dimColor: true, children: age })]),
         ],
       })
-    }
-
-    if (rows.length === 0) return Text({ dimColor: true, children: 'no delegates in this session yet' })
-    return Box({
-      flexDirection: 'column',
-      children: rows.map((row, i) => {
-        const cells = [
-          Button({
-            key: `open-${row.id}`,
-            plain: true,
-            ...(i < 9 ? { hotkey: String(i + 1) } : {}),
-            onPress: () => void openDelegateView($, row.id),
-            children: delegateSummary(row, now),
-          }),
-        ]
-        if (isLive(row.word)) {
-          cells.push(Text({ children: '  ' }), Button({ key: `stop-${row.id}`, plain: true, label: 'stop', onPress: stop(row) }))
-        }
-        if (row.tail !== '') cells.push(Text({ dimColor: true, wrap: 'truncate-end', children: `  ${row.tail}` }))
-        return Box({ key: `row-${row.id}`, children: cells })
-      }),
     })
+    // The list's own window: at most the body's rows under its title and
+    // frame, its top clamped to the entries it holds.
+    const listRows = bodyRows - (isFramed ? 2 : 0) - 1
+    listScrollTop = Math.max(0, Math.min(listScrollTop, Math.max(0, entries.length - listRows)))
+    const listed = entries.slice(listScrollTop, listScrollTop + Math.max(0, listRows))
+    const list = Box({
+      flexDirection: 'column',
+      flexShrink: 0,
+      width: listWidth,
+      ...frame,
+      children: [
+        Text({ italic: true, bold: e.props.isFocused, color: LIST_TITLE_COLOR, children: ' DELEGATES ' }),
+        ...listed,
+      ],
+    })
+
+    // The header: the prompt's first line cut at its end, stop at its right
+    // while the delegate runs; the account, model and job id under it. The
+    // pane draws no close action: Claude Code's frame around a pane carries
+    // one.
+    const title = shown?.name || chosen.profile
+    const facts = [chosen.profile, shown?.model ?? '', chosen.id].filter(fact => fact !== '').join(' · ')
+    const header = Box({
+      flexDirection: 'column',
+      children: [
+        Box({
+          flexDirection: 'row',
+          justifyContent: 'space-between',
+          children: [
+            Box({ flexShrink: 1, children: [Text({ bold: true, wrap: 'truncate-end', children: title })] }),
+            ...(isLive(chosen.word)
+              ? [
+                  Box({
+                    flexDirection: 'row',
+                    flexShrink: 0,
+                    marginLeft: 2,
+                    children: [Button({ key: 'stop', label: 'stop', onPress: () => void stopDelegate($, chosen) })],
+                  }),
+                ]
+              : []),
+          ],
+        }),
+        Text({ dimColor: true, wrap: 'truncate-end', children: facts }),
+      ],
+    })
+
+    // The status line: the mark, the state word, the tool calls and the last
+    // output's age, on the pane's last row with one blank row above it.
+    const mark = markOf(chosen, now)
+    const toolCalls = shown?.toolCalls ?? null
+    const lastOutput =
+      isLive(chosen.word) && chosen.lastOutputAt !== 0
+        ? `last output ${formatElapsed(Math.floor((now - chosen.lastOutputAt) / 1000))} ago`
+        : ''
+    const status = [toolCalls === null ? '' : plural(toolCalls, 'tool call'), lastOutput].filter(part => part !== '')
+    const statusLine = Box({
+      marginTop: 1,
+      children: [
+        Text({
+          wrap: 'truncate-end',
+          children: [
+            Text(mark),
+            ' ',
+            Text({ ...mark, children: chosen.word }),
+            ...(status.length === 0 ? [] : [Text({ dimColor: true, children: ` · ${status.join(' · ')}` })]),
+          ],
+        }),
+      ],
+    })
+
+    // The transcript's own window, measured in rows: the mod keeps where it
+    // starts, the engine's own window over the tree that fits the body stays
+    // at 0. It follows the end (its bottom row the transcript's last) or
+    // holds its top anchored by its item's key while new output lands below;
+    // a window whose anchored item left the read shows the oldest item it
+    // holds. Its top item may start partway in, drawn from its cut row down.
+    const items = shown?.items ?? []
+    drawnCardWidth = Math.max(1, detailWidth - 4)
+    drawnListWidth = listWidth
+    // The header's two rows, the blank row under it, and the status line's
+    // blank row and row: the transcript fills the rows between.
+    const transcriptRows = bodyRows - (isFramed ? 2 : 0) - 5
+    drawnTranscriptRows = transcriptRows
+    const layout = layoutOf(items, drawnCardWidth)
+    const totalRows = layout.length === 0 ? 0 : layout[layout.length - 1]!.start + layout[layout.length - 1]!.rows
+    const endTop = Math.max(0, totalRows - transcriptRows)
+    let top: number
+    if (transcriptScroll.id !== chosen.id || transcriptScroll.anchor === null) {
+      transcriptScroll = { id: chosen.id, anchor: null }
+      top = endTop
+    } else {
+      const anchored = resolveAnchorTop(layout, transcriptScroll.anchor)
+      if (anchored === null) {
+        transcriptScroll =
+          layout.length === 0 ? { id: chosen.id, anchor: null } : { id: chosen.id, anchor: { key: layout[0]!.key, row: 0 } }
+        top = 0
+      } else if (anchored >= endTop) {
+        transcriptScroll = { id: chosen.id, anchor: null }
+        top = endTop
+      } else {
+        top = anchored
+      }
+    }
+    const bottom = Math.min(totalRows, top + transcriptRows)
+    const transcript = (() => {
+      const drawn: ReturnType<typeof Box>[] = []
+      for (const entry of layout) {
+        const first = Math.max(0, top - entry.start)
+        const last = Math.min(entry.rows, bottom - entry.start)
+        if (last <= first) continue
+        const { item } = entry
+        if (item.kind === 'call') {
+          const callMark = item.result === null ? 'inactive' : item.isError ? 'error' : 'success'
+          const result = item.result ?? []
+          drawn.push(
+            Box({
+              flexDirection: 'column',
+              children: [
+                ...(first === 0
+                  ? [
+                      Box({
+                        flexDirection: 'row',
+                        children: [
+                          Text({ color: callMark, children: '⏺' }),
+                          Text({ wrap: 'truncate-end', children: ` ${item.call}` }),
+                        ],
+                      }),
+                    ]
+                  : []),
+                ...result
+                  .slice(Math.max(0, first - 1), Math.max(0, last - 1))
+                  .map((line, i) =>
+                    Text({ dimColor: true, wrap: 'truncate-end', children: `${i === 0 && first <= 1 ? '  ⎿  ' : '     '}${line}` }),
+                  ),
+                ...(item.more > 0 && last > 1 + result.length
+                  ? [Text({ dimColor: true, children: `     … +${plural(item.more, 'line')}` })]
+                  : []),
+              ],
+            }),
+          )
+          continue
+        }
+        if (item.kind === 'said') {
+          // The layout lays a message out as a card, so one is never null.
+          if (entry.card === null) continue
+          const card = entry.card
+          const cardSpan = (span: Span): ReturnType<typeof Text> =>
+            Text({
+              ...(span.bold === true ? { bold: true } : {}),
+              ...(span.italic === true ? { italic: true } : {}),
+              ...(span.code === true ? { color: 'permission' } : {}),
+              children: span.text,
+            })
+          const cardLine = (spans: Span[]): ReturnType<typeof Text> =>
+            Text({ wrap: 'wrap', children: spans.map(cardSpan) })
+          if (first === 0 && last === entry.rows) {
+            // The whole card, framed as the kit draws it.
+            drawn.push(
+              Box({
+                borderStyle: 'round',
+                borderColor: 'promptBorder',
+                paddingLeft: 1,
+                paddingRight: 1,
+                children: [
+                  Box({
+                    flexDirection: 'column',
+                    height: Math.min(card.rows, last - 2),
+                    overflow: 'hidden',
+                    children: card.lines.map(cardLine),
+                  }),
+                ],
+              }),
+            )
+          } else {
+            // A card the window cuts: exactly the rows it covers. A kept
+            // border row draws as its own text row, and the covered text
+            // rows keep the card's one-column padding, so the drawn rows
+            // equal the layout's and the text sits where the whole card
+            // puts it.
+            const borderRow = (side: 'top' | 'bottom'): ReturnType<typeof Text> => {
+              const edge = side === 'top' ? ['╭', '╮'] : ['╰', '╯']
+              return Text({
+                color: 'promptBorder',
+                children: `${edge[0]}${'─'.repeat(Math.max(0, drawnCardWidth - 2))}${edge[1]}`,
+              })
+            }
+            const kept = cardSlice(card, drawnCardWidth, Math.max(0, first - 1), Math.min(card.rows, last - 1))
+            drawn.push(
+              Box({
+                flexDirection: 'column',
+                height: last - first,
+                overflow: 'hidden',
+                children: [
+                  ...(first === 0 ? [borderRow('top')] : []),
+                  ...kept.map(line => Text({ wrap: 'wrap', children: [' ', ...line.map(cardSpan)] })),
+                  ...(last === entry.rows ? [borderRow('bottom')] : []),
+                ],
+              }),
+            )
+          }
+          continue
+        }
+        if (item.kind === 'asked') {
+          drawn.push(Text({ wrap: 'truncate-end', children: `> ${item.text}` }))
+          continue
+        }
+        drawn.push(Text({ dimColor: true, children: item.text }))
+      }
+      return drawn
+    })()
+    const detail = Box({
+      flexDirection: 'column',
+      flexGrow: 1,
+      ...frame,
+      children: [
+        header,
+        Box({ flexDirection: 'column', flexGrow: 1, marginTop: 1, children: transcript }),
+        statusLine,
+      ],
+    })
+
+    return Box({ ...body, flexDirection: 'row', children: [list, detail] })
   })
 }

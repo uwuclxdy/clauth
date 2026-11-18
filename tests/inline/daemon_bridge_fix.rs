@@ -690,6 +690,25 @@ fn proc_start_matches_reads_the_tests_own_start_time() {
     ));
 }
 
+/// A thread's id matches no recorded start, its own included: its
+/// `/proc/<tid>/stat` reads like a process's, so a record's pid the kernel
+/// reissued as a thread id must read as the record's process gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_start_matches_refuses_a_thread_id() {
+    let thread = crate::testutil::ParkedThread::spawn();
+    let start = crate::testutil::proc_start_of(thread.tid).expect("the thread's own start");
+    let matched = crate::session_record::proc_start_matches(thread.tid, &start);
+    drop(thread);
+    assert!(!matched, "a thread's id matches no start");
+    let leader = std::process::id();
+    let leader_start = crate::testutil::proc_start_of(leader).expect("the leader's own start");
+    assert!(
+        crate::session_record::proc_start_matches(leader, &leader_start),
+        "the leader still matches its own start"
+    );
+}
+
 /// MB-1: the poll's `remote` flag reads the device store fresh per call —
 /// pairing a control device after the hub starts flips the next poll. Pairing
 /// alone holds no ask: a hold needs that device's live `/events` stream.

@@ -2023,6 +2023,106 @@ fn a_named_accounts_advisor_row_prints_among_its_binds() {
     );
 }
 
+/// A row names when its plan ends or renews, and only when the user gave
+/// a date: the marked `plan_ends` day (still `ends` once past), a
+/// `plan_renews` later than a past end, else the next `plan_renews` day. A
+/// plan whose cached reading says canceled or refused names no renewal. The
+/// JSON row carries the same `plan_end` object `status.json` publishes.
+#[test]
+fn the_roster_names_when_a_plan_ends_or_renews() {
+    let _home = HomeSandbox::new();
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    let dated = |name: &str, ends, renews| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.plan_ends = ends;
+        p.plan_renews = renews;
+        save_profile(&p).expect("save a dated profile");
+    };
+    dated("ending", day(2099, 11, 20), day(2099, 4, 10));
+    dated("ended", day(2020, 3, 2), None);
+    dated("resubscribed", day(2020, 3, 2), day(2099, 12, 15));
+    dated("renewing", None, day(2099, 12, 15));
+    dated("gone", None, day(2099, 12, 15));
+    dated("held", None, day(2099, 12, 15));
+    save_profile(&Profile::new("plain".to_string(), None, None)).expect("save plain");
+    let names = [
+        "ending",
+        "ended",
+        "resubscribed",
+        "renewing",
+        "gone",
+        "held",
+        "plain",
+    ];
+    save_app_state(&AppState {
+        active_profile: Some("plain".into()),
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        ..Default::default()
+    })
+    .expect("save state");
+    for (name, status) in [
+        ("gone", "canceled"),
+        ("held", crate::usage::ORG_REFUSED_STATUS),
+    ] {
+        write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    tier: PlanTier::Free,
+                    plan_display_name: None,
+                    subscription_status: Some(status.to_string()),
+                    codex_plan: None,
+                    email: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    let config = crate::profile::load_config().expect("config");
+    let live = crate::live_sessions::LiveTally::collect(&config);
+    let plan_end = |name: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("seeded");
+        profile_row(p, &config, crate::usage::now_epoch_secs(), &live)
+            .get("plan_end")
+            .cloned()
+    };
+    assert_eq!(
+        (
+            lines(&call_profiles(None, None)),
+            names.map(plan_end).to_vec(),
+        ),
+        (
+            vec![
+                "- ending [anthropic]: usage unknown; tier unknown; plan ends 2099-11-20"
+                    .to_string(),
+                "- ended [anthropic]: usage unknown; tier unknown; plan ends 2020-03-02"
+                    .to_string(),
+                "- resubscribed [anthropic]: usage unknown; tier unknown; plan renews 2099-12-15"
+                    .to_string(),
+                "- renewing [anthropic]: usage unknown; tier unknown; plan renews 2099-12-15"
+                    .to_string(),
+                "- gone [anthropic, Free]: usage unknown; subscription canceled".to_string(),
+                "- held [anthropic, Free]: usage unknown; org refused".to_string(),
+                "- plain (global active) [anthropic]: usage unknown; tier unknown".to_string(),
+            ],
+            vec![
+                Some(serde_json::json!({ "kind": "ends", "date": "2099-11-20" })),
+                Some(serde_json::json!({ "kind": "ends", "date": "2020-03-02" })),
+                Some(serde_json::json!({ "kind": "renews", "date": "2099-12-15" })),
+                Some(serde_json::json!({ "kind": "renews", "date": "2099-12-15" })),
+                None,
+                None,
+                None,
+            ],
+        ),
+        "(the reply's rows, each row's JSON `plan_end`)"
+    );
+}
+
 /// A keyless third-party control (`vendor`), then two proxy accounts on their
 /// proxy's loopback bind as `clauth login <name> --proxy <service>` creates
 /// them: `pb` with its key cleared, `pk` keyed.

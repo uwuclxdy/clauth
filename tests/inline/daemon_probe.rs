@@ -1273,3 +1273,22 @@ fn replace_waits_out_an_inflight_token_save_without_escalating() {
         "no standby took over the lock"
     );
 }
+
+/// A daemon's thread id is no daemon: the thread answers with the daemon's
+/// `clauth daemon` argv, so a recorded daemon pid the kernel reissued as one
+/// of another clauth daemon's threads would draw `--replace`'s signals, which
+/// linux delivers to the whole process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_daemons_thread_id_is_no_clauth_daemon() {
+    let home = HomeSandbox::new();
+    let daemon = crate::testutil::spawn_parked(home.home(), Some("clauth"), &["daemon"]);
+    let pid = daemon.0.id();
+    let tid = crate::testutil::a_thread_of(pid);
+    let verdicts = (pid_is_clauth_daemon(tid), pid_is_clauth_daemon(pid));
+    assert_eq!(
+        verdicts,
+        (false, true),
+        "(thread, leader) of a parked `clauth daemon`"
+    );
+}

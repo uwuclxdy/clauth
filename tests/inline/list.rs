@@ -521,6 +521,75 @@ fn list_table_leaves_a_live_account_unmarked() {
     );
 }
 
+/// The PLAN cell names when the plan ends or renews, off the profile's
+/// `plan_ends` and `plan_renews`, in plain ASCII: a coming end `ends`, a past
+/// one `ended` on that same date, a `plan_renews` later than a past end its
+/// renewal, and a canceled plan no renewal.
+#[test]
+fn list_table_names_the_plan_end_in_the_plan_cell() {
+    let _home = HomeSandbox::new();
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    let dated = |name: &str, ends, renews| {
+        let mut p = oauth(name);
+        p.plan_ends = ends;
+        p.plan_renews = renews;
+        p
+    };
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            dated("ending", day(2099, 11, 20), None),
+            dated("ended", day(2020, 3, 2), None),
+            dated("resubscribed", day(2020, 3, 2), day(2099, 12, 15)),
+            dated("renewing", None, day(2099, 12, 15)),
+            dated("gone", None, day(2099, 12, 15)),
+        ],
+    };
+    for name in ["ending", "ended", "resubscribed", "renewing", "gone"] {
+        warm_usage(name, 42.4, 17.6);
+    }
+    let mut canceled = crate::profile_cache::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("gone's warmed cache");
+    if let Some(plan) = canceled.plan.as_mut() {
+        plan.subscription_status = Some("canceled".to_string());
+    }
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+        &canceled,
+    );
+    let table = render_table(
+        &config,
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
+    );
+    // PROFILE is twelve cells (`resubscribed`), PLAN twenty-three
+    // (`Max (renews 2099-12-15)`).
+    let row = |name: &str, plan: &str, suffix: &str| {
+        format!("  {name:<12}  {plan:<23}    42.4%    17.6%  -{suffix}")
+    };
+    let expected = [
+        format!(
+            "  {:<12}  {:<23}  5H USED  7D USED  ENDPOINT",
+            "PROFILE", "PLAN"
+        ),
+        row("ending", "Max (ends 2099-11-20)", ""),
+        row("ended", "Max (ended 2020-03-02)", ""),
+        row("resubscribed", "Max (renews 2099-12-15)", ""),
+        row("renewing", "Max (renews 2099-12-15)", ""),
+        row("gone", "Max", " (canceled)"),
+    ];
+    assert_eq!(table, table_of(&expected.each_ref().map(String::as_str)));
+}
+
 /// Both facts render. A user usually disables an account BECAUSE it died,
 /// so a `disabled` that masked `canceled` would hide the reason for the state it
 /// is reporting — the same erasure the Fallback tab's stacked pills prevent.

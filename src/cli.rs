@@ -429,6 +429,15 @@ pub(crate) enum Command {
             ]
         )]
         dump_openapi: bool,
+        /// The restart-handover probe's answer, before anything else runs: a
+        /// replacement that will serve the API (`--listen` given and
+        /// `CLAUTH_NO_API` unset) loads its certificate first, then prints the
+        /// handover token and exits 0, or the cert-refused marker with the
+        /// reason and exits 1. Hidden: it is the daemon's probe protocol, never
+        /// a user flag, so it stays out of --help and the hand-written
+        /// completions.
+        #[arg(long = "__exec-handover", hide = true)]
+        exec_handover: bool,
     },
 
     /// Pair, list, grant sessions to, and revoke the devices that may call the
@@ -488,6 +497,19 @@ pub(crate) enum Command {
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCommand,
+    },
+
+    /// Set the Rex plugin up, or take it back out
+    ///
+    /// `clauth rex install` writes the plugin bundled in this binary to
+    /// `clauth/` beside Rex's `init.lua` and appends one marked
+    /// `require("clauth")` block that loads it. The plugin opens Claude Code
+    /// through `clauth start`, shows the dashboard in a floating pane, and
+    /// labels each pane with the account it spends. Rex support is experimental.
+    /// `clauth rex uninstall` takes the block and the files back out.
+    Rex {
+        #[command(subcommand)]
+        cmd: RexCommand,
     },
 
     /// Work with clauth-compatible proxies
@@ -851,6 +873,30 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth rex <cmd>`: install and uninstall the Rex plugin.
+#[derive(Subcommand, Debug)]
+pub(crate) enum RexCommand {
+    /// Write the plugin beside Rex's init.lua and load it
+    ///
+    /// Rerun it after upgrading clauth to refresh the plugin files. A plugin
+    /// directory clauth did not write, or a symlink onto a checkout, refuses
+    /// the install rather than being overwritten.
+    Install {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Remove the plugin and the block install added to init.lua
+    Uninstall {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

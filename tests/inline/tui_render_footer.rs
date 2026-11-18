@@ -53,6 +53,8 @@ fn the_usage_hints_advertise_the_note_key() {
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -3129,6 +3131,37 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
     assert_eq!(
         settled_footer(&app, 80, 24),
         "←→ tabs   e edit   a actions   c harness   ? help   q quit"
+    );
+}
+
+/// `⇧↑↓` counts the rows the reorder reaches, never the roster: beside a
+/// disabled account, which has no Overview row, one shown account has no
+/// neighbour to swap with and two do.
+#[test]
+fn the_overview_footer_counts_the_rows_the_reorder_reaches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let footer = |names: &[&str]| {
+        let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from("off"));
+        off.disabled = true;
+        let shown = names
+            .iter()
+            .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: std::iter::once(off).chain(shown).collect(),
+        });
+        app.tab = Tab::Overview;
+        settled_footer(&app, 80, 24)
+    };
+    assert_eq!(
+        footer(&["p1"]),
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit",
+        "one shown row beside a disabled account"
+    );
+    assert_eq!(
+        footer(&["p1", "p2"]),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit",
+        "two shown rows beside a disabled account"
     );
 }
 
