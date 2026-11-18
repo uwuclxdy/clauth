@@ -3440,6 +3440,10 @@ pub(crate) fn read_validated_handle(
     Ok(text.to_string())
 }
 
+/// Durable: the temp's bytes are synced before the rename and, on Unix, the
+/// directory after it ([`publish_temp`]), so on Unix the new file outlasts a
+/// power loss or a kernel panic as well as a crashed process; on Windows the
+/// bytes are flushed but nothing flushes the rename.
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     atomic_write_with(path, |f| {
         use std::io::Write;
@@ -3459,21 +3463,41 @@ pub(crate) fn atomic_write_with(
     }
     let tmp = tmp_sibling(path);
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write, None)
+    publish_temp(&tmp, path, f, write, None, true)
 }
 
 /// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
 /// `path`; the temp is removed when either step fails, so a failing writer
 /// never leaves one behind (each temp name is used once). With `modified` the
 /// closed temp takes that mtime before the rename.
+///
+/// `durable` syncs the temp's bytes before the rename and, on Unix, the
+/// directory after it. A rename alone is atomic for readers but not across a
+/// power loss: the new name can reach the disk before the bytes it names, so
+/// the file comes back empty or torn, or the rename itself is lost and the old
+/// bytes come back. Either is a lost login when the file held a refresh token
+/// the server has already spent. A failed sync fails the write as a failed
+/// `write` does. The directory sync is best-effort, since the file has landed
+/// by then, and Unix-only, since Windows opens no directory as a file. The
+/// mtime a dated write sets after the sync is not itself synced. A test build
+/// skips both syncs unless [`sync_in_tests`] turned them on.
 fn publish_temp(
     tmp: &Path,
     path: &Path,
     mut f: std::fs::File,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     modified: Option<std::time::SystemTime>,
+    durable: bool,
 ) -> std::io::Result<()> {
-    let written = write(&mut f);
+    #[cfg(test)]
+    let durable = durable && TEST_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    let written = write(&mut f).and_then(|()| if durable { f.sync_all() } else { Ok(()) });
+    #[cfg(test)]
+    let written = if durable {
+        written.and_then(|()| take_sync_fault(path))
+    } else {
+        written
+    };
     drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(tmp);
@@ -3496,7 +3520,13 @@ fn publish_temp(
         }
     }
     match land(tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(unix)]
+            if durable && let Some(dir) = path.parent() {
+                let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
             Err(e)
@@ -3504,12 +3534,47 @@ fn publish_temp(
     }
 }
 
+/// Whether a test build's durable writes sync. Off by default: the suite
+/// writes thousands of stores, and on macOS each sync is an `F_FULLFSYNC`,
+/// which made the write-heavy modules' tests about seven times slower
+/// (17.3 s against 117.8 s with the syncs on, measured on macOS on
+/// 2026-11-16). Nothing a test reads tells a synced file from an unsynced
+/// one, so only the tests that drive the sync path itself turn this on
+/// ([`sync_in_tests`]).
+#[cfg(test)]
+static TEST_SYNCS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn on the syncs [`TEST_SYNCS`] skips, for the rest of this test process:
+/// one test under nextest, every test sharing the process under `cargo test`,
+/// which only makes those slower.
+#[cfg(test)]
+pub(crate) fn sync_in_tests() {
+    TEST_SYNCS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
 /// so the file is never world-readable even for the instant before the rename,
 /// and a stale temp at its name is removed first, so the mode is applied at
-/// creation.
+/// creation. Durable, as [`atomic_write`] is.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     atomic_write_600_dated(path, content, None)
+}
+
+/// [`atomic_write_600`] without the syncs, for a file rewritten every tick
+/// that the next tick rebuilds (`status.json`, `tps_cache.json`): a sync costs
+/// milliseconds on macOS, where it flushes the drive's cache (`F_FULLFSYNC`),
+/// and one a second buys such a file nothing. Readers still see old or new,
+/// never partial; a power loss can leave it empty until its next write.
+pub(crate) fn atomic_write_600_fast(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_600_dated_with(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())
+        },
+        None,
+        false,
+    )
 }
 
 /// [`atomic_write_600`] whose file lands already carrying the mtime
@@ -3529,6 +3594,7 @@ pub(crate) fn atomic_write_600_dated(
             f.write_all(content.as_ref())
         },
         modified,
+        true,
     )
 }
 
@@ -3540,15 +3606,16 @@ pub(crate) fn atomic_write_600_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    atomic_write_600_dated_with(path, write, None)
+    atomic_write_600_dated_with(path, write, None, true)
 }
 
 /// [`atomic_write_600_with`] landing with the mtime `modified` when given
-/// ([`atomic_write_600_dated`]).
+/// ([`atomic_write_600_dated`]), synced when `durable` ([`publish_temp`]).
 fn atomic_write_600_dated_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     modified: Option<std::time::SystemTime>,
+    durable: bool,
 ) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -3575,7 +3642,7 @@ fn atomic_write_600_dated_with(
     };
     #[cfg(not(unix))]
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write, modified)
+    publish_temp(&tmp, path, f, write, modified, durable)
 }
 
 /// [`publish_temp`]'s rename. In a test build the file is read at the instant
@@ -3654,6 +3721,35 @@ fn take_dating_fault(path: &Path) -> std::io::Result<()> {
         .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
     if planted {
         Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The paths whose next durable write fails at its sync step, as a failing
+/// disk's `sync_all` would; each fault fires once.
+#[cfg(test)]
+static SYNC_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_sync(path: &Path) {
+    if let Ok(mut faults) = SYNC_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The sync's result in a test build: an armed fault answers in place of the
+/// real call's, so the writer's handling of a failed sync is what a test
+/// exercises.
+#[cfg(test)]
+fn take_sync_fault(path: &Path) -> std::io::Result<()> {
+    let planted = SYNC_FAULTS
+        .lock()
+        .is_ok_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted sync fault"))
     } else {
         Ok(())
     }

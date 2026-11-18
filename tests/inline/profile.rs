@@ -6411,6 +6411,240 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
 
+/// A sync fault planted on one path fails that path's write the way a failing
+/// disk's `sync_all` does: the error propagates, the destination keeps its old
+/// bytes and no temp is left. The fault is per path and one-shot, so a sibling
+/// file's write never sees it and the armed path's next write lands.
+#[test]
+fn a_planted_sync_fault_keeps_the_old_bytes_and_leaves_no_temp() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    let sibling = dir.join("other.json");
+    std::fs::write(&path, b"old").unwrap();
+
+    fail_next_sync(&path);
+    let err = atomic_write_600(&path, b"new").expect_err("the planted sync failure propagates");
+    assert_eq!(err.to_string(), "planted sync fault");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["settings.json"], "a temp stayed behind");
+
+    atomic_write_600(&sibling, b"sibling").expect("the fault is per path");
+    atomic_write_600(&path, b"new").expect("the fault is one-shot");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+}
+
+/// The synced writers and the unsynced one land the same file: the new bytes
+/// over the old ones, owner-only on Unix whatever the old file's mode, and no
+/// temp left beside it. The syncs run for real here ([`sync_in_tests`]), but
+/// whether one reached the disk is not observable; this pins only that they
+/// succeed and change nothing a reader sees.
+#[test]
+fn the_synced_and_the_fast_writers_land_the_same_owner_only_file() {
+    sync_in_tests();
+    type Writer = fn(&Path, &[u8]) -> std::io::Result<()>;
+    let writers: [(&str, Writer); 4] = [
+        ("atomic_write_600", |p, b| atomic_write_600(p, b)),
+        ("atomic_write_600_with", |p, b| {
+            atomic_write_600_with(p, |f| std::io::Write::write_all(f, b))
+        }),
+        ("atomic_write_600_fast", |p, b| atomic_write_600_fast(p, b)),
+        ("atomic_write", |p, b| atomic_write(p, b)),
+    ];
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (label, write) in writers {
+        let path = dir.join(format!("{label}.json"));
+        std::fs::write(&path, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new", "{label}");
+        #[cfg(unix)]
+        if label != "atomic_write" {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{label} landed {mode:o}");
+        }
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "atomic_write.json",
+            "atomic_write_600.json",
+            "atomic_write_600_fast.json",
+            "atomic_write_600_with.json",
+        ],
+        "a temp stayed behind"
+    );
+}
+
+/// A dated write synced before its temp takes the mtime still lands carrying
+/// that mtime: the sync goes through the writing handle, the date through a
+/// handle of its own afterwards.
+#[test]
+fn a_synced_dated_write_still_lands_its_mtime() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cache.json");
+    std::fs::write(&path, b"old").unwrap();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    atomic_write_600_dated(&path, b"new", Some(at)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), at);
+}
+
+/// The unsynced writer stays on the files a tick rewrites and the next tick
+/// rebuilds (`status.json`, `tps_cache.json`). A new call anywhere else, a
+/// credential store above all, has to change this list, and so has to say why
+/// that file may come back empty after a power loss. The scan reads call sites
+/// by name: an alias or a function pointer to the writer is invisible to it.
+#[test]
+fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let scanned = crate::testutil::rs_files(&root);
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/ — it is not reading the crate",
+        scanned.len()
+    );
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    for file in scanned {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let n = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .filter(|code| code.contains("atomic_write_600_fast(") && !code.contains("fn "))
+            .count();
+        if n > 0 {
+            let rel = file.strip_prefix(&root).unwrap();
+            calls.push((rel.to_string_lossy().replace('\\', "/"), n));
+        }
+    }
+    calls.sort();
+    let expected: Vec<(String, usize)> = UNSYNCED_WRITERS
+        .iter()
+        .map(|(module, count, _)| ((*module).to_string(), *count))
+        .collect();
+    assert_eq!(calls, expected, "the unsynced writer's callers moved");
+}
+
+/// The documents that name the unsynced writer's files name exactly the files
+/// in `UNSYNCED_WRITERS`: `SECURITY.md`'s writes bullet, the writer's own doc
+/// comment, and the scan test's above. Each text is read for the backticked
+/// `.json` names it holds, in any order, so a third backticked name anywhere
+/// in it reds; a bare, unbackticked name is invisible to the extractor. The
+/// bullet is located by its "skip both syncs" sentence, so a reword keeps the
+/// check green only while that sentence stays, and the two doc blocks by the
+/// functions they document; a name in prose elsewhere in `SECURITY.md` falls
+/// outside the window. The expected names come from the table the scan pins,
+/// so a caller added there reds here until these documents name its file too.
+#[test]
+fn the_documents_name_the_same_files_as_the_unsynced_writer() {
+    // Controls: the extractor reads the two in either order, flags a third,
+    // and ignores a backticked path that is not a store, so a scan that read
+    // nothing could not keep this green.
+    assert_eq!(
+        json_names("files `status.json`, `tps_cache.json`"),
+        ["status.json", "tps_cache.json"]
+    );
+    assert_eq!(
+        json_names("files `tps_cache.json`, `status.json`"),
+        ["tps_cache.json", "status.json"]
+    );
+    assert_eq!(
+        json_names("files `status.json`, `tps_attribution.json`"),
+        ["status.json", "tps_attribution.json"]
+    );
+    assert_eq!(
+        json_names("`credentials.json.staged` at `0600`"),
+        Vec::<&str>::new()
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let security = std::fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let security_bullet = security
+        .lines()
+        .find(|line| line.contains("skip both syncs"))
+        .expect("SECURITY.md's writes bullet");
+    let profile = std::fs::read_to_string(root.join("src/profile.rs")).unwrap();
+    let writer_doc = doc_comment_above(&profile, "pub(crate) fn atomic_write_600_fast(");
+    let this_file = std::fs::read_to_string(root.join("tests/inline/profile.rs")).unwrap();
+    let scan_doc = doc_comment_above(
+        &this_file,
+        "fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer()",
+    );
+    let mut expected: Vec<&str> = UNSYNCED_WRITERS.iter().map(|(_, _, file)| *file).collect();
+    expected.sort_unstable();
+    expected.dedup();
+    for (label, text) in [
+        ("SECURITY.md", security_bullet),
+        ("atomic_write_600_fast's doc comment", writer_doc.as_str()),
+        ("the caller scan's doc comment", scan_doc.as_str()),
+    ] {
+        let mut names = json_names(text);
+        names.sort_unstable();
+        assert_eq!(names, expected, "{label}");
+    }
+}
+
+/// The backticked names ending in `.json` that `text` holds, in order.
+fn json_names(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            Path::new(token)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect()
+}
+
+/// The `///` block above the line holding `anchor`, its markers stripped, its
+/// attributes skipped and its lines joined.
+fn doc_comment_above(text: &str, anchor: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(anchor))
+        .expect("the anchored line");
+    let mut doc: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("///") || line.starts_with("#["))
+        .filter(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches("///").trim())
+        .collect();
+    doc.reverse();
+    doc.join(" ")
+}
+
+/// The unsynced writer's call sites, per module and count, and the file each
+/// rebuilds. Ordered by module, as the scan sorts them.
+const UNSYNCED_WRITERS: &[(&str, usize, &str)] = &[
+    ("daemon/mod.rs", 2, "status.json"),
+    ("usage/scheduler.rs", 1, "tps_cache.json"),
+];
+
 // ── a profile's id: what a login in flight lands by ──────────────────────────
 
 fn create_account(name: &str) {
