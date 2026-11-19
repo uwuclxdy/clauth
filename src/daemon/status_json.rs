@@ -729,8 +729,14 @@ pub(crate) fn build_profile_entries(
                 },
                 None => false,
             };
-            let stale = stuck || age_stale;
-            let alert_stale = stuck || alert_age_stale;
+            // A figure a Claude Code session confirmed off its own reply in
+            // the last few minutes is being maintained, however long `/usage`
+            // has refused: neither stuck nor old (see `usage::observed`). An
+            // OAuth account's only; a proxy copy keeps its chain's verdict.
+            let observed_fresh = third_party_copy.is_none()
+                && crate::usage::observed::is_fresh(name.as_str(), crate::usage::now_epoch_secs());
+            let stale = !observed_fresh && (stuck || age_stale);
+            let alert_stale = !observed_fresh && (stuck || alert_age_stale);
 
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
