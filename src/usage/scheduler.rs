@@ -3367,12 +3367,16 @@ fn apply_outcome_flagged(
 
 /// Fold the 5h/7d readings Claude Code sessions recorded off their own replies
 /// (`~/.clauth/observed-usage/<profile>.json`, see [`super::observed`]) into
-/// the stored bodies they are newer than. Memory only, like
-/// [`mark_window_open`]: no status, cadence, streak or disk-cache write, so a
-/// rate-limited poll stays visibly `RateLimited`, keeps its backoff, and the
-/// next live body overwrites the store as usual. The files are read before the
-/// store lock is taken.
-fn apply_observed_usage(store: &UsageStore) {
+/// the stored bodies they are newer than. No status, cadence, streak or
+/// fetch-age change: a rate-limited poll stays visibly `RateLimited`, keeps its
+/// backoff, and the next live body replaces the reading as usual.
+///
+/// With `persist` (the lease holder's tick only) a raised body is also written
+/// back to its usage cache ([`persist_observed`]), so every surface that reads
+/// the disk cache rather than this store sees it: `status.json`, `clauth list`,
+/// the start picker, the MCP tools and a stood-down TUI. The files are read
+/// before the store lock is taken.
+fn apply_observed_usage(store: &UsageStore, persist: bool) {
     let Some(dir) = super::observed::dir() else {
         return;
     };
@@ -3392,20 +3396,53 @@ fn apply_observed_usage(store: &UsageStore) {
     }
     let now = now_epoch_secs();
     let mut fresh = Vec::new();
+    let mut moved = Vec::new();
     if let Ok(mut s) = store.lock() {
         for (name, observed) in &readings {
             if let Some(info) = s.get_mut(name) {
                 if let Some(seen) = super::observed::usable_seen_at(info, observed, now) {
                     fresh.push((name.as_str(), seen));
                 }
-                super::observed::overlay(info, observed, now);
+                let before = super::observed::figures(info);
+                if super::observed::overlay(info, observed, now) {
+                    let after = super::observed::figures(info);
+                    moved.push((name.as_str(), before, after, info.clone()));
+                }
             }
+        }
+    }
+    // After the store lock is released. A stood-down instance re-reads the
+    // disk cache every tick and so re-raises the same figure; the line is
+    // written once per figure reached, not once per tick.
+    for (name, before, after, info) in &moved {
+        if super::observed::first_report(name, after) {
+            logline!("{name}: observed usage moved {before} -> {after}");
+        }
+        if persist {
+            persist_observed(name, info);
         }
     }
     // Noted after the store lock is released: the freshness map is a leaf.
     for (name, seen) in fresh {
         super::observed::note_fresh(name, seen);
     }
+}
+
+/// Write a body [`apply_observed_usage`] raised back to its usage cache. Under
+/// the state flock, and only while the cache still holds the poll the raise
+/// started from (same `fetched_at`): a poll that landed meanwhile wins and the
+/// next tick folds onto it. `fetched_at` itself is kept, so the poll age and
+/// the `stale` judgment built on it stay honest about when `/usage` last
+/// answered.
+fn persist_observed(name: &str, info: &UsageInfo) {
+    let pname = ProfileName::from(name);
+    let _ = crate::lock::with_state_lock_flag(None, |_held| {
+        let on_disk = load_profile_cache::<UsageInfo>(&pname, USAGE_CACHE_FILE);
+        if on_disk.is_some_and(|d| d.fetched_at == info.fetched_at) {
+            write_profile_cache(&pname, USAGE_CACHE_FILE, info);
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 }
 
 /// Optimistically mark a just-kicked profile's 5h window open in the store. A
@@ -6372,7 +6409,7 @@ pub(crate) fn tick(state: &SchedulerState) {
 
     // Readings sessions took off their own replies, folded in ahead of the
     // scan so a `/usage` 429 does not blind it (see [`apply_observed_usage`]).
-    apply_observed_usage(&state.store);
+    apply_observed_usage(&state.store, true);
 
     // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a
     // profile that crossed its threshold is switched immediately, without
@@ -7288,9 +7325,10 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         });
     }
 
-    // The hydrate above reloads the lease holder's disk cache, which a
-    // `/usage` 429 freezes; fold the observed readings back in on top.
-    apply_observed_usage(&state.store);
+    // The hydrate above reloads the lease holder's disk cache; fold any
+    // reading it has not written back yet. Never persisted from here: only
+    // the lease holder writes the shared cache.
+    apply_observed_usage(&state.store, false);
 }
 
 /// The store-refresh half of [`standdown_tick`], extracted store-narrow so the
@@ -7849,6 +7887,23 @@ pub(crate) fn fill_chain_snapshot_stores(
     usage
 }
 
+/// The last "capped active held" line, so the scan logs a held switch once
+/// per change of reason rather than on every tick.
+static CAPPED_ACTIVE_HELD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Log why the scan left an active at its weekly cap in place, once per
+/// distinct reason. A leaf lock, taken with no other held.
+fn note_capped_active_held(line: &str) {
+    let Ok(mut last) = CAPPED_ACTIVE_HELD.lock() else {
+        return;
+    };
+    if *last != line {
+        line.clone_into(&mut last);
+        drop(last);
+        logline!("{line}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
@@ -8003,6 +8058,13 @@ pub(crate) fn scan_auto_switch(
     // keep it from wedging the scan, live in `reading_is_actionable` — shared with
     // the per-session leg, which applies it to each session's own member.
     let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
+    let active_capped = usage.get(snapshot.active.as_str()).is_some_and(|info| {
+        crate::fallback::weekly_blocked_info(
+            info,
+            now_epoch_secs(),
+            crate::fallback::WEEKLY_HARD_BLOCK_PCT,
+        )
+    });
     if !reading_is_actionable(
         active_broken,
         status,
@@ -8012,10 +8074,20 @@ pub(crate) fn scan_auto_switch(
         third_party_names.contains(&snapshot.active),
         &snapshot.active.clone(),
     ) {
+        if active_capped {
+            note_capped_active_held(&format!(
+                "{}: at its weekly cap, but the reading is not actionable (status {:?}); no switch",
+                snapshot.active,
+                status
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(snapshot.active.as_str()).copied()),
+            ));
+        }
         return;
     }
 
-    match crate::fallback::next_auto_switch_decision_with_usage(
+    let decision = crate::fallback::next_auto_switch_decision_with_usage(
         &snapshot,
         &without_snapshot,
         &usage,
@@ -8023,7 +8095,14 @@ pub(crate) fn scan_auto_switch(
         crate::fallback::ActiveBurnRate::FromDisk,
         false,
         false,
-    ) {
+    );
+    if active_capped && decision.is_none() {
+        note_capped_active_held(&format!(
+            "{}: at its weekly cap, but the walk found no member to switch to",
+            snapshot.active
+        ));
+    }
+    match decision {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
             key_rejection_necessary,

@@ -30,10 +30,12 @@
 //! reading fresh figures off every reply. [`overlay`] lets a reading that is
 //! newer than the stored body move that body's 5h and 7d windows, so the
 //! surfaces and the auto-switch scan see current usage with no extra request.
-//! It never touches the fetch status, the cadence, the streaks or the disk
-//! cache: the poll stays visibly rate limited, the next live body overwrites
-//! the store as usual, and a reading older than that body is ignored, so a
-//! wrong reading lasts at most until the next live poll.
+//! It never touches the fetch status, the cadence, the streaks or the poll's
+//! `fetched_at`: the poll stays visibly rate limited, the next live body
+//! overwrites the reading as usual, and a reading older than that body is
+//! ignored, so a wrong reading lasts at most until the next live poll. The
+//! lease holder writes a raised body back to the usage cache so the surfaces
+//! that read the disk (status.json, `clauth list`, the start picker) see it.
 //!
 //! The switch scans act only on a reading they trust ([`is_fresh`] beside the
 //! `Fresh` status): a profile whose body a reading seen in the last
@@ -426,6 +428,31 @@ pub(crate) fn is_fresh(name: &str, now: i64) -> bool {
         .ok()
         .and_then(|fresh| fresh.get(name).copied())
         .is_some_and(|seen| seen <= now && now - seen <= FRESH_SECS)
+}
+
+/// The figures each profile's "observed usage moved" line last reported.
+static REPORTED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+
+/// Whether `figures` is new for `name` since its last report, recording it.
+/// A leaf lock.
+pub(crate) fn first_report(name: &str, figures: &str) -> bool {
+    let Ok(mut reported) = REPORTED.lock() else {
+        return true;
+    };
+    if reported.get(name).is_some_and(|last| last == figures) {
+        return false;
+    }
+    reported.insert(name.to_owned(), figures.to_owned());
+    true
+}
+
+/// A body's 5h and 7d figures for a log line, e.g. `5h - / 7d 91%`.
+pub(crate) fn figures(info: &UsageInfo) -> String {
+    let pct = |w: &Option<UsageWindow>| {
+        w.as_ref()
+            .map_or_else(|| "-".to_owned(), |w| format!("{}%", w.utilization))
+    };
+    format!("5h {} / 7d {}", pct(&info.five_hour), pct(&info.seven_day))
 }
 
 /// Fold a record into a stored body. Returns whether any window moved. A plan
@@ -890,6 +917,18 @@ mod tests {
             &prints(),
         );
         assert_eq!(got.as_deref(), Some("personal"));
+    }
+
+    #[test]
+    fn should_report_a_figure_once_per_profile() {
+        let name = "observed-report-test-profile";
+        assert!(first_report(name, "5h - / 7d 91%"));
+        assert!(!first_report(name, "5h - / 7d 91%"));
+        assert!(first_report(name, "5h - / 7d 92%"));
+        assert!(first_report(
+            "another-observed-report-test",
+            "5h - / 7d 92%"
+        ));
     }
 
     #[test]
