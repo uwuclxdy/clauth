@@ -20,7 +20,7 @@ use super::InputState;
 use super::SeededInput;
 use crate::fallback::parse_threshold;
 use crate::profile::ProfileName;
-use crate::testutil::write_live_creds;
+use crate::testutil::{peer_switches_active_to, write_live_creds};
 
 #[test]
 fn delete_word_removes_run_left_of_caret() {
@@ -3002,6 +3002,283 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
     );
 }
 
+/// The chain's own move leaves a line in clauth.log: the toast vanishes with
+/// the TUI, so without the line nothing tells when (or whether) the chain
+/// moved off an account whose window still ran out.
+#[test]
+fn on_tick_logs_a_queued_auto_switch_with_the_left_reading() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            seven_day: Some(boot_window(70.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // First tick dispatches (posts the gate); the second completes it.
+        super::on_tick(&mut app);
+        super::on_tick(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 92% (line 90%), 7d 70% (line 98%) 4m ago"),
+        "the landed auto-switch is logged with what the left account read and how long ago: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer switch landing while the queued switch's gate runs must not change
+/// what the line reports: the account left is the one `profiles.toml` names
+/// under the switch's own hold, never the process's copy read before it.
+#[test]
+fn on_tick_logs_the_account_its_hold_left_after_a_peer_switch() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso", "peer"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let mut peer = stored_oauth_profile("peer", far_future());
+    peer.fallback_threshold = Some(90.0);
+    save_profile(&peer).expect("save peer");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![
+            ProfileName::from("work"),
+            ProfileName::from("perso"),
+            ProfileName::from("peer"),
+        ],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso, peer],
+    });
+    app.bootstrap_started = true;
+    for (name, five, seven) in [("work", 91.0, 60.0), ("peer", 92.0, 70.0)] {
+        app.usage_store.lock().expect("usage_store").insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(five)),
+                seven_day: Some(boot_window(seven)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy still names work.
+        super::on_tick(&mut app);
+        // A peer's switch lands while that answer waits.
+        peer_switches_active_to(Some("peer"));
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'perso' from 'peer'; 'peer' read 5h 92% (line 90%), 7d 70% (line 98%) 4m ago"),
+        "the line names the account the switch's own hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after this app loaded
+/// leaves only the disk naming the account the queued switch will leave; the
+/// line still names it, with its reading.
+#[test]
+fn on_tick_names_a_left_account_its_config_copy_lacks() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy has no `delta`.
+        super::on_tick(&mut app);
+        // A peer saves `delta` and switches onto it while that answer waits.
+        stored_oauth_profile("delta", far_future());
+        crate::testutil::register_names(&["delta"]);
+        peer_switches_active_to(Some("delta"));
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: auto-switched to 'perso' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the queued switch's line: the name comes from the switch's own result, and
+/// only the figures need a profile. Its stored reading cannot fill them without
+/// one.
+#[test]
+fn on_tick_names_a_left_account_with_no_loadable_profile() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy has no `delta`.
+        super::on_tick(&mut app);
+        // A peer saves `delta`, switches onto it, and its config.toml stops
+        // loading while that answer waits.
+        stored_oauth_profile("delta", far_future());
+        crate::testutil::register_names(&["delta"]);
+        peer_switches_active_to(Some("delta"));
+        crate::testutil::break_profile_config("delta");
+        app.usage_store.lock().expect("usage_store").insert(
+            "delta".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(92.0)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: auto-switched to 'perso' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A queued switch must not execute once the TUI lost the fetch lease: the
 /// decision was queued under a ticket the watchdog then released, and the
 /// holder that took over decides. The record clears with the skip.
@@ -3589,8 +3866,75 @@ fn the_startup_one_shot_passes_over_a_member_with_a_credit_refusal() {
     )
     .expect("the one-shot runs");
 
-    assert_eq!(action, Some(SwitchAction::To("delta".into())));
+    assert_eq!(
+        action.map(|taken| taken.action),
+        Some(SwitchAction::To("delta".into()))
+    );
     assert_eq!(app.config().state.active_profile.as_deref(), Some("delta"));
+}
+
+/// The startup one-shot cannot log another account: its dispatch refuses to
+/// switch once `profiles.toml` names an active account other than the one the
+/// decision was made about, so the account it moves off is the one its hold
+/// read.
+#[test]
+fn the_startup_one_shot_drops_its_decision_once_disk_names_another_active() {
+    use crate::fallback::SwitchAction;
+
+    // Control: memory and disk both name the decided account, so it lands.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (app, gamma_store, readable) = unreadable_middle_member_app();
+        std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+        let action = crate::fallback::auto_switch_if_needed(
+            &app.config,
+            None,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.poll_streaks,
+            &app.third_party_streaks,
+            &app.kick_blocks,
+        )
+        .expect("the one-shot runs");
+        assert_eq!(
+            action.map(|taken| taken.action),
+            Some(SwitchAction::To("gamma".into())),
+            "fixture control: both copies name alpha, so the one-shot decides"
+        );
+    }
+
+    // A peer's switch left `profiles.toml` naming delta.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (app, gamma_store, readable) = unreadable_middle_member_app();
+        std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+        peer_switches_active_to(Some("delta"));
+        let action = crate::fallback::auto_switch_if_needed(
+            &app.config,
+            None,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.poll_streaks,
+            &app.third_party_streaks,
+            &app.kick_blocks,
+        )
+        .expect("the one-shot runs");
+        assert_eq!(action, None, "the rendezvous drops the stale decision");
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some("alpha"),
+            "this process's copy still names alpha"
+        );
+        assert_eq!(
+            active_on_disk().as_deref(),
+            Some("delta"),
+            "the peer's switch stands"
+        );
+    }
 }
 
 #[test]
@@ -14018,7 +14362,8 @@ fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
                 &app.third_party_streaks,
                 &app.kick_blocks,
             )
-            .unwrap(),
+            .unwrap()
+            .map(|taken| taken.action),
             Some(SwitchAction::To("kl".into())),
             "{label}: the startup one-shot"
         );
@@ -22985,11 +23330,21 @@ fn boot_window(utilization: f64) -> UsageWindow {
     }
 }
 
-/// Drive one bootstrap tail over the caller-held sandbox with `status` as the
-/// ACTIVE profile's last read. Everything else — chain, windows, credentials,
-/// the spare's own Fresh status — is identical across calls, so `status` is the
-/// only variable between the two directions.
-fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> App {
+/// Where a decided startup one-shot lands: on the idle spare, or off once the
+/// whole chain is spent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootTail {
+    Spare,
+    WrapOff,
+}
+
+/// Drive one bootstrap tail with `status` as the ACTIVE profile's last read.
+/// `tail` names where a decided one-shot lands and picks the member list it
+/// lands over, and `spent_fetched_at` dates the active's stored reading (a
+/// line that has to carry an age passes one). Every other field — the active
+/// account, its windows, its credentials, the live file — is identical across
+/// calls.
+fn bootstrap_app(status: FetchStatus, tail: BootTail, spent_fetched_at: Option<u64>) -> App {
     use super::{StartupSignal, drain_startup_signals};
     use crate::profile::{AppConfig, AppState, Profile, save_profile};
 
@@ -23000,49 +23355,58 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
         p
     };
     let spent = mk(BOOT_SPENT);
-    let spare = mk(BOOT_SPARE);
     // The live file is the ACTIVE account's captured mirror: the relink has no
     // uncaptured login to strand, so a decided switch actually lands.
     write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
+    let mut profiles = vec![spent];
+    let mut chain = vec![BOOT_SPENT.into()];
+    if tail == BootTail::Spare {
+        profiles.push(mk(BOOT_SPARE));
+        chain.push(BOOT_SPARE.into());
+    }
 
     let config = AppConfig {
         state: AppState {
             active_profile: Some(BOOT_SPENT.into()),
-            profiles: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
-            fallback_chain: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            profiles: chain.clone(),
+            fallback_chain: chain,
+            switch_off_when_spent: tail == BootTail::WrapOff,
             ..AppState::default()
         },
-        profiles: vec![spent, spare],
+        profiles,
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
     let mut app = App::new(config);
 
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     {
         let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
         store.insert(
             BOOT_SPENT.to_string(),
             UsageInfo {
                 five_hour: Some(boot_window(100.0)),
+                fetched_at: spent_fetched_at,
                 ..UsageInfo::default()
             },
         );
-        store.insert(
-            BOOT_SPARE.to_string(),
-            UsageInfo {
-                five_hour: Some(boot_window(1.0)),
-                ..UsageInfo::default()
-            },
-        );
+        if tail == BootTail::Spare {
+            store.insert(
+                BOOT_SPARE.to_string(),
+                UsageInfo {
+                    five_hour: Some(boot_window(1.0)),
+                    ..UsageInfo::default()
+                },
+            );
+        }
     }
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     {
         let mut s = app
             .usage_status
             .lock()
             .expect("usage_status mutex poisoned");
         s.insert(BOOT_SPENT.to_string(), status);
-        s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+        if tail == BootTail::Spare {
+            s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+        }
     }
 
     // `finish_bootstrap` starts the real scheduler via `spawn_refresher`, which
@@ -23095,7 +23459,7 @@ fn skips_the_one_shot(status: FetchStatus) -> bool {
 #[test]
 fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    let app = bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None);
 
     assert_eq!(
         app.config().state.active_profile.as_deref(),
@@ -23106,6 +23470,58 @@ fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
         toast_bodies(&app),
         vec!["auto-switched to 'spare'".to_string()],
         "the landed switch announces its target",
+    );
+}
+
+#[test]
+fn bootstrap_one_shot_logs_the_switch_away_from_a_fresh_exhausted_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None)
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPARE),
+        "precondition: the startup switch lands",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'spare' from 'spent'; 'spent' read 5h 100% (line 95%) at an unknown time"),
+        "the startup switch is logged with what the left account read, and that nothing dates it: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// The startup one-shot's wrap-off is the chain's own move too, so it leaves
+/// the same reading line the daemon's does.
+#[test]
+fn bootstrap_one_shot_logs_the_wrap_off_with_the_left_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_app(
+            FetchStatus::Fresh,
+            BootTail::WrapOff,
+            Some(crate::usage::now_ms() - 240_000),
+        )
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        None,
+        "precondition: the startup one-shot switched off",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'spent' read 5h 100% (line 95%) 4m ago"),
+        "the startup wrap-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
     );
 }
 
@@ -23125,7 +23541,7 @@ fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
 
     for status in skipped {
         let _home = crate::testutil::HomeSandbox::new();
-        let app = bootstrap_app(&_home, status);
+        let app = bootstrap_app(status, BootTail::Spare, None);
 
         assert_eq!(
             app.config().state.active_profile.as_deref(),
@@ -46686,7 +47102,7 @@ fn bootstrap_one_shot_stands_down_when_another_instance_holds_the_fetch_lease() 
     // flock stays held for the rest of the test.
     let other = crate::daemon::FetchLease::new();
     assert!(other.acquire(), "the first instance wins the lease");
-    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    let app = bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None);
     assert_eq!(
         app.config().state.active_profile.as_deref(),
         Some(BOOT_SPENT),
@@ -63880,6 +64296,215 @@ fn the_settle_runs_on_a_worker_and_holds_the_write() {
     );
     assert_eq!(active_on_disk(), None, "the settled sign-out ran");
     assert!(app.modals.is_empty(), "nothing to ask");
+}
+
+/// The chain's own switch-off leaves the same reading line in clauth.log that
+/// every other chain move does: its toast is gone with the TUI.
+#[test]
+fn drain_pending_switch_off_logs_the_left_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(97.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *app.pending_switch_off.lock().expect("flag") = true;
+        drain_pending_switch_off(&mut app);
+        // The gate holds the write on its settle; landing the answer resumes
+        // it, and the resumed write is the one that switches off.
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'work' read 5h 97% (line 95%) 4m ago"),
+        "the chain's switch-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer switch landing while the bare item settles must not change what the
+/// wrap-off line reports: the account left is the one `profiles.toml` names
+/// under the switch-off's own hold, never the copy read before it.
+#[test]
+fn perform_switch_off_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    let mut peer = stored_oauth_profile("peer", far_future());
+    peer.fallback_threshold = Some(90.0);
+    crate::testutil::register_names(&["peer"]);
+    app.config().profiles.push(peer);
+    for (name, five) in [("work", 97.0), ("peer", 92.0)] {
+        app.usage_store.lock().expect("usage_store").insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(five)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    // The peer's switch landed while this copy still named work.
+    peer_switches_active_to(Some("peer"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'peer' read 5h 92% (line 90%) 4m ago"),
+        "the line names the account the switch-off's own hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after this app loaded
+/// leaves only the disk naming the account the wrap-off will leave; the line
+/// still names it, with its reading.
+#[test]
+fn perform_switch_off_names_a_left_account_its_config_copy_lacks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    // A peer saves `delta` and switches onto it after this app loaded.
+    stored_oauth_profile("delta", far_future());
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
+        "the line names the account the switch-off's own hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the wrap-off line: the name comes from the switch-off's own result, and only
+/// the figures need a profile. Its stored reading cannot fill them without one.
+#[test]
+fn perform_switch_off_names_a_left_account_with_no_loadable_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    // A peer saves `delta`, switches onto it, and its config.toml stops loading
+    // after this app loaded.
+    stored_oauth_profile("delta", far_future());
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+    app.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
+        "the line names the account the switch-off's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A wrap-off `profiles.toml` already made writes the bare line, the daemon's
+/// twin shape, and names no reading for an account this process did not turn
+/// off.
+#[test]
+fn perform_switch_off_logs_the_bare_line_when_disk_is_already_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(97.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(None);
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent"),
+        "a wrap-off the disk already made writes the bare line: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains("'work' read")),
+        "the line reports no reading for an account this process did not turn off: {:?}",
+        lines.snapshot()
+    );
 }
 
 /// `s` with a profile cached with the login's account saves the login into

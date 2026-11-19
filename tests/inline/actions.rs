@@ -1131,6 +1131,7 @@ impl OneShotStores {
             &self.third_party_streaks,
             &self.kick_blocks,
         )
+        .map(|taken| taken.map(|taken| taken.action))
     }
 }
 
@@ -2447,7 +2448,7 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the switch then reads"
@@ -2814,7 +2815,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (mut config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the capture then reads"
@@ -2884,7 +2885,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
+    let (mut config, _departed) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the commit then reads"
@@ -7343,7 +7344,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
     };
     save_app_state(&config.state).expect("persist state");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     let after: serde_json::Value =
@@ -7549,7 +7550,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
     };
     save_app_state(&config.state).expect("persist state");
 
-    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
+    let (config, _departed) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     assert!(
@@ -16979,7 +16980,11 @@ fn a_cover_landed_from_switched_off_comes_back_on_switch_away() {
     let mut config = crate::profile::load_config().expect("read");
     assert!(switch_profile_locked(&mut config, &a).is_ok());
     seed_user_endpoint();
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     edit_profile_env(&mut config, &b, |e| {
         e.insert("ENDPOINT".to_string(), "mine".to_string());
     })
@@ -17145,7 +17150,11 @@ fn deleting_a_switched_off_coverer_gives_the_user_value_back() {
     })
     .expect("edit active a");
     assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
     delete_profile(&mut config, &a, false, &rotation).expect("delete a");
     drop(rotation);
@@ -17221,7 +17230,11 @@ fn a_switch_from_off_keeps_a_user_key_no_account_ever_applied() {
         e.insert("ENDPOINT".to_string(), "mine".to_string());
     })
     .expect("edit inactive b");
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert_eq!(
         live_endpoint().as_deref(),
@@ -17413,7 +17426,11 @@ fn two_accounts_covering_one_key_in_turn_give_the_users_value_back() {
     let mut config = crate::profile::load_config().expect("read");
     assert!(switch_profile_locked(&mut config, &a).is_ok());
     seed_user_endpoint();
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     for (name, value) in [(&a, "a-value"), (&b, "b-value")] {
         edit_profile_env(&mut config, name, |e| {
             e.insert("ENDPOINT".to_string(), value.to_string());
@@ -17590,7 +17607,11 @@ fn an_unrelated_unreadable_account_never_takes_the_users_key_from_off() {
         e.insert("ENDPOINT".to_string(), "mine".to_string());
     })
     .expect("edit inactive b");
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     std::fs::write(
         crate::profile::profile_subpath(&c, "config.toml").expect("c's config path"),
         "not = [toml",
@@ -17638,7 +17659,11 @@ fn a_switch_from_off_onto_an_account_holding_the_users_value_keeps_it() {
         e.insert("ENDPOINT".to_string(), "user".to_string());
     })
     .expect("edit inactive b");
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert_eq!(live_endpoint().as_deref(), Some("user"));
@@ -17691,7 +17716,11 @@ fn switching_off_gives_the_users_value_back() {
     })
     .expect("edit active a");
     assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     assert_eq!(live_endpoint().as_deref(), Some("user"));
     assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
 }
@@ -17799,7 +17828,11 @@ fn switching_off_drops_an_env_key_a_profile_field_sets() {
         Some("a-token"),
         "control: a's token is live"
     );
-    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
     assert_eq!(live_settings()["env"].get("ANTHROPIC_AUTH_TOKEN"), None);
 }
 
@@ -17867,7 +17900,11 @@ fn a_torn_record_never_keeps_an_account_active_through_a_switch_off() {
         "control: a is linked"
     );
     std::fs::write(base_env_path(), "{ torn").expect("tear the record");
-    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("the switch-off lands")
+            .is_some()
+    );
     assert_switched_off();
     assert_eq!(live_endpoint().as_deref(), Some("mine"));
     assert_eq!(
@@ -17892,7 +17929,11 @@ fn a_malformed_settings_file_never_keeps_an_account_active_through_a_switch_off(
     .expect("edit active a");
     let path = crate::claude::claude_settings_path().expect("settings path");
     std::fs::write(&path, "{ \"env\": { \"ENDPOINT\": \"mine\", } }").expect("break settings");
-    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("the switch-off lands")
+            .is_some()
+    );
     assert_switched_off();
     assert_eq!(
         std::fs::read_to_string(&path).expect("read settings"),
@@ -17928,7 +17969,11 @@ fn a_switch_off_that_cannot_put_back_the_values_logs_one_line() {
     );
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
-    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("the switch-off lands")
+            .is_some()
+    );
     assert_eq!(
         lines.snapshot(),
         [format!(
@@ -17957,7 +18002,11 @@ fn the_next_switch_puts_back_what_a_failed_switch_off_could_not() {
     let path = crate::claude::claude_settings_path().expect("settings path");
     let good = std::fs::read(&path).expect("read settings");
     std::fs::write(&path, "{ broken").expect("break settings");
-    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("the switch-off lands")
+            .is_some()
+    );
     assert_switched_off();
     std::fs::write(&path, &good).expect("the user repairs settings");
     assert_eq!(
@@ -18792,7 +18841,11 @@ fn a_switch_off_clears_an_account_a_peer_switched_on_meanwhile() {
     let _home = HomeSandbox::new();
     let (_a, b) = seed_two_captured();
     let mut peer = crate::profile::load_config().expect("peer read");
-    assert!(switch_off_locked(&mut peer).expect("peer switch-off"));
+    assert!(
+        switch_off_locked(&mut peer)
+            .expect("peer switch-off")
+            .is_some()
+    );
     let mut stale = crate::profile::load_config().expect("stale read");
     assert_eq!(
         stale.state.active_profile, None,
@@ -18801,7 +18854,7 @@ fn a_switch_off_clears_an_account_a_peer_switched_on_meanwhile() {
     let mut peer = crate::profile::load_config().expect("peer read");
     assert!(switch_profile_locked(&mut peer, &b).expect("peer switch on"));
     assert!(
-        switch_off_locked(&mut stale).expect("switch off"),
+        switch_off_locked(&mut stale).expect("switch off").is_some(),
         "the switch-off runs"
     );
     assert_eq!(
@@ -20097,7 +20150,7 @@ fn every_save_app_state_call_under_src_is_a_known_site() {
         std::collections::BTreeMap::from([
             ("actions.rs".to_string(), 15),
             ("profile.rs".to_string(), 2),
-            ("testutil.rs".to_string(), 3),
+            ("testutil.rs".to_string(), 4),
         ]),
         "a save_app_state call outside its known files: only the fresh-save helper, \
          the actions.rs fresh-read legs and test fixtures may save whole state"
@@ -20608,7 +20661,11 @@ fn departed_account_keys_fixture() -> AppConfig {
     .expect("on roster");
     peer_switches_to(&b);
     let mut peer = crate::profile::load_config().expect("peer read");
-    assert!(switch_off_locked(&mut peer).expect("peer switch-off"));
+    assert!(
+        switch_off_locked(&mut peer)
+            .expect("peer switch-off")
+            .is_some()
+    );
     // The switch-off of a clauth that predates the record left b's key live.
     forget_base_env_record();
     set_live_env("B_KEY", Some("b-secret"));

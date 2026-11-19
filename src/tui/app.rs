@@ -42,8 +42,8 @@ use crate::claude::{
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
-    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
-    parse_threshold, threshold_for,
+    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, StartupSwitch, SwitchAction,
+    auto_switch_if_needed, parse_threshold, threshold_for,
 };
 use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
@@ -7848,22 +7848,29 @@ impl App {
             }
         };
         match switched {
-            Some(SwitchAction::To(target)) => {
+            Some(StartupSwitch {
+                action: SwitchAction::To(target),
+                left,
+            }) => {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
+                let target = ProfileName::from(target);
                 let key_rejected = self.key_rejected_names();
-                let returned = self
-                    .config()
-                    .is_home_today(&ProfileName::from(target.clone()), &key_rejected);
+                let returned = self.config().is_home_today(&target, &key_rejected);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
                     format!("auto-switched to '{target}'")
                 };
+                log_auto_switch(self, left.as_ref(), &target);
                 self.toast(ToastKind::Warning, msg);
             }
-            Some(SwitchAction::Off) => {
+            Some(StartupSwitch {
+                action: SwitchAction::Off,
+                left,
+            }) => {
+                log_switch_off(self, left.as_ref());
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
@@ -20320,7 +20327,7 @@ fn finalize_switch(
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
-    let outgoing = app.config().state.active_profile.as_ref().cloned();
+    let outgoing = Option::clone(&app.config().state.active_profile);
     // An account whose config is unclassifiable gets no prompt: no answer
     // can tell whether the live login belongs in it.
     if let Err(e) = crate::actions::refuse_switch_off_unclassifiable(outgoing.as_ref(), name) {
@@ -20331,9 +20338,9 @@ fn finalize_switch(
         );
         return;
     }
-    if let Some(active) = outgoing
-        && active != *name
-        && active_diverged_unsaved(&active)
+    if let Some(active) = outgoing.as_ref()
+        && active != name
+        && active_diverged_unsaved(active)
     {
         clear_activity(&app.activity, name);
         prompt_divergence(app, active.to_string(), "switching");
@@ -20343,9 +20350,19 @@ fn finalize_switch(
     let result = switch_profile_gated(&app.config, name, gated);
     clear_activity(&app.activity, name);
     match result {
-        Ok(_switched) => {
+        Ok(outcome) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            // A queued switch is the chain's own move: leave its line in
+            // clauth.log, which outlives the toast below. The account named is
+            // the one the switch's own hold found active, never `outgoing`,
+            // the copy read before it.
+            if queued {
+                log_auto_switch(app, outcome.left.as_ref(), name);
+            }
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
@@ -20362,11 +20379,65 @@ fn finalize_switch(
     }
 }
 
+/// Resolve the account behind a chain-move log line and the reading it left.
+/// The config guard holds a clone and nothing else, and is dropped before the
+/// disk read a copy miss needs and before either store is locked: the stores
+/// rank below `Config`. A peer's rename, or an account it added and switched
+/// onto, is on disk alone until the next reload. `None` when no profile loads:
+/// the line still names the account and reads no figure.
+fn left_account(app: &App, name: &ProfileName) -> Option<crate::fallback::LeftAccount> {
+    let cached = app.config().find(name).cloned();
+    crate::fallback::left_account(name, cached, &app.usage_store, &app.third_party_usage_store)
+}
+
+/// Log an auto-switch the chain made from `from` to `to`
+/// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading and
+/// how long ago it read it. The name is the switch's own result, so it rides
+/// the line whatever loads. A move onto the account already active logs
+/// nothing.
+fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
+    if from == Some(to) {
+        return;
+    }
+    let left = from.and_then(|name| left_account(app, name));
+    let key_rejected = app.key_rejected_names();
+    let line = {
+        let cfg = app.config();
+        crate::fallback::auto_switch_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            from.map(ProfileName::as_str),
+            to.as_str(),
+            cfg.is_home_today(to, &key_rejected),
+            left.as_ref(),
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
+}
+
+/// Log a chain switch-off ([`crate::fallback::switch_off_log_line`]) with the
+/// account it left and that account's last reading. Only a switch-off the chain
+/// decided is logged this way. A switch-off that left no account — disk already
+/// switched off — logs the bare line, the shape the daemon's twin writes.
+fn log_switch_off(app: &App, left: Option<&ProfileName>) {
+    let account = left.and_then(|name| left_account(app, name));
+    let line = {
+        let cfg = app.config();
+        crate::fallback::switch_off_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            left.map(ProfileName::as_str),
+            account.as_ref(),
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
+}
+
 /// Turn off all accounts on the UI thread. Mirrors `finalize_switch`'s
 /// divergence guard: an unsaved `/login` must be resolved before clearing live
 /// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
+    let Some(active) = Option::clone(&app.config().state.active_profile) else {
         return;
     };
     if active_diverged_unsaved(&active) {
@@ -20378,9 +20449,13 @@ fn perform_switch_off(app: &mut App) {
     };
     let result = switch_off(&app.config);
     match result {
-        Ok(()) => {
+        Ok(departed) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            log_switch_off(app, departed.as_ref());
             app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,

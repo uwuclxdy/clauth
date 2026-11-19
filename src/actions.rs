@@ -384,14 +384,28 @@ pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Resul
 /// install a stored login no gate vouched for.
 ///
 /// The no-op switch (already active) republishes nothing: the feed on disk
-/// already names this account. Returns whether the active account moved, or
-/// the live slot moved onto it ([`relink_login_saved_elsewhere`]).
+/// already names this account. Returns the switch's outcome
+/// ([`SwitchOutcome`]): whether the active account moved, or the live slot
+/// moved onto it ([`relink_login_saved_elsewhere`]), and the account
+/// `profiles.toml` named active under the switch's own hold.
 pub(crate) fn switch_profile_gated(
     config: &ConfigHandle,
     name: &ProfileName,
     gated: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     switch_profile_synced_gated(config, name, gated, || {})
+}
+
+/// What a switch did to the global account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchOutcome {
+    /// The active account moved, or the live slot moved onto the already-active
+    /// target ([`relink_login_saved_elsewhere`]).
+    pub(crate) changed: bool,
+    /// The account `profiles.toml` named active under the switch's own state
+    /// hold: the one the switch moved off. `None` when it named none; the
+    /// target's own name when it already named the target (no move).
+    pub(crate) left: Option<ProfileName>,
 }
 
 /// Test-only: [`switch_profile_synced_gated`] with `gated: true`.
@@ -401,7 +415,7 @@ fn switch_profile_synced(
     name: &ProfileName,
     before_commit: impl FnOnce(),
 ) -> Result<bool> {
-    switch_profile_synced_gated(config, name, true, before_commit)
+    switch_profile_synced_gated(config, name, true, before_commit).map(|outcome| outcome.changed)
 }
 
 /// The injected closure runs after the switch has persisted and released both
@@ -414,19 +428,19 @@ fn switch_profile_synced_gated(
     name: &ProfileName,
     gated: bool,
     before_commit: impl FnOnce(),
-) -> Result<bool> {
-    #[allow(
+) -> Result<SwitchOutcome> {
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = switch_profile_locked_with(&mut guard, name, gated, true)?;
+    let outcome = switch_profile_locked_with(&mut guard, name, gated, true)?;
     drop(guard);
-    strip_stale_identity_after_switch(changed);
-    if changed {
+    strip_stale_identity_after_switch(outcome.changed);
+    if outcome.changed {
         crate::daemon::publish_status_with(config, before_commit);
     }
-    Ok(changed)
+    Ok(outcome)
 }
 
 /// issue #17: after a switch that moved the active profile (or switched off),
@@ -446,25 +460,27 @@ fn strip_stale_identity_after_switch(changed: bool) {
 /// Test-only: [`switch_profile_locked_gated`] with `gated: true`.
 #[cfg(test)]
 pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
-    switch_profile_locked_gated(config, name, true)
+    switch_profile_locked_gated(config, name, true).map(|outcome| outcome.changed)
 }
 
 /// [`switch_profile_gated`]'s locked body: the caller holds the config guard and
-/// receives the did-the-active-move answer so it can gate its own republish.
-/// Guard acquired before the flock — see the wrapper. `gated` names whether
-/// the caller ran the AUTH-1 gate: under the hold a `gated: false` switch that
-/// would install `name`'s STORED login (the relink fires, or the target is no
-/// longer active on disk) changes nothing and returns [`GateNeeded`]; the
-/// entry points then run the gate and retry once with `gated: true`. The
-/// daemon's tick drain and `fallback::auto_switch_if_needed` are the
-/// cross-module callers: each takes the guard first and holds it across this
-/// fn's flock (the fallback so its decision and dispatch share one state
-/// hold), keeping the config guard outer, the ranked order.
+/// receives the switch's outcome ([`SwitchOutcome`]: did the active move, and
+/// the account the hold found active) so it can gate its own republish and
+/// name the account it left. Guard acquired before the flock — see the
+/// wrapper. `gated` names whether the caller ran the AUTH-1 gate: under the
+/// hold a `gated: false` switch that would install `name`'s STORED login (the
+/// relink fires, or the target is no longer active on disk) changes nothing
+/// and returns [`GateNeeded`]; the entry points then run the gate and retry
+/// once with `gated: true`. The daemon's tick drain and
+/// `fallback::auto_switch_if_needed` are the cross-module callers: each takes
+/// the guard first and holds it across this fn's flock (the fallback so its
+/// decision and dispatch share one state hold), keeping the config guard
+/// outer, the ranked order.
 pub(crate) fn switch_profile_locked_gated(
     config: &mut AppConfig,
     name: &ProfileName,
     gated: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     switch_profile_locked_with(config, name, gated, false)
 }
 
@@ -477,18 +493,21 @@ fn switch_profile_locked_with(
     name: &ProfileName,
     gated: bool,
     manual: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     with_state_lock(|held| {
         let target = ensure_switch_target_ok(config, name, held)?;
-        let outgoing = mirror_active_on_disk(config, held)?;
+        let left = mirror_active_on_disk(config, held)?;
         if already_active(config, name, held)? {
             if !gated && crate::claude::live_login_saved_elsewhere(name) {
                 bail!(GateNeeded);
             }
-            return relink_login_saved_elsewhere(name);
+            return Ok(SwitchOutcome {
+                changed: relink_login_saved_elsewhere(name)?,
+                left,
+            });
         }
         if manual {
-            refuse_switch_off_unclassifiable(outgoing.as_ref(), name)?;
+            refuse_switch_off_unclassifiable(left.as_ref(), name)?;
         }
         if !gated {
             bail!(GateNeeded);
@@ -526,7 +545,10 @@ fn switch_profile_locked_with(
             engine.force_install_credentials(name)?;
         }
         finish_switch(config, target, held)?;
-        Ok(true)
+        Ok(SwitchOutcome {
+            changed: true,
+            left,
+        })
     })
 }
 
@@ -1284,8 +1306,8 @@ pub(crate) fn switch_profile_cli(
         None => {
             let switch = |gated: bool| switch_profile_gated(&config, canonical, gated);
             match switch(gated) {
-                Ok(changed) => {
-                    if changed {
+                Ok(outcome) => {
+                    if outcome.changed {
                         Reconciled::Switched
                     } else {
                         Reconciled::AlreadyActive
@@ -1293,7 +1315,7 @@ pub(crate) fn switch_profile_cli(
                 }
                 Err(e) if !gated && e.downcast_ref::<GateNeeded>().is_some() => {
                     run_gate(&config)?;
-                    if switch(true)? {
+                    if switch(true)?.changed {
                         Reconciled::Switched
                     } else {
                         Reconciled::AlreadyActive
@@ -1633,34 +1655,41 @@ pub(crate) fn switch_profile_noninteractive(
 /// the stored identity), so a fresh `/login` is dropped: the TUI gates that on
 /// the divergence prompt, while the automatic wrap-off leg accepts the drop,
 /// unattended by design. A first login over an unclassifiable account is no
-/// such drop: the switch-off holds ([`switch_off_locked`]).
-pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
-    #[allow(
+/// such drop: the switch-off holds ([`switch_off_locked`]). Returns the
+/// account `profiles.toml` named active under its hold — the one the
+/// switch-off departed — or `None` when it named none (nothing switched off).
+pub(crate) fn switch_off(config: &ConfigHandle) -> Result<Option<ProfileName>> {
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = switch_off_locked(&mut guard)?;
+    // The departed account comes back from the hold that cleared the marker, so
+    // it is the one the switch-off left, never the caller's older copy and
+    // never a second read of disk.
+    let departed = switch_off_locked(&mut guard)?;
+    let changed = departed.is_some();
     drop(guard);
     strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
-    Ok(())
+    Ok(departed)
 }
 
 /// [`switch_off`]'s locked body: the caller holds the config guard (ranked
-/// outer of the state flock) and receives the did-anything-change answer so
-/// it can gate its own republish. An unclassifiable active account holding a
-/// first login refuses with [`SwitchOffHeld`], changing nothing.
-pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
+/// outer of the state flock) and receives the account the switch-off departed,
+/// so it can gate its own republish and name the account it left. An
+/// unclassifiable active account holding a first login refuses with
+/// [`SwitchOffHeld`], changing nothing.
+pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<ProfileName>> {
     with_state_lock(|held| {
         // Off already in the caller's copy AND on disk: memory alone misses a
         // peer's switch onto an account, and the snapshot below captures into
         // the account disk names. The mirror makes memory equal disk, so one
         // `None` answers both.
         let Some(departed) = mirror_active_on_disk(config, held)? else {
-            return Ok(false);
+            return Ok(None);
         };
         // The snapshot would skip this login and the clear would delete the
         // only copy of it, so usage goes on until the config is fixed.
@@ -1702,7 +1731,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
                  {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
             );
         }
-        Ok(true)
+        Ok(Some(departed))
     })
 }
 

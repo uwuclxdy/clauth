@@ -2696,6 +2696,25 @@ pub(crate) fn register_names(names: &[&str]) {
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
+/// Leave `name`'s `config.toml` unloadable as a profile: valid TOML holding a
+/// value the profile schema rejects, the hand-edit typo a real config can
+/// carry. [`crate::profile::read_profile`] and a whole-config load fail on it
+/// while the credential store, the roster and the proxy claim still read.
+pub(crate) fn break_profile_config(name: &str) {
+    let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&path, "fallback_threshold = \"x\"\n").expect("break the profile's config");
+}
+
+/// A peer's write: `profiles.toml`'s active marker moves to `name` (or to
+/// none) while the process's config copy still names the account it loaded.
+pub(crate) fn peer_switches_active_to(name: Option<&str>) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.active_profile = name.map(Into::into);
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
 /// Hold `profiles` the way a loaded config does: each one's files on disk and
 /// its name on the roster, so a settings writer re-reading the account off
 /// disk finds what the in-memory fixture holds.
