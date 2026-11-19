@@ -88,6 +88,36 @@ fn serve_poll_once(
     out
 }
 
+/// A peer that already hung up is no fault: macOS answers SO_RCVTIMEO
+/// (`set_read_timeout`) with EINVAL on a socket whose peer end has closed
+/// (measured 2026-11-19 on macOS 27 arm64: 100/100). Every other error is a
+/// real fault and still fails the caller.
+fn tolerate_closed_peer(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
+}
+
+/// One `POST /event` for `s-self` on a fresh connection: the answer's status
+/// line, or `<no response>`.
+fn post_event(path: &std::path::Path, read_timeout: Duration) -> String {
+    let body = json!({"session":"s-self","seq":1,"kind":"start"}).to_string();
+    let mut s = UnixStream::connect(path).expect("connect");
+    // The over-budget server may refuse and hang up before this call; the
+    // read below still drains the refusal it wrote (measured 2026-11-19 on
+    // macOS 27 arm64: 40/40, 20 runs at 0 ms and 20 at 100 ms settle).
+    tolerate_closed_peer(s.set_read_timeout(Some(read_timeout))).expect("timeout");
+    drop(write!(
+        s,
+        "POST /event HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    let mut out = String::new();
+    drop(s.read_to_string(&mut out));
+    out.lines().next().unwrap_or("<no response>").to_string()
+}
+
 fn config() -> crate::profile::ConfigHandle {
     Arc::new(crate::lockorder::RankedMutex::new(
         crate::profile::AppConfig {
@@ -899,20 +929,7 @@ fn idle_peers_hold_the_event_budget_only_until_their_deadline() {
         s.write_all(b"P").expect("write");
         idle.push(s);
     }
-    let post = || -> String {
-        let body = json!({"session":"s-self","seq":1,"kind":"start"}).to_string();
-        let mut s = UnixStream::connect(&path).expect("connect");
-        s.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("timeout");
-        let _ = write!(
-            s,
-            "POST /event HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let mut out = String::new();
-        let _ = s.read_to_string(&mut out);
-        out.lines().next().unwrap_or("<no response>").to_string()
-    };
+    let post = || post_event(&path, Duration::from_secs(5));
     let mut saw_503 = false;
     let started = Instant::now();
     while !saw_503 && started.elapsed() < Duration::from_secs(2) {
@@ -942,6 +959,61 @@ fn idle_peers_hold_the_event_budget_only_until_their_deadline() {
         got_200,
         "the idled-out peers must free the budget so the event is served"
     );
+    server.stop();
+}
+
+/// Only `InvalidInput` (macOS's EINVAL on a closed peer) is tolerated; every
+/// other `set_read_timeout` error comes back unchanged. The sample is
+/// setsockopt(2)'s other errnos plus EPERM; a tolerance widened to a kind
+/// outside it is not seen here.
+#[test]
+fn a_closed_peers_timeout_error_is_tolerated_but_a_real_fault_is_not() {
+    assert!(
+        tolerate_closed_peer(Err(std::io::Error::from_raw_os_error(libc::EINVAL))).is_ok(),
+        "a peer that already hung up is no fault"
+    );
+    for errno in [libc::EBADF, libc::ENOTSOCK, libc::ENOPROTOOPT, libc::EPERM] {
+        assert_eq!(
+            tolerate_closed_peer(Err(std::io::Error::from_raw_os_error(errno)))
+                .map_err(|e| e.raw_os_error()),
+            Err(Some(errno)),
+            "errno {errno} is a real fault"
+        );
+    }
+}
+
+/// `post_event` routes its timeout call through `tolerate_closed_peer` and
+/// still reads the over-budget refusal: std's zero-duration guard raises
+/// `InvalidInput` on linux and macOS (measured 2026-11-19: 40/40), so both
+/// take the tolerate arm and the read still drains the refusal.
+#[test]
+fn post_event_reads_the_refusal_past_a_tolerated_timeout_error() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".clauth/bridge.sock");
+    let (_t, r) = table(&[(std::process::id(), instance("s-self", "1"))]);
+    let hub = Hub::new(true, r);
+    let listener = bind(&path).expect("bind");
+    let server = spawn_server_with_limits(
+        listener,
+        Arc::clone(&hub),
+        Limits {
+            request_deadline: Duration::from_secs(3),
+            write_timeout: Duration::from_secs(3),
+        },
+    )
+    .expect("spawn");
+    let mut idle = Vec::new();
+    for _ in 0..MAX_EVENT_CONNECTIONS {
+        let mut s = UnixStream::connect(&path).expect("connect");
+        s.write_all(b"P").expect("write");
+        idle.push(s);
+    }
+    let started = Instant::now();
+    let mut line = String::new();
+    while !line.starts_with("HTTP/1.1 503") && started.elapsed() < Duration::from_secs(2) {
+        line = post_event(&path, Duration::ZERO);
+    }
+    assert!(line.starts_with("HTTP/1.1 503"), "{line:?}");
     server.stop();
 }
 
