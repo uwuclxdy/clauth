@@ -20097,7 +20097,7 @@ fn every_save_app_state_call_under_src_is_a_known_site() {
         std::collections::BTreeMap::from([
             ("actions.rs".to_string(), 15),
             ("profile.rs".to_string(), 2),
-            ("testutil.rs".to_string(), 3),
+            ("testutil.rs".to_string(), 4),
         ]),
         "a save_app_state call outside its known files: only the fresh-save helper, \
          the actions.rs fresh-read legs and test fixtures may save whole state"

@@ -2696,6 +2696,14 @@ pub(crate) fn register_names(names: &[&str]) {
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
+/// A peer's write: `profiles.toml`'s active marker moves to `name` (or to
+/// none) while the process's config copy still names the account it loaded.
+pub(crate) fn peer_switches_active_to(name: Option<&str>) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.active_profile = name.map(Into::into);
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
 /// Hold `profiles` the way a loaded config does: each one's files on disk and
 /// its name on the roster, so a settings writer re-reading the account off
 /// disk finds what the in-memory fixture holds.

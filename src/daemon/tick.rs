@@ -522,7 +522,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_ref().cloned());
+            .and_then(|c| Option::clone(&c.state.active_profile));
         if let Some(active) = outgoing
             && active != target
             && active_diverged_unsaved(&active)
@@ -677,12 +677,11 @@ impl super::Daemon {
                 let outcome = switch_profile_locked_gated(&mut cfg, &target, true)?;
                 // The account left is the one `profiles.toml` named under the
                 // switch's own hold, never this process's copy read before it:
-                // a peer switch can land between the two.
+                // a peer switch can land between the two, and a profile it
+                // renamed or added since the last reload is on disk alone.
                 if outcome.left.as_ref() != Some(&target) {
-                    switched_from = Some((
-                        outcome.left.as_ref().and_then(|f| cfg.find(f)).cloned(),
-                        chain_weekly,
-                    ));
+                    let cached = outcome.left.as_ref().and_then(|f| cfg.find(f)).cloned();
+                    switched_from = Some((outcome.left, cached, chain_weekly));
                 }
                 Ok((returning, outcome.changed))
             })
@@ -703,7 +702,11 @@ impl super::Daemon {
                 self.apply_forgets();
                 self.switch_backoff = None;
                 match switched_from {
-                    Some((from, chain_weekly)) => {
+                    Some((left, cached, chain_weekly)) => {
+                        let from = cached.or_else(|| {
+                            let left = left.as_ref()?;
+                            crate::profile::read_profile(left).ok()
+                        });
                         let line = self.auto_switch_log_line(
                             from.as_ref(),
                             &target,
@@ -921,15 +924,21 @@ impl super::Daemon {
             crate::lock::with_state_lock(|held| {
                 // The account left is the one `profiles.toml` names under the
                 // switch-off's own hold, never this process's copy read before
-                // it: a peer switch can land between the two.
-                let left = crate::actions::mirror_active_on_disk(&mut cfg, held)?
-                    .and_then(|a| cfg.find(&a).cloned());
+                // it: a peer switch can land between the two, and a profile it
+                // renamed or added since the last reload is on disk alone.
+                let left = crate::actions::mirror_active_on_disk(&mut cfg, held)?;
+                let cached = left.as_ref().and_then(|a| cfg.find(a)).cloned();
                 let changed = switch_off_locked(&mut cfg)?;
-                Ok((changed, left, cfg.state.weekly_switch_threshold_pct()))
+                Ok((
+                    changed,
+                    left,
+                    cached,
+                    cfg.state.weekly_switch_threshold_pct(),
+                ))
             })
         };
         match result {
-            Ok((changed, left, chain_weekly)) => {
+            Ok((changed, left, cached, chain_weekly)) => {
                 if changed {
                     crate::claude_json::strip_home_oauth_account();
                 }
@@ -937,7 +946,11 @@ impl super::Daemon {
                 // Drain the switch-off's own forgets; the write is left
                 // unadopted, so the next tick's reload re-reads disk.
                 self.apply_forgets();
-                let line = self.switch_off_log_line(left.as_ref(), chain_weekly);
+                let from = cached.or_else(|| {
+                    let left = left.as_ref()?;
+                    crate::profile::read_profile(left).ok()
+                });
+                let line = self.switch_off_log_line(from.as_ref(), chain_weekly);
                 logline!("{line}");
                 if changed {
                     crate::daemon::publish_status(&self.config);

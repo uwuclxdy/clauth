@@ -7811,7 +7811,7 @@ impl App {
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
         // The account the one-shot may move off, for its log line.
-        let before = self.config().state.active_profile.as_ref().cloned();
+        let before = Option::clone(&self.config().state.active_profile);
         let switched = {
             let (active_fresh, rate) = self.active_bootstrap_state();
             // The one-shot may switch or switch off under its own locks, over
@@ -20318,7 +20318,7 @@ fn finalize_switch(
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
-    let outgoing = app.config().state.active_profile.as_ref().cloned();
+    let outgoing = Option::clone(&app.config().state.active_profile);
     // An account whose config is unclassifiable gets no prompt: no answer
     // can tell whether the live login belongs in it.
     if let Err(e) = crate::actions::refuse_switch_off_unclassifiable(outgoing.as_ref(), name) {
@@ -20371,13 +20371,19 @@ fn finalize_switch(
 }
 
 /// Resolve the account behind a chain-move log line and the reading it left.
-/// The config guard holds a clone and nothing else, and is dropped before either
-/// store is locked: the stores rank below `Config`.
+/// The config guard holds a clone and nothing else, and is dropped before the
+/// disk read a copy miss needs and before either store is locked: the stores
+/// rank below `Config`. A peer's rename, or an account it added and switched
+/// onto, is on disk alone until the next reload.
 fn left_reading(
     app: &App,
     from: Option<&ProfileName>,
 ) -> (Option<Profile>, Option<UsageInfo>, Option<u64>) {
-    let profile = from.and_then(|f| app.config().find(f).cloned());
+    let cached = from.and_then(|f| app.config().find(f).cloned());
+    let profile = cached.or_else(|| {
+        let name = from?;
+        crate::profile::read_profile(name).ok()
+    });
     let Some(profile) = profile else {
         return (None, None, None);
     };
@@ -20434,7 +20440,7 @@ fn log_switch_off(app: &App, left: Option<&ProfileName>) {
 /// divergence guard: an unsaved `/login` must be resolved before clearing live
 /// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
+    let Some(active) = Option::clone(&app.config().state.active_profile) else {
         return;
     };
     if active_diverged_unsaved(&active) {

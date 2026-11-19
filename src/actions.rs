@@ -429,7 +429,7 @@ fn switch_profile_synced_gated(
     gated: bool,
     before_commit: impl FnOnce(),
 ) -> Result<SwitchOutcome> {
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
@@ -1659,7 +1659,7 @@ pub(crate) fn switch_profile_noninteractive(
 /// account `profiles.toml` named active under its hold — the one the
 /// switch-off departed — or `None` when it named none (nothing switched off).
 pub(crate) fn switch_off(config: &ConfigHandle) -> Result<Option<ProfileName>> {
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
