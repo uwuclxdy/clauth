@@ -42,8 +42,8 @@ use crate::claude::{
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
-    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
-    parse_threshold, threshold_for,
+    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, StartupSwitch, SwitchAction,
+    auto_switch_if_needed, parse_threshold, threshold_for,
 };
 use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
@@ -7810,8 +7810,6 @@ impl App {
         // risks acting on a window the account no longer has. Stale profiles
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
-        // The account the one-shot may move off, for its log line.
-        let before = Option::clone(&self.config().state.active_profile);
         let switched = {
             let (active_fresh, rate) = self.active_bootstrap_state();
             // The one-shot may switch or switch off under its own locks, over
@@ -7845,7 +7843,10 @@ impl App {
             }
         };
         match switched {
-            Some(SwitchAction::To(target)) => {
+            Some(StartupSwitch {
+                action: SwitchAction::To(target),
+                left,
+            }) => {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
@@ -7857,11 +7858,14 @@ impl App {
                 } else {
                     format!("auto-switched to '{target}'")
                 };
-                log_auto_switch(self, before.as_ref(), &target);
+                log_auto_switch(self, left.as_ref(), &target);
                 self.toast(ToastKind::Warning, msg);
             }
-            Some(SwitchAction::Off) => {
-                log_switch_off(self, before.as_ref());
+            Some(StartupSwitch {
+                action: SwitchAction::Off,
+                left,
+            }) => {
+                log_switch_off(self, left.as_ref());
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
@@ -20374,43 +20378,32 @@ fn finalize_switch(
 /// The config guard holds a clone and nothing else, and is dropped before the
 /// disk read a copy miss needs and before either store is locked: the stores
 /// rank below `Config`. A peer's rename, or an account it added and switched
-/// onto, is on disk alone until the next reload.
-fn left_reading(
-    app: &App,
-    from: Option<&ProfileName>,
-) -> (Option<Profile>, Option<UsageInfo>, Option<u64>) {
-    let cached = from.and_then(|f| app.config().find(f).cloned());
-    let profile = cached.or_else(|| {
-        let name = from?;
-        crate::profile::read_profile(name).ok()
-    });
-    let Some(profile) = profile else {
-        return (None, None, None);
-    };
-    let (usage, age_secs) =
-        crate::fallback::picked_reading(&profile, &app.usage_store, &app.third_party_usage_store);
-    (Some(profile), usage, age_secs)
+/// onto, is on disk alone until the next reload. `None` when no profile loads:
+/// the line still names the account and reads no figure.
+fn left_account(app: &App, name: &ProfileName) -> Option<crate::fallback::LeftAccount> {
+    let cached = app.config().find(name).cloned();
+    crate::fallback::left_account(name, cached, &app.usage_store, &app.third_party_usage_store)
 }
 
 /// Log an auto-switch the chain made from `from` to `to`
 /// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading and
-/// how long ago it read it. A move onto the account already active logs
+/// how long ago it read it. The name is the switch's own result, so it rides
+/// the line whatever loads. A move onto the account already active logs
 /// nothing.
 fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
     if from == Some(to) {
         return;
     }
-    let (from_profile, from_usage, from_age_secs) = left_reading(app, from);
+    let left = from.and_then(|name| left_account(app, name));
     let key_rejected = app.key_rejected_names();
     let line = {
         let cfg = app.config();
         crate::fallback::auto_switch_log_line(
             crate::logline::role(crate::logline::stamped()),
-            from_profile.as_ref(),
+            from.map(ProfileName::as_str),
             to.as_str(),
             cfg.is_home_today(to, &key_rejected),
-            from_usage.as_ref(),
-            from_age_secs,
+            left.as_ref(),
             cfg.state.weekly_switch_threshold_pct(),
         )
     };
@@ -20422,14 +20415,13 @@ fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
 /// decided is logged this way. A switch-off that left no account — disk already
 /// switched off — logs the bare line, the shape the daemon's twin writes.
 fn log_switch_off(app: &App, left: Option<&ProfileName>) {
-    let (left_profile, left_usage, left_age_secs) = left_reading(app, left);
+    let account = left.and_then(|name| left_account(app, name));
     let line = {
         let cfg = app.config();
         crate::fallback::switch_off_log_line(
             crate::logline::role(crate::logline::stamped()),
-            left_profile.as_ref(),
-            left_usage.as_ref(),
-            left_age_secs,
+            left.map(ProfileName::as_str),
+            account.as_ref(),
             cfg.state.weekly_switch_threshold_pct(),
         )
     };

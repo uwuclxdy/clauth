@@ -1664,33 +1664,32 @@ pub(crate) fn switch_off(config: &ConfigHandle) -> Result<Option<ProfileName>> {
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    // The departed account is read under the same hold that clears the marker,
-    // so it is the one the switch-off left, never the caller's older copy.
-    let (changed, departed) = with_state_lock(|held| {
-        let departed = mirror_active_on_disk(&mut guard, held)?;
-        let changed = switch_off_locked(&mut guard)?;
-        Ok((changed, departed))
-    })?;
+    // The departed account comes back from the hold that cleared the marker, so
+    // it is the one the switch-off left, never the caller's older copy and
+    // never a second read of disk.
+    let departed = switch_off_locked(&mut guard)?;
+    let changed = departed.is_some();
     drop(guard);
     strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
-    Ok(if changed { departed } else { None })
+    Ok(departed)
 }
 
 /// [`switch_off`]'s locked body: the caller holds the config guard (ranked
-/// outer of the state flock) and receives the did-anything-change answer so
-/// it can gate its own republish. An unclassifiable active account holding a
-/// first login refuses with [`SwitchOffHeld`], changing nothing.
-pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
+/// outer of the state flock) and receives the account the switch-off departed,
+/// so it can gate its own republish and name the account it left. An
+/// unclassifiable active account holding a first login refuses with
+/// [`SwitchOffHeld`], changing nothing.
+pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<ProfileName>> {
     with_state_lock(|held| {
         // Off already in the caller's copy AND on disk: memory alone misses a
         // peer's switch onto an account, and the snapshot below captures into
         // the account disk names. The mirror makes memory equal disk, so one
         // `None` answers both.
         let Some(departed) = mirror_active_on_disk(config, held)? else {
-            return Ok(false);
+            return Ok(None);
         };
         // The snapshot would skip this login and the clear would delete the
         // only copy of it, so usage goes on until the config is fixed.
@@ -1732,7 +1731,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
                  {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
             );
         }
-        Ok(true)
+        Ok(Some(departed))
     })
 }
 

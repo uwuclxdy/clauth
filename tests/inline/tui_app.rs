@@ -3206,6 +3206,79 @@ fn on_tick_names_a_left_account_its_config_copy_lacks() {
     );
 }
 
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the queued switch's line: the name comes from the switch's own result, and
+/// only the figures need a profile. Its stored reading cannot fill them without
+/// one.
+#[test]
+fn on_tick_names_a_left_account_with_no_loadable_profile() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy has no `delta`.
+        super::on_tick(&mut app);
+        // A peer saves `delta`, switches onto it, and its config.toml stops
+        // loading while that answer waits.
+        stored_oauth_profile("delta", far_future());
+        crate::testutil::register_names(&["delta"]);
+        peer_switches_active_to(Some("delta"));
+        crate::testutil::break_profile_config("delta");
+        app.usage_store.lock().expect("usage_store").insert(
+            "delta".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(92.0)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: auto-switched to 'perso' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A queued switch must not execute once the TUI lost the fetch lease: the
 /// decision was queued under a ticket the watchdog then released, and the
 /// holder that took over decides. The record clears with the skip.
@@ -3793,7 +3866,10 @@ fn the_startup_one_shot_passes_over_a_member_with_a_credit_refusal() {
     )
     .expect("the one-shot runs");
 
-    assert_eq!(action, Some(SwitchAction::To("delta".into())));
+    assert_eq!(
+        action.map(|taken| taken.action),
+        Some(SwitchAction::To("delta".into()))
+    );
     assert_eq!(app.config().state.active_profile.as_deref(), Some("delta"));
 }
 
@@ -3823,7 +3899,7 @@ fn the_startup_one_shot_drops_its_decision_once_disk_names_another_active() {
         )
         .expect("the one-shot runs");
         assert_eq!(
-            action,
+            action.map(|taken| taken.action),
             Some(SwitchAction::To("gamma".into())),
             "fixture control: both copies name alpha, so the one-shot decides"
         );
@@ -14286,7 +14362,8 @@ fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
                 &app.third_party_streaks,
                 &app.kick_blocks,
             )
-            .unwrap(),
+            .unwrap()
+            .map(|taken| taken.action),
             Some(SwitchAction::To("kl".into())),
             "{label}: the startup one-shot"
         );
@@ -64302,6 +64379,52 @@ fn perform_switch_off_names_a_left_account_its_config_copy_lacks() {
             .iter()
             .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
         "the line names the account the switch-off's own hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the wrap-off line: the name comes from the switch-off's own result, and only
+/// the figures need a profile. Its stored reading cannot fill them without one.
+#[test]
+fn perform_switch_off_names_a_left_account_with_no_loadable_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    // A peer saves `delta`, switches onto it, and its config.toml stops loading
+    // after this app loaded.
+    stored_oauth_profile("delta", far_future());
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+    app.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
+        "the line names the account the switch-off's own result left, whatever loads: {:?}",
         lines.snapshot()
     );
 }

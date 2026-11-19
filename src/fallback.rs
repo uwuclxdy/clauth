@@ -73,21 +73,51 @@ pub(crate) fn threshold_in_range(value: f64) -> bool {
     value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
 }
 
+/// What a chain-move log line reports about the account it left: the profile
+/// behind it, when one loads, and the last reading held against it with the
+/// reading's age. The profile's thresholds fill each figure's line, so a profile
+/// that will not load costs the figures, never the name: the line takes the
+/// name from the switch's own result ([`auto_switch_log_line`]).
+pub(crate) struct LeftAccount {
+    pub(crate) profile: Profile,
+    pub(crate) usage: Option<UsageInfo>,
+    pub(crate) age_secs: Option<u64>,
+}
+
+/// The account behind a chain-move log line: `name`'s profile from the
+/// process's own copy (`cached`), else from disk, with the last reading held
+/// against it. `None` when neither loads — the line still names the account and
+/// reads no figure, since the lines its figures would be judged against are
+/// unknowable.
+pub(crate) fn left_account(
+    name: &ProfileName,
+    cached: Option<Profile>,
+    usage_store: &UsageStore,
+    third_party_store: &ThirdPartyUsageStore,
+) -> Option<LeftAccount> {
+    let profile = cached.or_else(|| crate::profile::read_profile(name).ok())?;
+    let (usage, age_secs) = picked_reading(&profile, usage_store, third_party_store);
+    Some(LeftAccount {
+        profile,
+        usage,
+        age_secs,
+    })
+}
+
 /// The log line a chain move of the global account leaves behind: the account
-/// it landed on, the one it left (`from`, when it still resolves), and what
-/// that one last read (`from_usage`) against its 5h and weekly lines
-/// (`chain_weekly` is the chain-wide weekly line) with how long ago it read it
-/// (`from_age_secs`). A toast vanishes with the TUI, so without this line a
-/// window that still ran out leaves no trace of when (or whether) the chain
-/// moved off it. `role` is the process prefix ([`crate::logline::role`]);
-/// `returning` names a move onto the home account.
+/// it landed on, the one it left (`from`, the name the switch's own result
+/// reports), and what that one last read against its lines (`left`, when its
+/// profile loads; `chain_weekly` is the chain-wide weekly line). A toast
+/// vanishes with the TUI, so without this line a window that still ran out
+/// leaves no trace of when (or whether) the chain moved off it. `role` is the
+/// process prefix ([`crate::logline::role`]); `returning` names a move onto the
+/// home account.
 pub(crate) fn auto_switch_log_line(
     role: &str,
-    from: Option<&Profile>,
+    from: Option<&str>,
     to: &str,
     returning: bool,
-    from_usage: Option<&UsageInfo>,
-    from_age_secs: Option<u64>,
+    left: Option<&LeftAccount>,
     chain_weekly: f64,
 ) -> String {
     let moved = if returning {
@@ -98,51 +128,53 @@ pub(crate) fn auto_switch_log_line(
     let Some(from) = from else {
         return format!("{role}: {moved} '{to}'");
     };
-    let read = read_with_age(from, from_usage, from_age_secs, chain_weekly);
-    format!(
-        "{role}: {moved} '{to}' from '{0}'; '{0}' read {read}",
-        from.name
-    )
+    let read = match left {
+        Some(left) => read_with_age(left, chain_weekly),
+        None => "nothing".to_string(),
+    };
+    format!("{role}: {moved} '{to}' from '{from}'; '{from}' read {read}")
 }
 
 /// The log line a switch-off leaves once every account is spent: the account it
-/// left and its last reading ([`auto_switch_log_line`]'s reading half). Both
-/// processes write the one shape, so a wrap-off says the same in either log.
+/// left (`from`) and its last reading ([`auto_switch_log_line`]'s reading half).
+/// Both processes write the one shape, so a wrap-off says the same in either
+/// log.
 pub(crate) fn switch_off_log_line(
     role: &str,
-    from: Option<&Profile>,
-    from_usage: Option<&UsageInfo>,
-    from_age_secs: Option<u64>,
+    from: Option<&str>,
+    left: Option<&LeftAccount>,
     chain_weekly: f64,
 ) -> String {
     let Some(from) = from else {
         return format!("{role}: switched off: all accounts spent");
     };
-    let read = read_with_age(from, from_usage, from_age_secs, chain_weekly);
-    format!(
-        "{role}: switched off: all accounts spent; '{0}' read {read}",
-        from.name
-    )
+    let read = match left {
+        Some(left) => read_with_age(left, chain_weekly),
+        None => "nothing".to_string(),
+    };
+    format!("{role}: switched off: all accounts spent; '{from}' read {read}")
 }
 
 /// What a chain-move log line reports for the account it left: each figure
 /// against its line, then how long ago the reading was taken. A reading with no
 /// figure reads `nothing` and carries no age; one with figures but no clock says
 /// the time is unknown, never implying the figures are current.
-fn read_with_age(
-    from: &Profile,
-    from_usage: Option<&UsageInfo>,
-    from_age_secs: Option<u64>,
-    chain_weekly: f64,
-) -> String {
-    let five = from_usage.and_then(|u| u.five_hour.as_ref()).map(|w| {
-        format!(
-            "5h {:.0}% (line {:.0}%)",
-            w.utilization,
-            threshold_for(from)
-        )
-    });
-    let long = from_usage
+fn read_with_age(left: &LeftAccount, chain_weekly: f64) -> String {
+    let from = &left.profile;
+    let five = left
+        .usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| {
+            format!(
+                "5h {:.0}% (line {:.0}%)",
+                w.utilization,
+                threshold_for(from)
+            )
+        });
+    let long = left
+        .usage
+        .as_ref()
         .and_then(UsageInfo::long_window)
         .map(|(label, w)| {
             let line = member_weekly_line(from, chain_weekly);
@@ -152,7 +184,7 @@ fn read_with_age(
     if read.is_empty() {
         return "nothing".to_string();
     }
-    match from_age_secs {
+    match left.age_secs {
         Some(secs) => format!("{read} {}", crate::format::humanize_age(secs)),
         None => format!("{read} at an unknown time"),
     }
@@ -3649,11 +3681,21 @@ fn auto_decision_gap(action: &SwitchAction) {
         .expect("gap controller releases the actor");
 }
 
+/// What the startup one-shot did, and the account it left doing it: the name
+/// `profiles.toml` held active under the dispatch's own hold, which a log line
+/// takes as the account the move left (the target's own name on a no-move
+/// relink, `None` when disk named none).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StartupSwitch {
+    pub(crate) action: SwitchAction,
+    pub(crate) left: Option<ProfileName>,
+}
+
 /// If the active profile is a chain member the scheduler walk leaves — past its
 /// threshold, a kick/canceled/dead-reading bypass, or a healthy return home —
 /// switch to the next viable member, or, in wrap-off mode when the whole chain
-/// is spent and no sink exists, turn off all accounts. Returns the action taken,
-/// or None.
+/// is spent and no sink exists, turn off all accounts. Returns the action taken
+/// with the account it left, or None.
 ///
 /// The decision is the scheduler walk's ([`next_auto_switch_target_with_usage`])
 /// over a [`ChainSnapshot`] + usage map built from the caller's stores, with the
@@ -3685,7 +3727,7 @@ pub(crate) fn auto_switch_if_needed(
     streaks: &PollStreaks,
     third_party_streaks: &ThirdPartyStreaks,
     kick_blocks: &KickBlocks,
-) -> Result<Option<SwitchAction>> {
+) -> Result<Option<StartupSwitch>> {
     let (decided_active, decision) = {
         let (mut snapshot, third_party_names, polled, key_rejected) = {
             #[allow(
@@ -3744,7 +3786,7 @@ pub(crate) fn auto_switch_if_needed(
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let (action, changed) = with_state_lock(|_held| {
+    let (taken, left, changed) = with_state_lock(|_held| {
         let config = &mut *guard;
         // Re-validate under the hold: the decision was made about
         // `decided_active`; an explicit switch that landed in the gap between
@@ -3757,11 +3799,11 @@ pub(crate) fn auto_switch_if_needed(
         if config.state.active_profile.as_deref() != Some(decided_active.as_str())
             || disk_active.as_deref() != Some(decided_active.as_str())
         {
-            return Ok((None, false));
+            return Ok((None, None, false));
         }
         #[cfg(test)]
         auto_decision_rendezvous(&action);
-        let changed = match &action {
+        let (left, changed) = match &action {
             SwitchAction::To(target) => {
                 // The drains' twin at the one-shot's dispatch: re-read the
                 // target's stored login on disk before linking. A store that
@@ -3778,22 +3820,26 @@ pub(crate) fn auto_switch_if_needed(
                         // the members flagged in this process's config copy
                         // (`snapshot.broken`); a flag that copy lacks is not
                         // re-checked in this hold.
-                        switch_profile_locked_gated(
+                        let outcome = switch_profile_locked_gated(
                             config,
                             &ProfileName::from(target.clone()),
                             true,
-                        )?
-                        .changed
+                        )?;
+                        (outcome.left, outcome.changed)
                     }
                     crate::profile::StoredLogin::HoldsNone
                     | crate::profile::StoredLogin::Unknown => {
-                        return Ok((None, false));
+                        return Ok((None, None, false));
                     }
                 }
             }
-            SwitchAction::Off => switch_off_locked(config)?,
+            SwitchAction::Off => {
+                let departed = switch_off_locked(config)?;
+                let changed = departed.is_some();
+                (departed, changed)
+            }
         };
-        Ok((Some(action), changed))
+        Ok((Some(action), left, changed))
     })?;
     drop(guard);
     if changed {
@@ -3803,7 +3849,7 @@ pub(crate) fn auto_switch_if_needed(
         crate::claude_json::strip_home_oauth_account();
         crate::daemon::publish_status(config);
     }
-    Ok(action)
+    Ok(taken.map(|action| StartupSwitch { action, left }))
 }
 
 #[cfg(test)]

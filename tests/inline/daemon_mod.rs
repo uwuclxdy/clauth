@@ -840,10 +840,74 @@ fn drain_pending_switch_names_a_left_account_its_config_copy_lacks() {
     );
     link_active_clean("beta");
     let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded: only
+    // disk carries it, with its own threshold and a stored reading.
+    let mut delta = profile_with_creds("delta", "at-delta");
+    delta.fallback_threshold = Some(90.0);
+    save_profile(&delta).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "gamma");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("gamma"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'gamma' from 'delta'; 'delta' read 5h 92% (line 90%) 4m ago"),
+        "the line names the account the switch's own hold left, which only disk knew, and reads it at its own line: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the switch line: the name comes from the switch's own result, and only the
+/// figures need a profile. Its stored reading cannot fill them without one.
+#[test]
+fn drain_pending_switch_names_a_left_account_with_no_loadable_profile() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
     // A peer saves `delta` and switches onto it after the daemon loaded.
     save_profile(&profile_with_creds("delta", "at-delta")).expect("save delta");
     crate::testutil::register_names(&["delta"]);
     peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
 
     stage_switch(&daemon, "gamma");
     let _stamp = crate::logline::StampOverride::new(false);
@@ -860,7 +924,7 @@ fn drain_pending_switch_names_a_left_account_its_config_copy_lacks() {
             .iter()
             .any(|l| l
                 == "clauth daemon: auto-switched to 'gamma' from 'delta'; 'delta' read nothing"),
-        "the line names the account the switch's own hold left, which only disk knew: {:?}",
+        "the line names the account the switch's own result left, whatever loads: {:?}",
         lines.snapshot()
     );
 }
@@ -2092,6 +2156,54 @@ fn drain_pending_switch_off_names_a_left_account_its_config_copy_lacks() {
             .iter()
             .any(|l| l == "clauth daemon: switched off: all accounts spent; 'delta' read nothing"),
         "the wrap-off line names the account its hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the wrap-off line: the name comes from the switch-off's own result, and only
+/// the figures need a profile.
+#[test]
+fn drain_pending_switch_off_names_a_left_account_with_no_loadable_profile() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded.
+    save_profile(&profile_with_creds("delta", "at-delta")).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth daemon: switched off: all accounts spent; 'delta' read nothing"),
+        "the wrap-off line names the account the switch-off's own result left, whatever loads: {:?}",
         lines.snapshot()
     );
 }

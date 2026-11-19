@@ -2696,6 +2696,17 @@ pub(crate) fn register_names(names: &[&str]) {
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
+/// Leave `name`'s `config.toml` unloadable as a profile: valid TOML holding a
+/// value the profile schema rejects, the hand-edit typo a real config can
+/// carry. [`crate::profile::read_profile`] and a whole-config load fail on it
+/// while the credential store, the roster and the proxy claim still read.
+pub(crate) fn break_profile_config(name: &str) {
+    let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&path, "fallback_threshold = \"x\"\n").expect("break the profile's config");
+}
+
 /// A peer's write: `profiles.toml`'s active marker moves to `name` (or to
 /// none) while the process's config copy still names the account it loaded.
 pub(crate) fn peer_switches_active_to(name: Option<&str>) {

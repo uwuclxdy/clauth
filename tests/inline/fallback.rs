@@ -11613,11 +11613,14 @@ fn auto_switch_log_line_names_both_accounts_and_the_reading_against_its_lines() 
     assert_eq!(
         auto_switch_log_line(
             "clauth",
-            Some(&work),
+            Some("work"),
             "perso",
             false,
-            Some(&usage),
-            Some(240),
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: Some(240),
+            }),
             98.0
         ),
         "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 91% (line 90%), 7d 70% (line 98%) 4m ago",
@@ -11635,11 +11638,14 @@ fn auto_switch_log_line_reads_the_member_weekly_override_and_default_threshold()
     assert_eq!(
         auto_switch_log_line(
             "clauth daemon",
-            Some(&work),
+            Some("work"),
             "perso",
             false,
-            Some(&usage),
-            Some(240),
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: Some(240),
+            }),
             98.0
         ),
         "clauth daemon: auto-switched to 'perso' from 'work'; 'work' read 7d 86% (line 85%) 4m ago",
@@ -11652,11 +11658,14 @@ fn auto_switch_log_line_reads_the_member_weekly_override_and_default_threshold()
     assert_eq!(
         auto_switch_log_line(
             "clauth",
-            Some(&plain),
+            Some("plain"),
             "b",
             false,
-            Some(&five),
-            Some(30),
+            Some(&LeftAccount {
+                profile: plain,
+                usage: Some(five),
+                age_secs: Some(30),
+            }),
             98.0
         ),
         "clauth: auto-switched to 'b' from 'plain'; 'plain' read 5h 96% (line 95%) just now",
@@ -11677,11 +11686,14 @@ fn auto_switch_log_line_marks_an_undated_reading() {
     assert_eq!(
         auto_switch_log_line(
             "clauth",
-            Some(&work),
+            Some("work"),
             "perso",
             false,
-            Some(&usage),
-            None,
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: None,
+            }),
             98.0
         ),
         "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 91% (line 90%) at an unknown time",
@@ -11692,29 +11704,58 @@ fn auto_switch_log_line_marks_an_undated_reading() {
 fn auto_switch_log_line_names_a_return_home_and_missing_readings() {
     let perso = Profile::new("perso".to_string(), None, None);
     assert_eq!(
-        auto_switch_log_line("clauth", Some(&perso), "work", true, None, None, 98.0),
+        auto_switch_log_line(
+            "clauth",
+            Some("perso"),
+            "work",
+            true,
+            Some(&LeftAccount {
+                profile: perso.clone(),
+                usage: None,
+                age_secs: None,
+            }),
+            98.0
+        ),
         "clauth: returned to preferred account 'work' from 'perso'; 'perso' read nothing",
     );
     // A reading with no figure carries no age, whatever clock the caller holds.
     assert_eq!(
         auto_switch_log_line(
             "clauth",
-            Some(&perso),
+            Some("perso"),
             "work",
             false,
-            Some(&UsageInfo::default()),
-            Some(240),
+            Some(&LeftAccount {
+                profile: perso,
+                usage: Some(UsageInfo::default()),
+                age_secs: Some(240),
+            }),
             98.0
         ),
         "clauth: auto-switched to 'work' from 'perso'; 'perso' read nothing",
     );
     assert_eq!(
-        auto_switch_log_line("clauth", None, "work", true, None, None, 98.0),
+        auto_switch_log_line("clauth", None, "work", true, None, 98.0),
         "clauth: returned to preferred account 'work'",
     );
     assert_eq!(
-        auto_switch_log_line("clauth", None, "work", false, None, None, 98.0),
+        auto_switch_log_line("clauth", None, "work", false, None, 98.0),
         "clauth: auto-switched to 'work'",
+    );
+}
+
+/// The name a switch's own result reports rides the line even when no profile
+/// loads: the profile only fills the figures, so an account clauth cannot load
+/// reads `nothing` rather than dropping out of the line.
+#[test]
+fn auto_switch_log_line_keeps_the_left_name_without_a_profile() {
+    assert_eq!(
+        auto_switch_log_line("clauth", Some("delta"), "gamma", false, None, 98.0),
+        "clauth: auto-switched to 'gamma' from 'delta'; 'delta' read nothing",
+    );
+    assert_eq!(
+        switch_off_log_line("clauth", Some("delta"), None, 98.0),
+        "clauth: switched off: all accounts spent; 'delta' read nothing",
     );
 }
 
@@ -11728,24 +11769,47 @@ fn switch_off_log_line_names_the_left_reading_and_its_age() {
         seven_day: Some(log_window(99.0)),
         ..UsageInfo::default()
     };
+    let read = LeftAccount {
+        profile: work,
+        usage: Some(usage),
+        age_secs: Some(120),
+    };
     assert_eq!(
-        switch_off_log_line("clauth", Some(&work), Some(&usage), Some(120), 98.0),
+        switch_off_log_line("clauth", Some("work"), Some(&read), 98.0),
         "clauth: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) 2m ago",
     );
     assert_eq!(
-        switch_off_log_line("clauth daemon", Some(&work), Some(&usage), Some(120), 98.0),
+        switch_off_log_line("clauth daemon", Some("work"), Some(&read), 98.0),
         "clauth daemon: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) 2m ago",
     );
     assert_eq!(
-        switch_off_log_line("clauth", Some(&work), Some(&usage), None, 98.0),
+        switch_off_log_line(
+            "clauth",
+            Some("work"),
+            Some(&LeftAccount {
+                profile: read.profile.clone(),
+                usage: read.usage.clone(),
+                age_secs: None,
+            }),
+            98.0
+        ),
         "clauth: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) at an unknown time",
     );
     assert_eq!(
-        switch_off_log_line("clauth", Some(&work), None, None, 98.0),
+        switch_off_log_line(
+            "clauth",
+            Some("work"),
+            Some(&LeftAccount {
+                profile: read.profile,
+                usage: None,
+                age_secs: None,
+            }),
+            98.0
+        ),
         "clauth: switched off: all accounts spent; 'work' read nothing",
     );
     assert_eq!(
-        switch_off_log_line("clauth", None, None, None, 98.0),
+        switch_off_log_line("clauth", None, None, 98.0),
         "clauth: switched off: all accounts spent",
     );
 }
