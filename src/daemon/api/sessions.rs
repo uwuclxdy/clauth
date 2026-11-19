@@ -10,6 +10,7 @@
 //! needs a clauth release, and the clients hand-model what they render.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -19,7 +20,7 @@ use utoipa::ToSchema;
 use super::http::{Request, Response, sanitize_for_log};
 use super::routes::{ApiContext, Caller, ErrorBody};
 use crate::logline::logline;
-use crate::sessions::{PAGE_MAX_BYTES, SessionInfo, SessionSource, Walked, newest_first};
+use crate::sessions::{Labels, PAGE_MAX_BYTES, SessionInfo, SessionSource, Walked, newest_first};
 
 const LISTING_LIMIT_DEFAULT: usize = 50;
 const LISTING_LIMIT_MAX: usize = 200;
@@ -43,7 +44,8 @@ pub(crate) struct SessionsBody {
 }
 
 /// One row of the transcript index: the fields `clauth sessions --json`
-/// emits minus its `tokens`/`cost`, plus the store the transcript lives in.
+/// emits minus its `tokens`/`cost`, plus the session's name, git branch and
+/// the store the transcript lives in.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionRow {
     /// The transcript filename stem, the id `GET /api/v1/sessions/{id}` pages.
@@ -63,6 +65,19 @@ pub(crate) struct SessionRow {
     /// tail held none.
     #[schema(required = true)]
     last_message: Option<String>,
+    /// The session's Claude Code name (`-n`, `/rename`): the newest
+    /// `custom-title` record within the transcript's bounded tail window (the
+    /// last 1 MiB, `TAIL_MAX` in `src/sessions.rs`), redacted and cut like the
+    /// previews; `null` when that window holds no such record, or when the
+    /// newest one has no usable name (an older one is never used).
+    #[schema(required = true)]
+    title: Option<String>,
+    /// The branch of the newest user record that names one, within the
+    /// transcript's bounded tail window (the last 1 MiB, `TAIL_MAX` in
+    /// `src/sessions.rs`), with control and bidi characters dropped; `null`
+    /// when none there names one.
+    #[schema(required = true)]
+    git_branch: Option<String>,
     /// `global`, or `isolated:<profile>` for a live isolated run's own store.
     store: String,
     /// How a command reaches this session now: `mod` when a mod instance is
@@ -73,10 +88,17 @@ pub(crate) struct SessionRow {
     /// reaches the session (`via == ["mod"]`); empty otherwise.
     #[schema(required = false)]
     lacks: Vec<String>,
+    /// The capabilities the session's live mod declared (`notes` today: it
+    /// applies an answer's notes); empty without a live mod, or once every
+    /// instance on the id is ending (`via` still lists `mod`: an ending
+    /// instance takes no more answers). Two live mods on one id list only what
+    /// both declared.
+    #[schema(required = false)]
+    caps: Vec<String>,
 }
 
-impl From<SessionInfo> for SessionRow {
-    fn from(info: SessionInfo) -> Self {
+impl SessionRow {
+    fn new(info: SessionInfo, labels: Labels, Reach { via, lacks, caps }: Reach) -> Self {
         Self {
             id: info.id,
             last_ran_profile: info.last_ran_profile,
@@ -84,14 +106,25 @@ impl From<SessionInfo> for SessionRow {
             updated: crate::sessions::updated_iso(info.updated),
             first_message: info.first_message,
             last_message: info.last_message,
+            title: labels.title,
+            git_branch: labels.git_branch,
             store: match info.source {
                 SessionSource::Global => "global".to_string(),
                 SessionSource::Isolated { profile } => format!("isolated:{profile}"),
             },
-            via: Vec::new(),
-            lacks: Vec::new(),
+            via,
+            lacks,
+            caps,
         }
     }
+}
+
+/// How a command reaches one listed session: [`SessionRow`]'s `via`, `lacks`
+/// and `caps`.
+struct Reach {
+    via: Vec<String>,
+    lacks: Vec<String>,
+    caps: Vec<String>,
 }
 
 /// `GET /api/v1/sessions/{id}`'s answer.
@@ -191,10 +224,10 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
         ("before" = Option<String>, Query, description = "the `next_before` of an earlier page; absent for the newest page")
     ),
     responses(
-        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach, at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
+        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach and the `caps` its live mod declared, its `title` and `git_branch` (both `null` when the tail window holds none), at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
         (status = 400, description = "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -223,17 +256,20 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
     let more = rows.len() > limit;
     rows.truncate(limit);
 
-    let mut page: Vec<SessionInfo> = rows.into_iter().map(crate::sessions::preview).collect();
-    crate::sessions::annotate_owners_of(page.iter_mut());
+    let mut page: Vec<(SessionInfo, Labels)> = rows
+        .into_iter()
+        .map(crate::sessions::preview_labelled)
+        .collect();
+    crate::sessions::annotate_owners_of(page.iter_mut().map(|(info, _)| info));
     let next_before = if more {
         page.last()
-            .map(|last| Cursor::encode(last.updated, &last.id))
+            .map(|(last, _)| Cursor::encode(last.updated, &last.id))
     } else {
         None
     };
     // The reach inputs, each at most one bounded call per listing: the bridge's
     // live instances, and one `herdr pane list` through the seam.
-    let mod_ids = mod_session_ids(ctx);
+    let mod_sessions = mod_sessions(ctx);
     let pane_ids = herdr_session_ids(ctx);
     Response::serialize(
         200,
@@ -241,12 +277,9 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
             ok: true,
             sessions: page
                 .into_iter()
-                .map(|info| {
-                    let (via, lacks) = reach(&mod_ids, &pane_ids, &info.id);
-                    let mut row = SessionRow::from(info);
-                    row.via = via;
-                    row.lacks = lacks;
-                    row
+                .map(|(info, labels)| {
+                    let reach = reach(&mod_sessions, &pane_ids, &info.id);
+                    SessionRow::new(info, labels, reach)
                 })
                 .collect(),
             next_before,
@@ -254,25 +287,34 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
     )
 }
 
-/// The session ids a live mod instance holds, from the bridge's own table.
-/// Empty on platforms with no bridge (Windows).
-fn mod_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
+/// The session ids a live mod instance holds, each with the capability names
+/// its live mods declared, from the bridge's own table. An id whose only
+/// instances are ending keeps its entry with no names, so the row still reads
+/// `mod`. Empty on platforms with no bridge (Windows).
+fn mod_sessions(ctx: &ApiContext) -> HashMap<String, Vec<String>> {
     #[cfg(unix)]
     {
         if let Some(hub) = &ctx.bridge {
-            return hub.live_session_ids().into_iter().collect();
+            return hub
+                .live_session_caps()
+                .into_iter()
+                .map(|(id, caps)| {
+                    let names = crate::daemon::bridge::Cap::names(&caps);
+                    (id, names.into_iter().map(str::to_string).collect())
+                })
+                .collect();
         }
     }
     #[cfg(not(unix))]
     let _ = ctx;
-    std::collections::HashSet::new()
+    HashMap::new()
 }
 
 /// The session ids a live herdr pane joins on, through at most one bounded
 /// `herdr pane list` call. herdr absent or unanswerable reads as no pane.
-fn herdr_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
+fn herdr_session_ids(ctx: &ApiContext) -> HashSet<String> {
     let Ok(panes) = super::panes::listed_panes(ctx) else {
-        return std::collections::HashSet::new();
+        return HashSet::new();
     };
     panes
         .into_iter()
@@ -280,22 +322,24 @@ fn herdr_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// One row's `via`/`lacks`: `via` is the sorted reach set, and `lacks` names the
-/// surfaces missing when the mod alone reaches the session (SB-12, MB-7).
+/// One row's reach: `via` is the sorted reach set, `lacks` names the surfaces
+/// missing when the mod alone reaches the session (SB-12, MB-7), and `caps`
+/// what its live mod declared.
 fn reach(
-    mod_ids: &std::collections::HashSet<String>,
-    pane_ids: &std::collections::HashSet<String>,
+    mod_sessions: &HashMap<String, Vec<String>>,
+    pane_ids: &HashSet<String>,
     id: &str,
-) -> (Vec<String>, Vec<String>) {
+) -> Reach {
+    let mod_caps = mod_sessions.get(id);
     let mut via = Vec::new();
-    if mod_ids.contains(id) {
+    if mod_caps.is_some() {
         via.push("mod".to_string());
     }
     if pane_ids.contains(id) {
         via.push("herdr".to_string());
     }
     via.sort();
-    let lacks = if via == ["mod".to_string()] {
+    let lacks = if via == ["mod"] {
         ["terminal_mirror", "engine_dialogs", "plan_approval"]
             .into_iter()
             .map(str::to_string)
@@ -303,7 +347,11 @@ fn reach(
     } else {
         Vec::new()
     };
-    (via, lacks)
+    Reach {
+        via,
+        lacks,
+        caps: mod_caps.cloned().unwrap_or_default(),
+    }
 }
 
 /// `GET /api/v1/sessions/{id}` — a page of one transcript's records, paged
@@ -325,7 +373,7 @@ fn reach(
         (status = 200, description = "the last records whose lines end at or before the cursor, oldest first, each one Claude Code transcript record verbatim; at most 4 MiB of records unless the page's one record is larger", body = HistoryBody),
         (status = 400, description = "a limit outside 1..=500, or a before that is not a byte offset (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "no readable transcript of that id in the shared store or a live isolated store (`session_not_found`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),

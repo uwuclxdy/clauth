@@ -42,13 +42,19 @@ const PREV_MARK: &str = "‹  ";
 const NEXT_MARK: &str = "  ›";
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let avail = area.width as usize;
-    let spans = if fits_normal(avail) {
+    let spans = spans(app, area.width as usize);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
+}
+
+/// The bar's spans in `avail` columns: every label while they fit, else the
+/// `‹  active  ›` overflow form. Shared with the header's no-art row, where
+/// the tabs ride the brand row.
+pub(super) fn spans(app: &App, avail: usize) -> Vec<Span<'static>> {
+    if fits_normal(avail) {
         build_normal(app, avail)
     } else {
         build_overflow(app)
-    };
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
+    }
 }
 
 /// Total width of the tab strip in normal form (all labels + separators),
@@ -62,6 +68,27 @@ pub(super) fn full_strip_width() -> usize {
             sep + t.title().len()
         })
         .sum()
+}
+
+/// The widest the overflow form renders over every tab: a label plus the edge
+/// markers that tab's position draws. The header's no-art row reserves this,
+/// so a chip never depends on which tab is active; the bar itself still draws
+/// at the active tab's own width inside that slot.
+pub(super) fn overflow_width_max() -> usize {
+    Tab::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let prev = if i > 0 { PREV_MARK.chars().count() } else { 0 };
+            let next = if i + 1 < Tab::ALL.len() {
+                NEXT_MARK.chars().count()
+            } else {
+                0
+            };
+            prev + t.title().chars().count() + next
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Whether all tabs fit in `avail` columns without truncation.

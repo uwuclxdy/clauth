@@ -281,6 +281,177 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
     );
 }
 
+/// The disabled ACTIVE account stays listed on a plain run, and its row says
+/// it is disabled.
+#[test]
+fn list_table_marks_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    let mut work = oauth("work");
+    work.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![work],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines, [HEADER, &format!("{WORK_ROW} (disabled)")]);
+}
+
+/// The `clauth list` table for `config`, every profile shown.
+fn rendered_table(config: &AppConfig) -> String {
+    render_table(
+        config,
+        &build_profile_entries(
+            config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
+    )
+}
+
+/// An OAuth account retyped to an api key of its own (login gone, endpoint and
+/// key set) keeps the `usage_cache.json` its OAuth leg last wrote, since a
+/// retype clears no caches. No leg reads or rewrites that file for it any more,
+/// so a `canceled` plan left there is a fossil: its row renders exactly as it
+/// would with no such file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("moved");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped row"
+    );
+}
+
+/// The env-token twin of the fossil above: a retype whose endpoint credential
+/// sits in `env` rather than `api_key` (an `[env] ANTHROPIC_AUTH_TOKEN`, the
+/// shape `claude::has_inference_auth` counts) is a retype no OAuth leg feeds
+/// too, so the canceled plan its OAuth life left behind marks nothing.
+#[test]
+fn a_retyped_env_token_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut retyped = Profile::new(
+        "envtok".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    retyped
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-envtok".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![retyped],
+    };
+    config.state.active_profile = Some("envtok".into());
+    crate::testutil::register_names(&["envtok"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("envtok");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped env-token row"
+    );
+}
+
+/// The control beside the fossil case: an account that keeps its OAuth login
+/// next to an endpoint of its own is still polled by the OAuth leg, so the
+/// canceled plan that leg wrote is live, and its row gains the marker.
+#[test]
+fn a_hybrid_account_still_polled_keeps_its_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut hybrid = oauth("both");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![hybrid],
+    };
+    config.state.active_profile = Some("both".into());
+    crate::testutil::register_names(&["both"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("both");
+
+    let after = rendered_table(&config);
+    let row = |t: &str| {
+        t.lines()
+            .find(|l| l.contains("both"))
+            .expect("the hybrid row")
+            .to_string()
+    };
+    assert_eq!(
+        row(&after),
+        format!("{} (canceled)", row(&before)),
+        "the OAuth leg still feeds this account, so its canceled plan marks the row"
+    );
+}
+
+/// The org-refused twin of the retyped fossil: a refusal its OAuth life left in
+/// `usage_cache.json` marks nothing once no leg feeds that file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_org_refused_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_profile_cache(
+        &crate::profile::ProfileName::from("moved"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                ..PlanInfo::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a refusal no leg feeds any more must not mark the retyped row"
+    );
+}
+
 /// An organization's refusal is named apart from a canceled plan, here as on
 /// every other surface: `(org refused)`, never `(canceled)`.
 #[test]
@@ -348,6 +519,75 @@ fn list_table_leaves_a_live_account_unmarked() {
         !table.contains('('),
         "a live account carries no state marker, got {table:?}"
     );
+}
+
+/// The PLAN cell names when the plan ends or renews, off the profile's
+/// `plan_ends` and `plan_renews`, in plain ASCII: a coming end `ends`, a past
+/// one `ended` on that same date, a `plan_renews` later than a past end its
+/// renewal, and a canceled plan no renewal.
+#[test]
+fn list_table_names_the_plan_end_in_the_plan_cell() {
+    let _home = HomeSandbox::new();
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    let dated = |name: &str, ends, renews| {
+        let mut p = oauth(name);
+        p.plan_ends = ends;
+        p.plan_renews = renews;
+        p
+    };
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            dated("ending", day(2099, 11, 20), None),
+            dated("ended", day(2020, 3, 2), None),
+            dated("resubscribed", day(2020, 3, 2), day(2099, 12, 15)),
+            dated("renewing", None, day(2099, 12, 15)),
+            dated("gone", None, day(2099, 12, 15)),
+        ],
+    };
+    for name in ["ending", "ended", "resubscribed", "renewing", "gone"] {
+        warm_usage(name, 42.4, 17.6);
+    }
+    let mut canceled = crate::profile_cache::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("gone's warmed cache");
+    if let Some(plan) = canceled.plan.as_mut() {
+        plan.subscription_status = Some("canceled".to_string());
+    }
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+        &canceled,
+    );
+    let table = render_table(
+        &config,
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
+    );
+    // PROFILE is twelve cells (`resubscribed`), PLAN twenty-three
+    // (`Max (renews 2099-12-15)`).
+    let row = |name: &str, plan: &str, suffix: &str| {
+        format!("  {name:<12}  {plan:<23}    42.4%    17.6%  -{suffix}")
+    };
+    let expected = [
+        format!(
+            "  {:<12}  {:<23}  5H USED  7D USED  ENDPOINT",
+            "PROFILE", "PLAN"
+        ),
+        row("ending", "Max (ends 2099-11-20)", ""),
+        row("ended", "Max (ended 2020-03-02)", ""),
+        row("resubscribed", "Max (renews 2099-12-15)", ""),
+        row("renewing", "Max (renews 2099-12-15)", ""),
+        row("gone", "Max", " (canceled)"),
+    ];
+    assert_eq!(table, table_of(&expected.each_ref().map(String::as_str)));
 }
 
 /// Both facts render. A user usually disables an account BECAUSE it died,
@@ -1717,10 +1957,10 @@ fn list_table_prints_the_codex_section_alone_without_a_claude_account() {
     );
 }
 
-/// A codex row reads no claude-only state. The cache write admits a name either
-/// roster holds, so a claude fetch still carrying a deleted claude profile can
-/// land its canceled `/profile` body in the `usage_cache.json` of a codex
-/// profile re-captured under that name; the codex row must not read it as a
+/// A codex row reads no claude-only state. A build whose cache write admitted a
+/// name either roster holds could land a claude fetch's canceled `/profile` body
+/// in the `usage_cache.json` of a codex profile re-captured under that name, and
+/// that file outlives the upgrade; the codex row must not read it as a
 /// cancellation. That body carries no codex plan either, and a codex row with
 /// no plan shows the missing-data dash, never its provider's name.
 #[test]
@@ -1784,4 +2024,96 @@ fn list_table_names_a_refused_setup_token_beside_a_stored_pair() {
             "with_pair={with_pair}, got:\n{table}"
         );
     }
+}
+
+/// A halfwidth katakana name with voiced sound marks sizes the PROFILE column
+/// by the eight cells the buffer draws — each U+FF9E mark renders its own
+/// halfwidth cell, which the grapheme width alone gives none — so the PLAN
+/// column opens on the same screen column in every row.
+#[test]
+fn a_halfwidth_katakana_name_keeps_the_plan_column_aligned() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("ｶﾞｶﾞｶﾞｶﾞ"), oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("ｶﾞｶﾞｶﾞｶﾞ", 42.4, 17.6);
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE   PLAN  5H USED  7D USED  ENDPOINT",
+            "  ｶﾞｶﾞｶﾞｶﾞ  Max     42.4%    17.6%  -",
+            "* work      Max     42.4%    17.6%  -",
+        ],
+        "the PROFILE column sizes and pads by the cells the buffer draws, got:\n{table}"
+    );
+}
+
+/// The ` (keyless)` suffix marks exactly the accounts the delegate refuses as
+/// keyless: a keyless proxy account on its bind (`pb`, as `clauth login <name>
+/// --proxy <service>` creates it, key cleared) gets it, the keyed proxy
+/// account beside it (`pk`) does not, and the keyless third-party control
+/// (`z.ai`) keeps it.
+#[test]
+fn list_table_marks_a_keyless_proxy_account_on_its_bind() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "z.ai".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    ))
+    .expect("save z.ai");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["z.ai".into()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+    let config = crate::profile::load_config().expect("reload");
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai           -        -  https://api.z.ai/api/anthropic (keyless)",
+            "  pb       generic        -        -  http://127.0.0.1:9141 (keyless)",
+            "  pk       generic        -        -  http://127.0.0.1:9141",
+        ],
+    );
 }

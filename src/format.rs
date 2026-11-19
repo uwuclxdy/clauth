@@ -1,17 +1,17 @@
 //! Profile/usage → display-string formatters (pure but for
 //! [`credit_refused_label`]'s clock read), plus the cross-surface diagnostic
 //! messages, so the TUI, the CLI subcommands (e.g. `clauth which`), and the
-//! headless daemon all share one spelling. No entry emits a `Span`/`Style`;
-//! the one ratatui dependency is [`grapheme_cells`], which counts the cells a
-//! terminal draws so a CLI table pads by the same measure.
-//!
+//! headless daemon all share one spelling. No entry emits a `Span`/`Style`; its
+//! ratatui use is measurement only — [`grapheme_cells`] sums the grapheme widths
+//! a terminal draws (via [`CellWidth`]) so a CLI table pads by the same measure.
 //! Helpers that emit `Span`/`Style` live in `tui/render/format.rs`, beside the
-//! theme they style with, so this tier never carries TUI styling;
-//! single-screen or domain-local display glue stays with its owner, since
-//! folding it in would mint one-caller abstractions. The split stands over a
-//! single grab-bag `format.rs` (surveyed 2026-07-16).
+//! theme they style with, so this tier never carries TUI styling; single-screen
+//! or domain-local display glue stays with its owner, since folding it in would
+//! mint one-caller abstractions, so the split stands over a single grab-bag
+//! `format.rs`.
 
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
+use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
 use ratatui::text::Span;
 
@@ -164,6 +164,16 @@ pub(crate) enum Cause {
     /// `store` is the dir the refusal names (the global store or the account's
     /// own `jobs/`).
     UnreadableJobStoreOnRotatingChain { profile: String, store: String },
+    /// The job store holds a job dir that never clears on its own — a
+    /// record-less dir of no known shape, or a record read whole that fails
+    /// both parses and is older than the mid-create grace — so clauth cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL stuck dir
+    /// blocks every profile on macOS until it is deleted; a tree-local one
+    /// blocks only the profile whose store holds it. Split from
+    /// [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
+    /// help: only deleting the named dir lets the rotation through. The `dir`
+    /// is the job dir, rendered home-relative by the caller.
+    UnreadableJobDirOnRotatingChain { profile: String, dir: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -264,6 +274,11 @@ impl Cause {
                     "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
                 )
             }
+            Self::UnreadableJobDirOnRotatingChain { profile, dir } => {
+                format!(
+                    "can't read claude code's background job ({dir}), so '{profile}' is not rotated; delete that dir to rotate"
+                )
+            }
             Self::RotationLockHeld(profile) => {
                 format!("'{profile}' has a token rotation in progress, retry in a moment")
             }
@@ -310,6 +325,7 @@ impl Cause {
 /// The status is deliberately separable: CLI stderr and the daemon log show it
 /// (neither has a companion log to read it out of) while a toast and the MCP
 /// payload do not.
+#[derive(Debug)]
 pub(crate) struct Transient {
     cause: Cause,
     status: Option<u16>,
@@ -406,13 +422,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
-/// pre-flight's quarantine arm, and — through
-/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
-/// the quarantine's own log line, wherever the profile neither serves its own
-/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
-/// same `None` case but words its own sentence, since it also has to say the
-/// arming did not happen.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, and —
+/// through `oauth::third_party_dead_chain_copy`'s `None` case — the MCP
+/// pre-flight's quarantine arm, the rotate toast and the quarantine's own log
+/// line, wherever the profile neither serves its own inference nor is keyless
+/// (`Profile::is_keyless`, or a proxy account with no key). `clauth
+/// rolling-token`'s dead-chain bail takes that same `None` case but words its
+/// own sentence, since it also has to say the arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -431,9 +447,30 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
 /// line, so the surfaces cannot spell one state two ways. A key the provider
-/// refused renders [`api_key_rejected`] on those surfaces instead.
-pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
-    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+/// refused renders [`api_key_rejected`] on those surfaces instead. A proxy
+/// account (`proxy` is its runtime claim's service) takes its key only from a
+/// login through its proxy, so the fix names that login instead.
+pub(crate) fn third_party_keyless(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "profile has no api key: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
+}
+
+/// The command that re-captures `name`'s inference key: `--api-key`, or the
+/// login through its proxy for a proxy account, the only login clauth takes
+/// for one.
+fn key_fix_command(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    match proxy {
+        Some(service) => crate::actions::proxy_login_command(name.as_str(), service),
+        None => format!("clauth login {name} --api-key <key>"),
+    }
 }
 
 /// A third-party api key the provider's dead-key record names rejected
@@ -442,9 +479,16 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// `--api-key`, the command that also lifts a keyless profile — a bare
 /// `clauth login <name>` runs the browser flow and leaves the key untouched.
 /// Rendered by the MCP pre-flight's key-rejected arm and by
-/// `oauth::third_party_dead_chain_copy`'s callers.
-pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
-    format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
+/// `oauth::third_party_dead_chain_copy`'s callers. A proxy account's fix is
+/// the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn api_key_rejected(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "api key rejected: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
 }
 
 /// An OAuth account's setup token that the usage probe found refused
@@ -477,19 +521,26 @@ pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String
 /// matches lands on this sentence instead, since "expired" would be false.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
-/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
-/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
-/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
-/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
-/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// the shared arm's up-front quarantine bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line.
+/// `RollingArmRefusal::sentence`'s `DeadChainKeptMint` arm carries a fourth
+/// dead-chain sentence and is deliberately NOT routed: `classify_armed_sidecar`'s
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach
+/// `Broken` for a profile with a `base_url`, so a third-party branch there is
+/// dead code.
 /// The MCP pre-flight admits that target instead of refusing it, so it renders
 /// nothing (owner ruling 2026-08-30).
 /// The command is backticked to match [`third_party_keyless`], which renders
-/// beside it on the same surfaces (owner ruling: house style).
-pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+/// beside it on the same surfaces. A proxy
+/// account's fix is the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn third_party_dead_chain(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
-         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+         (run `{}` to clear the quarantine)",
+        key_fix_command(name, proxy)
     )
 }
 
@@ -581,9 +632,10 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
-/// The CLI switch over an unsaved live login whose outgoing account runs on a
+/// A switch over an unsaved live login whose outgoing account runs on a
 /// long-lived token: that account's store cannot take an OAuth login, so the
-/// switch does not offer to save it there.
+/// CLI switch does not offer to save it there and the headless switch's
+/// `Overwrite` default (the plugin, the API) refuses before capturing.
 pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
     format!(
         "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
@@ -604,6 +656,13 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 /// The one spelling for "go fix this in the app". The surface is the `clauth`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the `clauth` TUI";
+
+/// `message` without its closing `; {RESOLVE_IN_TUI} first` pointer, for a
+/// surface where that pointer leads nowhere or is said elsewhere. `None` on a
+/// message that does not close with it, which each caller answers its own way.
+pub(crate) fn without_resolve_pointer(message: &str) -> Option<&str> {
+    message.strip_suffix(&format!("; {RESOLVE_IN_TUI} first"))
+}
 
 /// The one spelling for a stored login that exists but cannot be read.
 pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
@@ -631,15 +690,24 @@ pub(crate) fn humanize_span(secs: u64) -> String {
     humanize_duration(secs as i64)
 }
 
-/// The rendered cell width of `value`: each grapheme's own width summed, the
-/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
-/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
-/// cell while the buffer draws it per grapheme as two, so that measure lets a
-/// value overrun its budget.
-pub(crate) fn grapheme_cells(value: &str) -> usize {
-    Span::raw(value)
+/// One grapheme's cells as the buffer lays them down
+/// ([`CellWidth::cell_width`]): `unicode-width` plus one cell per halfwidth
+/// katakana sound mark (`U+FF9E`/`U+FF9F`), a mark `Span::width` reports zero
+/// where the buffer lays one down, so `ｶﾞ` draws 2.
+pub(crate) fn grapheme_cell_width(symbol: &str) -> usize {
+    usize::from(symbol.cell_width())
+}
+
+/// The terminal cells `s` occupies: each grapheme's [`grapheme_cell_width`]
+/// summed over `styled_graphemes`, the measure the buffer draws by (control
+/// graphemes dropped). The whole-string [`Span::width`] folds an Arabic
+/// lam-alef ligature to one cell while the buffer draws it per grapheme as two,
+/// and `chars().count()` spends one cell on a two-cell CJK glyph, so a value
+/// sized by either overruns its budget.
+pub(crate) fn grapheme_cells(s: &str) -> usize {
+    Span::raw(s)
         .styled_graphemes(Style::default())
-        .map(|g| Span::raw(g.symbol).width())
+        .map(|g| grapheme_cell_width(g.symbol))
         .sum()
 }
 
@@ -667,19 +735,150 @@ pub(crate) fn pad_cells(value: &str, width: usize, right_align: bool) -> String 
     }
 }
 
-/// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
+/// Whether `s` fits a cap of `max` on both measures a cap bounds: the cells
+/// [`grapheme_cells`] draws, and the characters — a char is at most four bytes,
+/// so a character cap also bounds the bytes one grapheme can carry. The
+/// characters are counted first: a string over the cap stops there, and the
+/// cell walk then sees at most `max` characters.
+fn cap_fits(s: &str, max: usize) -> bool {
+    s.chars().nth(max).is_none() && grapheme_cells(s) <= max
+}
+
+/// The byte length of the longest prefix of `s` that fits `budget` on both
+/// measures [`cap_fits`] bounds, every grapheme kept whole. A control
+/// character is one piece that spends its character and no cell, so a caller's
+/// line structure survives the cut and a run of controls stops at the char
+/// budget; keeping control characters off a terminal stays the caller's job
+/// ([`terminal_safe`], or the preview seam's own mapping). A control character
+/// breaks a grapheme cluster wherever it sits, except that a carriage return
+/// and the line feed right behind it are one cluster (UAX #29 GB3), so the two
+/// go as one piece and no piece straddles a cluster.
+fn cap_prefix_len(s: &str, budget: usize) -> usize {
+    let (mut cells, mut chars, mut len) = (0, 0, 0);
+    let mut segments = s.split_inclusive(char::is_control).peekable();
+    while let Some(segment) = segments.next() {
+        let control = segment.chars().next_back().filter(|c| c.is_control());
+        let head = &segment[..segment.len() - control.map_or(0, char::len_utf8)];
+        let mut head_len = 0;
+        for grapheme in Span::raw(head).styled_graphemes(Style::default()) {
+            let (w, n) = (
+                grapheme_cell_width(grapheme.symbol),
+                grapheme.symbol.chars().count(),
+            );
+            if cells + w > budget || chars + n > budget {
+                return len + head_len;
+            }
+            cells += w;
+            chars += n;
+            head_len += grapheme.symbol.len();
+        }
+        len += head_len;
+        if let Some(c) = control {
+            let line_feed = c == '\r' && segments.peek().is_some_and(|next| *next == "\n");
+            let cost = if line_feed { 2 } else { 1 };
+            if chars + cost > budget {
+                return len;
+            }
+            chars += cost;
+            len += c.len_utf8();
+            if line_feed {
+                segments.next();
+                len += '\n'.len_utf8();
+            }
+        }
+    }
+    len
+}
+
+/// Trailing-ellipsis truncation to a cap of `max` on both measures a terminal
+/// lays text out by ([`cap_fits`]): the cells [`grapheme_cells`] draws, and the
+/// characters, which also bound the bytes. A grapheme the content budget
+/// (`max` less the 3-cell, 3-character `...`) cannot hold whole is left out,
+/// and the cut stops at the first grapheme either measure cannot take. Control
+/// characters are kept, spending their characters and no cell, so an over-cap
+/// multi-line input keeps its line structure and a run of controls stops at
+/// the char budget; keeping control characters off a terminal stays the
+/// caller's job. At or under the cap the whole text comes back unchanged, and
+/// a cap under 3 renders dots alone.
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if cap_fits(s, max) {
         return s.to_string();
     }
-    // Three ASCII dots stand in for the ellipsis, so the content budget shrinks
-    // by three to keep the total at `max` columns.
     if max < 3 {
-        return "...".chars().take(max).collect();
+        return ".".repeat(max);
     }
-    let mut out: String = s.chars().take(max - 3).collect();
-    out.push_str("...");
-    out
+    format!("{}...", &s[..cap_prefix_len(s, max - 3)])
+}
+
+/// `text` with each character rendered by `piece`, cut at whole pieces to a cap
+/// of `max` on the escaped body. The body is measured by [`cap_fits`] — the
+/// cells a terminal draws it in and its characters — and a piece the content
+/// budget (`max` less the 3-cell `...`) cannot hold is left out, never split,
+/// so an escape never loses its tail and a control character survives the cut
+/// as its escape. The body stops being built at the first piece that would
+/// carry it past `max` characters, that piece included so the cut sees the
+/// grapheme it joins; nothing after it is built, which already proves the rest
+/// of the text over the cap, so no body far over it is ever built whole, and
+/// the fit and the cut both lie inside what was built. The kept text is
+/// wrapped in a pair of double quotes when `quoted` (the two quote cells sit
+/// outside `max`), `...` appended outside the quotes (at the end, bare) when
+/// anything was cut; at or under the cap the whole text comes back, and a bound
+/// under 3 cells renders dots alone.
+pub(crate) fn truncate_escaped(
+    text: &str,
+    max: usize,
+    piece: impl Fn(char) -> String,
+    quoted: bool,
+) -> String {
+    let mut body = String::new();
+    let mut ends = Vec::new();
+    let mut chars = 0;
+    let mut cut_short = false;
+    for c in text.chars() {
+        let escaped = piece(c);
+        let escaped_chars = escaped.chars().count();
+        if chars + escaped_chars > max {
+            cut_short = true;
+            body.push_str(&escaped);
+            ends.push(body.len());
+            break;
+        }
+        chars += escaped_chars;
+        body.push_str(&escaped);
+        ends.push(body.len());
+    }
+    let wrap = |s: &str| {
+        if quoted {
+            format!("\"{s}\"")
+        } else {
+            s.to_string()
+        }
+    };
+    if !cut_short && cap_fits(&body, max) {
+        return wrap(&body);
+    }
+    if max < 3 {
+        return ".".repeat(max);
+    }
+    // Both callers' `piece` escapes every control character, so every character
+    // of `body` reaches the grapheme walk and the cut lands on one of its
+    // boundaries; backing off to the last whole piece keeps an escape intact.
+    let fit = cap_prefix_len(&body, max - 3);
+    let cut = ends
+        .iter()
+        .copied()
+        .take_while(|&end| end <= fit)
+        .last()
+        .unwrap_or(0);
+    format!("{}...", wrap(&body[..cut]))
+}
+
+/// Whether a character must not reach a terminal as itself: a control
+/// character or a display-reordering one. The one predicate set
+/// [`terminal_safe`] drops, the preview seam maps to a space and a delegate
+/// reply escapes, so none of them can drift apart.
+pub(crate) fn unsafe_on_terminal(c: char) -> bool {
+    c.is_control() || reorders_display(c)
 }
 
 /// Untrusted text with its control and bidi formatting characters dropped: it
@@ -687,9 +886,39 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// line, and a bidi override could reorder the line to read as something it is
 /// not.
 pub(crate) fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !reorders_display(*c))
-        .collect()
+    s.chars().filter(|c| !unsafe_on_terminal(*c)).collect()
+}
+
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so a reader gets the
+/// text, not CSI bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+pub(crate) fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
@@ -711,6 +940,47 @@ pub(crate) fn reorders_display(c: char) -> bool {
         c,
         '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
     )
+}
+
+/// Whether a terminal may draw `c` as a blank cell: whitespace, `U+2800` BRAILLE
+/// PATTERN BLANK, and the Hangul fillers `U+115F`, `U+3164` and `U+FFA0`. Width
+/// tables disagree on the last two (glibc's `wcwidth` gives 0 for both, East
+/// Asian Width calls them wide and halfwidth), so they count as blank: a text
+/// holding only them shows nothing.
+pub(crate) fn is_blank(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{115F}' | '\u{3164}' | '\u{FFA0}')
+}
+
+/// `Unicode 18.0.0` `DerivedCoreProperties.txt`: the
+/// `Default_Ignorable_Code_Point` ranges, characters a terminal draws no glyph
+/// for. Some of them, the Hangul fillers included, can occupy a blank cell.
+pub(crate) fn draws_nothing(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Whether `text` shows nothing: blanks and `draws_nothing` characters only, a
+/// soft hyphen included. Callers pass `terminal_safe` output.
+pub(crate) fn shows_nothing(text: &str) -> bool {
+    text.chars().all(|c| is_blank(c) || draws_nothing(c))
 }
 
 /// `text` with every character `keep` rejects written as its `\u{..}` escape.
@@ -770,11 +1040,20 @@ pub(crate) fn format_pct(pct: f64) -> String {
 /// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
 /// a surface-local twin of this is a drift, not a specialization.
 pub(crate) fn format_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
-    }
+    let decimals = amount_decimals(n);
+    format!("{n:.decimals$}")
+}
+
+/// Whole amounts print bare, fractions at two decimals.
+fn amount_decimals(n: f64) -> usize {
+    if n.fract() == 0.0 { 0 } else { 2 }
+}
+
+/// [`format_amount`], grouped with `,` thousands separators and the sign ahead
+/// of the first group (`-1,234.50`).
+pub(crate) fn format_amount_grouped(n: f64) -> String {
+    let sign = if n < 0.0 { "-" } else { "" };
+    format!("{sign}{}", group_thousands(n.abs(), amount_decimals(n)))
 }
 
 /// A token threshold in its display form: exact millions as `{n}M` (`2M`),
@@ -788,6 +1067,22 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
         format!("{}k", v / 1000)
     } else {
         v.to_string()
+    }
+}
+
+/// A token amount as the pool bar's compact figure: `7.5B`, `285M`, `12k`.
+pub(crate) fn format_compact(n: f64) -> String {
+    let trim = |scaled: String| {
+        scaled
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    match n.abs() {
+        magnitude if magnitude >= 1e9 => format!("{}B", trim(format!("{:.2}", n / 1e9))),
+        magnitude if magnitude >= 1e6 => format!("{}M", trim(format!("{:.1}", n / 1e6))),
+        magnitude if magnitude >= 1e3 => format!("{:.0}k", n / 1e3),
+        _ => format!("{n:.0}"),
     }
 }
 
@@ -812,27 +1107,32 @@ pub(crate) fn group_thousands(n: f64, decimals: usize) -> String {
     out
 }
 
+/// The local calendar day of an epoch-seconds instant: the one epoch to
+/// local-date conversion, behind [`local_date`] and every plan-date
+/// comparison. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_day(epoch: i64) -> Option<NaiveDate> {
+    Some(
+        DateTime::from_timestamp(epoch, 0)?
+            .with_timezone(&Local)
+            .date_naive(),
+    )
+}
+
 /// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age
 /// spelling (an ISO date, no time). [`local_stamp`] is this plus the time of
 /// day. Returns `None` when the instant falls outside chrono's representable
 /// range.
 pub(crate) fn local_date(epoch: i64) -> Option<String> {
-    let naive = DateTime::from_timestamp(epoch, 0)?
-        .with_timezone(&Local)
-        .naive_local();
-    Some(format!(
-        "{:04}-{:02}-{:02}",
-        naive.year(),
-        naive.month(),
-        naive.day(),
-    ))
+    local_day(epoch).map(|day| format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day()))
 }
 
-/// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
-/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
-/// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
-/// --json`'s `updated` — do not route through here.
+/// The LOCAL prose-stamp formatter: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock.
+/// [`local_minute_stamp`] is the listing-cell spelling beside it; any other
+/// spelling of a LOCAL stamp is a bug in its caller, not a new helper. Machine
+/// timestamps that stay UTC by design — the daemon `logline!` prefix and
+/// `clauth sessions --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
     let naive = DateTime::from_timestamp(epoch, 0)?
@@ -844,6 +1144,22 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.hour(),
         naive.minute(),
         naive.second(),
+    ))
+}
+
+/// [`local_stamp`] without the seconds: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM` in the operator's local wall clock, the shape a listing
+/// cell shows. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_minute_stamp(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{} {:02}:{:02}",
+        local_date(epoch)?,
+        naive.hour(),
+        naive.minute(),
     ))
 }
 
@@ -1043,8 +1359,8 @@ fn start_age_cell(row: &StartCandidate) -> String {
 
 /// The member rows of a `--explain` start walk, one line per chain member in
 /// chain order: `*` for the pick, then the name and verdict each padded to the
-/// column's widest, then the cache-age cell. Pure, so the byte layout is pinned
-/// without capturing stdout.
+/// column's widest in terminal cells (a CJK name keeps its column), then the
+/// cache-age cell. Pure, so the byte layout is pinned without capturing stdout.
 pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
     let name_w = rows
         .iter()

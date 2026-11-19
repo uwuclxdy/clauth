@@ -153,6 +153,17 @@ fn classify_env_key_flags_managed_keys() {
     assert_eq!(classify_env_key(&p, &[], "ANTHROPIC_CUSTOM_FLAG"), None);
 }
 
+/// The effort row writes `CLAUDE_CODE_EFFORT_LEVEL`, so a custom entry with
+/// that name would silently override it: the collision prompt names the row.
+#[test]
+fn classify_env_key_names_the_effort_field() {
+    let p = Profile::new("acct".to_string(), None, None);
+    assert_eq!(
+        classify_env_key(&p, &[], "CLAUDE_CODE_EFFORT_LEVEL"),
+        Some(EnvKeyCollision::Managed("the effort field"))
+    );
+}
+
 #[test]
 fn classify_env_key_flags_own_field_by_sorted_index() {
     let mut p = Profile::new("acct".to_string(), None, None);
@@ -1562,7 +1573,7 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
     edit_profile_preset(
         &mut config,
         &crate::profile::ProfileName::from("acct"),
-        |url, models| {
+        |url, models, _| {
             *url = Some("https://api.deepseek.com/anthropic".to_string());
             *models = ModelSettings {
                 default: Some("deepseek-chat".to_string()),
@@ -1675,6 +1686,58 @@ fn the_own_roster_duplicate_keeps_the_rename_exemption() {
     assert!(validate_profile_name("cx", Harness::Codex, Some("cx")).is_ok());
 }
 
+/// A NEW name starting with `-` refuses on both harnesses: every command clauth
+/// prints for it (`clauth login -x`) would parse it as a flag. The `.` refusal
+/// shares the one line. The charset check alone keeps admitting it, because it
+/// also re-checks names already stored (the Keychain ownership ledger, the API's
+/// session create, the preset list, a codex re-login).
+#[test]
+fn a_new_name_starting_with_a_dash_is_refused() {
+    let _home = HomeSandbox::new();
+    let line = "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'";
+    for name in ["-x", "--x", "-", "---", " -x ", ".lead"] {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let err = validate_profile_name(name, harness, None)
+                .expect_err("a dash- or dot-led new name must refuse");
+            assert_eq!(err.to_string(), line, "{name:?} on {harness}");
+        }
+    }
+    assert!(
+        validate_profile_name("-x", Harness::Claude, Some("-x")).is_err(),
+        "a rename onto a dash-led name refuses too"
+    );
+    assert_eq!(
+        validate_name_chars("-x").expect("a stored dash-led name still passes the charset"),
+        "-x"
+    );
+    assert!(validate_profile_name("a-x", Harness::Claude, None).is_ok());
+}
+
+/// A NEW name equal to a clauth subcommand refuses: the bare `clauth <name>`
+/// switch loses to the subcommand, so `clauth list` could never reach it.
+/// Hidden subcommands and clap's generated `help` count; the match is exact,
+/// since `clauth List` is no subcommand and does reach the account.
+#[test]
+fn a_new_name_a_subcommand_holds_is_refused() {
+    let _home = HomeSandbox::new();
+    for name in ["list", "start", "switch", "help", "__api-key", "run"] {
+        for harness in [Harness::Claude, Harness::Codex] {
+            let err = validate_profile_name(name, harness, None)
+                .expect_err("a subcommand name must refuse");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "'{name}' is a clauth command, so `clauth {name}` can never switch to it; \
+                     pick another name"
+                ),
+                "{harness}"
+            );
+        }
+    }
+    assert!(validate_profile_name("List", Harness::Claude, None).is_ok());
+    assert!(validate_profile_name("lister", Harness::Claude, None).is_ok());
+}
+
 /// The capture-name flavor: tolerate an own-roster collision (it routes into
 /// capture-into-existing) while still refusing to shadow the other harness.
 #[test]
@@ -1692,6 +1755,10 @@ fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
         "an own-roster collision is this flavor's business to allow"
     );
     assert!(validate_foreign_harness_free("cx", Harness::Claude).is_err());
+    assert!(
+        validate_foreign_harness_free("CX", Harness::Claude).is_err(),
+        "names fold case across the rosters, so `CX` is the codex `cx`"
+    );
 }
 
 // ── codex CRUD: switch + delete against codex-profiles.toml ────────────────
@@ -2064,6 +2131,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     target.env.insert("FOO".to_string(), "bar".to_string());
     target.fallback_threshold = Some(42.0);
     target.bell_threshold = Some(77.0);
+    target.effort = Some("max".to_string());
     target.models.opus = Some("claude-opus-4".to_string());
     target.credentials = Some(ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -2166,6 +2234,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         "fallback_threshold preserved"
     );
     assert_eq!(acme.bell_threshold, Some(77.0), "bell_threshold preserved");
+    assert_eq!(acme.effort.as_deref(), Some("max"), "effort preserved");
     assert_eq!(
         acme.models.opus.as_deref(),
         Some("claude-opus-4"),
@@ -2755,6 +2824,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
         &mut config,
         "incoming".to_string(),
         Default::default(),
+        None,
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -2824,6 +2894,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
         &mut config,
         "incoming".to_string(),
         Default::default(),
+        None,
         ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-incoming".to_string(),
@@ -3416,6 +3487,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -3476,6 +3548,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted-refresh", None),
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -3560,6 +3633,7 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         minted,
         None,
         None,
@@ -3610,7 +3684,7 @@ fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
     let live = foreign_plain_live_login();
     let mut config = empty_config();
 
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
 
     assert!(became_active, "the first profile auto-activates");
     assert_eq!(config.state.active_profile.as_deref(), Some("work"));
@@ -3633,7 +3707,7 @@ fn capture_current_login_refuses_when_nothing_is_live() {
     let _home = HomeSandbox::new();
     let mut config = empty_config();
 
-    let err = capture_current_login(&mut config, "work").expect_err("nothing to capture");
+    let err = capture_current_login(&mut config, "work", false).expect_err("nothing to capture");
 
     assert_eq!(err.to_string(), "no live login found to capture");
     assert!(
@@ -3656,7 +3730,7 @@ fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
 
     // Case-different spelling: the refusal must name the canonical existing
     // profile, not mint a second one.
-    let err = capture_current_login(&mut config, "WORK").expect_err("duplicate refused");
+    let err = capture_current_login(&mut config, "WORK", false).expect_err("duplicate refused");
 
     let msg = err.to_string();
     assert!(
@@ -3711,7 +3785,7 @@ fn capture_beside_an_active_account_leaves_the_active_alone() {
     config.state.active_profile = Some(ProfileName::from("first"));
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
 
     assert!(!became_active, "a later profile needs an explicit switch");
     assert_eq!(config.state.active_profile.as_deref(), Some("first"));
@@ -3744,12 +3818,12 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
     config.add(owner);
     config.state.active_profile = Some(ProfileName::from("first"));
 
-    let err = capture_current_login(&mut config, "work").expect_err("owned login refused");
+    let err = capture_current_login(&mut config, "work", false).expect_err("owned login refused");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("'first'") && msg.contains("clauth first"),
-        "names the owning profile and the switch to it: {msg}"
+    assert_eq!(
+        err.to_string(),
+        "these credentials already belong to 'first'; switch to it with:  clauth switch first",
+        "names the owning profile and the switch to it"
     );
     assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
     assert!(
@@ -3757,6 +3831,599 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
             .is_ok_and(|m| !m.file_type().is_symlink()),
         "the live file is untouched"
     );
+}
+
+/// Profile `b` holding an older pair of the account `uuid-b`, the live login
+/// a newer pair no stored token matches (a bare `claude` refreshed it), and
+/// `~/.claude.json` naming `uuid-b` as the account Claude Code last signed in
+/// as. Returns the config and the live credentials path.
+fn id_matched_live_login(home_uuid: Option<&str>) -> (AppConfig, std::path::PathBuf) {
+    let live = foreign_plain_live_login();
+    let mut owner = Profile::new("b".to_string(), None, None);
+    owner.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "b-old-access".to_string(),
+            refresh_token: Some("b-old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&owner).expect("save b");
+    let mut config = empty_config();
+    config.add(owner);
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["b"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("b"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-b".to_string(),
+    );
+    let mut identity = serde_json::json!({"numStartups": 1});
+    if let Some(uuid) = home_uuid {
+        identity["oauthAccount"] = serde_json::json!({"accountUuid": uuid});
+    }
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        serde_json::to_vec_pretty(&identity).expect("ser"),
+    )
+    .expect("write ~/.claude.json");
+    (config, live)
+}
+
+fn stored_refresh(name: &str) -> Option<String> {
+    crate::profile::load_profile(&ProfileName::from(name))
+        .expect("load profile")
+        .refresh_token()
+        .map(str::to_string)
+}
+
+/// A capture under a new name over a login whose account an existing profile
+/// holds (matched by account id, not by token) refuses, names the owner, and
+/// offers both ways on.
+#[test]
+fn capture_refuses_a_login_whose_account_an_existing_profile_holds() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let err = capture_current_login(&mut config, "c", false).expect_err("id-matched refused");
+
+    assert_eq!(
+        err.to_string(),
+        "this login looks like b's account (Claude Code last signed in as b)\n\
+         save it into b with:  clauth capture b\n\
+         or keep it as a new account with:  clauth capture c --new"
+    );
+    assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
+/// `clauth capture b` over a login whose account a proxy account holds refuses
+/// through its proxy and writes nothing: no id lands in its `config.toml`, as
+/// the TUI's save goes through the same claim guard.
+#[test]
+fn capture_into_an_id_matched_proxy_owner_refuses_and_mints_no_id() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let b = ProfileName::from("b");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    };
+    crate::profile::write_proxy_record(&b, &record).expect("write the proxy record");
+    config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name == b)
+        .expect("b")
+        .proxy = Some(record);
+    let toml = crate::profile::profile_subpath(&b, "config.toml").expect("config path");
+    let before = std::fs::read(&toml).expect("read config");
+    assert!(
+        matches!(live_capture_owner(&config), CaptureOwner::LooksLike(_)),
+        "fixture control: the login reads as b's"
+    );
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'b' is an account on proxy \"stub\": log in to it again with `clauth login b --proxy \
+         stub`, or delete it with `clauth delete b` first"
+    );
+    assert!(
+        std::fs::read(&toml).expect("read config") == before,
+        "no id lands in the proxy account's config.toml"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
+/// Two profiles anchored to the login's account id: neither is named as the
+/// owner, so no capture saves into one of them (the account may be another
+/// org's); the capture falls back to the token tier alone.
+#[test]
+fn a_login_two_profiles_are_anchored_to_names_neither_as_its_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    assert!(
+        matches!(live_capture_owner(&config), CaptureOwner::LooksLike(_)),
+        "control: with b alone anchored, b is offered"
+    );
+    let mut twin = Profile::new("a".to_string(), None, None);
+    twin.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "a-old-access".to_string(),
+            refresh_token: Some("a-old-refresh".to_string()),
+            expires_at: Some(STORED_EXPIRES),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&twin).expect("save a");
+    config.add(twin);
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["b", "a"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("a"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-b".to_string(),
+    );
+
+    assert_eq!(live_capture_owner(&config), CaptureOwner::Unowned);
+    let err = capture_current_login(&mut config, "b", false)
+        .expect_err("an existing name with two claimants is refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    assert_eq!(stored_refresh("a").as_deref(), Some("a-old-refresh"));
+
+    capture_current_login(&mut config, "c", false).expect("captured as a new account");
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+}
+
+/// `clauth capture b` over a login whose account `b` holds saves the newer
+/// pair into `b`, so `b` no longer carries the spent copy.
+#[test]
+fn capture_into_the_owners_name_saves_the_newer_login_into_it() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    assert_eq!(config.profiles.len(), 1, "still one profile");
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+}
+
+/// `--new` keeps an id-matched login as a new account and leaves the owner's
+/// stored pair alone.
+#[test]
+fn capture_new_keeps_an_id_matched_login_as_a_new_account() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "c", true).expect("capture as new");
+
+    assert_eq!(config.profiles.len(), 2);
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// With no account id naming `b`, a capture under `b`'s name is still the
+/// existing-name refusal: the save-into arm needs the id match.
+#[test]
+fn capture_into_an_existing_name_without_an_id_match_is_still_refused() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    std::fs::write(
+        crate::profile::home_dir()
+            .expect("home")
+            .join(".claude.json"),
+        br#"{"numStartups":1,"oauthAccount":{"accountUuid":"uuid-other"}}"#,
+    )
+    .expect("write ~/.claude.json");
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("refused");
+
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// The save into `b` keeps `b`'s account-id anchor, where an off-disk
+/// snapshot's unproven install would remove it.
+#[test]
+fn capture_into_the_owners_name_keeps_its_anchor() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+            &ProfileName::from("b"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .as_deref(),
+        Some("uuid-b")
+    );
+}
+
+/// With `b` active and its live slot diverged onto the newer pair, the save
+/// into `b` leaves the live slot linked to `b`'s store again.
+#[test]
+fn capture_into_the_active_owner_relinks_the_live_slot() {
+    let home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    config.state.active_profile = Some(ProfileName::from("b"));
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("b")).expect("classify"),
+        crate::claude::LinkState::Diverged,
+        "precondition: the live slot holds a pair b does not store"
+    );
+
+    assert!(
+        capture_current_login(&mut config, "b", false).expect("save into b"),
+        "b stays the active account"
+    );
+
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("b")).expect("classify"),
+        crate::claude::LinkState::LinkedTo
+    );
+    #[cfg(unix)]
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()),
+        "the live slot is a link to b's store again"
+    );
+    #[cfg(not(unix))]
+    let _ = live;
+}
+
+/// What `b` stores expires at, in [`id_matched_login_with`]'s fixtures.
+const STORED_EXPIRES: i64 = 1_000;
+
+/// [`id_matched_live_login`] with the facts the save-into offer weighs: `b`
+/// stores a pair expiring at `stored_expires`, and the live login is the
+/// pair `cc-own-access` with `live_refresh`, expiring at `live_expires`.
+fn id_matched_login_with(
+    live_refresh: Option<&str>,
+    live_expires: Option<i64>,
+    stored_expires: Option<i64>,
+) -> (AppConfig, std::path::PathBuf) {
+    let (mut config, live) = id_matched_live_login(Some("uuid-b"));
+    let owner = config
+        .find_mut(&ProfileName::from("b"))
+        .expect("b is in the config");
+    owner
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+        .expect("b stores a pair")
+        .expires_at = stored_expires;
+    save_profile(owner).expect("save b");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "cc-own-access".to_string(),
+                refresh_token: live_refresh.map(str::to_string),
+                expires_at: live_expires,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    (config, live)
+}
+
+/// The shape the offer is for: a rotating pair that expires after `b`'s.
+fn id_matched_newer_login() -> (AppConfig, std::path::PathBuf) {
+    id_matched_login_with(
+        Some("cc-own-refresh"),
+        Some(STORED_EXPIRES + 1_000),
+        Some(STORED_EXPIRES),
+    )
+}
+
+fn live_capture_owner(config: &AppConfig) -> CaptureOwner {
+    let live = read_claude_credentials().expect("read the live login");
+    capture_owner_checked(config, live.as_ref())
+}
+
+/// A live login the save-into offer must not name `b` for: no menu or id
+/// refusal (`capture_owner` says `Unowned`), a capture under `b`'s name is
+/// the plain existing-name refusal, and a capture under a new name files the
+/// login as its own account. `b`'s stored pair is never touched.
+fn assert_not_offered_to_the_owner(config: &mut AppConfig) {
+    assert_eq!(live_capture_owner(config), CaptureOwner::Unowned);
+
+    let err = capture_current_login(config, "b", false).expect_err("existing name refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+
+    capture_current_login(config, "c", false).expect("a new name is not refused by the id arm");
+    assert_eq!(config.profiles.len(), 2);
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// A rolling bearer or a mint carries no refresh token: saving it into `b`
+/// would replace `b`'s rotating pair with a login that cannot rotate.
+#[test]
+fn a_live_login_without_a_refresh_token_is_not_offered_the_owner() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) =
+        id_matched_login_with(None, Some(STORED_EXPIRES + 1_000), Some(STORED_EXPIRES));
+
+    assert_not_offered_to_the_owner(&mut config);
+}
+
+/// The live slot lags the store: it holds a pair `b` already spent, which the
+/// server will refuse.
+#[test]
+fn a_spent_live_pair_is_not_offered_the_owner() {
+    let _home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    crate::oauth::record_spent(&ProfileName::from("b"), "cc-own-refresh");
+
+    assert_not_offered_to_the_owner(&mut config);
+}
+
+/// A live pair that does not expire after `b`'s stored one is not a newer
+/// one; neither is a pair with no known expiry, nor one against a stored
+/// pair with none.
+#[test]
+fn a_live_pair_not_newer_than_the_owners_is_not_offered_the_owner() {
+    for (live_expires, stored_expires) in [
+        (Some(STORED_EXPIRES - 1), Some(STORED_EXPIRES)),
+        (Some(STORED_EXPIRES), Some(STORED_EXPIRES)),
+        (None, Some(STORED_EXPIRES)),
+        (Some(STORED_EXPIRES + 1_000), None),
+    ] {
+        let _home = HomeSandbox::new();
+        let (mut config, _live) =
+            id_matched_login_with(Some("cc-own-refresh"), live_expires, stored_expires);
+
+        assert_not_offered_to_the_owner(&mut config);
+    }
+}
+
+/// The control for the three refusals above: a rotating pair expiring after
+/// `b`'s, no spent record naming it, is offered `b` (`/profile` confirms the
+/// live login is `b`'s account).
+#[test]
+fn a_newer_unspent_live_pair_is_offered_the_owner() {
+    let home = HomeSandbox::new();
+    let (config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert_eq!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(AccountIdMatch {
+            owner: ProfileName::from("b"),
+            account: crate::profile::AccountId::from("uuid-b"),
+        })
+    );
+}
+
+/// `/profile` with the live access token names another account than `b`'s
+/// anchor: the login is not `b`'s, so nobody is offered it and `clauth
+/// capture b` is the plain existing-name refusal. The probe ran: one
+/// `/profile` request reached the stub.
+#[test]
+fn a_live_login_profile_names_as_another_account_is_not_offered_the_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-z"}}"#.to_string())
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert_eq!(live_capture_owner(&config), CaptureOwner::Unowned);
+    let err = capture_current_login(&mut config, "b", false).expect_err("existing name refused");
+    assert_eq!(
+        err.to_string(),
+        "a profile named 'b' already exists; re-authenticate it with:  clauth login b"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+    drop(endpoints);
+    let paths = server.join().expect("stub");
+    assert!(
+        paths.iter().any(|p| p.contains("profile")),
+        "the account was asked for: {paths:?}"
+    );
+}
+
+/// `/profile` confirms the live login is `b`'s account: it is offered `b`,
+/// and the save into `b` lands with `b`'s anchor.
+#[test]
+fn a_live_login_profile_confirms_is_saved_into_the_owner() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(4, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert!(matches!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(_)
+    ));
+    capture_current_login(&mut config, "b", false).expect("save into b");
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+            &ProfileName::from("b"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+        .as_deref(),
+        Some("uuid-b")
+    );
+}
+
+/// `/profile` cannot answer (a server error): the account-id tier stands as
+/// it would with no probe, so `b` is still offered.
+#[test]
+fn a_failed_profile_probe_still_offers_the_owner() {
+    let home = HomeSandbox::new();
+    let (config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(4, |_, _| (500, "{}".to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    assert!(matches!(
+        live_capture_owner(&config),
+        CaptureOwner::LooksLike(_)
+    ));
+}
+
+/// The save into `b` is an identity change for the caches: the old login's
+/// usage reading and `/profile` stamp go, as an unproven install drops them,
+/// while `b`'s anchor stays.
+#[test]
+fn capture_into_the_owners_name_forgets_the_old_readings_but_keeps_the_anchor() {
+    let home = HomeSandbox::new();
+    let (mut config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let b = ProfileName::from("b");
+    let cache = |file: &str| crate::profile::profile_subpath(&b, file).expect("cache path");
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    ] {
+        crate::profile_cache::write_profile_cache(&b, file, &"old login".to_string());
+        assert!(cache(file).exists(), "precondition: {file} written");
+    }
+
+    capture_current_login(&mut config, "b", false).expect("save into b");
+
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    ] {
+        assert!(!cache(file).exists(), "{file} is forgotten");
+    }
+    assert_eq!(anchor_of("b").as_deref(), Some("uuid-b"));
+}
+
+/// A live credentials file that cannot be read is that read's error: the
+/// existing-name refusal would hide why the save into `b` was not tried.
+#[test]
+fn capture_into_an_existing_name_surfaces_an_unreadable_live_login() {
+    let _home = HomeSandbox::new();
+    let (mut config, live) = id_matched_newer_login();
+    std::fs::write(&live, b"{ not json").expect("corrupt the live login");
+
+    let err = capture_current_login(&mut config, "b", false).expect_err("unreadable live login");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(".credentials.json") && !msg.contains("already exists"),
+        "the read error, not the refusal: {msg}"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// `--new` reaches the capture through the dispatch seam.
+#[test]
+fn capture_new_through_dispatch_keeps_an_id_matched_login_as_a_new_account() {
+    let home = HomeSandbox::new();
+    let (_config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let cli =
+        <crate::cli::Cli as clap::Parser>::try_parse_from(["clauth", "capture", "c", "--new"])
+            .expect("parse");
+
+    crate::dispatch(cli).expect("--new captures as new through dispatch");
+
+    assert_eq!(stored_refresh("c").as_deref(), Some("cc-own-refresh"));
+    assert_eq!(stored_refresh("b").as_deref(), Some("b-old-refresh"));
+}
+
+/// A name typed in another case saves into the profile and is reported by the
+/// roster's spelling.
+#[test]
+fn capture_into_the_owner_by_another_spelling_reports_its_own_name() {
+    let home = HomeSandbox::new();
+    let (_config, _live) = id_matched_newer_login();
+    let (base, _server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"account":{"uuid":"uuid-b"}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(["clauth", "capture", "B"])
+        .expect("parse");
+    let out = crate::out::OutCapture::new();
+    let _capture = out.capture_here();
+
+    crate::dispatch(cli).expect("save into b");
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf8"),
+        "clauth: captured into profile 'b'. It is the active account.\n"
+    );
+    assert_eq!(stored_refresh("b").as_deref(), Some("cc-own-refresh"));
 }
 
 #[test]
@@ -3825,6 +4492,7 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
         &mut config,
         "orphan".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted", None),
     )
     .expect("capture");
@@ -3832,6 +4500,7 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
         &mut config,
         "brandnew".to_string(),
         Default::default(),
+        None,
         login_snapshot("minted2", None),
     )
     .expect("capture brand new");
@@ -4195,6 +4864,103 @@ fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
     );
 }
 
+/// A rename of the ACTIVE profile whose relink is refused (a regular live file
+/// holding another login) has still landed: the error says so and the roster
+/// holds the new name.
+#[test]
+fn a_landed_rename_whose_relink_is_refused_says_so() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rl-old");
+    let new = crate::profile::ProfileName::from("rl-new");
+    let creds = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    crate::testutil::register_names(&["rl-old"]);
+    let mut profile = Profile::new("rl-old".to_string(), None, None);
+    profile.credentials = Some(creds("rl-old-access"));
+    save_profile(&profile).expect("save profile");
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&creds("someone-elses-access")).unwrap(),
+    )
+    .unwrap();
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["rl-old".into()],
+            active_profile: Some("rl-old".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("rl-old"))
+        .expect_err("the relink refuses the foreign live login");
+
+    assert_eq!(
+        err.to_string(),
+        "renamed 'rl-old' to 'rl-new', but the live credentials were not relinked"
+    );
+    let landed = err
+        .downcast_ref::<RenamedButNotRelinked>()
+        .expect("callers tell a landed rename apart by its type");
+    assert!(
+        landed
+            .relink
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "the relink refusal rides as the source: {}",
+        landed.relink
+    );
+    let source = std::error::Error::source(landed).expect("the relink refusal rides as the source");
+    assert!(
+        source
+            .to_string()
+            .starts_with("refusing to replace .credentials.json"),
+        "{source}"
+    );
+    assert_eq!(config.canonical_name("rl-new").as_deref(), Some("rl-new"));
+    let on_disk = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        (
+            on_disk
+                .profiles
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>(),
+            on_disk.active_profile.as_ref().map(|n| n.as_str())
+        ),
+        (vec!["rl-new"], Some("rl-new")),
+        "the landed rename is on disk, active pick included"
+    );
+}
+
+/// A stored name a hand edit gave a control byte prints escaped in the landed
+/// rename's own line, so the refusal cannot drive the terminal.
+#[test]
+fn a_landed_rename_error_escapes_a_control_byte_in_the_old_name() {
+    let landed = RenamedButNotRelinked {
+        old: crate::profile::ProfileName::from("a\u{1b}x"),
+        new: crate::profile::ProfileName::from("b"),
+        relink: anyhow::anyhow!("boom"),
+    };
+    assert_eq!(
+        landed.to_string(),
+        "renamed 'a\\u{001b}x' to 'b', but the live credentials were not relinked"
+    );
+}
+
 /// A reauth overwrite replaces the dead credential chain — the whole point of
 /// re-logging in — so it must lift the profile's `auth_broken` quarantine,
 /// exactly like the fresh-capture path (`capture_into_profile`) does. Left
@@ -4506,6 +5272,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     // create_blank_profile does not activate; mark it active and wire the live
@@ -4563,6 +5330,7 @@ fn delete_refuses_live_session_unless_forced() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -4630,6 +5398,7 @@ fn a_delete_with_no_force_flag_never_names_it_on_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let sessions = home
@@ -4667,8 +5436,15 @@ fn profile_with_a_dead_copy_tree(
     config: &mut AppConfig,
     name: &str,
 ) -> std::path::PathBuf {
-    create_blank_profile(config, name.to_string(), None, None, Default::default())
-        .expect("create profile");
+    create_blank_profile(
+        config,
+        name.to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create profile");
     let claude_home = home.home().join(".claude");
     std::fs::create_dir_all(&claude_home).expect("mkdir .claude");
     std::fs::write(claude_home.join("CLAUDE.md"), "memory").expect("global memory");
@@ -5033,6 +5809,7 @@ fn delete_refuses_a_profile_with_a_background_job_tree_unless_forced() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5100,6 +5877,7 @@ fn a_job_under_another_profile_does_not_block_delete() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -5147,6 +5925,7 @@ fn delete_refuses_while_a_job_record_cannot_be_read() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let job = home.home().join(".claude").join("jobs").join("0add99ec");
@@ -5192,6 +5971,7 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     // Active, so the delete's unwire leg is armed: an api key in the live
@@ -5295,6 +6075,7 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5354,6 +6135,51 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// A comment written above an account in `profiles.toml` describes that
+/// account: after a rename it stays on the new name, never on a neighbour.
+#[test]
+fn a_rename_keeps_the_comment_above_the_account_in_both_lists() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in ["a", "b"] {
+        create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+            None,
+        )
+        .expect("create profile");
+    }
+    let path = home.home().join(".clauth").join("profiles.toml");
+    std::fs::write(
+        &path,
+        "profiles = [\n  # work account\n  \"a\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"a\",\n  \"b\",\n]\n",
+    )
+    .expect("hand edit");
+    config.state = crate::profile::load_app_state().expect("load");
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("a"),
+        &crate::profile::ProfileName::from("z"),
+        &rotation_guard("a"),
+    )
+    .expect("rename");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "profiles = [\n  # work account\n  \"z\",\n  \"b\",\n]\n\
+         fallback_chain = [\n  # try first\n  \"z\",\n  \"b\",\n]\n"
+    );
+}
+
 /// A profile held by a live `clauth start` session must not be renamed — the
 /// rename moves the whole profile directory, which holds the session's runtime
 /// tree, markers and env paths, and nothing rekeys the live-session registry
@@ -5372,6 +6198,7 @@ fn rename_refuses_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5433,6 +6260,7 @@ fn rename_refuses_a_profile_with_a_background_job_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5492,6 +6320,7 @@ fn rename_refuses_a_leftover_target_directory() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5548,6 +6377,7 @@ fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -5625,6 +6455,7 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5684,6 +6515,7 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5730,6 +6562,7 @@ fn a_case_only_rename_is_not_a_collision_with_itself() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5769,6 +6602,7 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     create_blank_profile(
@@ -5777,6 +6611,7 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5805,6 +6640,7 @@ fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5843,6 +6679,7 @@ fn disable_refuses_the_active_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     config.state.active_profile = Some("acme".into());
@@ -5875,6 +6712,7 @@ fn disable_refuses_a_profile_with_a_live_session() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5919,6 +6757,7 @@ fn disable_refuses_a_profile_with_a_background_job_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -5966,6 +6805,7 @@ fn disable_sets_the_flag_and_a_reload_observes_it() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6002,6 +6842,7 @@ fn disable_is_idempotent_on_an_already_disabled_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
     disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
@@ -6112,6 +6953,7 @@ fn enable_is_idempotent_on_an_already_enabled_profile() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create");
 
@@ -6144,6 +6986,7 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -6192,6 +7035,7 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -6733,6 +7577,65 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
             ..crate::profile::OAuthToken::default_extra()
         }),
     }
+}
+
+/// A proxy claim landing after the log out picked the login arm, readable or
+/// not, blanks the key and keeps the stored chain: the claim is read under the
+/// hold that writes. The plain account beside them loses its login and keeps
+/// its key.
+#[test]
+fn a_proxy_claim_landing_after_the_log_out_picked_its_arm_keeps_the_stored_chain() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let names = ["landed-record", "landed-unreadable", "landed-plain"];
+    for name in names {
+        let mut profile = crate::profile::Profile::new(
+            name.to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        profile.credentials = Some(oauth_creds(&format!("at-{name}")));
+        save_profile(&profile).expect("save");
+    }
+    crate::testutil::register_names(&names);
+    let mut stale = crate::profile::load_config().expect("the caller's read");
+    for name in ["landed-record", "landed-unreadable"] {
+        crate::profile::write_proxy_record(
+            &ProfileName::from(name),
+            &crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .expect("write the record");
+    }
+    crate::claude::tests::break_proxy_record("landed-unreadable");
+
+    let outcomes: Vec<_> = names
+        .into_iter()
+        .map(|name| {
+            let name_of = ProfileName::from(name);
+            let store = crate::profile::profile_subpath(&name_of, "credentials.json").unwrap();
+            let stored = std::fs::read(&store).unwrap();
+            let answer = clear_profile_credentials(&mut stale, &name_of).map_err(|e| e.to_string());
+            (
+                name,
+                answer,
+                std::fs::read(&store).ok() == Some(stored),
+                load_profile(&name_of).unwrap().api_key,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            ("landed-record", Ok(()), true, None),
+            ("landed-unreadable", Ok(()), true, None),
+            ("landed-plain", Ok(()), false, Some("clp_key".to_string())),
+        ],
+        "(account, the log out's answer, store kept byte for byte, api key)"
+    );
 }
 
 /// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
@@ -7319,7 +8222,7 @@ fn an_endpoint_edit_drops_the_third_party_disk_cache() {
     edit_profile_preset(
         &mut config,
         &crate::profile::ProfileName::from("cache-preset"),
-        |url, models| {
+        |url, models, _| {
             *url = Some("https://api.z.ai/api/anthropic".to_string());
             *models = crate::profile::ModelSettings::default();
             Ok(())
@@ -7482,6 +8385,519 @@ fn a_failed_endpoint_save_restores_the_in_memory_profile() {
         format!("{after:?}"),
         format!("{before:?}"),
         "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// A preset carrying a base URL, applied to an OAuth account with no key, saves
+/// the URL unused: memory and the live settings hide it as a load would.
+#[test]
+fn a_url_preset_on_an_oauth_account_stays_out_of_memory_and_settings() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+
+    edit_profile_preset(&mut config, &name, |url, models, _| {
+        *url = Some("https://y.example".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
+    .expect("the preset apply saves");
+
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert_eq!(
+        loaded.base_url, None,
+        "a load hides a keyless URL behind the login"
+    );
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "memory derives the URL the way the load does"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the OAuth login: {live:?}"
+    );
+}
+
+/// A preset that moves an account off Alibaba drops its Model Studio console
+/// session, in memory and on disk, as an endpoint edit off Alibaba does.
+#[test]
+fn a_preset_off_alibaba_drops_the_console_session() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("qwen");
+    let mut p = Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        Some("sk-sp-key".to_string()),
+    );
+    p.set_console(Some(crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    }));
+    save_profile(&p).expect("save the Alibaba profile");
+    crate::testutil::register_names(&["qwen"]);
+    let mut config = inactive_config(p);
+
+    edit_profile_preset(&mut config, &name, |url, models, _| {
+        *url = Some("https://api.deepseek.com/anthropic".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
+    .expect("the preset apply saves");
+
+    assert!(
+        config
+            .find(&name)
+            .expect("qwen in the roster")
+            .console
+            .is_none(),
+        "memory drops the console session off Alibaba"
+    );
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert!(
+        loaded.console.is_none(),
+        "disk drops the console session off Alibaba"
+    );
+}
+
+/// Duplicating an OAuth account whose saved base URL is unused copies the URL it
+/// routes to (none): the copy holds no login, so carrying the saved URL would
+/// make it an endpoint account with no key.
+#[test]
+fn a_duplicate_of_an_unused_url_account_carries_no_url() {
+    let _home = HomeSandbox::new();
+    let mut p = Profile::new("src".to_string(), None, None);
+    p.credentials = Some(oauth_pair("access-A"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    save_profile(&p).expect("save the source");
+    crate::testutil::register_names(&["src"]);
+    let mut config = inactive_config(p);
+
+    duplicate_profile(&mut config, &ProfileName::from("src"), "dup".to_string())
+        .expect("duplicate");
+
+    let dup = ProfileName::from("dup");
+    let in_memory = config.find(&dup).expect("dup in the roster");
+    assert_eq!(in_memory.base_url, None, "the copy routes nowhere new");
+    assert_eq!(in_memory.saved_base_url(), None, "the copy saves no URL");
+    let loaded = crate::profile::load_profile(&dup).expect("load the copy");
+    assert_eq!(
+        loaded.saved_base_url(),
+        None,
+        "disk holds no URL for the copy"
+    );
+}
+
+/// A base URL committed with no key on an OAuth account is saved but unused:
+/// the next load hides it behind the login, so memory hides it too. Left live
+/// in memory, the active-profile settings write would put the host in
+/// `ANTHROPIC_BASE_URL` beside the OAuth login, and Claude Code would send the
+/// account's OAuth bearer to it.
+#[test]
+fn a_keyless_url_on_an_oauth_account_stays_out_of_memory_and_settings() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the endpoint edit saves");
+
+    let on_disk = std::fs::read_to_string(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("config.toml"),
+    )
+    .expect("read config.toml");
+    assert!(
+        on_disk.contains("base_url = \"https://y.example\""),
+        "the typed URL is saved"
+    );
+    let loaded = crate::profile::load_profile(&name).expect("load the profile");
+    assert_eq!(
+        loaded.base_url, None,
+        "a load hides a keyless URL behind the login"
+    );
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "memory derives the URL the way the load does"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the OAuth login: {live:?}"
+    );
+}
+
+/// A failed env save restores the in-memory profile to exactly its pre-call
+/// value, as a failed endpoint save does: the env edit re-derives the URL, so a
+/// kept edit would route an unsaved inference token to a URL the disk hides.
+#[cfg(unix)]
+#[test]
+fn a_failed_env_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut p = Profile::new(
+        "acct".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    );
+    p.credentials = Some(oauth_pair("access-A"));
+    crate::profile::save_profile(&p).expect("save the profile");
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    let mut config = inactive_config(crate::profile::load_profile(&name).expect("load"));
+    let before = config.find(&name).expect("acct in the roster").clone();
+    let mut env = BTreeMap::new();
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "tok-unsaved".to_string(),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_env(&mut config, &name, |e| *e = env).expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&name)
+        .expect("acct still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// Committing an EMPTY base-url row on an unused saved URL clears it on disk:
+/// the row states the user's value outright, so emptying a saved-but-unused URL
+/// is not a no-op that leaves the typed value in place.
+#[test]
+fn clearing_an_unused_url_removes_it_from_disk() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .saved_base_url()
+            .as_deref(),
+        Some("https://y.example"),
+        "the keyless commit saves the typed URL"
+    );
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = None;
+        *key = None;
+    })
+    .expect("the clear saves");
+
+    let p = config.find(&name).expect("acct in the roster");
+    assert_eq!(
+        p.saved_base_url(),
+        None,
+        "the cleared row drops the saved URL"
+    );
+    assert_eq!(p.base_url, None, "routing stays on the login");
+    let on_disk = std::fs::read_to_string(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("config.toml"),
+    )
+    .expect("read config.toml");
+    assert!(
+        !on_disk.lines().any(|l| l.starts_with("base_url")),
+        "no base_url line survives on disk:\n{on_disk}"
+    );
+}
+
+/// A preset apply whose save fails restores the in-memory profile: the next
+/// unrelated save must not persist an endpoint the error said did not land.
+#[cfg(unix)]
+#[test]
+fn a_failed_preset_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let p = Profile::new(
+        "acct".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    let mut config = inactive_config(crate::profile::load_profile(&name).expect("load"));
+    let before = config.find(&name).expect("acct in the roster").clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_preset(&mut config, &name, |url, models, _| {
+        *url = Some("https://api.example.com".to_string());
+        *models = ModelSettings::default();
+        Ok(())
+    })
+    .expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&name)
+        .expect("acct still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// A torn store counts as a login for an env edit's re-derive, as at load: a
+/// keyless saved URL stays out of memory and the live settings.
+#[test]
+fn an_env_edit_beside_a_torn_store_keeps_a_keyless_url_hidden() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("torn");
+    save_profile(&Profile::new(
+        "torn".to_string(),
+        Some("https://y.example".to_string()),
+        None,
+    ))
+    .expect("save");
+    crate::testutil::register_names(&["torn"]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    std::fs::write(store, "{").expect("tear the store");
+    let mut config = crate::profile::load_config().expect("load");
+    config.state.active_profile = Some("torn".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+    assert_eq!(config.find(&name).expect("torn").base_url, None);
+    edit_profile_env(&mut config, &name, |env| {
+        env.insert("FOO".to_string(), "bar".to_string());
+    })
+    .expect("the env edit saves");
+    assert_eq!(config.find(&name).expect("torn").base_url, None);
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        !live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry no base URL beside the torn store: {live:?}"
+    );
+}
+
+/// An edit that moves only the key hands the closure the URL saved on disk,
+/// never the in-memory one: a key typed beside an OAuth login's unused saved
+/// URL keeps that URL and makes it live.
+#[test]
+fn a_key_only_edit_beside_an_unused_saved_url_keeps_it_and_goes_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+
+    let mut seen = None;
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        seen = url.clone();
+        *key = Some("sk-1".to_string());
+    })
+    .expect("the key-only edit saves");
+
+    assert_eq!(seen.as_deref(), Some("https://y.example"), "the saved URL");
+    let after = load_profile(&name).expect("reload");
+    assert_eq!(after.saved_base_url().as_deref(), Some("https://y.example"));
+    assert_eq!(after.api_key.as_deref(), Some("sk-1"));
+    assert_eq!(after.base_url.as_deref(), Some("https://y.example"));
+}
+
+/// A preset that carries no base URL, applied with "keep", keeps the account's
+/// unused saved URL.
+#[test]
+fn a_models_only_preset_keeps_an_unused_saved_url() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("mp");
+    let mut p = Profile::new("mp".to_string(), None, None);
+    p.credentials = Some(oauth_pair("ref"));
+    p.replace_base_url(Some("https://y.example".to_string()));
+    p.rederive_base_url();
+    assert_eq!(p.base_url, None, "the url hides behind the login");
+    save_profile(&p).expect("save the account");
+    crate::testutil::register_names(&["mp"]);
+    let mut config = crate::profile::load_config().expect("load");
+    let preset = crate::presets::Preset {
+        name: "models-only".to_string(),
+        base_url: None,
+        models: crate::profile::ModelSettings {
+            default: Some("m1".to_string()),
+            ..Default::default()
+        },
+        builtin: false,
+    };
+    edit_profile_preset(&mut config, &name, |url, models, _| {
+        (*url, *models) = preset.applied_clearing(url, models, &[]);
+        Ok(())
+    })
+    .expect("the preset apply saves");
+    let disk = load_profile(&name).expect("reload");
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some("https://y.example"),
+        "keep keeps the saved url"
+    );
+    assert_eq!(disk.models.default.as_deref(), Some("m1"));
+}
+
+/// An api-key log-out keeps a base URL a peer saved after the caller's read.
+#[test]
+fn an_api_key_log_out_keeps_a_peer_base_url_edit() {
+    let _home = HomeSandbox::new();
+    let acct = ProfileName::from("acct");
+    save_profile(&Profile::new(
+        "acct".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fake-key".to_string()),
+    ))
+    .expect("save acct");
+    crate::testutil::register_names(&["acct"]);
+    let mut stale = crate::profile::load_config().expect("stale read");
+    let mut peer = crate::profile::load_config().expect("peer read");
+    edit_profile_endpoint(&mut peer, &acct, |url, _key| {
+        *url = Some("https://api.example.com".to_string());
+    })
+    .expect("peer edit");
+    clear_profile_api_key(&mut stale, &acct).expect("log out");
+    let after = load_profile(&acct).expect("reload");
+    assert_eq!(
+        after.saved_base_url().as_deref(),
+        Some("https://api.example.com"),
+        "the peer's base-url edit is kept, not rewound"
+    );
+    assert_eq!(after.api_key, None);
+}
+
+/// Adding a key beside a previously unused URL makes memory live and the
+/// active-profile settings carry the URL — the complement of the keyless case,
+/// so the unconditional re-derive cannot strand a now-usable URL.
+#[test]
+fn adding_a_key_beside_an_unused_url_goes_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the OAuth profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+    config.state.active_profile = Some("acct".into());
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = None;
+    })
+    .expect("the keyless endpoint edit saves");
+    assert_eq!(
+        config.find(&name).expect("acct in the roster").base_url,
+        None,
+        "the keyless URL stays hidden in memory"
+    );
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("https://y.example".to_string());
+        *key = Some("sk-1".to_string());
+    })
+    .expect("the keyed endpoint edit saves");
+
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .base_url
+            .as_deref(),
+        Some("https://y.example"),
+        "adding a key makes the saved URL live in memory"
+    );
+    assert_eq!(
+        config
+            .find(&name)
+            .expect("acct in the roster")
+            .api_key
+            .as_deref(),
+        Some("sk-1"),
+        "the key lands beside the URL"
+    );
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(
+        live.contains(&"ANTHROPIC_BASE_URL".to_string()),
+        "the live settings carry the URL once the key lands: {live:?}"
+    );
+}
+
+/// The shunt mint shape — a gateway URL with a freshly minted client token —
+/// keeps both halves live; the unconditional re-derive must not change it.
+#[test]
+fn the_shunt_mint_shape_stays_live() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = Profile::new("acct".to_string(), None, None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    let mut config = inactive_config(profile);
+
+    edit_profile_endpoint(&mut config, &name, |url, key| {
+        *url = Some("http://127.0.0.1:9101".to_string());
+        *key = Some("minted-token".to_string());
+    })
+    .expect("the mint edit saves");
+
+    let p = config.find(&name).expect("acct in the roster");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("http://127.0.0.1:9101"),
+        "the mint keeps the gateway URL live"
+    );
+    assert_eq!(
+        p.api_key.as_deref(),
+        Some("minted-token"),
+        "the mint keeps the client token"
+    );
+    assert_eq!(
+        p.saved_base_url().as_deref(),
+        Some("http://127.0.0.1:9101"),
+        "the mint shape's saved URL equals its live URL"
     );
 }
 
@@ -8459,6 +9875,53 @@ fn the_codex_detach_postscript_names_what_each_slot_did() {
     );
 }
 
+/// Both paths the postscript names come off the filesystem (`CODEX_HOME`, the
+/// home dir), so a control or bidi character in either is spelled as its
+/// escape where it enters the copy: the CLI line and the TUI toast print the
+/// body as it stands, and a raw one could reorder or restyle it.
+#[test]
+fn the_codex_detach_postscript_escapes_both_paths_it_names() {
+    let operator_home = std::path::PathBuf::from("/home/op/\u{202e}own");
+    let operator_slot = operator_home.join("auth.json");
+    let default_slot = std::path::PathBuf::from("/home/op/.co\u{1b}dex/auth.json");
+    let slot = |slot: &std::path::PathBuf, under_operator_home: bool| {
+        crate::actions::DetachedOperatorSlot {
+            slot: slot.clone(),
+            under_operator_home,
+        }
+    };
+    let logged_out = crate::actions::OperatorAuthDetach {
+        operator_home: operator_home.clone(),
+        slots: vec![slot(&operator_slot, true)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&logged_out),
+        vec![(
+            crate::actions::CodexDetachNotice::LoggedOut,
+            format!(
+                "/home/op/\\u{{202e}}own{}auth.json followed that profile's chain and is detached \
+                 now, so your own codex has no login; run `codex login` to mint a fresh one",
+                std::path::MAIN_SEPARATOR
+            ),
+        )],
+        "the detached slot's path is escaped"
+    );
+    let unaffected = crate::actions::OperatorAuthDetach {
+        operator_home,
+        slots: vec![slot(&default_slot, false)],
+    };
+    assert_eq!(
+        crate::actions::codex_detach_postscript(&unaffected),
+        vec![(
+            crate::actions::CodexDetachNotice::Unaffected,
+            "/home/op/.co\\u{1b}dex/auth.json followed that profile's chain and is detached now; \
+             your own codex reads /home/op/\\u{202e}own and is unaffected"
+                .to_string(),
+        )],
+        "the slot and the operator home are both escaped"
+    );
+}
+
 /// The browser login's pre-flight refuses a cross-harness clash before ever
 /// opening a browser — but an own-roster name is a RE-AUTH, so the pre-flight
 /// must NOT refuse it (the earlier `.and(Err(e))` made every re-auth
@@ -8491,6 +9954,41 @@ fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
     let (name, account) = codex_browser_preflight("fresh").expect("fresh clears");
     assert_eq!(name, "fresh");
     assert!(account.is_none(), "a create carries no id");
+}
+
+/// A NEW codex name takes the creation rules at the CLI's login entry, before
+/// any browser opens: a leading `-` and a clauth subcommand are refused there,
+/// never after the browser trip. A stored name of either shape is a re-auth
+/// and stays exempt.
+#[test]
+fn codex_browser_login_refuses_a_new_unaddressable_name_before_the_trip() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["-c", "list"]);
+
+    let err = crate::actions::codex_browser_login_with("-newc", || {
+        panic!("the creation refusal must come before the browser trip");
+    })
+    .expect_err("a new dash-led name refuses");
+    assert_eq!(
+        err.to_string(),
+        "name: letters, digits and - _ . @ + only, and can't start with '.' or '-'"
+    );
+
+    let err = crate::actions::codex_browser_login_with("start", || {
+        panic!("the creation refusal must come before the browser trip");
+    })
+    .expect_err("a new subcommand name refuses");
+    assert_eq!(
+        err.to_string(),
+        "'start' is a clauth command, so `clauth start` can never switch to it; pick another name"
+    );
+
+    let (name, account) = codex_browser_preflight("-c").expect("a stored dash name re-auths");
+    assert_eq!(name, "-c");
+    assert!(
+        account.is_some(),
+        "the re-auth carries the stored profile's id"
+    );
 }
 
 /// `clauth login <name> --codex --browser` on a codex account deleted and
@@ -9139,6 +10637,7 @@ fn blank_profiles(names: &[&str]) -> AppConfig {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -9343,6 +10842,132 @@ fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
             .is_some(),
         "the refused rename moved nothing"
     );
+}
+
+/// Every path under `dir` with its bytes, a directory holding none.
+fn tree_bytes(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    let mut entries = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                std::fs::read_dir(&path)
+                    .expect("read the dir")
+                    .map(|entry| entry.expect("read the entry").path()),
+            );
+            entries.push((path, None));
+        } else {
+            let bytes = std::fs::read(&path).expect("read the file");
+            entries.push((path, Some(bytes)));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// A proxy claim landing after the shared delete's lock-free read refuses in
+/// the hold the removal runs under, with that claim's own sentence: the stored
+/// chain, the profile's every other byte, the roster, the active mark and the
+/// live link stay as the landing left them.
+#[test]
+fn a_proxy_claim_landing_after_the_deletes_read_refuses_in_its_hold() {
+    use crate::claude::tests::{Unclassifiable, break_proxy_record};
+    use crate::profile::{ProfileName, ProxyAccount};
+    type Land = fn(&ProfileName);
+    fn record(name: &ProfileName) {
+        let account = ProxyAccount {
+            service: crate::proxy::Service::parse("stub").expect("service"),
+            account: "acct-1".to_string(),
+        };
+        crate::profile::write_proxy_record(name, &account).expect("write the record");
+    }
+    fn table(name: &ProfileName) {
+        record(name);
+        break_proxy_record(name.as_str());
+    }
+    fn directory(name: &ProfileName) {
+        Unclassifiable::Directory.pose(name.as_str());
+    }
+    fn noted_header(name: &ProfileName) {
+        Unclassifiable::NotedProxyHeader.pose(name.as_str());
+    }
+    let unclassifiable = "can't read the config of 'work', so clauth can't tell whether it is \
+                          an account on a proxy; fix its config.toml, then delete it again";
+
+    // `None`: the sentence naming the record's path, which the sandbox picks.
+    let cases: [(Option<&str>, Land); 4] = [
+        (
+            Some(
+                "'work' is an account on proxy \"stub\": delete it with `clauth delete work`, \
+                 which also deletes it on the proxy",
+            ),
+            record,
+        ),
+        (None, table),
+        (Some(unclassifiable), directory),
+        (Some(unclassifiable), noted_header),
+    ];
+    for (refusal, land) in cases {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("work");
+        let work = crate::testutil::oauth_profile("work", "rt-work");
+        crate::testutil::persist_profiles(std::slice::from_ref(&work));
+        let mut config = crate::profile::load_config().expect("load the config");
+        config.state.active_profile = Some(name.clone());
+        crate::profile::save_app_state(&config.state).expect("persist the active mark");
+        crate::claude::link_profile_credentials(&name).expect("link the live slot");
+
+        let dir = crate::profile::profile_dir(&name).expect("profile dir");
+        let store = dir.join("credentials.json");
+        let stored = std::fs::read(&store).expect("the stored chain");
+        let roster_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml");
+        let roster = std::fs::read(&roster_path).expect("the roster");
+        let live = crate::claude::claude_credentials_path().expect("live slot");
+        let live_login = std::fs::read(&live).expect("the live login");
+
+        let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&landed);
+        let (landing, tree) = (name.clone(), dir.clone());
+        crate::gateway_tokens::set_pre_hold_hook(
+            "work",
+            std::sync::Arc::new(move || {
+                land(&landing);
+                *seen.lock().expect("lock") = tree_bytes(&tree);
+            }),
+        );
+
+        let refused = delete(&mut config, "work");
+
+        let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+        let refusal = refusal.map_or_else(
+            || {
+                format!(
+                    "profile 'work' has a [proxy] table in {path:?} that clauth cannot read, so \
+                     its account on the proxy cannot be deleted; nothing was deleted. Give the \
+                     table a valid `service` and `account`, or remove it to delete the profile \
+                     alone"
+                )
+            },
+            str::to_string,
+        );
+        assert_eq!(refused, Err(refusal));
+        let landed = landed.lock().expect("lock").clone();
+        assert_eq!(
+            (
+                !landed.is_empty(),
+                tree_bytes(&dir) == landed,
+                std::fs::read(&store).expect("the stored chain") == stored,
+                std::fs::read(&roster_path).expect("the roster") == roster,
+                config.find(&name).is_some(),
+                std::fs::read(&live).ok() == Some(live_login),
+            ),
+            (true, true, true, true, true, true),
+            "(the landing ran, the profile dir, the store, the roster on disk, in memory, the \
+             live login)"
+        );
+    }
 }
 
 fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
@@ -9839,6 +11464,7 @@ fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_m
         crate::usage::StreakCounts {
             rate_limit: 3,
             refresh_fail: 0,
+            last_fetch_failed: false,
         },
     );
 }
@@ -10424,6 +12050,7 @@ fn a_same_account_capture_through_the_install_path_forgets_nothing() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         login_snapshot("access-A-again", Some("uuid-A")),
     )
     .expect_err("an orphan login refuses the capture");
@@ -10491,6 +12118,7 @@ fn a_same_account_create_through_the_install_path_forgets_nothing() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         oauth_pair("access-A-again"),
         Some(AccountId::from("uuid-A")),
         None,
@@ -10764,6 +12392,254 @@ fn a_proven_same_account_relogin_forgets_nothing() {
     assert!(
         stores.usage_status.lock().unwrap().contains_key("acct"),
         "the OAuth status survives a proven same-account re-login"
+    );
+}
+
+fn canceled_plan() -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+        ..crate::usage::PlanInfo::default()
+    }
+}
+
+fn active_plan_for(account: &str) -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        subscription_status: Some("active".to_string()),
+        ..plan_for(account)
+    }
+}
+
+/// Re-login `acct` as the same account over a usage cache holding `cached`, one
+/// 5h window and an old mtime, with the login's probe reading `probe`. Runs
+/// `before_login` with the usage-cache path once the fixture is seeded and
+/// before the login, so a fault armed there sees only the login's own write.
+/// Answers the mtime the cache was left with before the login, in epoch ms.
+fn relogin_over_cached_plan(
+    cached: crate::usage::PlanInfo,
+    probe: crate::usage::PlanInfo,
+    before_login: impl FnOnce(&std::path::Path),
+) -> (HomeSandbox, ProfileName, u64) {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, profile_cache_path};
+
+    let home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let info = crate::usage::UsageInfo {
+        plan: Some(cached),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    crate::profile_cache::write_profile_cache(&name, PROFILE_FETCHED_CACHE_FILE, &123u64);
+    let cache_path = profile_cache_path(&name, USAGE_CACHE_FILE).expect("the cache path");
+    let dated_secs = 1_000_000u64;
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dated_secs),
+    );
+    before_login(&cache_path);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        &crate::testutil::profile_id(&name),
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+            plan: Some(probe),
+        },
+    )
+    .expect("same-account re-login");
+    (home, name, dated_secs * 1000)
+}
+
+/// Resubscribing changes the plan and not the account, so a same-account
+/// re-login must carry the plan its probe read: a cached `canceled` otherwise
+/// keeps the account out of every walk until the next hourly `/profile` read.
+/// Only the plan moves. The windows and the age they read as stay, and the
+/// `/profile` clock lapses for the processes holding the old plan in memory.
+#[test]
+fn a_same_account_relogin_corrects_a_canceled_plan_and_keeps_the_windows() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    };
+
+    let (_home, name, dated_ms) =
+        relogin_over_cached_plan(canceled_plan(), active_plan_for("uuid-A"), |_| {});
+
+    let plan = seeded_plan("acct").expect("the cache keeps a plan");
+    assert!(
+        !plan.is_canceled(),
+        "the login's own reading replaces the cached cancellation"
+    );
+    assert_eq!(plan.tier, crate::usage::PlanTier::Max(Some(5)));
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the cache survives");
+    assert_eq!(
+        disk.five_hour.map(|w| w.utilization),
+        Some(42.0),
+        "only the plan moves"
+    );
+    assert_eq!(
+        profile_cache_mtime_ms(&name, USAGE_CACHE_FILE),
+        Some(dated_ms),
+        "old windows must not read as fresh because the plan beside them changed"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "the /profile clock lapses, so a process holding the old plan re-reads it"
+    );
+}
+
+/// A re-login whose probe agrees with the cached plan changes nothing, the
+/// common case: the hourly clock keeps running.
+#[test]
+fn a_same_account_relogin_on_an_unchanged_plan_keeps_the_stamp() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+
+    let (_home, name, _) =
+        relogin_over_cached_plan(active_plan_for("uuid-A"), active_plan_for("uuid-A"), |_| {});
+
+    assert!(load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some());
+}
+
+/// A probe plan paired with another account is not this login's plan, the
+/// same refusal the new-account seed makes.
+#[test]
+fn a_same_account_relogin_ignores_a_plan_paired_with_another_account() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+
+    let (_home, name, _) =
+        relogin_over_cached_plan(canceled_plan(), active_plan_for("uuid-B"), |_| {});
+
+    assert!(
+        seeded_plan("acct").is_some_and(|plan| plan.is_canceled()),
+        "another account's plan never lands"
+    );
+    assert!(load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some());
+}
+
+/// A status change alone is a disagreement: every walk excludes on the status,
+/// so a probe reading `active` over a cached `canceled` corrects the plan on an
+/// unchanged tier, keeping the windows and the file date and lapsing the clock.
+#[test]
+fn a_same_account_relogin_corrects_a_status_change_on_an_unchanged_tier() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    };
+
+    let cached = crate::usage::PlanInfo {
+        subscription_status: Some("canceled".to_string()),
+        ..active_plan_for("uuid-A")
+    };
+    let (_home, name, dated_ms) =
+        relogin_over_cached_plan(cached, active_plan_for("uuid-A"), |_| {});
+
+    let plan = seeded_plan("acct").expect("the cache keeps a plan");
+    assert!(
+        !plan.is_canceled(),
+        "the login's own reading replaces the cached cancellation"
+    );
+    assert_eq!(
+        plan.tier,
+        crate::usage::PlanTier::Max(Some(5)),
+        "the tier never moved"
+    );
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the cache survives");
+    assert_eq!(
+        disk.five_hour.map(|w| w.utilization),
+        Some(42.0),
+        "only the plan moves"
+    );
+    assert_eq!(
+        profile_cache_mtime_ms(&name, USAGE_CACHE_FILE),
+        Some(dated_ms),
+        "the file keeps its date"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "the /profile clock lapses on a status-only disagreement"
+    );
+}
+
+/// A tier change alone is a disagreement too: a probe reading a different tier
+/// over the same `active` status corrects the plan, keeping the windows and the
+/// file date and lapsing the clock.
+#[test]
+fn a_same_account_relogin_corrects_a_tier_change_on_an_unchanged_status() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    };
+
+    let cached = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Pro,
+        ..active_plan_for("uuid-A")
+    };
+    let (_home, name, dated_ms) =
+        relogin_over_cached_plan(cached, active_plan_for("uuid-A"), |_| {});
+
+    let plan = seeded_plan("acct").expect("the cache keeps a plan");
+    assert_eq!(
+        plan.tier,
+        crate::usage::PlanTier::Max(Some(5)),
+        "the login's own reading replaces the cached tier"
+    );
+    assert_eq!(
+        plan.subscription_status.as_deref(),
+        Some("active"),
+        "the status never moved"
+    );
+    let disk = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the cache survives");
+    assert_eq!(
+        disk.five_hour.map(|w| w.utilization),
+        Some(42.0),
+        "only the plan moves"
+    );
+    assert_eq!(
+        profile_cache_mtime_ms(&name, USAGE_CACHE_FILE),
+        Some(dated_ms),
+        "the file keeps its date"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "the /profile clock lapses on a tier-only disagreement"
+    );
+}
+
+/// A correction whose cache write fails still lapses the `/profile` clock, so
+/// the next read re-anchors the plan: the failed write leaves the cached
+/// cancellation on disk, and the lapse is what makes that temporary.
+#[test]
+fn a_correction_whose_write_fails_still_lapses_the_profile_clock() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+
+    let (_home, name, _dated_ms) = relogin_over_cached_plan(
+        canceled_plan(),
+        active_plan_for("uuid-A"),
+        crate::profile::fail_next_dating,
+    );
+
+    assert!(
+        seeded_plan("acct").is_some_and(|plan| plan.is_canceled()),
+        "the failed write leaves the cached cancellation on disk"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "a correction whose write failed still lapses the /profile clock"
     );
 }
 
@@ -11752,6 +13628,7 @@ fn a_delete_then_recreate_forgets_the_old_reading() {
         &mut config,
         "re".to_string(),
         Default::default(),
+        None,
         CaptureSnapshot {
             credentials: Some(oauth_pair("access-B")),
             base_url: None,
@@ -12623,6 +14500,7 @@ fn capture_into_profile_seeds_the_probe_plan() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -12671,6 +14549,7 @@ fn a_failed_install_after_the_seed_leaves_no_usage_cache() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect_err("the app-state save fails after the seed");
@@ -12699,6 +14578,7 @@ fn create_profile_from_login_seeds_the_probe_plan() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -12756,6 +14636,7 @@ fn a_probe_less_install_seeds_nothing() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -12779,6 +14660,7 @@ fn a_plan_for_another_account_is_not_seeded() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -12894,6 +14776,7 @@ fn the_capture_seed_lands_before_the_identity_writes() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");
@@ -12916,6 +14799,7 @@ fn the_create_seed_lands_before_the_identity_writes() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13146,6 +15030,7 @@ fn a_seeded_new_account_is_due_at_once() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13192,6 +15077,7 @@ fn a_failed_create_after_the_seed_leaves_no_usage_cache() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-fresh")),
         Some(plan_for("uuid-fresh")),
@@ -13274,6 +15160,7 @@ fn a_same_account_capture_onto_an_orphan_dir_keeps_the_window() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect_err("the orphan's login refuses the capture");
@@ -13331,6 +15218,7 @@ fn a_same_account_create_onto_an_orphan_dir_keeps_the_window() {
         &mut config,
         "acct".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         Some(AccountId::from("uuid-A")),
         Some(plan_for("uuid-A")),
@@ -13413,6 +15301,7 @@ fn delete_profile_stops_a_tree_supervisor_first() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
         let tree = home
@@ -13469,6 +15358,7 @@ fn delete_profile_refuses_when_a_supervisor_lands_after_the_stop() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13529,6 +15419,7 @@ fn delete_profile_with_force_still_stops_a_verifiable_supervisor() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13578,6 +15469,7 @@ fn delete_profile_refuses_a_verified_supervisor_that_ignores_sigterm() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13635,6 +15527,7 @@ fn delete_profile_with_force_removes_a_verified_supervisor_that_ignores_sigterm(
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13687,6 +15580,7 @@ fn delete_profile_spares_a_tree_whose_post_signal_liveness_read_fails() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13762,6 +15656,7 @@ fn delete_wedges_when_any_wait_read_saw_the_supervisor_alive() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13838,6 +15733,7 @@ fn delete_profile_refuses_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13903,6 +15799,7 @@ fn delete_profile_removes_a_tree_with_a_symlinked_daemon_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -13949,6 +15846,7 @@ fn delete_profile_with_force_removes_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14000,6 +15898,7 @@ fn rename_profile_refuses_an_unverifiable_supervisor_tree() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14065,6 +15964,7 @@ fn a_refused_delete_of_the_active_profile_leaves_it_wired() {
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
         Default::default(),
+        None,
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -14144,6 +16044,7 @@ fn rename_profile_stops_a_tree_supervisor_first() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     let tree = home
@@ -14594,6 +16495,7 @@ fn a_capture_keeps_the_switch_and_chain_edit_made_meanwhile() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -14621,6 +16523,7 @@ fn a_capture_keeps_the_switch_and_chain_edit_made_meanwhile() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("capture over a stale config");
@@ -14680,6 +16583,7 @@ fn seed_two_captured() -> (crate::profile::ProfileName, crate::profile::ProfileN
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -15045,6 +16949,1714 @@ fn live_settings() -> serde_json::Value {
         .expect("parse settings")
 }
 
+/// The live `settings.json` env `ENDPOINT`, or `None` when absent.
+fn live_endpoint() -> Option<String> {
+    live_settings()["env"]["ENDPOINT"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Seed the user's own `ENDPOINT = "user"` into the live `settings.json`.
+fn seed_user_endpoint() {
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = if path.exists() {
+        live_settings()
+    } else {
+        serde_json::json!({})
+    };
+    live["env"]["ENDPOINT"] = serde_json::json!("user");
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("seed user endpoint");
+    assert_eq!(live_endpoint().as_deref(), Some("user"), "control: seeded");
+}
+
+/// A switch onto an account covering the user's key, made while no account is
+/// active (after a switch-off), then a switch away, puts the user's value back.
+#[test]
+fn a_cover_landed_from_switched_off_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "an inactive edit writes nothing live"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "b covers");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// The same flow with a stays active throughout: the control for the test above.
+#[test]
+fn a_cover_landed_from_an_active_account_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "b covers");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// A switch onto an account a peer dropped the api key from mirrors the typed
+/// endpoint and console beside the derived ones: every endpoint row in memory
+/// answers what a fresh load of `config.toml` answers.
+#[test]
+fn a_switch_mirrors_the_typed_endpoint_a_peer_dropped_the_key_from() {
+    let _home = HomeSandbox::new();
+    let (_a, b) = seed_two_captured();
+    // An Alibaba endpoint the account's key makes live, beside its login.
+    let url = "https://coding-intl.dashscope.aliyuncs.com";
+    crate::profile::update_profile_config(&b, |p| {
+        p.replace_base_url(Some(url.to_string()));
+        p.api_key = Some("sk-b".to_string());
+        Ok(())
+    })
+    .expect("stage the endpoint")
+    .expect("b stays on the roster");
+    let mut config = crate::profile::load_config().expect("load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").base_url.as_deref(),
+        Some(url),
+        "control: memory routes the keyed url"
+    );
+
+    // The race: a peer logs the account out and moves its console session, so
+    // disk hides the saved url behind the login while the typed url stands.
+    crate::profile::update_profile_config(&b, |p| {
+        p.api_key = None;
+        p.set_console(Some(crate::profile::ConsoleCredential {
+            token: "console-b".to_string(),
+            site: crate::profile::ConsoleSite::International,
+            region: "ap-southeast-1".to_string(),
+        }));
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("b stays on the roster");
+    let disk = crate::profile::load_profile(&b).expect("the peer state on disk");
+    assert_eq!(disk.base_url, None, "control: the login hides the url");
+    assert_eq!(
+        disk.saved_base_url().as_deref(),
+        Some(url),
+        "control: the peer kept the typed url"
+    );
+    assert!(
+        disk.console.is_some(),
+        "control: the peer's console is saved"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+
+    let fresh = crate::profile::load_profile(&b).expect("fresh load");
+    let memory = config.find(&b).expect("b in memory");
+    assert_eq!(memory.base_url, fresh.base_url);
+    assert_eq!(
+        memory.saved_base_url(),
+        fresh.saved_base_url(),
+        "memory saves the url a fresh load saves"
+    );
+    assert_eq!(
+        memory.console, fresh.console,
+        "memory holds the console session a fresh load holds"
+    );
+}
+
+/// A switch onto an account whose effort a peer changed on disk mirrors it
+/// into memory: the Setup row answers what a fresh load of `config.toml`
+/// answers.
+#[test]
+fn a_switch_mirrors_an_effort_a_peer_changed_meanwhile() {
+    let _home = HomeSandbox::new();
+    let (_a, b) = seed_two_captured();
+    crate::profile::update_profile_config(&b, |p| {
+        p.effort = Some("high".to_string());
+        Ok(())
+    })
+    .expect("stage the effort")
+    .expect("b stays on the roster");
+    let mut config = crate::profile::load_config().expect("load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").effort.as_deref(),
+        Some("high"),
+        "control: memory holds the staged effort"
+    );
+
+    // The race: a peer changes the account's effort after this copy loaded.
+    crate::profile::update_profile_config(&b, |p| {
+        p.effort = Some("max".to_string());
+        Ok(())
+    })
+    .expect("peer edit")
+    .expect("b stays on the roster");
+    assert_eq!(
+        crate::profile::load_profile(&b)
+            .expect("control read")
+            .effort
+            .as_deref(),
+        Some("max"),
+        "control: the peer edit landed"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+
+    let fresh = crate::profile::load_profile(&b).expect("fresh load");
+    assert_eq!(
+        config.find(&b).expect("b in memory").effort,
+        fresh.effort,
+        "memory mirrors the effort a fresh load holds"
+    );
+}
+
+/// A covering account switched off, then deleted while inactive: the next
+/// switch reads the user's value, never the deleted account's.
+#[test]
+fn deleting_a_switched_off_coverer_gives_the_user_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    delete_profile(&mut config, &a, false, &rotation).expect("delete a");
+    drop(rotation);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// Deleting the ACTIVE covering account gives the user's value back.
+#[test]
+fn deleting_the_active_coverer_gives_the_user_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    delete_profile(&mut config, &a, false, &rotation).expect("delete a");
+    drop(rotation);
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// A covering key the active account's `config.toml` gained outside the TUI
+/// (a hand edit), landed by any later settings apply, comes back on switch away.
+#[test]
+fn a_hand_added_cover_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "mine".to_string());
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an unrelated env edit applies the account");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value comes back"
+    );
+}
+
+/// No cover ever lands: an inactive account names the user's key, the state is
+/// switched off, and a switch onto an account lacking it keeps the user's value.
+#[test]
+fn a_switch_from_off_keeps_a_user_key_no_account_ever_applied() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value stays"
+    );
+}
+
+/// Hand-edit the live `settings.json` env: `key` set to `value`, or removed at
+/// `None`, the way the user or a pre-record clauth would.
+fn set_live_env(key: &str, value: Option<&str>) {
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = if path.exists() {
+        live_settings()
+    } else {
+        serde_json::json!({ "env": {} })
+    };
+    let env = live["env"].as_object_mut().expect("env object");
+    match value {
+        Some(value) => env.insert(key.to_string(), serde_json::json!(value)),
+        None => env.remove(key),
+    };
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("hand-edit live settings");
+}
+
+fn base_env_path() -> std::path::PathBuf {
+    crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("base-env.json")
+}
+
+/// The parsed `~/.clauth/base-env.json`.
+fn base_env_record() -> serde_json::Value {
+    crate::profile::read_json_file::<serde_json::Value>(&base_env_path()).expect("parse record")
+}
+
+/// Whether `~/.clauth/base-env.json` holds an entry for `key`.
+fn base_env_record_names(key: &str) -> bool {
+    base_env_path().exists() && base_env_record()["keys"].get(key).is_some()
+}
+
+/// Remove `~/.clauth/base-env.json`, stamp included: the state a clauth that
+/// predates the record leaves behind.
+fn forget_base_env_record() {
+    match std::fs::remove_file(base_env_path()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("remove record: {e}"),
+        _ => {}
+    }
+}
+
+fn seed_third_captured() -> crate::profile::ProfileName {
+    let mut config = crate::profile::load_config().expect("read");
+    capture_into_profile(
+        &mut config,
+        "c".to_string(),
+        Default::default(),
+        None,
+        login_snapshot("c", None),
+    )
+    .expect("seed capture");
+    crate::profile::ProfileName::from("c")
+}
+
+/// A value the user sets while an account covers the key is the user's newest:
+/// the uncover keeps it instead of reverting to the value saved at cover start.
+#[test]
+fn a_user_edit_made_while_covered_survives_the_uncover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    set_live_env("ENDPOINT", Some("user-later"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user-later"));
+}
+
+/// A cover a clauth without the record landed (the live value is the
+/// outgoing account's own, no entry) is still stripped: from a sibling's
+/// settings built off the live file, and from the live file on switch away.
+#[test]
+fn a_cover_from_before_the_record_is_stripped_from_a_sibling_and_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    assert!(!base_env_record_names("ENDPOINT"), "control: no entry");
+
+    let strip = outgoing_env_keys_now(&config).expect("strip list");
+    let sibling = config.find(&b).cloned().expect("b");
+    let copy: serde_json::Value = serde_json::from_str(
+        &crate::claude::build_claude_settings_json(
+            Some(&crate::claude::claude_settings_path().expect("settings path")),
+            &sibling,
+            &strip,
+        )
+        .expect("build b's copy"),
+    )
+    .expect("copy parses");
+    assert_eq!(
+        copy["env"].get("ENDPOINT"),
+        None,
+        "the sibling never sees a's value"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the switch away strips a's value");
+}
+
+/// The first apply after an upgrade that keeps a pre-record cover in place
+/// never saves the account's own value as the user's: the switch away still
+/// strips it instead of writing it back.
+#[test]
+fn a_cover_from_before_the_record_is_never_saved_as_the_users_value() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an unrelated env edit re-applies a");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-secret"),
+        "a still covers"
+    );
+    assert_eq!(
+        base_env_record()["v"],
+        serde_json::json!(1),
+        "the first apply after the upgrade stamps the record"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a's value never comes back as the user's"
+    );
+}
+
+/// An account whose own value equals the user's covers and uncovers it, and
+/// the user's value stays.
+#[test]
+fn an_account_value_equal_to_the_users_stays_after_the_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// Two accounts cover one key in turn, the first from a switched-off state;
+/// the unset that ends the second account's cover gives the user's value back.
+#[test]
+fn two_accounts_covering_one_key_in_turn_give_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    for (name, value) in [(&a, "a-value"), (&b, "b-value")] {
+        edit_profile_env(&mut config, name, |e| {
+            e.insert("ENDPOINT".to_string(), value.to_string());
+        })
+        .expect("edit inactive account");
+    }
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("a-value"), "a covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    edit_profile_env(&mut config, &b, |e| {
+        e.remove("ENDPOINT");
+    })
+    .expect("unset on active b");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A managed key no profile field sets (`ANTHROPIC_CUSTOM_HEADERS`) holding the
+/// user's own value is saved when an account's `[env]` covers it and comes
+/// back when the cover ends, like any custom key.
+#[test]
+fn a_users_own_unlabelled_managed_key_comes_back_after_a_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    set_live_env("ANTHROPIC_CUSTOM_HEADERS", Some("x-user: 1"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ANTHROPIC_CUSTOM_HEADERS".to_string(), "x-a: 1".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_CUSTOM_HEADERS"].as_str(),
+        Some("x-a: 1"),
+        "a covers"
+    );
+    assert!(
+        base_env_record_names("ANTHROPIC_CUSTOM_HEADERS"),
+        "the user's value is saved"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_CUSTOM_HEADERS"].as_str(),
+        Some("x-user: 1")
+    );
+}
+
+/// A covered key the user deletes from the live file during the cover stays
+/// deleted when the cover ends: after the stamp only a current clauth writes,
+/// and it never deletes a covered key, so a missing key is the user's call.
+#[test]
+fn a_key_the_user_deleted_during_a_cover_stays_deleted() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    set_live_env("ENDPOINT", None);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the deletion stands");
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch back to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers again");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b again"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a later cover's end never brings the deleted value back"
+    );
+}
+
+/// An outgoing account whose `config.toml` no longer reads cannot say which
+/// value it wrote, so a key it is listed for with no record entry counts as
+/// clauth's: dropped from a sibling's copy and on switch away, never kept as
+/// the user's.
+#[test]
+fn an_unreadable_outgoing_account_still_has_its_key_stripped() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    forget_base_env_record();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-secret".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    set_live_env("ENDPOINT", Some("a-secret"));
+    std::fs::write(
+        crate::profile::profile_subpath(&a, "config.toml").expect("a's config path"),
+        "not = [toml",
+    )
+    .expect("corrupt a's config");
+    assert!(
+        crate::profile::read_profile(&a).is_err(),
+        "control: a no longer reads"
+    );
+    assert!(!base_env_record_names("ENDPOINT"), "control: no entry");
+
+    let strip = outgoing_env_keys_now(&config).expect("strip list");
+    assert!(strip.iter().any(|k| k == "ENDPOINT"), "control: listed");
+    let sibling = config.find(&b).cloned().expect("b");
+    let copy: serde_json::Value = serde_json::from_str(
+        &crate::claude::build_claude_settings_json(
+            Some(&crate::claude::claude_settings_path().expect("settings path")),
+            &sibling,
+            &strip,
+        )
+        .expect("an unreadable account never blocks the build"),
+    )
+    .expect("copy parses");
+    assert_eq!(
+        copy["env"].get("ENDPOINT"),
+        None,
+        "the sibling never sees a's value"
+    );
+
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint(), None, "the switch away strips a's value");
+}
+
+/// The first live settings apply stamps `~/.clauth/base-env.json` with the
+/// record's version, and the stamp stays once no entry is left.
+#[test]
+fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    assert_eq!(
+        base_env_record(),
+        serde_json::json!({ "v": 1, "active": "a", "keys": {} }),
+        "stamped at the first apply, naming the account it saw active"
+    );
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert!(
+        base_env_record_names("ENDPOINT"),
+        "control: the cover saved"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        base_env_record(),
+        serde_json::json!({ "v": 1, "active": "b", "keys": {} }),
+        "the last entry retired, the stamp stays"
+    );
+}
+
+/// From a switched-off state, a `config.toml` that no longer reads on an
+/// account unrelated to the key never makes the user's value clauth's.
+#[test]
+fn an_unrelated_unreadable_account_never_takes_the_users_key_from_off() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    std::fs::write(
+        crate::profile::profile_subpath(&c, "config.toml").expect("c's config path"),
+        "not = [toml",
+    )
+    .expect("corrupt c's config");
+    assert!(
+        crate::profile::read_profile(&c).is_err(),
+        "control: c no longer reads"
+    );
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("user"),
+        "the user's value stays"
+    );
+}
+
+/// Committing, on the active account, the very value the user's key already
+/// holds keeps it as the user's: the switch away leaves it in place.
+#[test]
+fn pinning_the_users_own_value_on_the_active_account_keeps_it_after_the_cover() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit active a");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// From a switched-off state, a switch onto an account whose own value equals
+/// the user's, then away, keeps the user's value.
+#[test]
+fn a_switch_from_off_onto_an_account_holding_the_users_value_keeps_it() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// b takes over a's cover, and the record update that follows b's live write
+/// is lost (an io failure or a kill between the two writes): b's unset still
+/// gives the user's value back and leaves nothing of b's live.
+#[test]
+fn a_takeover_whose_record_update_was_lost_still_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let before_takeover = std::fs::read(base_env_path()).expect("read record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    std::fs::write(base_env_path(), &before_takeover).expect("lose the update");
+    edit_profile_env(&mut config, &b, |e| {
+        e.remove("ENDPOINT");
+    })
+    .expect("unset on active b");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// "switch off all" ends a cover like a switch away: the user's value comes
+/// back at once and the entry retires.
+#[test]
+fn switching_off_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+}
+
+/// The record keeps the user's own value (it is what comes back) but never a
+/// covering account's raw value, which can be a secret.
+#[test]
+fn the_record_never_holds_an_accounts_own_value() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-secret-value".to_string());
+    })
+    .expect("edit active a");
+    let raw = std::fs::read_to_string(base_env_path()).expect("read record");
+    assert!(
+        base_env_record_names("ENDPOINT"),
+        "control: the cover saved"
+    );
+    assert!(
+        !raw.contains("a-secret-value"),
+        "the account's value is not in the record"
+    );
+    assert!(raw.contains("\"user\""), "the user's value is");
+}
+
+/// A record that does not parse never blocks a switch whose two accounts
+/// cover no key, and the switch leaves the torn bytes for the user to repair.
+#[test]
+fn a_torn_record_never_blocks_a_switch_that_touches_no_covered_key() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// The record save that precedes a first cover's live write is its crash
+/// guard: when that save fails, the live file keeps the user's value.
+#[test]
+fn a_failed_record_save_leaves_the_live_file_untouched() {
+    let home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    let fail = crate::claude::FailBaseEnvSave::new(&home);
+    let edit = edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    });
+    drop(fail);
+    assert!(edit.is_err(), "the failed save fails the edit");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A value the user sets during a cover, then commits on the covering account
+/// itself, stays the user's: the edit's new value on disk never reads as
+/// clauth's earlier write, so the switch away keeps it.
+#[test]
+fn committing_the_users_newer_value_on_the_covering_account_keeps_it() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    set_live_env("ENDPOINT", Some("user-later"));
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "user-later".to_string());
+    })
+    .expect("commit the user's newer value on a");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user-later"));
+}
+
+/// A switch-off drops an `[env]` key a profile field also sets, as a switch
+/// away does: a `claude` started while off never runs on the departed
+/// account's token.
+#[test]
+fn switching_off_drops_an_env_key_a_profile_field_sets() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "a-token".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(
+        live_settings()["env"]["ANTHROPIC_AUTH_TOKEN"].as_str(),
+        Some("a-token"),
+        "control: a's token is live"
+    );
+    assert!(switch_off_locked(&mut config).expect("switch off"));
+    assert_eq!(live_settings()["env"].get("ANTHROPIC_AUTH_TOKEN"), None);
+}
+
+/// A record that does not parse refuses a switch onto an account covering the
+/// user's key: the user's value would otherwise be covered with nothing
+/// saved. The live file and the torn bytes stay as they were.
+#[test]
+fn a_torn_record_refuses_a_switch_onto_a_covering_account() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit inactive b");
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(
+        switch_profile_locked(&mut config, &b).is_err(),
+        "the switch refuses"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// Asserts the switch-off took effect: no account is active on disk and the
+/// live credential slot is gone.
+fn assert_switched_off() {
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        None,
+        "no account stays active"
+    );
+    assert!(
+        std::fs::symlink_metadata(live_credentials_path()).is_err(),
+        "the live credentials are cleared"
+    );
+}
+
+/// A switch-off over a record that does not parse, while the active account
+/// covers the user's key, still switches off: the credentials and the active
+/// marker clear, so an account never keeps spending over a damaged record.
+/// The cover stays live (nothing saved says what to put back) and the torn
+/// bytes stay for the user to repair.
+#[test]
+fn a_torn_record_never_keeps_an_account_active_through_a_switch_off() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert!(
+        std::fs::symlink_metadata(live_credentials_path()).is_ok(),
+        "control: a is linked"
+    );
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read record"),
+        "{ torn",
+        "the torn bytes stay"
+    );
+}
+
+/// A switch-off over a `settings.json` that does not parse still switches
+/// off, and leaves the unparsable bytes as they were.
+#[test]
+fn a_malformed_settings_file_never_keeps_an_account_active_through_a_switch_off() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    std::fs::write(&path, "{ \"env\": { \"ENDPOINT\": \"mine\", } }").expect("break settings");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read settings"),
+        "{ \"env\": { \"ENDPOINT\": \"mine\", } }",
+        "the unparsable bytes stay"
+    );
+}
+
+/// The switch-off that could not put the user's values back says so once:
+/// the line names the departed account and the read failure's chain, which
+/// carries the file's path and the parse position but none of its contents.
+#[test]
+fn a_switch_off_that_cannot_put_back_the_values_logs_one_line() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    std::fs::write(&path, "{ \"env\": { \"ENDPOINT\": \"mine\", } }").expect("break settings");
+    // The failure text comes off the same read the put-back makes, so the
+    // platform's path spelling is not restated here.
+    let read_error = crate::profile::read_json_file::<serde_json::Value>(&path)
+        .expect_err("control: the broken settings do not parse");
+    assert_eq!(
+        format!("{read_error:#}"),
+        format!("failed to parse {} at line 1, column 32", path.display()),
+        "the chain carries the path and the position, no contents"
+    );
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: switched off, but could not put back the settings.json values a's \
+             [env] keys covered: {read_error:#}; the next switch that lands puts them back"
+        )],
+        "one line, naming the account and the read failure"
+    );
+}
+
+/// A switch-off that could not put the user's value back (its `settings.json`
+/// did not parse) leaves it to the next switch that lands: once the user
+/// repairs the file, a switch onto an account covering nothing gives the
+/// user's value back and retires the entry.
+#[test]
+fn the_next_switch_puts_back_what_a_failed_switch_off_could_not() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let good = std::fs::read(&path).expect("read settings");
+    std::fs::write(&path, "{ broken").expect("break settings");
+    assert!(switch_off_locked(&mut config).expect("the switch-off lands"));
+    assert_switched_off();
+    std::fs::write(&path, &good).expect("the user repairs settings");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("mine"),
+        "control: a's cover is still live"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+    assert!(!base_env_record_names("ENDPOINT"), "the entry retires");
+}
+
+/// A switch-off whose marker save fails puts nothing back: the values go back
+/// only after the credentials and the active marker are cleared.
+#[test]
+fn a_switch_off_whose_marker_save_fails_puts_nothing_back() {
+    let home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    assert!(
+        switch_off_locked(&mut config).is_err(),
+        "the marker save fails"
+    );
+    assert!(
+        crate::claude::claude_credentials_path()
+            .expect("link path")
+            .symlink_metadata()
+            .is_err(),
+        "the credentials were cleared before the marker save failed"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+}
+
+/// A switch-off whose credential clear fails puts nothing back: the values go
+/// back only after the live login is gone.
+#[test]
+fn a_switch_off_whose_credential_clear_fails_puts_nothing_back() {
+    let _home = HomeSandbox::new();
+    let (a, _b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    let link = crate::claude::claude_credentials_path().expect("link path");
+    std::fs::remove_file(&link).expect("remove the live link");
+    std::fs::create_dir_all(link.join("x")).expect("a directory the clear cannot remove");
+    assert!(
+        switch_off_locked(&mut config).is_err(),
+        "the credential clear fails"
+    );
+    assert_eq!(live_endpoint().as_deref(), Some("mine"));
+}
+
+/// b takes over a's cover by a switch and the record update after b's live
+/// write is lost; the switch away from b still gives the user's value back,
+/// recognising b's value as b's own off disk.
+#[test]
+fn a_switch_away_after_a_takeover_whose_record_update_was_lost_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let before_takeover = std::fs::read(base_env_path()).expect("read record");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b takes the cover"
+    );
+    std::fs::write(base_env_path(), &before_takeover).expect("lose the update");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// What a switch by a clauth that predates the record does: name `to` active
+/// and set the live `ENDPOINT` to `live`, writing no record entry. A daemon or
+/// TUI left running across an update is such a writer.
+fn old_clauth_switches(
+    config: &mut AppConfig,
+    to: &crate::profile::ProfileName,
+    live: Option<&str>,
+) {
+    set_live_env("ENDPOINT", live);
+    let mut state = crate::profile::load_app_state().expect("read state");
+    state.active_profile = Some(to.clone());
+    crate::profile::save_app_state(&state).expect("save state");
+    *config = crate::profile::load_config().expect("re-read");
+}
+
+/// What a "switch off all" by a clauth that predates the record does: clear
+/// the active marker and leave the live file as it was.
+fn old_clauth_switches_off(config: &mut AppConfig) {
+    let mut state = crate::profile::load_app_state().expect("read state");
+    state.active_profile = None;
+    crate::profile::save_app_state(&state).expect("save state");
+    *config = crate::profile::load_config().expect("re-read");
+}
+
+/// Renaming the active account moves the marker under this clauth's own hand,
+/// never an older clauth's: a value of the user's that equals another
+/// account's own value stays the user's across the next covers.
+#[test]
+fn renaming_the_active_account_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    let renamed = crate::profile::ProfileName::from("a2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
+    rename_profile(&mut config, &a, &renamed, &rotation).expect("rename active a");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &renamed).expect("switch to a2"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// Logging the active account out clears the marker through this clauth's
+/// own save, so the next switch never judges the live file as an older
+/// clauth's: the user's value equal to b's own stays the user's.
+#[test]
+fn logging_out_the_active_account_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    clear_profile_credentials(&mut config, &a).expect("log out active a");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        None,
+        "control: no account active"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The detaching capture clears the marker through this clauth's own save
+/// before its re-activation writes the live file, so that write never judges
+/// the live file as an older clauth's and keeps the user's value.
+#[test]
+fn the_detaching_capture_never_reads_as_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("edit inactive b");
+    overwrite_captured_profile_with(
+        &mut config,
+        &a,
+        &crate::testutil::profile_id("a"),
+        login_snapshot("a-again", None),
+        true,
+    )
+    .expect("detaching capture of a")
+    .expect("a is no proxy account");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The record's account lands before the marker a switch saves: a failed
+/// record write leaves the marker where it was, so the two never part.
+#[test]
+fn a_failed_record_update_leaves_the_marker_where_it_was() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    assert_eq!(
+        base_env_record()["active"],
+        serde_json::json!("a"),
+        "control"
+    );
+    let fail = crate::claude::FailBaseEnvSave::new(&home);
+    let switched = switch_profile_locked(&mut config, &b);
+    drop(fail);
+    assert!(
+        switched.is_err(),
+        "the failed record write fails the switch"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "the marker stays on a"
+    );
+    assert_eq!(base_env_record()["active"], serde_json::json!("a"));
+}
+
+/// An older clauth's switch onto `b`, which covers `ENDPOINT` with `b-value`,
+/// after the user seeded `ENDPOINT = "user"` with `a` active.
+fn older_clauth_covers_with_b(
+    config: &mut AppConfig,
+    a: &crate::profile::ProfileName,
+    b: &crate::profile::ProfileName,
+) {
+    assert!(switch_profile_locked(config, a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(config, b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    old_clauth_switches(config, b, Some("b-value"));
+}
+
+/// A log out of the account an older clauth switched onto keeps the evidence
+/// of that unseen switch: the next apply still strips its value.
+#[test]
+fn a_log_out_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    clear_profile_credentials(&mut config, &b).expect("log out active b");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A rename of the account an older clauth switched onto keeps the evidence of
+/// that unseen switch.
+#[test]
+fn a_rename_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    let renamed = crate::profile::ProfileName::from("b2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&b).expect("rotation guard");
+    rename_profile(&mut config, &b, &renamed, &rotation).expect("rename active b");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A first-account create after an older clauth's cover and switch-off keeps
+/// the evidence of those unseen writes.
+#[test]
+fn a_first_account_create_after_an_older_clauths_cover_never_keeps_its_value() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    old_clauth_switches_off(&mut config);
+    create_profile_from_login(
+        &mut config,
+        "c".to_string(),
+        Default::default(),
+        None,
+        oauth_pair("c-login"),
+        None,
+        None,
+    )
+    .expect("create c");
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A rename after an older clauth's switch away from a cover keeps the
+/// evidence too: the user's value still comes back.
+#[test]
+fn a_rename_after_an_older_clauths_switch_away_still_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    old_clauth_switches(&mut config, &b, None);
+    let renamed = crate::profile::ProfileName::from("b2");
+    let rotation = crate::actions::rotation_guard_for_mutation(&b).expect("rotation guard");
+    rename_profile(&mut config, &b, &renamed, &rotation).expect("rename active b");
+    drop(rotation);
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert!(switch_profile_locked(&mut config, &renamed).expect("switch to b2"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An apply that finds an older clauth's unseen switch and then fails to write
+/// the live file keeps that evidence: the retry still strips the older
+/// clauth's value instead of keeping it as the user's.
+#[test]
+fn a_failed_live_write_keeps_the_evidence_of_an_older_clauths_switch() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &a);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("retry the switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// The first apply after an upgrade that fails its live write leaves the
+/// migration to its retry: with no account active, an older clauth's leftover
+/// cover still reads as clauth's there, so the retry strips it and no later
+/// cover saves it as the user's.
+#[test]
+fn a_failed_first_apply_after_the_upgrade_leaves_the_migration_to_its_retry() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "a-value".to_string());
+        Ok(())
+    })
+    .expect("a carries the key")
+    .expect("on roster");
+    old_clauth_switches(&mut config, &a, Some("a-value"));
+    old_clauth_switches_off(&mut config);
+    forget_base_env_record();
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("retry the switch to b"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "a's leftover never stays as the user's"
+    );
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert!(switch_profile_locked(&mut config, &b).expect("switch back to b"));
+    assert_eq!(live_endpoint(), None, "nor comes back after a later cover");
+}
+
+/// A takeover (b covers a key a covered) whose live write fails leaves a's
+/// value live: it is still clauth's, so the next switch to an account without
+/// the key gives the user's value back instead of keeping a's.
+#[test]
+fn a_takeover_whose_live_write_fails_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-value"),
+        "control: a's cover stays"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An edit of the covering account's own value whose live write fails leaves
+/// the old value live: it is still clauth's, so the next switch away gives
+/// the user's value back instead of keeping the old account value.
+#[test]
+fn an_edit_of_the_covering_value_whose_live_write_fails_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-newer".to_string());
+    });
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("a-value"),
+        "control: the old cover stays"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The next live apply that lands after a failed takeover drops the old
+/// account's digest it kept, so that digest can never later read a value the
+/// user sets as clauth's.
+#[test]
+fn a_landed_apply_after_a_failed_takeover_drops_the_old_digest() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let fault = crate::claude::FailLiveSettingsWrite::new(&home);
+    let failed = switch_profile_locked(&mut config, &b);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert!(
+        base_env_record()["keys"]["ENDPOINT"]
+            .get("pending")
+            .is_some(),
+        "control: the failed takeover kept the old digest"
+    );
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &b).expect("retry the switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("b-value"), "b covers");
+    assert_eq!(
+        base_env_record()["keys"]["ENDPOINT"].get("pending"),
+        None,
+        "the landed apply dropped the old digest"
+    );
+}
+
+/// Once a live apply has dealt with an older clauth's unseen switch, later
+/// applies trust the record again: a value of the user's equal to another
+/// account's own value stays the user's across that account's cover.
+#[test]
+fn a_handled_older_clauth_switch_leaves_later_applies_trusting_the_record() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "control: the unseen switch was handled"
+    );
+    set_live_env("ENDPOINT", Some("user"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("b's value now equals the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch back to a"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// The detaching capture of the account an older clauth switched onto keeps
+/// the evidence of that unseen switch for the re-activation that follows it,
+/// so b's value is still clauth's and the switch away removes it.
+#[test]
+fn a_detaching_capture_after_an_older_clauths_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    overwrite_captured_profile_with(
+        &mut config,
+        &b,
+        &crate::testutil::profile_id("b"),
+        login_snapshot("b-again", None),
+        true,
+    )
+    .expect("detaching capture of b")
+    .expect("b is no proxy account");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// A live apply that handles an older clauth's unseen switch records the
+/// marker it judged, so the switch onto a third account leaves the record
+/// agreeing with the marker: later applies trust it, and the user's value
+/// equal to b's own stays the user's across b's cover.
+#[test]
+fn handling_an_older_clauths_switch_onto_a_third_account_leaves_the_record_trusted() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    older_clauth_covers_with_b(&mut config, &a, &b);
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(
+        live_endpoint(),
+        None,
+        "control: the unseen switch was handled"
+    );
+    set_live_env("ENDPOINT", Some("user"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "user".to_string());
+    })
+    .expect("b's value now equals the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &c).expect("switch back to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// An older clauth covers a key and then switches off, so no account is
+/// active: the covering account's value is still clauth's, never the user's.
+/// The next switch removes it, and no later cover saves it as the user's.
+#[test]
+fn an_older_clauths_cover_then_switch_off_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    old_clauth_switches(&mut config, &b, Some("b-value"));
+    old_clauth_switches_off(&mut config);
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a again"));
+    assert_eq!(live_endpoint(), None, "nor comes back after a later cover");
+}
+
+/// With no older clauth in play, a value the user hand-adds to the active
+/// account's `config.toml` that equals the live value is still the user's:
+/// a re-apply saves it, and the switch away keeps it.
+#[test]
+fn a_hand_added_value_equal_to_the_users_stays_the_users_after_a_reapply() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.insert("ENDPOINT".to_string(), "user".to_string());
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    switch_profile_locked(&mut config, &a).expect("re-apply the active account");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// After the stamp, an older clauth's switch away from a covering account
+/// (it deletes the covered key) is an unseen switch, not the user's deletion:
+/// the next apply puts the user's value back.
+#[test]
+fn an_older_clauths_switch_away_from_a_cover_gives_the_users_value_back() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a covers");
+    old_clauth_switches(&mut config, &b, None);
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("OTHER".to_string(), "x".to_string());
+    })
+    .expect("an edit on active b re-applies it");
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// After the stamp, an older clauth's switch onto a covering account leaves
+/// that account's value live with no entry: it is clauth's, so the next switch
+/// away removes it instead of keeping it as the user's.
+#[test]
+fn an_older_clauths_switch_onto_a_cover_never_leaves_its_value_as_the_users() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    set_live_env("EDITOR", Some("vim"));
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    assert_eq!(live_endpoint(), None, "control: no cover yet");
+    old_clauth_switches(&mut config, &b, Some("b-value"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_endpoint(), None, "b's value never stays as the user's");
+}
+
+/// b takes over a's cover by a switch that dies right after its live write:
+/// neither the record update after it nor the active marker lands. The next
+/// switch away still gives the user's value back, never b's as the user's.
+#[test]
+fn a_takeover_that_dies_after_its_live_write_still_gives_the_users_value_back() {
+    let home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let c = seed_third_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "a-value".to_string());
+    })
+    .expect("edit active a");
+    edit_profile_env(&mut config, &b, |e| {
+        e.insert("ENDPOINT".to_string(), "b-value".to_string());
+    })
+    .expect("edit inactive b");
+    let state_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    let state_before = std::fs::read(&state_path).expect("read state");
+    let fail = crate::claude::FailBaseEnvLanding::new(&home);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    drop(fail);
+    assert_eq!(
+        live_endpoint().as_deref(),
+        Some("b-value"),
+        "b's live write landed"
+    );
+    std::fs::write(&state_path, &state_before).expect("lose the marker save");
+    config = crate::profile::load_config().expect("re-read");
+    assert!(switch_profile_locked(&mut config, &c).expect("switch to c"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
+/// A cover only the record still names (a hand edit dropped the key from the
+/// active account's `config.toml`) is given back on switch away.
+#[test]
+fn a_cover_only_the_record_names_comes_back_on_switch_away() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &a).is_ok());
+    seed_user_endpoint();
+    edit_profile_env(&mut config, &a, |e| {
+        e.insert("ENDPOINT".to_string(), "mine".to_string());
+    })
+    .expect("edit active a");
+    crate::profile::update_profile_config(&a, |p| {
+        p.env.remove("ENDPOINT");
+        Ok(())
+    })
+    .expect("hand edit")
+    .expect("on roster");
+    config = crate::profile::load_config().expect("re-read");
+    assert_eq!(live_endpoint().as_deref(), Some("mine"), "a still covers");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(live_endpoint().as_deref(), Some("user"));
+}
+
 /// A switch refuses a target a peer disabled after the caller's read, and
 /// links nothing.
 #[test]
@@ -15225,6 +18837,7 @@ fn a_failed_roster_write_keeps_a_profile_dir_that_predates_the_create() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -15251,6 +18864,7 @@ fn a_first_account_create_whose_roster_write_fails_keeps_the_login_live() {
         &mut config,
         "first".to_string(),
         Default::default(),
+        None,
         oauth_pair("first-access"),
         None,
         None,
@@ -15292,6 +18906,7 @@ fn a_capture_or_duplicate_whose_roster_write_fails_leaves_nothing() {
             &mut config,
             "c".to_string(),
             Default::default(),
+            None,
             login_snapshot("c", None),
         )
         .expect_err("the roster write fails");
@@ -15380,6 +18995,7 @@ fn a_reconciled_switch_elsewhere_after_a_peer_switch_keeps_each_accounts_own_log
         &mut seeded,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("seed c");
@@ -15610,6 +19226,7 @@ fn a_link_refusal_rollback_keeps_a_dir_that_predates_the_create() {
         &mut config,
         "work".to_string(),
         Default::default(),
+        None,
         login_snapshot("work", None),
     )
     .expect_err("the link refuses");
@@ -15647,6 +19264,7 @@ fn a_failed_roster_write_removes_only_the_files_the_create_wrote() {
         &mut config,
         "left".to_string(),
         Default::default(),
+        None,
         oauth_pair("left"),
         None,
         None,
@@ -15682,6 +19300,7 @@ fn a_create_whose_profile_save_fails_removes_what_it_wrote() {
         &mut config,
         "late".to_string(),
         Default::default(),
+        None,
         oauth_pair("late"),
         None,
         None,
@@ -15774,7 +19393,7 @@ fn every_settings_writer_applies_live_off_the_active_marker_on_disk() {
             edit_profile_model(c, n, |m| m.default = Some("own-model".into()))
         }),
         ("edit_profile_preset", "preset-model", |c, n| {
-            edit_profile_preset(c, n, |_, m| {
+            edit_profile_preset(c, n, |_, m, _| {
                 m.default = Some("preset-model".into());
                 Ok(())
             })
@@ -15854,11 +19473,11 @@ fn a_duplicate_of_a_source_missing_from_memory_names_it() {
     assert_eq!(err.to_string(), "profile 'a' not found");
 }
 
-/// `save_new_profile(` is called only by the four creates, once each: a
+/// `save_new_profile(` is called only by the five creates, once each: a
 /// whole-profile write of a caller-held profile anywhere else reds here. A call
 /// spelled through a `use .. as` alias is the known residual.
 #[test]
-fn every_save_new_profile_call_is_one_of_the_four_creates() {
+fn every_save_new_profile_call_is_one_of_the_five_creates() {
     fn enclosing_fn(before: &str) -> Option<&str> {
         before.lines().rev().find_map(|line| {
             let (qualifiers, rest) = line.trim_start().split_once("fn ")?;
@@ -15905,6 +19524,7 @@ fn every_save_new_profile_call_is_one_of_the_four_creates() {
             "capture_into_profile",
             "create_blank_profile",
             "create_profile_from_login",
+            "create_proxy_profile",
             "duplicate_profile",
         ]
         .map(|f| ("actions.rs".to_string(), f.to_string()))
@@ -15945,6 +19565,7 @@ fn a_login_create_keeps_the_switch_and_chain_edit_made_meanwhile() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None).credentials.unwrap(),
         None,
         None,
@@ -15983,8 +19604,15 @@ fn a_blank_create_keeps_the_switch_and_chain_edit_made_meanwhile() {
     let _home = HomeSandbox::new();
     seed_two_captured();
     let (mut stale, meantime) = stale_config_and_meantime();
-    create_blank_profile(&mut stale, "c".to_string(), None, None, Default::default())
-        .expect("create");
+    create_blank_profile(
+        &mut stale,
+        "c".to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create");
     let after = crate::profile::load_app_state().expect("after");
     assert_eq!(
         after.active_profile, meantime.active_profile,
@@ -16225,6 +19853,7 @@ fn a_reorder_moves_by_name_when_the_roster_changed_meanwhile() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -16264,6 +19893,7 @@ fn a_reorder_of_an_account_a_peer_deleted_rewrites_nothing() {
             &mut fresh,
             name.to_string(),
             Default::default(),
+            None,
             login_snapshot(name, None),
         )
         .expect("seed capture");
@@ -16415,7 +20045,7 @@ fn capture_current_login_decides_activation_off_the_fresh_marker() {
     };
     crate::profile::save_app_state(&peer).expect("peer activation");
     let mut config = empty_config();
-    let became_active = capture_current_login(&mut config, "work").expect("capture");
+    let became_active = capture_current_login(&mut config, "work", false).expect("capture");
     assert!(
         !became_active,
         "the peer-activated account is active, not this capture"
@@ -16465,7 +20095,7 @@ fn every_save_app_state_call_under_src_is_a_known_site() {
     assert_eq!(
         sites,
         std::collections::BTreeMap::from([
-            ("actions.rs".to_string(), 14),
+            ("actions.rs".to_string(), 15),
             ("profile.rs".to_string(), 2),
             ("testutil.rs".to_string(), 3),
         ]),
@@ -16576,7 +20206,7 @@ fn config_writer_cases() -> Vec<ConfigWriterCase> {
                     default: Some("preset-model".into()),
                     ..ModelSettings::default()
                 };
-                edit_profile_preset(c, n, |u, m| {
+                edit_profile_preset(c, n, |u, m, _| {
                     *u = Some(QWEN_BASE.to_string());
                     *m = models;
                     Ok(())
@@ -16746,6 +20376,7 @@ fn a_reconciled_switch_saves_the_live_login_into_an_account_the_copy_lacks() {
         &mut peer,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("a peer creates c");
@@ -16792,7 +20423,8 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
     let (_, out) = through_handle(stale, |h| switch_profile_reconciled(h, &b, Some(&a)));
     assert_eq!(
         out.expect_err("the switch refuses").to_string(),
-        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+        "'a' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
     );
     assert_eq!(
         live_regular_refresh().as_deref(),
@@ -16815,6 +20447,47 @@ fn a_reconciled_switch_whose_capture_cannot_land_keeps_the_live_login() {
             .active_profile,
         Some(a),
         "nothing switched"
+    );
+}
+
+/// A capture that writes nothing refuses as the generic unsaved-login text
+/// instead of reporting success: the live login and both stores stay, so the
+/// relink riding on it never drops the login. Driven at the helper level with
+/// a stale config naming `a` while disk names `b`; no caller passes such a
+/// state (the reconciled arms mirror the disk marker under their hold first,
+/// the TUI arm runs under `while_disk_names_active`), so this post-check has
+/// no caller-level pin.
+#[test]
+fn a_capture_whose_sink_cannot_land_refuses_as_unsaved() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    let mut stale = crate::profile::load_config().expect("stale read");
+    assert_eq!(
+        stale.state.active_profile.as_ref(),
+        Some(&a),
+        "fixture: the copy names a"
+    );
+    peer_switches_to(&b);
+    relogin_live("y5");
+    let err = crate::actions::force_capture_live_login(&mut stale)
+        .expect_err("the capture refuses rather than report success");
+    assert_eq!(
+        err.to_string(),
+        "'a' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(store_refresh("a").as_deref(), Some("a"), "a's store");
+    assert_eq!(store_refresh("b").as_deref(), Some("b"), "b's store");
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-y5"),
+        "the live login stays"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(b),
+        "disk keeps b active"
     );
 }
 
@@ -16922,7 +20595,8 @@ fn a_discard_onto_the_disk_active_account_keeps_its_live_login() {
 }
 
 /// `b` carries `[env] B_KEY`; a peer switches to it (stamping the key live)
-/// then switches off, after `stale` was read naming `a` active.
+/// then switches off, after `stale` was read naming `a` active, leaving the
+/// key live with no record the way a clauth that predates the record does.
 fn departed_account_keys_fixture() -> AppConfig {
     let (_a, b) = seed_two_captured();
     let stale = crate::profile::load_config().expect("stale read");
@@ -16935,6 +20609,9 @@ fn departed_account_keys_fixture() -> AppConfig {
     peer_switches_to(&b);
     let mut peer = crate::profile::load_config().expect("peer read");
     assert!(switch_off_locked(&mut peer).expect("peer switch-off"));
+    // The switch-off of a clauth that predates the record left b's key live.
+    forget_base_env_record();
+    set_live_env("B_KEY", Some("b-secret"));
     assert_eq!(
         live_settings()["env"]["B_KEY"],
         serde_json::json!("b-secret"),
@@ -16960,6 +20637,7 @@ fn a_first_account_activation_strips_the_departed_accounts_keys() {
         &mut stale,
         "c".to_string(),
         Default::default(),
+        None,
         oauth_pair("c-login"),
         None,
         None,
@@ -17047,6 +20725,7 @@ fn a_failed_create_over_a_leftover_dir_puts_back_what_it_overwrote() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect_err("the roster write fails");
     }
@@ -17113,6 +20792,7 @@ fn a_failed_undo_over_a_leftover_dir_names_the_file() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -17142,6 +20822,7 @@ fn a_failed_undo_names_every_file_it_left() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     let denied = std::io::Error::from_raw_os_error(13);
@@ -17178,6 +20859,7 @@ fn a_failed_undo_names_a_leftover_it_could_not_read() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect_err("the roster write fails");
     assert_eq!(
@@ -17206,9 +20888,16 @@ fn leftover_login_refusal(name: &str) -> String {
 #[test]
 fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
     type Create = fn(&mut AppConfig) -> Result<()>;
-    let creates: [(&str, Create); 4] = [
+    let creates: [(&str, Create); 5] = [
         ("blank", |config| {
-            create_blank_profile(config, "left".to_string(), None, None, Default::default())
+            create_blank_profile(
+                config,
+                "left".to_string(),
+                None,
+                None,
+                Default::default(),
+                None,
+            )
         }),
         ("duplicate", |config| {
             duplicate_profile(config, &ProfileName::from("src"), "left".to_string())
@@ -17218,6 +20907,7 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 config,
                 "left".to_string(),
                 Default::default(),
+                None,
                 login_snapshot("minted", None),
             )
         }),
@@ -17226,8 +20916,22 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
                 config,
                 "left".to_string(),
                 Default::default(),
+                None,
                 oauth_pair("minted"),
                 None,
+                None,
+            )
+        }),
+        ("proxy", |config| {
+            create_proxy_profile(
+                config,
+                "left".to_string(),
+                crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-left".to_string(),
+                },
+                "http://127.0.0.1:9141".to_string(),
+                "clp_left-key".to_string(),
                 None,
             )
         }),
@@ -17241,6 +20945,7 @@ fn a_create_over_a_leftover_login_refuses_and_keeps_its_bytes() {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("a source to duplicate");
         let dir = crate::profile::profile_dir(&ProfileName::from("left")).expect("dir");
@@ -17292,6 +20997,7 @@ fn a_create_over_a_leftover_config_alone_lands() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("the create lands");
     assert!(
@@ -17369,6 +21075,7 @@ fn three_accounts_a_relogged() -> (ProfileName, ProfileName, ProfileName) {
         &mut seeded,
         "c".to_string(),
         Default::default(),
+        None,
         login_snapshot("c", None),
     )
     .expect("seed c");
@@ -17574,6 +21281,134 @@ fn a_switch_off_a_long_lived_account_never_offers_to_save_into_it() {
     );
 }
 
+/// A headless switch whose `Overwrite` default lands on an outgoing account
+/// running on a long-lived token refuses with the long-lived line — that
+/// account's store cannot hold the login, the same sentence the CLI's prompt
+/// path refuses with — never the generic unsaved-login text, and changes
+/// nothing.
+#[test]
+fn a_headless_overwrite_off_a_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &b,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
+/// A headless switch whose `Overwrite` default lands on the already-active
+/// account running on a long-lived token refuses with the long-lived line —
+/// that account's store cannot hold the login — never the generic
+/// unsaved-login text, and changes nothing.
+#[test]
+fn a_headless_overwrite_onto_the_active_long_lived_account_refuses_with_the_long_lived_line() {
+    fn no_network(
+        _rt: &str,
+        _scopes: Option<&str>,
+    ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    }
+    let _home = HomeSandbox::new();
+    let (a, _) = seed_two_captured();
+    crate::testutil::write_long_lived_sidecar(&a);
+    relogin_live("a-new");
+    assert!(
+        crate::claude::live_diverged_and_unsaved(&a).expect("classify"),
+        "fixture: a's live re-login is unsaved"
+    );
+    let stale = crate::profile::load_config().expect("stale read");
+    let (_, result) = through_handle(stale, |h| {
+        switch_profile_noninteractive(
+            h,
+            &a,
+            Some(crate::profile::DivergenceChoice::Overwrite),
+            no_network,
+            None,
+        )
+    });
+    let err = result.expect_err("refused");
+    assert_eq!(
+        err.deep_refusal(),
+        Some(
+            "'a' runs on a long-lived token and cannot hold this login; save it as another \
+             account first: `clauth capture <new name>`"
+                .to_string()
+        ),
+        "the long-lived line, not the generic unsaved-login text"
+    );
+    assert_eq!(
+        store_refresh("a").as_deref(),
+        Some("a"),
+        "a keeps its own chain"
+    );
+    assert_eq!(
+        store_refresh("b").as_deref(),
+        Some("b"),
+        "b keeps its own chain"
+    );
+    assert_eq!(
+        live_regular_refresh().as_deref(),
+        Some("refresh-a-new"),
+        "the re-login stays live"
+    );
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("state")
+            .active_profile,
+        Some(a),
+        "nothing switched"
+    );
+}
+
 /// Another re-login landing while the CLI prompt waits: the answer was about
 /// the login the prompt saw, so it saves nothing and the prompt asks again
 /// about the login live now.
@@ -17689,6 +21524,7 @@ fn a_peer_took_the_name_n() -> AppConfig {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("a source to duplicate");
     let stale = crate::profile::load_config().expect("stale read");
@@ -17698,6 +21534,7 @@ fn a_peer_took_the_name_n() -> AppConfig {
         None,
         Some("sk-peer".to_string()),
         Default::default(),
+        None,
     )
     .expect("the peer's create");
     stale
@@ -17746,6 +21583,7 @@ fn a_login_create_onto_a_name_a_peer_took_refuses() {
         &mut stale,
         "n".to_string(),
         Default::default(),
+        None,
         oauth_pair("minted"),
         None,
         None,
@@ -17768,6 +21606,7 @@ fn a_create_of_a_login_another_account_stores_refuses() {
                 config,
                 "dup".to_string(),
                 Default::default(),
+                None,
                 login_snapshot("a", None),
             )
         }),
@@ -17780,6 +21619,7 @@ fn a_create_of_a_login_another_account_stores_refuses() {
                 config,
                 "dup".to_string(),
                 Default::default(),
+                None,
                 login,
                 None,
                 None,
@@ -17852,8 +21692,14 @@ fn a_active_with_bs_saved_login_live() {
         {
             oauth.access_token = format!("acc-{name}");
         }
-        capture_into_profile(&mut seeded, name.to_string(), Default::default(), snapshot)
-            .expect("seed capture");
+        capture_into_profile(
+            &mut seeded,
+            name.to_string(),
+            Default::default(),
+            None,
+            snapshot,
+        )
+        .expect("seed capture");
     }
     let b = ProfileName::from("b");
     let b_store = crate::profile::profile_dir(&b)
@@ -17984,6 +21830,7 @@ fn a_switch_off_an_account_without_a_login_never_adopts_a_saved_one() {
         Some("https://api.example.test".to_string()),
         Some("sk-keyed".to_string()),
         Default::default(),
+        None,
     )
     .expect("the api-key account");
     crate::profile::update_app_state(|s, held| s.set_active(Some("keyed".into()), held))
@@ -18167,7 +22014,7 @@ fn the_cli_onto_the_active_account_over_a_login_another_account_stores_relinks_i
     relogin_live("x15");
     let mut capturing = crate::profile::load_config().expect("read");
     assert!(
-        !capture_current_login(&mut capturing, "d").expect("the capture"),
+        !capture_current_login(&mut capturing, "d", false).expect("the capture"),
         "d is captured beside the active a"
     );
     let stale = crate::profile::load_config().expect("stale read");
@@ -18216,7 +22063,7 @@ fn the_cli_save_answer_after_a_peer_saved_the_login_elsewhere_relinks_the_active
     let stdin = ScriptedStdin::new(vec![(
         Box::new(|| {
             let mut peer = crate::profile::load_config().expect("peer read");
-            capture_current_login(&mut peer, "d").expect("the peer's capture");
+            capture_current_login(&mut peer, "d", false).expect("the peer's capture");
         }),
         "y\n",
     )]);
@@ -18961,4 +22808,442 @@ fn the_cli_keeps_the_exemption_with_no_peer_write() {
         "a stays flagged"
     );
     crate::testutil::switch_race_seam::assert_empty();
+}
+
+// ── the shared rolling-token arm ────────────────────────────────────────────
+
+/// The shared arm action rolls the flag back on a failed arm WITHOUT
+/// rewinding a concurrent edit to another `config.toml` key made between the
+/// flag write and the failure: the rollback re-reads the profile fresh, so
+/// the peer's edit survives it.
+#[test]
+fn a_failed_arm_rolls_the_flag_back_without_rewinding_a_mid_arm_edit() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-midarm");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-expiring".to_string(),
+            refresh_token: Some("rt-expiring".to_string()),
+            // Within the gate's refresh grace, so the arm calls the refresher
+            // instead of stamping from the stored chain.
+            expires_at: Some(crate::usage::now_ms() as i64 + 60_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let edited = name.clone();
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, move |_rt: &str, _scopes: Option<&str>| {
+        // A peer's edit landing between the flag write and the arm's failure:
+        // the refresher edits another config key through the same fresh-disk
+        // writer the rollback uses, then fails the refresh.
+        crate::profile::update_profile_config(&edited, |p| {
+            p.models.default = Some("claude-sonnet-4-5".to_string());
+            Ok(())
+        })
+        .expect("the mid-arm edit lands");
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
+    })
+    .expect_err("the failed refresh fails the arm");
+
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "the failed arm rolls the flag back");
+    assert_eq!(
+        after.models.default.as_deref(),
+        Some("claude-sonnet-4-5"),
+        "the mid-arm edit survives the rollback"
+    );
+}
+
+/// A pre-armed profile keeps its flag on a failed arm: the rollback restores
+/// the PRIOR value, never a hardcoded off. The unrecorded grant refuses the
+/// stamp without touching the network, so the panic refresher proves the
+/// refresh never ran.
+#[test]
+fn a_pre_armed_profile_keeps_its_flag_on_a_failed_arm() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-prearmed");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-unrecorded".to_string(),
+            refresh_token: Some("rt-unrecorded".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes");
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("an unrecorded grant refuses before any refresh")
+    })
+    .expect_err("the unrecorded grant refuses the arm");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::Transient(_)),
+        "{:?}",
+        failure.refusal
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(
+        after.rolling_token,
+        "a flag that was already on is left on — the rollback restores the PRIOR value"
+    );
+}
+
+/// An account that left the roster between the pre-arm read and the flag
+/// write refuses the arm as a typed refusal: the write silently wrote
+/// nothing, so the arm must not run for it (and report a success nothing
+/// will re-stamp).
+#[test]
+fn an_account_that_left_the_roster_refuses_the_arm_typed() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("roll-gone");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-gone".to_string(),
+            refresh_token: Some("rt-gone".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let state = AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+
+    let pre = precheck_rolling_token(&name).expect("the pre-arm passes on the roster");
+    // The account leaves the roster after the pre-arm read, before the flag
+    // write.
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![],
+        ..AppState::default()
+    })
+    .expect("the account leaves the roster");
+
+    let failure = arm_rolling_token(pre, |_rt: &str, _scopes: Option<&str>| {
+        panic!("the arm must not run for an account that left the roster")
+    })
+    .expect_err("the flag write refused");
+    assert!(
+        matches!(failure.refusal, RollingArmRefusal::GoneFromRoster),
+        "{:?}",
+        failure.refusal
+    );
+    assert_eq!(
+        failure.refusal.sentence(&name),
+        "profile 'roll-gone' not found",
+        "the off-roster sentence is the CLI's own not-found head"
+    );
+    let after = crate::profile::load_profile(&name).expect("reload");
+    assert!(!after.rolling_token, "no flag was ever written");
+}
+
+/// The roster a rename acts on is the one read under the flock. A racing rename
+/// took `rs-old` after the caller loaded its config, so this one refuses with
+/// the CLI's own not-found head instead of reporting a rename that moved nothing.
+#[test]
+fn a_rename_whose_old_name_left_the_fresh_roster_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rs-old");
+    let new = crate::profile::ProfileName::from("rs-new");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rs-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rs-taken".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rs-old"))
+        .expect_err("the fresh roster no longer holds the old name");
+
+    assert_eq!(err.to_string(), "profile 'rs-old' not found");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![crate::profile::ProfileName::from("rs-taken")]
+    );
+}
+
+/// A name the fresh roster holds under another case is taken: every resolution
+/// site folds, so landing it would leave one of the two unaddressable. The
+/// caller's own check ran on a config loaded before the racing rename landed.
+#[test]
+fn a_rename_onto_a_name_the_fresh_roster_holds_by_case_refuses_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rc-old");
+    let new = crate::profile::ProfileName::from("rc-new");
+    crate::testutil::register_names(&["rc-old"]);
+    save_profile(&Profile::new("rc-old".to_string(), None, None)).expect("save profile");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rc-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rc-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rc-old".into(), "RC-NEW".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rc-old"))
+        .expect_err("the fresh roster holds the new name under another case");
+
+    assert_eq!(err.to_string(), "a profile named 'rc-new' already exists");
+    let after = crate::profile::load_app_state().expect("reload state");
+    assert_eq!(
+        after.profiles,
+        vec![
+            crate::profile::ProfileName::from("rc-old"),
+            crate::profile::ProfileName::from("RC-NEW"),
+        ]
+    );
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A racing rename took the name and moved its directory there: that directory
+/// holds a live account, so the loser hears the name is taken and is never told
+/// to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_rename_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("rw-old");
+    let new = crate::profile::ProfileName::from("rw-new");
+    crate::testutil::register_names(&["rw-old", "rw-new"]);
+    save_profile(&Profile::new("rw-old".to_string(), None, None)).expect("save old");
+    save_profile(&Profile::new("rw-new".to_string(), None, None)).expect("save winner");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["rw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("rw-old".to_string(), None, None)],
+    };
+    let on_disk = AppState {
+        profiles: vec!["rw-old".into(), "rw-new".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&on_disk).expect("persist state");
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("rw-old"))
+        .expect_err("the fresh roster holds the new name");
+
+    assert_eq!(err.to_string(), "a profile named 'rw-new' already exists");
+    assert!(
+        crate::profile::profile_dir(&new).unwrap().exists(),
+        "the winner's directory stays put"
+    );
+}
+
+/// A codex create took the name and wrote its store: that directory holds a
+/// single-use login, so the rename hears the name is a codex account and is
+/// never told to delete it as an orphan.
+#[test]
+fn a_rename_onto_a_name_a_racing_codex_create_took_never_calls_its_directory_an_orphan() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cw-old");
+    let new = crate::profile::ProfileName::from("cw-new");
+    crate::testutil::register_names(&["cw-old"]);
+    save_profile(&Profile::new("cw-old".to_string(), None, None)).expect("save old");
+    let mut stale = AppConfig {
+        state: AppState {
+            profiles: vec!["cw-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cw-old".to_string(), None, None)],
+    };
+    let store = crate::profile::profile_dir(&new).unwrap().join("auth.json");
+    let written = store.clone();
+    crate::gateway_tokens::set_pre_hold_hook(
+        "cw-old",
+        std::sync::Arc::new(move || {
+            crate::testutil::write_codex_roster(&["cw-new"]);
+            std::fs::create_dir_all(written.parent().unwrap()).expect("create the codex directory");
+            std::fs::write(&written, "{}").expect("write the codex store");
+        }),
+    );
+
+    let err = rename_profile(&mut stale, &old, &new, &rotation_guard("cw-old"))
+        .expect_err("the codex roster holds the new name");
+
+    assert_eq!(
+        err.to_string(),
+        "'cw-new' is a codex profile. Profile names span both harnesses, so pick another"
+    );
+    assert!(store.exists(), "the codex store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A codex capture whose roster save failed left the only copy of its
+/// single-use login in a directory no account claims: the rename keeps its
+/// hands off and never advises deleting it.
+#[test]
+fn a_rename_onto_a_codex_store_no_account_claims_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cs-old");
+    let new = crate::profile::ProfileName::from("cs-new");
+    crate::testutil::register_names(&["cs-old"]);
+    save_profile(&Profile::new("cs-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cs-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cs-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cs-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cs-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert!(
+        crate::profile::profile_dir(&old).unwrap().exists(),
+        "the old directory stays put"
+    );
+}
+
+/// A dangling `auth.json` link still marks a codex store: the name is refused
+/// the same way, never read as an empty orphan.
+#[cfg(unix)]
+#[test]
+fn a_rename_onto_a_dangling_codex_store_link_never_advises_deleting_it() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cl-old");
+    let new = crate::profile::ProfileName::from("cl-new");
+    crate::testutil::register_names(&["cl-old"]);
+    save_profile(&Profile::new("cl-old".to_string(), None, None)).expect("save old");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cl-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cl-old".to_string(), None, None)],
+    };
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::os::unix::fs::symlink(new_dir.join("gone"), new_dir.join("auth.json"))
+        .expect("link the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cl-old"))
+        .expect_err("the directory holds a codex store's link");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cl-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+}
+
+/// A record whose directory is gone is no half-done rename of a codex store:
+/// that path's retry would hand the store to a claude account, whose delete
+/// then destroys the only copy of the login.
+#[test]
+fn a_rename_of_a_record_with_no_directory_never_adopts_a_codex_store() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("cd-old");
+    let new = crate::profile::ProfileName::from("cd-new");
+    crate::testutil::register_names(&["cd-old"]);
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["cd-old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("cd-old".to_string(), None, None)],
+    };
+    assert!(
+        !crate::profile::profile_dir(&old).unwrap().exists(),
+        "precondition: the record has no directory"
+    );
+    let new_dir = crate::profile::profile_dir(&new).unwrap();
+    std::fs::create_dir_all(&new_dir).expect("create the store's directory");
+    std::fs::write(new_dir.join("auth.json"), "{}").expect("write the store");
+
+    let err = rename_profile(&mut config, &old, &new, &rotation_guard("cd-old"))
+        .expect_err("the directory holds a codex login");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "'cd-new' has a directory at {} holding a codex login with no account behind it, \
+             keep the directory and pick another name",
+            new_dir.display()
+        )
+    );
+    assert!(new_dir.join("auth.json").exists(), "the store stays put");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("reload state")
+            .profiles
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
+        ["cd-old"],
+        "the record keeps its name"
+    );
 }

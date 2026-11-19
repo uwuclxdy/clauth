@@ -3,12 +3,16 @@
 //! # Design
 //!
 //! Two-phase load, emitted as two events per run so the tab paints instantly:
-//! 1. **Base stats** ([`load_base`]) — parsed from `~/.claude/stats-cache.json`,
-//!    which Claude Code maintains as a pre-aggregated lifetime snapshot. A single
-//!    small JSON file, so it returns in well under a millisecond and is the tab's
-//!    first paint instead of a blank "reading ~/.claude".
+//! 1. **Base stats** ([`load_frozen_base`]) — parsed from
+//!    `~/.clauth/stats-base.json`, a frozen copy of the
+//!    `~/.claude/stats-cache.json` Claude Code maintains as a pre-aggregated
+//!    lifetime snapshot. The global file advances when a shared tree's `/stats`
+//!    result goes back at the tree's end; the frozen copy does not, so the tab's
+//!    figures never move with it. A single small JSON file, so it returns in well
+//!    under a millisecond and is the tab's first paint instead of a blank
+//!    "reading ~/.claude".
 //! 2. **Live top-up** ([`merge_topup`]) — appends days from `~/.claude/projects/`
-//!    transcripts strictly newer than the cache's `lastComputedDate`, avoiding
+//!    transcripts strictly newer than the base's `lastComputedDate`, avoiding
 //!    double-counting days already in the snapshot. The recursive sweep also
 //!    reaches subagent/workflow transcripts under `<session>/subagents/`. Each
 //!    response is deduplicated by `message.id` (a content composite when absent,
@@ -54,6 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use crate::logline::logline;
 use crate::poll::run_polling_loop;
 use crate::pricing::HourTokens;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
@@ -644,6 +649,14 @@ struct StatsCacheFile {
     hour_counts: HashMap<String, u64>,
 }
 
+/// `StatsCacheFile`'s date alone: a body whose other fields changed shape still
+/// yields its `lastComputedDate`, so a publish or freeze does not stop silently.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatsCacheDate {
+    last_computed_date: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct WireActivity {
@@ -763,6 +776,13 @@ const ADVISOR_ITERATION: &str = "advisor_message";
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
+/// Claude Code's aggregate, in `~/.claude` and in a shared tree.
+pub(crate) const STATS_CACHE_FILE: &str = "stats-cache.json";
+
+/// The tab's base under `~/.clauth`: the first dated global stats cache clauth
+/// saw, frozen before any publish replaces a dated file.
+pub(crate) const STATS_BASE_FILE: &str = "stats-base.json";
+
 /// Why the stats-cache base read failed: each failure maps to its own lowercase
 /// cause line, without exposing an upstream error body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -785,24 +805,171 @@ impl TokensLoadError {
     }
 }
 
+/// The typed cause of a failed read of the stats cache at `path`.
+pub(crate) fn read_error(e: &std::io::Error, path: &Path) -> TokensLoadError {
+    let kind = e.kind();
+    match kind {
+        std::io::ErrorKind::NotFound => TokensLoadError::Missing,
+        // Windows refuses to open a directory as a file with an access error.
+        std::io::ErrorKind::PermissionDenied if path.is_dir() => {
+            TokensLoadError::ReadFailed(std::io::ErrorKind::IsADirectory.to_string())
+        }
+        std::io::ErrorKind::PermissionDenied => TokensLoadError::PermissionDenied,
+        // `ErrorKind::Uncategorized` is unstable (`io_error_uncategorized`), so its
+        // Display text is the stable way to recognize the kind.
+        _ if kind.to_string() == "uncategorized error" => match e.raw_os_error() {
+            Some(code) => TokensLoadError::ReadFailed(format!("os error {code}")),
+            None => TokensLoadError::ReadFailed(kind.to_string()),
+        },
+        kind => TokensLoadError::ReadFailed(kind.to_string()),
+    }
+}
+
 /// Parse `stats-cache.json` into the base view-model — the fast first phase of
 /// the load. No transcript sweep, so it returns in well under a millisecond; the
 /// background loader emits this for an instant first paint, then merges the live
 /// transcript top-up ([`merge_topup`]). Fails with the typed cause the tab
 /// surfaces.
 pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError> {
-    let cache_path = claude_dir.join("stats-cache.json");
-    let raw = match std::fs::read_to_string(&cache_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TokensLoadError::Missing);
+    parse_stats_file(&claude_dir.join(STATS_CACHE_FILE))
+}
+
+/// [`load_base`] over the frozen base ([`STATS_BASE_FILE`]), freezing it first
+/// when none exists. The tab's cutoff is the frozen `lastComputedDate`, so a
+/// later global file never hands ledger days (cache split, hours, served-model
+/// correction) over to stats-cache rows that carry none of those. An unusable
+/// frozen file costs the freeze, never the tab: the global file stands in.
+pub(crate) fn load_frozen_base(
+    claude_dir: &Path,
+    clauth_dir: &Path,
+) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = freeze_stats_base(claude_dir, clauth_dir) {
+        logline!("clauth: could not freeze the stats base: {e}");
+    }
+    match parse_stats_file(&clauth_dir.join(STATS_BASE_FILE)) {
+        Ok(stats) => Ok(stats),
+        Err(TokensLoadError::Missing) => load_base(claude_dir),
+        Err(e) => {
+            logline!(
+                "clauth: reading the global stats cache, the frozen base failed: {}",
+                e.cause_line()
+            );
+            load_base(claude_dir)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(TokensLoadError::PermissionDenied);
-        }
-        Err(e) => return Err(TokensLoadError::ReadFailed(e.kind().to_string())),
+    }
+}
+
+/// Test seam for [`freeze_stats_base`]'s second frozen-file check: a hook run
+/// once between the global read and the check, posing a publisher that froze
+/// the same base while this one read. Test-only.
+#[cfg(test)]
+pub(crate) struct StatsFreezeRereadHook;
+
+#[cfg(test)]
+thread_local! {
+    static STATS_FREEZE_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl StatsFreezeRereadHook {
+    pub(crate) fn arm(hook: impl FnMut() + 'static) -> Self {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatsFreezeRereadHook {
+    fn drop(&mut self) {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_stats_freeze_reread_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&STATS_FREEZE_REREAD_HOOK) {
+        hook();
+    }
+}
+
+/// Copy the global stats cache to the frozen base, unless a frozen file is
+/// already there; it is never overwritten. A global file that does not exist,
+/// or holds no date the tab could cut off at, has nothing to freeze, which is
+/// `Ok`. A frozen body without a date would outlive every dated replacement of
+/// the global file and pin the tab's cutoff to that file for good.
+pub(crate) fn freeze_stats_base(claude_dir: &Path, clauth_dir: &Path) -> std::io::Result<()> {
+    let frozen = clauth_dir.join(STATS_BASE_FILE);
+    let is_frozen = || frozen.metadata().is_ok_and(|meta| meta.is_file());
+    if is_frozen() {
+        return Ok(());
+    }
+    let bytes = match read_stats_bytes(&claude_dir.join(STATS_CACHE_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    let wire: StatsCacheFile = match serde_json::from_str(&raw) {
+    if stats_cache_date(&bytes).is_none() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    run_stats_freeze_reread_hook();
+    // A publisher freezes before it moves a dated global file, so its moved
+    // bytes can only be in hand here with the frozen file already in place. A
+    // global that was absent has nothing to freeze: the moved file is the base.
+    if is_frozen() {
+        return Ok(());
+    }
+    crate::profile::atomic_write_600(&frozen, bytes)
+}
+
+/// Refuse anything at `path` but a regular file, links followed: a FIFO would
+/// hang the reading thread.
+fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        // The kind `read_error` maps a directory to, so the tab's typed cause
+        // line does not change.
+        return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+    }
+    Err(std::io::Error::other("not a regular file"))
+}
+
+/// The bytes of the regular file at `path`, links followed.
+pub(crate) fn read_stats_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    require_regular_file(path)?;
+    std::fs::read(path)
+}
+
+/// A stats-cache body's `lastComputedDate` as epoch seconds; `None` for a body
+/// that does not parse or carries no usable date. The date is checked against
+/// the calendar first: the arithmetic parser accepts `2026-99-99`, which would
+/// sort after every real date.
+pub(crate) fn stats_cache_date(bytes: &[u8]) -> Option<i64> {
+    let wire: StatsCacheDate = serde_json::from_slice(bytes).ok()?;
+    let date = wire.last_computed_date?;
+    chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+    iso_to_epoch_secs(&format!("{date}T00:00:00+00:00"))
+}
+
+/// Parse the stats cache at `path` into the base view-model. A FIFO or a
+/// directory at either stats-cache name is refused instead of read.
+fn parse_stats_file(path: &Path) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = require_regular_file(path) {
+        return Err(read_error(&e, path));
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => return Err(read_error(&e, path)),
+    };
+    parse_stats_json(raw.as_bytes())
+}
+
+fn parse_stats_json(raw: &[u8]) -> Result<TokenStats, TokensLoadError> {
+    let wire: StatsCacheFile = match serde_json::from_slice(raw) {
         Ok(wire) => wire,
         Err(e) => return Err(TokensLoadError::InvalidJson(e.to_string())),
     };
@@ -910,23 +1077,54 @@ pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError
 }
 
 /// Full synchronous load: parse the stats-cache, sweep transcripts once, merge.
-/// Test-only — the background [`spawn`] loader uses `load_base` + `merge_topup`
-/// directly so it can paint the base instantly and reuse its per-file cache.
+/// Test-only — the background [`spawn`] loader uses [`load_frozen_base`] +
+/// `merge_topup` directly so it can paint the base instantly and reuse its
+/// per-file cache.
 #[cfg(test)]
 pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let mut base = load_base(claude_dir).ok()?;
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
-    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache, |_, _| {});
-    merge_topup(&mut base, &cache, lcd.as_deref(), &today);
+    let cutoff = match lcd.as_deref() {
+        Some(date) => TopUpCutoff::After(date),
+        // A rollup with no computed date already holds days we cannot locate.
+        None => TopUpCutoff::Skip,
+    };
+    refresh_topup_cache(claude_dir, cutoff, &mut cache, |_, _| {});
+    merge_topup(&mut base, &cache, cutoff, &today);
     Some(base)
 }
 
 /// Current UTC calendar date as "YYYY-MM-DD".
 pub(crate) fn today_date() -> String {
+    #[cfg(test)]
+    if let Some(pinned) = TODAY_OVERRIDE.with(|c| c.borrow().clone()) {
+        return pinned;
+    }
     let iso = epoch_secs_to_iso(now_epoch_secs());
     iso.get(..10).map(str::to_owned).unwrap_or(iso)
+}
+
+// Test-only: pins [`today_date`] for the bucket-rollover tests, restoring
+// the real clock after, even on a panic.
+#[cfg(test)]
+thread_local! {
+    static TODAY_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_today_pinned<T>(date: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TODAY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    TODAY_OVERRIDE.with(|c| *c.borrow_mut() = Some(date.to_owned()));
+    let _restore = Restore;
+    run()
 }
 
 // ── Period bucketing ─────────────────────────────────────────────────────────
@@ -1194,6 +1392,27 @@ struct FileContrib {
     recs: Vec<LineRec>,
 }
 
+/// How far a transcript sweep may read. A missing rollup is not the same as a
+/// dateless one: with no stats cache nothing is counted yet, so the sweep has
+/// to read every transcript; a rollup that exists but carries no
+/// `lastComputedDate` already holds days the sweep cannot locate, so counting
+/// everything would double count them. A datable boundary reads only past it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopUpCutoff<'a> {
+    All,
+    After(&'a str),
+    Skip,
+}
+
+impl TopUpCutoff<'_> {
+    /// Whether this sweep accounts for every day up to today: the whole history
+    /// (`All`), or past a boundary that the base/ledger already cover (`After`).
+    /// `Skip` reads nothing, so the ledger watermark must not advance across it.
+    fn covers_all_days(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+}
+
 /// Per-file transcript contributions persisted across the loader's 90s sweeps.
 /// Only files whose mtime advanced (or are new) get re-read; everything else is
 /// re-merged from memory, so the multi-hundred-MB full re-read that the old sweep
@@ -1211,16 +1430,20 @@ struct TopUpCache {
 /// now runs only for what actually changed between ticks.
 fn refresh_topup_cache(
     claude_dir: &Path,
-    last_computed_date: Option<&str>,
+    cutoff: TopUpCutoff<'_>,
     cache: &mut TopUpCache,
     mut progress: impl FnMut(usize, usize),
 ) {
-    let Some(cutoff_date) = last_computed_date else {
-        cache.files.clear();
-        return;
-    };
-    let Some(cutoff_st) = date_to_cutoff(cutoff_date) else {
-        return;
+    let cutoff_st = match cutoff {
+        TopUpCutoff::Skip => {
+            cache.files.clear();
+            return;
+        }
+        TopUpCutoff::All => None,
+        TopUpCutoff::After(date) => match date_to_cutoff(date) {
+            Some(st) => Some(st),
+            None => return,
+        },
     };
     let projects_dir = claude_dir.join("projects");
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1245,8 +1468,8 @@ fn refresh_topup_cache(
         };
         // mtime guard: a file untouched since the cutoff can hold no post-cutoff
         // lines, so it never enters the cache (and its today lines, if any, would
-        // also predate the cutoff day).
-        if mtime <= cutoff_st {
+        // also predate the cutoff day). A full sweep has no cutoff to guard against.
+        if cutoff_st.is_some_and(|st| mtime <= st) {
             cache.files.remove(&path);
             continue;
         }
@@ -1272,11 +1495,15 @@ fn refresh_topup_cache(
 fn merge_topup(
     base: &mut TokenStats,
     cache: &TopUpCache,
-    last_computed_date: Option<&str>,
+    cutoff: TopUpCutoff<'_>,
     today_date: &str,
 ) {
-    let Some(cutoff_date) = last_computed_date else {
-        return; // no safe boundary
+    // An empty boundary sorts before every real date, so `All` counts every
+    // transcript line; `Skip` counts none of them.
+    let cutoff_date = match cutoff {
+        TopUpCutoff::Skip => return,
+        TopUpCutoff::All => "",
+        TopUpCutoff::After(date) => date,
     };
 
     // Token aggregates seeded from base so post-cutoff days extend, never replace.
@@ -1858,8 +2085,9 @@ fn backfill_corpus(
 /// [`crate::token_ledger::Ledger::backfill_hours`] (exact-or-absent fill),
 /// which also marks the pass done. Returns whether the pass ran — i.e.
 /// whether a save should follow. Called by the tokens worker after
-/// `record`, so the watermark is already at yesterday and the sweep's
-/// line-date bound is the finalized-day boundary. Runs synchronously inside the
+/// `record_covering`, so the watermark sits at yesterday only after a sweep
+/// that covered every day, and the sweep's line-date bound is the
+/// finalized-day boundary. Runs synchronously inside the
 /// worker's single tick, so the pass never overlaps the next 90s cycle —
 /// the polling loop serializes ticks by construction. The filled hours
 /// reach the UI on the NEXT tick: the current run's merged base was built
@@ -1921,17 +2149,18 @@ fn run_remap(
 /// Persist the ledger after a merge: record newly-finalized days, then run
 /// the one-shot v1→v2 backfill, the one-shot shape re-derive and the
 /// one-shot served-model re-derive. Each save is independent of whether
-/// `record` changed anything — a done flag must persist even on an idle
-/// cycle, or the corpus re-sweeps every 90s.
+/// `record_covering` changed anything — a done flag must persist even on an
+/// idle cycle, or the corpus re-sweeps every 90s.
 fn persist_ledger(
     claude_dir: &Path,
     ledger: &mut crate::token_ledger::Ledger,
     dir: &Path,
     base: &TokenStats,
     today: &str,
+    sweep_covers_all_days: bool,
     mut progress: impl FnMut(usize, usize),
 ) {
-    if ledger.record(base, today) {
+    if ledger.record_covering(base, today, sweep_covers_all_days) {
         ledger.save(dir);
     }
     // The speed ledger is written by the producer at day rollover; the tokens
@@ -1980,9 +2209,10 @@ pub(crate) enum TokensEvent {
 ///
 /// `claude_dir` and `clauth_dir` must already be resolved by the caller — the
 /// worker never re-resolves `home_dir()`, matching the pattern in `status::spawn`.
-/// `clauth_dir` is where the durable per-day ledger lives; `None` disables it (the
-/// tab still works off stats-cache + transcripts, just without the aged-day
-/// backfill / cold-start bound).
+/// `clauth_dir` holds the durable per-day ledger and the frozen stats base;
+/// `None` disables both (the tab still works off the global stats cache +
+/// transcripts, just without the aged-day backfill, the cold-start bound, or a
+/// cutoff that stays put).
 pub(crate) fn spawn(
     tx: Sender<TokensEvent>,
     refresh_rx: Receiver<()>,
@@ -1993,8 +2223,22 @@ pub(crate) fn spawn(
         let mut cache = TopUpCache::default();
 
         let run = |cache: &mut TopUpCache| {
-            let mut base = match load_base(&claude_dir) {
+            let loaded = match clauth_dir.as_deref() {
+                Some(dir) => load_frozen_base(&claude_dir, dir),
+                None => load_base(&claude_dir),
+            };
+            let mut rollup_missing = false;
+            let mut base = match loaded {
                 Ok(base) => base,
+                // No rollup on disk yet — a fresh machine, a wiped `~/.claude`,
+                // or a Claude Code build that hasn't written one. The ledger and
+                // the transcripts are still there, so an absent cache is an
+                // empty base, never a failed tab. A cache that exists and cannot
+                // be read still reports its cause.
+                Err(TokensLoadError::Missing) => {
+                    rollup_missing = true;
+                    TokenStats::default()
+                }
                 Err(cause) => {
                     let _ = tx.send(TokensEvent::Failed(cause));
                     return;
@@ -2019,29 +2263,46 @@ pub(crate) fn spawn(
             // Sweep only past the ledger watermark, so a frozen `lastComputedDate`
             // can't keep the cold-start read growing.
             let today = today_date();
-            let cutoff = ledger
+            let cutoff_date = ledger
                 .as_ref()
                 .and_then(|l| l.effective_cutoff(lcd.as_deref()))
                 .or_else(|| lcd.clone());
+            // Three states: a datable boundary (base or ledger) bounds the read;
+            // with no rollup at all a first launch must sweep every transcript
+            // because nothing is counted yet; a dateless rollup keeps the skip
+            // path, where counting everything would double count its days.
+            let cutoff = match cutoff_date.as_deref() {
+                Some(date) => TopUpCutoff::After(date),
+                None if rollup_missing => TopUpCutoff::All,
+                None => TopUpCutoff::Skip,
+            };
             // Throttled progress: every 25th file plus the final one, so a
             // several-hundred-file sweep paints a moving count at ~1/25 the
             // per-file send volume (warm cycles still emit; render ignores
             // them — see `App::tokens_progress`).
-            refresh_topup_cache(&claude_dir, cutoff.as_deref(), cache, |done, total| {
+            refresh_topup_cache(&claude_dir, cutoff, cache, |done, total| {
                 if done % 25 == 0 || done == total {
                     let _ = tx.send(TokensEvent::Progress { done, total });
                 }
             });
-            merge_topup(&mut base, cache, cutoff.as_deref(), &today);
+            merge_topup(&mut base, cache, cutoff, &today);
             // Persist: newly-finalized days first, then the one-shot passes.
             // All run inside this one tick, so no sweep overlaps another or
             // the next 90s cycle's.
             if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
-                persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
-                    if done % 25 == 0 || done == total {
-                        let _ = tx.send(TokensEvent::Progress { done, total });
-                    }
-                });
+                persist_ledger(
+                    &claude_dir,
+                    l,
+                    dir,
+                    &base,
+                    &today,
+                    cutoff.covers_all_days(),
+                    |done, total| {
+                        if done % 25 == 0 || done == total {
+                            let _ = tx.send(TokensEvent::Progress { done, total });
+                        }
+                    },
+                );
                 // Re-read the producer's latest folds so the Loaded event
                 // carries the fresh day sums.
                 apply_speed_ledger(&mut base, crate::token_ledger::SpeedLedger::load(dir));

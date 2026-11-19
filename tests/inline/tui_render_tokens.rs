@@ -429,6 +429,50 @@ fn total_card_groups_kv_rows_and_carries_the_range_meta() {
     assert!(out.contains("1,000"), "session count is comma-grouped");
 }
 
+/// A focused card's border is one token: the dashes closing its meta badge
+/// must not fall back to the blurred line color.
+#[test]
+fn a_focused_cards_meta_dashes_carry_the_focused_border() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_dash_focus = crate::tui::app::CardKind::Total;
+    let (w, h) = (120u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains(" TOTAL "))
+        .expect("the total card renders");
+    let cells: Vec<char> = rows[y].chars().collect();
+    let title_x = rows[y]
+        .find(" TOTAL ")
+        .map(|b| rows[y][..b].chars().count());
+    let title_x = title_x.expect("title column");
+    let left = (0..title_x).rev().find(|&x| cells[x] == '╭').expect("╭");
+    let right = (title_x..cells.len())
+        .find(|&x| cells[x] == '╮')
+        .expect("╮");
+    let strong = crate::tui::theme::line_strong_color();
+    let off: Vec<(usize, ratatui::style::Color)> = (left..=right)
+        .filter_map(|x| {
+            let cell = buf.cell((x as u16, y as u16)).unwrap();
+            (matches!(cell.symbol(), "─" | "╭" | "╮") && cell.fg != strong).then_some((x, cell.fg))
+        })
+        .collect();
+    assert!(
+        rows[y].contains("jun 21 ─╮"),
+        "the meta badge renders on the focused card, got {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        off,
+        Vec::new(),
+        "every border cell of the focused card's top row is the focused border color"
+    );
+}
+
 // ── model rows: unpriced cost dash ────────────────────────────────────────────
 
 #[test]
@@ -3239,15 +3283,15 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
     std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
     std::fs::create_dir(dir.join("stats-cache.json")).unwrap();
     let unreadable = crate::tokens::load_base(&dir).expect_err("a directory fails");
-    // Windows refuses to read a directory as a file with an access error, so
-    // the same fault surfaces there through the permission arm.
-    let expected = if cfg!(windows) {
-        "permission denied"
-    } else {
-        "read failed: is a directory"
-    };
-    assert_eq!(unreadable.cause_line(), expected);
+    // One cause on every OS: Windows refuses a directory with an access error,
+    // and the directory still reads as a directory there.
+    assert_eq!(unreadable.cause_line(), "read failed: is a directory");
     std::fs::remove_dir(dir.join("stats-cache.json")).unwrap();
+
+    std::fs::write(dir.join("stats-cache.json"), [0xff, 0xfe, 0x00]).unwrap();
+    let not_utf8 = crate::tokens::load_base(&dir).expect_err("non-UTF-8 bytes fail");
+    assert_eq!(not_utf8.cause_line(), "read failed: invalid data");
+    std::fs::remove_file(dir.join("stats-cache.json")).unwrap();
 
     #[cfg(unix)]
     {
@@ -3260,4 +3304,201 @@ fn each_stats_cache_failure_maps_to_its_cause_line() {
         let denied = crate::tokens::load_base(&dir).expect_err("unreadable file fails");
         assert_eq!(denied.cause_line(), "permission denied");
     }
+}
+
+/// A machine with no `stats-cache.json` yet — Claude Code writes the rollup late,
+/// or not at all before the first compaction — still builds the Tokens tab from
+/// what is on disk. Before the fix the worker sent `Failed(Missing)` and returned
+/// before the ledger fold and the transcript sweep, so a fresh install, a rebuilt
+/// box, or a wiped `~/.claude` showed only "unreadable".
+#[test]
+fn a_missing_stats_cache_builds_the_tab_from_the_ledger() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    let clauth = sb.home().join(".clauth");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        clauth.join("token_ledger.json"),
+        r#"{"recorded_through":"2026-06-01",
+            "days":{"2026-06-01":{"opus":
+              {"input":1000,"output":2000,"cache_read":0,"cache_create":0}}}}"#,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    crate::tokens::spawn(tx, refresh_rx, claude, Some(clauth));
+    let stats = loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
+            Ok(crate::tokens::TokensEvent::Failed(cause)) => {
+                panic!(
+                    "a missing stats cache failed the tab: {}",
+                    cause.cause_line()
+                )
+            }
+            Ok(_) => {}
+            Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+        }
+    };
+    drop(refresh_tx);
+    assert_eq!(
+        stats.total_input, 1000,
+        "the ledger's input reached the tab"
+    );
+    assert_eq!(
+        stats.total_output, 2000,
+        "the ledger's output reached the tab"
+    );
+    assert!(
+        stats
+            .daily
+            .iter()
+            .any(|d| d.date == "2026-06-01" && d.tokens == 3000),
+        "the ledger day reached the tab: {:?}",
+        stats.daily
+    );
+}
+
+/// The #165 first launch: no stats cache, no ledger, only transcripts. With
+/// nothing counted yet the sweep has no lower date bound, so every transcript
+/// counts; before the fix the absent `lastComputedDate` read as "read nothing"
+/// and the tab painted empty while the ledger recorded the history as zero.
+#[test]
+fn a_first_launch_counts_every_transcript() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    let clauth = sb.home().join(".clauth");
+    let project = claude.join("projects/p1");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        project.join("sess.jsonl"),
+        [
+            r#"{"timestamp":"2026-06-11T10:00:00+00:00","message":{"model":"claude-opus-4","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"timestamp":"2026-06-12T10:00:00+00:00","message":{"model":"claude-opus-4","usage":{"input_tokens":80,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    crate::tokens::spawn(tx, refresh_rx, claude, Some(clauth.clone()));
+    let stats = loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(crate::tokens::TokensEvent::Loaded(stats)) => break *stats,
+            Ok(crate::tokens::TokensEvent::Failed(cause)) => {
+                panic!("a first launch failed the tab: {}", cause.cause_line())
+            }
+            Ok(_) => {}
+            Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+        }
+    };
+    drop(refresh_tx);
+    assert_eq!(stats.total_input, 200, "both transcript days counted");
+    assert_eq!(stats.total_output, 50, "both transcript days counted");
+    assert_eq!(
+        stats
+            .daily
+            .iter()
+            .map(|d| (d.date.as_str(), d.tokens))
+            .collect::<Vec<_>>(),
+        vec![("2026-06-11", 150), ("2026-06-12", 100)],
+        "the pre-launch history reached the tab: {:?}",
+        stats.daily
+    );
+    // The sweep read the whole history, so the ledger may keep the days.
+    let ledger = std::fs::read_to_string(clauth.join("token_ledger.json")).unwrap();
+    assert!(
+        ledger.contains("\"2026-06-11\"") && ledger.contains("\"2026-06-12\""),
+        "the ledger kept the swept days: {ledger}"
+    );
+}
+
+/// A rollup that exists but carries no `lastComputedDate` already holds days
+/// the sweep cannot locate: counting every transcript would double count them,
+/// and the sweep must not claim (or watermark) days it never read.
+#[test]
+fn a_dateless_rollup_skips_the_sweep() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    let clauth = sb.home().join(".clauth");
+    let project = claude.join("projects/p1");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        claude.join("stats-cache.json"),
+        r#"{"totalSessions":1,"totalMessages":2,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("sess.jsonl"),
+        r#"{"timestamp":"2026-06-11T10:00:00+00:00","message":{"model":"claude-opus-4","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
+    crate::tokens::spawn(tx, refresh_rx, claude, Some(clauth.clone()));
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(crate::tokens::TokensEvent::Loaded(_)) => break,
+            Ok(crate::tokens::TokensEvent::Failed(cause)) => {
+                panic!("the dateless rollup failed the tab: {}", cause.cause_line())
+            }
+            Ok(_) => {}
+            Err(e) => panic!("no Loaded event from the tokens worker: {e}"),
+        }
+    }
+    drop(refresh_tx);
+    // Nothing was swept, so the ledger may stay absent — but a saved ledger
+    // must hold no transcript day and leave the watermark unset, or a later
+    // launch would mistake the unswept history for counted days.
+    if let Ok(raw) = std::fs::read_to_string(clauth.join("token_ledger.json")) {
+        assert!(
+            !raw.contains("2026-06-11"),
+            "a skipped sweep must not record transcript days: {raw}"
+        );
+        let ledger: serde_json::Value =
+            serde_json::from_str(&raw).expect("the saved ledger parses");
+        assert!(
+            ledger.get("recorded_through").is_none_or(|v| v.is_null()),
+            "a skipped sweep must not advance the watermark: {raw}"
+        );
+    }
+}
+
+/// The access error Windows returns for a directory reads as a directory on
+/// every OS, while the same error on a file stays a permission cause.
+#[test]
+fn a_permission_error_on_a_directory_names_the_directory() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".claude");
+    std::fs::create_dir_all(dir.join("stats-cache.json")).unwrap();
+    let file = dir.join("other.json");
+    std::fs::write(&file, "{}").unwrap();
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+    assert_eq!(
+        crate::tokens::read_error(&denied, &dir.join("stats-cache.json")).cause_line(),
+        "read failed: is a directory"
+    );
+    assert_eq!(
+        crate::tokens::read_error(&denied, &file).cause_line(),
+        "permission denied"
+    );
+}
+
+/// An error kind std leaves uncategorized names its raw OS code instead of a
+/// word that says nothing.
+#[test]
+fn an_uncategorized_read_error_names_its_raw_os_code() {
+    let home = crate::testutil::HomeSandbox::new();
+    let file = home.home().join("other.json");
+    std::fs::write(&file, "{}").unwrap();
+    // 999 is no errno or Win32 code std maps to a named kind.
+    let unnamed = std::io::Error::from_raw_os_error(999);
+    assert_eq!(
+        crate::tokens::read_error(&unnamed, &file).cause_line(),
+        "read failed: os error 999"
+    );
 }

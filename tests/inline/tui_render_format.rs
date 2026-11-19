@@ -63,7 +63,7 @@ fn cell_is_always_exactly_width() {
 
 /// CJK is two cells per char: a 5-cell column holds two glyphs plus `…`.
 #[test]
-fn fixed_split_budgets_display_cells_for_cjk() {
+fn fixed_split_budgets_grapheme_cells_for_cjk() {
     assert_eq!(fixed_split("日本語", 5), ("日本…".into(), "".into()));
     assert_eq!(fixed_split("日本語", 6).0, "日本語");
 }
@@ -78,7 +78,7 @@ fn fixed_split_keeps_a_wide_glyph_whole_at_an_odd_budget() {
 
 /// `truncate` shares the cell budget: the content is `fixed_split`'s.
 #[test]
-fn truncate_budgets_display_cells() {
+fn truncate_budgets_grapheme_cells() {
     assert_eq!(truncate("日本語", 5), "日本…");
     assert_eq!(truncate("日本語", 6), "日本語");
     assert_eq!(truncate("🧭🧭", 3), "🧭…");
@@ -89,7 +89,7 @@ fn truncate_budgets_display_cells() {
 /// Middle ellipsis budgets both halves by cells, so a CJK path's head and tail
 /// stay inside the column instead of the tail being silently dropped.
 #[test]
-fn middle_truncate_budgets_display_cells_for_cjk() {
+fn middle_truncate_budgets_grapheme_cells_for_cjk() {
     assert_eq!(middle_truncate("日本語/アカウント", 12), "日本語…ント");
     assert_eq!(middle_truncate("🧭🧭🧭🧭", 5), "🧭…🧭");
     // ASCII stays byte-identical to the old char budget.
@@ -142,6 +142,21 @@ fn helpers_budget_lam_alef_per_grapheme() {
     assert_eq!(fixed("لا", 3), "لا ");
 }
 
+/// A halfwidth katakana sound mark (U+FF9E) draws its own cell though
+/// `unicode-width` reports it zero (`Grapheme_Extend`), and the buffer
+/// advances each grapheme by `CellWidth::cell_width` — `unicode-width` plus
+/// one cell per mark. `ｶﾞｶﾞ` is two clusters drawing 2 cells each, so 4 drawn
+/// where a per-grapheme `Span::width` sum reads 2: `grapheme_cells` counts 4
+/// and `prefix_in_cells` keeps one cluster of a 3-cell budget (the next would
+/// draw 4).
+#[test]
+fn helpers_budget_katakana_sound_marks_by_cell_width() {
+    assert_eq!(grapheme_cells("ｶﾞｶﾞ"), 4);
+    assert_eq!(grapheme_cells("ｶﾞ"), 2);
+    assert_eq!(prefix_in_cells("ｶﾞｶﾞ", 3), ("ｶﾞ".into(), 2));
+    assert_eq!(prefix_in_cells("ｶﾞｶﾞ", 4), ("ｶﾞｶﾞ".into(), 4));
+}
+
 // ── fetch-state cue ──────────────────────────────────────────────────────
 //
 // `fetch_cue_color`: amber = serving last-known numbers, red = failed or
@@ -158,11 +173,14 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: std::collections::BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -176,6 +194,9 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         status,
     )
@@ -234,8 +255,18 @@ fn cue_absent_for_api_key_profiles() {
 fn brackets_stay_dim_regardless_of_fetch_state() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
-    let spans =
-        window_summary_spans_bracketed(Some(&w), 17, 0, true, None, ResetFmt::default(), false, 0);
+    let spans = window_summary_spans_bracketed(
+        Some(&w),
+        17,
+        0,
+        true,
+        None,
+        ResetFmt::default(),
+        false,
+        0,
+        0,
+        false,
+    );
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -247,8 +278,18 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 #[test]
 fn no_data_dash_stays_faint() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let spans =
-        window_summary_spans_bracketed(None, 17, 0, true, None, ResetFmt::default(), false, 0);
+    let spans = window_summary_spans_bracketed(
+        None,
+        17,
+        0,
+        true,
+        None,
+        ResetFmt::default(),
+        false,
+        0,
+        0,
+        false,
+    );
     // 17 wide: the 10-cell bar + 2 brackets + 1 gap leave the 13-cell dash span.
     assert_eq!(spans[0].content, "            —");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
@@ -454,9 +495,9 @@ fn each_surface_words_the_clock_its_own_way() {
 fn relative_reset_suffix_ignores_the_column_width() {
     let fmt = ResetFmt::default();
     for width in [0, 17, 26, 120] {
-        assert_eq!(reset_suffix(2400, fmt, width), " (40m)");
+        assert_eq!(reset_suffix(2400, fmt, width, false), " (40m)");
     }
-    assert_eq!(reset_suffix(6 * 86400 + 82800, fmt, 26), " (6d 23h)");
+    assert_eq!(reset_suffix(6 * 86400 + 82800, fmt, 26, false), " (6d 23h)");
 }
 
 /// A stamp that doesn't fit the column degrades to the bare countdown rather
@@ -467,13 +508,13 @@ fn clock_reset_suffix_degrades_when_the_column_is_too_narrow() {
         display: ResetDisplay::Both,
         clock: ClockFormat::H24,
     };
-    let roomy = reset_suffix(2400, fmt, 120);
+    let roomy = reset_suffix(2400, fmt, 120, false);
     assert!(
         roomy.starts_with(" (40m · ") && roomy.ends_with(')'),
         "a wide column carries both halves, got {roomy}"
     );
     assert_eq!(
-        reset_suffix(2400, fmt, 9),
+        reset_suffix(2400, fmt, 9, false),
         " (40m)",
         "the 9 cells a 26-wide column leaves its bar block can't fit a stamp: \
          fall back to the countdown"
@@ -540,6 +581,55 @@ fn the_widest_column_text_still_fits_the_wide_overview_tier() {
     );
 }
 
+/// The fill's stamp room is a constant per display mode, notation and window:
+/// the widest suffix `reset_suffix` can draw, hand-built from `clock_text`'s
+/// longest time (`12:59pm`, `21:59`), its longest day qualifier (the date
+/// form `sep 30, `, reached by a 7d window seven days out) and
+/// `humanize_duration`'s longest forms (`4h 59m`, `23h 59m`), plus the ` (`
+/// and `)` wrapper and `both`'s ` · ` join.
+#[test]
+fn the_worst_suffix_is_the_widest_stamp_each_window_draws() {
+    let cases = [
+        (ResetDisplay::Relative, ClockFormat::H24, (9, 10)),
+        // A 5h reset crosses at most one local midnight, so its stamp carries
+        // a weekday at most: `wed 21:59`, `wed 12:59pm`.
+        (ResetDisplay::Clock, ClockFormat::H24, (12, 16)),
+        (ResetDisplay::Clock, ClockFormat::H12, (14, 18)),
+        (ResetDisplay::Both, ClockFormat::H24, (17, 18)),
+        (ResetDisplay::Both, ClockFormat::H12, (19, 20)),
+    ];
+    for (display, clock, want) in cases {
+        let fmt = ResetFmt { display, clock };
+        assert_eq!(
+            reset_suffix_worst(fmt),
+            want,
+            "{display:?} in {clock:?}: the widest suffix each window draws"
+        );
+        // The constant also covers every suffix the formatter actually draws
+        // inside each window, whatever hour the run lands on.
+        let sweep = [
+            1i64,
+            299,
+            300,
+            3_599,
+            4 * 3_600 + 59 * 60,
+            10 * 3_600 + 20 * 60,
+            23 * 3_600 + 59 * 60,
+            6 * 86_400 + 23 * 3_600,
+            7 * 86_400,
+        ];
+        for (window, worst) in [(5 * 3_600, want.0), (7 * 86_400, want.1)] {
+            for secs in sweep.into_iter().filter(|&secs| secs <= window) {
+                let drawn = grapheme_cells(&reset_suffix(secs, fmt, usize::MAX, false));
+                assert!(
+                    drawn <= worst,
+                    "{display:?} in {clock:?} at {secs}s: {drawn} cells over the {worst}-cell room"
+                );
+            }
+        }
+    }
+}
+
 /// The `·` joining a countdown to its stamp in the overview column stays neutral
 /// (inherits the paragraph's base style). A drain-colored reset then reads as a
 /// styled run broken by a plain separator instead of a solid colored bar, and
@@ -604,7 +694,18 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
             clock: ClockFormat::H24,
         },
     ] {
-        let single = window_summary_spans_bracketed(Some(&w), 160, 0, true, None, no_dot, false, 0);
+        let single = window_summary_spans_bracketed(
+            Some(&w),
+            160,
+            0,
+            true,
+            None,
+            no_dot,
+            false,
+            0,
+            0,
+            false,
+        );
         assert!(
             !single.iter().any(|s| s.content == " · "),
             "no separator without a countdown+stamp pair"
@@ -664,10 +765,30 @@ fn stale_window_fades_only_fill_and_percent() {
     // actually red: with `None` the suffix defaults to faint on both calls, hiding
     // a mutation that leaked `stale` into the reset color.
     let reset = Some(theme::warning());
-    let live =
-        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), false, 0);
-    let stale =
-        window_summary_spans_bracketed(Some(&w), 26, 0, true, reset, ResetFmt::default(), true, 0);
+    let live = window_summary_spans_bracketed(
+        Some(&w),
+        26,
+        0,
+        true,
+        reset,
+        ResetFmt::default(),
+        false,
+        0,
+        0,
+        false,
+    );
+    let stale = window_summary_spans_bracketed(
+        Some(&w),
+        26,
+        0,
+        true,
+        reset,
+        ResetFmt::default(),
+        true,
+        0,
+        0,
+        false,
+    );
 
     // spans[0] = `[`, [1] = fill, [2] = `]`, [3] = ` XX%`, [4..] = reset suffix.
     assert_eq!(live[1].content, "█████░░░░░");
@@ -780,4 +901,30 @@ fn the_bracketed_bar_label_keeps_two_rounded_decimals() {
             );
         }
     }
+}
+
+/// The Usage tab's plan-end phrase: the day it falls on and how many days
+/// away, `today` for one due today, the bare day for one already past, and
+/// the year for a day more than half a year out.
+#[test]
+fn plan_end_text_names_the_day_and_the_days_left() {
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    let today = day(2026, 11, 4);
+    assert_eq!(
+        plan_end_text(PlanEnd::Ends(day(2026, 11, 20)), today),
+        "ends nov 20 (16d)"
+    );
+    assert_eq!(plan_end_text(PlanEnd::Ends(today), today), "ends today");
+    assert_eq!(
+        plan_end_text(PlanEnd::Ends(day(2026, 11, 2)), today),
+        "ended nov 2"
+    );
+    assert_eq!(
+        plan_end_text(PlanEnd::Ends(day(2027, 8, 1)), today),
+        "ends aug 1, 2027 (270d)"
+    );
+    assert_eq!(
+        plan_end_text(PlanEnd::Renews(day(2026, 12, 15)), today),
+        "renews dec 15 (41d)"
+    );
 }

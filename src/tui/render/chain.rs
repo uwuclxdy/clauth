@@ -110,11 +110,13 @@ fn draw_chain_selector(
                             // same total width it had as a bare number — nothing
                             // downstream shifts.
                             let ord = format!("#{}", i + 1);
-                            let rail = if selected && focused {
-                                Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
+                            let caret = if selected && focused {
+                                Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
                             } else {
-                                Span::styled(format!("  {ord:>3} "), theme::faint())
+                                Span::raw("  ")
                             };
+                            let ordinal = Span::styled(format!("{ord:>3} "), theme::faint());
+                            let rail_w = caret.width() + ordinal.width();
                             // A member still sits in `fallback_chain` on disk while
                             // disabled (only the walk skips it), so it renders as a
                             // normal row with a dim name; the exclusion itself
@@ -138,8 +140,7 @@ fn draw_chain_selector(
                                     app.installs_session_token(&p.name),
                                 )
                             });
-                            let rail_w = rail.width();
-                            let mut spans = vec![rail];
+                            let mut spans = vec![caret, ordinal];
                             match &reason {
                                 // The 1-cell marker is right-aligned at the row's last
                                 // content column (the scrollbar owns the padding cell
@@ -172,7 +173,7 @@ fn draw_chain_selector(
                         }
                         ChainItemKind::Add => {
                             let arrow = if selected && focused {
-                                Span::styled("❯ ", theme::accent().bold())
+                                Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
                             } else {
                                 Span::raw("  ")
                             };
@@ -265,6 +266,7 @@ fn draw_chain_detail(
                 &name,
                 MemberCard {
                     focused: detail_focused,
+                    entered: app.fallback_detail_entered,
                     row_cursor: app.fallback_detail_cursor,
                     armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
                     editing: typed(FallbackRow::Threshold),
@@ -598,20 +600,37 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
 /// ladder has no notion of), so bridging the two just to share strings would
 /// couple two ladders that are allowed to diverge. Same register: short,
 /// lowercase, names the concrete next action.
-fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active: bool) -> String {
+///
+/// `proxy` is the member's proxy service off its runtime claim: a proxy
+/// account's key is the proxy's to mint, so its dead-credential and quarantine
+/// fixes name the one login clauth takes for it.
+fn reason_fix(
+    reason: &BlockedReason,
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+    active: bool,
+) -> String {
+    let proxy_login = |service| cmd(&crate::actions::proxy_login_command(name.as_str(), service));
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
         BlockedReason::OrgRefused => FIX_ORG_REFUSED.to_string(),
-        BlockedReason::AuthBroken => {
-            format!("re-login with {}", cmd(&format!("clauth login {name}")))
-        }
-        BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
+        BlockedReason::AuthBroken => match proxy {
+            Some(service) => format!("log in again with {}", proxy_login(service)),
+            None => format!("re-login with {}", cmd(&format!("clauth login {name}"))),
+        },
+        BlockedReason::KeyRejected => match proxy {
+            Some(service) => format!("log in again with {}", proxy_login(service)),
+            None => "re-enter the api key on the setup tab".to_string(),
+        },
         BlockedReason::TokenRejected => setup_token_remint_fix(name.as_str()),
-        BlockedReason::LoggedOut => format!(
-            "log in with {}, or add an api key on the setup tab",
-            cmd(&format!("clauth login {name}"))
-        ),
+        BlockedReason::LoggedOut => match proxy {
+            Some(service) => format!("log in with {}", proxy_login(service)),
+            None => format!(
+                "log in with {}, or add an api key on the setup tab",
+                cmd(&format!("clauth login {name}"))
+            ),
+        },
         BlockedReason::WeeklySpent { monthly, .. } => {
             if *monthly {
                 "monthly quota is spent".to_string()
@@ -819,6 +838,9 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
 #[derive(Clone, Copy, Default)]
 struct MemberCard<'a> {
     focused: bool,
+    /// Whether the card's blurred tint may show: only once the shown member's
+    /// card has been entered, so a never-opened card shades nothing at rest.
+    entered: bool,
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&'a InputState>,
@@ -974,6 +996,7 @@ fn member_detail(
 ) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
+        entered,
         row_cursor,
         armed_remove,
         editing,
@@ -1017,6 +1040,7 @@ fn member_detail(
     // onto has it NOW, and that is the card an operator is most likely looking
     // at when they go looking for it.
     let active = cfg.is_active(name);
+    let proxy = profile.proxy.as_ref().map(|record| &record.service);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
     if let Some(reason) = blocked_reason(
         cfg,
@@ -1029,7 +1053,7 @@ fn member_detail(
     ) {
         pills.push((
             reason_pill_spans(&reason, fmt),
-            reason_fix(&reason, name, active),
+            reason_fix(&reason, name, proxy, active),
         ));
         if reason == BlockedReason::Disabled
             && let Some(health) = health_blocked_reason(
@@ -1044,7 +1068,7 @@ fn member_detail(
         {
             pills.push((
                 reason_pill_spans(&health, fmt),
-                reason_fix(&health, name, active),
+                reason_fix(&health, name, proxy, active),
             ));
         }
     }
@@ -1163,8 +1187,9 @@ fn member_detail(
             width,
         );
         let start = lines.len();
+        let tinted = i == cursor && (focused || entered);
         lines.extend(row_lines.into_iter().map(|line| {
-            if selected {
+            if tinted {
                 highlight_row(line, width)
             } else {
                 line
@@ -1495,7 +1520,7 @@ fn detail_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -1560,7 +1585,7 @@ fn detail_row(
             // it) — same disabled-row contract as the budget-off ceiling.
             let dimmed = !check_weekly && editing.is_none();
             let arrow = if dimmed && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1669,7 +1694,7 @@ fn detail_row(
             // `max_spend_hint` names the holding half.
             let dimmed = !spend_budget && editing.is_none();
             let arrow = if dimmed && selected {
-                Span::styled("❯ ", theme::faint())
+                Span::styled(format!("{} ", theme::CARET), theme::faint())
             } else {
                 arrow
             };
@@ -1882,7 +1907,7 @@ fn day_picker_lines(days: &[Weekday], caret: usize, width: usize) -> Vec<Line<'s
                 }
                 let picked = days.contains(&WEEKDAYS_ALL[i]);
                 spans.push(if i == caret {
-                    Span::styled("❯", theme::accent().bold())
+                    Span::styled(theme::CARET, theme::accent().bold())
                 } else {
                     Span::raw(" ")
                 });
@@ -1969,7 +1994,7 @@ fn add_detail(
             focus.0 = lines.len();
         }
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         };

@@ -35,6 +35,13 @@ fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'stat
     lines.remove(0)
 }
 
+/// [`effort_cycle_lines`] in a pane wide enough that the row is one line.
+fn effort_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
+    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
 // Blurred: bare labels, no brackets anywhere. Focused: the active preset wraps
 // in `[]` and that bracket pair is the only width change (the old shape padded
 // the blurred active option to ` label `, so blurred==focused in width — this
@@ -71,6 +78,62 @@ fn model_cycle_lists_fable_first_after_default() {
     assert_eq!(
         options.split_whitespace().collect::<Vec<_>>(),
         ["default", "fable", "opus", "sonnet", "haiku", "opusplan"]
+    );
+}
+
+#[test]
+fn effort_cycle_lists_the_presets_after_unset() {
+    let line = line_text(&effort_line(Span::raw("  "), "", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("effort")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        ["unset", "low", "medium", "high", "xhigh", "max"]
+    );
+}
+
+#[test]
+fn effort_cycle_brackets_the_active_preset_only_on_focus() {
+    let arrow = Span::raw("  ");
+    let blurred = line_text(&effort_line(arrow.clone(), "high", false));
+    let focused = line_text(&effort_line(arrow, "high", true));
+
+    assert!(
+        blurred.contains("high"),
+        "active preset renders when blurred: {blurred}"
+    );
+    assert!(!blurred.contains('['), "blurred stays bare: {blurred}");
+    assert!(
+        focused.contains("[high]"),
+        "focused brackets the active preset: {focused}"
+    );
+    assert_eq!(
+        focused.chars().count(),
+        blurred.chars().count() + 2,
+        "the bracket pair is the only width change on focus"
+    );
+}
+
+#[test]
+fn effort_cycle_trails_a_custom_value_outside_the_presets() {
+    let line = line_text(&effort_line(Span::raw("  "), "ultracode", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("effort")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        [
+            "unset",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultracode"
+        ]
     );
 }
 
@@ -196,13 +259,13 @@ fn setup_hints_follow_the_row_value() {
     let mut snap = Snap::blank("a");
 
     snap.auto_start = true;
-    let on = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    let on = row_hint(ConfigRow::AutoStart, &snap, "").unwrap();
     assert_eq!(
         on,
         "sends a 1-token request to Haiku at every 5h usage reset"
     );
     snap.auto_start = false;
-    let off = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    let off = row_hint(ConfigRow::AutoStart, &snap, "").unwrap();
     assert_eq!(off, "5h usage window stays closed after reset");
 
     // A plan with no 5h limit: both auto-start states say nothing is sent, and
@@ -211,7 +274,7 @@ fn setup_hints_follow_the_row_value() {
     for auto_start in [true, false] {
         snap.auto_start = auto_start;
         assert_eq!(
-            row_hint(ConfigRow::AutoStart, &snap).unwrap(),
+            row_hint(ConfigRow::AutoStart, &snap, "").unwrap(),
             "this plan has no 5h limit, so nothing is sent",
             "marked, auto-start {auto_start}"
         );
@@ -219,26 +282,26 @@ fn setup_hints_follow_the_row_value() {
     snap.auto_start = false;
     snap.usage_probe = true;
     assert_eq!(
-        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        row_hint(ConfigRow::UsageProbe, &snap, "").unwrap(),
         "a 1-token request to Haiku reads usage",
         "marked, probe on"
     );
     snap.usage_probe = false;
     assert_eq!(
-        row_hint(ConfigRow::UsageProbe, &snap).unwrap(),
+        row_hint(ConfigRow::UsageProbe, &snap, "").unwrap(),
         "usage goes unread; a probe is a 1-token request to Haiku",
         "marked, probe off"
     );
     snap.no_five_hour_limit = false;
 
     snap.base_url = String::new();
-    let empty = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    let empty = row_hint(ConfigRow::BaseUrl, &snap, "").unwrap();
     assert_eq!(
         empty,
         "leave empty for a Claude account, or set an API endpoint"
     );
     snap.base_url = "https://api.example.com".into();
-    let set = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    let set = row_hint(ConfigRow::BaseUrl, &snap, "").unwrap();
     assert_eq!(
         set,
         "the API endpoint this account calls instead of claude.ai"
@@ -289,6 +352,142 @@ fn the_no_five_hour_verdict_reads_the_oauth_store_not_the_picked_reading() {
     }
 }
 
+/// `build_snap` derives `auth_broken` from `AppState::auth_broken` (the
+/// renderer's dim for a quarantined login), driven through a real `App`,
+/// never a hand-set `Snap`.
+#[test]
+fn an_auth_broken_quarantine_dims_the_rolling_row_through_the_app() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, ProfileName};
+
+    let name = ProfileName::from("acct");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            auth_broken: vec![name.clone()],
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&name)],
+    });
+    app.profile_cursor.set(0);
+    let snap = build_snap(&app, &app.readings_snapshot(), true);
+    assert!(snap.auth_broken, "the quarantine reached the snap");
+    assert!(
+        snap.rolling_switch_gated(),
+        "a quarantined login dims the rolling switch row"
+    );
+    assert_eq!(
+        row_hint(ConfigRow::RollingTokenSwitch, &snap, "").as_deref(),
+        Some("cannot switch: this login is dead · log in again first"),
+        "the gate line names the dead login"
+    );
+}
+
+/// A saved base URL an OAuth account does not use (no api key, no env token)
+/// shows on the row with a dim inline note, blurred and focused alike, and its
+/// help line names where requests really go. A used URL keeps the plain row.
+#[test]
+fn an_unused_saved_base_url_says_so_on_its_row() {
+    let input = InputState::new("");
+    let mut snap = Snap::blank("a");
+    snap.base_url = "https://y.example".into();
+    snap.base_url_unused = true;
+    for selected in [false, true] {
+        let line = one_row(ConfigRow::BaseUrl, selected, false, None, &snap, &input);
+        let text = line_text(&line);
+        assert!(
+            text.trim_end()
+                .ends_with("https://y.example  · unused until an api key is set"),
+            "selected={selected}: {text:?}"
+        );
+        let note = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("unused until an api key is set"))
+            .expect("the note is its own span");
+        assert_eq!(note.style.fg, theme::dim().fg, "selected={selected}");
+    }
+    assert_eq!(
+        row_hint(ConfigRow::BaseUrl, &snap, "").as_deref(),
+        Some("this account calls claude.ai until it has an api key")
+    );
+
+    snap.base_url_unused = false;
+    let used = line_text(&one_row(
+        ConfigRow::BaseUrl,
+        false,
+        false,
+        None,
+        &snap,
+        &input,
+    ));
+    assert!(
+        used.trim_end().ends_with("https://y.example"),
+        "a used URL carries no note: {used:?}"
+    );
+    assert_eq!(
+        row_hint(ConfigRow::BaseUrl, &snap, "").as_deref(),
+        Some("the API endpoint this account calls instead of claude.ai")
+    );
+}
+
+/// After a keyless base-url commit on an OAuth account the type line still
+/// reads `oauth`: the reseeded draft carries the saved URL without routing to
+/// it, so it must not flip the endpoint-shaped rows to api.
+#[test]
+fn a_reseeded_unused_url_draft_keeps_the_oauth_type() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut profile = crate::profile::Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_login());
+    profile.replace_base_url(Some("https://y.example".to_string()));
+    profile.rederive_base_url();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("acct")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    app.profile_cursor.set(0);
+    // The reseeded draft a commit or ⎋ revert leaves: the saved URL in the
+    // buffer, no active field.
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new("https://y.example");
+    app.config_draft = Some(draft);
+
+    let snap = build_snap(&app, &app.readings_snapshot(), false);
+    let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            f.area(),
+            &app,
+            &[ConfigRow::Name, ConfigRow::BaseUrl],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: false,
+                toast_rects: &[],
+            },
+        );
+    })
+    .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let type_line = rows
+        .iter()
+        .find(|r| r.starts_with("type"))
+        .unwrap_or_else(|| panic!("type row renders:\n{}", rows.join("\n")));
+    assert!(
+        type_line.trim_end().ends_with("oauth"),
+        "the reseeded unused URL keeps the oauth type: {type_line:?}"
+    );
+}
+
 /// Field rows whose labels self-describe carry no hint (a hint restating the
 /// label reads as noise); the siblings that keep one are pinned whole.
 #[test]
@@ -303,28 +502,124 @@ fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
         ConfigRow::EnvEntry(0),
         ConfigRow::EnvAdd,
     ] {
-        assert_eq!(row_hint(row, &snap), None, "{row:?} carries no hint");
+        assert_eq!(row_hint(row, &snap, ""), None, "{row:?} carries no hint");
     }
     assert_eq!(
-        row_hint(ConfigRow::SubagentModel, &snap).as_deref(),
+        row_hint(ConfigRow::SubagentModel, &snap, "").as_deref(),
         Some("default subagent model in this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::AdvisorModel, &snap).as_deref(),
+        row_hint(ConfigRow::AdvisorModel, &snap, "").as_deref(),
         Some("server-side advisor model in this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::ModelOverrideAdd, &snap).as_deref(),
+        row_hint(ConfigRow::ModelOverrideAdd, &snap, "").as_deref(),
         Some("set custom model names on this account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::ApiKey, &snap).as_deref(),
+        row_hint(ConfigRow::ApiKey, &snap, "").as_deref(),
         Some("provided to Claude Code via \"apiKeyHelper\" field"),
     );
     snap.console_login = true;
     assert_eq!(
-        row_hint(ConfigRow::Login, &snap).as_deref(),
+        row_hint(ConfigRow::Login, &snap, "").as_deref(),
         Some("log into alibaba console to see this account's usage"),
+    );
+}
+
+/// The effort hint says whether the account holds an effort, since a held one
+/// outranks `/effort` in the session. Byte-exact copy.
+#[test]
+fn the_effort_hint_says_whether_the_account_holds_an_effort() {
+    let mut snap = Snap::blank("a");
+    snap.effort = "max".into();
+    let set = "reasoning effort for this account; /effort can't change it while set";
+    for value in ["low", "medium", "high", "xhigh", "max", "ultracode"] {
+        assert_eq!(
+            row_hint(ConfigRow::Effort, &snap, value).as_deref(),
+            Some(set),
+            "{value:?}"
+        );
+    }
+    // The trim matches the commit's: a blank buffer commits to unset.
+    for value in ["", "  "] {
+        assert_eq!(
+            row_hint(ConfigRow::Effort, &snap, value).as_deref(),
+            Some("no effort set: /effort and Claude Code's default apply"),
+            "{value:?}"
+        );
+    }
+}
+
+/// The set-effort hint at an 80-column terminal: the detail pane is narrower
+/// than the copy, so the hint word-wraps onto a second line — every word stays
+/// whole and in order, nothing clips.
+#[test]
+fn the_effort_hint_wraps_not_clips_at_an_80_column_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut snap = Snap::blank("acct");
+    snap.effort = "max".into();
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+
+    // The pane the hint wraps to, at a full 80-column frame: the master-detail
+    // split gives the detail side 80 - selector_width(80) cells, and the
+    // section box trims its border.
+    let (_, settings) = master_detail(Rect::new(0, 0, 80, 24), app.setup_items().len() + 1);
+    let inner = section_box("acct", true, false, settings.width).inner(settings);
+    assert_eq!(
+        settings.width,
+        80 - 24,
+        "selector_width(80) = 24: the detail pane is 56 cells wide"
+    );
+    let copy = "reasoning effort for this account; /effort can't change it while set";
+    assert!(
+        copy.chars().count() > inner.width as usize,
+        "the copy is wider than the pane ({} cells), so the wrap is real",
+        inner.width
+    );
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| {
+        draw_settings_rows(
+            f,
+            inner,
+            &app,
+            &[ConfigRow::Effort],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: true,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    let start = rows
+        .iter()
+        .position(|r| r.contains("reasoning effort for this account;"))
+        .expect("the effort hint renders");
+    let words = rows[start..]
+        .iter()
+        .flat_map(|r| r.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        words.contains(copy),
+        "every word of the copy renders in order — a clip would drop one: {words}"
+    );
+    assert!(
+        rows[start + 1].contains("while set"),
+        "the tail wraps whole onto the next line: {}",
+        rows[start + 1]
     );
 }
 
@@ -333,17 +628,17 @@ fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
 fn capture_and_logout_hints_state_the_act_alone() {
     let mut snap = Snap::blank("a");
     assert_eq!(
-        row_hint(ConfigRow::CaptureLogin, &snap).as_deref(),
+        row_hint(ConfigRow::CaptureLogin, &snap, "").as_deref(),
         Some("save the current global credentials into a new account"),
     );
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored OAuth login"),
     );
     // `api_login` flips on `!login_is_oauth`, mirroring row_hint's own guard.
     snap.login_is_oauth = false;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored API key"),
     );
 }
@@ -358,13 +653,90 @@ fn logout_hint_over_a_torn_store_names_the_file() {
     snap.has_unreadable_store = true;
     snap.has_api_key = true;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the stored API key and the unreadable credentials.json"),
     );
     snap.has_api_key = false;
     assert_eq!(
-        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        row_hint(ConfigRow::DeleteCreds, &snap, "").as_deref(),
         Some("clears the unreadable credentials.json"),
+    );
+}
+
+/// A proxy account's log out blanks its key and nothing else, so the hint says
+/// that over a stored chain and over a torn store, its `[proxy]` table readable
+/// or not. The snapshot takes the claim off the loaded profile: the
+/// `config.toml` is gone when it reads.
+#[test]
+fn a_proxy_accounts_log_out_hint_names_the_key_over_whatever_it_stores() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, ProxyAccount};
+    let hint = |chain: bool, readable_record: bool| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("px");
+        let mut px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_key".to_string()),
+        );
+        px.credentials = chain.then(|| crate::testutil::oauth_pair("at-px"));
+        crate::profile::save_profile(&px).unwrap();
+        if !chain {
+            let store = crate::profile::profile_subpath(&name, "credentials.json").unwrap();
+            std::fs::write(store, "{ torn").unwrap();
+        }
+        crate::profile::write_proxy_record(
+            &name,
+            &ProxyAccount {
+                service: crate::proxy::Service::parse("stub").unwrap(),
+                account: "acct-1".to_string(),
+            },
+        )
+        .unwrap();
+        if !readable_record {
+            crate::claude::tests::break_proxy_record("px");
+        }
+        let loaded = crate::profile::load_profile(&name).unwrap();
+        let shape = (
+            loaded.credentials.is_some(),
+            loaded.unreadable_credentials_store.is_some(),
+            loaded.proxy.is_some(),
+            loaded.has_unreadable_proxy_record,
+        );
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![loaded],
+        });
+        app.profile_cursor.set(0);
+        std::fs::remove_file(crate::profile::profile_subpath(&name, "config.toml").unwrap())
+            .unwrap();
+        (
+            shape,
+            row_hint(
+                ConfigRow::DeleteCreds,
+                &build_snap(&app, &app.readings_snapshot(), true),
+                "",
+            ),
+        )
+    };
+
+    let key = || Some("clears the stored API key".to_string());
+    assert_eq!(
+        [
+            hint(true, true),
+            hint(false, true),
+            hint(true, false),
+            hint(false, false),
+        ],
+        [
+            ((true, false, true, false), key()),
+            ((false, true, true, false), key()),
+            ((true, false, false, true), key()),
+            ((false, true, false, true), key()),
+        ],
+        "((chain, torn store, record, unreadable table), hint) per shape"
     );
 }
 
@@ -399,7 +771,8 @@ fn torn_store_logout_hint_survives_an_open_draft() {
             assert_eq!(
                 row_hint(
                     ConfigRow::DeleteCreds,
-                    &build_snap(&app, &app.readings_snapshot(), with_text)
+                    &build_snap(&app, &app.readings_snapshot(), with_text),
+                    "",
                 )
                 .as_deref(),
                 Some(want),
@@ -582,27 +955,27 @@ fn disabled_hint_follows_the_gate_then_the_value() {
     let mut snap = Snap::blank("a");
 
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("excludes this account from auto-switch, usage polling, and status until re-enabled"),
     );
 
     snap.disabled = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("excluded from auto-switch, usage polling, and status until re-enabled"),
     );
 
     snap.disabled = false;
     snap.has_live_session = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("cannot disable an account with a live session"),
     );
 
     // The active-account gate outranks the live-session gate.
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        row_hint(ConfigRow::Disabled, &snap, "").as_deref(),
         Some("cannot disable the global active account"),
     );
 }
@@ -743,6 +1116,7 @@ fn email_header(
     let mut snap = Snap::blank("acct");
     snap.email = email.map(str::to_string);
     snap.base_url = base_url.to_string();
+    snap.base_url_derived = base_url.to_string();
     snap.session_token = token;
     let app = App::new(AppConfig {
         state: AppState::default(),
@@ -1407,33 +1781,33 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     let mut snap = Snap::blank("a");
 
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 
     // An api key alone opens the gate, and there is no login behind it.
     snap.has_other_login = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("the next switch runs this account on its API key"),
     );
 
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("signs Claude Code out now · this account runs on its API key"),
     );
 
     // A stored OAuth pair is what the clear actually falls back to.
     snap.clear_falls_back_to_oauth = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow"),
     );
 
     snap.is_active = false;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("the next switch installs this account's own login again"),
     );
 
@@ -1445,12 +1819,12 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     // has its own test below.)
     snap.rolling_armed = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
     );
     snap.has_static_backup = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some(
             "relinks this account's own login now · running sessions follow · re-stamping \
              stops · the preserved mint goes too"
@@ -1463,7 +1837,7 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     snap.rolling_token = true;
     snap.has_static_backup = false;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
     );
 }
@@ -1481,7 +1855,7 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     snap.rolling_armed = true;
 
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("stops the daemon re-stamping this account · nothing else is stored"),
     );
 
@@ -1489,7 +1863,7 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     // and the hint says so instead of hiding it behind the disarm.
     snap.is_active = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some(
             "stops the daemon re-stamping this account · signs Claude Code out · nothing is \
              stored behind it"
@@ -1499,14 +1873,14 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
 
     snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 
     snap.session_token = None;
     snap.has_static_backup = true;
     assert_eq!(
-        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        row_hint(ConfigRow::ClearSessionToken, &snap, "").as_deref(),
         Some("cannot clear with no other login stored"),
     );
 }
@@ -1867,7 +2241,7 @@ fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
     assert_eq!(set.spans[2].content, "90%");
     assert_eq!(set.spans[2].style.fg, theme::accent().fg);
     assert_eq!(
-        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        row_hint(ConfigRow::BellThreshold, &snap, "").unwrap(),
         "alerts once when 5h usage reaches this, again after it drops below"
     );
 
@@ -1894,7 +2268,7 @@ fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
     assert_eq!(off.spans[2].content, "off");
     assert_eq!(off.spans[2].style.fg, theme::faint().fg);
     assert_eq!(
-        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        row_hint(ConfigRow::BellThreshold, &snap, "").unwrap(),
         concat!(
             "no alert when 5h usage climbs; ",
             key_lit!("↵"),
@@ -2643,4 +3017,438 @@ fn an_editing_setup_field_paints_no_sunken_fill() {
         "no span of an editing row paints BG_SUNKEN: {:?}",
         line.spans
     );
+}
+
+// ── blurred detail rows, band headings and selector icons ────────────────────
+
+/// One claude account (`xqz1`), one codex account (`cx1`, quarantined when
+/// `broken`) and one pool account (`alpha`) on the Setup tab, so every band
+/// and every detail renderer is one selector step apart.
+fn three_band_setup_app(broken: bool) -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::{CodexRow, ShuntPool, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("xqz1")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("xqz1"))],
+    });
+    app.tab = Tab::Setup;
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    app.shunt_pool = ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: vec![PoolAccount {
+            name: "alpha".to_string(),
+            available: true,
+            near_quota: false,
+            cooldown_secs_remaining: None,
+            needs_relogin: false,
+            paused: false,
+            disabled: false,
+            utilization_5h: None,
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
+            plan: None,
+            status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
+        }],
+    }]);
+    app
+}
+
+fn press(app: &mut App, code: ratatui::crossterm::event::KeyCode) {
+    crate::tui::app::handle_key(app, crate::testutil::key(code));
+}
+
+fn setup_frame(app: &App) -> ratatui::buffer::Buffer {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Select the `steps`-th selector row below the first, descend into its
+/// detail, then ascend back to the selector with the real keys.
+fn descend_and_ascend(app: &mut App, steps: usize) {
+    use ratatui::crossterm::event::KeyCode;
+    for _ in 0..steps {
+        press(app, KeyCode::Down);
+    }
+    press(app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    press(app, KeyCode::Esc);
+    assert_eq!(app.config_focus, ConfigFocus::Profiles, "esc ascends");
+}
+
+/// The blurred-pane selection: the row holding `label` inside a bordered pane
+/// keeps the `BG_HOVER` tint across its content width (padding columns
+/// excluded), shows no caret, and its label is `label_fg` without bold.
+fn assert_blurred_selection(
+    buf: &ratatui::buffer::Buffer,
+    label: &str,
+    label_fg: ratatui::style::Color,
+) {
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| {
+            let b = r.find(label)?;
+            r[..b].contains('│').then(|| (y, r[..b].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("{label} renders in a pane:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred pane keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred pane draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(cell(x).fg, label_fg, "{label} keeps its blurred color");
+        assert!(
+            !cell(x).modifier.contains(Modifier::BOLD),
+            "{label} drops the bold on a blurred pane"
+        );
+    }
+}
+
+/// Ascending from a claude account's detail keeps the row the cursor left
+/// marked, so the next descend's landing row stays visible.
+#[test]
+fn a_blurred_claude_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 0);
+    assert_eq!(
+        config_rows(&app).get(app.config_action_cursor),
+        Some(&ConfigRow::Name),
+        "the cursor rests on the name row"
+    );
+    assert_blurred_selection(&setup_frame(&app), "name", theme::text_dim_color());
+}
+
+/// Ascending from a codex account's detail keeps its last action row marked.
+#[test]
+fn a_blurred_codex_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 1);
+    assert_blurred_selection(&setup_frame(&app), "re-login", theme::accent_color());
+}
+
+/// Ascending from a pool account's detail keeps its last action row marked.
+#[test]
+fn a_blurred_pool_detail_keeps_its_last_rows_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 2);
+    assert_blurred_selection(&setup_frame(&app), "refresh", theme::accent_color());
+}
+
+/// A band heading is the current-section cue, so it lifts only while the
+/// selector itself holds focus on a row under it.
+#[test]
+fn a_band_heading_lifts_only_while_the_selector_holds_focus() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    press(&mut app, KeyCode::Down);
+    let heading = |buf: &ratatui::buffer::Buffer| -> Vec<(ratatui::style::Color, bool)> {
+        let rows = crate::testutil::buffer_rows(buf);
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with("│   codex "))
+            .unwrap_or_else(|| panic!("the codex heading renders:\n{}", rows.join("\n")));
+        (4..9)
+            .map(|x| {
+                let c = buf.cell((x, y as u16)).unwrap();
+                (c.fg, c.modifier.contains(Modifier::BOLD))
+            })
+            .collect()
+    };
+    assert_eq!(
+        heading(&setup_frame(&app)),
+        vec![(theme::text_color(), true); 5],
+        "the selector holds focus on a codex row: the heading reads TEXT + bold"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    assert_eq!(
+        heading(&setup_frame(&app)),
+        vec![(theme::text_dim_color(), true); 5],
+        "focus sits in the detail pane: the heading drops to TEXT_DIM + bold"
+    );
+}
+
+/// Selection promotes the name alone: the dead-credential `×` before it is
+/// an icon and keeps its own color and weight.
+#[test]
+fn the_dead_credential_glyph_keeps_its_style_on_a_selected_row() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(true);
+    let needle = format!("{} cx1", theme::dead_credential_glyph());
+    let styles = |buf: &ratatui::buffer::Buffer| {
+        let rows = crate::testutil::buffer_rows(buf);
+        let (y, col) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, r)| r.find(&needle).map(|b| (y, r[..b].chars().count())))
+            .unwrap_or_else(|| panic!("{needle} renders:\n{}", rows.join("\n")));
+        let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap().clone();
+        let (mark, name) = (cell(col), cell(col + 2));
+        (
+            (mark.fg, mark.modifier.contains(Modifier::BOLD)),
+            name.modifier.contains(Modifier::BOLD),
+        )
+    };
+    let (rest_mark, rest_name_bold) = styles(&setup_frame(&app));
+    assert!(!rest_name_bold, "an unselected name is not bold");
+    press(&mut app, KeyCode::Down);
+    let (sel_mark, sel_name_bold) = styles(&setup_frame(&app));
+    assert!(sel_name_bold, "the selected, focused name promotes to bold");
+    assert_eq!(
+        sel_mark, rest_mark,
+        "the glyph keeps its unselected color and weight (fg, bold)"
+    );
+}
+
+// ── never-entered detail shading ─────────────────────────────────────────────
+
+/// The cells inside the detail pane (right of the `││` master-detail
+/// separator) that carry `BG_HOVER`.
+fn detail_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A detail the user never opened shades no row: its cursor is a default,
+/// not a memory, so the blurred claude detail stays untinted.
+#[test]
+fn a_never_entered_setup_detail_shades_no_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = three_band_setup_app(false);
+    let buf = setup_frame(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered detail shades nothing:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// Entering the detail once earns its remembered-row tint: walking to the
+/// `auto-start` row and ascending keeps that whole row tinted.
+#[test]
+fn an_entered_setup_detail_keeps_the_walked_rows_tint_after_ascending() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "enter descends");
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.config_action_cursor, 1,
+        "the walk lands on the auto-start row"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.config_focus, ConfigFocus::Profiles, "esc ascends");
+    assert_blurred_selection(&setup_frame(&app), "auto-start", theme::text_dim_color());
+}
+
+/// Moving the selector to another account makes that account's detail a new
+/// subject: the previous account's tint does not return with it.
+#[test]
+fn moving_the_selector_to_another_account_clears_the_detail_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = three_band_setup_app(false);
+    descend_and_ascend(&mut app, 0);
+    assert_blurred_selection(&setup_frame(&app), "name", theme::text_dim_color());
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        detail_tinted_cells(&setup_frame(&app)),
+        Vec::new(),
+        "the codex detail nobody entered shades nothing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        detail_tinted_cells(&setup_frame(&app)),
+        Vec::new(),
+        "the claude detail is never-entered again"
+    );
+}
+
+// ── `switch to a rolling token` row ─────────────────────────────────────────
+
+/// The row's copy, arm-on-first-press like `clear long-lived token`: the
+/// unarmed label is fixed whatever the focus, the armed one swaps to the
+/// confirm, and another row's arm never bleeds into it.
+#[test]
+fn rolling_switch_button_reads_its_unarmed_and_armed_labels() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("a");
+    let input = InputState::new("");
+
+    for selected in [false, true] {
+        let arrow = if selected { "❯ " } else { "  " };
+        let unarmed = one_row(
+            ConfigRow::RollingTokenSwitch,
+            selected,
+            false,
+            None,
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&unarmed),
+            format!("{arrow}switch to a rolling token"),
+            "unarmed label (selected={selected})"
+        );
+        assert_ne!(
+            unarmed.spans[1].style.fg,
+            theme::faint().fg,
+            "an ungated row is not dim (selected={selected})"
+        );
+        let armed = one_row(
+            ConfigRow::RollingTokenSwitch,
+            selected,
+            false,
+            Some(ConfigRow::RollingTokenSwitch),
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&armed),
+            format!("{arrow}press again to switch"),
+            "arming swaps to the confirm copy (selected={selected})"
+        );
+    }
+    let cross_armed = one_row(
+        ConfigRow::RollingTokenSwitch,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&cross_armed), "❯ switch to a rolling token");
+}
+
+/// Dim + inert where `clauth rolling-token` refuses: a disabled account and a
+/// quarantined (dead) login. The arrow dims too, a stale arm shows the plain
+/// label, and the hint names the reason; an ungated row carries its
+/// disclosure.
+#[test]
+fn rolling_switch_button_dims_on_a_disabled_account_or_a_dead_login() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let input = InputState::new("");
+
+    let open = Snap::blank("a");
+    assert_eq!(
+        row_hint(ConfigRow::RollingTokenSwitch, &open, "").as_deref(),
+        Some(
+            "sessions get this login's full-scope token, re-stamped by the daemon · \
+             wider than a setup token · no refresh token"
+        ),
+    );
+    let ungated = one_row(
+        ConfigRow::RollingTokenSwitch,
+        true,
+        false,
+        None,
+        &open,
+        &input,
+    );
+
+    let mut disabled = Snap::blank("a");
+    disabled.disabled = true;
+    let mut dead = Snap::blank("a");
+    dead.auth_broken = true;
+    for (snap, hint) in [
+        (&disabled, "cannot switch a disabled account"),
+        (
+            &dead,
+            "cannot switch: this login is dead · log in again first",
+        ),
+    ] {
+        assert_eq!(
+            row_hint(ConfigRow::RollingTokenSwitch, snap, "").as_deref(),
+            Some(hint)
+        );
+        let gated = one_row(
+            ConfigRow::RollingTokenSwitch,
+            true,
+            false,
+            Some(ConfigRow::RollingTokenSwitch),
+            snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&gated),
+            "❯ switch to a rolling token",
+            "a gated row ignores a stale arm ({hint})"
+        );
+        assert_eq!(gated.spans[1].style.fg, theme::faint().fg, "{hint}");
+        assert_eq!(
+            gated.spans[0].style.fg,
+            theme::faint().fg,
+            "the arrow dims too ({hint})"
+        );
+        assert_ne!(
+            gated.spans[1].style.fg, ungated.spans[1].style.fg,
+            "gated renders distinctly from ungated ({hint})"
+        );
+    }
 }

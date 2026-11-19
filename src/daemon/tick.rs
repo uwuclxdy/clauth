@@ -90,7 +90,11 @@ impl super::Daemon {
             self.drain_pending_switch_off();
         }
         self.reconcile_background_holds();
-        self.write_status();
+        // The status build's codex read also feeds the name notices, so a tick
+        // reads `codex-profiles.toml` once and cannot judge a codex roster its
+        // body did not describe.
+        let codex = self.write_status();
+        self.log_name_notices(codex.as_ref());
         // Honour a strip the switch-time strip deferred (its sync lock was held)
         // with no live `clauth start` wrapper to reconcile it. Try-once: never
         // parks this tick behind a held sync lock, and no ranked lock is held
@@ -112,6 +116,16 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+        // Keep MCP server logins in step across every account's store.
+        // Throttled and detached inside, so it never spends this tick's window;
+        // its toggle off the config this tick's reload refreshed, a poisoned
+        // config mutex reading on like the file's default.
+        let sync_mcp = self
+            .config
+            .lock()
+            .map(|c| c.state.sync_mcp_logins)
+            .unwrap_or(true);
+        crate::runtime::sync_mcp_logins_detached(sync_mcp);
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every
@@ -197,6 +211,36 @@ impl super::Daemon {
             logline!("clauth: {msg}");
         }
         self.day_claim_notices = notices;
+    }
+
+    /// Log once per change which stored accounts the printed commands cannot
+    /// address: the headless half of `tui::app::warn_name_notices`, gated the
+    /// way [`Self::log_day_claim_notices`] is. `codex` is the tick's own roster
+    /// read — the one `write_status` built `status.json` from — never a fresh
+    /// load: two reads in one tick can disagree. A FAILED read judges the codex
+    /// half against the last successful one, so the read's recovery re-raises
+    /// nothing.
+    pub(super) fn log_name_notices(&mut self, codex: Option<&crate::codex_profiles::CodexState>) {
+        if let Some(codex) = codex {
+            self.last_codex_roster.clear();
+            self.last_codex_roster.extend_from_slice(codex.profiles());
+        }
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let notices = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .name_notices(self.last_codex_roster.iter());
+        if notices == self.name_notices {
+            return;
+        }
+        for notice in notices.iter().filter(|n| !self.name_notices.contains(n)) {
+            logline!("{}", notice.cli_line());
+        }
+        self.name_notices = notices;
     }
 
     /// Whether the next drain must be skipped rather than handed a wait: the
@@ -326,6 +370,10 @@ impl super::Daemon {
     /// its retry window closes, rather than dropped after one attempt. Every
     /// skip/failure logs once per distinct reason (see [`SwitchBackoff`]).
     pub(super) fn drain_pending_switch(&mut self) {
+        // The generation this drain started under: the gate's ticket is built
+        // from it, so a release landing anywhere after the guard — including
+        // in the span before the gate is even built — spends the ticket.
+        let generation = self.fetch_lease.generation();
         // The set holds at most one scheduler target in practice
         // (`scan_auto_switch` skips while one is pending); `min_by` keeps the
         // pick deterministic anyway.
@@ -338,6 +386,15 @@ impl super::Daemon {
                 d
             })
             .unwrap_or_default();
+        // A decision queued under a ticket this instance no longer holds must
+        // not execute — the holder that took over decides. The record clears
+        // here (the queue drained above, the backoff below), so the next
+        // holder's scan re-derives the walk from scratch. Checked on every
+        // drain, so a deferred retry past a release never fires.
+        if !self.fetch_lease.fetches_here() {
+            self.switch_backoff = None;
+            return;
+        }
         let Some(decision) = decision else {
             return;
         };
@@ -514,13 +571,28 @@ impl super::Daemon {
         // The spend is claimed inside the gate, under the rotation lock, right
         // before the POST: a stop signal that lands while the gate is parked on
         // the lock refuses the spend (the gate answers `Stopping`) and the
-        // switch stays queued rather than failing.
-        match crate::oauth::ensure_installable_from_main_loop(
+        // switch stays queued rather than failing. The claim carries this
+        // instance's lease ticket, so a watchdog release in that same window
+        // refuses the refresh too.
+        let gate = crate::usage::SpendGate::new(
+            self.shutting_down.as_ref(),
+            Some(self.fetch_lease.ticket_at(generation)),
+        );
+        let answer = crate::oauth::ensure_installable_from_main_loop(
             &self.config,
             &target,
             crate::oauth::refresh_result,
-            Some((&self.activity, &self.shutting_down)),
-        ) {
+            Some((&self.activity, gate)),
+        );
+        // The decision came from the queue, not from the user: a lease this
+        // instance lost while the gate ran must not execute the switch — the
+        // holder that took over decides. The record clears with the skip, as
+        // on the guard above.
+        if !self.fetch_lease.fetches_here() {
+            self.switch_backoff = None;
+            return;
+        }
+        match answer {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
             crate::oauth::AuthGate::Stopping => {
                 self.requeue_quiet(&decision);
@@ -721,6 +793,12 @@ impl super::Daemon {
         if !off {
             return;
         }
+        // A switch-off queued under a ticket this instance no longer holds
+        // must not execute — the holder that took over decides. The flag was
+        // consumed above, so the record clears with the skip.
+        if !self.fetch_lease.fetches_here() {
+            return;
+        }
         let active = self
             .config
             .lock()
@@ -787,7 +865,9 @@ impl super::Daemon {
                 // Apply so the dropped login's reading does not survive in the
                 // daemon's stores.
                 self.apply_forgets();
-                logline!("clauth daemon: switch-off failed: {e}");
+                if !crate::actions::switch_off_hold_said(&e) {
+                    logline!("clauth daemon: switch-off failed: {e}");
+                }
             }
         }
     }

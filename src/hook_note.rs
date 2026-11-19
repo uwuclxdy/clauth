@@ -122,7 +122,7 @@ const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 /// and the hook manifest's `timeout` bounds TIME rather than memory: reading an
 /// unbounded stream reached 28.4 GB RSS in review. Matches the 10 MB cap
 /// `update.rs` already puts on a downloaded asset.
-const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The two spellings, behind one renderer so they cannot drift apart. The
 /// switched spelling carries an optional headroom clause (r9, 2026-08-28): the
@@ -254,6 +254,57 @@ pub(crate) struct NoteRecord {
     /// (`resume_not_accepted`), so the next main-scope fire re-sends it.
     #[serde(default)]
     pub(crate) resume_pending: bool,
+    /// The option NAMES a bare `claude` conversation was STARTED with,
+    /// recorded at its first `SessionStart` — a startup, a `/clear`, or a fork,
+    /// whose new conversation id keeps the process — so a restored process's
+    /// option names can be compared with what it lost. Names only, as
+    /// [`crate::hook_resume::option_names`] reads them — never a positional
+    /// word, nor a value unless it is itself shaped like an option: a
+    /// credential passed on the command line must not reach the record or the
+    /// notice. `None` on every record written
+    /// before the field existed, and on a `clauth start` session, whose own
+    /// per-spawn flags would always differ from the restored argv.
+    #[serde(default)]
+    pub(crate) launch_options: Option<Vec<String>>,
+    /// The resume command (the report's argv tail) this record last reported
+    /// to herdr, written when the seq is minted. `None` on every record from
+    /// before the field existed: such a record's stored argv cannot be trusted
+    /// to be the one this fire would send, so the next fire re-reports once.
+    #[serde(default)]
+    pub(crate) reported_argv: Option<Vec<String>>,
+    /// The restore dropped or could not keep something: the next main-scope
+    /// prompt is refused with this text once (see [`crate::hook_resume`]).
+    /// Only the herdr arm writes it: the degrade notice rides the launched
+    /// claude's env, never this record.
+    #[serde(default)]
+    pub(crate) restore_notice: Option<String>,
+    /// The process [`Self::restore_notice`] belongs to, by the `CLAUDE_PID` the
+    /// herdr arm read: the restored process a herdr restore stamped. A take
+    /// delivers a record notice only to the process it names and drops a
+    /// notice that names another or none. Kept after a delivery as the herdr
+    /// arm's spent mark, so an in-process `/resume` back into the conversation
+    /// arms nothing and a second prompt of the same process gets nothing. The
+    /// degrade env take neither reads nor writes it; that channel's mark is
+    /// [`Self::degrade_told`].
+    #[serde(default)]
+    pub(crate) restore_notice_pid: Option<u32>,
+    /// The `CLAUDE_PID`s of claudes a degraded resume launched that were
+    /// already refused once with the env notice ([`crate::hook_resume`]): the
+    /// env take refuses each of them at most once, so a second prompt of the
+    /// same claude — or an in-process `/resume` back into the conversation —
+    /// is never refused again, whatever other processes of the conversation
+    /// deliver in between. Empty on every record written before the field
+    /// existed — the `#[serde(default)]` upgrade gate that keeps old records
+    /// parsing.
+    #[serde(default)]
+    pub(crate) degrade_told: Vec<u32>,
+    /// When this conversation's last turn ended with a delegate of its own
+    /// still out, epoch ms; `None` while a turn runs. The start of the idle
+    /// count [`crate::hook_jobs`] keeps for the `mcp-await-job` watcher, which
+    /// clears it as its wait ends. `None` on every record written before the
+    /// field existed.
+    #[serde(default)]
+    pub(crate) turn_ended_at: Option<u64>,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -406,6 +457,16 @@ pub(crate) fn run() -> Result<()> {
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
+    // A restore that dropped something refuses the restored process's first
+    // main-scope prompt once. Claude Code shows the reason to the user, keeps
+    // it out of the model's context, and re-attaches the original prompt to
+    // the block, so this fire's only document is the block envelope: the
+    // prompt never runs, and every other leg waits for the next one.
+    if let Some(reason) = crate::hook_resume::take_restore_notice(&payload) {
+        outln!("{}", block_envelope(&reason));
+        return Ok(());
+    }
+    crate::hook_jobs::note_turn_start(&payload);
     // One `load_config` per fire, shared by its two consumers — the account
     // note's resolve (gate-open only) and the nudge reader (every eligible
     // agent-spawn fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
@@ -491,8 +552,25 @@ fn envelope(event: &str, note: &str) -> serde_json::Value {
     })
 }
 
-fn parse_payload(input: &str) -> Option<Payload> {
+/// Claude Code's `UserPromptSubmit` block shape: the reason is shown to the
+/// user and never reaches the model, and the host appends the original prompt
+/// to the very message that refuses it.
+pub(crate) fn block_envelope(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    })
+}
+
+pub(crate) fn parse_payload(input: &str) -> Option<Payload> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    payload_from_value(&value)
+}
+
+/// The typed [`Payload`] off a value the caller already parsed, so a caller
+/// that also needs the raw JSON — `mcp-await-job`'s job-id scan — parses once.
+/// The validation is the same [`parse_payload`]'s: every gate lives here.
+pub(crate) fn payload_from_value(value: &serde_json::Value) -> Option<Payload> {
     let session_id = value.get("session_id")?.as_str()?.to_string();
     if !is_bare_id(&session_id) {
         return None;
@@ -755,6 +833,8 @@ fn note_for_inner(
     });
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
+    } else if record.transcript.is_none() {
+        record.transcript = inherited_transcript(payload);
     }
     // The account this scope's record held before the fire. The owner-store
     // write keys on this: only a first attribution or a real change reaches
@@ -890,9 +970,11 @@ fn touch_record(path: &Path) {
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
 /// Today there is no such nesting: `note_for_inner`, `nudge_note`,
-/// `gc_conversation_records`, `hook_context::context_note` and the
-/// resume-report leg's seq mint and re-send arm are the only holders and none
-/// reaches another.
+/// `gc_conversation_records`, `hook_context::context_note`, the resume-report
+/// leg's seq mint, re-send arm and restore-notice record and take, and
+/// `hook_jobs`'s turn-end stamp and clear, its lost-sidecar record and
+/// confirm, and its lease `try_lock` are the only holders and none reaches
+/// another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -931,9 +1013,9 @@ impl ScopeLock {
                 wait,
                 |waited| {
                     anyhow::anyhow!(
-                        "timed out after {:.0}s acquiring the scope lock; another clauth \
+                        "timed out after {} ms acquiring the scope lock; another clauth \
                          process or thread holds ~/.clauth/conversations/.lock",
-                        waited.as_secs_f64()
+                        waited.as_millis()
                     )
                 },
                 "failed to acquire the scope lock",
@@ -962,6 +1044,18 @@ fn inherited_baseline(payload: &Payload) -> Option<String> {
     payload.agent_id.as_ref()?;
     let main = record_path(&payload.session_id, None).ok()?;
     load_record(&main)?.told
+}
+
+/// The transcript a subagent scope's record keeps when its fire names none:
+/// the main thread's. The hooks module's fires come from a `tool.call` hook,
+/// which the engine hands no transcript path, while the conversation's
+/// `SessionStart` fire stamps one on the main record; without it the sweep
+/// would keep a subagent's record for the orphan age instead of reaping it
+/// with its conversation.
+fn inherited_transcript(payload: &Payload) -> Option<PathBuf> {
+    payload.agent_id.as_ref()?;
+    let main = record_path(&payload.session_id, None).ok()?;
+    load_record(&main)?.transcript
 }
 
 /// The change test, against the record this scope carries. `current` is `None`
@@ -1589,6 +1683,53 @@ pub(crate) fn gc_conversation_records() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext == crate::hook_jobs::WATCH_LEASE_EXTENSION)
+        {
+            crate::hook_jobs::reap_watch_lease(&path);
+            continue;
+        }
+        // A print-mode (unleased) watcher writes the lost sidecar with no
+        // `.watch` beside it, so the lease arm never reaches it: reap it on
+        // its own once it has outlived the longest a kept corpse can survive —
+        // the running store's silence window — since a fresher one still
+        // guards a live session's once. The age implies the corpse's age, but
+        // removal does not follow it: a process running this sweep without a
+        // jobs sweep reaps the sidecar first, and the next turn end adopts
+        // the still-kept corpse and wakes a second time. The sidecar stays
+        // while any id it names still has a collectable record.
+        if path
+            .extension()
+            .is_some_and(|ext| ext == crate::hook_jobs::REPORTED_LOST_EXTENSION)
+        {
+            let aged = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_some_and(|a| a > Duration::from_millis(crate::mcp::jobs::RUNNING_TTL_MS));
+            let still_guarding = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(crate::hook_jobs::reported_lost)
+                .is_some_and(|ids| {
+                    // The sidecar is user-editable, so only a safe id may
+                    // reach a path join in the jobs store.
+                    ids.iter().any(|id| {
+                        crate::mcp::jobs::is_safe_job_id(id) && crate::mcp::jobs::read(id).is_some()
+                    })
+                });
+            if aged
+                && !path
+                    .with_extension(crate::hook_jobs::WATCH_LEASE_EXTENSION)
+                    .exists()
+                && !still_guarding
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
         // Records only. The dir also holds the `.lock` file and, for an instant,
         // an `atomic_write_600` temp; reaping either would be a sweep deleting
         // live machinery.

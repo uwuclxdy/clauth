@@ -1,5 +1,5 @@
 //! Config-tab row geometry. Every blurred row's value starts at the same
-//! column (the Config tab is a tight chip group); cycle options are
+//! column (the Config tab is a settings table); cycle options are
 //! bare labels on 2-space gaps with the active option bracketed only on focus;
 //! an on/off boolean renders as a toggle, not a 2-option cycle.
 
@@ -50,6 +50,7 @@ fn toggles() -> RowState {
         switch_off_when_budget_spent: true,
         preemptive: false,
         preserve_non_login_keys: true,
+        sync_mcp_logins: true,
         auto_update: true,
         refresh_spent: true,
         auto_start_queue: true,
@@ -57,6 +58,55 @@ fn toggles() -> RowState {
         reset_display: ResetDisplay::Relative,
         clock_format: ClockFormat::H24,
         home_tab: HomeTab::Overview,
+        reduce_motion: false,
+    }
+}
+
+/// The `reduce motion` toggle sits in the appearance band right after
+/// `home tab`, draws its state at the shared value column, and its hint names
+/// what each state does.
+#[test]
+fn the_reduce_motion_row_follows_home_tab_and_names_what_it_stills() {
+    let home = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::HomeTab)
+        .expect("home tab row");
+    assert_eq!(
+        GLOBAL_CONFIG_ROWS.get(home + 1),
+        Some(&GlobalConfigRow::ReduceMotion)
+    );
+    assert_eq!(GlobalConfigRow::ReduceMotion.band(), "appearance");
+
+    for (on, glyph, hint) in [
+        (
+            false,
+            "○─",
+            "the mascot reacts to events and provider names shimmer",
+        ),
+        (
+            true,
+            "─●",
+            "the mascot and provider names stay still; spinners keep turning",
+        ),
+    ] {
+        let rows = RowState {
+            reduce_motion: on,
+            ..toggles()
+        };
+        let line = line_text(&one_row(
+            GlobalConfigRow::ReduceMotion,
+            false,
+            rows,
+            tunables(),
+            None,
+        ));
+        let col = value_col("reduce motion", &line);
+        assert_eq!(col, 2 + KEY_W + KEY_GUTTER, "{line:?}");
+        assert_eq!(line[col..].trim_end(), glyph, "{line:?}");
+        assert_eq!(
+            row_hint(GlobalConfigRow::ReduceMotion, rows, tunables()).as_deref(),
+            Some(hint)
+        );
     }
 }
 
@@ -80,6 +130,104 @@ fn key_cell_is_uniform_width() {
             "{key} key block must be exactly KEY_W + KEY_GUTTER wide"
         );
     }
+}
+
+/// `cells_window` slices by the cells the buffer draws
+/// ([`CellWidth::cell_width`]): `ｶﾞｶﾞ` is two clusters drawing 2 cells each
+/// (a halfwidth sound mark draws its own cell), so a 3-cell window holds one
+/// cluster, and a window starting at drawn cell 2 shows the second cluster —
+/// never a blank window over content, which a per-grapheme `Span::width`
+/// slice draws (a drawn start mapped onto `Span::width` coordinates).
+#[test]
+fn cells_window_slices_a_dakuten_value_by_drawn_cells() {
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 0, 3);
+    assert_eq!(window, "ｶﾞ", "the 3-cell window holds one 2-cell cluster");
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 2, 3);
+    assert_eq!(
+        window, "ｶﾞ",
+        "a window at drawn cell 2 shows the second cluster"
+    );
+    let window = super::super::panes::cells_window("ｶﾞｶﾞ", 1, 3);
+    assert_eq!(
+        window, " ｶﾞ",
+        "a cluster cut by the left edge leaves its cell blank"
+    );
+}
+
+/// `key_cell` pads by the key's drawn cells: a profile name pre-cut to drawn
+/// cells (services' facts column) holding `ｶﾞｶﾞ` draws 4 where a whole-string
+/// width reads 2, so a whole-string pad overpads by 2 and the value column
+/// drifts right past the pane edge. Drawn 4 + pad 4 = the 6-cell column + gutter.
+#[test]
+fn key_cell_pads_a_dakuten_key_by_drawn_cells() {
+    assert_eq!(key_cell("ｶﾞｶﾞ", 6, 2), "ｶﾞｶﾞ    ");
+}
+
+/// A cycle row's trail measures each custom value's word by the cells the
+/// buffer draws: the Setup model field takes any typed id, and `لالالا` draws 6
+/// cells where the whole-string `Span::width` reads 3. At an 18-cell pane the
+/// value column is 7, so `sonnet` (6) opens its own line and the fold word (6
+/// drawn) cannot share it; a word measured at 3 joins that line and the run
+/// draws 20 cells in an 18-cell pane, cut at the pane edge.
+#[test]
+fn a_cycle_row_sizes_a_fold_class_custom_word_by_drawn_cells() {
+    use super::super::format::grapheme_cells;
+    use super::super::panes::cycle_row_lines;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+    const WIDTH: usize = 18;
+    let lines = cycle_row_lines(
+        vec![Span::raw("  "), Span::raw("key  ")],
+        &[("aa", false)],
+        Some(("sonnet لالالا", true)),
+        None,
+        false,
+        WIDTH,
+    );
+    // Drawn twice the pane wide, so an overrunning row draws whole here instead
+    // of being cut at a buffer edge.
+    let mut term = ratatui::Terminal::new(TestBackend::new(WIDTH as u16 * 2, 4)).unwrap();
+    term.draw(|frame| {
+        frame.render_widget(Paragraph::new(lines), frame.area());
+    })
+    .unwrap();
+    let drawn: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|row| row.trim_end().to_string())
+        .filter(|row| !row.is_empty())
+        .collect();
+    for row in &drawn {
+        assert!(
+            grapheme_cells(row) <= WIDTH,
+            "a drawn row overruns the {WIDTH}-cell pane: {row:?}"
+        );
+    }
+    assert_eq!(drawn, ["  key  aa", "       sonnet", "       لالالا"]);
+}
+
+/// The trail asks room for the whole custom value by drawn cells, and indents
+/// by its widest drawn word: `ab لالا` draws 7 (whole-string 5), so at 17 it
+/// cannot join `  key  aa` (9 + 2 + 7 = 18) and opens its own line; `لالالالا`
+/// draws 8 (whole-string 4), so at 14 the value column (7 + 8 = 15) cannot
+/// hold it and it stacks at the 2-cell indent.
+#[test]
+fn a_cycle_row_groups_and_indents_a_fold_class_custom_value_by_drawn_cells() {
+    use super::super::panes::cycle_row_lines;
+    let rows = |custom: &str, width: usize| -> Vec<String> {
+        cycle_row_lines(
+            vec![Span::raw("  "), Span::raw("key  ")],
+            &[("aa", false)],
+            Some((custom, true)),
+            None,
+            false,
+            width,
+        )
+        .iter()
+        .map(line_text)
+        .collect()
+    };
+    assert_eq!(rows("ab لالا", 17), ["  key  aa", "       ab لالا"]);
+    assert_eq!(rows("لالالالا", 14), ["  key  aa", "  لالالالا"]);
 }
 
 /// Rot-proof against a new row with a longer key: every blurred row opens its
@@ -283,6 +431,34 @@ fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
         row_hint(GlobalConfigRow::AutoStartQueue, off, tunables()).as_deref(),
         Some("auto-start usage windows as soon as possible"),
     );
+}
+
+/// The compatible toggle's bracket frame drops exactly one bracket pair: a
+/// glyph carrying its own (`[[on]]`) renders whole, its inner brackets in the
+/// word span's state colour, while the theme's own `[on]`/`[off]` glyphs keep
+/// their word alone between the dim brackets.
+#[test]
+fn the_compatible_toggle_drops_exactly_one_bracket_pair() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let state = theme::accent();
+    let frames = crate::tui::render::panes::compatible_toggle_spans("[[on]]", state);
+    let rendered: Vec<_> = frames.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(rendered, vec!["[", "[on]", "]"], "the glyph renders whole");
+    assert_eq!(frames[0].style, theme::dim(), "the frame's own bracket");
+    assert_eq!(frames[1].style, state, "the word carries the state");
+    assert_eq!(frames[2].style, theme::dim());
+
+    // The theme's glyphs hold no inner brackets: the word is the glyph less
+    // its one frame pair.
+    let plain = crate::tui::render::panes::compatible_toggle_spans("[on]", state);
+    let words: Vec<_> = plain.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(words, vec!["[", "on", "]"]);
+
+    // The call site feeds the tier's glyph through the same frame.
+    let on = toggle_value(true, false);
+    let parts: Vec<_> = on.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(parts, vec!["[", "on", "]"], "the on toggle at compatible");
+    assert_eq!(on[1].style, theme::accent());
 }
 
 /// `refresh spent` is a pure on/off boolean — a toggle (`─●` / `○─`),
@@ -768,7 +944,7 @@ fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
     let hint_on = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
     assert_eq!(
         hint_on,
-        "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+        "checks for updates hourly, unless CLAUTH_NO_UPDATE=1"
     );
     let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
     assert_eq!(hint_off, "no update checks");
@@ -1525,11 +1701,11 @@ fn value_row_hints_state_what_the_setting_does() {
             ),
             (
                 GlobalConfigRow::BurnFloor,
-                "never switch away before this share is used, however fast the burn",
+                "the burn projection never switches below this share; it does nothing at or above an account's threshold",
             ),
             (
                 GlobalConfigRow::BurnHorizon,
-                "how far ahead to look when guessing the next switch",
+                "how far ahead to look, never past the next usage reading",
             ),
         ] {
             assert_eq!(
@@ -1551,5 +1727,142 @@ fn value_row_hints_state_what_the_setting_does() {
     assert_eq!(
         row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
         Some("no context nudge is sent")
+    );
+}
+
+/// The burn-aware hint names the threshold check that still applies with the
+/// mode on, so the projection reads as an earlier switch, never a later one.
+#[test]
+fn burn_aware_hints_keep_the_threshold_check() {
+    let mut on = toggles();
+    on.burn_aware = true;
+    let mut off = toggles();
+    off.burn_aware = false;
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, on, tunables()).as_deref(),
+        Some(
+            "switch the active account away at its threshold, or sooner once its burn would reach 100% within the look-ahead"
+        )
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::BurnAware, off, tunables()).as_deref(),
+        Some("switch the active account away once its usage crosses its threshold")
+    );
+}
+
+/// The MCP login mode sits right after `non-login keys`, the other row about
+/// what travels beside a login, in the scheduler band.
+#[test]
+fn sync_mcp_logins_sits_after_non_login_keys() {
+    assert_eq!(GlobalConfigRow::SyncMcpLogins.band(), "scheduler");
+    let pos = |row: GlobalConfigRow| {
+        GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row in the config list")
+    };
+    assert_eq!(
+        pos(GlobalConfigRow::SyncMcpLogins),
+        pos(GlobalConfigRow::PreserveNonLoginKeys) + 1
+    );
+}
+
+/// A plain toggle labelled `sync MCP logins`, with the exact hint per mode.
+#[test]
+fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
+    let mut off_state = toggles();
+    off_state.sync_mcp_logins = false;
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+        let on = line_text(&one_row(
+            GlobalConfigRow::SyncMcpLogins,
+            false,
+            toggles(),
+            tunables(),
+            None,
+        ));
+        assert!(on.contains("sync MCP logins"), "the key reads: {on}");
+        assert!(on.contains("[on]"), "on renders the bracket: {on}");
+        let off = line_text(&one_row(
+            GlobalConfigRow::SyncMcpLogins,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(off.contains("[off]"), "off renders the bracket: {off}");
+    }
+    assert_eq!(
+        row_hint(GlobalConfigRow::SyncMcpLogins, toggles(), tunables()).expect("hint"),
+        "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch"
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::SyncMcpLogins, off_state, tunables()).expect("hint"),
+        "each account keeps its own MCP server logins"
+    );
+}
+
+/// The `auto-start queue` row's label cells on the drawn Config tab, found by
+/// matching the label cell by cell (a glyph before it would shift a string
+/// index off its cell).
+fn auto_start_queue_label_cells(app: &crate::tui::app::App) -> Vec<ratatui::buffer::Cell> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let label: Vec<String> = "auto-start queue".chars().map(String::from).collect();
+    for y in 0..buf.area.height {
+        let row: Vec<ratatui::buffer::Cell> =
+            (0..buf.area.width).map(|x| buf[(x, y)].clone()).collect();
+        if let Some(start) = row
+            .windows(label.len())
+            .position(|win| win.iter().zip(&label).all(|(c, l)| c.symbol() == l))
+        {
+            return row[start..start + label.len()].to_vec();
+        }
+    }
+    panic!(
+        "no `auto-start queue` row on the Config tab:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// A Config-tab app holding `profile` alone, the cursor off the queue row.
+fn queue_row_app(profile: crate::profile::Profile) -> crate::tui::app::App {
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = crate::tui::app::Tab::Config;
+    app
+}
+
+/// A proxy account never joins the auto-start queue (its member filter takes
+/// only accounts that spend their own OAuth chain), so one carrying
+/// `auto_start = true` from before it became a proxy account leaves the
+/// queue with no possible member: the row stays the dimmed, inert one. The
+/// same flag on an ordinary account makes it live (the positive twin).
+#[test]
+fn a_proxy_account_with_auto_start_on_leaves_the_queue_row_dimmed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let mut px = crate::profile::Profile::new("px".to_string(), None, None);
+    px.auto_start = true;
+    px.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-px".to_string(),
+    });
+    let dimmed = auto_start_queue_label_cells(&queue_row_app(px));
+    assert!(
+        dimmed.iter().all(|c| c.fg == theme::faint().fg.unwrap()),
+        "a proxy account alone leaves the row faint: {dimmed:?}"
+    );
+
+    let mut kitty = crate::profile::Profile::new("kitty".to_string(), None, None);
+    kitty.auto_start = true;
+    let live = auto_start_queue_label_cells(&queue_row_app(kitty));
+    assert!(
+        live.iter().all(|c| c.fg != theme::faint().fg.unwrap()),
+        "an ordinary opted-in account makes the row live: {live:?}"
     );
 }

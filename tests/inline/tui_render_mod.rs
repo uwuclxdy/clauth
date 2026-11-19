@@ -18,11 +18,14 @@ fn oauth(name: &str, auto: bool) -> Profile {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -36,6 +39,9 @@ fn oauth(name: &str, auto: bool) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -426,7 +432,7 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         let viewport = app.global_config_viewport.get();
         assert!(viewport >= 4, "config publishes its viewport at {w}x{h}");
         let starts: Vec<usize> = app.global_config_row_starts.borrow().clone();
-        assert_eq!(starts.len(), 20, "one start line per config row");
+        assert_eq!(starts.len(), 22, "one start line per config row");
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
         let target = starts[0] + viewport - 1;
         let expected = (0..starts.len())
@@ -439,8 +445,8 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         );
         if (w, h) == (40, 24) {
             // The rows wrap at 40 cols, so a row-count page (viewport - 1 rows)
-            // would land on row 17; paging by lines lands on row 6.
-            assert_eq!(app.global_config_cursor, 6, "40x24 lands on row 6, not 17");
+            // would land on row 17; paging by lines lands on row 7.
+            assert_eq!(app.global_config_cursor, 7, "40x24 lands on row 7, not 17");
         }
         term.draw(|f| super::draw(f, &app)).unwrap();
         assert!(
@@ -580,6 +586,113 @@ fn long_config_pane_follows_selection_without_repinning() {
     );
 }
 
+/// A form whose view is derived from the frame alone (the smallest offset
+/// showing the row, or a follow seeded at the bottom or at the row) puts a
+/// mid-form row back at offset 1 after the pane grows, or loses the view after
+/// a move or a resize; the saved viewport only clamps to the new maximum, and
+/// an adjacent move or a resize that still fits leaves the row where it was
+/// drawn, at the maximum and below it.
+#[test]
+fn a_grown_config_pane_clamps_its_saved_viewport_instead_of_recomputing_it() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        23,
+        "the last row stops at the 80x14 pane's maximum, 31 - 8"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+        .unwrap();
+    term.backend_mut().resize(80, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 80x24 the form draws 31 lines (22 rows, 4 band headers, 3 spacers,
+    // the wrapped home-tab row's second line and the focused row's hint) in an
+    // 18-row pane, so the saved offset from 80x14 clamps to 31 - 18; the row's
+    // line 15 sits on 13 + 2, the band's edge, so the follow leaves it there.
+    assert_eq!(
+        app.global_config_offset.get(),
+        13,
+        "the saved viewport clamps to the grown pane's maximum"
+    );
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = rows
+        .iter()
+        .position(|row| row.contains("auto-start queue"))
+        .unwrap();
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        rows.iter().position(|row| row.contains("auto-start queue")),
+        Some(before),
+        "an adjacent move does not repin the grown pane"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::ContextNudge)
+        .unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // ContextNudge's line 14 falls inside the 13 + 2 band, so the follow lifts
+    // the view to 14 - 2, below the maximum; a view seeded at the bottom on
+    // every draw reads 12 here too, then drops back to 13 on the next move.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an upward move follows the row"
+    );
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "an adjacent move keeps a viewport below the maximum"
+    );
+    // The row's lines 15-16 keep two lines either side inside an 8-row pane
+    // at offset 12, and 12 stays under the 80x24 maximum of 13, so neither
+    // resize moves the view; a view reseeded at the bottom or at the row on
+    // a resize reads 13 in both.
+    for (height, label) in [(14, "a shrunk pane"), (24, "a regrown pane")] {
+        term.backend_mut().resize(80, height);
+        term.autoresize().unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        assert_eq!(
+            app.global_config_offset.get(),
+            12,
+            "{label} keeps a saved view that still fits"
+        );
+    }
+    term.backend_mut().resize(70, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // At 70 columns one more line wraps below the row, so the form grows to
+    // 32 lines and its maximum to 14 while the row keeps lines 15-16: the
+    // saved 12 still fits and holds; a view reseeded on a width or length
+    // change reads 13 from the bottom or the row and 1 from the top.
+    assert_eq!(
+        app.global_config_offset.get(),
+        12,
+        "a narrower pane keeps a saved view that still fits"
+    );
+    app.global_config_cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        0,
+        "first row restores the top"
+    );
+}
+
 #[test]
 fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
     use crate::tui::app::{Check, Health, Tab};
@@ -603,10 +716,10 @@ fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
         })
         .collect();
     app.services.cursor = 3;
-    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     let bottom = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(bottom[6].contains("herdr"), "last service is visible");
+    assert!(bottom[5].contains("herdr"), "last service is visible");
     assert_eq!(
         app.services.selector.offset.get(),
         1,
@@ -616,11 +729,11 @@ fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
     term.draw(|f| super::draw(f, &app)).unwrap();
     let adjacent = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
-        adjacent[5].contains("plugin"),
+        adjacent[4].contains("plugin"),
         "cursor moves inside the viewport"
     );
     assert!(
-        adjacent[6].contains("herdr"),
+        adjacent[5].contains("herdr"),
         "lower context remains visible"
     );
     assert_eq!(
@@ -656,42 +769,42 @@ fn a_three_line_status_viewport_shows_only_whole_incidents() {
         .collect();
     app.tab = Tab::Status;
     app.status.cursor = 11;
-    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(rows[4].contains("incident-11"), "selected title is visible");
+    assert!(rows[3].contains("incident-11"), "selected title is visible");
     assert_eq!(
-        rows[5].chars().take(22).collect::<String>(),
+        rows[4].chars().take(22).collect::<String>(),
         "│        ● monitoring ",
         "selected phase line is visible"
     );
-    assert!(!rows[6].contains("incident-"), "no orphan title at bottom");
+    assert!(!rows[5].contains("incident-"), "no orphan title at bottom");
     assert_eq!(app.status.selector.offset.get(), 22);
     assert_eq!(
-        term.backend().buffer().cell((22, 6)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 5)).unwrap().symbol(),
         "┃",
         "thumb reaches the bottom of the full panel viewport"
     );
     assert_eq!(
-        term.backend().buffer().cell((22, 5)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 4)).unwrap().symbol(),
         "┊",
         "track occupies the whole panel above the bottom thumb"
     );
     app.status.cursor = 0;
     term.draw(|f| super::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(rows[4].contains("incident-00"), "first title is reachable");
+    assert!(rows[3].contains("incident-00"), "first title is reachable");
     assert_eq!(
-        rows[5].chars().take(22).collect::<String>(),
+        rows[4].chars().take(22).collect::<String>(),
         "│        ● monitoring ",
         "first phase line is visible"
     );
     assert!(
-        !rows[6].contains("incident-"),
+        !rows[5].contains("incident-"),
         "bottom stays whole at the top"
     );
     assert_eq!(
-        term.backend().buffer().cell((22, 4)).unwrap().symbol(),
+        term.backend().buffer().cell((22, 3)).unwrap().symbol(),
         "┃",
         "thumb reaches the top"
     );
@@ -912,15 +1025,21 @@ fn a_usage_status_row_past_its_deadline_reads_queued_instead_of_refresh_in_zero(
 
 /// A stood-down instance mirrors another process's disk and runs no fetch round
 /// of its own, so a past published deadline is its own cache-mtime estimate, not
-/// a due fetch. Both surfaces must render that row as a countdown — the floored
-/// `0s` under its staleness cue — never a `queued` spinner promising work this
-/// process will not do.
+/// a due fetch. Both surfaces must render that row as overdue — the `+4m` age
+/// under its amber staleness cue, the usage row's `refresh overdue` — never a
+/// `queued` spinner promising work this process will not do, and never a
+/// countdown frozen at `0s`.
 #[test]
-fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
+fn a_stood_down_row_past_its_deadline_shows_its_overdue_age_not_queued() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::Tab;
 
     let mut app = app_with_a_passed_deadline("dueacct");
+    // 4m30s past due: `+4m` holds 30 s from either minute boundary.
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("dueacct")),
+        crate::usage::now_ms() - 270_000,
+    );
     // Another instance wins the usage-fetch lease first; its `File` must stay
     // alive so the flock stays held for the rest of the test.
     let other = crate::daemon::FetchLease::new();
@@ -946,24 +1065,33 @@ fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
             .any(|c| crate::spinner::SPINNER_FRAMES.contains(&c.symbol())),
         "a stood-down row must not claim a queued fetch:\n{text}"
     );
+    assert!(
+        !text.contains("0s"),
+        "the mirror's past estimate must not floor at `0s`:\n{text}"
+    );
     assert_eq!(
-        text.split_whitespace().filter(|w| *w == "0s").count(),
+        text.split_whitespace().filter(|w| *w == "+4m").count(),
         1,
-        "the mirror's past estimate floors at `0s`:\n{text}"
+        "the mirror's past estimate reads its overdue age:\n{text}"
     );
-    let zero = cells
+    let plus = cells
         .iter()
-        .position(|c| c.symbol() == "0")
-        .unwrap_or_else(|| panic!("the timer slot holds no countdown:\n{text}"));
+        .position(|c| c.symbol() == "+")
+        .unwrap_or_else(|| panic!("the timer slot holds no overdue age:\n{text}"));
     assert_eq!(
-        cells[zero + 1].symbol(),
-        "s",
-        "the cell is a countdown:\n{text}"
+        cells[plus + 1].symbol(),
+        "4",
+        "the cell is the age:\n{text}"
     );
     assert_eq!(
-        cells[zero].fg,
+        cells[plus + 2].symbol(),
+        "m",
+        "the cell is the age:\n{text}"
+    );
+    assert_eq!(
+        cells[plus].fg,
         crate::tui::theme::warning_color(),
-        "the stood-down countdown keeps its amber staleness cue:\n{text}"
+        "the stood-down overdue age keeps its amber staleness cue:\n{text}"
     );
 
     app.tab = Tab::Usage;
@@ -973,8 +1101,12 @@ fn a_stood_down_row_past_its_deadline_keeps_its_countdown_not_queued() {
         "a stood-down status row names no queued fetch:\n{usage}"
     );
     assert!(
-        usage.contains("refresh in 0s"),
-        "the mirror's past estimate reads `refresh in 0s`:\n{usage}"
+        usage.contains("refresh overdue"),
+        "the mirror's past estimate reads overdue:\n{usage}"
+    );
+    assert!(
+        !usage.contains("refresh in 0s"),
+        "a passed deadline must not read `refresh in 0s`:\n{usage}"
     );
 }
 
@@ -2079,6 +2211,51 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
     );
 }
 
+/// A proxy account's login row names the one login clauth takes for it, whether
+/// the account holds only its key or a stored OAuth pair beside it: every other
+/// login is refused (`refuse_relogin_off_proxy`), so neither account-type hint
+/// may stand.
+#[test]
+fn setup_login_hint_on_a_proxy_account_names_its_proxy_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    for stored_chain in [false, true] {
+        let mut px = Profile::new(
+            "px".to_string(),
+            Some("http://127.0.0.1:9141".to_string()),
+            Some("clp_stub-key-0".to_string()),
+        );
+        px.proxy = Some(crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        if stored_chain {
+            px.credentials = Some(hybrid_creds());
+        }
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["px".into()],
+                ..AppState::default()
+            },
+            profiles: vec![px],
+        };
+        let mut app = App::new(config);
+        app.tab = Tab::Setup;
+        app.config_focus = ConfigFocus::Actions;
+        app.config_action_cursor = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::Login)
+            .expect("every account shows a login row");
+
+        let out = dump(&app, 120, 30);
+        assert!(
+            out.lines().any(|l| l.trim_matches(|c| c == '│' || c == ' ')
+                == "└ log in with `clauth login px --proxy stub`"),
+            "stored_chain {stored_chain}: the hint names the proxy login, whole:\n{out}",
+        );
+    }
+}
+
 /// Same typing rule for the log-out row's own hint: a hybrid holding both an api
 /// key and an OAuth pair logs out of the pair, and the copy must say so.
 #[test]
@@ -3050,11 +3227,14 @@ fn bare(name: &str) -> Profile {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: Some(95.0),
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -3068,6 +3248,9 @@ fn bare(name: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -3713,7 +3896,10 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
 
     // A bar is 10 interior cells in brackets, always trailed by its percentage —
     // specific enough that no pill or chip elsewhere in the frame can match it.
+    // Past the 122-cell layout (126 columns) the bars take a share of the
+    // panel's slack, so there a bar holds at least its 10 cells.
     let bar = regex::Regex::new(r"\[[^\[\]]{10}\] +\d+%").expect("valid pattern");
+    let grown_bar = regex::Regex::new(r"\[[^\[\]]{10,}\] +\d+%").expect("valid pattern");
     let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
 
     // Pre-column behavior as a function of TERMINAL width, per NAME LENGTH. The
@@ -3765,6 +3951,7 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
             let frame = dump(&app, width, 20);
             let bars = usize::from(width >= *first_bar) + usize::from(width >= *seven_bar);
             let resets = usize::from(width >= *first_reset) + usize::from(width >= *seven_reset);
+            let bar = if width > 126 { &grown_bar } else { &bar };
             assert_eq!(
                 (
                     bar.find_iter(&frame).count(),
@@ -3964,19 +4151,26 @@ fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
     }
 }
 
-/// Desktop pin: past the clamp the name column stops absorbing the panel's
-/// spare width — the columns keep their cap-width layout and the band centres,
-/// so the 26-cell ASCII name clips to its 22-cell column (`…`) while the type
-/// cell stays on the same terminal cell as every other row. The expected row
-/// is hand-derived from the layout at the 122-cell cap plus the centring pad.
+/// Desktop pin: past the 122-cell layout the name column stops absorbing the
+/// panel's spare width — it keeps its laid-out 22 cells while the slack goes to
+/// the bars and the gaps, so the 26-cell ASCII name clips to its column (`…`)
+/// while the type cell stays on the same terminal cell as every other row.
+///
+/// The expected row is hand-derived. The layout at 122 is name 22, kind 16,
+/// 5h 26, 7d 27, live 4, t/s 4, gap 3 (narrow 1), timer 5: a 121-cell row. At
+/// 160 columns the list is 156 wide, so the slack is 35: the bars' collective
+/// third is 11, the 5h taking 5 (a 15-cell bar, a 31-cell column) and the 7d
+/// the odd cell (6, a 16-cell bar, a 33-cell column), and the other 24 spread
+/// over the 5 gaps at 4 each with the leftmost four a cell more (gaps 8,
+/// narrow 6). Fill is round-to-nearest: 12% of 15 -> 2, 8% of 16 -> 1.
 #[test]
 fn the_overview_name_column_clips_to_its_capped_column_at_160() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
-    // Select on the row content after the band's centring pad, never a
-    // left-flush prefix: past the clamp every row carries the pad.
+    // Select on the row content after the border's padding, never a fixed
+    // left-flush prefix.
     let got: Vec<String> = rows
         .iter()
         .filter(|r| {
@@ -3989,25 +4183,27 @@ fn the_overview_name_column_clips_to_its_capped_column_at_160() {
     assert_eq!(
         got,
         vec![
-            "│                  ❯   abcdefghijklmnopqrstu…   —                     [█░░░░░░░░░] 12%             [█░░░░░░░░░]  8%                                            │",
+            "│ ❯   abcdefghijklmnopqrstu…        —                          [██░░░░░░░░░░░░░] 12%                  [█░░░░░░░░░░░░░░░]  8%                                   │",
         ],
         "name column ascii row at 160 cols"
     );
 }
 
-/// Desktop pin: the CJK and emoji names render whole inside the capped name
+/// Desktop pin: the CJK and emoji names render whole inside the 22-cell name
 /// column, and the type cell lands on the same terminal cell in the CJK, emoji
 /// and ASCII rows — one cell-measured column layout shared by every row, the
-/// band's centring pad included. The expected rows are hand-derived from the
-/// layout at the 122-cell cap plus the centring pad.
+/// widened gaps included. The expected rows are hand-derived the way
+/// [`the_overview_name_column_clips_to_its_capped_column_at_160`] derives its
+/// own (15- and 16-cell bars, gaps 8, narrow 6): 49% of 15 -> 7, 30% of 16 ->
+/// 5 (4.8 rounds up), 63% of 15 -> 9, 40% of 16 -> 6 filled cells.
 #[test]
 fn the_overview_name_column_desktop_rows_measure_by_cells() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = s9_overview_app();
     let wide = dump(&app, 160, 40);
     let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
-    // Select on the row content after the band's centring pad, never a
-    // left-flush prefix: past the clamp every row carries the pad.
+    // Select on the row content after the border's padding, never a fixed
+    // left-flush prefix.
     let got: Vec<String> = rows
         .iter()
         .filter(|r| {
@@ -4022,8 +4218,8 @@ fn the_overview_name_column_desktop_rows_measure_by_cells() {
     assert_eq!(
         got,
         vec![
-            "│                    ✻ cjk-日 本 語 ア カ ウ ン ト      —                     [█████░░░░░] 49%             [███░░░░░░░] 30%                                            │",
-            "│                      emoji-🧭 ⚠️ -account       —                     [██████░░░░] 63%             [████░░░░░░] 40%                                            │",
+            "│   ✻ cjk-日 本 語 ア カ ウ ン ト           —                          [███████░░░░░░░░] 49%                  [█████░░░░░░░░░░░] 30%                                   │",
+            "│     emoji-🧭 ⚠️ -account            —                          [█████████░░░░░░] 63%                  [██████░░░░░░░░░░] 40%                                   │",
         ],
         "name column wide rows at 160 cols"
     );
@@ -6018,7 +6214,7 @@ fn forms_and_overview_codex_page_by_hand_pinned_cursors() {
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| super::draw(f, &app)).unwrap();
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
-    assert_eq!(app.fallback_detail_cursor, 2, "fallback card page");
+    assert_eq!(app.fallback_detail_cursor, 3, "fallback card page");
 
     // Fallback `+ add` picker: 24 candidates at 80x24, page = 17.
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
@@ -7943,6 +8139,118 @@ fn a_display_only_provider_account_rings_no_bell_on_its_cached_reading() {
     );
 }
 
+/// The toasts one `apply_usage` tick raises for the proxy account `px`,
+/// armed at 90%, whose copy holds its chain 5h window at 97% read `chain_age`
+/// ago, the copy's mtime 3 h old (an offer figure beside the window, read
+/// then): the copy as the leg writes it. `status` overrides the status the
+/// startup seed took off the copy.
+fn proxy_bell_toasts(
+    chain_age: std::time::Duration,
+    status: Option<crate::usage::FetchStatus>,
+) -> Vec<String> {
+    let written = std::time::SystemTime::now();
+    proxy_bell_toasts_dated(
+        written,
+        written - chain_age,
+        written - std::time::Duration::from_secs(3 * 3600),
+        status,
+    )
+}
+
+/// [`proxy_bell_toasts`] over a copy written at `written`, its chain 5h
+/// window read at `chain` and its mtime `stalest`.
+fn proxy_bell_toasts_dated(
+    written: std::time::SystemTime,
+    chain: std::time::SystemTime,
+    stalest: std::time::SystemTime,
+    status: Option<crate::usage::FetchStatus>,
+) -> Vec<String> {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("px");
+    let port = 47_811;
+    let registry = crate::proxy::registry_path().unwrap();
+    std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    std::fs::write(registry, format!("[stub]\nport = {port}\nenabled = true\n")).unwrap();
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some(format!("http://127.0.0.1:{port}"));
+    p.api_key = Some("clp_k".into());
+    p.bell_threshold = Some(90.0);
+    save_startup_state(&[&p], AppState::default());
+    crate::profile::write_proxy_record(
+        &name,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .unwrap();
+    let epoch_ms = |at: std::time::SystemTime| {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    crate::profile_cache::write_third_party_copy(
+        &name,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 97.0)]),
+        Some(epoch_ms(chain)),
+        epoch_ms(written),
+        stalest,
+    );
+    let mut app = startup_app_from_disk();
+    if let Some(status) = status {
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("px".to_string(), status);
+    }
+    app.apply_usage();
+    app.toasts.iter().map(|t| t.body.to_string()).collect()
+}
+
+/// The TUI's 5h bell judges a proxy copy by its chain windows, as the
+/// daemon's does: the chain window read now at 97% rings though an offer
+/// figure beside it is 3 h old. The same account whose chain window itself is
+/// 3 h old stays silent, under the status the seed took off it and under a
+/// `Fresh` one alike.
+#[test]
+fn the_tui_bell_rings_for_a_proxy_account_whose_chain_window_is_fresh() {
+    let three_hours = std::time::Duration::from_secs(3 * 3600);
+    assert_eq!(
+        proxy_bell_toasts(std::time::Duration::ZERO, None),
+        vec!["alert: px at 97%".to_string()],
+        "a fresh chain window rings"
+    );
+    assert_eq!(
+        proxy_bell_toasts(three_hours, None),
+        Vec::<String>::new(),
+        "a stale chain window is silent"
+    );
+    assert_eq!(
+        proxy_bell_toasts(three_hours, Some(crate::usage::FetchStatus::Fresh)),
+        Vec::<String>::new(),
+        "and silent on its own age, whatever the status"
+    );
+}
+
+/// The TUI's 5h bell reads a chain date ahead of the clock (the clock stepped
+/// back after the write) as undated, so stale, as the daemon's does: the
+/// chain window at 97% dated 1 h ahead stays silent under a `Fresh` status,
+/// though the copy's 60 s old mtime raises no stale cue.
+#[test]
+fn the_tui_bell_never_rings_on_a_chain_date_ahead_of_the_clock() {
+    let written = std::time::SystemTime::now();
+    assert_eq!(
+        proxy_bell_toasts_dated(
+            written,
+            written + std::time::Duration::from_secs(3600),
+            written - std::time::Duration::from_secs(60),
+            Some(crate::usage::FetchStatus::Fresh),
+        ),
+        Vec::<String>::new(),
+        "a chain window dated 1 h ahead is silent"
+    );
+}
+
 /// A one-member chain holding `p`, its cache `age` old, through the real
 /// startup and one `apply_usage` tick.
 fn chain_member_after_one_tick(p: &Profile, age: std::time::Duration) -> App {
@@ -8128,7 +8436,9 @@ fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
 
 /// The #74 `stale` pill end to end: an aged `usage_cache.json` on disk, one
 /// `apply_usage` (the per-tick map), then a real draw whose per-frame snapshot
-/// carries that map to the Usage tab's status block.
+/// carries that map to the Usage tab's status block. The reading is past its
+/// own cadence with no deadline published, so the dot arm reads the overdue
+/// wording the pill prepends — the pill's threshold is what this pins.
 #[test]
 fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
     use crate::tui::app::Tab;
@@ -8170,7 +8480,7 @@ fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
     assert_eq!(
         rows_with(&dump(&app, 100, 40), &["stale"]),
         vec![
-            "│                            ││ status    [ stale ] ◌ up to date                                   │"
+            "│                            ││ status    [ stale ] ◌ refresh overdue · read 23m ago               │"
         ],
         "the aged cache's stale pill reaches the drawn status block"
     );
@@ -8475,9 +8785,9 @@ fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
     app.tab = Tab::Tokens;
     app.anim_phase_ms = Some(5_000);
     let want: &[(&str, u16, &str)] = &[
-        ("alpha", 28, "▝▜██████"),
-        ("bravo", 28, "▝▜██████"),
-        ("charlie", 28, "▝▜██████"),
+        ("alpha", 28, "1%        ● status.claude.ai"),
+        ("bravo", 28, "73.42%    ● status.claude.ai"),
+        ("charlie", 28, "100%      ● status.claude.ai"),
         ("alpha", 45, "▝▜██████▀ alpha 1%         ● status.claude.ai"),
         ("bravo", 45, "▝▜██████▀ bravo 73.42%     ● status.claude.ai"),
         (
@@ -9399,4 +9709,671 @@ fn the_empty_state_keeps_its_action_line_on_a_short_pane() {
         ["no services yet", "r to run", ""],
         "services rows"
     );
+}
+
+fn header_app(tab: crate::tui::app::Tab) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work", false)],
+    });
+    app.tab = tab;
+    app
+}
+
+/// The cell column where `needle` starts on `row`, counted in cells.
+fn cell_col(row: &str, needle: &str) -> Option<usize> {
+    row.find(needle).map(|at| row[..at].chars().count())
+}
+
+/// Which service chips a no-art header shows depends on the terminal width
+/// alone: switching tabs at a fixed width never shows or hides a chip.
+#[test]
+fn the_no_art_chips_hold_across_a_tab_switch() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let tabs = [
+        Tab::Overview,
+        Tab::Usage,
+        Tab::Tokens,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Config,
+        Tab::Status,
+        Tab::Services,
+    ];
+    for width in 40..=70u16 {
+        let chips: Vec<(bool, bool)> = tabs
+            .iter()
+            .map(|&tab| {
+                let frame = dump(&header_app(tab), width, 13);
+                let row0 = frame.lines().next().unwrap_or_default().to_string();
+                (row0.contains("[ shunt ]"), row0.contains("[ daemon ]"))
+            })
+            .collect();
+        assert!(
+            chips.windows(2).all(|pair| pair[0] == pair[1]),
+            "at {width} columns the chips change with the tab: {chips:?}"
+        );
+    }
+}
+
+/// The service chips outrank the full tab strip: at 80 columns the tab bar
+/// collapses to its overflow form and both chips keep the right edge.
+#[test]
+fn the_no_art_header_keeps_both_chips_beside_a_collapsed_tab_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 80, 13);
+    let rows: Vec<&str> = frame.lines().collect();
+    let left = format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"));
+    let chips = "[ shunt ]  [ daemon ]";
+    let gap = 80 - left.chars().count() - chips.chars().count();
+    assert_eq!(rows[0], format!("{left}{}{chips}", " ".repeat(gap)));
+}
+
+/// The two-row header at 80x13: brand and version at column 0, the no-logo
+/// separator, the overflow tabs, both chips on the right edge, and the status
+/// line below. Whole rows by equality.
+#[test]
+fn the_no_art_header_at_eighty_by_thirteen() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 80, 13);
+    let rows: Vec<&str> = frame.lines().collect();
+    let left = format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"));
+    let chips = "[ shunt ]  [ daemon ]";
+    let gap = 80 - left.chars().count() - chips.chars().count();
+    assert_eq!(rows[0], format!("{left}{}{chips}", " ".repeat(gap)));
+    assert_eq!(
+        rows[1],
+        format!("{:<62}● status.claude.ai", "[ 0 live ]  [ — tok/s ]")
+    );
+}
+
+/// The two-row header at 36x24 (under the art's fit width): same shape, the
+/// status line left of the live/tok-s chips' budget. The row is 30 cells, so
+/// neither chip fits and the overflow bar stands whole.
+#[test]
+fn the_no_art_header_at_thirty_six_by_twenty_four() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let frame = dump(&app, 36, 24);
+    let rows: Vec<&str> = frame.lines().collect();
+    assert_eq!(
+        rows[0],
+        format!(
+            "{:<36}",
+            format!("clauth v{}  •  overview  ›", env!("CARGO_PKG_VERSION"))
+        )
+    );
+    assert_eq!(rows[1], format!("{:<18}● status.claude.ai", ""));
+}
+
+/// The no-art row's shed ladder, each seam pinned on both sides by whole-row
+/// equality: the `[ herdr ]` tag, then the tab bar's collapse to its overflow
+/// form, then the shunt chip, then the daemon chip.
+///
+/// The spans: `clauth` (6) + ` v<version>` (8) = 14, the no-logo separator
+/// `  •  ` (5), the full strip 73 (8 labels, seven 3-cell separators), the
+/// widest overflow bar 14 (`‹  fallback  ›`, the middle tab), the tag
+/// `  [ herdr ]` (11), the 3-cell gap before a chip set, both chips
+/// `[ shunt ]` (9) + `  ` (2) + `[ daemon ]` (10) = 21, the daemon chip (10).
+/// The collapse and the chip seams charge the widest bar over every tab, so a
+/// tab switch never moves one.
+#[test]
+fn the_no_art_row_sheds_the_tag_then_collapses_then_the_chips() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let strip = "overview   usage   tokens   setup   fallback   config   status   services";
+    let bar = "overview  ›";
+    let chips = "[ shunt ]  [ daemon ]";
+    let daemon = "[ daemon ]";
+
+    // 6 + 8 + 11 + 5 + 73 + 3 + 21 = 127: the tag rides only while the full
+    // strip and both chips fit beside it.
+    let herdr = header_app(crate::tui::app::Tab::Overview).with_herdr_mode(true);
+    let at = dump(&herdr, 127, 13);
+    let at: Vec<&str> = at.lines().collect();
+    assert_eq!(
+        at[0],
+        format!(
+            "clauth  [ herdr ] v{version}  •  {strip}{}{chips}",
+            " ".repeat(3)
+        )
+    );
+    // Without the tag the chips keep the right edge, 13 cells off the tabs.
+    let off = dump(&herdr, 126, 13);
+    let off: Vec<&str> = off.lines().collect();
+    assert_eq!(
+        off[0],
+        format!("clauth v{version}  •  {strip}{}{chips}", " ".repeat(13))
+    );
+
+    // 6 + 8 + 5 + 73 + 3 + 21 = 116: the full strip with both chips. One
+    // column narrower and the bar collapses to its widest overflow form,
+    // 6 + 8 + 5 + 14 + 3 + 21 = 57, while both chips stay.
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let both = dump(&app, 116, 13);
+    let both: Vec<&str> = both.lines().collect();
+    assert_eq!(
+        both[0],
+        format!("clauth v{version}  •  {strip}{}{chips}", " ".repeat(3))
+    );
+    let collapsed = dump(&app, 115, 13);
+    let collapsed: Vec<&str> = collapsed.lines().collect();
+    assert_eq!(
+        collapsed[0],
+        format!("clauth v{version}  •  {bar}{}{chips}", " ".repeat(64))
+    );
+
+    // At 57 the shunt chip is the next to go; one column narrower and only
+    // the daemon chip rides the row (6 + 8 + 5 + 14 + 3 + 10 = 46), 16 cells
+    // off the bar.
+    let shunt_at = dump(&app, 57, 13);
+    let shunt_at: Vec<&str> = shunt_at.lines().collect();
+    assert_eq!(
+        shunt_at[0],
+        format!("clauth v{version}  •  {bar}{}{chips}", " ".repeat(6))
+    );
+    let shunt_gone = dump(&app, 56, 13);
+    let shunt_gone: Vec<&str> = shunt_gone.lines().collect();
+    assert_eq!(
+        shunt_gone[0],
+        format!("clauth v{version}  •  {bar}{}{daemon}", " ".repeat(16))
+    );
+
+    // At 46 the daemon chip is the last to fit; one column narrower sheds it
+    // and the bar alone reads 6 + 8 + 5 + 14 = 33 cells.
+    let daemon_at = dump(&app, 46, 13);
+    let daemon_at: Vec<&str> = daemon_at.lines().collect();
+    assert_eq!(
+        daemon_at[0],
+        format!("clauth v{version}  •  {bar}{}{daemon}", " ".repeat(6))
+    );
+    let no_chip = dump(&app, 45, 13);
+    let no_chip: Vec<&str> = no_chip.lines().collect();
+    assert_eq!(
+        no_chip[0],
+        format!("{:<45}", format!("clauth v{version}  •  {bar}"))
+    );
+    let bar_at = dump(&app, 33, 13);
+    let bar_at: Vec<&str> = bar_at.lines().collect();
+    assert_eq!(
+        bar_at[0],
+        format!("{:<33}", format!("clauth v{version}  •  {bar}"))
+    );
+}
+
+/// Under the widest overflow bar's reserved slot (33 columns) the bar and its
+/// separator drop whole rather than a label cut mid-word; brand and version
+/// still hold the row.
+#[test]
+fn the_no_art_bar_drops_whole_below_its_reserved_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let left = format!("clauth v{version}");
+    for width in [20usize, 29, 32] {
+        let app = header_app(crate::tui::app::Tab::Overview);
+        let frame = dump(&app, width as u16, 13);
+        let rows: Vec<&str> = frame.lines().collect();
+        assert_eq!(rows[0], format!("{left:<width$}"), "{width} columns");
+    }
+}
+
+/// The overflow bar's chevrons follow the active tab: none to the left at the
+/// first tab, both around a middle one, none to the right at the last.
+#[test]
+fn the_no_art_overflow_bar_marks_the_active_tabs_edges() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let version = env!("CARGO_PKG_VERSION");
+    for (tab, bar) in [
+        (crate::tui::app::Tab::Overview, "overview  ›"),
+        (crate::tui::app::Tab::Tokens, "‹  tokens  ›"),
+        (crate::tui::app::Tab::Services, "‹  services"),
+    ] {
+        let app = header_app(tab);
+        let frame = dump(&app, 36, 24);
+        let rows: Vec<&str> = frame.lines().collect();
+        assert_eq!(
+            rows[0],
+            format!("{:<36}", format!("clauth v{version}  •  {bar}")),
+            "{tab:?}"
+        );
+    }
+}
+
+/// The art header at 80x24 and at its exact fit width, 37x14
+/// (10 logo + 6 brand + 8 version + 3 gap + 10 daemon chip): whole rows by
+/// equality, so the three-row shape is pinned above its gate too.
+#[test]
+fn the_art_header_rows_at_twenty_four_rows_and_at_the_exact_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let version = env!("CARGO_PKG_VERSION");
+
+    let wide = dump(&app, 80, 24);
+    let wide: Vec<&str> = wide.lines().collect();
+    // 10 logo + 14 brand+version + 35 gap + 21 chips = 80.
+    assert_eq!(
+        wide[0],
+        format!(
+            " ▐▛███▛█  clauth v{version}{}[ shunt ]  [ daemon ]",
+            " ".repeat(35)
+        )
+    );
+    assert_eq!(wide[2], format!("{:<80}", " ▝▝   ▝▝  overview  ›"));
+
+    let fit = dump(&app, 37, 14);
+    let fit: Vec<&str> = fit.lines().collect();
+    assert_eq!(
+        fit[0],
+        format!(
+            "{:<37}",
+            format!(" ▐▛███▛█  clauth v{version}   [ daemon ]")
+        )
+    );
+    assert_eq!(fit[2], format!("{:<37}", " ▝▝   ▝▝  overview  ›"));
+}
+
+/// The art header needs the art's rows plus a usable body: under 14 rows the
+/// header drops the art and carries the tabs on its brand row.
+#[test]
+fn the_art_header_needs_fourteen_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+
+    let tall = dump(&app, 80, 14);
+    let tall: Vec<&str> = tall.lines().collect();
+    assert_eq!(
+        cell_col(tall[0], "clauth"),
+        Some(10),
+        "at 14 rows the brand sits right of the art: {tall:?}"
+    );
+    assert!(
+        !tall[0].contains("overview") && tall[2].contains("overview"),
+        "at 14 rows the tabs keep their own row: {tall:?}"
+    );
+
+    let short = dump(&app, 80, 13);
+    let short: Vec<&str> = short.lines().collect();
+    assert!(
+        cell_col(short[0], "clauth").is_some_and(|c| c < 10),
+        "at 13 rows no art sits left of the brand: {short:?}"
+    );
+    assert!(
+        short[0].contains("overview"),
+        "at 13 rows the active tab rides the brand row: {short:?}"
+    );
+    assert!(
+        short[1].contains("status.claude.ai"),
+        "the status line keeps the second row: {short:?}"
+    );
+}
+
+/// The art header needs width for the art plus brand, version and the daemon
+/// chip with the content gap; one column less drops the art.
+#[test]
+fn the_art_header_needs_room_for_brand_version_and_the_daemon_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = header_app(crate::tui::app::Tab::Overview);
+    let fit = 10
+        + "clauth".len()
+        + format!(" v{}", env!("CARGO_PKG_VERSION")).len()
+        + 3
+        + "[ daemon ]".len();
+    let fit = u16::try_from(fit).expect("narrow");
+
+    let wide = dump(&app, fit, 24);
+    let wide: Vec<&str> = wide.lines().collect();
+    assert_eq!(
+        cell_col(wide[0], "clauth"),
+        Some(10),
+        "at {fit} columns the art fits: {wide:?}"
+    );
+    assert!(
+        wide[0].contains("[ daemon ]"),
+        "at {fit} columns the daemon chip fits beside the art: {wide:?}"
+    );
+
+    let narrow = dump(&app, fit - 1, 24);
+    let narrow: Vec<&str> = narrow.lines().collect();
+    assert!(
+        cell_col(narrow[0], "clauth").is_some_and(|c| c < 10),
+        "at {} columns the art drops: {narrow:?}",
+        fit - 1
+    );
+    assert!(
+        narrow[0].contains("overview"),
+        "at {} columns the active tab rides the brand row: {narrow:?}",
+        fit - 1
+    );
+    assert!(
+        narrow[0].contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "brand and version never clip: {narrow:?}"
+    );
+}
+
+/// The Tokens tab's loading panel is the screen's only panel, so it owns the
+/// focus border.
+#[test]
+fn the_sole_tokens_loading_panel_takes_the_focused_border() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = header_app(crate::tui::app::Tab::Tokens);
+    app.token_stats = None;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let corner = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .find(|&p| buf[p].symbol() == "╭")
+        .expect("the loading panel draws a top-left corner");
+    assert_eq!(
+        buf[corner].style().fg,
+        Some(crate::tui::theme::line_strong_color()),
+        "the sole panel's border is the focused LINE_STRONG"
+    );
+}
+
+fn surface_cells(app: &App, w: u16, h: u16) -> Vec<(u16, u16, ratatui::style::Color)> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let mut cells = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if let Some(bg) = buf[(x, y)].style().bg {
+                cells.push((x, y, bg));
+            }
+        }
+    }
+    cells
+}
+
+/// On the compatible tier the surfaces inherit the terminal's own background:
+/// no cell carries the base or sunken fill, while the selected-row tint stays.
+#[test]
+fn the_compatible_tier_paints_no_surface_fill() {
+    use crate::tui::app::Tab;
+    use ratatui::style::Color;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    for tab in [
+        Tab::Overview,
+        Tab::Usage,
+        Tab::Tokens,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Config,
+        Tab::Status,
+        Tab::Services,
+    ] {
+        let app = header_app(tab);
+        let cells = surface_cells(&app, 100, 30);
+        let painted: Vec<_> = cells
+            .iter()
+            .filter(|(_, _, bg)| matches!(bg, Color::Indexed(235) | Color::Indexed(233)))
+            .collect();
+        assert!(
+            painted.is_empty(),
+            "{tab:?} paints a surface fill on the compatible tier at {:?}",
+            painted.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+    let app = header_app(Tab::Overview);
+    assert!(
+        surface_cells(&app, 100, 30)
+            .iter()
+            .any(|(_, _, bg)| *bg == Color::Indexed(236)),
+        "the selected-row tint survives the compatible tier"
+    );
+}
+
+/// The full tier keeps painting its base surface.
+#[test]
+fn the_full_tier_paints_the_base_surface() {
+    use ratatui::style::Color;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = header_app(crate::tui::app::Tab::Overview);
+    assert!(
+        surface_cells(&app, 100, 30)
+            .iter()
+            .any(|(_, _, bg)| *bg == Color::Rgb(30, 30, 46)),
+        "the full tier paints BG"
+    );
+}
+
+/// A stood-down overdue fixture for the Usage fetch row's width ladder:
+/// `uwuclxdy`'s reading `read_ago_ms` old with fetch status `status`, the
+/// `[ stale ]` cue armed when `stale`, its published deadline
+/// `deadline_ago_ms` past.
+fn overdue_width_app(
+    read_ago_ms: u64,
+    deadline_ago_ms: u64,
+    status: crate::usage::FetchStatus,
+    stale: bool,
+) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![oauth("uwuclxdy", false)],
+    });
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - read_ago_ms);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), status);
+    if stale {
+        app.stale_cues.insert("uwuclxdy".to_string(), true);
+    }
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the competing instance wins the lease");
+    assert!(!app.fetch_lease.acquire(), "this TUI stands down");
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - deadline_ago_ms,
+    );
+    app.tab = crate::tui::app::Tab::Usage;
+    app
+}
+
+/// A due time passed under a second ago is already overdue: the overview
+/// timer slot reads `+1s`, never `+0s`. The fixture dates the refresh off the
+/// reading's own stamp on the instance that fetches (a stuck worker holds the
+/// leg, so nothing published a deadline) — the one arm where a sub-second
+/// overdue age can still render. The 300 ms age sits clear of both the due
+/// boundary and the `+2s` flip.
+#[test]
+fn a_deadline_passed_under_a_second_ago_reads_plus_one_second() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let mut app = app_with_a_passed_deadline("dueacct");
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .remove(&crate::usage::FetchLeg::OAuth.key(ProfileName::from("dueacct")));
+    let cfg = app.config();
+    let interval = crate::usage::usage_interval_ms(
+        cfg.find(&ProfileName::from("dueacct"))
+            .expect("fixture profile"),
+        cfg.state.refresh_interval_ms,
+    );
+    drop(cfg);
+    let reading = crate::usage::UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 300),
+        ..crate::usage::UsageInfo::default()
+    };
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("dueacct".to_string(), reading);
+
+    app.tab = Tab::Overview;
+    let cells = cells_of_row_holding(&app, 100, 24, "dueacct");
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(
+        !text.split_whitespace().any(|w| w == "+0s"),
+        "a passed due time must not read `+0s`:\n{text}"
+    );
+    assert_eq!(
+        text.split_whitespace().filter(|w| *w == "+1s").count(),
+        1,
+        "the age reads one second, the overdue floor:\n{text}"
+    );
+}
+
+/// A failed account whose leg a left-running fetch worker holds has no
+/// published deadline, on the instance that fetches: the reading's own stamp
+/// plus the account's interval dates when the refresh fell due, so the Usage
+/// fetch row reads the overdue wording, never a bare `[ failed ]`.
+#[test]
+fn a_late_workers_failed_usage_row_reads_the_overdue_wording() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let p = oauth("uwuclxdy", false);
+    let interval = crate::usage::usage_interval_ms(&p, AppState::default().refresh_interval_ms);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    // The 90 s interval + 4m30s lands the stamp exactly 6 m out, and
+    // `spoken_age` floors, so `read 6m ago` holds from the stamp to the 7 m
+    // boundary — a full minute of margin.
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - interval - 270_000);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), crate::usage::FetchStatus::Failed);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "a late worker belongs to the instance that fetches"
+    );
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 120, 30);
+    let row = usage
+        .lines()
+        .find(|l| l.contains("[ failed ]"))
+        .unwrap_or_else(|| panic!("the failed fetch row renders:\n{usage}"));
+    let row = &row[row.find("status").expect("the key cell renders")..];
+    assert_eq!(
+        row.trim_end().trim_end_matches('│').trim_end(),
+        "status    [ failed ]  retry overdue · read 6m ago",
+        "the late worker's row reads the overdue wording:\n{usage}"
+    );
+}
+
+/// A fresh reading with no published deadline is not overdue until its own
+/// interval has run: the draw site hands the Usage row the account's real
+/// interval, so a reading younger than it reads `up to date`. A draw site
+/// passing a smaller interval would date this same reading overdue.
+#[test]
+fn a_fresh_usage_row_with_no_deadline_reads_up_to_date_inside_its_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let p = oauth("uwuclxdy", false);
+    let interval = crate::usage::usage_interval_ms(&p, AppState::default().refresh_interval_ms);
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    // Two thirds of the interval old: a third of it (30 s at the default
+    // 90 s) of margin before the refresh falls due.
+    let mut u = oauth_usage(42.0, 42.0);
+    u.fetched_at = Some(crate::usage::now_ms() - interval * 2 / 3);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), u);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), crate::usage::FetchStatus::Fresh);
+
+    app.tab = Tab::Usage;
+    let usage = dump(&app, 120, 30);
+    let row = usage
+        .lines()
+        .find(|l| l.contains("status") && l.contains('◌'))
+        .unwrap_or_else(|| panic!("the fetch row renders:\n{usage}"));
+    let row = &row[row.find("status").expect("the key cell renders")..];
+    assert_eq!(
+        row.trim_end().trim_end_matches('│').trim_end(),
+        "status    ◌ up to date",
+        "a reading inside its interval is not overdue:\n{usage}"
+    );
+}
+
+/// The overdue fetch row at desktop widths: when the pane cannot hold the
+/// dated row, the ` · read Nm ago` half drops whole first — the drawn row
+/// reads either the full string or the undated form, never a figure
+/// cut mid-word. The 70-column pin drives the `[ cached ]` arm alone: the
+/// `[ stale ] [ cached ]` row is 47 cells against the 45-cell pane at
+/// that width, so even its undated form cannot fit and the pane's own cut
+/// (the pre-existing clip) takes over.
+#[test]
+fn the_overdue_fetch_row_drops_its_reading_age_whole_before_clipping() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stale_app = overdue_width_app(
+        13 * 60_000 + 30_000,
+        270_000,
+        crate::usage::FetchStatus::Cached,
+        true,
+    );
+    let bare_app = overdue_width_app(
+        13 * 60_000 + 30_000,
+        270_000,
+        crate::usage::FetchStatus::Cached,
+        false,
+    );
+    let stale_full = "status    [ stale ] [ cached ]  refresh overdue · read 13m ago";
+    let stale_undated = "status    [ stale ] [ cached ]  refresh overdue";
+    let bare_full = "status    [ cached ]  refresh overdue · read 13m ago";
+    let bare_undated = "status    [ cached ]  refresh overdue";
+    for (w, app, full, undated) in [
+        (120u16, &stale_app, stale_full, stale_undated),
+        (90, &stale_app, stale_full, stale_undated),
+        (80, &stale_app, stale_full, stale_undated),
+        (70, &bare_app, bare_full, bare_undated),
+    ] {
+        let usage = dump(app, w, 30);
+        let row = usage
+            .lines()
+            .find(|l| l.contains("[ cached ]") || l.contains("[ stale ]"))
+            .unwrap_or_else(|| panic!("the fetch row renders at {w} columns:\n{usage}"));
+        let row = &row[row.find("status").expect("the key cell renders")..];
+        let row = row.trim_end().trim_end_matches('│').trim_end();
+        if w == 120 {
+            assert_eq!(row, full, "at 120 columns the row fits whole:\n{usage}");
+        } else {
+            assert!(
+                row == full || row == undated,
+                "at {w} columns the row is whole or sheds its reading age whole, never cut mid-word: {row:?}"
+            );
+        }
+    }
 }

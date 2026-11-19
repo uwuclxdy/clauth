@@ -1,0 +1,108 @@
+/* The browser login callback page: the page-state shell over its dot grid,
+   carrying only the tokens, type and rules this page uses. Dark is the
+   default; the light block below re-derives every colour it keeps. */
+
+/* Self-hosted Onest, latin subset: every string these pages show is ASCII, so
+   the other subsets never had a glyph to paint. */
+@font-face {
+  font-family: Onest;
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("fonts/onest-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  color-scheme: dark;
+
+  --bg:   oklch(0.255 0.024 280);   /* the page */
+  --line: oklch(0.345 0.026 280);   /* the dot grid's ink */
+
+  --text:   oklch(0.900 0.030 280);   /* 11.70:1 on --bg */
+  --text-3: oklch(0.720 0.030 280);   /*  6.35:1 */
+  --accent-quiet: oklch(0.76 0.110 238 / 0.16);
+
+  --t-3: 14px; --t-4: 16px; --t-6: 26px; --t-7: 34px;
+  --page-narrow: 528px;
+  --space-4: 16px; --space-6: 24px; --space-10: 40px;
+  --space-12: 48px; --space-16: 64px;
+  --font-sans: "Onest", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --dot-rest: 0.60;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --bg:   oklch(0.955 0.006 275);
+    --line: oklch(0.890 0.012 275);
+
+    --text:   oklch(0.300 0.020 275);   /* 11.98:1 */
+    --text-3: oklch(0.500 0.018 275);   /*  5.27:1 */
+    --accent-quiet: oklch(0.55 0.140 238 / 0.12);
+  }
+}
+
+/* ---- Base reset ---- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; }
+body {
+  font-family: var(--font-sans);
+  font-size: var(--t-3);
+  line-height: 1.55;
+  font-weight: 400;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-wrap: pretty;
+}
+::selection { background: var(--accent-quiet); color: var(--text); }
+
+/* ---- The dot grid ----
+   A still lattice, not a module: one 1.15px dot of --line at its lifted
+   resting alpha on a centred 40px pitch. Nothing on this page moves. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(circle 1.15px at 50% 50%,
+    rgb(from var(--line) r g b / var(--dot-rest)) 0 1.15px, transparent 1.15px);
+  background-position: center;
+  background-size: 40px 40px;
+}
+
+/* ---- Full-page state ---- */
+.page-state {
+  min-height: 100vh;
+  min-height: 100dvh;   /* vh lies under mobile browser chrome */
+  display: grid;
+  place-items: center;
+  padding: var(--space-10) var(--space-6);
+}
+/* The gap IS the design, and it is torn rather than cut: the radial ramp holds
+   the copy's own area at page tone and hands the grid back on the way out, so
+   no rectangle edge reads as a card laid on the lattice. */
+.page-state-gap {
+  background: radial-gradient(ellipse 60% 60% at 50% 50%,
+              var(--bg) 0 38%, oklch(from var(--bg) l c h / 0) 100%);
+  padding: var(--space-16) var(--space-12);
+}
+.page-state-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  max-width: var(--page-narrow);
+  text-align: center;
+}
+.page-state-title {
+  font: 600 var(--t-7)/1.15 var(--font-sans);
+  letter-spacing: -0.025em;
+  color: var(--text);
+  text-wrap: balance;
+}
+@media (max-width: 768px) { .page-state-title { font-size: var(--t-6); } }
+.page-state-text { font-size: var(--t-4); color: var(--text-3); }   /* 6.35:1 dark, 5.27:1 light on --bg */

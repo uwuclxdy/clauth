@@ -52,6 +52,139 @@ fn an_emoji_presentation_sequence_splits_as_one_two_cell_glyph() {
     );
 }
 
+/// `لالالا` (three lam-alef pairs): a whole-string `Span::width` folds each
+/// pair to one cell and measures 3, but the buffer draws per grapheme and
+/// lays down 6 cells, so a word-width taken from the whole string lets the
+/// line overrun its budget. The wrap measures each grapheme's own width, the
+/// way [`super::super::format::grapheme_cells`] does, and splits the word.
+#[test]
+fn a_lam_alef_word_wraps_by_its_drawn_cells() {
+    let out = wrap_words("لالالا", 3);
+    // Each letter is its own one-cell grapheme, so a 3-cell fill cuts after
+    // three letters: ["لال", "الا"].
+    assert_eq!(out, vec!["لال", "الا"]);
+    for line in &out {
+        assert!(
+            super::super::format::grapheme_cells(line) <= 3,
+            "a wrapped line overruns the 3-cell budget: {out:?}"
+        );
+    }
+    assert_eq!(out.join(""), "لالالا", "no grapheme is lost in the split");
+}
+
+/// The stack's wrap budget and column width measure drawn cells: a toast body
+/// interpolates profile names, and `لالالا` draws 6 cells where a whole-string
+/// width reads 3 — a whole-string budget force-wraps the line, and a
+/// whole-string column leaves the row short of its drawn width plus the
+/// 3-cell chrome.
+#[test]
+fn a_lam_alef_name_in_a_toast_budgets_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.toast(crate::tui::app::ToastKind::Info, "switched to 'لالالا'");
+    let laid = super::layout(ratatui::layout::Rect::new(0, 0, 80, 24), &app);
+    assert_eq!(laid.len(), 1, "one toast lays out: {}", laid.len());
+    assert_eq!(
+        laid[0].rows.len(),
+        1,
+        "the body fits one row at its drawn width: {:?}",
+        laid[0].rows
+    );
+    // `switched to 'لالالا'`: 13 ASCII + the name's 6 drawn cells (three
+    // lam-alef pairs, one cell per letter) + the closing quote = 20.
+    assert_eq!(
+        laid[0].rect.width, 23,
+        "the column is the row's 20 drawn cells plus the 3-cell chrome: rect {:?}",
+        laid[0].rect
+    );
+}
+
+/// A cut toast's last kept row frees a cell for `…` by drawn width: a lam-alef
+/// name draws 6 where a whole-string sum reads 3, so that sum pops
+/// nothing and lands the `…` a drawn cell past the budget. The body makes
+/// `لالالا m` the last kept row (4 lines, capped at 3): its drawn width 8
+/// equals the budget, so the ellipsis must replace one trailing grapheme.
+#[test]
+fn a_truncated_toasts_last_row_frees_ellipsis_cells_by_drawn_width() {
+    use crate::tui::app::{Toast, ToastKind};
+
+    let toast = Toast {
+        kind: ToastKind::Info,
+        body: "h\nzz\nلالالا m\nzzz".into(),
+        born: Instant::now(),
+    };
+    let rows = super::toast_rows(&toast, 8);
+    assert_eq!(rows.len(), 3, "a 4-line body keeps 3 rows: {rows:?}");
+    let last = &rows[2];
+    // Hand-derived: the row `لالالا m` draws 8, the budget's worth, so the
+    // ellipsis frees its cell by popping the trailing `m`: `لالالا ` + `…`.
+    let last_text: String = last.iter().map(|span| span.content.as_ref()).collect();
+    assert_eq!(last_text, "لالالا …", "the ellipsis replaces the popped `m`");
+    assert_eq!(last.last().map(|span| span.content.as_ref()), Some("…"));
+    let drawn: usize = last
+        .iter()
+        .map(|span| super::super::format::grapheme_cells(span.content.as_ref()))
+        .sum();
+    assert!(
+        drawn <= 8,
+        "the last kept row overruns its budget with the ellipsis: {last:?}"
+    );
+}
+
+/// A cut toast's last kept row draws the whole budget and ends in a zero-width
+/// grapheme (U+200B): the first pop frees no cell, so the ellipsis needs the
+/// pop loop to pass again over the same row. Stopped after one pass, the row
+/// keeps its budget's worth of drawn text and then adds `…` a cell past it.
+#[test]
+fn a_truncated_toast_row_ending_in_a_zero_width_grapheme_frees_a_whole_cell() {
+    use crate::tui::app::{Toast, ToastKind};
+
+    // `abcdefgh` draws 8, the budget's worth; U+200B draws none, so the first
+    // pop takes the zero-width grapheme and leaves the row still full.
+    let toast = Toast {
+        kind: ToastKind::Info,
+        body: "h\nzz\nabcdefgh\u{200B}\nzzz".into(),
+        born: Instant::now(),
+    };
+    let rows = super::toast_rows(&toast, 8);
+    assert_eq!(rows.len(), 3, "a 4-line body keeps 3 rows: {rows:?}");
+    let last = &rows[2];
+    let last_text: String = last.iter().map(|span| span.content.as_ref()).collect();
+    assert_eq!(
+        last_text, "abcdefg…",
+        "the second pop pass frees the cell the `…` takes"
+    );
+    let drawn: usize = last
+        .iter()
+        .map(|span| super::super::format::grapheme_cells(span.content.as_ref()))
+        .sum();
+    assert!(
+        drawn <= 8,
+        "the last kept row overruns its budget with the ellipsis: {last:?}"
+    );
+}
+
+/// `ｶﾞｶﾞ` is two clusters drawing 2 cells each (the buffer advances by
+/// `CellWidth::cell_width`: `unicode-width` plus one per halfwidth sound
+/// mark), so 4 drawn cells where a per-grapheme `Span::width` sum reads 2 —
+/// that measure keeps the word whole in a 3-cell budget, drawing 4. The
+/// wrap splits after one cluster: each row draws 2.
+#[test]
+fn a_katakana_sound_mark_word_wraps_by_its_drawn_cells() {
+    let out = wrap_words("ｶﾞｶﾞ", 3);
+    assert_eq!(out, vec!["ｶﾞ", "ｶﾞ"]);
+    for line in &out {
+        assert!(
+            super::super::format::grapheme_cells(line) <= 3,
+            "a wrapped line overruns the 3-cell budget: {out:?}"
+        );
+    }
+    assert_eq!(out.join(""), "ｶﾞｶﾞ", "no grapheme is lost in the split");
+}
+
 #[test]
 fn col_width_equals_content_width_plus_chrome() {
     let msg = "· enlarge for full layout";

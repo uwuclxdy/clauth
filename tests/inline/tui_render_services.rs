@@ -9,6 +9,7 @@ use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
 use crate::testutil::{EYEBROW_ACTIVE, EYEBROW_AT_REST};
 use crate::tui::app::{App, Check, Health, Problem, ServiceFix, delegates_check, herdr_check};
+use crate::tui::render::modals::tests::help_row_segments;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
@@ -425,12 +426,12 @@ fn the_services_footer_hints_pin_each_focus_state() {
         "a job-less delegates row binds no `↵` beyond the shared keys"
     );
 
-    // List on a delegates row WITH jobs: `↵ detail` appears, no `f`.
+    // List on a delegates row WITH jobs: `↵ detail` appears, no `f`; the lone
+    // row's walk wraps onto itself, so no `↑↓`.
     let app = app_with_delegates(seed_walk_jobs(3));
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("a", "actions"),
@@ -461,7 +462,6 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("f", "next fix"),
@@ -476,7 +476,6 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("a", "actions"),
@@ -485,16 +484,17 @@ fn the_services_footer_hints_pin_each_focus_state() {
         "a healthy herdr row offers no fix verb"
     );
 
-    // Plugin detail, focused problem 0 and 1: the verb follows the focus.
+    // Plugin detail, focused problem 0 and 1: the verb follows the focus, and
+    // the focused row's own key leads so a narrow footer sheds the walk first.
     let mut app = app_with(plugin_check_with_problems());
     app.services.focus = ServicesFocus::Detail;
     app.services.problem_cursor = 0;
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "install plugin"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
@@ -505,14 +505,36 @@ fn the_services_footer_hints_pin_each_focus_state() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "wire mcp server"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
         ],
         "the wire problem names its verb"
+    );
+    app.services.plugin_option_focus = true;
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("space/↵", "toggle"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("f", "next fix"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the option row offers its toggle and no fix verb"
+    );
+    let mut one = plugin_check_with_problems();
+    one.problems.truncate(1);
+    let mut app = app_with(one);
+    app.services.focus = ServicesFocus::Detail;
+    assert!(
+        hints(&app).contains(&("↑↓", "row")),
+        "one problem still walks onto the option row: {:?}",
+        hints(&app)
     );
 
     // Herdr detail: the options row keys, no `f` on a healthy check.
@@ -593,6 +615,8 @@ fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
             "claude      press r to probe",
             "path        /usr/local/bin/clauth",
             "data        /home/u/.clauth",
+            "OPTIONS",
+            "idle wake  ─●",
         ],
         "every readout in order, by equality"
     );
@@ -649,6 +673,8 @@ fn plugin_detail_over_completions() -> Check {
         None,
         None,
         crate::completions::detected_installed_script(),
+        crate::hook_jobs::CacheView::default(),
+        true,
     )
 }
 
@@ -665,9 +691,18 @@ fn plugin_base_rows(pad: usize) -> Vec<String> {
         "writes the clauth entry into ~/.claude.json".to_string(),
         "f  wire mcp server".to_string(),
         format!("claude{}press r to probe", spaces(6)),
+        format!("cache{}auto: 1h subscription, 5m api key", spaces(5)),
+        format!("agent cache{}auto: 5m", spaces(11)),
+        format!("idle wake{}55 min idle with a delegate, 1h only", spaces(9)),
         format!("path{}/usr/bin/clauth", spaces(4)),
         "data".to_string(),
     ]
+}
+
+/// The OPTIONS section closing every plugin detail, its `idle wake` row at
+/// the default (on) and unfocused.
+fn plugin_options_rows() -> [String; 2] {
+    ["OPTIONS".to_string(), "idle wake  ─●".to_string()]
 }
 
 /// The plugin detail's rows with the `data` row cut to its key: its value is
@@ -684,6 +719,294 @@ fn plugin_rows(rows: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The cache-TTL rows of one plugin card, off the production builder
+/// and the real detail path, with the card's key column at `pad`, then the
+/// OPTIONS `idle wake` row the same filter keeps, at the default (on).
+fn cache_rows_at(pad: usize, lines: &[&str]) -> Vec<String> {
+    cache_rows_toggled_at(pad, lines, "─●")
+}
+
+/// [`cache_rows_at`] with the OPTIONS row's toggle glyph `toggle`. The
+/// readout rows are the visible ones: three while the key is on, two (no
+/// `idle wake` line) while it is off.
+fn cache_rows_toggled_at(pad: usize, lines: &[&str], toggle: &str) -> Vec<String> {
+    let spaces = |key_w: usize| " ".repeat(pad.saturating_sub(key_w) + 2);
+    let mut rows = vec![
+        format!("cache{}{}", spaces(5), lines[0]),
+        format!("agent cache{}{}", spaces(11), lines[1]),
+    ];
+    if let Some(wake) = lines.get(2) {
+        rows.push(format!("idle wake{}{}", spaces(9), wake));
+    }
+    rows.push(format!("idle wake  {toggle}"));
+    rows
+}
+
+/// Render one plugin card over `view` and return its three cache rows and
+/// its OPTIONS `idle wake` row.
+fn cache_rows(view: crate::hook_jobs::CacheView) -> Vec<String> {
+    cache_rows_with(view, true)
+}
+
+/// [`cache_rows`] with `[plugin] idle_wake` at `idle_wake`, in the app state
+/// the OPTIONS row reads and in the card the recompute would build.
+fn cache_rows_with(view: crate::hook_jobs::CacheView, idle_wake: bool) -> Vec<String> {
+    let app = app_with(crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        view,
+        idle_wake,
+    ));
+    app.config().state.plugin.idle_wake = idle_wake;
+    let (rows, _) = render(&app);
+    detail_rows(&rows)
+        .into_iter()
+        .filter(|r| {
+            r.starts_with("cache") || r.starts_with("agent cache") || r.starts_with("idle wake")
+        })
+        .collect()
+}
+
+/// A TTL from a setting names the setting, main and subagent alike; a 1h
+/// main cache turns the wake on.
+#[test]
+fn the_cache_rows_name_a_setting() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = crate::hook_jobs::CacheView {
+        main_setting: Some("1h".to_string()),
+        subagent_setting: Some("1h".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        cache_rows(view),
+        cache_rows_at(
+            11,
+            &[
+                "1h, promptCacheTtl",
+                "1h, subagentPromptCacheTtl",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+}
+
+/// A TTL from an env var names the var, each of the three.
+#[test]
+fn the_cache_rows_name_the_env_var() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            force_5m: Some("1".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            &[
+                "5m, FORCE_PROMPT_CACHING_5M",
+                "5m, FORCE_PROMPT_CACHING_5M",
+                "off: a 5 min cache expires first",
+            ]
+        ),
+    );
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            main_env: Some("1h".to_string()),
+            subagent_env: Some("1h".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            &[
+                "1h, CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "1h, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            enable_1h: Some("on".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            &[
+                "1h, ENABLE_PROMPT_CACHING_1H",
+                "1h, ENABLE_PROMPT_CACHING_1H",
+                "55 min idle with a delegate",
+            ]
+        ),
+    );
+}
+
+/// Nothing set reads the automatic rows: the account split on the main line,
+/// 5m on the agent line, and the wake's hedge on the 1h cache.
+#[test]
+fn the_cache_rows_read_automatic_when_nothing_is_set() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView::default()),
+        cache_rows_at(
+            11,
+            &[
+                "auto: 1h subscription, 5m api key",
+                "auto: 5m",
+                "55 min idle with a delegate, 1h only",
+            ]
+        ),
+    );
+}
+
+/// A 5m main TTL turns the wake off, the agent row untouched.
+#[test]
+fn a_5m_main_cache_turns_the_wake_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert_eq!(
+        cache_rows(crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        }),
+        cache_rows_at(
+            11,
+            &[
+                "5m, CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "auto: 5m",
+                "off: a 5 min cache expires first",
+            ]
+        ),
+    );
+}
+
+/// At an 80-column terminal the card's value column is 39 cells (key column
+/// 11): every cache-row value but the agent-env one renders whole, no cut
+/// ellipsis — the copy was sized to fit the card's real pane width there.
+#[test]
+fn the_cache_rows_render_whole_at_80_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let views = [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("1h".to_string()),
+            subagent_setting: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            subagent_env: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView::default(),
+    ];
+    for view in views {
+        let app = app_with(crate::tui::app::plugin_check(
+            Some(std::path::Path::new("/usr/bin/clauth")),
+            None,
+            None,
+            None,
+            view,
+            true,
+        ));
+        let mut term = Terminal::new(TestBackend::new(80, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let cache_rows: Vec<String> = detail_rows(&rows)
+            .into_iter()
+            .filter(|row| {
+                row.starts_with("cache")
+                    || row.starts_with("agent cache")
+                    || row.starts_with("idle wake")
+            })
+            .collect();
+        for row in cache_rows {
+            // The agent-env row is the one value the 80-column pane still
+            // cuts; its cut form already drops the var name's tail.
+            if !row.contains("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_") {
+                assert!(
+                    !row.contains('…'),
+                    "the row renders whole at 80 columns: {row}"
+                );
+            }
+        }
+    }
+}
+
+/// The three cache keys never widen the card's key column: the fresh card
+/// keeps 11 (`agent cache` is the widest key there), and on the fullest
+/// plugin detail (an install record with `installedAt`) the column keeps its
+/// old width, `installed at` still the widest key at 12.
+#[test]
+fn the_cache_keys_do_not_widen_the_key_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let fresh = crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        crate::hook_jobs::CacheView::default(),
+        true,
+    );
+    let fresh_key_w = fresh
+        .detail
+        .iter()
+        .filter_map(|line| line.split_once(": ").map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        fresh_key_w, 11,
+        "agent cache is the fresh card's widest key: {:?}",
+        fresh.detail
+    );
+
+    let dir = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let body = serde_json::json!({
+        "plugins": { "clauth@clauth": [
+            { "scope": "user", "version": "1.0.0", "installedAt": "2026-01-01T00:00:00Z" }
+        ] }
+    });
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(&body).expect("ser"),
+    )
+    .expect("write");
+
+    let check = crate::tui::app::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        None,
+        None,
+        None,
+        crate::hook_jobs::CacheView::default(),
+        true,
+    );
+    let key_w = check
+        .detail
+        .iter()
+        .filter_map(|line| line.split_once(": ").map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        key_w, 12,
+        "installed at is still the widest key: {:?}",
+        check.detail
+    );
+
+    let app = app_with(check);
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    assert!(
+        detail.iter().any(|r| r == "agent cache   auto: 5m"),
+        "the agent cache key aligns to the 12-cell column: {:?}",
+        detail
+    );
 }
 
 /// A stale script names the problem and its `f  update completions` line; a
@@ -704,6 +1027,7 @@ fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
         "bash script differs from this clauth's".to_string(),
         "f  update completions".to_string(),
     ]);
+    expected.extend(plugin_options_rows());
     assert_eq!(
         plugin_rows(&rows),
         expected,
@@ -715,7 +1039,7 @@ fn the_plugin_detail_offers_update_completions_for_a_stale_script() {
     let (rows, _) = render(&current);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(10),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "a current script shows no completions line and no fix, by equality"
     );
 }
@@ -737,6 +1061,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
         "bash script not installed".to_string(),
         "f  install completions".to_string(),
     ]);
+    expected.extend(plugin_options_rows());
     assert_eq!(
         plugin_rows(&rows),
         expected,
@@ -750,7 +1075,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     let (rows, _) = render(&unknown);
     assert_eq!(
         plugin_rows(&rows),
-        plugin_base_rows(10),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "an unknown shell renders the card without any completions row"
     );
     drop(_tcsh);
@@ -766,7 +1091,7 @@ fn the_plugin_detail_offers_install_completions_only_for_a_known_shell() {
     );
     assert_eq!(
         detail,
-        plugin_base_rows(10),
+        [plugin_base_rows(11), plugin_options_rows().to_vec()].concat(),
         "an unset $SHELL renders the card without any completions row"
     );
 }
@@ -807,7 +1132,7 @@ fn a_verb_removed_script_reaches_the_cards_update_line() {
 #[test]
 fn the_completions_value_tones_only_a_stale_script() {
     let value_styles = |text: &str| {
-        super::detail_line(text, 11, 80)
+        super::detail_line(text, 11, 80, None)
             .spans
             .iter()
             .skip(1)
@@ -1244,7 +1569,7 @@ fn detail_line_truncates_paths_and_prose_to_the_pane() {
     let long_path = "/home/uwuclxdy/.cargo/bin/clauth";
     // value column = width - key_w - 2 = 20 - 4 - 2 = 14 cells; the shared
     // `middle_truncate` keeps 7 head / 6 tail (the head rounds up).
-    let line = super::detail_line(&format!("path: {long_path}"), 4, 20);
+    let line = super::detail_line(&format!("path: {long_path}"), 4, 20, None);
     assert_eq!(
         text(&line),
         "path  /home/u…clauth",
@@ -1252,7 +1577,7 @@ fn detail_line_truncates_paths_and_prose_to_the_pane() {
     );
 
     // Prose trails an ellipsis.
-    let line = super::detail_line("claude code spawns clauth mcp by name", 6, 20);
+    let line = super::detail_line("claude code spawns clauth mcp by name", 6, 20, None);
     let rendered = text(&line);
     assert!(
         rendered.ends_with('…'),
@@ -1268,7 +1593,7 @@ fn detail_line_truncates_paths_and_prose_to_the_pane() {
 #[test]
 fn an_outdated_plugin_version_reads_in_the_warning_tone() {
     let value_styles = |text: &str| {
-        super::detail_line(text, 7, 80)
+        super::detail_line(text, 7, 80, None)
             .spans
             .iter()
             .skip(1)
@@ -1303,13 +1628,13 @@ fn the_shunt_path_keys_truncate_on_the_shared_middle_ellipsis() {
             .collect::<String>()
     };
     // key_w = 9 (`last exit` is the widest shunt key): value column = 20 - 9 - 2 = 9.
-    let line = super::detail_line("config: /home/u/.clauth/gateway.toml", 9, 20);
+    let line = super::detail_line("config: /home/u/.clauth/gateway.toml", 9, 20, None);
     assert_eq!(
         text(&line),
         "config     /hom…toml",
         "the config path keeps both ends"
     );
-    let line = super::detail_line("binary: /usr/local/bin/shunt", 9, 20);
+    let line = super::detail_line("binary: /usr/local/bin/shunt", 9, 20, None);
     assert_eq!(
         text(&line),
         "binary     /usr…hunt",
@@ -1578,10 +1903,10 @@ fn the_herdr_fix_line_is_a_walk_stop_reached_by_f_and_the_arrows() {
     }
 }
 
-/// A healthy herdr detail has no fix line, so the options walk keeps its six
-/// stops and `f` does nothing there.
+/// A healthy herdr detail has no fix line, so the options walk keeps one stop
+/// per option row and `f` does nothing there.
 #[test]
-fn a_herdr_detail_without_a_fix_keeps_the_six_option_walk() {
+fn a_herdr_detail_without_a_fix_walks_the_option_rows_alone() {
     use crate::tui::app::{HERDR_OPTIONS, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -2129,11 +2454,11 @@ fn the_footer_names_enter_for_the_focused_fix_and_f_for_the_next() {
     let _home = crate::testutil::HomeSandbox::new();
     let hints = |app: &App| super::super::footer::services_hints(app);
 
+    // A lone row's walk wraps onto itself, so the list offers no `↑↓`.
     let mut app = app_with(plugin_check_with_problems());
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
             ("f", "next fix"),
@@ -2147,9 +2472,9 @@ fn the_footer_names_enter_for_the_focused_fix_and_f_for_the_next() {
     assert_eq!(
         hints(&app),
         vec![
-            ("↑↓", "problem"),
-            ("r", "refresh"),
             ("↵", "install plugin"),
+            ("↑↓", "row"),
+            ("r", "refresh"),
             ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
@@ -3696,10 +4021,10 @@ fn herdr_options_app(config: ConfigStatus) -> App {
     app
 }
 
-/// The six rows render their real values and glyphs on BOTH tiers — the toggle
-/// glyph is the one control the tier changes, so each tier pins its own.
+/// The seven rows render their real values and glyphs on BOTH tiers — the
+/// toggle glyph is the one control the tier changes, so each tier pins its own.
 #[test]
-fn herdr_options_render_all_six_rows_on_both_tiers() {
+fn herdr_options_render_all_seven_rows_on_both_tiers() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = herdr_options_app(healthy_config());
     let row_with = |rows: &[String], label: &str| -> String {
@@ -3737,6 +4062,10 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
         row_with(&rows, "delegate row text").contains("○─"),
         "delegate row text off:\n{screen}"
     );
+    assert!(
+        row_with(&rows, "restore notice").contains("─●"),
+        "restore notice on:\n{screen}"
+    );
     drop(full);
 
     let compatible = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
@@ -3757,6 +4086,10 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
     assert!(
         row_with(&rows, "delegate row text").contains("[off]"),
         "delegate row text [off]:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "restore notice").contains("[on]"),
+        "restore notice [on]:\n{screen}"
     );
     drop(compatible);
 }
@@ -3997,6 +4330,61 @@ fn herdr_form_keeps_its_selected_row_in_view_across_adjacent_moves_and_resize() 
         .position(|r| r.contains("delegate row text"))
         .unwrap();
     assert_eq!(after_row, before_row, "last option stays at its screen row");
+    app.services.herdr_options_cursor = 0;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // The first option sits on line 6 (4 detail lines, a blank, `OPTIONS`):
+    // following it up from the bottom offset keeps two lines of context, 6 - 2.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "top herdr option keeps nearby content when it remains visible"
+    );
+    let top = crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .position(|r| r.contains("pane tag"))
+        .unwrap();
+    app.services.herdr_options_cursor = 1;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // At offset 4 the second option's line 7 keeps at least two lines either
+    // side on screen, so the saved view stays; a follow seeded at the bottom
+    // offset 5 would keep 5.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "the next option down keeps the viewport below the bottom"
+    );
+    // The screen holds too, not only the saved number: a view drawn from the
+    // frame alone beside a saved offset shows `pane tag` one row higher here.
+    assert_eq!(
+        crate::testutil::buffer_rows(term.backend().buffer())
+            .iter()
+            .position(|r| r.contains("pane tag")),
+        Some(top),
+        "the drawn herdr form stays on its saved offset"
+    );
+    term.backend_mut().resize(70, 14);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // At 70 columns the popup-width row wraps, so the form grows to 14 lines
+    // and the option moves to line 8, which keeps two lines either side at
+    // offset 4; a view reseeded on a width or length change reads 6 from the
+    // bottom or the row and 3 from the top.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "a narrower herdr form keeps a saved view that still fits"
+    );
+    term.backend_mut().resize(80, 15);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // Back at 80 columns and one row taller, the bottom offset is 13 - 9 = 4,
+    // where the saved view already sits, so it holds; a view reseeded at the
+    // top on a resize follows the option down to 7 + 1 + 2 - 9 = 1.
+    assert_eq!(
+        app.services.form_offset.get(),
+        4,
+        "a grown herdr form keeps a saved view at its new bottom"
+    );
     term.backend_mut().resize(80, 45);
     term.autoresize().unwrap();
     term.draw(|f| super::super::draw(f, &app)).unwrap();
@@ -4004,6 +4392,26 @@ fn herdr_form_keeps_its_selected_row_in_view_across_adjacent_moves_and_resize() 
         app.services.form_offset.get(),
         0,
         "fitting herdr form resets the offset"
+    );
+    term.backend_mut().resize(80, 14);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // Back at 80x14 the saved 0 follows the second option (line 7) down to
+    // 7 + 1 + 2 - 8; the same cursor and size read 4 above, so no view
+    // derived from the frame alone meets both.
+    assert_eq!(
+        app.services.form_offset.get(),
+        2,
+        "a shrunk herdr form follows down from the saved top"
+    );
+    app.services.herdr_options_cursor = 2;
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // The third option's line 8 needs 8 + 1 + 2 - 8 = 3 from the saved 2; a
+    // view reseeded one row above the bottom on a move keeps 4.
+    assert_eq!(
+        app.services.form_offset.get(),
+        3,
+        "an adjacent move follows down from the saved view"
     );
 }
 
@@ -10934,8 +11342,9 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
                 "{wide} cols: glyph {i} of the line"
             );
         }
-        // The line closes the card: past it the pane is blank down to its
-        // bottom border, so no fix line sits under a wrapped row.
+        // Past the line only the OPTIONS section follows, then the pane is
+        // blank down to its bottom border, so no fix line sits under a
+        // wrapped row.
         let bottom = rows
             .iter()
             .enumerate()
@@ -10943,11 +11352,24 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
             .find(|(_, chars)| chars[col0..right].iter().all(|c| *c == '─'))
             .map(|(row, _)| row)
             .expect("the pane's bottom border");
+        // Only the OPTIONS section, the walk's last stop, sits between them.
+        let section: Vec<String> = rows
+            .iter()
+            .take(bottom)
+            .skip(first + joined.len())
+            .take(3)
+            .map(|chars| text(&chars[col0..right]).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            section,
+            ["", "OPTIONS", "  idle wake  ─●"],
+            "{wide} cols: the OPTIONS section follows the line"
+        );
         for (row, chars) in rows
             .iter()
             .enumerate()
             .take(bottom)
-            .skip(first + joined.len())
+            .skip(first + joined.len() + 3)
         {
             assert!(
                 chars[col0..right].iter().all(|c| *c == ' '),
@@ -10956,4 +11378,2422 @@ fn assert_daemon_binary_line_wraps_whole(change: crate::plugin_host::ExeChange, 
             );
         }
     }
+}
+
+/// The typed editor's caret offset measures the label by the cells the
+/// buffer draws, the way `key_cell` pads it: `ｶﾞ` is 2 drawn cells but 1 by
+/// whole-string width, so the row (2 lead pad + 14 key budget + 2 gutter = 18
+/// cells) and its caret must agree on 18.
+#[test]
+fn a_sound_mark_label_in_the_typed_editor_parks_the_caret_by_drawn_cells() {
+    assert_eq!(super::typed_field_label_width("ｶﾞ", 4, 20), 18);
+}
+
+// ── rex row ──────────────────────────────────────────────────────────────────
+
+fn rex(plugin: crate::rex::PluginDir, watcher_running: bool) -> Check {
+    crate::tui::app::rex_check(&crate::rex::RexStatus {
+        plugin,
+        watcher_running,
+    })
+}
+
+/// One `key value` detail row as the pane lays it out: the key column is the
+/// widest key (`experimental`, 12 cells) plus a 2-cell gap.
+fn rex_row(key: &str, value: &str) -> String {
+    format!("{key}{}{value}", " ".repeat(12 - key.chars().count() + 2))
+}
+
+const REX_EXPERIMENTAL: &str = "may change in any release";
+
+fn rex_rows(check: Check) -> Vec<String> {
+    let app = app_with(check);
+    let (rows, _) = render(&app);
+    detail_rows(&rows)
+}
+
+#[test]
+fn a_current_rex_plugin_reads_installed_with_this_version() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        true,
+    );
+    assert_eq!(check.label, "rex");
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row(
+                "plugin",
+                &format!("installed (clauth {})", env!("CARGO_PKG_VERSION"))
+            ),
+            rex_row("watcher", "running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Ok);
+}
+
+#[test]
+fn a_rex_plugin_from_another_clauth_reads_stale() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: "0.17.0".to_owned(),
+        },
+        true,
+    );
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row(
+                "plugin",
+                &format!(
+                    "written by clauth 0.17.0, this is {}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            ),
+            rex_row("watcher", "running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+            "clauth rex install".to_string(),
+        ]
+    );
+    assert_dot(&check, Health::Warn);
+}
+
+#[test]
+fn a_linked_rex_plugin_names_its_root() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Linked {
+            target: Some(PathBuf::from("/src/rex-plugin")),
+            missing: false,
+        },
+        false,
+    );
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "linked (local)"),
+            rex_row("root", "/src/rex-plugin"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Ok);
+}
+
+#[test]
+fn a_foreign_rex_plugin_dir_reads_not_written_by_clauth() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(crate::rex::PluginDir::Foreign, false);
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "not written by clauth"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+        ]
+    );
+    assert_dot(&check, Health::Warn);
+}
+
+#[test]
+fn an_absent_rex_plugin_reads_not_installed_and_idle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(crate::rex::PluginDir::Absent, false);
+    assert_eq!(
+        rex_rows(check.clone()),
+        vec![
+            rex_row("plugin", "not installed"),
+            rex_row("watcher", "not running"),
+            rex_row("experimental", REX_EXPERIMENTAL),
+            "clauth rex install".to_string(),
+        ]
+    );
+    assert_dot(&check, Health::Idle);
+}
+
+/// The rex row's install hint names `clauth rex install` ACCENT, never bold,
+/// like the herdr row's: a missing and a stale install both carry it.
+#[test]
+fn a_missing_or_stale_rex_plugin_styles_its_install_command() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for plugin in [
+        crate::rex::PluginDir::Absent,
+        crate::rex::PluginDir::Managed {
+            version: "0.17.0".to_owned(),
+        },
+    ] {
+        let (_, buf) = render(&app_with(rex(plugin, false)));
+        crate::testutil::assert_prose_part(
+            &buf,
+            "clauth rex install",
+            "clauth rex install",
+            false,
+            crate::tui::theme::dim(),
+        );
+    }
+}
+
+#[test]
+fn a_rex_root_holding_control_bytes_renders_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = rex(
+        crate::rex::PluginDir::Linked {
+            target: Some(PathBuf::from("/src/\u{1b}[2Jx")),
+            missing: false,
+        },
+        false,
+    );
+    assert!(
+        check.detail.iter().all(|line| !line.contains('\u{1b}')),
+        "a raw ESC reaches the detail: {:?}",
+        check.detail
+    );
+}
+
+#[test]
+fn a_rex_marker_version_holding_control_bytes_renders_escaped() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = rex(
+        crate::rex::PluginDir::Managed {
+            version: "\u{1b}[2J".to_owned(),
+        },
+        false,
+    );
+    assert!(
+        check.detail.iter().all(|line| !line.contains('\u{1b}')),
+        "a raw ESC reaches the detail: {:?}",
+        check.detail
+    );
+}
+
+/// `rex` sits above `herdr`, whose row appears only once its background probe
+/// lands, so that landing never moves a selection resting on `rex`.
+#[test]
+fn the_rex_row_sits_above_the_herdr_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let mut app = app_with_checks(Vec::new());
+    app.services.herdr = Some(Some(healthy_probe()));
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    land_rex_readings_from_disk(&mut app);
+    let labels: Vec<&str> = app.services.checks.iter().map(|c| c.label).collect();
+    assert_eq!(labels, vec!["shunt", "delegates", "plugin", "rex", "herdr"]);
+}
+
+/// How many times `counting_rex_watcher` ran.
+static REX_WATCHER_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A watcher read that counts its runs and finds no watcher.
+fn counting_rex_watcher() -> bool {
+    REX_WATCHER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    false
+}
+
+/// The watcher check reads the process table (a `ps` spawn off Linux), so the
+/// 1 s tick reuses the last answer and only a full refresh (tab focus, `r`)
+/// asks again, on its worker.
+#[test]
+fn the_tick_reuses_the_rex_watcher_answer_and_a_refresh_rechecks_it() {
+    use std::sync::atomic::Ordering;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    let watcher_line = |app: &App| -> Option<String> {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "rex")
+            .and_then(|c| {
+                c.detail
+                    .iter()
+                    .find(|l| l.starts_with("watcher: "))
+                    .cloned()
+            })
+    };
+    let mut app = app_with_checks(Vec::new());
+    land_rex_readings_from_disk(&mut app);
+    app.services.rex_watcher_probe.prober = Some(counting_rex_watcher);
+    let before = REX_WATCHER_RUNS.load(Ordering::SeqCst);
+    // The stub reads `not running`; the cached `running` must survive a tick.
+    app.services.rex_watcher = Some(true);
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    crate::tui::app::join_test_workers();
+    crate::tui::app::drain_service_probes(&mut app);
+    assert_eq!(watcher_line(&app).as_deref(), Some("watcher: running"));
+    assert_eq!(
+        REX_WATCHER_RUNS.load(Ordering::SeqCst),
+        before,
+        "the tick asked the watcher again"
+    );
+
+    crate::tui::app::recompute_services_checks(&mut app, true, crate::tui::app::ShuntRefresh::Keep);
+    crate::tui::app::join_test_workers();
+    crate::tui::app::drain_service_probes(&mut app);
+    assert_eq!(
+        REX_WATCHER_RUNS.load(Ordering::SeqCst),
+        before + 1,
+        "a refresh asks the watcher once"
+    );
+    assert_eq!(watcher_line(&app).as_deref(), Some("watcher: not running"));
+    assert_eq!(app.services.rex_watcher, Some(false));
+}
+
+/// The row joins the Services list only when Rex's config dir exists, from the
+/// readings landed through `drain_service_probes` over a sandbox HOME.
+#[test]
+fn the_rex_row_shows_only_when_the_rex_config_dir_exists() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    );
+    let labels =
+        |app: &App| -> Vec<&'static str> { app.services.checks.iter().map(|c| c.label).collect() };
+
+    let mut app = app_with_checks(Vec::new());
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+    land_rex_readings_from_disk(&mut app);
+    assert!(
+        !labels(&app).contains(&"rex"),
+        "no rex row without ~/.config/rex: {:?}",
+        labels(&app)
+    );
+
+    std::fs::create_dir_all(home.home().join(".config").join("rex")).unwrap();
+    land_rex_readings_from_disk(&mut app);
+    assert!(
+        labels(&app).contains(&"rex"),
+        "a rex row once ~/.config/rex exists: {:?}",
+        labels(&app)
+    );
+}
+
+/// What sits at Rex's plugin path, posed on disk under the sandbox HOME.
+enum RexOnDisk<'a> {
+    Absent,
+    /// A plugin dir whose `.clauth-managed` marker holds these bytes.
+    Marker(&'a str),
+    /// A plugin dir holding no marker.
+    NoMarker,
+    /// A symlink onto a dir that exists.
+    #[cfg(unix)]
+    LinkToDir,
+    /// A symlink onto a path that does not exist.
+    #[cfg(unix)]
+    DanglingLink,
+    /// A symlink onto a regular file.
+    #[cfg(unix)]
+    LinkToFile,
+}
+
+/// The `rex` row the real recompute builds over `state`, the app it lives in
+/// with that row selected, and the posed link target (when one is posed).
+/// The recompute reads no disk: the real `crate::rex` reads run here
+/// (on the test thread) and land through the probes' channels and
+/// `drain_service_probes`, the production landing path.
+fn rex_row_on_disk(
+    home: &crate::testutil::HomeSandbox,
+    state: &RexOnDisk<'_>,
+) -> (App, Check, Option<PathBuf>) {
+    let config = home.home().join(".config").join("rex");
+    std::fs::create_dir_all(&config).unwrap();
+    let plugin = config.join("clauth");
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut target = None;
+    match state {
+        RexOnDisk::Absent => {}
+        RexOnDisk::Marker(bytes) => {
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(plugin.join(".clauth-managed"), bytes).unwrap();
+        }
+        RexOnDisk::NoMarker => std::fs::create_dir_all(&plugin).unwrap(),
+        #[cfg(unix)]
+        RexOnDisk::LinkToDir => {
+            let checkout = home.home().join("checkout").join("rex-plugin");
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::os::unix::fs::symlink(&checkout, &plugin).unwrap();
+            target = Some(checkout);
+        }
+        #[cfg(unix)]
+        RexOnDisk::DanglingLink => {
+            let gone = home.home().join("gone").join("rex-plugin");
+            std::os::unix::fs::symlink(&gone, &plugin).unwrap();
+            target = Some(gone);
+        }
+        #[cfg(unix)]
+        RexOnDisk::LinkToFile => {
+            let file = home.home().join("checkout").join("init.lua");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "-- not a plugin dir\n").unwrap();
+            std::os::unix::fs::symlink(&file, &plugin).unwrap();
+            target = Some(file);
+        }
+    }
+    let mut app = app_with_checks(Vec::new());
+    land_rex_readings_from_disk(&mut app);
+    let cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "rex")
+        .expect("the rex row renders once ~/.config/rex exists");
+    app.services.cursor = cursor;
+    let check = app.services.checks[cursor].clone();
+    (app, check, target)
+}
+
+/// Run the real Rex plugin and watcher reads over the sandbox HOME on the
+/// test thread and land them through the probes' channels and
+/// `drain_service_probes`, the production landing path.
+fn land_rex_readings_from_disk(app: &mut App) {
+    let home_dir = crate::profile::home_dir().expect("the sandbox home");
+    let paths = crate::rex::Paths::resolve(
+        std::env::var_os("REX_CONFIG"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        &home_dir,
+    );
+    let plugin = crate::rex::plugin_status(&paths);
+    let running = crate::rex::watcher_running(
+        &crate::rex::state_dir(std::env::var_os("XDG_STATE_HOME"), &home_dir),
+        &crate::which::SystemProcs,
+    );
+    app.services
+        .rex_plugin_probe
+        .tx
+        .send(plugin)
+        .expect("land the plugin reading");
+    app.services
+        .rex_watcher_probe
+        .tx
+        .send(running)
+        .expect("land the watcher reading");
+    crate::tui::app::drain_service_probes(app);
+}
+
+fn rex_env(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("REX_CONFIG", None),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_STATE_HOME", None),
+        ],
+    )
+}
+
+/// The colour the detail pane draws `value`'s first cell in, on the row
+/// whose detail starts with `plugin`.
+fn rex_plugin_value_fg(app: &App, value: &str) -> ratatui::style::Color {
+    detail_value_fg(app, "plugin", value)
+}
+
+/// The colour the detail pane draws `value`'s first cell in, on the row
+/// whose detail starts with `key`.
+fn detail_value_fg(app: &App, key: &str, value: &str) -> ratatui::style::Color {
+    let (rows, buf) = render(app);
+    let y = rows
+        .iter()
+        .position(|r| {
+            r.split("││")
+                .nth(1)
+                .is_some_and(|d| d.trim_matches('│').trim().starts_with(&format!("{key} ")))
+        })
+        .unwrap_or_else(|| panic!("no {key} detail row:\n{}", rows.join("\n")));
+    let byte = rows[y]
+        .rfind(value)
+        .unwrap_or_else(|| panic!("row {:?} does not show {value:?}", rows[y]));
+    let x = rows[y][..byte].chars().count();
+    buf.content[y * W as usize + x].fg
+}
+
+/// Only the rex row's health colours its `plugin` value: a herdr row whose dot
+/// disagrees with its `plugin` value keeps the key/value tone.
+#[test]
+fn a_non_rex_plugin_value_keeps_its_key_value_tone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let herdr = |health: Health, line: &str| Check {
+        label: "herdr",
+        health,
+        detail: vec![line.to_string()],
+        fix: None,
+        problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    };
+    for (check, value, fg) in [
+        (
+            herdr(Health::Warn, "plugin: linked (local)"),
+            "linked (local)",
+            crate::tui::theme::success().fg.unwrap(),
+        ),
+        (
+            herdr(Health::Idle, "plugin: not installed"),
+            "not installed",
+            crate::tui::theme::warning().fg.unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            rex_plugin_value_fg(&app_with(check), value),
+            fg,
+            "the text colour of {value:?}"
+        );
+    }
+}
+
+/// A marker whose version cannot be read proves nothing about which clauth
+/// wrote the dir, so the row reads it like a dir with no marker.
+#[test]
+fn a_rex_marker_with_no_readable_version_reads_not_written_by_clauth() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (_app, check, _) = rex_row_on_disk(&home, &RexOnDisk::Marker("garbage\n"));
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: not written by clauth".to_string(),
+            "watcher: not running".to_string(),
+            "experimental: may change in any release".to_string(),
+        ]
+    );
+    assert_eq!(check.health, Health::Warn);
+}
+
+/// A link onto a path that no longer exists loads no plugin: it warns and
+/// says so, keeping the `root` line naming where it points.
+#[cfg(unix)]
+#[test]
+fn a_dangling_rex_plugin_link_reads_target_missing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (_app, check, target) = rex_row_on_disk(&home, &RexOnDisk::DanglingLink);
+    let target = target.expect("a posed link names its target");
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: linked (local), target missing".to_string(),
+            format!("root: {}", target.display()),
+            "watcher: not running".to_string(),
+            "experimental: may change in any release".to_string(),
+        ]
+    );
+    assert_eq!(check.health, Health::Warn);
+}
+
+/// A link onto a regular file resolves but loads no plugin (Rex loads a
+/// folder): it warns and says so, keeping the `root` line.
+#[cfg(unix)]
+#[test]
+fn a_rex_plugin_link_onto_a_file_reads_target_is_not_a_folder() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (_app, check, target) = rex_row_on_disk(&home, &RexOnDisk::LinkToFile);
+    let target = target.expect("a posed link names its target");
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: linked (local), target is not a folder".to_string(),
+            format!("root: {}", target.display()),
+            "watcher: not running".to_string(),
+            "experimental: may change in any release".to_string(),
+        ]
+    );
+    assert_eq!(check.health, Health::Warn);
+}
+
+/// A link that resolves keeps its green `linked (local)` reading.
+#[cfg(unix)]
+#[test]
+fn a_resolving_rex_plugin_link_stays_linked() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let (_app, check, target) = rex_row_on_disk(&home, &RexOnDisk::LinkToDir);
+    let target = target.expect("a posed link names its target");
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: linked (local)".to_string(),
+            format!("root: {}", target.display()),
+            "watcher: not running".to_string(),
+            "experimental: may change in any release".to_string(),
+        ]
+    );
+    assert_eq!(check.health, Health::Ok);
+}
+
+/// The `plugin` value's text takes the colour of the row's dot: green for
+/// a working install, amber for every state that warns, body text for the
+/// idle `not installed`.
+#[test]
+fn the_rex_plugin_value_takes_the_colour_of_its_dot() {
+    let this = env!("CARGO_PKG_VERSION");
+    let current = format!("written by clauth {this}\n");
+    let installed = format!("installed (clauth {this})");
+    let stale = format!("written by clauth 0.17.0, this is {this}");
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut cases: Vec<(RexOnDisk<'_>, String, Health, ratatui::style::Color)> = vec![
+        (
+            RexOnDisk::Absent,
+            "not installed".to_string(),
+            Health::Idle,
+            crate::tui::theme::body().fg.unwrap(),
+        ),
+        (
+            RexOnDisk::Marker(&current),
+            installed,
+            Health::Ok,
+            crate::tui::theme::success().fg.unwrap(),
+        ),
+        (
+            RexOnDisk::Marker("written by clauth 0.17.0\n"),
+            stale,
+            Health::Warn,
+            crate::tui::theme::warning().fg.unwrap(),
+        ),
+        (
+            RexOnDisk::NoMarker,
+            "not written by clauth".to_string(),
+            Health::Warn,
+            crate::tui::theme::warning().fg.unwrap(),
+        ),
+    ];
+    #[cfg(unix)]
+    cases.extend([
+        (
+            RexOnDisk::LinkToDir,
+            "linked (local)".to_string(),
+            Health::Ok,
+            crate::tui::theme::success().fg.unwrap(),
+        ),
+        (
+            RexOnDisk::DanglingLink,
+            "linked (local), target missing".to_string(),
+            Health::Warn,
+            crate::tui::theme::warning().fg.unwrap(),
+        ),
+        (
+            RexOnDisk::LinkToFile,
+            "linked (local), target is not a folder".to_string(),
+            Health::Warn,
+            crate::tui::theme::warning().fg.unwrap(),
+        ),
+    ]);
+    for (state, value, health, fg) in &cases {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = rex_env(&home);
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        let (app, check, _) = rex_row_on_disk(&home, state);
+        assert_eq!(check.health, *health, "the dot for {value:?}");
+        assert_eq!(
+            rex_plugin_value_fg(&app, value),
+            *fg,
+            "the text colour of {value:?}"
+        );
+    }
+}
+
+/// Only the `plugin` value follows the dot: the rex row's other values stay
+/// body text on a row that warns.
+#[cfg(unix)]
+#[test]
+fn the_rex_rows_other_values_stay_body_text() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (app, check, _) = rex_row_on_disk(&home, &RexOnDisk::DanglingLink);
+    assert_eq!(check.health, Health::Warn);
+    for (key, value) in [
+        ("root", "/"),
+        ("watcher", "not running"),
+        ("experimental", "may change in any release"),
+    ] {
+        assert_eq!(
+            detail_value_fg(&app, key, value),
+            crate::tui::theme::body().fg.unwrap(),
+            "the text colour of the {key} value"
+        );
+    }
+}
+
+/// Only the `plugin` value follows the dot: on a warning row that poses no
+/// link (a stale marker), `watcher` and `experimental` stay body text on every
+/// platform, not only where the unix link cases run.
+#[test]
+fn the_rex_rows_other_values_stay_body_text_on_a_stale_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = rex_env(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (app, check, _) = rex_row_on_disk(&home, &RexOnDisk::Marker("written by clauth 0.17.0\n"));
+    assert_eq!(check.health, Health::Warn);
+    for (key, value) in [
+        ("watcher", "not running"),
+        ("experimental", "may change in any release"),
+    ] {
+        assert_eq!(
+            detail_value_fg(&app, key, value),
+            crate::tui::theme::body().fg.unwrap(),
+            "the text colour of the {key} value"
+        );
+    }
+}
+
+// ── blurred detail selection ─────────────────────────────────────────────────
+
+/// Ascend from the Services detail with the real key.
+fn ascend_services(app: &mut App) {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+}
+
+/// The blurred-pane selection: the detail row holding `label` keeps the
+/// `BG_HOVER` tint across its content width (padding columns excluded),
+/// shows no caret, and `label` reads `TEXT_DIM` without bold.
+fn assert_blurred_detail_selection(app: &App, label: &str) {
+    let mut term = Terminal::new(TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| {
+            let b = r.find(label)?;
+            r[..b].contains("││").then(|| (y, r[..b].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("{label} renders in the detail:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != crate::tui::theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred detail keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred detail draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(
+            cell(x).fg,
+            crate::tui::theme::text_dim_color(),
+            "{label} keeps its blurred color"
+        );
+        assert!(
+            !cell(x).modifier.contains(ratatui::style::Modifier::BOLD),
+            "{label} drops the bold on a blurred detail"
+        );
+    }
+}
+
+/// Ascending from the herdr detail keeps the option row the cursor left
+/// marked, so the next descend's landing row stays visible.
+#[test]
+fn a_blurred_herdr_detail_keeps_its_last_option_rows_tint() {
+    use crate::tui::app::HERDR_OPTIONS;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = herdr_options_app(healthy_config());
+    app.services.herdr_options_cursor = 1;
+    ascend_services(&mut app);
+    assert_eq!(
+        app.services.herdr_options_cursor, 1,
+        "the option cursor persists"
+    );
+    assert_blurred_detail_selection(&app, HERDR_OPTIONS[1].label());
+}
+
+/// Ascending from the plugin detail keeps the fix line the cursor left
+/// marked, so the next descend's landing line stays visible.
+#[test]
+fn a_blurred_plugin_detail_keeps_its_last_fix_lines_tint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.problem_cursor = 1;
+    ascend_services(&mut app);
+    assert_eq!(app.services.problem_cursor, 1, "the fix cursor persists");
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+// ── never-entered detail shading ─────────────────────────────────────────────
+
+/// The cells inside the detail pane (right of the `││` pane separator) that
+/// carry `BG_HOVER`.
+fn detail_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == crate::tui::theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A herdr detail the user never opened shades no option row: its cursor is
+/// a default, not a memory, so the blurred detail stays untinted.
+#[test]
+fn a_never_entered_herdr_detail_shades_no_option() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    let (rows, buf) = render(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered herdr detail shades nothing:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Entering the herdr detail once earns its remembered-row tint: walking to
+/// the `pane tag` option and ascending keeps that row tinted.
+#[test]
+fn an_entered_herdr_detail_keeps_the_walked_options_tint_after_ascending() {
+    use crate::tui::app::{HERDR_OPTIONS, ServicesFocus};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "enter descends");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.herdr_options_cursor, 1,
+        "the walk lands on pane tag"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    assert_blurred_detail_selection(&app, HERDR_OPTIONS[1].label());
+}
+
+/// Moving the Services selector to another row makes the herdr detail a new
+/// subject: its tint does not return with the selection.
+#[test]
+fn moving_the_services_selector_clears_the_herdr_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        herdr_check(&probe, Some(&healthy_config())),
+        plugin_check_with_problems(),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !detail_tinted_cells(&render(&app).1).is_empty(),
+        "the tint shows before the move"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.services.cursor, 0, "the selector wrapped back to herdr");
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the herdr detail is never-entered again"
+    );
+}
+
+/// A plugin detail the user never opened shades no fix line: its cursor is a
+/// default, not a memory, so the blurred detail stays untinted.
+#[test]
+fn a_never_entered_plugin_detail_shades_no_fix_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_with(plugin_check_with_problems());
+    let (rows, buf) = render(&app);
+    assert_eq!(
+        detail_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered plugin detail shades nothing:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Entering the plugin detail once earns its remembered-row tint: walking to
+/// the `wire mcp server` fix and ascending keeps that line tinted.
+#[test]
+fn an_entered_plugin_detail_keeps_the_walked_fix_lines_tint_after_ascending() {
+    use crate::tui::app::ServicesFocus;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(plugin_check_with_problems());
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "enter descends");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.problem_cursor, 1,
+        "the walk lands on the wire fix"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+/// Moving the Services selector to another row makes the plugin detail a new
+/// subject: its fix-line tint does not return with the selection.
+#[test]
+fn moving_the_services_selector_clears_the_plugin_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !detail_tinted_cells(&render(&app).1).is_empty(),
+        "the tint shows before the move"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.cursor, 0,
+        "the selector wrapped back to plugin"
+    );
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the plugin detail is never-entered again"
+    );
+}
+
+/// A selector key that moves nothing keeps the subject: `PageUp` on the top
+/// row of a list shorter than a page leaves the entered plugin detail's
+/// remembered fix line tinted.
+#[test]
+fn a_selector_key_that_moves_nothing_keeps_the_entered_detail_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    // The page keys read the selector geometry the last frame published.
+    render(&app);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(
+        app.services.cursor, 0,
+        "PageUp on the top row moves nothing"
+    );
+    assert_blurred_detail_selection(&app, "wire mcp server");
+}
+
+/// A fresh Services entry is a new subject, never a leave: a plugin detail
+/// nobody entered stays never-entered across a tab round trip, so a check
+/// order that puts it first shades no fix line.
+#[test]
+fn a_services_round_trip_leaves_a_never_entered_detail_untinted() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let probe = healthy_probe();
+    let mut app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_ne!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "fixture control: → left Services"
+    );
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "← returned to Services"
+    );
+    assert_eq!(
+        (
+            app.services.problem_entered,
+            app.services.herdr_options_entered
+        ),
+        (false, false),
+        "the fresh entry leaves both walk panes never-entered"
+    );
+    // The entry rebuilt the real check list (shunt first); restore the
+    // plugin-first order the render pin reads.
+    app.services.checks = vec![
+        plugin_check_with_problems(),
+        herdr_check(&probe, Some(&healthy_config())),
+    ];
+    assert_eq!(
+        detail_tinted_cells(&render(&app).1),
+        Vec::new(),
+        "the never-entered plugin detail shades nothing after the round trip"
+    );
+}
+
+/// The help's `space` row on the shunt card says what `space` does on the
+/// focused line, in the footer's words, and is absent where `space` does
+/// nothing: `toggle enabled` on the enabled line, no row on a fix line.
+#[test]
+fn the_shunt_help_space_row_follows_the_focused_line() {
+    use crate::tui::app::{Check, Health, Modal, ServiceFix, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let space_rows = |focus: ShuntFocus| -> Vec<String> {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label: "shunt",
+            health: Health::Ok,
+            detail: (0..6).map(|i| format!("card row {i}")).collect(),
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![focus],
+            shunt_action_start: Some(0),
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(&app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" space "))
+            .collect()
+    };
+    let rows = space_rows(ShuntFocus::Enabled { line: 1 });
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space toggle enabled"),
+        "the enabled line: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space toggle enabled │"],
+        "the enabled line's row whole"
+    );
+    let rows = space_rows(ShuntFocus::Fix {
+        line: 1,
+        fix: ServiceFix::MoveStoresIn,
+    });
+    assert!(rows.is_empty(), "a fix line's space does nothing: {rows:?}");
+}
+
+/// The help's `space` row on the shunt card names the focused state control
+/// in the footer's words: `expand the entry` / `collapse the entry` on an
+/// entry, `cycle the field` on a cycle field, and nothing on a typed field or
+/// a busy row, where `space` does nothing.
+#[test]
+fn the_shunt_help_space_row_names_the_entry_and_the_cycle_field() {
+    use crate::tui::app::{
+        Modal, ShuntEntryKey, ShuntFieldKey, ShuntFocusLine, ShuntSave, ShuntSaveKey,
+        UpstreamFieldKind, handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let entry_key = ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    };
+    let view = || {
+        let mut view = base_view();
+        view.upstreams = vec![shorthand_up("anthropic", "claude_oauth")];
+        view
+    };
+    let build = |expanded: bool| {
+        let mut expanded_set = std::collections::HashSet::new();
+        if expanded {
+            expanded_set.insert(entry_key.clone());
+        }
+        let mut app = config_view_app(view(), expanded_set);
+        render_tall(&app);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        app
+    };
+    let space_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" space "))
+            .collect()
+    };
+
+    let mut app = build(false);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry_key.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space expand the entry"),
+        "a collapsed entry expands: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space expand the entry │"],
+        "a collapsed entry's row whole"
+    );
+
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry_key.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space collapse the entry"),
+        "an expanded entry collapses: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space collapse the entry │"],
+        "an expanded entry's row whole"
+    );
+
+    let provider = ShuntFieldKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Provider,
+    };
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(provider.clone())));
+    let rows = space_rows(&mut app);
+    assert_eq!(rows.len(), 1, "one space row: {rows:?}");
+    assert!(
+        rows[0].contains("space cycle the field"),
+        "a cycle field steps its pick: {rows:?}"
+    );
+    assert_eq!(
+        help_row_segments(&rows, "space"),
+        ["│ space cycle the field │"],
+        "a cycle field's row whole"
+    );
+
+    let name_field = ShuntFieldKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    };
+    let mut app = build(true);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(name_field)));
+    assert!(
+        space_rows(&mut app).is_empty(),
+        "a typed field's space does nothing"
+    );
+
+    let mut app = build(true);
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::Field(provider.clone()),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(provider)));
+    assert!(
+        space_rows(&mut app).is_empty(),
+        "a busy row's space does nothing"
+    );
+}
+
+/// A detail whose keymap is the scroll-only one (any check outside shunt /
+/// plugin / herdr / delegates) binds neither `↵` nor `f` on a fix line, so
+/// the footer offers neither and a press changes nothing.
+#[test]
+fn a_generic_detail_with_fix_lines_offers_no_inert_keys() {
+    use crate::tui::app::{ServicesFocus, fix_line, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let fix = ServiceFix::MoveStoresIn;
+    let mut app = app_with(Check {
+        label: "rex",
+        health: Health::Warn,
+        detail: vec![fix_line(&fix), fix_line(&fix)],
+        fix: Some(fix.clone()),
+        problems: vec![
+            Problem {
+                line: 0,
+                fix: fix.clone(),
+            },
+            Problem {
+                line: 1,
+                fix: fix.clone(),
+            },
+        ],
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    });
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::Detail,
+        "the rex detail descends"
+    );
+    let footer = draw_frame(&app, 200, 60)
+        .last()
+        .expect("the footer row")
+        .clone();
+    assert!(!footer.contains('↵'), "no inert ↵: {footer:?}");
+    assert!(!footer.contains("next fix"), "no inert f: {footer:?}");
+
+    let before = draw_frame(&app, 200, 60);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        draw_frame(&app, 200, 60),
+        before,
+        "↵ and f change nothing on the scroll-only detail"
+    );
+}
+
+// ---- the Services detail's page row follows the frame's own routing ----
+
+/// The help's page row on the Services detail names what the key does there:
+/// the shunt card scrolls (bound-gated — a fitting card lists none), herdr
+/// diagnostics that fit list none either (the press does nothing there), and
+/// the delegates detail pages its job selection while it can move.
+#[test]
+fn the_services_detail_page_row_follows_the_frames_routing() {
+    use crate::tui::app::{Modal, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        draw_frame(app, 200, 120)
+            .into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" pgup/pgdn "))
+            .collect()
+    };
+    let shunt = |detail: usize| {
+        let mut app = app_with(Check {
+            label: "shunt",
+            health: Health::Ok,
+            detail: (0..detail).map(|i| format!("card row {i}")).collect(),
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![ShuntFocus::Enabled { line: 1 }],
+            shunt_action_start: Some(0),
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app
+    };
+
+    // The shunt card fits: the page keys scroll nothing, so no row lists them.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = shunt(2);
+        let _ = draw_frame(&app, 200, 60);
+        assert!(!crate::tui::app::detail_scrolls(&app), "the card fits");
+        let rows = page_rows(&mut app);
+        assert!(
+            rows.is_empty(),
+            "a fitting card lists no page row: {rows:?}"
+        );
+    }
+    // The shunt card overflows: the per-tab row names the scroll. Long
+    // enough to overflow the tall help frame too — the row reads the bound
+    // the frame under the modal published.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = shunt(130);
+        let _ = draw_frame(&app, 200, 60);
+        assert!(crate::tui::app::detail_scrolls(&app), "the card overflows");
+        let rows = page_rows(&mut app);
+        assert_eq!(rows.len(), 1, "one page row: {rows:?}");
+        assert!(
+            rows[0].contains("pgup/pgdn scroll a page"),
+            "the card's page keys scroll: {rows:?}"
+        );
+        assert_eq!(
+            help_row_segments(&rows, "pgup/pgdn"),
+            ["│ pgup/pgdn scroll a page │"],
+            "the card's page row whole"
+        );
+    }
+    // Herdr diagnostics that fit leave the page keys nothing to read: no row.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !crate::tui::app::detail_scrolls(&app),
+            "the diagnostics fit"
+        );
+        let rows = page_rows(&mut app);
+        assert!(
+            rows.is_empty(),
+            "fitting herdr diagnostics list no page row: {rows:?}"
+        );
+    }
+    // The delegates detail pages its job selection.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_delegates(seed_every_state(NOW));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(app.services.delegates_selection_moves(), "the jobs page");
+        let rows = page_rows(&mut app);
+        assert_eq!(rows.len(), 1, "one page row: {rows:?}");
+        assert!(
+            rows[0].contains("pgup/pgdn move a page"),
+            "the delegates page keys move the selection: {rows:?}"
+        );
+        assert_eq!(
+            help_row_segments(&rows, "pgup/pgdn"),
+            ["│ pgup/pgdn move a page │"],
+            "the delegates page row whole"
+        );
+    }
+    // A lone job wraps onto itself: the page row drops.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with_delegates(seed_every_state(NOW).into_iter().take(1).collect());
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !app.services.delegates_selection_moves(),
+            "one job cannot page"
+        );
+        let rows = page_rows(&mut app);
+        assert!(rows.is_empty(), "a lone job lists no page row: {rows:?}");
+    }
+}
+
+/// On a herdr or plugin detail whose diagnostics fit, a page press has nothing
+/// to read: the help lists no page row, and a press changes neither the
+/// focus, the scroll nor the frame.
+#[test]
+fn a_fitting_diagnostic_detail_lists_no_page_row_and_ignores_the_press() {
+    use crate::tui::app::{Modal, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        let rows = draw_frame(app, 200, 120);
+        let _ = app.pop_modal();
+        rows.into_iter()
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|r| r.contains(" pgup/pgdn "))
+            .collect()
+    };
+    for label in ["herdr", "plugin"] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = app_with(Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        });
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = draw_frame(&app, 200, 60);
+        assert!(
+            !crate::tui::app::detail_scrolls(&app),
+            "{label}: the diagnostics fit"
+        );
+        assert!(!app.services.diagnostic_focus, "{label}: action focus");
+        let held_frame = draw_frame(&app, 200, 60);
+        assert_eq!(
+            page_rows(&mut app),
+            Vec::<String>::new(),
+            "{label}: a press moves nothing, so no row lists"
+        );
+        let held = (
+            app.services.diagnostic_focus,
+            app.services.detail_scroll,
+            app.services.detail_max_scroll.get(),
+        );
+        for code in [KeyCode::PageDown, KeyCode::PageUp] {
+            handle_key(&mut app, crate::testutil::key(code));
+            assert_eq!(
+                (
+                    app.services.diagnostic_focus,
+                    app.services.detail_scroll,
+                    app.services.detail_max_scroll.get(),
+                ),
+                held,
+                "{label}: {code:?} changes no state"
+            );
+            assert_eq!(
+                draw_frame(&app, 200, 60),
+                held_frame,
+                "{label}: {code:?} changes no frame"
+            );
+        }
+    }
+}
+
+/// A herdr detail whose diagnostics fit offers no page key on either surface,
+/// and pgdn / pgup change no state and no frame: the options keep focus.
+#[test]
+fn a_fitting_herdr_detail_offers_no_page_key_and_its_press_changes_nothing() {
+    use crate::tui::app::{Modal, Tab, handle_key, page_keys_act};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.tab = Tab::Services;
+    let held_frame = draw_frame(&app, 200, 60);
+    assert!(
+        !crate::tui::app::detail_scrolls(&app),
+        "the diagnostics fit"
+    );
+    assert_eq!(page_keys_act(&app), None, "the page keys act nowhere");
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("space/↵", "cycle / toggle"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the footer offers no page key"
+    );
+    app.help_scroll = 0;
+    app.open_modal(Modal::Help);
+    let help: Vec<String> = draw_frame(&app, 200, 120)
+        .into_iter()
+        .filter(|r| r.contains("pgup/pgdn"))
+        .collect();
+    let _ = app.pop_modal();
+    assert_eq!(help, Vec::<String>::new(), "the help lists no page row");
+    let held = (
+        app.services.diagnostic_focus,
+        app.services.detail_scroll,
+        app.services.herdr_options_cursor,
+        app.services.herdr_fix_focus,
+    );
+    for code in [KeyCode::PageDown, KeyCode::PageUp] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (
+                app.services.diagnostic_focus,
+                app.services.detail_scroll,
+                app.services.herdr_options_cursor,
+                app.services.herdr_fix_focus,
+            ),
+            held,
+            "{code:?} changes no state (diagnostic focus, scroll, option, fix focus)"
+        );
+        assert_eq!(
+            draw_frame(&app, 200, 60),
+            held_frame,
+            "{code:?} changes no frame"
+        );
+    }
+}
+
+/// The herdr `tag refresh` stepper offers `+` and `-` each only while that
+/// direction moves the seconds: at the 1 s floor no `- lower` and its press
+/// writes nothing, at the top no `+ raise`; the help's joined `+ / -` stays.
+#[test]
+fn the_tag_refresh_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{HERDR_OPTIONS, HerdrOption, Tab, handle_key};
+    use crate::tui::render::modals::tests::help_of;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let stepper = |secs: u64| {
+        let mut app = herdr_options_app(healthy_config());
+        app.tab = Tab::Services;
+        app.services.herdr_options_cursor = HERDR_OPTIONS
+            .iter()
+            .position(|o| *o == HerdrOption::TagRefresh)
+            .expect("the tag refresh row");
+        app.config().state.herdr.tag_watch_secs = secs;
+        app
+    };
+    let hints = |steps: &[(&'static str, &'static str)]| {
+        let mut hints = vec![("↑↓", "row")];
+        hints.extend_from_slice(steps);
+        hints.extend([
+            ("↵", "type"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ]);
+        hints
+    };
+    let joined = ("+ / -", "step the tag refresh");
+    let secs = |app: &App| app.config().state.herdr.tag_watch_secs;
+
+    let mut mid = stepper(5);
+    assert_eq!(
+        super::super::footer::services_hints(&mid),
+        hints(&[("+", "raise"), ("-", "lower")]),
+        "5 s"
+    );
+    let mid_help = help_of(&mid);
+    assert!(mid_help.contains(&joined), "5 s: {mid_help:?}");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(secs(&mid), 4, "5 s: - lands");
+
+    for (start, steps, dead) in [
+        (1, [("+", "raise")], '-'),
+        (u64::MAX, [("-", "lower")], '+'),
+    ] {
+        let mut app = stepper(start);
+        assert_eq!(
+            super::super::footer::services_hints(&app),
+            hints(&steps),
+            "{start} s"
+        );
+        assert_eq!(help_of(&app), mid_help, "{start} s: the joined row stays");
+        let frame = draw_frame(&app, 200, 60);
+        let toasts = app.toasts.len();
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(dead)));
+        assert_eq!(
+            (secs(&app), app.toasts.len()),
+            (start, toasts),
+            "{start} s: {dead:?} changes no state"
+        );
+        assert_eq!(
+            draw_frame(&app, 200, 60),
+            frame,
+            "{start} s: {dead:?} changes no frame"
+        );
+    }
+}
+
+/// The plugin detail's rows at a height that shows the whole card.
+fn plugin_detail_rows(app: &App) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(W, 120)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+    detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+}
+
+/// Unsets the prompt-cache env vars the plugin card reads, so a box running
+/// with a 5 min cache forced cannot flip the card's copy under a test.
+fn cache_env_pin(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+            ("CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL", None),
+        ],
+    )
+}
+
+/// The plugin detail ends on an OPTIONS section holding one `idle wake`
+/// toggle: `↑` from the first problem wraps onto it, the focused row explains
+/// itself on the line below, `space` flips it and persists `[plugin]
+/// idle_wake` (written only while off, the table removed once it is back
+/// on), and the cache group's `idle wake` readout shows only while it is on.
+#[test]
+fn the_plugin_idle_wake_row_toggles_and_persists() {
+    use crate::tui::app::{ServicesFocus, ShuntRefresh, Tab, recompute_services_checks};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let profiles = home.home().join(".clauth").join("profiles.toml");
+    let on_disk =
+        || std::fs::read_to_string(&profiles).expect("profiles.toml reads after a toggle");
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    assert!(
+        !app.services.checks[app.services.cursor].problems.is_empty(),
+        "the sandbox card holds a problem, so `↑` wraps from it onto the row"
+    );
+    app.services.focus = ServicesFocus::Detail;
+    let option_row = |rows: &[String]| {
+        rows.iter()
+            .find(|r| r.contains("idle wake") && (r.ends_with("─●") || r.ends_with("○─")))
+            .cloned()
+            .unwrap_or_else(|| panic!("no `idle wake` option row:\n{}", rows.join("\n")))
+    };
+    let readouts = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.starts_with("idle wake") && !r.ends_with("─●") && !r.ends_with("○─"))
+            .cloned()
+            .collect()
+    };
+    let explains = |rows: &[String], opening: &str| rows.iter().any(|r| r.starts_with(opening));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter().any(|r| r == "OPTIONS"),
+        "the eyebrow renders:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        option_row(&rows),
+        "❯ idle wake  ─●",
+        "on by default, focused"
+    );
+    assert_eq!(
+        readouts(&rows).len(),
+        1,
+        "one readout while on:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        readouts(&rows)[0].ends_with("55 min idle with a delegate, 1h only"),
+        "{}",
+        readouts(&rows)[0]
+    );
+    assert!(
+        explains(&rows, "└ sends a short no-op keepalive"),
+        "the focused row explains itself:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        on_disk().contains("[plugin]\nidle_wake = false"),
+        "space writes the key off:\n{}",
+        on_disk()
+    );
+    let same_frame = plugin_detail_rows(&app);
+    assert_eq!(
+        (option_row(&same_frame), readouts(&same_frame)),
+        ("❯ idle wake  ○─".to_string(), Vec::<String>::new()),
+        "the toggle rebuilds the card before any recompute:\n{}",
+        same_frame.join("\n")
+    );
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    let rows = plugin_detail_rows(&app);
+    assert_eq!(option_row(&rows), "❯ idle wake  ○─");
+    assert_eq!(
+        readouts(&rows),
+        Vec::<String>::new(),
+        "no readout while off:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        explains(&rows, "└ a delegate may wake a session"),
+        "the focused row explains the off state:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !on_disk().contains("idle_wake") && !on_disk().contains("[plugin]"),
+        "back on writes nothing:\n{}",
+        on_disk()
+    );
+}
+
+/// `space` writes the flip of the value the row SHOWS: when another process
+/// turned the key off after this TUI last read it, the row still shows on, so
+/// `space` means off and off lands, never the disk value's flip.
+#[test]
+fn the_idle_wake_toggle_writes_the_flip_of_what_the_row_shows() {
+    use crate::tui::app::{ServicesFocus, Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&home);
+    let mut app = app_with(plugin_check_with_problems());
+    app.tab = Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
+    app.services.plugin_option_focus = true;
+    assert!(app.config().state.plugin.idle_wake, "the row shows on");
+    let profiles = home.home().join(".clauth").join("profiles.toml");
+    std::fs::create_dir_all(profiles.parent().unwrap()).unwrap();
+    std::fs::write(&profiles, "profiles = []\n\n[plugin]\nidle_wake = false\n").unwrap();
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+
+    let on_disk = std::fs::read_to_string(&profiles).expect("profiles.toml reads");
+    assert!(
+        on_disk.contains("[plugin]\nidle_wake = false"),
+        "space on a row showing on writes off:\n{on_disk}"
+    );
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "the row now shows off"
+    );
+}
+
+/// `[plugin] idle_wake = false` drops the `idle wake` readout whatever the
+/// TTL view: automatic, a 1h setting and a 5m env alike — the two cache rows
+/// stay, and the OPTIONS row still shows off.
+#[test]
+fn the_idle_wake_readout_is_absent_while_off_on_every_ttl_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), false),
+        cache_rows_toggled_at(11, &["auto: 1h subscription, 5m api key", "auto: 5m"], "○─"),
+    );
+    assert_eq!(
+        cache_rows_with(
+            crate::hook_jobs::CacheView {
+                main_setting: Some("1h".to_string()),
+                ..Default::default()
+            },
+            false
+        ),
+        cache_rows_toggled_at(11, &["1h, promptCacheTtl", "auto: 5m"], "○─"),
+    );
+    assert_eq!(
+        cache_rows_with(
+            crate::hook_jobs::CacheView {
+                main_env: Some("5m".to_string()),
+                ..Default::default()
+            },
+            false
+        ),
+        cache_rows_toggled_at(11, &["5m, CLAUDE_CODE_PROMPT_CACHE_TTL", "auto: 5m"], "○─"),
+    );
+}
+
+/// The compatible tier spells the `idle wake` toggle `[on]` / `[off]`.
+#[test]
+fn the_idle_wake_row_brackets_its_state_on_the_compatible_tier() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let lines = [
+        "auto: 1h subscription, 5m api key",
+        "auto: 5m",
+        "55 min idle with a delegate, 1h only",
+    ];
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), true),
+        cache_rows_toggled_at(11, &lines, "[on]"),
+    );
+    assert_eq!(
+        cache_rows_with(crate::hook_jobs::CacheView::default(), false),
+        cache_rows_toggled_at(11, &[lines[0], lines[1]], "[off]"),
+    );
+}
+
+/// The plugin detail's walk: `↓` from the last problem lands on the OPTIONS
+/// row and wraps on to problem 0; `f` walks the fixes alone, from the option
+/// row to problem 0; `↵` on the option row flips the key while `↵` on a
+/// problem still names its fix; with no problem the walk rests on the row.
+#[test]
+fn the_plugin_walk_wraps_through_the_option_row_and_f_skips_it() {
+    use crate::tui::app::ServicesFocus;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let press = |app: &mut App, code: KeyCode| handle_key(app, crate::testutil::key(code));
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.focus = ServicesFocus::Detail;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::WireMcpServers)
+    );
+    press(&mut app, KeyCode::Down);
+    assert!(app.services.plugin_on_option(), "↓ from the last problem");
+    assert_eq!(app.services.focused_fix(), None);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "↓ from the option row wraps to problem 0"
+    );
+    press(&mut app, KeyCode::Up);
+    assert!(app.services.plugin_on_option(), "↑ from problem 0");
+
+    press(&mut app, KeyCode::Char('f'));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f from the option row lands on the first fix"
+    );
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Char('f'));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f wraps over the fixes alone, never onto the option row"
+    );
+
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "↵ on the option row turns the key off"
+    );
+    assert!(
+        app.modals.is_empty(),
+        "↵ on the option row opens no fix confirm"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "a second ↵ turns it on"
+    );
+    // The toggle rebuilt the card from the sandbox; the walk below runs on the
+    // fixture this test built, so its first problem is the install fix.
+    app.services.checks[app.services.cursor] = plugin_check_with_problems();
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(crate::tui::app::Modal::Confirm(state))
+                if matches!(state.on_confirm, crate::tui::app::ConfirmAction::InstallPlugin)
+        ),
+        "↵ on a problem still opens its fix confirm"
+    );
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "and leaves the key alone"
+    );
+
+    let mut app = app_with(Check {
+        fix: None,
+        problems: Vec::new(),
+        ..plugin_check_with_problems()
+    });
+    app.services.focus = ServicesFocus::Detail;
+    assert!(
+        app.services.plugin_on_option(),
+        "no problem: the walk rests on the row"
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Up);
+    assert!(app.services.plugin_on_option());
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "space on the lone option row flips it"
+    );
+}
+
+/// The focused `idle wake` row's explanation, by state, by equality: on with
+/// a 1 h main cache set (a setting or an env var), on with the automatic
+/// length (which the card cannot resolve to 1 h or 5 m, so the text names the
+/// 1 h condition), on with a 5 m main cache, and off.
+#[test]
+fn the_idle_wake_tooltip_reads_each_state_by_equality() {
+    let tooltip = crate::tui::app::plugin_idle_wake_tooltip;
+    for view in [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("1h".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("1h".to_string()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            tooltip(&view, true),
+            "sends a short no-op keepalive after 55 idle minutes while delegates run to keep prompt cache warm",
+        );
+    }
+    assert_eq!(
+        tooltip(&crate::hook_jobs::CacheView::default(), true),
+        "sends a short no-op keepalive after 55 idle minutes while delegates run to keep a 1h prompt cache warm",
+    );
+    for view in [
+        crate::hook_jobs::CacheView {
+            main_setting: Some("5m".to_string()),
+            ..Default::default()
+        },
+        crate::hook_jobs::CacheView {
+            main_env: Some("5m".to_string()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            tooltip(&view, true),
+            "on, but a 5 min prompt cache expires first, so it never fires",
+        );
+    }
+    assert_eq!(
+        tooltip(&crate::hook_jobs::CacheView::default(), false),
+        "a delegate may wake a session with an expired prompt cache",
+    );
+}
+
+/// The focused `idle wake` row's explanation renders only while the cursor
+/// rests on it: focused it wraps dim under the row, unfocused no line holds
+/// it.
+#[test]
+fn the_idle_wake_explanation_shows_only_while_the_row_is_focused() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "focused, the explanation renders:\n{}",
+        rows.join("\n")
+    );
+    app.services.focus = ServicesFocus::List;
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        !rows
+            .iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "unfocused, no explanation line:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The focused row's explanation is the house tooltip: the `└ ` leader renders
+/// in LINE and the text in TEXT_FAINT, read off the buffer cells.
+#[test]
+fn the_idle_wake_explanation_wears_the_house_tooltip_styles() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let mut term = Terminal::new(TestBackend::new(W, 120)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &[])).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("└ sends a short no-op keepalive"))
+        .unwrap_or_else(|| panic!("the tooltip leader renders:\n{}", rows.join("\n")));
+    let row = &rows[y];
+    let lead_x = row[..row.find('└').expect("the leader glyph renders")]
+        .chars()
+        .count();
+    let cell = |x: usize| &buf.content[y * W as usize + x];
+    assert_eq!(cell(lead_x).symbol(), "└", "leader cell:\n{row}");
+    assert_eq!(
+        Some(cell(lead_x).fg),
+        super::theme::line().fg,
+        "the leader wears LINE:\n{row}"
+    );
+    let text_x = lead_x + 2;
+    assert_eq!(cell(text_x).symbol(), "s", "text cell:\n{row}");
+    assert_eq!(
+        Some(cell(text_x).fg),
+        super::theme::faint().fg,
+        "the text wears TEXT_FAINT:\n{row}"
+    );
+}
+
+/// A no-problem plugin card taller than its pane opens (`↵` from the list)
+/// with the lone option row and its explanation in view; the arrows still
+/// scroll the text, and while the row is scrolled out of view `space` and `↵`
+/// leave the key alone and the footer offers no toggle, until the row is back
+/// in view.
+#[test]
+fn a_tall_no_problem_plugin_card_opens_on_its_option_row_and_acts_only_in_view() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut check = plugin_check_with_problems();
+    check.problems.clear();
+    check.fix = None;
+    check.detail = (0..40).map(|i| format!("filler {i}")).collect();
+    let mut app = app_with(check);
+    // The recompute resolves the row's explanation; this card is built by
+    // hand, so the fixture does what the recompute would.
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let hints = |app: &App| super::super::footer::services_hints(app);
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    let row_shown = |rows: &[String]| rows.iter().any(|r| r.starts_with("❯ idle wake"));
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let opened = visible(&app);
+    assert!(
+        row_shown(&opened),
+        "the first frame shows the option row:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        opened
+            .iter()
+            .any(|r| r.starts_with("└ sends a short no-op keepalive")),
+        "and its explanation's first line:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        opened
+            .last()
+            .is_some_and(|r| r.ends_with("prompt cache warm")),
+        "and its explanation's last line:\n{}",
+        opened.join("\n")
+    );
+    assert!(
+        hints(&app).contains(&("space/↵", "toggle")),
+        "in view, the footer offers the toggle: {:?}",
+        hints(&app)
+    );
+    assert_eq!(
+        visible(&app),
+        opened,
+        "a redraw with no key keeps the scrolled frame"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let up_one = visible(&app);
+    assert_ne!(up_one, opened, "↑ scrolls the text:\n{}", up_one.join("\n"));
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    let top = visible(&app);
+    assert_eq!(
+        top.first().map(String::as_str),
+        Some("filler 0"),
+        "↑ scrolls to the card's top:\n{}",
+        top.join("\n")
+    );
+    assert!(
+        !row_shown(&top),
+        "the option row is out of view:\n{}",
+        top.join("\n")
+    );
+    assert!(
+        app.services.plugin_on_option(),
+        "the cursor still rests on the lone option row"
+    );
+    assert!(
+        !hints(&app).contains(&("space/↵", "toggle")),
+        "out of view, the footer offers no toggle: {:?}",
+        hints(&app)
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "space leaves an out-of-view row alone"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.config().state.plugin.idle_wake,
+        "↵ leaves an out-of-view row alone"
+    );
+    assert_eq!(visible(&app), top, "neither key moved the card");
+
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let bottom = visible(&app);
+    assert!(
+        row_shown(&bottom),
+        "↓ scrolls the row back into view:\n{}",
+        bottom.join("\n")
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "back in view, space flips the key"
+    );
+}
+
+/// The scroll that brought the option row into view belongs to that visit of
+/// the detail: once the user ascends and the list moves to another row and
+/// back, or the tab is left and re-entered, the plugin preview opens at the
+/// card's top like every other row's, with no key pressed in the detail first.
+#[test]
+fn leaving_the_plugin_detail_drops_the_option_row_scroll() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut plugin = plugin_check_with_problems();
+    plugin.problems.clear();
+    plugin.fix = None;
+    plugin.detail = (0..40).map(|i| format!("filler {i}")).collect();
+    let mut other = plugin.clone();
+    other.label = "rex";
+    other.detail = vec!["rex line".to_string()];
+    let checks = vec![plugin, other];
+    let mut app = app_with_checks(checks.clone());
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    let descend_onto_the_row = |app: &mut App| {
+        visible(app);
+        handle_key(app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+        let opened = visible(app);
+        assert_ne!(
+            opened.first().map(String::as_str),
+            Some("filler 0"),
+            "the descend scrolled the row into view:\n{}",
+            opened.join("\n")
+        );
+    };
+
+    descend_onto_the_row(&mut app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.services.cursor, 1, "the list moves to the other row");
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.services.cursor, 0, "and back to the plugin row");
+    let back = visible(&app);
+    assert_eq!(
+        back.first().map(String::as_str),
+        Some("filler 0"),
+        "after a list move the preview opens at the card's top:\n{}",
+        back.join("\n")
+    );
+
+    descend_onto_the_row(&mut app);
+    // The descended plugin detail traps `tab` like any editable pane, so the
+    // user ascends first.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
+    assert_ne!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "tab leaves the Services tab"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::BackTab));
+    assert_eq!(
+        app.tab,
+        crate::tui::app::Tab::Services,
+        "⇧tab re-enters the Services tab"
+    );
+    // The re-entry recomputes the checks off the sandbox; put the tall card
+    // back so the frame can show where the preview opens.
+    app.services.checks = checks;
+    app.services.cursor = 0;
+    let reentered = visible(&app);
+    assert_eq!(
+        reentered.first().map(String::as_str),
+        Some("filler 0"),
+        "after leaving the tab the preview opens at the card's top:\n{}",
+        reentered.join("\n")
+    );
+}
+
+/// At 80 columns the plugin footer sheds other hints before the focused
+/// row's own key: on a problem its `↵ <verb>`, on the option row its toggle,
+/// stays in the frame.
+#[test]
+fn an_80_column_plugin_footer_keeps_the_focused_rows_own_key() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    // Taller than the pane, so the page keys act and their hint competes for
+    // the footer's width too.
+    let mut check = plugin_check_with_problems();
+    check.detail.extend((0..40).map(|i| format!("filler {i}")));
+    let mut app = app_with(check);
+    app.services.plugin_idle_wake_tooltip = Some(crate::tui::app::plugin_idle_wake_tooltip(
+        &crate::hook_jobs::CacheView::default(),
+        true,
+    ));
+    let footer = |app: &App| -> String {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| super::super::draw(f, app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        rows.iter()
+            .rfind(|r| r.contains("? help"))
+            .cloned()
+            .unwrap_or_else(|| panic!("a footer row renders:\n{}", rows.join("\n")))
+    };
+    footer(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let on_problem = footer(&app);
+    assert!(
+        on_problem.contains("↵ install plugin"),
+        "on a problem the footer keeps its fix verb: {on_problem}"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.plugin_on_option(),
+        "↑ wraps onto the option row"
+    );
+    let on_row = footer(&app);
+    assert!(
+        on_row.contains("space/↵ toggle"),
+        "on the option row the footer keeps its toggle: {on_row}"
+    );
+}
+
+/// On a plugin card with problems taller than its pane, `↑` from the first
+/// problem wraps onto the option row and the next frame shows it, so the
+/// toggle the footer offers is one the user can see.
+#[test]
+fn the_problem_walk_onto_the_option_row_brings_it_into_view() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let mut check = plugin_check_with_problems();
+    check.detail.extend((0..40).map(|i| format!("filler {i}")));
+    let mut app = app_with(check);
+    let visible = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+        detail_rows(&crate::testutil::buffer_rows(term.backend().buffer()))
+            .into_iter()
+            .map(|r| r.trim_end_matches(['┊', '┃', ' ']).to_string())
+            .collect()
+    };
+    visible(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "↵ descends");
+    let opened = visible(&app);
+    assert!(
+        opened.iter().any(|r| r.contains("install plugin")),
+        "the walk opens on the first problem, in view:\n{}",
+        opened.join("\n")
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.plugin_on_option(),
+        "↑ wraps onto the option row"
+    );
+    let on_row = visible(&app);
+    assert!(
+        on_row.iter().any(|r| r.starts_with("❯ idle wake")),
+        "the frame shows the focused option row:\n{}",
+        on_row.join("\n")
+    );
+    assert!(
+        super::super::footer::services_hints(&app).contains(&("space/↵", "toggle")),
+        "and the footer offers its toggle"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.plugin.idle_wake,
+        "space flips the row it shows"
+    );
+}
+
+/// With a problem present ↓ still walks to the option row (never scrolls):
+/// the caret rests on it and the focused explanation renders below.
+#[test]
+fn with_a_problem_the_down_walk_still_lands_on_the_option_row() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntRefresh, Tab, handle_key, recompute_services_checks,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _env = cache_env_pin(&_home);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    recompute_services_checks(&mut app, false, ShuntRefresh::Keep);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.services.focus = ServicesFocus::Detail;
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0);
+    assert!(
+        problems > 0,
+        "the sandbox card holds a problem to walk past"
+    );
+    for _ in 0..problems {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert!(
+        app.services.plugin_on_option(),
+        "↓ walked to the option row"
+    );
+    assert_eq!(app.services.focused_fix(), None);
+    let rows = plugin_detail_rows(&app);
+    assert!(
+        rows.iter().any(|r| r == "❯ idle wake  ─●"),
+        "the caret rests on the row:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| { r.starts_with("└ sends a short no-op keepalive") }),
+        "the focused row explains itself:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// A stopped record draws its own word, dated by when it stopped, and no
+/// live figures — the word is what tells it from an orphaned row.
+#[test]
+fn a_stopped_record_draws_its_own_facts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-stop.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-stop",
+            "profile": "D1",
+            "state": "done",
+            "started_at": NOW - 65_000,
+            "done_at": NOW - 5_000,
+            "stopped": true,
+            "session_id": "sid-tui",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let cells = super::delegate_cells(&jobs::list_banded(NOW), NOW);
+    let cell = cells
+        .iter()
+        .find(|c| c.profile == "D1")
+        .expect("the stopped row is drawn");
+    assert_eq!(cell.state, crate::mcp::jobs::JobPhase::Stopped);
+    assert_eq!(cell.facts, vec!["stopped 5s ago".to_string()]);
+    assert_eq!(super::state_mark(crate::mcp::jobs::JobPhase::Stopped), "○");
+    // The drawn row text itself, by equality: a wording drift in the TUI's
+    // own row builder stays green on the facts alone.
+    let line = super::delegate_row_line(cell, 2, 40, false, false);
+    let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(
+        drawn, "  ○ stopped   D1  stopped 5s ago",
+        "the drawn row is the stopped one's own facts, exactly"
+    );
 }

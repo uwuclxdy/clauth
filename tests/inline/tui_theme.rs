@@ -353,7 +353,7 @@ fn an_env_no_color_process_draws_no_colour_on_both_tiers() {
 /// above re-enters this binary with `NO_COLOR=1` and must pass, then again
 /// without it and must fail, which proves that child ran and would see colour.
 /// A filter matching no test exits 0, so the failing control is what keeps
-/// this pin from passing vacuously. Residual: `ratatui::try_init()`'s own
+/// this pin from passing vacuously. Residual: `tui::open_terminal`'s own
 /// setup (its `Stdout` sink, raw mode, the alternate screen) is not exercised,
 /// nor is a production backend other than `CrosstermBackend`; windows runs no
 /// re-entry, so there only the switch-level test above holds.
@@ -569,4 +569,101 @@ fn the_colour_scan_flags_sgr_literals_and_overrides_and_skips_other_escapes() {
         colour_sgrs(escape_spellings_to_esc(r#"write!(w, "\x1b]52;c;{}\x07")"#).as_bytes()),
         Vec::<String>::new()
     );
+}
+
+/// Every mark the render code draws comes from this module: a literal in a
+/// render file is a second copy that drifts from its theme constant.
+#[test]
+fn no_mark_glyph_is_spelled_in_a_render_file() {
+    const MARKS: [char; 10] = ['❯', '●', '○', '✓', '▶', '▼', '✎', '┃', '┊', '◌'];
+    let render = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/render");
+    let scanned = crate::testutil::rs_files(&render);
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/tui/render — it is not reading the tree",
+        scanned.len()
+    );
+    let mut offenders = Vec::new();
+    for file in scanned {
+        let text = std::fs::read_to_string(&file).expect("readable render file");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or_default();
+            for mark in MARKS {
+                if code.contains(mark) {
+                    offenders.push(format!("{}:{}: {mark}", file.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "draw marks through the theme module: {offenders:?}"
+    );
+}
+
+/// The reviewed provider palette: Anthropic's crest is `ACCENT_2`, Codex's the
+/// neutral `TEXT` glint, z.ai's a dark sweep below `TEXT_DIM`, the rest each
+/// provider's own color.
+#[test]
+fn each_provider_crest_is_its_reviewed_color() {
+    use super::{CrestProvider as P, crest_rgb};
+    let expected = [
+        (P::Anthropic, (217, 119, 87)),
+        (P::DeepSeek, (0x67, 0x99, 0xFE)),
+        (P::Zai, (0x8A, 0x90, 0xA6)),
+        (P::Alibaba, (0xFF, 0x6A, 0x00)),
+        (P::OpenRouter, (0xC8, 0xFF, 0x00)),
+        (P::MiniMax, (0xFF, 0x51, 0x51)),
+        (P::Codex, (205, 214, 244)),
+    ];
+    assert_eq!(
+        expected.len(),
+        P::ALL.len(),
+        "every provider has a pinned crest"
+    );
+    for (provider, rgb) in expected {
+        assert_eq!(crest_rgb(provider), rgb, "{provider:?}'s crest");
+    }
+}
+
+/// WCAG 2.x relative luminance of an sRGB triple.
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Every crest differs from the `TEXT_DIM` base it rides and holds 4.5:1
+/// against both `BG` (30, 30, 46) and `BG_HOVER` (40, 40, 56), the backgrounds
+/// a type cell sits on.
+#[test]
+fn every_provider_crest_clears_the_contrast_floor() {
+    use super::{CrestProvider, crest_rgb};
+    assert!(
+        contrast((255, 255, 255), (0, 0, 0)) > 20.9,
+        "control: the formula gives white on black its 21:1"
+    );
+    for provider in CrestProvider::ALL {
+        let rgb = crest_rgb(provider);
+        assert_ne!(
+            rgb,
+            (166, 173, 200),
+            "{provider:?}'s crest differs from TEXT_DIM"
+        );
+        for (bg_name, bg) in [("BG", (30, 30, 46)), ("BG_HOVER", (40, 40, 56))] {
+            let ratio = contrast(rgb, bg);
+            assert!(ratio >= 4.5, "{provider:?} on {bg_name}: {ratio:.3}:1");
+        }
+    }
 }

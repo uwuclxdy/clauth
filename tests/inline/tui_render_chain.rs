@@ -33,11 +33,14 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(threshold),
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -51,6 +54,9 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
@@ -1709,6 +1715,7 @@ fn the_spent_fix_names_a_monthly_quota() {
                 monthly: true,
             },
             &crate::profile::ProfileName::from("acct"),
+            None,
             false,
         ),
         "monthly quota is spent"
@@ -1746,6 +1753,7 @@ fn the_soft_fix_names_a_monthly_quota() {
                 monthly: true,
             },
             &crate::profile::ProfileName::from("acct"),
+            None,
             false,
         ),
         "monthly quota past the weekly switch line, still serving"
@@ -2387,7 +2395,12 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
     }
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
-        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"), false);
+        let fix = reason_fix(
+            &reason,
+            &crate::profile::ProfileName::from("acct"),
+            None,
+            false,
+        );
         assert!(!fix.trim().is_empty(), "{reason:?} has no fix copy");
         assert_eq!(
             fix,
@@ -2410,6 +2423,7 @@ fn key_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::KeyRejected,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2435,6 +2449,7 @@ fn token_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::TokenRejected,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2464,6 +2479,7 @@ fn logged_out_fix_line_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::LoggedOut,
         &crate::profile::ProfileName::from("acct"),
+        None,
         false,
     );
     assert_eq!(
@@ -2484,6 +2500,127 @@ fn logged_out_fix_line_is_pinned_by_equality() {
         .map(|s| s.content.as_ref())
         .collect();
     assert_eq!(pill, "[ logged out ]", "the rendered pill is {pill:?}");
+}
+
+/// `px` alone on the chain, drawn on the Fallback pane the way the operator
+/// reaches its card: the proxy claim on the runtime profile as `load_profile`
+/// records it when `proxy` (the same member with no claim otherwise), a key in
+/// hand when `key`, and that key recorded dead when `rejected`. Returns the
+/// detail pane's pill row, the fix row under it, and the style of the card
+/// span that is exactly `command`, when one is.
+fn px_member_card(
+    proxy: bool,
+    key: bool,
+    rejected: bool,
+    command: &str,
+) -> (String, String, Option<ratatui::style::Style>) {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        key.then(|| "sk-px-0001".to_string()),
+    );
+    px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let fp = crate::usage::dead_login_fingerprint(&px);
+    let (cfg, readings) = config_with(vec![(px, ReadingsSnapshot::default())], None, vec!["px"]);
+    let app = app_with_readings(cfg, &readings);
+    if rejected {
+        app.third_party_broken.lock().unwrap().insert(
+            "px".to_string(),
+            fp.expect("a keyed member has a fingerprint"),
+        );
+    }
+    let rows = render_chain(&app, 100, 24);
+    let screen = rows.join("\n");
+    let pill = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("status"))
+        .unwrap_or_else(|| panic!("no status row on the card:\n{screen}"));
+    let key_rejected = app.key_rejected_names();
+    let cfg = app.config();
+    let lines = member_detail(
+        &cfg,
+        &ProfileName::from("px"),
+        MemberCard {
+            width: 200,
+            ..Default::default()
+        },
+        &key_rejected,
+        &readings,
+    )
+    .0;
+    let styled = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == command)
+        .map(|s| s.style);
+    (
+        detail_of(&rows[pill]).to_string(),
+        detail_of(&rows[pill + 1]).to_string(),
+        styled,
+    )
+}
+
+/// A proxy account's key is the proxy's to mint, so a proxy member with no key
+/// is sent to the one login clauth takes for it, through its proxy, the command
+/// drawn as one command run; the same member with no proxy claim keeps the
+/// login-or-key fix, byte for byte.
+#[test]
+fn a_keyless_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, false, false, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, false, false, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px, or add an api key on the setup tab"
+        )
+    );
+}
+
+/// A proxy member whose key a provider refused gets a new key the one way
+/// clauth takes one for it, a login through its proxy; the same member with no
+/// proxy claim keeps the setup-tab fix, byte for byte.
+#[test]
+fn a_rejected_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, true, true, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ log in again with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, true, true, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ re-enter the api key on the setup tab"
+        )
+    );
 }
 
 // ── `max spend` dims while inert (spend budget off) ──────────────────────────
@@ -3692,7 +3829,12 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"), false);
+    let fix = reason_fix(
+        &BlockedReason::AuthBroken,
+        &ProfileName::from("a"),
+        None,
+        false,
+    );
     assert_prose_part(
         &lines_buffer(rail_hint_lines(&fix, 60, false), 60),
         "re-login with clauth login a",
@@ -4682,5 +4824,283 @@ fn max_spend_hint_never_restates_the_ceiling() {
         hint(Some(billing(Some(1.0)))),
         "$8.00 left to spend here before it stops",
         "armed"
+    );
+}
+
+// ── blurred card selection + selector rail ───────────────────────────────────
+
+/// A two-member chain (`a`, `b`) on the Fallback tab.
+fn two_member_chain_app() -> App {
+    let (a, a_readings) = profile("a", 95.0, 20.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 20.0, 3600);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    let mut app = app_with_readings(cfg, &readings);
+    app.tab = crate::tui::app::Tab::Fallback;
+    app
+}
+
+/// The Fallback body as a buffer, so a pin can read cell styles.
+fn chain_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Ascending from a member card keeps the row the cursor left tinted, with
+/// the caret and the label's bold dropped, so the card shows where the user
+/// was and where the next descend lands.
+#[test]
+fn a_blurred_fallback_card_keeps_its_last_rows_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.fallback_focus, FallbackFocus::Detail, "enter descends");
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(FALLBACK_ROWS[3], FallbackRow::CheckScoped);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain, "esc ascends");
+
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let label = "scoped gate";
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| r.find(label).map(|b| (y, r[..b].chars().count())))
+        .unwrap_or_else(|| panic!("{label} renders:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred card keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred card draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(
+            cell(x).fg,
+            theme::text_dim_color(),
+            "{label} keeps its blurred color"
+        );
+        assert!(
+            !cell(x).modifier.contains(ratatui::style::Modifier::BOLD),
+            "{label} drops the bold on a blurred card"
+        );
+    }
+}
+
+/// Selection promotes the caret, never the rank: the `#N` ordinal is
+/// metadata and keeps its own faint, regular style on the selected row.
+#[test]
+fn the_selected_chain_rows_ordinal_keeps_its_faint_style() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    app.fallback_focus = FallbackFocus::Chain;
+    app.chain_cursor = 0;
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let (y, caret_x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| r.find(theme::CARET).map(|b| (y, r[..b].chars().count())))
+        .unwrap_or_else(|| panic!("the caret renders:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let hash_x = (caret_x..cells.len())
+        .find(|&x| cells[x] == '#')
+        .expect("the ordinal follows the caret");
+    assert_eq!(&cells[hash_x..hash_x + 2], &['#', '1'], "the first member");
+    let style = |x: usize| {
+        let c = buf.cell((x as u16, y as u16)).unwrap();
+        (c.fg, c.modifier.contains(ratatui::style::Modifier::BOLD))
+    };
+    assert_eq!(
+        style(caret_x),
+        (theme::accent_color(), true),
+        "the caret is ACCENT + bold"
+    );
+    assert_eq!(
+        vec![style(hash_x), style(hash_x + 1)],
+        vec![(theme::text_faint_color(), false); 2],
+        "the ordinal keeps TEXT_FAINT without bold on the selected row"
+    );
+}
+
+// ── never-entered card shading ───────────────────────────────────────────────
+
+/// The cells inside the member card (right of the `││` pane separator) that
+/// carry `BG_HOVER`.
+fn card_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A card the user never opened shades no row: its cursor is a default, not
+/// a memory, so the blurred card stays untinted.
+#[test]
+fn a_never_entered_card_shades_no_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = two_member_chain_app();
+    let buf = chain_buffer(&app, 100, 30);
+    assert_eq!(
+        card_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered card shades nothing:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// Entering the card once earns its remembered-row tint: walking to the
+/// `credit gate` row and ascending keeps that row tinted whole, and nothing
+/// else.
+#[test]
+fn an_entered_card_keeps_the_walked_rows_tint_after_ascending() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.fallback_focus, FallbackFocus::Detail, "enter descends");
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(FALLBACK_ROWS[4], FallbackRow::CheckCreditCap);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain, "esc ascends");
+
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("credit gate"))
+        .unwrap_or_else(|| panic!("credit gate renders:\n{}", rows.join("\n")));
+    let tinted = card_tinted_cells(&buf);
+    assert!(!tinted.is_empty(), "the walked row is tinted");
+    assert!(
+        tinted.iter().all(|&(_, ty)| ty == y as u16),
+        "the tint covers the credit gate row whole, nothing else"
+    );
+}
+
+/// Moving the chain selector to another member makes that member's card a
+/// new subject: the previous member's tint does not return with it.
+#[test]
+fn moving_the_selector_to_another_member_clears_the_cards_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !card_tinted_cells(&chain_buffer(&app, 100, 30)).is_empty(),
+        "the tint shows before the move"
+    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.chain_cursor, 1, "the selector moved to b");
+    assert_eq!(
+        card_tinted_cells(&chain_buffer(&app, 100, 30)),
+        Vec::new(),
+        "member b's card shades nothing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.chain_cursor, 0, "the selector moved back to a");
+    assert_eq!(
+        card_tinted_cells(&chain_buffer(&app, 100, 30)),
+        Vec::new(),
+        "a's card is never-entered again"
+    );
+}
+
+/// A quarantined proxy member is sent to the login through its proxy, the one
+/// login clauth takes for it; the same member with no proxy claim keeps the
+/// re-login fix, byte for byte. The pill row and the fix row under it, as the
+/// member card draws them.
+#[test]
+fn a_quarantined_proxy_members_card_names_the_login_through_its_proxy() {
+    let card = |proxy: bool| {
+        let (mut px, readings) = profile("px", 95.0, 10.0, 3600);
+        px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        let (mut cfg, readings) = config_with(vec![(px, readings)], None, vec!["px"]);
+        cfg.state.auth_broken.push("px".into());
+        let (lines, _, _) = member_detail(
+            &cfg,
+            &ProfileName::from("px"),
+            MemberCard {
+                width: 200,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let at = text
+            .iter()
+            .position(|l| l.starts_with("└ "))
+            .unwrap_or_else(|| panic!("no fix line in {text:#?}"));
+        (text[at - 1].clone(), text[at].clone())
+    };
+    assert_eq!(
+        (card(true), card(false)),
+        (
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ log in again with clauth login px --proxy stub".to_string(),
+            ),
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ re-login with clauth login px".to_string(),
+            ),
+        ),
+        "((proxy member's pill row, fix row), (plain member's ...))"
     );
 }

@@ -12,45 +12,59 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus, escape_control,
-    pool_auth_label,
+    App, CodexRow, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus,
+    escape_control, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{
-    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset, relative_age,
+    NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset,
+    overdue_phrase, past_deadline_age, plan_end_text, reading_due_age, relative_age,
     reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
     FIX_ORG_REFUSED, QueueView, cells_window, draw_scrollbar, edit_slot_block, empty_state,
     follow_window, grapheme_cells_before, key_cell, master_detail, pill, place_caret,
-    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
+    rail_hint_lines, scroll_offset, section_box, section_box_verbatim, spans_cells, wrap_words,
 };
 use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
-    UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
+    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, PlanEnd, ProfileActivity, QueueSlot,
+    StreakCounts, UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
     kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
-    switch_grade_kick_lifts,
+    switch_grade_kick_lifts, usage_interval_ms,
 };
 
 const KEY_W: usize = 8;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
 /// The fix for a third-party profile no leg will ever fetch — the status
-/// block's `[ no key ]` hint and the empty body share these exact words.
-const KEYLESS_FIX: &str = "no api key set, add one on the setup tab";
+/// block's `[ no key ]` hint and the empty body share these exact words. A
+/// proxy account's key is the proxy's to mint (`proxy` names the service its
+/// record names), so its fix is the re-login.
+fn keyless_fix(profile_name: &str, proxy: Option<&crate::proxy::Service>) -> Cow<'static, str> {
+    match proxy {
+        Some(service) => Cow::Owned(format!(
+            "no api key set, run `{}`",
+            crate::actions::proxy_login_command(profile_name, service)
+        )),
+        None => Cow::Borrowed("no api key set, add one on the setup tab"),
+    }
+}
+
 /// The 5h row's value on a plan with no 5h limit: the plan's shape in place of
 /// a figure clauth never read.
 const NO_FIVE_HOUR_LIMIT: &str = "no limit on this plan";
 
-/// Config-derived diagnostic flags for the shown profile, gathered under the
-/// config guard in [`draw_usage_detail`] so [`status_lines`] stays lock-free.
-/// Each maps to a `└` fix hint (see [`diag_fix`]); render-only, no decision
-/// consumes them — the same invariant `fallback::blocked_reason` holds.
+/// Per-frame facts for the shown profile, gathered once under the guards in
+/// [`draw_usage_detail`] so [`status_lines`] stays lock-free: the
+/// config-derived diagnostic flags (each maps to a `└` fix hint, see
+/// [`diag_fix`]), plus the countdown blank and the poll interval the fetch
+/// row's overdue arm reads. Render-only, no decision consumes them — the same
+/// invariant `fallback::blocked_reason` holds.
 #[derive(Clone, Copy, Default)]
 struct DiagFlags {
     /// AUTH-1 quarantine (`AppConfig::is_auth_broken`).
@@ -74,6 +88,13 @@ struct DiagFlags {
     /// for a demand that may need credits, and nothing else on the card says
     /// so.
     credit_refused_at: Option<u64>,
+    /// The scheduler deliberately publishes no countdown for the shown leg
+    /// this tick ([`crate::usage::countdown_blanked`]): the fetch row keeps
+    /// its blank instead of dating the absent deadline as a stuck worker's.
+    blanked: bool,
+    /// The base poll interval the no-deadline overdue arm derives the
+    /// reading's due time from ([`crate::usage::usage_interval_ms`]).
+    interval_ms: u64,
 }
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
@@ -84,9 +105,10 @@ struct HeaderState {
     /// [`crate::usage::display_activity`]); a stood-down mirror reads `false`.
     fetches_here: bool,
     tick: u64,
-    /// Consecutive-failure counts for the shown profile (zeroed when absent).
-    /// The retry suffix names which retry the countdown leads to, so a deep slot
-    /// reads as stuck from the count alone, no judgment label.
+    /// The shown profile's poll-health record (defaulted when absent): the
+    /// consecutive-failure counts whose depth the retry suffix reads, and the
+    /// failed-fetch mark the skipped-spent guard consults. A deep slot reads as
+    /// stuck from the count alone, no judgment label.
     streaks: StreakCounts,
     /// The reading source behind `streaks.rate_limit` — OAuth-first, so the
     /// stuck hint names the endpoint that actually throttled, never the row's
@@ -252,13 +274,22 @@ fn draw_usage_detail(
         &third_party_streaks,
         &oauth_status_has,
     );
+    // The selected activity and the deliberately-blanked flag read off the
+    // same store, in one lock — the same pair the overview's timer slot reads.
+    let (activity, blanked) = app
+        .activity
+        .lock()
+        .ok()
+        .map(|activity| {
+            let key = crate::usage::FetchLeg::for_profile(profile).key(profile.name.clone());
+            (
+                crate::usage::selected_activity(&activity, profile),
+                crate::usage::countdown_blanked(&activity, &key),
+            )
+        })
+        .unwrap_or((ProfileActivity::Idle, false));
     let header = HeaderState {
-        activity: app
-            .activity
-            .lock()
-            .ok()
-            .map(|activity| crate::usage::selected_activity(&activity, profile))
-            .unwrap_or(ProfileActivity::Idle),
+        activity,
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
@@ -298,6 +329,8 @@ fn draw_usage_detail(
                     |n| crate::fallback::refuses_service_from_usage(n, &readings.usage),
                 ),
                 credit_refused_at: app.credit_refusals.get(&profile.name).map(|r| r.at_ms),
+                blanked,
+                interval_ms: cfg.state.refresh_interval_ms,
             }
         },
         queue_slot: QueueView::new(
@@ -452,17 +485,19 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .concat(),
         ));
     }
-    if let Some(resets) = row.resets.filter(|n| *n > 0) {
-        lines.push(Line::from(vec![
-            key_span("resets"),
-            Span::styled(format!("↺ {resets} banked"), theme::accent()),
-        ]));
-    }
+    lines.extend(codex_resets_block(
+        row,
+        app.codex_resets.get(row.name.as_str()),
+        inner.width,
+    ));
     lines.push(Line::from(vec![
         key_span("status"),
         match row.fetched_at {
-            Some(stamp) => Span::styled(format!("◌ read {}", relative_age(stamp)), theme::dim()),
-            None => Span::styled("◌ not read yet", theme::dim()),
+            Some(stamp) => Span::styled(
+                format!("{} read {}", theme::WAITING, relative_age(stamp)),
+                theme::dim(),
+            ),
+            None => Span::styled(format!("{} not read yet", theme::WAITING), theme::dim()),
         },
     ]));
     lines.push(Line::from(""));
@@ -484,9 +519,9 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// The Usage pool pane: `type`/`family`/`provider`/`plan`/`status`/`read`
-/// facts, then the 5h, 7d and `7d fable` bars from the pool account's own
-/// admin row. No notes, no speed/rate and no burn rate — the design's pool
-/// rows.
+/// facts and the `requests` row (see [`pool_requests_line`]), then the 5h, 7d
+/// and `7d fable` bars from the pool account's own admin row. No notes, no
+/// speed/rate and no burn rate — the design's pool rows.
 fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some((pi, ai)) = app.usage_pool_pair() else {
         return;
@@ -542,6 +577,9 @@ fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None => Span::styled("not read yet", theme::dim()),
         },
     ]));
+    if let Some(requests) = pool_requests_line(account, inner.width) {
+        lines.push(requests);
+    }
     lines.push(Line::from(""));
 
     let reset_fmt = ResetFmt::from_state(&app.config().state);
@@ -562,6 +600,49 @@ fn draw_pool_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.extend(render_stat_block(&stats, inner.width));
     }
     render_usage_lines(frame, inner, app, lines);
+}
+
+/// The pool pane's `requests` row off shunt's per-account counters: the
+/// attempted count, then `N failed` and `N cancelled` when above zero, then
+/// the mean latency as `N ms avg` rounded to the whole millisecond once shunt
+/// measured one; every figure grouped by thousands. No row for a shunt that
+/// sends no counters. Parts shed whole from the right until the row fits
+/// `inner_w`; the attempted count never sheds.
+fn pool_requests_line(
+    account: &crate::gateway_admin::PoolAccount,
+    inner_w: u16,
+) -> Option<Line<'static>> {
+    let count = |n: u64| crate::format::group_thousands(n as f64, 0);
+    let mut parts = vec![count(account.requests_attempted?)];
+    for (n, word) in [
+        (account.requests_failed, "failed"),
+        (account.requests_cancelled, "cancelled"),
+    ] {
+        if let Some(n) = n.filter(|n| *n > 0) {
+            parts.push(format!("{} {word}", count(n)));
+        }
+    }
+    // shunt times elapsed spans, so a negative or non-finite mean is no
+    // measurement; `-0.0` too, which would draw `-0`.
+    if let Some(ms) = account
+        .mean_latency_ms
+        .filter(|ms| ms.is_finite() && ms.is_sign_positive())
+    {
+        parts.push(format!(
+            "{} ms avg",
+            crate::format::group_thousands(ms.round(), 0)
+        ));
+    }
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+    let mut value = parts.join(" · ");
+    while parts.len() > 1 && Span::raw(value.as_str()).width() > value_width {
+        parts.pop();
+        value = parts.join(" · ");
+    }
+    Some(Line::from(vec![
+        key_span("requests"),
+        Span::styled(value, theme::accent()),
+    ]))
 }
 
 /// Render an assembled Usage detail body into `inner`, publishing the scroll
@@ -611,6 +692,16 @@ fn build_usage_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w, readings));
     lines.push(Line::from(""));
+    // The banked-reset row sits right under the plan row, ahead of the
+    // pricing and status rows: the account's resets read as part of its
+    // facts (the codex pane keeps the same row in its own place). The
+    // file's presence is the predicate, as it is on the Overview chip:
+    // `limit_resets.json` is written only under a profile with a claude OAuth
+    // pair (a hybrid with a pair included), so a pane without a reading
+    // draws no row.
+    if let Some(resets) = app.claude_resets.get(profile.name.as_str()) {
+        lines.splice(1..1, claude_resets_block(resets, inner_w));
+    }
     // The live speed/rate rows sit under the header, ahead of the usage bars:
     // they are the account's current figures, read off a fresh producer, and
     // render from the first frame.
@@ -650,7 +741,7 @@ fn build_usage_lines(
 
     let Some(usage) = readings.usage_of(&profile.name) else {
         lines.extend(oauth_empty_lines(
-            oauth_empty_msg_here(
+            &oauth_empty_msg_here(
                 profile,
                 readings.status_of(&profile.name),
                 app.fetch_lease.fetches_here(),
@@ -663,7 +754,7 @@ fn build_usage_lines(
     let mut stats = collect_stats(usage, reset_fmt);
     if stats.is_empty() {
         lines.extend(oauth_empty_lines(
-            oauth_empty_msg_here(
+            &oauth_empty_msg_here(
                 profile,
                 readings.status_of(&profile.name),
                 app.fetch_lease.fetches_here(),
@@ -725,10 +816,169 @@ fn build_usage_lines(
     with_notes(lines)
 }
 
+/// A claude reading's `resets` row is aged once it passes this: the hourly
+/// read missed a slot.
+const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
+
+/// The claude pane's `resets` block off the account's limit-reset reading
+/// (the scheduler's hourly side read or the post-spend refresh): the count
+/// line, `N available`, or `N/M available` against a banked total the count
+/// falls short of, `· cooldown (<dur>)` while the block's cooldown holds a
+/// reset back, and the reading's age once it passes 75 min; then one rail
+/// entry per grant still holding a reset (a used grant names nothing to
+/// spend): its label, then `resets <windows> · valid until <day>`, the
+/// grant's STATE word on the tail once it is not `ready` (a cooling grant's
+/// word sits on the count line instead). A zero count draws nothing unless
+/// the reading carries a banked total above zero.
+fn claude_resets_block(resets: &crate::usage::LimitResets, inner_w: u16) -> Vec<Line<'static>> {
+    use crate::usage::claude_reset::{available_of, cooldown_left, grant_state, windows_cell};
+    let banked = resets.banked;
+    if resets.usable == 0 && banked.unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let mut parts = vec![available_of(resets.usable, banked.unwrap_or(resets.usable))];
+    let held: Vec<&crate::usage::claude_reset::Grant> = resets
+        .grants
+        .iter()
+        .filter(|g| g.resets_left() > 0)
+        .collect();
+    let cooldown_part = cooldown_left(resets.cooldown_until.as_deref(), now_epoch_secs())
+        .filter(|_| held.iter().any(|g| !g.is_usable_now()))
+        .map(|left| {
+            format!(
+                "cooldown ({})",
+                crate::usage::humanize_duration(left as i64)
+            )
+        });
+    parts.extend(cooldown_part.clone());
+    parts.extend(stale_read(resets.fetched_at));
+    let entries = held
+        .iter()
+        .map(|g| {
+            let state = grant_state(
+                g,
+                resets.cooldown_until.as_deref(),
+                resets.at_limit,
+                now_epoch_secs(),
+            );
+            let detail = [
+                Some(windows_cell(g.clears()))
+                    .filter(|w| !w.is_empty())
+                    .map(|w| format!("resets {w}")),
+                g.ends_at().and_then(valid_until_day),
+                // The STATE word rides the tail of every grant a spend would
+                // not send now, so the rail never offers it as if spendable;
+                // a cooling grant's word is already on the count line.
+                (state != "ready" && !(state.starts_with("cooldown ") && cooldown_part.is_some()))
+                    .then_some(state),
+            ];
+            (g.label(), detail.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
+    resets_block(&parts.join(" · "), entries, inner_w)
+}
+
+/// The codex pane's `resets` block. Off the account's last reset-list read
+/// when it names a credit that reads available: the count of those, the
+/// read's age past the stale cut, and one rail entry per such credit (its
+/// title, then `resets <what> · valid until <day>` or `no expiry`). Else the
+/// usage poll's count alone, the only figure its body carries.
+fn codex_resets_block(
+    row: &CodexRow,
+    reset_list: Option<&crate::usage::LimitResets>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let listed = reset_list.map(|reading| {
+        let held: Vec<_> = reading
+            .credits
+            .iter()
+            .filter(|c| c.is_available())
+            .collect();
+        (reading, held)
+    });
+    if let Some((reading, held)) = listed.filter(|(_, held)| !held.is_empty()) {
+        let mut parts = vec![format!("{} available", held.len())];
+        parts.extend(stale_read(reading.fetched_at));
+        let entries = held
+            .iter()
+            .map(|c| {
+                let valid = match c.expires_at.as_deref() {
+                    Some(raw) if !crate::format::shows_nothing(raw) => valid_until_day(raw),
+                    Some(_) | None => Some("no expiry".to_string()),
+                };
+                let detail = std::iter::once(format!("resets {}", c.resets()))
+                    .chain(valid)
+                    .collect();
+                (c.label(), detail)
+            })
+            .collect();
+        return resets_block(&parts.join(" · "), entries, inner_w);
+    }
+    match row.resets.filter(|n| *n > 0) {
+        Some(n) => resets_block(&format!("{n} available"), Vec::new(), inner_w),
+        None => Vec::new(),
+    }
+}
+
+/// `read <age>` once a resets reading passes the 75-min stale cut.
+fn stale_read(fetched_at: Option<u64>) -> Option<String> {
+    fetched_at
+        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
+        .map(|stamp| format!("read {}", relative_age(stamp)))
+}
+
+/// `valid until <day>` off a reset's end: the local month and day (`Dec 10`),
+/// the year added when it is not this one (`Mar 9, 2027`). `None` for a stamp
+/// clauth cannot date.
+fn valid_until_day(raw: &str) -> Option<String> {
+    use chrono::Datelike as _;
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let day = if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d")
+    } else {
+        local.format("%b %-d, %Y")
+    };
+    Some(format!("valid until {day}"))
+}
+
+/// The `resets` block both panes draw: the count line, its value cut with `…`
+/// at the pane's edge, then one entry per reset on the stacked-hints rail at
+/// col 0 — the label's rows, then the detail parts joined by ` · ` — the
+/// label and detail wrapping between words, never cut.
+fn resets_block(
+    count: &str,
+    entries: Vec<(String, Vec<String>)>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+    let mut lines = vec![Line::from(vec![
+        key_span("resets"),
+        Span::styled(truncate(count, value_width), theme::accent()),
+    ])];
+    let width = super::panes::rail_text_width(inner_w as usize);
+    let last = entries.len().saturating_sub(1);
+    for (i, (label, detail)) in entries.into_iter().enumerate() {
+        // Server text: wrapped plain, so a backtick in a label never reads as
+        // a typed command.
+        let mut rows = prose::plain_wrap(&label, width);
+        if !detail.is_empty() {
+            rows.extend(prose::plain_wrap(&detail.join(" · "), width));
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| vec![Span::styled(row, theme::faint())])
+            .collect();
+        lines.extend(super::panes::rail_lines(rows, i < last));
+    }
+    lines
+}
+
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
-/// computing the column widths (`max_trailing`/`max_rate_w`/`max_amount_w`) once
-/// so the `%` column lines up across rows. A blank line separates rows. Used by
-/// both the OAuth window path and the third-party bars path.
+/// computing the column widths (`max_trailing`/`max_amount_w`) once so the `%`
+/// column lines up across rows. A blank line separates rows. Used by both the
+/// OAuth window path and the third-party bars path.
 fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let max_trailing = stats
         .iter()
@@ -738,14 +988,9 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let bar_width = bar_width_for(inner_w, max_trailing);
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-    let max_rate_w = stats
-        .iter()
-        .map(|s| s.rate_section_width())
-        .max()
-        .unwrap_or(0);
     let max_amount_w = stats
         .iter()
-        .map(|s| s.amount.chars().count())
+        .map(|s| Span::raw(&s.amount).width())
         .max()
         .unwrap_or(0);
 
@@ -754,7 +999,7 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width, pct_col, max_rate_w, max_amount_w));
+        lines.extend(stat.render(bar_width, pct_col, max_amount_w));
     }
     lines
 }
@@ -801,37 +1046,22 @@ pub(super) fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64>
     (secs > 0).then_some(secs)
 }
 
-fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
-    eta_left_secs(rate, pct, rate_unit).map(crate::usage::humanize_duration)
-}
-
 impl Stat {
-    /// Width of the ` · rate` + optional ` · X left` section, for alignment.
-    fn rate_section_width(&self) -> usize {
-        let Some(rate) = self.burn_rate.filter(|r| *r > 0.0) else {
-            return 0;
-        };
-        let mut w =
-            " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
-        if let Some(pct) = self.pct
-            && let Some(dur) = eta_left(rate, pct, self.rate_unit)
-        {
-            w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
-        }
-        w
+    /// The `{dur} left` clause, drawn only while the window runs dry before it
+    /// resets: past the reset the figure never comes true, and at a low pace it
+    /// can spell a duration longer than the row.
+    fn eta_left_text(&self, rate: f64) -> Option<String> {
+        let eta_secs = eta_left_secs(rate, self.pct?, self.rate_unit)?;
+        self.reset_secs
+            .is_some_and(|reset| eta_secs < reset)
+            .then(|| format!("{} left", humanize_duration(eta_secs)))
     }
 
     /// Eyebrow (label · rate · `used / total` · %) then bar with trailing reset
     /// suffix. `bar_width` shared across rows; `pct_col` = far content edge for %
-    /// alignment. `max_rate_w` / `max_amount_w` keep the rate + amount columns
-    /// fixed across all rows so the `%` column never shifts.
-    fn render(
-        &self,
-        bar_width: usize,
-        pct_col: usize,
-        max_rate_w: usize,
-        max_amount_w: usize,
-    ) -> Vec<Line<'static>> {
+    /// alignment; `max_amount_w` keeps the amount column fixed across all rows
+    /// so the `%` column never shifts.
+    fn render(&self, bar_width: usize, pct_col: usize, max_amount_w: usize) -> Vec<Line<'static>> {
         if let Some(note) = self.note {
             return vec![Line::from(vec![
                 Span::styled(self.label.clone(), theme::faint()),
@@ -854,11 +1084,93 @@ impl Stat {
         } else {
             0
         };
+        let pct_cells = Span::raw(pct_str.as_ref()).width();
+        let amount_cells = Span::raw(&self.amount).width();
+        // Two cells between the label and the first figure after it, so a label
+        // ending in a figure never runs into it (`20M95%`, `1001234 / 2000`).
+        // The amount column already supplies them: a row with no amount has its
+        // whole column blank before the `%`, and a shorter amount sits behind its
+        // own blank padding. Only a row filling the column needs a gap of its own.
+        let pct_gap = if max_amount_w == 0 {
+            2
+        } else if self.amount.is_empty() {
+            0
+        } else {
+            2usize.saturating_sub(max_amount_w.saturating_sub(amount_cells))
+        };
+        // The rate section and its `{dur} left` clause, built once per row: the
+        // widths, the cut decision and the spans all read the same strings.
+        let rate = self.burn_rate.filter(|r| *r > 0.0);
+        let rate_text = rate.map(|r| format!("{r:.1} %/{}", self.rate_unit));
+        let eta_text = rate.and_then(|r| self.eta_left_text(r));
+        let rate_only_w = rate_text
+            .as_ref()
+            .map_or(0, |t| " · ".chars().count() + grapheme_cells(t));
+        let eta_cells = eta_text.as_ref().map_or(0, |t| grapheme_cells(t));
+        let eta_w = if eta_text.is_some() {
+            " · ".chars().count() + eta_cells
+        } else {
+            0
+        };
+        let rate_w = rate_only_w + eta_w;
+        // The room the label has on its own line, beside this row's own rate
+        // section: another row's wider one leaves blank cells here, never room
+        // to borrow.
+        let label_room = pct_col.saturating_sub(rate_w);
+        // The row's whole content beside its `%`.
+        let content_w = grapheme_cells(&self.label) + rate_w + amount_section_w + pct_cells;
+        // On the `%` line a row without an amount leaves its amount column blank,
+        // so a moved estimate needs only the two-cell gap before the `%`.
+        let (dropped_amount_w, dropped_gap) = if self.amount.is_empty() {
+            (0, 2)
+        } else {
+            (amount_section_w, pct_gap)
+        };
+        // A row whose whole content cannot sit beside its `%` moves the estimate
+        // onto the `%`'s line rather than cut the name: the estimate is the part
+        // that travels, so the name stays whole. That line only takes it when the
+        // estimate, amount and `%` fit there together.
+        let moved_estimate = eta_text.is_some()
+            && content_w + pct_gap > pct_col
+            && eta_cells + dropped_gap + dropped_amount_w + pct_cells <= pct_col;
+        // A label that fits its own line stays whole and the `%` drops a line;
+        // a wider one is cut. With the estimate moved, the first line carries
+        // the label and the rate alone, so the cut only bites once those two no
+        // longer fit. A rate section that alone fills the row leaves no room to
+        // cut to, and that eyebrow still overruns.
+        let label = if moved_estimate {
+            let room = pct_col.saturating_sub(rate_only_w);
+            if room > 0 && grapheme_cells(&self.label) > room {
+                truncate(&self.label, room)
+            } else {
+                self.label.clone()
+            }
+        } else if label_room > 0 && grapheme_cells(&self.label) > label_room {
+            // A bar label carrying its own figures (`… | 205M left of 300M`) is
+            // cut so the granted total cannot reach the pane edge as a smaller
+            // number: to `full_room` when that leaves a name, and otherwise to
+            // its own line's room, since under three cells the cut would leave
+            // dots where the name was. The cut ends on the house `…`, never
+            // flushed against the figure.
+            let full_room = label_room
+                .saturating_sub(amount_section_w)
+                .saturating_sub(pct_gap)
+                .saturating_sub(pct_cells);
+            let cut_room = if full_room >= 3 {
+                full_room
+            } else {
+                label_room
+            };
+            truncate(&self.label, cut_room)
+        } else {
+            self.label.clone()
+        };
+        let label_cells = grapheme_cells(&label);
         let header_pad = pct_col
-            .saturating_sub(self.label.chars().count())
-            .saturating_sub(max_rate_w)
+            .saturating_sub(label_cells)
+            .saturating_sub(rate_w)
             .saturating_sub(amount_section_w)
-            .saturating_sub(pct_str.chars().count());
+            .saturating_sub(pct_cells);
 
         let filled = self.pct.map_or(0, |p| {
             (((p / 100.0) * bar_width as f64).round() as usize).min(bar_width)
@@ -901,81 +1213,63 @@ impl Stat {
             v
         };
 
-        let mut label_spans = vec![Span::styled(self.label.clone(), theme::label())];
-        if let Some(rate) = self.burn_rate
-            && rate > 0.0
-        {
+        let (eyebrow_eta, moved_eta) = if moved_estimate {
+            (None, eta_text)
+        } else {
+            (eta_text, None)
+        };
+        let mut label_spans = vec![Span::styled(label, theme::label())];
+        if let (Some(rate), Some(text)) = (rate, rate_text) {
             let rate_color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
             label_spans.push(Span::styled(" · ", theme::dim()));
-            let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
-            label_spans.push(Span::styled(rate_str.clone(), rate_color));
-
-            if let Some(pct) = self.pct
-                && let Some(eta_secs) = eta_left_secs(rate, pct, self.rate_unit)
-            {
-                let dur = crate::usage::humanize_duration(eta_secs);
-                // Warn when the window hits 100% before it resets: you run dry
-                // before the limit refreshes. Faint when the reset lands first.
-                let runs_dry_first = self.reset_secs.is_some_and(|r| eta_secs < r);
-                let style = if runs_dry_first {
-                    theme::warning()
-                } else {
-                    theme::faint()
-                };
-                label_spans.push(Span::styled(" · ", theme::faint()));
-                label_spans.push(Span::styled(format!("{dur} left"), style));
-            }
-
-            let my_rate_w = self.rate_section_width();
-            let extra = max_rate_w.saturating_sub(my_rate_w);
-            if extra > 0 {
-                label_spans.push(Span::raw(" ".repeat(extra)));
-            }
-        } else {
-            label_spans.push(Span::raw(" ".repeat(max_rate_w)));
+            label_spans.push(Span::styled(text, rate_color));
+        }
+        if let Some(eta) = eyebrow_eta {
+            label_spans.push(Span::styled(" · ", theme::faint()));
+            label_spans.push(Span::styled(eta, theme::warning()));
         }
 
-        let pct_cells = Span::raw(pct_str.as_ref()).width();
-        let fits =
-            Span::raw(&self.label).width() + max_rate_w + amount_section_w + pct_cells <= pct_col;
+        let pct_span = Span::styled(pct_str, pct_style);
+        let mut amount_spans: Vec<Span<'static>> = Vec::new();
+        if max_amount_w > 0 {
+            // Right-align the amount in its fixed column, then a 2-space gap.
+            amount_spans.push(Span::raw(
+                " ".repeat(max_amount_w.saturating_sub(amount_cells)),
+            ));
+            if !self.amount.is_empty() {
+                amount_spans.push(Span::styled(self.amount.clone(), theme::faint()));
+            }
+            amount_spans.push(Span::raw("  "));
+        }
+
+        let fits = label_cells + rate_w + amount_section_w + pct_gap + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
         if fits {
-            out.push(Line::from({
-                let mut spans = label_spans;
-                spans.push(Span::raw(" ".repeat(header_pad)));
-                if max_amount_w > 0 {
-                    // Right-align the amount in its fixed column, then a 2-space gap.
-                    let pad = max_amount_w.saturating_sub(self.amount.chars().count());
-                    spans.push(Span::raw(" ".repeat(pad)));
-                    if !self.amount.is_empty() {
-                        spans.push(Span::styled(self.amount.clone(), theme::faint()));
-                    }
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(Span::styled(pct_str, pct_style));
-                spans
-            }));
+            let mut spans = label_spans;
+            spans.push(Span::raw(" ".repeat(header_pad)));
+            spans.extend(amount_spans);
+            spans.push(pct_span);
+            out.push(Line::from(spans));
         } else {
             // The eyebrow no longer holds the `%` figure: it drops to its own
             // line, right-aligned to the far edge, carrying the amount with it
-            // so no figure vanishes — the pair never hard-wraps apart.
+            // so no figure vanishes — the pair never hard-wraps apart. A moved
+            // estimate leads that line, in the colour that marks the run-dry.
             out.push(Line::from(label_spans));
             let mut dropped = Vec::new();
-            if max_amount_w > 0 {
-                let amount_cells = Span::raw(&self.amount).width();
-                let right = max_amount_w + 2 + pct_cells;
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(right))));
-                dropped.push(Span::raw(
-                    " ".repeat(max_amount_w.saturating_sub(amount_cells)),
-                ));
-                if !self.amount.is_empty() {
-                    dropped.push(Span::styled(self.amount.clone(), theme::faint()));
-                }
-                dropped.push(Span::raw("  "));
+            let lead_w = if let Some(eta) = moved_eta {
+                dropped.push(Span::styled(eta, theme::warning()));
+                eta_cells
             } else {
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(pct_cells))));
+                0
+            };
+            dropped.push(Span::raw(" ".repeat(
+                pct_col.saturating_sub(lead_w + dropped_amount_w + pct_cells),
+            )));
+            if !self.amount.is_empty() {
+                dropped.extend(amount_spans);
             }
-            dropped.push(Span::styled(pct_str, pct_style));
+            dropped.push(pct_span);
             out.push(Line::from(dropped));
         }
         if self.value.is_none() {
@@ -1345,24 +1639,36 @@ fn header_lines(
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
-    // as a real plan on the one row an operator checks their plan from.
+    // as a real plan on the one row a user checks their plan from.
     let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
     };
     let plan_key = key_span("plan");
-    let left_w = plan_key.width() + plan_w;
+    let mut left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
-    // A plan with no 5h limit has no window the kick could open, so the
-    // countdown would name a kick that never fires.
-    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
-    if profile.auto_start && !no_five_hour_limit {
-        plan_spans.extend(kick_spans(
-            &kick_text(profile, header, readings),
-            left_w,
-            inner_w as usize,
-        ));
+    let row_w = usize::from(inner_w);
+    // A plan with no 5h limit has no window the kick could open, and no kick
+    // leg spends a chain clauth never spends, so either way the countdown
+    // would name a kick that never fires.
+    let kick = (profile.has_effective_auto_start()
+        && !readings.no_five_hour_limit(profile.name.as_str()))
+    .then(|| kick_text(profile, header, readings));
+    // When the plan ends or renews, beside its name in the room the countdown
+    // leaves: the countdown and its gap stay reserved, so the date drops
+    // before the countdown shortens.
+    let kick_room = kick.as_deref().map_or(0, |k| grapheme_cells(k) + KICK_GAP);
+    if let Some((text, style)) = plan_end_tail(profile, readings) {
+        let tail = format!(" · {text}");
+        let tail_w = grapheme_cells(&tail);
+        if left_w + tail_w + kick_room <= row_w {
+            left_w += tail_w;
+            plan_spans.push(Span::styled(tail, style));
+        }
+    }
+    if let Some(kick) = kick {
+        plan_spans.extend(kick_spans(&kick, left_w, row_w));
     }
     let mut lines = vec![Line::from(plan_spans)];
     if let Some(peak) = header.peak {
@@ -1370,6 +1676,22 @@ fn header_lines(
     }
     lines.extend(status_lines(profile, header, inner_w, readings));
     lines
+}
+
+/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: a plan
+/// marked ending in the warning color, a renewal faint. `None` when no date
+/// applies, a renewal included on a plan whose reading says it cannot serve
+/// (the status the Overview's `⊖` marks).
+fn plan_end_tail(profile: &Profile, readings: &ReadingsSnapshot) -> Option<(String, Style)> {
+    let today = crate::format::local_day(now_epoch_secs())?;
+    let refuses_service =
+        crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name));
+    let end = profile.plan_dates().end(today, refuses_service)?;
+    let style = match end {
+        PlanEnd::Renews(_) => theme::faint(),
+        PlanEnd::Ends(_) => theme::warning(),
+    };
+    Some((plan_end_text(end, today), style))
 }
 
 /// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure
@@ -1534,14 +1856,15 @@ fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into
 /// `auto_start` except one whose plan has no 5h limit (there is no window the
-/// kick could open), queue toggle on or off. The value is THIS account's next
-/// kick: with a queue slot, the LATER of the queue's next-opening estimate
-/// and the account's own 5h window reset — the kick fires once the queue
-/// gate has cleared AND this window has lapsed, so either clock can delay
-/// it, and the gate alone would name an instant no kick fires at. Without a
-/// slot (toggle off, or the profile is excluded from the queue) it is the
-/// account's own reset alone — the lapsed-leg kick fires the moment that
-/// reset passes.
+/// kick could open) or whose chain clauth never spends
+/// ([`Profile::spends_oauth_chain`]), queue toggle on or off. The value is
+/// THIS account's next kick: with a queue slot, the LATER of the queue's
+/// next-opening estimate and the account's own 5h window reset — the kick
+/// fires once the queue gate has cleared AND this window has lapsed, so
+/// either clock can delay it, and the gate alone would name an instant no
+/// kick fires at. Without a slot (toggle off, or the profile is excluded from
+/// the queue) it is the account's own reset alone — the lapsed-leg kick fires
+/// the moment that reset passes.
 fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapshot) -> String {
     let now = now_epoch_secs();
     let own_reset_in = readings
@@ -1563,20 +1886,23 @@ fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapsho
     }
 }
 
+/// The house minimum gap, in cells, between the `plan` row's left content and
+/// its flush-right countdown.
+const KICK_GAP: usize = 3;
+
 /// Spans putting `text` flush against the pane's right edge on the `plan` row,
-/// keeping the house 3-cell minimum gap from the row's left content. Truncates
-/// with `…` when the row can't hold both; drops the kick when not even a
-/// countdown hint fits.
+/// keeping the [`KICK_GAP`] from the row's left content. Truncates with `…`
+/// when the row can't hold both; drops the kick when not even a countdown hint
+/// fits.
 fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
-    let avail = inner_w.saturating_sub(left_w);
-    if avail < 3 {
+    let Some(room) = inner_w.saturating_sub(left_w).checked_sub(KICK_GAP) else {
         return Vec::new();
-    }
-    let text = truncate(text, avail - 3);
+    };
+    let text = truncate(text, room);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - Span::raw(&text).width();
+    let pad = room.saturating_sub(Span::raw(&text).width()) + KICK_GAP;
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),
@@ -1678,7 +2004,12 @@ fn status_lines(
                 DIAG_AUTH_BROKEN.to_string(),
                 theme::danger().add_modifier(Modifier::BOLD),
             ),
-            hint: Some(diag_fix(UsageDiag::AuthBroken, &profile.name)),
+            hint: Some(diag_fix(
+                UsageDiag::AuthBroken {
+                    proxy: profile.proxy.as_ref().map(|record| record.service.clone()),
+                },
+                &profile.name,
+            )),
         });
         return render_status_rows(rows, w);
     }
@@ -1776,8 +2107,8 @@ fn status_lines(
     // window: the profile is due and the next tick on this instance fetches it,
     // so the fetch row reads `queued` like a marked one rather than a countdown
     // frozen at `0s`. Only the instance that fetches draws it — a stood-down
-    // mirror has no fan-out of its own, and `display_activity` leaves its row a
-    // countdown.
+    // mirror has no fan-out of its own, and `display_activity` leaves its row
+    // idle, so a past deadline there reads overdue below.
     let activity = crate::usage::display_activity(
         header.activity,
         header.next_refresh_ms,
@@ -1795,14 +2126,60 @@ fn status_lines(
     }
 
     let countdown = header.next_refresh_ms.map(|next| {
-        let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
+        let secs = next.saturating_sub(now_ms()) / 1000;
         format!("{secs}s")
     });
+    // No scheduled refresh and a window maxed: the poll skips this account
+    // until its window resets, so no fetch is lined up to serve it.
+    let skipped_spent = countdown.is_none()
+        && readings
+            .usage_of(&profile.name)
+            .and_then(|u| crate::usage::spent_resume_in_secs(u, now))
+            .is_some();
+    // The due time derives off the full clock (an undatable OAuth body's
+    // mtime fallback included); the read age dates off the reading's own
+    // stamp only, so an undatable body shows its overdue form undated.
+    let due_clock = readings.clock_of(&profile.name);
+    let reading_clock = readings.read_clock_of(&profile.name);
+    // An overdue refresh reads how far past due it is and dates the reading,
+    // never `refresh in 0s` (the instance that fetches returned above as
+    // `queued`). Two shapes, the overview's own arms: a published deadline
+    // past (a stood-down mirror's stamp is its own cache estimate, nothing
+    // here will fetch it), or no deadline at all with no deliberate blank —
+    // a stuck worker holds the leg, so the reading dates its own refresh
+    // past `clock + interval`. A deliberately blanked leg (a spent skip, a
+    // suppressed credential, a selected leg on no work list) keeps its blank.
+    let overdue_age = match header.next_refresh_ms {
+        Some(next) => past_deadline_age(header.fetches_here, next),
+        None if !header.diag.blanked => reading_due_age(
+            due_clock,
+            usage_interval_ms(profile, header.diag.interval_ms),
+        ),
+        None => None,
+    };
 
     // 5. The fetch row, always last. Its own fix hint (if any) rides beneath it,
     //    connected into the same rail as the rows above once 2+ hints stack.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut fetch_hint: Option<UsageDiag> = None;
+    // The overdue suffix's undated twin, kept beside the dated one so a pane
+    // too narrow for it can drop the ` · read Nm ago` half whole (below).
+    let mut suffix_undated: Option<Span<'static>> = None;
+    // The overdue replacement for an arm's countdown suffix, its leading pad
+    // and verb (with the retry ordinal) kept from the countdown form; the
+    // twin is `None` when the row is already undated (no reading clock).
+    let overdue_suffix =
+        |verb: &str, ordinal: Option<&str>| -> (Span<'static>, Option<Span<'static>>) {
+            let head = ordinal.map_or_else(|| verb.to_string(), |n| format!("{n} {verb}"));
+            let dated = Span::styled(
+                format!("  {}", overdue_phrase(&head, reading_clock)),
+                theme::faint(),
+            );
+            let undated = reading_clock.is_some().then(|| {
+                Span::styled(format!("  {}", overdue_phrase(&head, None)), theme::faint())
+            });
+            (dated, undated)
+        };
     match readings.status_of(&profile.name) {
         _ if (profile.base_url.is_some() || profile.provider.is_some())
             && !crate::usage::third_party_credentialed(profile)
@@ -1821,31 +2198,40 @@ fn status_lines(
             // that account has no key to miss. Figures shown are last-known,
             // and the stale cue can coexist with this pill: age is a fact
             // whether or not a fetch is scheduled.
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(
-                    "no key".to_string(),
-                    theme::warning().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ]", theme::dim()),
-            ]);
+            spans.extend(pill(
+                "no key".to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ));
             // The hint rides only when figures render — without them the body
             // already names the fix, and one pane must not say it twice.
             if readings.stats_of(&profile.name).is_some() {
-                fetch_hint = Some(UsageDiag::NoKey);
+                fetch_hint = Some(UsageDiag::NoKey {
+                    proxy: profile.proxy.as_ref().map(|record| record.service.clone()),
+                });
             }
         }
         Some(FetchStatus::Failed) => {
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled("failed", theme::danger().add_modifier(Modifier::BOLD)),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
+            spans.extend(pill(
+                "failed".to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ));
+            if overdue_age.is_some() {
+                let (suffix, undated) = overdue_suffix("retry", None);
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 spans.push(Span::styled(format!("  retry in {c}"), theme::faint()));
             }
         }
-        Some(FetchStatus::Cached) => {
+        // A skipped spent account's `Cached` falls through to the spent pill
+        // below only while nothing failed: a seeded reading (a stood-down
+        // mirror, the boot seed) carries no refresh streak and no failed-fetch
+        // mark, but a failed attempt sets the mark and stays visible here.
+        Some(FetchStatus::Cached)
+            if header.streaks.refresh_fail > 0
+                || header.streaks.last_fetch_failed
+                || !skipped_spent =>
+        {
             // A run of failed token refreshes lands here — we ARE serving
             // last-known numbers, so `Cached` is honest — but "cached" alone
             // names the symptom and not the cause, and nothing else on the row
@@ -1860,12 +2246,16 @@ fn status_lines(
             } else {
                 theme::warning().add_modifier(Modifier::BOLD)
             };
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(label, style),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
+            spans.extend(pill(label.to_string(), style));
+            if overdue_age.is_some() {
+                let (suffix, undated) = if failing {
+                    overdue_suffix("retry", Some(&ordinal(header.streaks.refresh_fail)))
+                } else {
+                    overdue_suffix("refresh", None)
+                };
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 // The countdown leads to the next REFRESH attempt while failing,
                 // not to a plain usage poll, so it reads as a retry ordinal —
                 // same shape the throttled row uses.
@@ -1885,15 +2275,22 @@ fn status_lines(
             });
         }
         Some(FetchStatus::RateLimited) => {
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled("rate limited", streak_style(header.streaks.rate_limit)),
-                Span::styled(" ]", theme::dim()),
-            ]);
-            if let Some(c) = countdown {
-                // The retry ordinal makes slot depth visible — a high count
-                // means the throttle never drained (#40's distrust boundary
-                // sits past the 6th) — without a judgment label.
+            spans.extend(pill(
+                "rate limited".to_string(),
+                streak_style(header.streaks.rate_limit),
+            ));
+            // The retry ordinal makes slot depth visible — a high count
+            // means the throttle never drained (#40's distrust boundary
+            // sits past the 6th) — without a judgment label.
+            if overdue_age.is_some() {
+                let (suffix, undated) = if header.streaks.rate_limit > 0 {
+                    overdue_suffix("retry", Some(&ordinal(header.streaks.rate_limit)))
+                } else {
+                    overdue_suffix("retry", None)
+                };
+                spans.push(suffix);
+                suffix_undated = undated;
+            } else if let Some(c) = countdown {
                 let suffix = if header.streaks.rate_limit > 0 {
                     format!("  {} retry in {c}", ordinal(header.streaks.rate_limit))
                 } else {
@@ -1916,60 +2313,58 @@ fn status_lines(
             // next attempt to count down to. Only a re-login (or a manual
             // refresh, which retries once) moves this.
             let label = crate::format::auth_expired_label(profile);
-            spans.extend([
-                Span::styled("[ ", theme::dim()),
-                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
-                Span::styled(" ]", theme::dim()),
-            ]);
+            spans.extend(pill(
+                label.to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ));
             if crate::usage::dead_login_is_setup_token(profile) {
                 fetch_hint = Some(UsageDiag::SetupTokenRefused);
             }
         }
-        _ => match countdown {
+        _ => match (overdue_age, countdown) {
+            // The stood-down mirror's past deadline: nothing is queued, the
+            // refresh is past due, and the reading's own age rides the dot.
+            (Some(_), _) => {
+                let dot = Span::styled(format!("{} ", theme::WAITING), theme::accent());
+                let phrase = Span::styled(overdue_phrase("refresh", reading_clock), theme::dim());
+                suffix_undated = reading_clock
+                    .is_some()
+                    .then(|| Span::styled(overdue_phrase("refresh", None), theme::dim()));
+                spans.extend([dot, phrase]);
+            }
             // A scheduled refresh is work lined up — the `queued` dot (`◌` in
             // ACCENT), not a spinner: nothing is running yet.
-            Some(c) => spans.extend([
-                Span::styled("◌ ", theme::accent()),
+            (None, Some(c)) => spans.extend([
+                Span::styled(format!("{} ", theme::WAITING), theme::accent()),
                 Span::styled(format!("refresh in {c}"), theme::dim()),
             ]),
-            None => {
-                // No scheduled refresh means `refresh_spent_accounts` is OFF and
-                // this account is spent — skipped until its window resets. Render
-                // it as a status pill like the fetch states above so the blank
-                // overview timer reads as intent; the binding reset is already on
-                // the maxed window's own bar line, so the pill stays bare. A
-                // genuinely quiet account with no maxed window falls through to
-                // "up to date".
-                let resumes = readings
-                    .usage_of(&profile.name)
-                    .and_then(|u| crate::usage::spent_resume_in_secs(u, now));
-                match resumes {
-                    Some(_) => {
-                        spans.extend([
-                            Span::styled("[ ", theme::dim()),
-                            Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
-                            Span::styled(" ]", theme::dim()),
-                        ]);
-                        // Only the weekly cap earns the teach — the domain fact
-                        // that a live-looking 5h window can't serve while the week
-                        // is spent. A 5h-only spend is self-evident from the reset.
-                        if header.diag.weekly_hard {
-                            let monthly = readings
-                                .usage_of(&profile.name)
-                                .and_then(|u| u.long_window())
-                                .is_some_and(|(label, _)| label == crate::usage::LABEL_30D);
-                            fetch_hint = Some(UsageDiag::WeeklyHard { monthly });
-                        }
-                    }
-                    // Nothing pending and nothing maxed — the `idle` dot, which
-                    // differs from `queued` above by color alone, so the label
-                    // carries the meaning on a monochrome read.
-                    None => spans.extend([
-                        Span::styled("◌ ", theme::dim()),
-                        Span::styled("up to date", theme::dim()),
-                    ]),
+            // A skipped spent account renders as a status pill like the fetch
+            // states above so the blank overview timer reads as intent; the
+            // binding reset is already on the maxed window's own bar line, so
+            // the pill stays bare.
+            (None, None) if skipped_spent => {
+                spans.extend(pill(
+                    "spent".to_string(),
+                    theme::warning().add_modifier(Modifier::BOLD),
+                ));
+                // Only the weekly cap earns the teach — the domain fact that a
+                // live-looking 5h window can't serve while the week is spent.
+                // A 5h-only spend is self-evident from the reset.
+                if header.diag.weekly_hard {
+                    let monthly = readings
+                        .usage_of(&profile.name)
+                        .and_then(|u| u.long_window())
+                        .is_some_and(|(label, _)| label == crate::usage::LABEL_30D);
+                    fetch_hint = Some(UsageDiag::WeeklyHard { monthly });
                 }
             }
+            // Nothing pending and nothing maxed — the `idle` dot, which differs
+            // from `queued` above by color alone, so the label carries the
+            // meaning on a monochrome read.
+            (None, None) => spans.extend([
+                Span::styled(format!("{} ", theme::WAITING), theme::dim()),
+                Span::styled("up to date", theme::dim()),
+            ]),
         },
     }
     // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
@@ -1988,6 +2383,18 @@ fn status_lines(
         merged.push(Span::raw(" "));
         merged.extend(spans);
         spans = merged;
+    }
+    // The overdue suffix is 13-17 cells longer than the countdown it
+    // replaced: on a pane it does not fit, the ` · read Nm ago` half drops
+    // whole first — the header gauge draws its age only in the cells the
+    // drawn row leaves, so there it never pushes anything else out — then the
+    // pane's own cut applies: a figure is whole or dropped whole, never cut
+    // mid-word. Every arm that pushes a suffix pushes it last.
+    if let Some(undated) = suffix_undated
+        && KEY_W + KEY_GUTTER + spans_cells(&spans) > w
+        && let Some(last) = spans.last_mut()
+    {
+        *last = undated;
     }
     rows.push(DiagRow {
         content: spans,
@@ -2057,8 +2464,11 @@ enum UsageDiag {
     /// OAuth streak, a typed provider's lowercase display name or `the endpoint`
     /// for a third-party streak.
     Stuck429 { throttler: String },
-    /// AUTH-1 quarantine.
-    AuthBroken,
+    /// AUTH-1 quarantine; `proxy` is the service a proxy account's record
+    /// names, whose login is the only one clauth takes for it.
+    AuthBroken {
+        proxy: Option<crate::proxy::Service>,
+    },
     /// Long window (7d, else the provider-marked monthly quota) at/over the
     /// hard cap; `monthly` names the monthly arm so the teach never calls a
     /// monthly-only block "weekly".
@@ -2073,8 +2483,11 @@ enum UsageDiag {
     RefreshFailing,
     /// Endpoint-shaped profile no leg will ever fetch (no OAuth pair, no
     /// third-party credential): the fetch row names the missing key instead
-    /// of a dot or a historical verdict.
-    NoKey,
+    /// of a dot or a historical verdict; `proxy` is the service a proxy
+    /// account's record names.
+    NoKey {
+        proxy: Option<crate::proxy::Service>,
+    },
     /// The usage probe's setup token was refused: only a new mint revives it.
     SetupTokenRefused,
     /// A credit refusal on record: the walks pass the account over for a
@@ -2121,12 +2534,16 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
             "expires at its ceiling, since no probe reads it".to_string()
         }
         UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
-        UsageDiag::AuthBroken => {
-            format!(
+        UsageDiag::AuthBroken { proxy } => match proxy {
+            Some(service) => format!(
+                "log in again with {}",
+                cmd(&crate::actions::proxy_login_command(profile_name, &service))
+            ),
+            None => format!(
                 "re-login with {}",
                 cmd(&format!("clauth login {profile_name}"))
-            )
-        }
+            ),
+        },
         UsageDiag::WeeklyHard { monthly } => {
             if monthly {
                 "monthly quota is spent".to_string()
@@ -2138,7 +2555,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
         UsageDiag::Stale => "last usage check failed".to_string(),
         UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
-        UsageDiag::NoKey => KEYLESS_FIX.to_string(),
+        UsageDiag::NoKey { proxy } => keyless_fix(profile_name, proxy.as_ref()).into_owned(),
         UsageDiag::SetupTokenRefused => prose::setup_token_remint_fix(profile_name),
         UsageDiag::CreditRefused => {
             "skipped for work that may need credits until a request on it succeeds, a window \
@@ -2181,7 +2598,7 @@ fn ordinal(n: u32) -> String {
 /// probed setup token is never scheduled, a disabled one is likewise skipped,
 /// and a terminal `Failed` or a refused setup token already tried — mirror
 /// `build_tp_rows`, never spin on "loading" forever (issue #2).
-fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static str {
+fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> Cow<'static, str> {
     let probed = profile.has_long_lived_sidecar && crate::usage::usage_probe_admits(profile);
     if crate::usage::usage_poll_pair(profile).is_none() && !probed {
         // A long-lived session-token sidecar is a login the OAuth leg cannot
@@ -2189,21 +2606,29 @@ fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static s
         // to log the same account in or probe it, the login first: the probe
         // spends inference, the login does not. An api key / `[env]` inference
         // token has no usage windows at all — nothing to fix, so no fix line.
-        // Only a member holding nothing is "not logged in".
-        if profile.has_long_lived_sidecar {
-            "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe"
+        // Only a member holding nothing is "not logged in", unless it is a
+        // proxy account, whose missing key only its proxy login mints, or
+        // carries a `[proxy]` table clauth cannot read, which refuses every
+        // login until the table is fixed. Both refuse `+ login`, so a sidecar
+        // there never gets the line naming it.
+        if profile.has_long_lived_sidecar && profile.spends_oauth_chain() {
+            "can't read usage, log in the same account with + login on the setup tab, or turn on its usage probe".into()
         } else if crate::claude::has_inference_auth(profile) {
-            "can't read usage, an api key has no usage windows"
+            "can't read usage, an api key has no usage windows".into()
+        } else if let Some(record) = &profile.proxy {
+            keyless_fix(&profile.name, Some(&record.service))
+        } else if profile.has_unreadable_proxy_record {
+            "can't read its [proxy] table, fix it in config.toml".into()
         } else {
-            "not logged in, use + login on the setup tab"
+            "not logged in, use + login on the setup tab".into()
         }
     } else if profile.is_disabled()
         || matches!(status, Some(FetchStatus::Failed | FetchStatus::AuthExpired))
     {
         // Disabled: never scheduled, so with no seeded cache no fetch will land.
-        "no usage available"
+        "no usage available".into()
     } else {
-        "loading"
+        "loading".into()
     }
 }
 
@@ -2215,10 +2640,10 @@ fn oauth_empty_msg_here(
     profile: &Profile,
     status: Option<FetchStatus>,
     fetches_here: bool,
-) -> &'static str {
+) -> Cow<'static, str> {
     match oauth_empty_msg(profile, status) {
-        "loading" if !fetches_here && crate::usage::usage_probe_admits(profile) => {
-            "no reading yet from the clauth process that fetches usage"
+        msg if msg == "loading" && !fetches_here && crate::usage::usage_probe_admits(profile) => {
+            "no reading yet from the clauth process that fetches usage".into()
         }
         msg => msg,
     }
@@ -2260,39 +2685,42 @@ fn build_tp_rows(
         // show, and a RateLimited one means the provider throttled us with
         // nothing cached — never spin on "loading" forever (the original z.ai bug).
         // A disabled profile is never scheduled either, so it never loads.
-        let msg = if profile.is_disabled() {
-            "no usage available"
+        let msg: Cow<'static, str> = if profile.is_disabled() {
+            "no usage available".into()
         } else {
             match readings.status_of(&profile.name) {
-                Some(FetchStatus::Failed) => "no usage available",
-                Some(FetchStatus::RateLimited) => "rate limited, retrying",
+                Some(FetchStatus::Failed) => "no usage available".into(),
+                Some(FetchStatus::RateLimited) => "rate limited, retrying".into(),
                 // The ways a provider's usage credential can be unusable read
                 // differently to the operator, and the profile itself says
                 // which one this is: a lapsed or never-captured console session
                 // (Alibaba), or a dead api key (any other provider, whose
                 // verdict only a 401 can produce).
                 Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
-                    concat!("console login expired, run ", cmd_lit!("clauth login"))
+                    concat!("console login expired, run ", cmd_lit!("clauth login")).into()
                 }
                 Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
-                    "api key rejected, re-enter it on the setup tab"
+                    "api key rejected, re-enter it on the setup tab".into()
                 }
                 Some(FetchStatus::AuthExpired) => {
-                    concat!("console login needed, run ", cmd_lit!("clauth login"))
+                    concat!("console login needed, run ", cmd_lit!("clauth login")).into()
                 }
                 // A profile no leg will ever fetch must not claim to be
                 // loading — the same rule `oauth_empty_msg` applies. An Alibaba
                 // profile is never in here: its quota runs on the console
                 // session, so it is scheduled with or without an api key.
-                _ if !crate::usage::third_party_credentialed(profile) => KEYLESS_FIX,
-                _ => "loading",
+                _ if !crate::usage::third_party_credentialed(profile) => keyless_fix(
+                    &profile.name,
+                    profile.proxy.as_ref().map(|record| &record.service),
+                ),
+                _ => "loading".into(),
             }
         };
         // Stack, don't truncate: the fix copy must survive a narrow pane, so
         // every terminal message routes through the shared greedy wrapper
         // (`panes::wrap_words`) instead of clipping its tail at the pane edge.
         lines.extend(
-            prose::wrap(msg, usize::from(inner_w), theme::faint())
+            prose::wrap(&msg, usize::from(inner_w), theme::faint())
                 .into_iter()
                 .map(Line::from),
         );
@@ -2352,13 +2780,21 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
+                // A ` | `-joined composite drops whole parts from the right
+                // (the shunt `requests` row's rule) and a last part still too
+                // wide ends on `…`; the column left is what the pane holds
+                // after this row's own key cell, which widens past TP_KEY_W.
+                let key_lead = 2 + Span::raw(key_cell(&row.label, TP_KEY_W, KEY_GUTTER)).width();
+                let value_width = usize::from(inner_w).saturating_sub(key_lead);
                 let (lead, tail) = row_parts(row);
+                let lead = fit_row_value(&lead, value_width);
                 let pad = if matches!(
                     row.kind,
                     StatRowKind::Body | StatRowKind::Danger | StatRowKind::Faint
                 ) && is_row_figure(row)
                 {
-                    value_w
+                    // Never wider than this row's own value column.
+                    value_w.min(value_width)
                 } else {
                     0
                 };
@@ -2518,11 +2954,12 @@ fn is_row_figure(row: &StatRow) -> bool {
 
 /// Whether a stat-row value reads as a figure — one number (optionally signed)
 /// with an optional unit/currency word — rather than a word (`valid`) or a
-/// no-data glyph (`-`, `—`), or a `·`-joined / parenthesized composite. Figure
-/// rows left-pad to the block's widest figure; everything else starts at the
-/// value column unpadded. Residuals the predicate cannot separate without a
-/// producer to distinguish them: a leading-currency `$5` reads as a word and an
-/// ISO date (`2026-10-01`) as a figure; no current producer emits either shape.
+/// no-data glyph (`-`, `—`), or a `·`- or ` | `-joined / parenthesized
+/// composite. Figure rows left-pad to the block's widest figure; everything
+/// else starts at the value column unpadded. Residuals the predicate cannot
+/// separate without a producer to distinguish them: a leading-currency `$5`
+/// reads as a word and an ISO date (`2026-10-01`) as a figure; no current
+/// producer emits either shape.
 fn is_figure(value: &str) -> bool {
     let mut chars = value.chars();
     let digit_led = match chars.next() {
@@ -2530,7 +2967,24 @@ fn is_figure(value: &str) -> bool {
         Some('-') => chars.next().is_some_and(|c| c.is_ascii_digit()),
         _ => false,
     };
-    digit_led && !value.contains('·') && !value.contains('(')
+    // A ` | `-joined composite is text, never a right-aligned figure column.
+    digit_led && !value.contains('·') && !value.contains('(') && !value.contains(" | ")
+}
+
+/// Fit a labelled row's value to the value column: a ` | `-joined composite
+/// drops whole parts from the right (the shunt `requests` row's rule), and a
+/// single part still wider than the column ends on `…`.
+fn fit_row_value(value: &str, value_width: usize) -> String {
+    let mut parts: Vec<&str> = value.split(" | ").collect();
+    while parts.len() > 1 && Span::raw(parts.join(" | ")).width() > value_width {
+        parts.pop();
+    }
+    let kept = parts.join(" | ");
+    if Span::raw(kept.as_str()).width() > value_width {
+        truncate(&kept, value_width)
+    } else {
+        kept
+    }
 }
 
 fn key_value_span(

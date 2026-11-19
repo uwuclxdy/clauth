@@ -24,6 +24,15 @@ pub(crate) struct SessionRecord {
     /// record writing `cwd` as a non-string must not fail their parses.
     #[serde(rename = "cwd", default, deserialize_with = "lenient_string")]
     pub(crate) cwd: String,
+    /// The name the record carries (the human label Claude Code shows), for the
+    /// `switch --list` name cell. Read leniently like `cwd`: a non-string reads
+    /// empty, which the listing maps to no name.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub(crate) name: String,
+    /// The status the record carries, for the `switch --list --json` status
+    /// cell. Read leniently like `name`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub(crate) status: String,
     /// The process start time the record carries, as the record spells it. Both
     /// callers that compare it — the bridge's linux resolver and the scheduler's
     /// ambiguity scan, the latter through [`process_matches_record`] — read it
@@ -259,8 +268,12 @@ pub(crate) fn live_cwd(
 /// Whether `/proc/<pid>/stat` field 22 (the start time in clock ticks since
 /// boot) equals `proc_start` (measured 2.1.301). The one field-22 compare,
 /// shared by [`process_matches_record`] and the bridge's gone-or-moved check.
+/// False for a thread's id.
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_start_matches(pid: u32, proc_start: &str) -> bool {
+    if crate::runtime::pid_is_thread(pid) {
+        return false;
+    }
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -300,10 +313,13 @@ pub(crate) fn process_matches_record(pid: u32, record: &SessionRecord) -> bool {
 }
 
 /// The parent of process `pid`, where it can be read: `/proc/<pid>/stat` on
-/// linux, `proc_pidinfo` on macOS. Elsewhere none, the same degraded case as
-/// [`process_matches_record`].
+/// linux, none for a thread's id there; `proc_pidinfo` on macOS. Elsewhere
+/// none, the same degraded case as [`process_matches_record`].
 #[cfg(target_os = "linux")]
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    if crate::runtime::pid_is_thread(pid) {
+        return None;
+    }
     // Field 4 of `/proc/<pid>/stat` is the ppid; the comm (field 2) may hold
     // spaces and parentheses, so the split runs from the closing parenthesis.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -320,5 +336,28 @@ pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
 /// See the linux [`parent_pid`].
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// How far up a process's parents [`first_ancestor`] looks: a `clauth start`
+/// child or a delegate's child sits one level below its row's process, and a
+/// shell or a nested `claude` between them adds a level each.
+pub(crate) const ANCESTOR_DEPTH: usize = 4;
+
+/// The first answer `probe` gives over `pid`'s first [`ANCESTOR_DEPTH`]
+/// parents, nearest first. The walk ends at an unreadable parent and at pid 1
+/// or below: the init process and the kernel adopt orphans, so no session is
+/// theirs.
+pub(crate) fn first_ancestor<T>(pid: u32, mut probe: impl FnMut(u32) -> Option<T>) -> Option<T> {
+    let mut pid = pid;
+    for _ in 0..ANCESTOR_DEPTH {
+        pid = parent_pid(pid)?;
+        if pid <= 1 {
+            return None;
+        }
+        if let Some(found) = probe(pid) {
+            return Some(found);
+        }
+    }
     None
 }

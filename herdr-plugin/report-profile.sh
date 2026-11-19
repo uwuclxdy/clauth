@@ -6,19 +6,14 @@
 #
 # herdr's process-info names the pane's own session in
 # `foreground_process_group_id` — the `clauth start` supervisor for a
-# clauth-started pane — and the live-session registry carries that pid, so
-# the walk up the parent chain is the join. Delegate sessions share the pane:
-# they run as children of its `clauth mcp` and their rows are keyed on their
-# own processes, so the foreground chain resolves first and the compat sweep
-# never matches through an mcp.
+# clauth-started pane — and `clauth which --pid` joins that pid (or one of
+# its ancestors) to the live-session registry, answering whose account the
+# pane spends. Delegate sessions share the pane: they run as children of its
+# `clauth mcp`, and the join skips an mcp hop, so the foreground chain
+# resolves to the pane's own session first.
 set -u
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
-# clauth resolves its home off $HOME alone (no CLAUTH_HOME override exists in
-# the binary), so the registry the walk reads is the tree clauth actually
-# writes. An unset HOME trips `set -u` by design: nothing the walk needs can
-# resolve without it.
-sessions_dir="$HOME/.clauth/live_sessions"
 pane="${HERDR_PANE_ID:-}"
 
 # The parent pid and the argv line of process $1, from /proc where there is
@@ -33,8 +28,7 @@ proc_ppid() {
         # comm sits in parentheses and may itself hold ") ", so cut after the
         # LAST one: what follows is the state letter, then the ppid. A newline
         # inside comm spans stat across lines; the one-line read then finds no
-        # ") " and the climb breaks off, so the pane falls back to `clauth
-        # which` while that process lives.
+        # ") " and the sweep breaks off with no row, as for a vanished pid.
         _stat=
         read -r _stat 2>/dev/null <"$proc_root/$1/stat" || return 0
         _stat=${_stat##*") "}
@@ -53,76 +47,6 @@ proc_args() {
     else
         ps -o args= -p "$1" 2>/dev/null
     fi
-}
-
-# Prints the registry row owning $1 or one of its ancestors, empty if none.
-# A `clauth mcp` hop is never matched: rows keyed on it belong to delegate runs
-# the pane hosts, and matching one would name a delegate's account for the
-# pane. The climb passes through it — the pane's own supervisor sits beyond.
-session_row() {
-    _pid=$1
-    _depth=0
-    while [ "${_pid:-0}" -gt 1 ] && [ "$_depth" -lt 8 ]; do
-        _args=$(proc_args "$_pid")
-        case "$_args" in
-            'clauth mcp '* | 'clauth mcp') : ;;
-            *)
-                # The delimiter alternative keeps the prefix exclusion a bare
-                # "pid":$_pid would lose (123 against 1234) without pinning
-                # `pid` to its current slot in the row. Newest row wins: a
-                # recycled pid can match a stale row and a live one at once,
-                # and the stale one sorts first alphabetically.
-                _matches=$(grep -lE "\"pid\":$_pid(,|})" "$sessions_dir"/*.json 2>/dev/null)
-                if [ -n "$_matches" ]; then
-                    _row=$(printf '%s\n' "$_matches" | xargs ls -td 2>/dev/null | head -n 1)
-                    printf '%s\n' "$_row"
-                    return 0
-                fi
-                ;;
-        esac
-        _pid=$(proc_ppid "$_pid")
-        _depth=$((_depth + 1))
-    done
-    return 1
-}
-
-# The profile the operator's own codex login is adopted into, or nothing.
-# `clauth login <name> --codex` leaves `$CODEX_HOME/auth.json` (default
-# `~/.codex/auth.json`) a symlink onto `~/.clauth/profiles/<name>/auth.json`,
-# so the link target names the profile; a login that was never adopted, or a
-# host that could not repoint (a separate copy), spends no clauth account.
-adopted_codex_profile() {
-    _home="${CODEX_HOME:-$HOME/.codex}"
-    # A dash-leading path reads as readlink options on GNU and as a filename
-    # on BSD; refuse it rather than resolve either (readlink has no portable
-    # `--`).
-    case "$_home" in
-        -*) return 0 ;;
-    esac
-    _link=$(readlink "$_home/auth.json" 2>/dev/null) || return 0
-    case "$_link" in
-        /*) ;;
-        *) _link="$_home/$_link" ;;
-    esac
-    case "$_link" in
-        "$HOME/.clauth/profiles/"*/auth.json)
-            _p=${_link#"$HOME/.clauth/profiles/"}
-            _p=${_p%/auth.json}
-            case "$_p" in
-                '' | */*) return 0 ;;
-            esac
-            printf '%s\n' "$_p"
-            ;;
-    esac
-}
-
-# The account a row names: the member a --with-fallback session swapped onto,
-# else its launch member.
-row_profile() {
-    _row=$1
-    _p=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$_row")
-    [ -n "$_p" ] || _p=$(sed -n 's/.*"start_profile":"\([^"]*\)".*/\1/p' "$_row")
-    printf '%s\n' "$_p"
 }
 
 # Reads a herdr pane JSON line's own `agent` field from stdin. The nested
@@ -180,7 +104,9 @@ esac
 
 profile=""
 if [ -z "$agentless" ] && [ -n "$pane" ]; then
-    info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null)
+    # A failed process-info could not read the pane either: keep the last tag,
+    # like a failed `pane get`, rather than read it as "no account".
+    info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null) || exit 0
     # The pane's own session is named by the foreground process group id herdr
     # reports — the `clauth start` supervisor for every clauth-started pane
     # (measured 2026-09-03 on 0.8.2). A delegate session runs in its parent
@@ -188,49 +114,72 @@ if [ -z "$agentless" ] && [ -n "$pane" ]; then
     # the foreground chain must resolve FIRST or a delegate's account shadows
     # the pane's own.
     fg_pid=$(printf '%s' "$info" | sed -n 's/.*"foreground_process_group_id":\([0-9]*\).*/\1/p')
+    # A `clauth which --pid` that exits nonzero could not read, never "nothing
+    # resolved": the plugin is installed at the newest release tag whatever the
+    # binary's version, so a binary predating `--pid` answers exit 2 here. Like
+    # a failed `pane get`, that keeps the last tag — publish nothing, spawn
+    # nothing. An exit-0 JSON answer with a null profile is the definitive
+    # unresolved one.
     if [ -n "$fg_pid" ]; then
-        row=$(session_row "$fg_pid")
-        [ -n "$row" ] && profile=$(row_profile "$row")
+        if answer=$(clauth which --pid "$fg_pid" --json 2>/dev/null); then
+            _p=$(printf '%s' "$answer" | sed -n 's/.*"profile":"\([^"]*\)".*/\1/p')
+            _harness=$(printf '%s' "$answer" | sed -n 's/.*"harness":"\([^"]*\)".*/\1/p')
+            # Another harness's account is never this pane's: a codex pane
+            # reading the Claude Code global login gets no clauth token.
+            if [ -n "$_p" ] && [ "$_harness" = "$agent" ]; then
+                profile=$_p
+            fi
+        else
+            exit 0
+        fi
     fi
     # The pid sweep is the compat path for a process-info without the
-    # foreground field. When the field is there and found no row, the pane
-    # hosts no clauth session and the global fallback below is the answer —
-    # sweeping would hand a bare `claude` pane the account of a delegate it
-    # happens to host. The sweep skips a pid whose parent is `clauth mcp`: a
-    # delegate child, whose row is keyed on the child itself, and which names
-    # a run the pane hosts, never the pane.
+    # foreground field. When the field is there, the foreground answer above
+    # stands — sweeping would hand a bare `claude` pane the account of a
+    # delegate it happens to host. The sweep skips a pid whose parent is
+    # `clauth mcp`: a delegate child, whose row is keyed on the child itself,
+    # and which names a run the pane hosts, never the pane. A row answer wins
+    # over a bare login's; the bare answer is kept only while no pid gives one.
+    # A call that exits nonzero is skipped, and a sweep whose every call failed
+    # could not read either: publish nothing, as above.
     if [ -z "$profile" ] && [ -z "$fg_pid" ]; then
+        fallback=""
+        asked=0
+        answered=0
         pids=$(printf '%s' "$info" | grep -o '"pid":[0-9]*' | cut -d: -f2)
         for pid in $pids; do
             _pp=$(proc_ppid "$pid")
             _pargs=$(proc_args "$_pp")
-            case "$_pargs" in 'clauth mcp '* | 'clauth mcp') continue ;; esac
-            row=$(session_row "$pid") || continue
-            profile=$(row_profile "$row")
-            [ -n "$profile" ] && break
+            case "$_pargs" in 'clauth mcp '* | 'clauth mcp' | */clauth' mcp '* | */clauth' mcp') continue ;; esac
+            asked=$((asked + 1))
+            _answer=$(clauth which --pid "$pid" --json 2>/dev/null) || continue
+            answered=$((answered + 1))
+            _source=$(printf '%s' "$_answer" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p')
+            _p=$(printf '%s' "$_answer" | sed -n 's/.*"profile":"\([^"]*\)".*/\1/p')
+            if [ "$_source" = live_session ] && [ -n "$_p" ]; then
+                profile=$_p
+                break
+            fi
+            if [ -z "$fallback" ] && [ -n "$_p" ]; then
+                _harness=$(printf '%s' "$_answer" | sed -n 's/.*"harness":"\([^"]*\)".*/\1/p')
+                [ "$_harness" = "$agent" ] && fallback=$_p
+            fi
         done
+        [ -n "$profile" ] || profile=$fallback
+        if [ -z "$profile" ] && [ "$asked" -gt 0 ] && [ "$answered" -eq 0 ]; then
+            exit 0
+        fi
     fi
 fi
 
-# No clauth-managed session in this pane. A bare `claude` burns whatever owns
-# the global credentials, so that answer is right rather than a guess. A bare
-# `codex` burns the operator's own login, which is a clauth account only once
-# adopted — and `clauth which` is never asked for it: a caller holding no
-# CODEX_HOME gets the Claude Code answer there, a different harness's account.
+# A codex pane with nothing resolved is a DEFINITIVE empty: a bare codex burns
+# the operator's own login, a clauth account only once adopted, so no adopted
+# login means the pane spends no clauth account. The empty side then publishes
+# the clear and spawns the watcher below. The claude arm's empty keeps today's
+# silent exit, whatever the caller.
 definitive_empty=""
-if [ -z "$agentless" ] && [ -z "$profile" ]; then
-    if [ "$agent" = codex ]; then
-        profile=$(adopted_codex_profile)
-        # A codex pane with no adopted login is a DEFINITIVE empty resolution:
-        # the pane spends no clauth account, so the empty side publishes the
-        # clear and spawns the watcher below. The claude arm's empty is a
-        # `clauth which` failure (`clauth which` prints `unknown` at exit 0
-        # when nothing resolves), not a statement about the pane, and keeps
-        # today's silent exit — whatever the caller.
-        [ -z "$profile" ] && definitive_empty=1
-    else
-        profile=$(clauth which 2>/dev/null) || profile=""
-    fi
+if [ -z "$agentless" ] && [ -z "$profile" ] && [ "$agent" = codex ]; then
+    definitive_empty=1
 fi
 [ -n "$profile" ] || { [ -n "$definitive_empty" ] && [ -n "$pane" ]; } || [ -n "$agentless" ] || exit 0
 

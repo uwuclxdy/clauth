@@ -26,11 +26,14 @@ fn mini_profile(name: &str) -> Profile {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -44,6 +47,9 @@ fn mini_profile(name: &str) -> Profile {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 

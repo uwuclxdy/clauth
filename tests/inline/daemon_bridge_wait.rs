@@ -70,17 +70,35 @@ fn ev(hub: &Hub, pid: u32, body: serde_json::Value) -> (u16, serde_json::Value) 
     hub.event(pid, body.to_string().as_bytes())
 }
 
-/// A control device paired, a live session `s-one` at pid 100, and its asks
-/// `asks` open and held (seqs 2.., after `start` at 1).
-fn session_with_asks(asks: &[&str]) -> (HomeSandbox, Arc<Hub>, Arc<ApiContext>) {
+/// The sandbox, and the control device's `/events` subscription held open
+/// beside it for the test's duration; the subscription drops first.
+struct HeldHome {
+    _stream: Subscription,
+    _home: HomeSandbox,
+}
+
+/// A control device paired with a live control stream, a live session `s-one`
+/// at pid 100, and its asks `asks` open and held (seqs 2.., after `start` at
+/// 1).
+fn session_with_asks(asks: &[&str]) -> (HeldHome, Arc<Hub>, Arc<ApiContext>) {
     let home = HomeSandbox::new();
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
-    let start = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true});
+    let home = HeldHome {
+        _stream: hub.subscribe_as(Some(&Tier::Control)),
+        _home: home,
+    };
+    let start = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]});
     assert_eq!(ev(&hub, 100, start).0, 200);
     for (i, ask) in asks.iter().enumerate() {
-        let opened = json!({"session": "s-one", "seq": 2 + i as u64, "kind": "ask_opened", "ask": ask, "tool": "Bash", "input": {"command": "ls"}});
+        // A `q` ask is a question the answers name; any other a permission ask.
+        let (tool, input) = if ask.starts_with('q') {
+            ("AskUserQuestion", json!([{"question": "Which colour?"}]))
+        } else {
+            ("Bash", json!({"command": "ls"}))
+        };
+        let opened = json!({"session": "s-one", "seq": 2 + i as u64, "kind": "ask_opened", "ask": ask, "tool": tool, "input": input});
         let (status, answer) = ev(&hub, 100, opened);
         assert_eq!(
             (status, answer["hold"].clone()),
@@ -153,6 +171,29 @@ fn an_answer_landing_before_the_wait_is_returned_at_once() {
         (
             200,
             json!({"remote": true, "answer": {"answers": {"Which colour?": "blue"}}, "closed": true})
+        )
+    );
+}
+
+/// A note rides the wait reply's answer beside the answers it was typed with:
+/// the parked wait is the mod's usual delivery path, so a note that survived
+/// only the poll command would be lost.
+#[test]
+fn the_wait_reply_carries_the_answers_notes() {
+    let (_home, hub, ctx) = session_with_asks(&["q1"]);
+    answer(
+        &ctx,
+        "q1",
+        r#"{"answers":{"Which colour?":"blue"},"notes":{"Which colour?":"a deeper blue"}}"#,
+    );
+
+    assert_eq!(
+        park(&hub, "q1", Duration::from_secs(20))
+            .recv_timeout(WOKEN)
+            .expect("an answered ask's wait answers at once"),
+        (
+            200,
+            json!({"remote": true, "answer": {"answers": {"Which colour?": "blue"}, "notes": {"Which colour?": "a deeper blue"}}, "closed": true})
         )
     );
 }
@@ -326,6 +367,7 @@ fn the_wait_route_serves_over_the_socket() {
     let pid = std::process::id();
     let (_t, resolver) = table(&[(pid, instance("s-self", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     let start =
         json!({"session": "s-self", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
     assert_eq!(ev(&hub, pid, start).0, 200);
@@ -475,6 +517,7 @@ fn a_moved_record_wakes_its_wait_closed() {
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (table, resolver) = table(&[(100, instance("s-one", "1"))]);
     let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
     let start =
         json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
     assert_eq!(ev(&hub, 100, start).0, 200);
@@ -574,7 +617,7 @@ fn a_polled_answer_drops_its_payload_with_no_wait_parked() {
 /// Posed through the hub's own records, so no thread timing decides it.
 #[test]
 fn a_polled_answer_keeps_its_payload_for_a_parked_wait_only() {
-    let (_home, hub, ctx) = session_with_asks(&["q1", "q2"]);
+    let (_home, hub, ctx) = session_with_asks(&["q1", "a2"]);
     hub.inner
         .lock()
         .unwrap()
@@ -585,7 +628,7 @@ fn a_polled_answer_keeps_its_payload_for_a_parked_wait_only() {
         .insert("q1".to_string(), 1);
 
     answer(&ctx, "q1", r#"{"answers":{"Which colour?":"blue"}}"#);
-    answer(&ctx, "q2", r#"{"decision":"allow"}"#);
+    answer(&ctx, "a2", r#"{"decision":"allow"}"#);
     let (status, _) = hub.poll(100, "s-one", Duration::ZERO);
     assert_eq!(status, 200);
 
@@ -597,9 +640,9 @@ fn a_polled_answer_keeps_its_payload_for_a_parked_wait_only() {
         "a wait parked on q1 still owes its payload"
     );
     assert_eq!(
-        live.closed_asks.get("q2"),
+        live.closed_asks.get("a2"),
         Some(&serde_json::Value::Null),
-        "no wait is parked on q2, so the poll was its last consumer"
+        "no wait is parked on a2, so the poll was its last consumer"
     );
 }
 

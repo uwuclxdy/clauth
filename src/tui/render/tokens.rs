@@ -1,7 +1,7 @@
 //! Tokens tab — global Claude Code token usage read from `~/.claude`. Claude
 //! Code only: a codex session writes no transcript here, so its spend is
 //! absent from every figure below rather than folded in silently.
-//! (`stats-cache.json` + recent transcript top-up; see `crate::tokens`).
+//! (the frozen stats base + recent transcript top-up; see `crate::tokens`).
 //!
 //! Two views. The **dashboard** (landing page) is a fixed grid of bordered
 //! cards — today, lifetime totals, daily trend, top models, token composition,
@@ -894,7 +894,8 @@ fn failed_cache_line() -> Line<'static> {
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
         let area = clamp_width(area, DASH_MAX_W);
-        let block = section_box("tokens", false, true, area.width);
+        // The screen's only panel, so it owns the focus border.
+        let block = section_box("tokens", true, true, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = if app.tokens_failed {
@@ -1273,10 +1274,14 @@ fn card(
         None => section_box(title, focused, first, area.width),
     };
     if let Some(m) = meta {
-        // The badge closes with a border cell of its own (`… badge ─╮`), the
-        // same rule the meta-slot family follows — the card border is the
-        // unfocused `LINE`.
-        block = block.title(meta_line(m, Style::default().fg(theme::line_color())));
+        // The badge closes with a border cell of its own (`… badge ─╮`), so
+        // that dash carries the card's own border token.
+        let border = if focused {
+            theme::line_strong()
+        } else {
+            theme::line()
+        };
+        block = block.title(meta_line(m, border));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

@@ -19,10 +19,11 @@
 //! and Windows.
 //!
 //! The directory is a default, not a rule: `~/.clauth/tls.json` carries it, is
-//! written with this platform's default on first use, and is read back on every
-//! start ([`cert_dir`]). That is what lets a Windows box whose lego lives
-//! somewhere other than `%AppData%` — or a Linux one behind a packaging
-//! convention of its own — serve TLS without a rebuild.
+//! written with this platform's default on a start's first use
+//! ([`create_default_tls_config`]), and is read back on every start
+//! ([`cert_dir`]). That is what lets a Windows box whose lego lives somewhere
+//! other than `%AppData%` — or a Linux one behind a packaging convention of its
+//! own — serve TLS without a rebuild.
 //!
 //! The derivation itself can be wrong, though, and no directory setting fixes
 //! that: on a tailnet node `hostname -f` answers a name no certificate covers,
@@ -41,8 +42,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rustls::ServerConfig;
+use rustls::client::verify_server_name;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::ParsedCertificate;
 use serde::{Deserialize, Serialize};
 
 use crate::logline::logline;
@@ -115,45 +118,62 @@ fn tls_config_path() -> Result<PathBuf> {
     Ok(crate::profile::clauth_dir()?.join(TLS_FILE))
 }
 
-/// The configured certificate directory, writing the platform default on first
-/// use so the operator has a file to edit rather than a documented path to
-/// retype. Only [`server_config`] calls this, so `tls.json` appears when a
-/// `--listen` daemon first starts.
+/// The configured certificate directory, read from `tls.json` where a start
+/// left one.
 ///
-/// Runs under the cross-process state flock, so two instances starting
-/// together cannot both decide they are the one creating it.
+/// Read-only and lock-free: the restart-handover probe's answer runs this same
+/// read, so it can neither wait on the state flock nor write the home. An
+/// absent file reads as [`default_cert_dir`]; [`create_default_tls_config`] is
+/// the start's write that leaves one for the operator to edit.
 ///
-/// A malformed file is a hard error, NOT a silent fall back to the default:
-/// quietly ignoring an edited `cert_dir` would serve certificates from a
-/// directory the operator believes they moved away from, and the only symptom
-/// would be a confusing "no such file" naming a path they never configured.
+/// A malformed or unreadable file is a hard error, NOT a silent fall back to
+/// the default: quietly ignoring an edited `cert_dir` would serve certificates
+/// from a directory the operator believes they moved away from, and the only
+/// symptom would be a confusing "no such file" naming a path they never
+/// configured.
 pub(crate) fn cert_dir() -> Result<PathBuf> {
     let path = tls_config_path()?;
-    crate::lock::with_state_lock(|_| {
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            let dir = default_cert_dir()?;
-            write_tls_config(&path, &dir)?;
-            return Ok(dir);
-        };
-        let parsed: TlsConfigFile = serde_json::from_str(&body).map_err(|e| {
-            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
-        })?;
-        if parsed.schema > TLS_SCHEMA {
-            // Written by a newer clauth. The one field this build reads is a
-            // path either way, so take it and let the newer field set be.
-            logline!(
-                "clauth daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
-                parsed.schema
-            );
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return default_cert_dir(),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let parsed: TlsConfigFile = serde_json::from_str(&body).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })?;
+    if parsed.schema > TLS_SCHEMA {
+        // Written by a newer clauth. The one field this build reads is a
+        // path either way, so take it and let the newer field set be.
+        logline!(
+            "clauth daemon: {TLS_FILE} is schema {} (this build knows {TLS_SCHEMA})",
+            parsed.schema
+        );
+    }
+    if parsed.cert_dir.trim().is_empty() {
+        bail!(
+            "{} has an empty cert_dir; set it to the directory holding \
+             <fqdn>.crt, or delete the file to get this platform's default",
+            path.display()
+        );
+    }
+    Ok(PathBuf::from(parsed.cert_dir))
+}
+
+/// Write the platform default `tls.json` when the start finds none, so the
+/// operator has a file to edit rather than a documented path to retype.
+///
+/// The start's write alone, under the cross-process state flock so two starts
+/// landing together cannot both decide they are the one creating it;
+/// [`cert_dir`]'s read never takes that flock. An existing file is left
+/// exactly as it is.
+pub(crate) fn create_default_tls_config() -> Result<()> {
+    let path = tls_config_path()?;
+    crate::lock::with_state_lock(|_| match std::fs::read_to_string(&path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_tls_config(&path, &default_cert_dir()?)
         }
-        if parsed.cert_dir.trim().is_empty() {
-            bail!(
-                "{} has an empty cert_dir; set it to the directory holding \
-                 <fqdn>.crt, or delete the file to get this platform's default",
-                path.display()
-            );
-        }
-        Ok(PathBuf::from(parsed.cert_dir))
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     })
 }
 
@@ -347,9 +367,64 @@ pub(crate) fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         .with_context(|| format!("failed to read the TLS private key {}", path.display()))
 }
 
-/// Build the server's TLS configuration from an explicit set of paths.
+/// Build the server's TLS configuration from an explicit set of paths: the
+/// tests' listener fixture, which needs no published name.
+#[cfg(all(test, unix))]
 pub(crate) fn server_config_from(paths: &CertPaths) -> Result<Arc<ServerConfig>> {
+    load_served(paths).map(|(config, _leaf)| config)
+}
+
+/// A loaded TLS identity: the configuration the listener serves, and the name
+/// a pairing link can carry for it.
+pub(crate) struct Identity {
+    pub(crate) config: Arc<ServerConfig>,
+    /// The name the certificate's files were found by (the FQDN for lego, the
+    /// `--cert` file's stem, as `tailscale cert` names it) when the leaf covers
+    /// it as a DNS name, else the leaf's own first non-wildcard DNS name;
+    /// `None` when it carries none.
+    pub(crate) name: Option<String>,
+}
+
+/// `candidate` when `leaf` covers it as a DNS name, else `None`: rustls' own
+/// name check, so the name published is one a client's handshake accepts.
+fn covered_name(leaf: &CertificateDer<'_>, candidate: &str) -> Option<String> {
+    let name = ServerName::try_from(candidate).ok()?;
+    let ServerName::DnsName(_) = name else {
+        return None;
+    };
+    let parsed = ParsedCertificate::try_from(leaf).ok()?;
+    verify_server_name(&parsed, &name).ok()?;
+    Some(candidate.to_owned())
+}
+
+/// The first DNS name `leaf` carries that names a host: a wildcard entry names
+/// a pattern, not a host, so it is skipped. `None` when every name it carries
+/// is one.
+fn leaf_dns_name(leaf: &CertificateDer<'_>) -> Option<String> {
+    webpki::EndEntityCert::try_from(leaf)
+        .ok()?
+        .valid_dns_names()
+        .find(|name| !name.starts_with("*."))
+        .map(str::to_owned)
+}
+
+/// The name a pairing link publishes for `leaf`: `candidate` (the lego FQDN or
+/// the `--cert` file's stem) when the leaf covers it, else the leaf's own first
+/// non-wildcard DNS name. `None` when it carries none.
+fn published_name(leaf: &CertificateDer<'_>, candidate: Option<&str>) -> Option<String> {
+    candidate
+        .and_then(|candidate| covered_name(leaf, candidate))
+        .or_else(|| leaf_dns_name(leaf))
+}
+
+/// The server's TLS configuration from an explicit set of paths, and the leaf
+/// certificate it serves.
+fn load_served(paths: &CertPaths) -> Result<(Arc<ServerConfig>, CertificateDer<'static>)> {
     let chain = load_chain(&paths.cert, paths.issuer.as_deref())?;
+    let leaf = chain
+        .first()
+        .cloned()
+        .with_context(|| format!("{} contains no certificate", paths.cert.display()))?;
     let key = load_key(&paths.key)?;
 
     // Pin the provider rather than taking the process-wide default: ureq also
@@ -363,7 +438,7 @@ pub(crate) fn server_config_from(paths: &CertPaths) -> Result<Arc<ServerConfig>>
         .with_single_cert(chain, key)
         .context("the TLS certificate and private key do not match")?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), leaf))
 }
 
 /// Tailscale's IPv4 node-address range (`net/tsaddr`'s `CGNATRange`). It is
@@ -417,9 +492,13 @@ fn refuse_on_tailnet(listen: IpAddr, cause: anyhow::Error) -> anyhow::Error {
 /// not-found than a missing file (a path through a regular file among them),
 /// so there those read as absent. Every other failure (a `.crt` that exists
 /// but does not parse, a missing key, a bad `tls.json`, an unreadable parent)
-/// stays exactly as today, as does a bind outside the ranges.
-pub(crate) fn load_lego_or_refuse(listen: IpAddr, paths: &CertPaths) -> Result<Arc<ServerConfig>> {
-    server_config_from(paths).map_err(|cause| {
+/// stays exactly as today, as does a bind outside the ranges. The leaf comes
+/// back beside the configuration, for the name [`Identity`] publishes.
+pub(crate) fn load_lego_or_refuse(
+    listen: IpAddr,
+    paths: &CertPaths,
+) -> Result<(Arc<ServerConfig>, CertificateDer<'static>)> {
+    load_served(paths).map_err(|cause| {
         if matches!(paths.cert.try_exists(), Ok(false)) {
             refuse_on_tailnet(listen, cause)
         } else {
@@ -438,14 +517,25 @@ pub(crate) fn load_lego_or_refuse(listen: IpAddr, paths: &CertPaths) -> Result<A
 /// route instead of lego's missing-file error. For [`CertSource::Explicit`]
 /// none of that runs: no `hostname -f`, no `tls.json`, no issuer file, no
 /// tailnet refusal — the two named files are read and that is all.
-pub(crate) fn server_config(source: &CertSource, listen: IpAddr) -> Result<Arc<ServerConfig>> {
+pub(crate) fn server_config(source: &CertSource, listen: IpAddr) -> Result<Identity> {
     match source {
         CertSource::Lego => {
             let fqdn = fqdn().map_err(|cause| refuse_on_tailnet(listen, cause))?;
             let paths = lego_paths_in(&cert_dir()?, &fqdn);
-            load_lego_or_refuse(listen, &paths)
+            let (config, leaf) = load_lego_or_refuse(listen, &paths)?;
+            Ok(Identity {
+                config,
+                name: published_name(&leaf, Some(&fqdn)),
+            })
         }
-        CertSource::Explicit(paths) => server_config_from(paths),
+        CertSource::Explicit(paths) => {
+            let (config, leaf) = load_served(paths)?;
+            let stem = paths.cert.file_stem().and_then(|stem| stem.to_str());
+            Ok(Identity {
+                config,
+                name: published_name(&leaf, stem),
+            })
+        }
     }
 }
 

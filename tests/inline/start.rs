@@ -161,6 +161,51 @@ fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
     );
 }
 
+/// The launch's announce line (a degraded resume's "resumed pinned", the
+/// no-daemon chain line, `start --auto`'s launch line) prints only once every
+/// startup step that can still refuse has passed: the `extras.announce` print
+/// is the statement right before claude's spawn, and `run_for_code` names
+/// `extras.announce` once. Read off the comment- and whitespace-stripped text,
+/// for the reason the teardown pin above gives.
+///
+/// What it cannot decide: a failure of the spawn itself still follows the
+/// line; an early print reached through another binding of `extras`; and a
+/// caller printing the line itself before `run_for_code` (the degraded
+/// resume's own launch-line tests cover that caller, the other two have
+/// none).
+#[test]
+fn the_announce_line_is_the_last_step_before_the_spawn() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run_for_code(")
+        .expect("run_for_code is defined")
+        .1;
+    let body = body
+        .split_once("\n}\n")
+        .expect("run_for_code ends at a top-level brace")
+        .0;
+    let dense: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let announce = "ifletSome(line)=&extras.announce{errln!(\"{line}\");}";
+    assert_eq!(
+        dense.matches("extras.announce").count(),
+        1,
+        "the announce line is printed from one place"
+    );
+    let before_spawn = dense
+        .split_once("letmutchild=command.spawn()")
+        .expect("run_for_code spawns claude")
+        .0;
+    assert!(
+        before_spawn.ends_with(announce),
+        "the announce line must be the statement right before the spawn"
+    );
+}
+
 /// The production teardown plus the sessions dir it reads, so a change to either
 /// shows up here. A fresh sessions dir holds one live marker: this session's.
 fn teardown(iso_root: &std::path::Path, claude_home: &std::path::Path) -> (usize, usize) {
@@ -628,6 +673,72 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     );
 }
 
+/// The subagent-shell hook is for a headless delegate alone: a `clauth start`
+/// session's settings file carries the symlink repairs and nothing else.
+/// Driven through the real `run`, read off the settings file the fake `claude`
+/// was handed.
+#[cfg(unix)]
+#[test]
+fn a_started_session_carries_no_foreground_spawn_hook() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+    crate::testutil::healthy_install(&claude);
+
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("a shared start");
+
+    let settings = fake.settings_files();
+    assert_eq!(
+        settings.len(),
+        1,
+        "the shared start's linked projects get the repair settings file"
+    );
+    let pre = settings[0]["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("a PreToolUse array");
+    assert!(
+        pre.iter().any(|entry| entry["matcher"] == "Read"),
+        "the Read exemption hook is there, so the file under test is the start's own"
+    );
+    for entry in pre {
+        let commands: Vec<&str> = entry["hooks"]
+            .as_array()
+            .map(|hooks| hooks.iter().filter_map(|h| h["command"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            commands
+                .iter()
+                .all(|c| !c.contains(crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND)),
+            "a started session runs no foreground-spawn hook: {entry}"
+        );
+        assert_eq!(
+            entry["matcher"], "Read",
+            "a started session's file holds the Read exemption alone: {entry}"
+        );
+    }
+}
+
 // ── the plugin pre-flight ─────────────────────────────────────────────────
 
 /// The migration trigger's own pin: a `clauth start` heals a broken plugin
@@ -768,8 +879,14 @@ fn start_prints_one_line_per_store_it_cannot_create() {
             ),
             format!(
                 "clauth: could not create {}: {refused}; this session's transcripts \
-                 stay in its own tree and are lost when it ends\n",
+                 stay in its own tree until ~/.claude can take them and no job still holds \
+                 that tree\n",
                 claude.join("projects").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's background sessions \
+                 stay in its own tree, where the clauth app cannot reach them\n",
+                claude.join("sessions").display()
             ),
         ];
         assert_eq!(
@@ -779,12 +896,13 @@ fn start_prints_one_line_per_store_it_cannot_create() {
         );
     }
 
-    // Only `jobs` fails: `projects` pre-exists as a real dir before arming, so
-    // the run names only the store whose records stay in the tree.
+    // Only `jobs` fails: `projects` and `sessions` pre-exist as real dirs before
+    // arming, so the run names only the store whose records stay in the tree.
     {
         let sb = HomeSandbox::new();
         let claude = sb.home().join(".claude");
         std::fs::create_dir_all(claude.join("projects")).expect("~/.claude/projects");
+        std::fs::create_dir_all(claude.join("sessions")).expect("~/.claude/sessions");
         let _config = ConfigDirSandbox::new(&sb, &claude);
         let fake = FakeClaude::new(&sb);
         let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
@@ -1686,7 +1804,10 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
 /// tree without a `jobs` link would keep the record where no clauth reader
 /// looks and lose the tree under the running session. The transcript store is
 /// the same case: with no `~/.claude/projects`, a transcript written through
-/// the tree is unindexed and dies with it.
+/// the tree stays unindexed until the tree's rescue. The live session record
+/// matters for the mod bridge, which reads a peer no `live_sessions` row joins
+/// from `~/.claude/sessions`: with no link, the record stays in the tree and
+/// the bridge cannot find it while the session runs.
 ///
 /// The red-first pin: on the base it places no store link.
 #[cfg(unix)]
@@ -1744,6 +1865,20 @@ fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
         transcripts.len(),
         1,
         "the transcript is in the global store the session index reads"
+    );
+    // The mod bridge reads a peer no `live_sessions` row joins from
+    // `~/.claude/sessions`, so a background session's record must land there.
+    assert_eq!(
+        fs::read_link(tree.join("sessions")).expect("the tree links its sessions store"),
+        claude.join("sessions"),
+        "the tree's live records land in the global store the bridge reads"
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &fs::metadata(claude.join("sessions")).expect("the global sessions store exists")
+        ) & 0o777,
+        0o700,
+        "the created store is owner-only"
     );
 }
 
@@ -3381,7 +3516,7 @@ fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
     let tree = background_tree(&shim);
     // A live process with the right config dir and the recorded (real) start,
     // but argv that is NOT `daemon run`.
-    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let mut foreign = crate::testutil::spawn_parked(&tree, None, &["not", "a", "supervisor"]);
     let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
     crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
     for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {

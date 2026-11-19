@@ -243,10 +243,22 @@ pub(crate) mod rank {
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         /// Codex poll-cadence memo (`usage::scheduler::CODEX_POLLED_AT`). Taken
-        /// alone by `forget_codex_polled`, and under the epoch guard (160) by the
-        /// codex landing's section 2, which also takes the usage stores (300/350)
-        /// — so it ranks above them all as a leaf.
+        /// alone by `forget_codex_polled` and the reset side read's hold-off
+        /// snapshot, and under the epoch guard (160) by the codex landing's
+        /// section 2, which also takes the usage stores (300/350) — so it ranks
+        /// above them all as a leaf.
         CodexPolled = 1150;
+        /// Banked-reset side-read memo (`usage::scheduler`'s `ResetsMemo`,
+        /// one per scheduler state, the claude leg's under `ClaudeResets` and
+        /// the codex leg's under `CodexResets`). The same leaf shape
+        /// as `CodexPolled`: taken alone by the leg (under `Config`, 400), the
+        /// forget and rename paths, and the landing's transition detector, so
+        /// it ranks above everything any of those nests with.
+        ClaudeResets = 1155;
+        /// The codex banked-reset side-read memo's rank: the twin of
+        /// [`ClaudeResets`] on the codex roster, taken alone by its leg and
+        /// the forget and rename paths.
+        CodexResets = 1156;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
@@ -314,6 +326,35 @@ pub(crate) mod rank {
         /// acquisition is one bookkeeping step, and the warning line it decides
         /// on is written after the guard drops.
         TerminalHolders = 1902;
+        /// The sessions whose per-session Keychain item a daemon-side reader
+        /// gave up on (`runtime::ITEM_READ_GAVE_UP`), shared by the stale-copy
+        /// sweep and the MCP login sync. A true leaf: each reader copies the
+        /// set out, releases it, runs its `security` reads with nothing held,
+        /// then re-takes it to record what it gave up and pruned.
+        #[cfg(target_os = "macos")]
+        ItemReadGaveUp = 1903;
+        /// The `[serve] app_origins` texts already logged as skipped
+        /// (`daemon::api::routes::note_skipped_origin`). A true leaf: held for
+        /// one lookup and one insert, and the line it decides on is written
+        /// after the guard drops.
+        SkippedOrigins = 1904;
+        /// The last `[serve] app_origins` list that read
+        /// (`daemon::api::routes::listed_origins`), the fallback answered from
+        /// while a later read fails. A true leaf: held for one `Arc` clone or
+        /// one assignment, and the line it decides on is written after the
+        /// guard drops.
+        LastOrigins = 1905;
+        /// The live terminal tickets (`daemon::api::ticket::Tickets`). A true
+        /// leaf: every acquisition does in-memory work only (a sweep, a count,
+        /// a removal, an insert), and every check, store read, herdr call and
+        /// line that follows a removal runs after the guard drops.
+        TerminalTickets = 1906;
+        /// The per-account `limit-reset` spend flock
+        /// (`usage::limit_reset_pending::LimitResetLock`,
+        /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend
+        /// holds it across its reads, writes, prompts and HTTP round trip with
+        /// no ranked lock acquired underneath, so nothing ever nests inside it.
+        LimitResetSpend = 1950;
     }
 }
 
@@ -324,8 +365,9 @@ thread_local! {
 }
 
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
-/// the two file-lock guards ([`crate::lock`]'s state flock and
-/// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
+/// the file-lock guards ([`crate::lock`]'s state flock,
+/// [`crate::runtime::RotationGuard`], the limit-reset spend lock and the other
+/// flock guards) — not [`Mutex`]es but still in the order.
 #[must_use]
 pub(crate) struct RankGuard {
     #[cfg(debug_assertions)]

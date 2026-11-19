@@ -130,14 +130,12 @@ fn incident_rows(
     // The stacked selector reaches content widths under the 2-cell gutter; the
     // row keeps its leading indent inside `content_w` rather than overrunning.
     let gutter = content_w.min(2);
-    let (caret_text, caret_w) = prefix_in_cells(
-        if selected && pane_focused {
-            "❯ "
-        } else {
-            "  "
-        },
-        gutter,
-    );
+    let caret_slot = if selected && pane_focused {
+        format!("{} ", theme::CARET)
+    } else {
+        "  ".to_string()
+    };
+    let (caret_text, caret_w) = prefix_in_cells(&caret_slot, gutter);
     let caret = if selected && pane_focused {
         Span::styled(
             caret_text,
@@ -241,7 +239,7 @@ fn incident_rows(
         // word's budget.
         let budget = content_w.saturating_sub(used + 4);
         let dot = Span::styled(
-            "●",
+            theme::DOT_ON,
             with_bg(
                 Style::default()
                     .fg(phase_text_color(&incident.phase))
@@ -728,7 +726,7 @@ fn components_line(components: &[(String, String)], inner_w: usize) -> Line<'sta
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(
-            "●",
+            theme::DOT_ON,
             Style::default().fg(component_status_color(status)),
         ));
         spans.push(Span::styled(format!(" {label}"), theme::body()));
