@@ -255,15 +255,53 @@ fn strip_os_error(s: &str) -> String {
     }
 }
 
-/// Who wrote a launch's passthrough args, which decides whose
-/// `cleanupPeriodDays` a spawn `--settings` carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ArgsFrom {
-    /// The operator's own `clauth start -- …` args: their number wins.
-    Operator,
-    /// A calling model's delegate `args`: the larger of its number and the
-    /// remembered one wins.
-    Model,
+/// Whose launch a spawn `--settings` is built for: it decides whose
+/// `cleanupPeriodDays` the file carries, and whether a fault can refuse the
+/// launch at all.
+pub(crate) trait LaunchOwner: Copy {
+    /// The line a refused launch comes back with. An operator launch cannot
+    /// be refused, so its type carries no line.
+    type Refusal;
+
+    /// Build this owner's refusal from `line`, or hand `line` back when this
+    /// owner cannot refuse a launch.
+    fn refusal(line: String) -> Result<Self::Refusal, String>;
+
+    /// Whether this owner is a calling model's delegate: its own number is a
+    /// floor under the remembered one, it registers whatever its own key says,
+    /// and a fault with a number due refuses it. A model delegate is exactly an
+    /// owner [`Self::refusal`] builds a line for, so the answer is derived from
+    /// that polarity rather than stated a second time by each impl.
+    fn is_model(&self) -> bool {
+        Self::refusal(String::new()).is_ok()
+    }
+}
+
+/// The operator's own `clauth start -- …` args: their number wins, and the
+/// launch is never refused.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Operator;
+
+/// A calling model's delegate `args`: the larger of its number and the
+/// remembered one wins, and a value that cannot carry the number refuses the
+/// launch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Model;
+
+impl LaunchOwner for Operator {
+    type Refusal = std::convert::Infallible;
+
+    fn refusal(line: String) -> Result<Self::Refusal, String> {
+        Err(line)
+    }
+}
+
+impl LaunchOwner for Model {
+    type Refusal = String;
+
+    fn refusal(line: String) -> Result<Self::Refusal, String> {
+        Ok(line)
+    }
 }
 
 /// Append the spawn `--settings` (when the launch needs one) and then the
@@ -315,16 +353,16 @@ pub(crate) enum ArgsFrom {
     clippy::too_many_arguments,
     reason = "one input per distinct part of the spawn-settings step, each handed by both callers"
 )]
-pub(crate) fn apply_spawn_settings(
+pub(crate) fn apply_spawn_settings<O: LaunchOwner>(
     command: &mut Command,
     config_dir: &Path,
     cwd: &Path,
     passthrough: &[String],
-    args_from: ArgsFrom,
+    owner: O,
     read_hook_command: &str,
     foreground_hook_command: Option<&str>,
     settings_file: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, O::Refusal> {
     let literal = config_dir.join("projects");
     // `Some` only when the symlink repairs are needed, so the memory dir and
     // the Read hook below are skipped for a runtime whose spellings agree.
@@ -355,7 +393,7 @@ pub(crate) fn apply_spawn_settings(
     // hold. With a number to carry, an unusable value refuses the launch
     // instead of warning. The operator's own launch owns the number and is
     // never refused.
-    let refuses = args_from == ArgsFrom::Model && days.is_some();
+    let refuses = owner.is_model() && days.is_some();
     let tail: std::borrow::Cow<'static, str> = match days {
         Some(days) if refuses => refusal_tail(days).into(),
         _ => TAIL.into(),
@@ -369,11 +407,12 @@ pub(crate) fn apply_spawn_settings(
                     // Only our hooks need the user's `hooks` shape; the number
                     // alone rides any object.
                     if repairs && let Some(field) = hooks_shape_error(&map) {
-                        if refuses {
-                            return Err(hooks_warning(inline, &value, &field, &tail));
-                        }
+                        let warning = refuse_or_warn::<O>(
+                            refuses,
+                            hooks_warning(inline, &value, &field, &tail),
+                        )?;
                         command.args(passthrough);
-                        return Ok(Some(hooks_warning(inline, &value, &field, &tail)));
+                        return Ok(Some(warning));
                     }
                     map
                 }
@@ -381,9 +420,7 @@ pub(crate) fn apply_spawn_settings(
                 // needs none passes the user's settings through silently; the
                 // tree's own `settings.json` still carries the number.
                 Err(warning) => {
-                    if refuses {
-                        return Err(warning);
-                    }
+                    let warning = refuse_or_warn::<O>(refuses, warning)?;
                     command.args(passthrough);
                     return Ok(repairs.then_some(warning));
                 }
@@ -495,7 +532,7 @@ pub(crate) fn apply_spawn_settings(
     // The floor a registration stores: none for an operator launch — its own
     // key, valid or not, never registers — and a delegate's own valid number.
     let floor = own_valid;
-    let registerable = args_from == ArgsFrom::Model || own.is_none();
+    let registerable = owner.is_model() || own.is_none();
     // The number due: the one the hold decides, else the pre-read's when the
     // flock is not taken. A spawn file that cannot be written leaves that
     // number out of the flag tier, and a project-tier `cleanupPeriodDays` in
@@ -535,10 +572,11 @@ pub(crate) fn apply_spawn_settings(
             }
         }
         crate::retention::CarryOutcome::WriteFailed(e) => {
-            if args_from == ArgsFrom::Model
+            if owner.is_model()
                 && let Some(due) = due
+                && let Ok(refusal) = O::refusal(write_fault(settings_file, &e, &refusal_tail(due)))
             {
-                return Err(write_fault(settings_file, &e, &refusal_tail(due)));
+                return Err(refusal);
             }
             command.args(passthrough);
             return Ok(repairs.then(|| write_fault(settings_file, &e, TAIL)));
@@ -546,7 +584,7 @@ pub(crate) fn apply_spawn_settings(
         crate::retention::CarryOutcome::LockedOut => {
             // The flock was not taken: the file still carries the number the
             // pre-read decided, unregistered, and the fault was reported once
-            // through the record-fault latch.
+            // through the state-lock latch.
             if let Some(number) = days {
                 crate::retention::apply_launch_days(&mut settings, number, own_valid);
             }
@@ -555,10 +593,11 @@ pub(crate) fn apply_spawn_settings(
     if !written {
         let json = Value::Object(settings).to_string();
         if let Err(e) = crate::profile::atomic_write_600(settings_file, json.as_bytes()) {
-            if args_from == ArgsFrom::Model
+            if owner.is_model()
                 && let Some(due) = due
+                && let Ok(refusal) = O::refusal(write_fault(settings_file, &e, &refusal_tail(due)))
             {
-                return Err(write_fault(settings_file, &e, &refusal_tail(due)));
+                return Err(refusal);
             }
             command.args(passthrough);
             // As with an unreadable user `--settings` above, a launch that
@@ -570,6 +609,18 @@ pub(crate) fn apply_spawn_settings(
     command.arg("--settings").arg(settings_file);
     command.args(&clean);
     Ok(None)
+}
+
+/// Turn `line` into `O`'s refusal when the launch refuses, else hand it back as
+/// the warning to pass through.
+fn refuse_or_warn<O: LaunchOwner>(refuses: bool, line: String) -> Result<String, O::Refusal> {
+    if !refuses {
+        return Ok(line);
+    }
+    match O::refusal(line) {
+        Ok(refusal) => Err(refusal),
+        Err(line) => Ok(line),
+    }
 }
 
 /// The resolved `config_dir/projects`: the literal's realpath when it exists,
@@ -1033,7 +1084,7 @@ fn hooks_warning(inline: bool, value: &str, field: &str, tail: &str) -> String {
 /// arms: `tail` makes it the passthrough warning or the delegate refusal.
 #[expect(
     clippy::unnecessary_debug_formatting,
-    reason = "the approved line quotes and escapes the path as Debug does"
+    reason = "the line quotes and escapes the path as Debug does"
 )]
 fn write_fault(settings_file: &Path, e: &std::io::Error, tail: &str) -> String {
     format!("clauth: --settings {settings_file:?}: cannot write it ({e}); {tail}")

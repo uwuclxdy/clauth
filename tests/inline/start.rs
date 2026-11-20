@@ -113,10 +113,9 @@ fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     assert!(!snap.exists(), "the sidecar moved too");
 }
 
-/// `run`'s rescue leg cannot be driven without a real `claude` child, which this
-/// crate never fakes, so it is pinned over the source: the teardown tests own
-/// whether the move works, and this owns what stands between the stamp leg and
-/// the end of the teardown region.
+/// `run`'s rescue leg is pinned over the source: the teardown tests own whether
+/// the move works, and this owns what stands between the stamp leg and the end
+/// of the teardown region.
 ///
 /// An EQUALITY rather than a `contains`, because a needle that only looks for the
 /// condition is blind to every spelling that leaves the condition's own bytes

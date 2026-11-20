@@ -61,6 +61,13 @@ const KEY: &str = "cleanupPeriodDays";
 /// report again on every check.
 static RECORD_FAULT_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Latch for the state-flock fault line: one hold that cannot be taken — an
+/// unresolvable `~/.clauth`, its lock file, or the flock itself — is reported
+/// once, and a record write that lands re-arms it; a hold that writes nothing
+/// leaves it set. Its own latch keeps a lock fault from silencing the record
+/// fault that may follow it.
+static STATE_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// The files whose put-back or keep-current rewrite last failed, so a write
 /// fault that stays is reported once per process rather than on every check.
 /// Per file: a put-back landing in one file must not re-arm the line for
@@ -148,7 +155,7 @@ pub(crate) enum CarryOutcome {
     WriteFailed(std::io::Error),
     /// The state flock could not be taken: nothing is registered, and the
     /// caller writes the file with the number it already read. The fault is
-    /// reported once through the record-fault latch.
+    /// reported once through the state-lock latch.
     LockedOut,
 }
 
@@ -190,7 +197,7 @@ pub(crate) fn carry_into_spawn_file(
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
-            record_fault(format_args!(
+            state_lock_fault(format_args!(
                 "clauth: {e:#}; the spawn settings file {} is not registered, so it is not \
                  kept current",
                 settings_file.display()
@@ -250,7 +257,10 @@ fn register_spawn_file(file: &Path, floor: Option<u64>) {
         return;
     };
     match crate::profile::atomic_write_600(&record, bytes) {
-        Ok(()) => RECORD_FAULT_WARNED.store(false, Ordering::Relaxed),
+        Ok(()) => {
+            RECORD_FAULT_WARNED.store(false, Ordering::Relaxed);
+            STATE_LOCK_WARNED.store(false, Ordering::Relaxed);
+        }
         Err(e) => record_fault(format_args!(
             "clauth: failed to write the retention record {}: {e:#}; {} is not kept current",
             record.display(),
@@ -745,11 +755,20 @@ fn record_fault(line: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Clear both latches, so a test counting latched lines never reads a latch an
-/// earlier test in the same process left set.
+/// Report one state-flock fault under [`STATE_LOCK_WARNED`]: the first since
+/// a record write last landed logs `line`, the rest are silent.
+fn state_lock_fault(line: std::fmt::Arguments<'_>) {
+    if !STATE_LOCK_WARNED.swap(true, Ordering::Relaxed) {
+        logline!("{line}");
+    }
+}
+
+/// Clear every fault latch, so a test counting latched lines never reads a
+/// latch an earlier test in the same process left set.
 #[cfg(test)]
 pub(crate) fn reset_latches() {
     RECORD_FAULT_WARNED.store(false, Ordering::Relaxed);
+    STATE_LOCK_WARNED.store(false, Ordering::Relaxed);
     PUT_BACK_FAILURES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -789,8 +808,9 @@ fn spawn_rewrite_failure(path: &Path, e: &anyhow::Error) {
 /// Write `next` owner-only when it differs from what is on disk. A failure is
 /// reported once through [`record_fault`] and never fails the check: the
 /// decision this pass already made stands, and a later pass retries the write.
-/// A clean write clears the fault latch. Returns whether it wrote or failed
-/// to, `false` only when the record already said `next`.
+/// A clean write clears both fault latches, so the next fault on either is
+/// reported again; a hold that writes nothing clears neither. Returns whether
+/// it wrote or failed to, `false` only when the record already said `next`.
 fn persist(path: &Path, on_disk: &mut Retention, next: &Retention) -> bool {
     if on_disk == next {
         return false;
@@ -806,6 +826,7 @@ fn persist(path: &Path, on_disk: &mut Retention, next: &Retention) -> bool {
     match crate::profile::atomic_write_600(path, bytes) {
         Ok(()) => {
             RECORD_FAULT_WARNED.store(false, Ordering::Relaxed);
+            STATE_LOCK_WARNED.store(false, Ordering::Relaxed);
             *on_disk = next.clone();
         }
         Err(e) => {

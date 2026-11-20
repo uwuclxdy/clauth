@@ -1463,33 +1463,31 @@ flight and start the next as each result arrives."
                  tier, which outranks every setting clauth passes",
             ));
         }
-        // A `--settings` with no word left to take ends clauth's own walk with
-        // `Err`, and that walk is the one that merges a delegate's settings into
-        // clauth's file. Claude's parser refuses such an argv, and the
-        // passthrough a failed walk falls back to would hand over every earlier
-        // `--settings` word as the model wrote it, merged into nothing.
-        if args
-            .as_ref()
-            .is_some_and(|a| crate::cc_exempt::fold_settings_args(a).is_err())
-        {
-            return Ok(delegate_refusal(
-                "`args` cannot end in a `--settings` with no value: claude would refuse it",
-            ));
-        }
-        // A `--settings` before clauth's end of options is merged into the file
-        // it passes. Claude Code 2.1.326's own early settings reader takes the
-        // last `--settings` hit and skips a word only after a flag it knows
-        // exactly, so any `--settings` word clauth did not merge can win over
-        // that file: it is refused wherever it sits, after `--` or as another
-        // flag's value included.
-        if args
-            .as_ref()
-            .is_some_and(|a| args_hold_unmerged_settings(a))
-        {
-            return Ok(delegate_refusal(
-                "`args` cannot carry a `--settings` after `--` or as another flag's value: \
-                 claude would read it in place of the settings clauth passes",
-            ));
+        // One fold decides both `--settings` refusals. A walk ending in `Err`
+        // (a `--settings` with no word left to take) is an argv Claude's own
+        // parser refuses, and the passthrough a failed walk falls back to would
+        // hand over every earlier `--settings` word as the model wrote it,
+        // merged into nothing. A `--settings` word the fold leaves in its output
+        // is one clauth did not merge, whether after `--` or taken as another
+        // flag's value, and Claude Code 2.1.326's own early settings reader
+        // takes the last `--settings` hit and skips a word only after a flag it
+        // knows exactly, so such a word can win over the file clauth passes: it
+        // is refused wherever it sits.
+        if let Some(args) = args.as_ref() {
+            match crate::cc_exempt::fold_settings_args(args) {
+                Err(()) => {
+                    return Ok(delegate_refusal(
+                        "`args` cannot end in a `--settings` with no value: claude would refuse it",
+                    ));
+                }
+                Ok((_, clean)) if words_carry_flag(&clean, "--settings") => {
+                    return Ok(delegate_refusal(
+                        "`args` cannot carry a `--settings` after `--` or as another flag's \
+                         value: claude would read it in place of the settings clauth passes",
+                    ));
+                }
+                Ok(_) => {}
+            }
         }
         // The result mode is a closed set: unset means inline, `"file"` means
         // the envelope lands on disk and the reply carries path + sha256 + cost.
@@ -4279,15 +4277,6 @@ fn words_carry_flag(words: &[String], flag: &str) -> bool {
     })
 }
 
-/// True when raw `args` holds a `--settings` word clauth's own walk did not
-/// merge: one [`crate::cc_exempt::fold_settings_args`] leaves in its output. A
-/// walk that ends in `Err` (a `--settings` with no word left to take) is
-/// refused before this check, so only an `Ok` walk is read here.
-fn args_hold_unmerged_settings(args: &[String]) -> bool {
-    crate::cc_exempt::fold_settings_args(args)
-        .is_ok_and(|(_, clean)| words_carry_flag(&clean, "--settings"))
-}
-
 /// What the stdout reader keeps from a streamed delegate. The transcript runs to
 /// megabytes and only the terminal envelope is wanted, so lines are inspected and
 /// dropped rather than buffered, alongside a bounded tail of the assistant text
@@ -5036,7 +5025,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         runtime.config_dir(),
         &settings_cwd,
         &opts.extra_args,
-        crate::cc_exempt::ArgsFrom::Model,
+        crate::cc_exempt::Model,
         &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
         Some(&crate::cc_exempt::hook_command(
             crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND,
@@ -5438,10 +5427,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 /// `session_id` is the id clauth pinned at the spawn, so every arm's envelope
 /// carries a resumable handle even when nothing the child streamed named one.
 ///
-/// Split out because the live spawn paths have no unit test by standing decision
-/// — this crate never fakes a `claude` on PATH, since a fake binary would assert
-/// nothing about the real envelope contract — so handing this function a real
-/// `ExitStatus` is the only way to drive the two lossy arms at all.
+/// Split out so the two lossy arms run on a real `ExitStatus`: `FakeClaude`
+/// drives the spawn path in the tests, but a fake binary asserts nothing about
+/// the real envelope contract.
 enum RunOutcome {
     /// A clean exit whose terminal envelope parsed: the delegate's own
     /// self-report, verbatim. `throttle_scan` rides it too so the recording

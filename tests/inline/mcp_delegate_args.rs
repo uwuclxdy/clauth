@@ -580,9 +580,8 @@ fn args_carry_flag_matches_both_spellings() {
 }
 
 /// The wiring the shadow rule protects: `subagent_type` reaches the child as
-/// `--agent <name>`. `run_delegate` cannot run without a real `claude` child,
-/// so the pin is a source scan, the same mechanism the heartbeat wiring pins
-/// use.
+/// `--agent <name>`. The argv test below runs `run_delegate` under
+/// `FakeClaude`; this source scan stays as the cheap pin on the arm itself.
 #[test]
 fn subagent_type_is_passed_as_the_agent_flag() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -2407,5 +2406,107 @@ fn a_quarantined_proxy_target_is_told_the_login_through_its_proxy() {
             ),
         ),
         "(the proxy account's refusal, the plain account's)"
+    );
+}
+
+/// Ends the held delegate if the test leaves before its own signal: the shim
+/// records its pid before it waits, so a drop after a panic past that read
+/// still finds the pid, and a second signal to a group already gone does
+/// nothing. Without it, a panic between the spawn and the signal leaves the
+/// run thread blocked on a child only a signal ends, and the scoped join hangs.
+/// Residual: a shim that records nothing inside the pid wait's ten seconds
+/// leaves no pid to find, so a panic there waits on the child; a shim that
+/// starts at all records before it waits.
+#[cfg(target_os = "linux")]
+struct HeldDelegate<'a> {
+    hold: &'a std::path::Path,
+    pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldDelegate<'_> {
+    /// Record the pid the test read, so the drop signals even if the file it
+    /// was read from is unreadable by then.
+    fn record(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldDelegate<'_> {
+    fn drop(&mut self) {
+        let recorded = std::fs::read_to_string(self.hold)
+            .ok()
+            .and_then(|text| text.lines().next()?.parse::<u32>().ok());
+        if let Some(pid) = self.pid.or(recorded) {
+            jobs::signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// A delegate's child reads stdin from `/dev/null`: claude 2.1.327 takes
+/// settings and managed settings from a piped stdin's initialize line, and no
+/// scan of `args` sees them, so a piped stdin would open a settings channel
+/// clauth never judged.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_delegate_spawns_claude_with_a_null_stdin() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let mut fake = FakeClaude::new(&home);
+    let hold = home.home().join("stdin-hold.log");
+    fake.set_signal_hold(&hold);
+    let stdin = std::thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            call_delegate(DelegateArgs {
+                profiles: Some(vec!["solo".to_string()]),
+                prompt: Some("hi".to_string()),
+                ..base()
+            })
+        });
+        let mut held = HeldDelegate {
+            hold: &hold,
+            pid: None,
+        };
+        let pid = super::tests::wait_for_recorded_pid(&hold);
+        held.record(pid);
+        let stdin = std::fs::read_link(format!("/proc/{pid}/fd/0"));
+        // The group signal ends the held child and the grandchild holding its
+        // pipes; a group already gone signals nothing.
+        jobs::signal_group(pid, libc::SIGTERM);
+        run.join().expect("the delegate returns a tool result");
+        stdin
+    });
+    assert_eq!(
+        stdin.expect("the held child still has its stdin"),
+        std::path::Path::new("/dev/null"),
+        "the delegate's claude reads stdin from /dev/null, never a settings channel"
+    );
+}
+
+/// The delegate spawn names its stdin exactly once: an inherited one is the MCP
+/// server's own JSON-RPC pipe, and a later `.stdin(..)` on the same builder
+/// overrides the null. The runtime test above cannot tell an inherited stdin
+/// from `/dev/null` when the runner itself hands the test `/dev/null`.
+#[test]
+fn run_delegate_names_a_null_stdin() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let rest = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let body = rest.split_once("\nfn ").map_or(rest, |(body, _)| body);
+    assert!(
+        body.contains(".stdin(Stdio::null())"),
+        "run_delegate must spawn claude with a null stdin"
+    );
+    assert_eq!(
+        body.matches(".stdin(").count(),
+        1,
+        "run_delegate sets claude's stdin once, so nothing overrides the null"
     );
 }

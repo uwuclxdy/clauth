@@ -1513,7 +1513,7 @@ pub(crate) fn run_for_code(
             runtime.config_dir(),
             cwd,
             claude_args,
-            crate::cc_exempt::ArgsFrom::Operator,
+            crate::cc_exempt::Operator,
             &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
             // `clauth start` keeps a session's own turn lifecycle; the
             // foreground-spawn guard is a delegate-only repair.
@@ -1522,9 +1522,6 @@ pub(crate) fn run_for_code(
         ) {
             Ok(Some(warning)) => errln!("{warning}"),
             Ok(None) => {}
-            // No arm refuses an operator launch, but a refusal must stop the
-            // launch rather than warn and spawn anyway.
-            Err(line) => anyhow::bail!(line),
         }
     } else {
         command.args(claude_args);
