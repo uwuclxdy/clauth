@@ -90,8 +90,18 @@ fn start_older_mod(hub: &Hub, pid: u32, session: &str) {
     assert_eq!(status, 200, "start {session}: {answer}");
 }
 
+/// One poll of a [`start`] session's mod, which announces reports on every
+/// poll as on its start.
 fn commands(hub: &Hub, pid: u32, session: &str) -> serde_json::Value {
-    let (status, answer) = hub.poll(pid, session, Duration::ZERO);
+    polled(hub.poll_as(pid, session, Duration::ZERO, true), session)
+}
+
+/// One poll of a [`start_older_mod`] session's mod: no reports flag.
+fn older_mod_commands(hub: &Hub, pid: u32, session: &str) -> serde_json::Value {
+    polled(hub.poll(pid, session, Duration::ZERO), session)
+}
+
+fn polled((status, answer): (u16, serde_json::Value), session: &str) -> serde_json::Value {
     assert_eq!(status, 200, "poll {session}: {answer}");
     answer["commands"].clone()
 }
@@ -308,7 +318,7 @@ fn an_older_mod_gets_no_prompt_ids() {
         )
     );
     assert_eq!(
-        commands(&hub, 100, "s-one"),
+        older_mod_commands(&hub, 100, "s-one"),
         json!([{"kind": "prompt", "text": "fix it"}])
     );
     assert_eq!(hub.snapshot()["prompts"], json!([]));

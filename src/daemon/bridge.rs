@@ -93,10 +93,11 @@ const MAX_EVENT_CONNECTIONS: usize = 32;
 const MAX_PARKED_POLLS: usize = 256;
 
 /// Cap on one instance's queued commands, counted together with any a poll has
-/// drained and is still writing (the in-flight count). A live mod drains the
-/// queue on every poll, so the queue stays empty or near-empty; the cap only
-/// bites a mod that stopped polling, whose commands would otherwise grow
-/// without bound while every command route kept answering 200 (SB-10, SB-19).
+/// drained and is still writing (the in-flight count). A live mod's current
+/// load drains the queue on every poll, so the queue stays empty or
+/// near-empty; the cap only bites a mod that stopped polling, whose commands
+/// would otherwise grow without bound while every command route kept
+/// answering 200 (SB-10, SB-19).
 /// 8192 doubles the write-timeout pin's 4096-command batch, so the cap never
 /// bites a live mod while still bounding one stopped-reading instance. It
 /// bounds the prompts one instance holds still awaiting an outcome too: no
@@ -419,9 +420,9 @@ impl Cap {
     }
 }
 
-/// One live claude instance, keyed by its peer pid. Liveness is the poll:
-/// `last_poll` moves on every poll, and a poll silent past [`SILENCE_LIMIT`]
-/// closes the instance (SB-13).
+/// One live claude instance, keyed by its peer pid. Liveness is the poll of
+/// its current module load ([`Loads`]): `last_poll` moves on each such poll,
+/// and one silent past [`SILENCE_LIMIT`] closes the instance (SB-13).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "four independent per-instance state flags (announced, prompt_reports, tailing, ending), never read as one combined mode"
@@ -448,16 +449,19 @@ struct Live {
     /// The `start` event's cwd and interactive, for the snapshot.
     cwd: Value,
     interactive: Value,
-    /// Whether the mod reports each prompt's outcome: its `start` carried
-    /// `"prompt_reports": true`, or one of its polls announced reports. A mod
+    /// Whether the mod reports each prompt's outcome, as the current load's
+    /// last `start` (`"prompt_reports": true`) or poll (`prompt_reports=1`)
+    /// said: a hot reload onto a mod that never reports turns it off. A mod
     /// that never reports gets no prompt id, so nothing sits queued here for a
     /// session that would never settle it.
     prompt_reports: bool,
-    /// The capabilities the mod declared on its last `start` or poll. Unlike
-    /// `prompt_reports`, which only ever turns on, each start and each poll
-    /// replaces them: a hot reload onto an older mod really drops a capability,
-    /// and a note sent on a stale `notes` would be lost.
+    /// The capabilities the current load declared on its last `start` or poll,
+    /// each of which replaces them: a hot reload onto an older mod really
+    /// drops a capability, and a note sent on a stale `notes` would be lost.
     caps: BTreeSet<Cap>,
+    /// Which module load of the mod speaks for this instance: only its starts
+    /// and polls set `prompt_reports` and `caps` or drain `commands`.
+    loads: Loads,
     /// The main transcript, located at registration and tailed on each
     /// main-file wake; `None` until the file is found (SB-11).
     main_file: Option<FileTail>,
@@ -534,6 +538,7 @@ impl Live {
             interactive: Value::Null,
             prompt_reports: false,
             caps: BTreeSet::new(),
+            loads: Loads::Unheard,
             main_file: None,
             subagent_files: HashMap::new(),
             subagent_snapshot: HashMap::new(),
@@ -589,6 +594,68 @@ impl Live {
             self.prompts.retain(|minted| minted.id != evicted);
         }
         true
+    }
+}
+
+/// The mod's module loads one instance has heard from. The mod counts each
+/// load in `$.state` and sends that load number on every `start` (`"load"`)
+/// and poll (`load=`); a mod released before load numbers sends none. A start
+/// and a poll ride different connections, so a poll a torn-down module sent
+/// before a hot reload can reach the hub after the new module's start: only a
+/// start or poll of the current load counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loads {
+    /// Nothing heard yet: whatever comes first is current, as a restarted
+    /// daemon meeting a live mod has nothing to judge it by.
+    Unheard,
+    /// The current load sends this number, the highest seen.
+    Numbered(u64),
+    /// The current load sends no number. It came after every load numbered up
+    /// to `after`, the highest number seen, if any.
+    Unnumbered { after: Option<u64> },
+}
+
+impl Loads {
+    /// Whether a poll sent under `load` comes from the current load or a
+    /// newer one: a newer number is a load whose start never reached the hub.
+    fn admits_poll(self, load: Option<u64>) -> bool {
+        match (self, load) {
+            (Self::Unheard, _) | (Self::Unnumbered { .. }, None) => true,
+            (Self::Numbered(high), Some(n)) => n >= high,
+            (Self::Numbered(_), None) => false,
+            (Self::Unnumbered { after }, Some(n)) => after.is_none_or(|high| n > high),
+        }
+    }
+
+    /// Admit a poll sent under `load`, moving the current load to it.
+    /// `false` for a poll of an older load, which changes nothing.
+    fn admit_poll(&mut self, load: Option<u64>) -> bool {
+        let current = self.admits_poll(load);
+        if current {
+            self.adopt(load);
+        }
+        current
+    }
+
+    /// Admit a `start` sent under `load`, moving the current load to it. An
+    /// unnumbered start is always current: a released mod's start is the
+    /// downgrade it stands for, and the event `seq` already refuses a stale
+    /// one. A numbered start is judged as a poll is.
+    fn admit_start(&mut self, load: Option<u64>) -> bool {
+        let current = load.is_none() || self.admits_poll(load);
+        if current {
+            self.adopt(load);
+        }
+        current
+    }
+
+    fn adopt(&mut self, load: Option<u64>) {
+        *self = match (load, *self) {
+            (Some(n), _) => Self::Numbered(n),
+            (None, Self::Unheard) => Self::Unnumbered { after: None },
+            (None, Self::Numbered(high)) => Self::Unnumbered { after: Some(high) },
+            (None, unnumbered @ Self::Unnumbered { .. }) => unnumbered,
+        };
     }
 }
 
@@ -1326,32 +1393,37 @@ impl Hub {
         let mut append_agent: Option<Option<String>> = None;
         let (status, body) = match kind {
             "start" => {
-                live.cwd = value.get("cwd").cloned().unwrap_or(Value::Null);
-                live.interactive = value.get("interactive").cloned().unwrap_or(Value::Null);
-                // Tracking only ever turns on (a `start` carrying the flag, or a
-                // poll announcing it): a later start without the flag must not
-                // un-track a mod the polls already marked.
-                if value.get("prompt_reports").and_then(Value::as_bool) == Some(true) {
-                    live.prompt_reports = true;
+                // A start of an older load than the current one changes nothing.
+                if live
+                    .loads
+                    .admit_start(value.get("load").and_then(Value::as_u64))
+                {
+                    // Wake a parked poll of the load this start replaced: it
+                    // answers empty, never draining what the new load owns.
+                    self.changed.notify_all();
+                    live.cwd = value.get("cwd").cloned().unwrap_or(Value::Null);
+                    live.interactive = value.get("interactive").cloned().unwrap_or(Value::Null);
+                    live.prompt_reports =
+                        value.get("prompt_reports").and_then(Value::as_bool) == Some(true);
+                    live.caps = Cap::set_of(
+                        value
+                            .get("caps")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    );
+                    self.broadcast(
+                        "session.status",
+                        json!({
+                            "session": named,
+                            "state": "start",
+                            "cwd": live.cwd,
+                            "interactive": live.interactive,
+                            "caps": Cap::names(&live.caps),
+                        }),
+                    );
                 }
-                live.caps = Cap::set_of(
-                    value
-                        .get("caps")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str),
-                );
-                self.broadcast(
-                    "session.status",
-                    json!({
-                        "session": named,
-                        "state": "start",
-                        "cwd": live.cwd,
-                        "interactive": live.interactive,
-                        "caps": Cap::names(&live.caps),
-                    }),
-                );
                 (200, json!({ "ok": true }))
             }
             "turn_start" | "turn_end" => {
@@ -1840,10 +1912,10 @@ impl Hub {
     /// answer has the write succeed by construction, so its drained commands
     /// are consumed here. Production polls only through
     /// [`Hub::poll_announced`], so the consume-or-requeue choice stays in
-    /// `serve`. A poll with `reports` marks the mod as reporting each prompt's
-    /// outcome, as its `/poll` query flag does; one without never turns
-    /// tracking off. It declares no capabilities, so it leaves the instance
-    /// none.
+    /// `serve`. `reports` is the poll's `prompt_reports` flag, which replaces
+    /// the instance's as its `/poll` query flag does. It declares no
+    /// capabilities, so it leaves the instance none, and sends no load number,
+    /// as a mod released before load numbers polls ([`Loads`]).
     #[cfg(test)]
     pub(crate) fn poll_as(
         &self,
@@ -1893,8 +1965,8 @@ impl Hub {
         Ok(resolved)
     }
 
-    /// [`Hub::poll_announced`] for a poll declaring no capabilities, with
-    /// `reports` as its `prompt_reports` flag.
+    /// [`Hub::poll_announced`] for a poll declaring no capabilities and no
+    /// load number, with `reports` as its `prompt_reports` flag.
     #[cfg(test)]
     fn poll_answer(
         &self,
@@ -1906,6 +1978,7 @@ impl Hub {
         let announced = Announced {
             prompt_reports: reports,
             caps: BTreeSet::new(),
+            load: None,
         };
         self.poll_announced(peer_pid, session, wait, announced)
     }
@@ -1914,8 +1987,10 @@ impl Hub {
     /// requeue them when the answer write fails rather than letting a 200'd
     /// command vanish (A#1). A restarted daemon first meets a live mod by its
     /// poll, so the poll's [`Announced`] lands on the instance it reconciles:
-    /// `prompt_reports` turns prompt tracking on (a poll without never clears
-    /// it), and `caps` replaces the instance's capabilities.
+    /// its `prompt_reports` and `caps` replace the instance's. A poll of an
+    /// older module load than the instance's current one ([`Loads`]) answers
+    /// empty at once and touches nothing: no announcement, no drain, no
+    /// liveness, no park, so the current load's parked poll stays parked.
     fn poll_announced(
         &self,
         peer_pid: u32,
@@ -1930,15 +2005,19 @@ impl Hub {
         // The device store is read once per poll answer (A#15), before the hub
         // lock, so the read never stalls the hub (SB-10).
         let remote = self.remote_flag();
+        let load = announced.load;
         let (created, generation, commands) = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let now = self.now();
             self.close_silent(&mut inner, now);
             let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
-            live.last_poll = now;
-            if announced.prompt_reports {
-                live.prompt_reports = true;
+            // A just-minted instance has heard no load, so it admits this poll
+            // and never stays behind with its registration tail slot held.
+            if !live.loads.admit_poll(load) {
+                return PollAnswer::empty(200, poll_body(remote, &[]));
             }
+            live.last_poll = now;
+            live.prompt_reports = announced.prompt_reports;
             live.caps = announced.caps;
             let commands: Vec<Value> = live.commands.drain(..).collect();
             live.inflight += commands.len();
@@ -1958,12 +2037,13 @@ impl Hub {
         // and a parked poll only ever drains its own instance's queue (SB-4).
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let my_epoch = match inner.instances.get_mut(&peer_pid) {
-            Some(live) if live.generation == generation => {
+            Some(live) if live.generation == generation && live.loads.admits_poll(load) => {
                 live.poll_epoch = live.poll_epoch.wrapping_add(1);
                 live.poll_epoch
             }
             // The instance was replaced or closed during the registration
-            // locate: this poll no longer owns the park.
+            // locate, or a newer load started since the drain: this poll no
+            // longer owns the park.
             _ => return PollAnswer::empty(200, poll_body(remote, &[])),
         };
         let my_generation = generation;
@@ -1988,6 +2068,8 @@ impl Hub {
                 // A newer poll parked on the same instance: empty, never a
                 // command the replacement owns (A#1).
                 Some(live) if live.poll_epoch != my_epoch => (Vec::new(), true),
+                // A newer load started: empty, never a command it owns.
+                Some(live) if !live.loads.admits_poll(load) => (Vec::new(), true),
                 Some(live) => {
                     let commands: Vec<Value> = live.commands.drain(..).collect();
                     live.inflight += commands.len();
@@ -3484,15 +3566,18 @@ fn parse_poll_session(path: &str) -> Option<&str> {
     query_param(path, "session")
 }
 
-/// What a poll's query announces about its mod: the mod sends both on every
-/// poll, so a restarted daemon that first meets a live mod by its poll still
-/// learns them.
+/// What a poll's query announces about its mod: the mod sends all of it on
+/// every poll, so a restarted daemon that first meets a live mod by its poll
+/// still learns it.
 struct Announced {
     /// `prompt_reports=1`: the mod reports each prompt's outcome.
     prompt_reports: bool,
     /// `caps=<name>,<name>`: the capabilities the mod declares, known names
     /// only; none when the query carries no `caps`.
     caps: BTreeSet<Cap>,
+    /// `load=<n>`: the module load that sent the poll ([`Loads`]); none when
+    /// the query carries no `load` or one that is not a decimal `u64`.
+    load: Option<u64>,
 }
 
 impl Announced {
@@ -3504,6 +3589,10 @@ impl Announced {
                     .into_iter()
                     .flat_map(|names| names.split(',')),
             ),
+            // Digits only: `u64`'s parse also takes a leading `+`.
+            load: query_param(path, "load")
+                .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse().ok()),
         }
     }
 }
@@ -3759,3 +3848,7 @@ mod wait_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_prompts.rs"]
 mod prompts_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_loads.rs"]
+mod loads_tests;

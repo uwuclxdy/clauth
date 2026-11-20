@@ -1443,7 +1443,7 @@ test('CL3: the clear end goes out under the ended id, and the new id start carri
   session.id = 'sid-2'
   for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
   expect(bridge.events.filter(b => b.kind === 'end').map(b => b.session)).toEqual(['sid-1'])
-  const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, ...rest }) => rest)
+  const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, load, ...rest }) => rest)
   expect(starts).toEqual([
     { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
     { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
@@ -2022,7 +2022,7 @@ test('PQ9: the start event tells the daemon this mod reports prompt outcomes and
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const starts = bridge.events.filter(e => e.kind === 'start')
-  expect(starts.map(({ seq, ...rest }) => rest)).toEqual([
+  expect(starts.map(({ seq, load, ...rest }) => rest)).toEqual([
     { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true, caps: ['notes'] },
   ])
 })
@@ -2081,6 +2081,77 @@ test('PQ23: every poll tells the daemon this mod takes notes', async ($, on) => 
   for (const f of polls) {
     expect(/[?&]caps=notes(&|$)/.test(f.url)).toBe(true)
   }
+})
+
+// The last module load's number, as `$.state` keeps it across a reload.
+const LOAD = { plugin: 'clauth', key: 'load' }
+
+// `$.state` answers `stored` for the load number while it holds none, standing
+// for the load before this one; `empty.once` makes the next read find none,
+// as a `/clear` leaves it.
+function seedLoad(on: On, stored: number, empty = { once: false }) {
+  on('state.get', async ($, e, next) => {
+    const r = (await next(e)) as { value?: { value?: unknown; version: number } }
+    if (e.plugin !== LOAD.plugin || e.key !== LOAD.key) return r as never
+    if (empty.once) {
+      empty.once = false
+      return { value: { value: undefined, version: r!.value!.version } }
+    }
+    if (r?.value?.value === undefined) return { value: { value: stored, version: r!.value!.version } }
+    return r as never
+  })
+}
+
+function loadWrites(on: On): unknown[] {
+  const writes: unknown[] = []
+  on('state.set', async ($, e, next) => {
+    if (e.plugin === LOAD.plugin && e.key === LOAD.key) writes.push(e.value)
+    return next(e)
+  })
+  return writes
+}
+
+test('LD1: a fresh load sends one more than the last load number on its start and every poll, and keeps it', async ($, on) => {
+  seedLoad(on, 6)
+  const writes = loadWrites(on)
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  expect(bridge.events.filter(e => e.kind === 'start').map(e => e.load)).toEqual([7])
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(1)
+  for (const f of polls) {
+    expect(/[?&]load=7(&|$)/.test(f.url)).toBe(true)
+  }
+  expect(writes).toEqual([7])
+})
+
+test('LD2: the start retry and the re-registration after a /clear carry the load number and write it back', async ($, on) => {
+  const empty = { once: false }
+  seedLoad(on, 6, empty)
+  const writes = loadWrites(on)
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  bridge.start.refuse = 'sid-2'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  empty.once = true
+  const writesAtClear = writes.length
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  bridge.start.refuse = null
+  for (let i = 0; i < 8; i++) await clock.advance(PARK_MS)
+  const starts = bridge.events.filter(b => b.kind === 'start')
+  expect(starts.filter(b => b.session === 'sid-2').length).toBeGreaterThan(1)
+  for (const b of starts) expect(b.load).toBe(7)
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?session=sid-2'))
+  expect(polls.length).toBeGreaterThan(0)
+  for (const f of polls) expect(/[?&]load=7(&|$)/.test(f.url)).toBe(true)
+  const after = writes.slice(writesAtClear)
+  expect(after.length).toBeGreaterThan(0)
+  for (const w of after) expect(w).toBe(7)
 })
 
 // A fresh load of the module (a hooks-worker respawn or a reload) starts with

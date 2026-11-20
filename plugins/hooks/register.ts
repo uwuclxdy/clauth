@@ -81,6 +81,7 @@ const CONTINUING_ENDS = new Set(['clear', 'resume'])
 const CAPS = ['notes'] as const
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
+const LOAD = { plugin: 'clauth', key: 'load' } as const
 const HELD = { plugin: 'clauth', key: 'heldRow' } as const
 const PROMPTS = { plugin: 'clauth', key: 'prompts' } as const
 
@@ -240,7 +241,8 @@ type HeldEntry = {
 }
 
 // Per-load runtime state. The values a hot reload must keep, the event
-// sequence number and the prompt queue, live in `$.state` (SEQ, PROMPTS);
+// sequence number, the load count and the prompt queue, live in `$.state`
+// (SEQ, LOAD, PROMPTS);
 // everything here is re-established by the `session.start` that fires again on
 // a reload.
 let inert = false
@@ -251,6 +253,10 @@ let sessionId: string | null = null
 // to leave this id, then registers the new one with the last `session.start`'s
 // fields.
 let endedSessionId: string | null = null
+// This module load's number, one above the last load's (LOAD), sent on every
+// start and poll: a start and a poll ride different connections, so the daemon
+// tells a poll the torn-down module already sent from one of this load's.
+let loadNumber: number | null = null
 let startFields: Record<string, unknown> = {}
 let interactive = false
 let pollStarted = false
@@ -830,7 +836,7 @@ async function doPoll($: EngineInterface): Promise<void> {
     try {
       res = await fetchBridge(
         $,
-        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1&caps=${CAPS.join(',')}`,
+        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1&caps=${CAPS.join(',')}&load=${loadNumber}`,
         'GET',
       )
     } catch {
@@ -878,6 +884,10 @@ async function pollSession($: EngineInterface): Promise<string | null> {
     return sessionId
   }
   if (current === sessionId || current === endedSessionId) return sessionId
+  // The next conversation's `$.state` may hold no LOAD, or a lower one, while
+  // this load goes on sending its number: written back, a later load counts
+  // above this one.
+  await update($, LOAD, cur => Math.max(cur ?? 0, loadNumber ?? 0))
   if (!(await postEvent($, 'start', startFields, current))) {
     await onPollError($)
     return null
@@ -1419,10 +1429,9 @@ async function scanDelegates($: EngineInterface): Promise<void> {
   const after = [...rows.values()].sort((a, b) => b.startedAt - a.startedAt)
   const live = after.some(row => isLive(row.word))
   // A read that started under a conversation that has since ended writes
-  // nothing into the next one: a `/clear` or a `/resume` empties `$.state` and
-  // moves the epoch, so this scan's rows, stamps, open and notices all belong
-  // to a conversation that is gone. The next scan redoes the work under the
-  // new id.
+  // nothing into the next one: every session end moves the epoch, so this
+  // scan's rows, stamps, open and notices all belong to a conversation that is
+  // gone. The next scan redoes the work under the new id.
   if (epoch !== sessionEpoch) return
   // A read that adopts a live run takes over the ticks: a job minted outside
   // a delegate call has no call to start them.
@@ -2217,7 +2226,14 @@ export const register: Register = on => {
     interruptedTurn = null
     await loadPrompts($)
     await $.state.set(HELD, null)
-    startFields = { cwd: e.cwd, interactive: e.isInteractive, prompt_reports: true, caps: [...CAPS] }
+    loadNumber ??= await update($, LOAD, cur => (cur ?? 0) + 1)
+    startFields = {
+      cwd: e.cwd,
+      interactive: e.isInteractive,
+      prompt_reports: true,
+      caps: [...CAPS],
+      load: loadNumber,
+    }
     void postEvent($, 'start', startFields)
     startPollLoop($)
     return next(e)
