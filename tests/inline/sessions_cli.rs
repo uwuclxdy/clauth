@@ -1551,12 +1551,152 @@ fn switch_is_a_no_op_for_a_session_already_on_the_profile() {
             .expect("row")
             .intended_member,
         None,
-        "no intent is written for a session already on the profile: the executor \
-         treats an intent equal to the current member as the steady state"
+        "no intent is written for a session already on the profile with no intent \
+         to another account standing: the executor treats an intent equal to the \
+         current member as the steady state"
     );
     assert_eq!(
         already_on_line("4242-0", "work"),
         "clauth: session '4242-0' is already on 'work'"
+    );
+}
+
+/// An intent that already names the account the session runs is the steady
+/// state, not a standing move: switching onto that account stays the
+/// `already on` no-op and leaves the intent as it was.
+#[test]
+fn switch_onto_the_current_account_with_an_equal_intent_is_a_no_op() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    crate::live_sessions::update_as_daemon("4242-0", |d| d.set_intended_member("work"))
+        .expect("seed an intent equal to the current account");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "work").expect("already-on is a satisfied ask");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", already_on_line("4242-0", "work")),
+        "an intent equal to the current account is no move to replace"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("work"),
+        "the no-op leaves the intent as it was"
+    );
+}
+
+/// A switch back onto the account a session runs, while an earlier switch away
+/// still waits for the executor, replaces that intent: it is no `already on`
+/// no-op, or the session lands on the account the earlier switch named.
+#[test]
+fn a_switch_back_replaces_a_standing_intent() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+    run_switch("4242-0", "spare").expect("the first switch");
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "fixture control: the first switch's intent stands"
+    );
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "work").expect("the switch back");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", switch_receipt("4242-0", "work")),
+        "the switch back prints the move receipt, never `already on`"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("work"),
+        "the switch back replaces the intent it found"
+    );
+}
+
+/// A session that moved off its launch account, as the executor leaves it.
+fn moved_live_row(sid: &str, start: &str, current: &str, intent: &str) -> std::fs::File {
+    let mut row = live_fixture_row(sid, start, 60);
+    row.current_member = Some(current.to_string());
+    row.visited_members = vec![start.to_string(), current.to_string()];
+    row.intended_member = Some(intent.to_string());
+    register_live(&row, current)
+}
+
+/// The no-op reads the account the session runs, never its launch account: a
+/// moved session with a move back to its launch account standing is no
+/// `already on` no-op when switched onto the account it runs.
+#[test]
+fn a_switch_back_on_a_moved_session_replaces_a_move_to_its_launch_account() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = moved_live_row("4242-0", "work", "spare", "work");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "spare").expect("the switch back");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", switch_receipt("4242-0", "spare")),
+        "the switch back prints the move receipt, never `already on`"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "the switch back replaces the move to the launch account"
+    );
+}
+
+/// A moved session's steady state (an intent equal to the account it runs)
+/// stays the `already on` no-op when switched onto that account.
+#[test]
+fn switch_onto_a_moved_sessions_current_account_is_a_no_op() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = moved_live_row("4242-0", "work", "spare", "spare");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _capture = out.capture_here();
+        run_switch("4242-0", "spare").expect("already-on is a satisfied ask");
+    }
+
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        format!("{}\n", already_on_line("4242-0", "spare")),
+        "an intent equal to the account a moved session runs is no move to replace"
+    );
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .as_deref(),
+        Some("spare"),
+        "the no-op leaves the intent as it was"
     );
 }
 

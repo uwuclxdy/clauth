@@ -3477,6 +3477,138 @@ fn a_shutdown_preempts_a_probe_and_stops_the_gateway_inside_the_budget() {
     rig.server.wait_serving(false);
 }
 
+/// A refused stop spawn runs its inline stop AFTER the spend drain: with a
+/// real gateway and one real proxy whose children outlast the stop budget,
+/// and both stop-thread spawns refused through the seam, the drain's
+/// shutdown flag latches before either stop sends its one SIGTERM. The
+/// spender thread holds the in-flight claim and watches the latches — the
+/// flag and both stubs' TERM records — so the first of them names the
+/// order, never a wall clock: under the old order an inline stop ran first
+/// and the watchdog could then cut the drain.
+#[cfg(unix)]
+#[test]
+fn a_refused_stop_spawn_drains_before_its_inline_stops() {
+    let rig = Rig::new("0.49.1");
+    let dir = clauth_dir().expect("dir");
+    let super::super::probe::Claim::Active(singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    // One enabled stub proxy in the same sandbox: its registry row, token and
+    // stub binary. The drain marker makes its stop outlast the budget (the
+    // child keeps draining past it and exits on its own).
+    let pdir = tempfile::tempdir().expect("proxy stub dir");
+    stub::write_proxy_stub(pdir.path(), "zcode");
+    std::fs::write(pdir.path().join("drain"), "10").expect("drain marker");
+    let pport = stub::free_port();
+    let pserver = stub::HealthServer::start_proxy(pdir.path(), pport, "zcode", "1.2.0", "1.0");
+    crate::proxy::enable("zcode", Some(pport), Some(pdir.path().as_os_str())).expect("enable");
+    let zcode = crate::proxy::Service::parse("zcode").expect("a service");
+    let slots = crate::daemon::proxies::new_slots();
+
+    let gateway = start(Arc::clone(&rig.handle), &singleton).expect("the gateway supervisor");
+    let proxies =
+        crate::daemon::proxies::start(Arc::clone(&slots), &singleton).expect("the coordinator");
+    stub::wait_until("the thread publishes a healthy gateway", secs(15), || {
+        published(&rig.handle).is_some_and(|slot| slot.state == GatewayState::Healthy)
+    });
+    stub::wait_until(
+        "the coordinator publishes a healthy proxy",
+        secs(15),
+        || {
+            crate::daemon::proxies::published(&slots, &zcode)
+                .is_some_and(|slot| slot.state == crate::daemon::proxies::ProxyState::Healthy)
+        },
+    );
+    let pid = rig.only_call().pid;
+
+    // The gateway's stop outlasts the budget: the stall holds the supervisor
+    // thread at its stopping line, so the answer never comes inside the
+    // budget and the inline stop takes the whole budget plus the grace.
+    let _stall = probe_seam::stall_begin_stop("clauth-gateway", secs(10));
+
+    // A token spend in flight when the stop runs: the spender holds the
+    // claim and watches the order — the drain's flag must latch before
+    // either stub records its TERM (each inline stop's first act).
+    let activity: crate::usage::ActivityStore = Arc::new(crate::lockorder::RankedMutex::new(
+        std::collections::HashMap::new(),
+    ));
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let spender = {
+        let activity = Arc::clone(&activity);
+        let shutting_down = Arc::clone(&shutting_down);
+        let gateway_dir = rig.dir.clone();
+        let proxy_dir = pdir.path().to_path_buf();
+        let lines = rig.lines.clone();
+        std::thread::spawn(move || {
+            let name = crate::profile::ProfileName::from("mid-spend");
+            let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                &activity,
+                &name,
+                shutting_down.as_ref(),
+            )
+            .expect("an unset flag admits the spend");
+            claimed_tx.send(()).expect("the test waits for the claim");
+            let deadline = std::time::Instant::now() + secs(20);
+            loop {
+                assert!(
+                    stub::terms(&gateway_dir).is_empty() && stub::terms(&proxy_dir).is_empty(),
+                    "a stop began before the drain: gateway {:?}, proxy {:?}",
+                    stub::terms(&gateway_dir),
+                    stub::terms(&proxy_dir)
+                );
+                // The flag alone is not enough to release the claim: the
+                // drain raises it before it reads the spend, so a release on
+                // the flag could land before that read and the drain would
+                // never log its wait. The wait line proves the drain saw the
+                // spend in flight.
+                let drained = shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+                    && lines.snapshot().iter().any(|l| l.contains("waiting up to"));
+                if drained {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the drain never began"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // The drain began first: release the spend so the drain ends and
+            // the stops run.
+            drop(claim);
+        })
+    };
+    claimed_rx.recv().expect("the spender claimed");
+
+    let _refused = probe_seam::fail_stop_spawns();
+    stop_for_exit(&spends, Some(gateway), proxies);
+
+    spender.join().expect("the spender ran");
+    assert_eq!(
+        probe_seam::stop_spawn_failures(),
+        2,
+        "the gateway and coordinator stop spawns failed through the seam, and the run survived"
+    );
+    assert!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .any(|l| l.contains("waiting up to")),
+        "the drain waited for the spend in flight: {:?}",
+        rig.lines.snapshot()
+    );
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [pid],
+        "the gateway's inline stop sent its one SIGTERM after the drain"
+    );
+    rig.server.wait_serving(false);
+    drop(pserver);
+}
+
 /// A shutdown landing while a stop is already underway sends no second
 /// SIGTERM: shunt reads a second signal as "skip the drain".
 #[cfg(unix)]
@@ -4738,7 +4870,7 @@ fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
             let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
                 &activity,
                 &name,
-                &shutting_down,
+                shutting_down.as_ref(),
             )
             .expect("an unset flag admits the spend");
             claimed_tx.send(()).expect("the test waits for the claim");
@@ -4765,8 +4897,12 @@ fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
     );
     let late = crate::profile::ProfileName::from("late");
     assert!(
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
-            .is_none(),
+        crate::usage::claim_scheduler_spend_unless_shutting_down(
+            &activity,
+            &late,
+            shutting_down.as_ref()
+        )
+        .is_none(),
         "a spend starting after the stop signal is refused"
     );
     spender.join().expect("the spender ran to its save");
@@ -4783,9 +4919,12 @@ fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
     let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let name = crate::profile::ProfileName::from("stuck-spend");
-    let held =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &name, &shutting_down)
-            .expect("an unset flag admits the spend");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &name,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
     let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
 
     let started = std::time::Instant::now();
@@ -4838,9 +4977,12 @@ fn a_spend_starting_while_the_drain_waits_is_refused() {
     let activity = crate::testutil::fresh_activity();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let first = crate::profile::ProfileName::from("first");
-    let held =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &first, &shutting_down)
-            .expect("an unset flag admits the spend");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &first,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
     let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
     let drainer = std::thread::spawn(move || spends.drain(Duration::from_secs(5)));
     // Wait until the drain has actually raised the flag, not a fixed sleep: a
@@ -4854,12 +4996,689 @@ fn a_spend_starting_while_the_drain_waits_is_refused() {
     }
 
     let late = crate::profile::ProfileName::from("late");
-    let refused =
-        crate::usage::claim_scheduler_spend_unless_shutting_down(&activity, &late, &shutting_down)
-            .is_none();
+    let refused = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &late,
+        shutting_down.as_ref(),
+    )
+    .is_none();
     drop(held);
     let cleared = drainer.join().expect("the drain returns");
 
     assert!(refused, "a spend starting mid-drain is refused");
     assert!(cleared, "the drain clears once the earlier spend saves");
+}
+
+/// The env var carrying the verdict file into the re-entered parked-signal
+/// test.
+#[cfg(unix)]
+const PARKED_SIGNAL_FILE_ENV: &str = "CLAUTH_TEST_PARKED_SIGNAL_FILE";
+
+/// Re-entry target: pose the re-exec path owning the stop by taking the kit
+/// first, then SIGTERM this process. The real watcher reads the signal,
+/// finds the kit taken, and parks it on the kit's atomic; the verdict file
+/// then gets what the kit holds. With the marker env absent (the normal
+/// suite run) it passes instantly.
+#[cfg(unix)]
+#[test]
+fn parked_signal_child_for_reexec_watcher_test() {
+    let Some(verdict) = std::env::var_os(PARKED_SIGNAL_FILE_ENV) else {
+        return;
+    };
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
+    let spends = crate::daemon::SpendDrain::new(
+        crate::testutil::fresh_activity(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let kit = stop_on_signal(spends, None, ProxySupervision::idle());
+    let _parts = kit.take().expect("the re-exec path won the race");
+    signal_hook::low_level::raise(libc::SIGTERM).expect("SIGTERM this process");
+    // Two reads: one source answers each. The flag handler records the
+    // signal the instant it is raised, the watcher parks it once it wakes —
+    // whichever answers first, the other still holds it, so the second read
+    // is the park's (or the flag's) alone and no second signal was raised.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reads = 0;
+    let parked = loop {
+        if let Some(signal) = kit.take_pending_stop_signal() {
+            reads += 1;
+            if reads == 2 {
+                break signal;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never parked the SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::write(verdict, format!("{parked}\n")).expect("write the verdict");
+}
+
+/// The real watcher's lost-race arm parks a stop signal read while the
+/// re-exec path owns the stop: a re-entered child takes the kit first,
+/// SIGTERMs itself, and the kit then holds the parked signal for the
+/// re-exec path's post-stop check.
+#[cfg(unix)]
+#[test]
+fn the_stop_signal_watcher_parks_a_signal_read_while_the_reexec_owns_the_stop() {
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let verdict = scratch.path().join("parked");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::gateway::tests::parked_signal_child_for_reexec_watcher_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env(PARKED_SIGNAL_FILE_ENV, &verdict);
+    let mut child = cmd.spawn().expect("spawn the parked-signal child");
+
+    // Bounded reap: a red (no park) kills the child, so the suite never
+    // leaks a live watcher process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                drop(child.kill());
+                drop(child.wait());
+                panic!("the child never finished parking the signal");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => panic!("waiting on the parked-signal child failed: {e}"),
+        }
+    };
+    assert!(status.success(), "the child passed: {status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&verdict)
+            .expect("the verdict")
+            .trim(),
+        "15",
+        "the watcher parked the SIGTERM on the kit"
+    );
+}
+
+/// The env var carrying the verdict file into the re-entered caught-signal
+/// test.
+#[cfg(unix)]
+const CAUGHT_SIGNAL_FILE_ENV: &str = "CLAUTH_TEST_CAUGHT_SIGNAL_FILE";
+
+/// Re-entry target: pose the re-exec path owning the stop by taking the
+/// kit's slot while holding the kit's lock — the watcher's lost-race park
+/// needs the same lock, so no park can land before the check below — then
+/// SIGTERM this process: the post-stop check must see the signal through
+/// the registered flag even though the watcher has not parked it yet. With
+/// the marker env absent (the normal suite run) it passes instantly.
+#[cfg(unix)]
+#[test]
+fn caught_signal_child_for_reexec_watcher_test() {
+    let Some(verdict) = std::env::var_os(CAUGHT_SIGNAL_FILE_ENV) else {
+        return;
+    };
+    let parent = std::os::unix::process::parent_id();
+    let _reparent = std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
+    let spends = crate::daemon::SpendDrain::new(
+        crate::testutil::fresh_activity(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let kit = stop_on_signal(spends, None, ProxySupervision::idle());
+    let mut held = kit
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _parts = held.take().expect("the re-exec path won the race");
+    signal_hook::low_level::raise(libc::SIGTERM).expect("SIGTERM this process");
+    let seen = kit.take_pending_stop_signal();
+    drop(held);
+    std::fs::write(verdict, format!("{}\n", seen.unwrap_or(0))).expect("write the verdict");
+}
+
+/// The registered flag answers the re-exec path's post-stop check the
+/// instant a stop signal lands, even while the watcher has not woken to
+/// park it: a re-entered child takes the kit, holds its lock so the park
+/// cannot land, SIGTERMs itself, and reads the signal back through the
+/// kit's check at once — the run then ends by the signal-exit step, never
+/// the exec.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_in_the_watchers_wake_to_park_gap_is_seen_by_the_reexec_check() {
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let verdict = scratch.path().join("caught");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::gateway::tests::caught_signal_child_for_reexec_watcher_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env(CAUGHT_SIGNAL_FILE_ENV, &verdict);
+    let mut child = cmd.spawn().expect("spawn the caught-signal child");
+
+    // Bounded reap: a red (no signal seen) kills the child, so the suite never
+    // leaks a live watcher process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                drop(child.kill());
+                drop(child.wait());
+                panic!("the child never finished reading the caught signal");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => panic!("waiting on the caught-signal child failed: {e}"),
+        }
+    };
+    assert!(status.success(), "the child passed: {status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&verdict)
+            .expect("the verdict")
+            .trim(),
+        "15",
+        "the caught flag answered the check before the watcher could park"
+    );
+}
+
+/// The env var naming the re-entered stage of the inherited-child reap test.
+#[cfg(target_os = "linux")]
+const INHERITED_REAP_STAGE_ENV: &str = "CLAUTH_TEST_INHERITED_REAP_STAGE";
+
+/// A replaced daemon image reaps the child its predecessor left: a
+/// re-entered child spawns a grandchild, writes the gateway marker for it,
+/// execs itself into the "new image", and the new image's reclaim reaps the
+/// grandchild once it exits, so nothing is left defunct. The suite parent
+/// spawns stage 1; each later stage runs in the same process, exec'd
+/// forward, and its test result IS the verdict.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replaced_daemon_image_reaps_its_inherited_child() {
+    match std::env::var_os(INHERITED_REAP_STAGE_ENV).as_deref() {
+        None => {
+            let child_home = tempfile::tempdir().expect("child home");
+            let mut cmd = crate::testutil::reentry_command(
+                "daemon::gateway::tests::a_replaced_daemon_image_reaps_its_inherited_child",
+                &["daemon"],
+            );
+            cmd.env_clear()
+                .env("HOME", child_home.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .env(INHERITED_REAP_STAGE_ENV, "1");
+            let mut child = cmd.spawn().expect("spawn the stage-1 child");
+
+            // Bounded reap: a red kills the child, so the suite never leaks
+            // a live watcher process.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        drop(child.kill());
+                        drop(child.wait());
+                        panic!("the child never finished the reap");
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(e) => panic!("waiting on the reap child failed: {e}"),
+                }
+            };
+            assert!(status.success(), "the re-exec'd child passed: {status:?}");
+        }
+        Some(stage) if stage == "1" => {
+            let parent = std::os::unix::process::parent_id();
+            let _reparent =
+                std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
+            crate::profile::set_home_override(PathBuf::from(
+                std::env::var_os("HOME").expect("the parent set the sandbox home"),
+            ));
+            // The child this image hands over: it exits after the exec lands.
+            // Never waited here: the exec's new image owns its reap, which is
+            // the very claim this test pins.
+            #[expect(clippy::zombie_processes, reason = "the new image's reclaim reaps it")]
+            let grandchild = Command::new("/bin/sh")
+                .args(["-c", "/bin/sleep 1"])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the grandchild");
+            let start = process_start_time(grandchild.id()).expect("the grandchild's start");
+            crate::daemon::gateway::write_marker(&ChildMarker {
+                pid: grandchild.id(),
+                start: Some(start),
+                stop_bound_secs: 4,
+                stop_deadline_ms: Some(crate::usage::now_ms() + 5_000),
+            })
+            .expect("write the marker");
+            let err = Command::new("/proc/self/exe")
+                .args(std::env::args_os().skip(1))
+                .env(INHERITED_REAP_STAGE_ENV, "2")
+                .exec();
+            panic!("the exec failed: {err}");
+        }
+        Some(stage) if stage == "2" => {
+            crate::profile::set_home_override(PathBuf::from(
+                std::env::var_os("HOME").expect("the sandbox home survived the exec"),
+            ));
+            // The boot capture, as the daemon's `serve` runs it first thing:
+            // the grandchild this image inherited across the exec enters the
+            // reap set, which is what admits the marker reap below.
+            crate::daemon::gateway::capture_inherited_children();
+            let pid = crate::daemon::gateway::read_marker()
+                .expect("read the marker")
+                .expect("the marker survived the exec")
+                .pid;
+            let mut supervisor = Supervisor::new(new_handle());
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if supervisor.reclaim(Tick::now()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reclaim never finished"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the inherited child was reaped, not left defunct"
+            );
+        }
+        Some(stage) => panic!("unknown reap stage {stage:?}"),
+    }
+}
+
+/// A child that exits at once and sits as this process's zombie once the
+/// poll below sees it.
+#[cfg(target_os = "linux")]
+fn spawn_exiting_grandchild() -> std::process::Child {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the grandchild");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while zombie_start(child.id()).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grandchild never became a zombie"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    child
+}
+
+/// The inherited-child reap's guards: only a zombie still carrying its
+/// recorded start time is reaped. A live pid is left alone, a zombie whose
+/// recorded start differs is left alone (a recycled pid's status is never
+/// stolen), and the matching zombie is reaped.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_inherited_child_reap_reaps_only_a_matching_zombie() {
+    // A live child: not a zombie, never reaped.
+    let mut live = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/sleep 5"])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let live_start = process_start_time(live.id()).expect("the live child's start");
+    reap_inherited_zombie(live.id(), &live_start);
+    assert!(
+        live.try_wait().expect("poll the live child").is_none(),
+        "a live pid is never reaped"
+    );
+    drop(live.kill());
+    drop(live.wait());
+
+    // A zombie whose recorded start differs: the start check refuses it.
+    // `try_wait` itself would reap, so the probe reads the zombie's state.
+    let mut wrong = spawn_exiting_grandchild();
+    reap_inherited_zombie(wrong.id(), "never-matching");
+    assert!(
+        zombie_start(wrong.id()).is_some(),
+        "a zombie with a different recorded start stays unreaped"
+    );
+    drop(wrong.wait());
+
+    // The matching zombie: reaped, so no zombie state is left to read.
+    let mut matching = spawn_exiting_grandchild();
+    let matching_start = zombie_start(matching.id()).expect("the zombie's start");
+    reap_inherited_zombie(matching.id(), &matching_start);
+    assert!(
+        zombie_start(matching.id()).is_none(),
+        "the matching zombie was reaped, not left defunct"
+    );
+    // The reap already consumed the status; this wait returns the empty
+    // ECHILD and settles the handle.
+    drop(matching.wait());
+}
+
+/// The env var naming the re-entered stage of the inherited-set reap test,
+/// and the env var carrying the pid the old image spawned.
+#[cfg(target_os = "linux")]
+const INHERITED_REAP_SET_STAGE_ENV: &str = "CLAUTH_TEST_INHERITED_REAP_SET_STAGE";
+#[cfg(target_os = "linux")]
+const INHERITED_REAP_SET_PID_ENV: &str = "CLAUTH_TEST_INHERITED_REAP_SET_PID";
+
+/// A replaced image reaps every child its predecessor left, marker or not: a
+/// re-entered child spawns a grandchild that outlives the exec and exits
+/// after it, the new image captures its inherited children at boot (the same
+/// call the daemon's `serve` makes first), waits until the grandchild reads
+/// as its zombie, and one per-tick reap then takes it, so no `Z` entry with
+/// this pid as parent is left. The suite parent spawns stage 1; each later
+/// stage runs in the same process, exec'd forward, and its test result IS
+/// the verdict.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replaced_daemon_image_reaps_an_unmarked_inherited_child() {
+    match std::env::var_os(INHERITED_REAP_SET_STAGE_ENV).as_deref() {
+        None => {
+            let child_home = tempfile::tempdir().expect("child home");
+            let scratch = tempfile::tempdir().expect("test scratch");
+            let stage_log = scratch.path().join("stage.log");
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stage_log)
+                .expect("stage log");
+            let mut cmd = crate::testutil::reentry_command(
+                "daemon::gateway::tests::a_replaced_daemon_image_reaps_an_unmarked_inherited_child",
+                &["daemon"],
+            );
+            cmd.env_clear()
+                .env("HOME", child_home.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .env(INHERITED_REAP_SET_STAGE_ENV, "1")
+                // The re-entered stages' own output goes to a file (the
+                // exec'd stage inherits both streams): a red carries the
+                // inner assertion the stage panicked on, never only its
+                // exit status.
+                .stdout(std::process::Stdio::from(
+                    log.try_clone().expect("clone the stage log"),
+                ))
+                .stderr(std::process::Stdio::from(log));
+            let mut child = cmd.spawn().expect("spawn the stage-1 child");
+
+            // Bounded reap: a red kills the child, so the suite never leaks
+            // a live stage process.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if std::time::Instant::now() >= deadline => {
+                        drop(child.kill());
+                        drop(child.wait());
+                        panic!("the child never finished the reap");
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(e) => panic!("waiting on the reap child failed: {e}"),
+                }
+            };
+            assert!(
+                status.success(),
+                "the re-exec'd child passed: {status:?}\nstage output:\n{}",
+                std::fs::read_to_string(&stage_log).unwrap_or_default()
+            );
+        }
+        Some(stage) if stage == "1" => {
+            // The child this image hands over: it exits after the exec
+            // lands. Never waited here — the exec's new image owns its
+            // reap, which is the very claim this test pins — and nothing
+            // writes a marker for it.
+            #[expect(
+                clippy::zombie_processes,
+                reason = "the new image's inherited reap reaps it"
+            )]
+            let grandchild = Command::new("/bin/sh")
+                .args(["-c", "/bin/sleep 2"])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the grandchild");
+            let err = Command::new("/proc/self/exe")
+                .args(std::env::args_os().skip(1))
+                .env(INHERITED_REAP_SET_STAGE_ENV, "2")
+                .env(INHERITED_REAP_SET_PID_ENV, grandchild.id().to_string())
+                .exec();
+            panic!("the exec failed: {err}");
+        }
+        Some(stage) if stage == "2" => {
+            let pid: u32 = std::env::var(INHERITED_REAP_SET_PID_ENV)
+                .expect("the parent set the pid")
+                .parse()
+                .expect("the pid parses");
+            // The boot capture: the grandchild sits as this process's child
+            // (the exec keeps the pid), and no marker names it.
+            crate::daemon::gateway::capture_inherited_children();
+            // Wait for the grandchild to read as this image's zombie BEFORE
+            // the reap: the tick runs once the zombie state is observed, so
+            // the reap can never race the exit (the old loop could see the
+            // child leave between the zombie read and the tick, and then red
+            // a correct fix under a preempted thread).
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while zombie_start(pid).is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the child never exited as this image's zombie"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            crate::daemon::gateway::reap_inherited_tick();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the tick reaped the inherited child"
+            );
+        }
+        Some(stage) => panic!("unknown reap stage {stage:?}"),
+    }
+}
+
+/// The inherited reap waits only on the pids its captured set holds: an
+/// owned child that exited and sits as this image's zombie keeps its status
+/// for its own handle (a reap that waited outside the set — `waitpid(-1)`
+/// included — would steal it), and a live pid that is not this process's
+/// child is never waited on (it stays tracked, the process untouched).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_inherited_reap_never_waits_outside_its_captured_set() {
+    // An owned zombie: the reap over a set without its pid must leave its
+    // status for its handle.
+    let mut owned = spawn_exiting_grandchild();
+    let mut foreign_only = vec![(1u32, "0".to_string())];
+    reap_inherited(&mut foreign_only);
+    assert!(
+        owned.try_wait().expect("poll the owned zombie").is_some(),
+        "the owned child's status stayed with its handle"
+    );
+
+    // A live pid that is not this process's child (init): never a zombie of
+    // ours, so the reap leaves it alone — it stays tracked, and the process
+    // is untouched.
+    assert!(
+        !reap_inherited_zombie(1, "0"),
+        "a live foreign pid is not reaped and stays tracked"
+    );
+    assert!(
+        std::path::Path::new("/proc/1/stat").exists(),
+        "the foreign process is untouched"
+    );
+}
+
+/// The per-tick reap prunes what can no longer be this image's inherited
+/// child: a gone pid, and a live pid whose start differs from the recorded
+/// one (a pid recycled after the marker reap freed it), while a live child
+/// with its recorded start stays tracked. One reap run over the set is the
+/// unit: the prune must not wait for a later tick.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_inherited_reap_prunes_gone_and_recycled_entries() {
+    // A live child of this test with its real start: stays.
+    let mut live_child = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/sleep 5"])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let live_pid = live_child.id();
+    let live_start = process_start_time(live_pid).expect("the live child's start");
+
+    let mut set = vec![
+        // A gone pid: 0 is never allocated, so no recycled process can ever
+        // carry it (a real reaped child's pid can come back within its
+        // start jiffy on a busy box, which would read as a live match and
+        // stay tracked).
+        (0, "never-matching".to_string()),
+        // This test process's own pid with a token that is not its start: a
+        // live pid whose recorded start differs, never waited on.
+        (std::process::id(), "never-matching".to_string()),
+        (live_pid, live_start.clone()),
+    ];
+    reap_inherited(&mut set);
+    assert_eq!(
+        set,
+        vec![(live_pid, live_start)],
+        "the gone and recycled entries are pruned; the live child stays"
+    );
+    drop(live_child.kill());
+    drop(live_child.wait());
+}
+
+/// A failed start read is never read as the pid being gone: through the
+/// seam-posed read failure the entry stays tracked, and once the reads
+/// succeed the live child with its recorded start still stays.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_start_read_keeps_the_inherited_child_tracked() {
+    let mut live_child = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/sleep 30"])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let live_pid = live_child.id();
+    let live_start = process_start_time(live_pid).expect("the live child's start");
+    let mut set = vec![(live_pid, live_start.clone())];
+    let failed = crate::daemon::gateway::probe_seam::fail_inherited_reads();
+    reap_inherited(&mut set);
+    assert_eq!(
+        set,
+        vec![(live_pid, live_start.clone())],
+        "a failed read keeps the live child tracked"
+    );
+    drop(failed);
+    reap_inherited(&mut set);
+    assert_eq!(
+        set,
+        vec![(live_pid, live_start)],
+        "the live child stays with its recorded start once the reads work"
+    );
+    drop(live_child.kill());
+    drop(live_child.wait());
+}
+
+/// A marker naming a zombie THIS image owns is never reaped by the marker
+/// reap: the pid sits outside the boot-captured set (the zombie spawned
+/// after the capture), so `stop_left_behind` leaves the status with the
+/// handle that owns the child — a reclaim taking a status this image still
+/// owns must not return.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_marker_naming_an_owned_zombie_stays_with_its_owner() {
+    // Serialized with the other inherited-set tests: they share the one
+    // process-global capture set.
+    let _home = HomeSandbox::new();
+    // The capture runs first, so the membership gate below is a live read
+    // over a real set; the zombie spawns after it, so its pid can never sit
+    // in the set.
+    crate::daemon::gateway::capture_inherited_children();
+    let mut zombie = spawn_exiting_grandchild();
+    let start = zombie_start(zombie.id()).expect("the owned zombie's start");
+    let dir = tempfile::tempdir().expect("marker dir");
+    let path = dir.path().join("marker");
+    let marker = ChildMarker {
+        pid: zombie.id(),
+        start: Some(start),
+        stop_bound_secs: 5,
+        stop_deadline_ms: None,
+    };
+    write_marker_at(&path, &marker).expect("write the marker");
+    assert!(
+        stop_left_behind(&path, "the test child", crate::usage::now_ms()).is_none(),
+        "a marker whose pid reads gone is dropped"
+    );
+    assert!(
+        zombie_start(zombie.id()).is_some(),
+        "the owned zombie was not reaped: its pid is outside the captured set"
+    );
+    let status = zombie.try_wait().expect("poll the owned zombie");
+    assert!(
+        status.is_some(),
+        "the owning handle still returns the child's status"
+    );
+    assert!(!path.exists(), "the marker was removed");
+}
+
+/// A boot capture whose listing fails logs one daemon line instead of
+/// reading as "no children": the failure reaches the capture, and the reap
+/// then no-ops with a trace, so a stripped PATH (no `ps`) or a broken
+/// `/proc` read cannot silently turn the inherited reap off. The line is
+/// pinned by equality (the seam's error is fixed text), and a live child
+/// spawned first proves the failed capture left the set UNSET: a stored
+/// empty set would make the second capture a no-op and the child unlisted.
+#[cfg(unix)]
+#[test]
+fn a_failed_boot_listing_logs_its_failure() {
+    // Serialized with the other inherited-set tests: they share the one
+    // process-global capture set.
+    let _home = HomeSandbox::new();
+    crate::daemon::gateway::reset_inherited_children();
+    let mut live_child = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/sleep 30"])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the live child");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let failed = crate::daemon::gateway::probe_seam::fail_children_listing();
+    crate::daemon::gateway::capture_inherited_children();
+    drop(capture);
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth daemon: cannot list the children inherited across the re-exec; none will be reaped: the listing was refused by the test seam"
+                .to_string()
+        ],
+        "the boot capture logged its listing failure once"
+    );
+    drop(failed);
+    // The failure left the set unset, so this capture lists for real: the
+    // live child enters the set and the reap admits it.
+    crate::daemon::gateway::capture_inherited_children();
+    assert!(
+        crate::daemon::gateway::is_inherited_child(
+            live_child.id(),
+            &process_start_time(live_child.id()).expect("the live child's start"),
+        ),
+        "a failed capture leaves the set unset, so the next capture lists"
+    );
+    drop(live_child.kill());
+    drop(live_child.wait());
+}
+
+/// A thread's id has no start time: its `/proc/<tid>/stat` reads like its
+/// process's, so a marker pid the kernel reissued as another program's thread
+/// id would read as a live process with that thread's start.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_id_has_no_start_time() {
+    let thread = crate::testutil::ParkedThread::spawn();
+    let start = process_start_time(thread.tid);
+    drop(thread);
+    assert_eq!(start, None, "a thread's id reads no start time");
+    assert!(
+        process_start_time(std::process::id()).is_some(),
+        "the leader still reads its start time"
+    );
 }

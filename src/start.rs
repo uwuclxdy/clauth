@@ -169,8 +169,8 @@ enum ChainIneligible {
     NoSecondMember,
     /// The daemon singleton's lock exists but cannot be tested.
     DaemonUnchecked,
-    /// Only the daemon's decision leg writes `intended_member`, so with no
-    /// daemon the flag is inert.
+    /// Only the daemon's decision leg moves a session along the chain, so
+    /// with no daemon the flag is inert.
     NoDaemon,
     /// The host structurally cannot execute a per-session credential swap.
     Transport(crate::runtime::SwapUnsupported),
@@ -1128,8 +1128,9 @@ fn remap_model_aliases(models: &mut Vec<String>, child_env: &impl Fn(&str) -> Op
     *models = expanded;
 }
 
-/// The model slots a passthrough `--settings <file|json>` sets, the top
-/// settings tier: above project-local. Parsed through the same helpers the
+/// The model slots a passthrough `--settings <file|json>` sets: the flag
+/// tier, above user, project and local, below managed policy (measured
+/// 2026-11-12, Claude Code 2.1.322). Parsed through the same helpers the
 /// spawn-side settings fold uses, so one value is read one way. Empty when the
 /// args carry no `--settings` or the value fails to parse (the spawn path warns;
 /// the demand just reads nothing from it). Inline JSON is self-contained and
@@ -1143,7 +1144,12 @@ fn passthrough_settings_sources(
     };
     let inline = crate::cc_exempt::is_inline_settings(&value);
     let parsed = if inline {
-        crate::cc_exempt::parse_settings_value(&value, std::path::Path::new("."), true)
+        crate::cc_exempt::parse_settings_value(
+            &value,
+            std::path::Path::new("."),
+            true,
+            crate::cc_exempt::TAIL,
+        )
     } else {
         // An absolute path resolves without the spawn cwd; `parse_settings_value`
         // joins the base only for a relative one.
@@ -1152,7 +1158,7 @@ fn passthrough_settings_sources(
             None if std::path::Path::new(value.trim()).is_absolute() => std::path::Path::new("."),
             None => return crate::claude::RuntimeModelSources::default(),
         };
-        crate::cc_exempt::parse_settings_value(&value, dir, false)
+        crate::cc_exempt::parse_settings_value(&value, dir, false, crate::cc_exempt::TAIL)
     };
     let Ok(map) = parsed else {
         return crate::claude::RuntimeModelSources::default();
@@ -1502,18 +1508,23 @@ pub(crate) fn run_for_code(
     if let Some(cwd) = spawn_cwd.as_deref() {
         let settings_file =
             crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
-        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+        match crate::cc_exempt::apply_spawn_settings(
             &mut command,
             runtime.config_dir(),
             cwd,
             claude_args,
+            crate::cc_exempt::ArgsFrom::Operator,
             &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
             // `clauth start` keeps a session's own turn lifecycle; the
             // foreground-spawn guard is a delegate-only repair.
             None,
             &settings_file,
         ) {
-            errln!("{warning}");
+            Ok(Some(warning)) => errln!("{warning}"),
+            Ok(None) => {}
+            // No arm refuses an operator launch, but a refusal must stop the
+            // launch rather than warn and spawn anyway.
+            Err(line) => anyhow::bail!(line),
         }
     } else {
         command.args(claude_args);

@@ -22,6 +22,7 @@ use super::devices::Tier;
 use super::http::{Request, Response, sanitize_for_log};
 use super::panes::{HerdrOut, HerdrProbeOut, NO_SERVER, NOT_INSTALLED};
 use super::routes::{ApiContext, Caller, ErrorBody};
+use crate::format::strip_ansi_csi;
 use crate::logline::logline;
 use crate::profile::ProfileName;
 
@@ -43,6 +44,11 @@ const SESSION_LAUNCH_DRAIN: Duration = Duration::from_secs(2);
 /// The bound the background session id read retries within. Still unread ->
 /// `null`, never an error.
 const SESSION_ID_READ_BOUND: Duration = Duration::from_secs(2);
+
+/// The stderr lines one successful background launch may put in the daemon log:
+/// more than the shared stores' notes, and short of letting a chatty child fill
+/// the log per create.
+const SESSION_LAUNCH_SAID_LINES: usize = 8;
 
 /// The fixed sentences; nothing off the wire reaches a body.
 const SESSION_CREATION_OFF: &str = "session creation is off; set `session_creation = true` \
@@ -102,9 +108,28 @@ pub(crate) struct SessionCreateBody {
     prompt: Option<String>,
 }
 
+// Each answer's `type` tag is a one-variant enum, so a body cannot carry the
+// other arm's value. Plain comments and `#[schema(inline)]` keep the served
+// property a bare `type` + `enum`: a doc comment would become its
+// `description`, and without `inline` it would be a `$ref`. The field came after
+// both objects shipped, so it stays optional in the schema.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum PaneTag {
+    Pane,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum BackgroundTag {
+    Background,
+}
+
 /// The answer a created session carries.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionCreated {
+    #[schema(inline, required = false)]
+    r#type: PaneTag,
     ok: bool,
     workspace_id: String,
     tab_id: String,
@@ -120,6 +145,8 @@ pub(crate) struct SessionCreated {
 /// stdout, and the record's `sessionId` read back, `null` when it never read.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct BackgroundSessionCreated {
+    #[schema(inline, required = false)]
+    r#type: BackgroundTag,
     ok: bool,
     background_id: String,
     #[schema(required = true)]
@@ -259,16 +286,21 @@ fn profile_roster(
 /// The 8-hex job id off `claude --bg`'s `backgrounded · <id>` line. The id is
 /// the first word after the dot: a no-prompt launch follows it with a note on
 /// the same line (`(idle — send a prompt to start)` on Claude Code 2.1.318).
+/// `FORCE_COLOR` in the child's env wraps the id in colour codes (measured on
+/// 2.1.319), so the lines are read with CSI sequences stripped.
 fn background_id(stdout: &[u8]) -> Option<String> {
     // `claude --bg` separates the id with a middle dot (U+00B7); matched as its
     // UTF-8 bytes so the source stays ASCII.
     const PREFIX: &[u8] = b"backgrounded \xc2\xb7 ";
-    for line in stdout.split(|&b| b == b'\n') {
-        let Some(rest) = line.strip_prefix(PREFIX) else {
+    let text = strip_ansi_csi(&String::from_utf8_lossy(stdout));
+    for line in text.split('\n') {
+        if !line.as_bytes().starts_with(PREFIX) {
             continue;
-        };
-        let rest = String::from_utf8_lossy(rest);
-        let Some(id) = rest.split_whitespace().next() else {
+        }
+        let Some(id) = line
+            .get(PREFIX.len()..)
+            .and_then(|rest| rest.split_whitespace().next())
+        else {
             continue;
         };
         if id.len() == 8
@@ -357,7 +389,7 @@ fn refusal_response(refusal: &crate::start::StartRefusal) -> Response {
 /// One background launch through the seam, reduced to its answer: 200 with the
 /// job id and (best-effort) session id, 502 for a launch that fails, never
 /// answers, or prints no job id, 503 when clauth is stopping that tree's
-/// background service. The child's output reaches daemon.log only.
+/// background service. The child's stderr reaches daemon.log only.
 fn launch_background_session(
     ctx: &ApiContext,
     launcher: Launcher,
@@ -390,6 +422,16 @@ fn launch_background_session(
         );
         return Response::refused(502, "background_refused", BACKGROUND_REFUSED);
     }
+    for said in String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(SESSION_LAUNCH_SAID_LINES)
+    {
+        logline!(
+            "clauth api: device '{device}' background launch said: {}",
+            sanitize_for_log(said.trim_end())
+        );
+    }
     let Some(id) = background_id(&out.stdout) else {
         let stdout = String::from_utf8_lossy(&out.stdout);
         logline!(
@@ -418,6 +460,7 @@ fn launch_background_session(
     Response::serialize(
         200,
         &BackgroundSessionCreated {
+            r#type: BackgroundTag::Background,
             ok: true,
             background_id: id,
             session_id,
@@ -530,10 +573,10 @@ fn close_tab(ctx: &ApiContext, tab_id: &str, device: &str) {
     path = "/api/v1/sessions",
     request_body = SessionCreateBody,
     responses(
-        (status = 200, description = "the pane was created and the agent started (`agent_status` is herdr's answer read back after the start, `null` for a `pane run`), or a background session launched with the job id and the record's session id (`null` when it never read)", body = SessionCreated),
+        (status = 200, description = "`type` names the arm: `pane`, the pane was created and the agent started (`agent_status` is herdr's answer read back after the start, `null` for a `pane run`), or `background`, a background session launched with the job id and the record's session id (`null` when it never read)", body = SessionCreated),
         (status = 400, description = "the body held no parseable cwd, or a cwd that is not an absolute existing directory, both a profile and a kind, a profile whose name is not shaped like one, a kind outside 1..=32 ascii lowercase letters or digits, a workspace outside 1..=32 chars of letters, digits or colons, background with a kind or workspace, background on a codex-roster profile, with_fallback with a kind or without a profile, prompt without background, or an empty or NUL-holding prompt (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), a view-only device (`control_required`), session creation off in profiles.toml (`session_creation_off`), or a device without the sessions grant (`sessions_grant_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored in the claude or codex roster (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "the named workspace, or the default when none is named, does not exist (`workspace_not_found`); a disabled account (`profile_disabled`); a with_fallback refusal from clauth start (`with_fallback_unavailable`); a background launch refused on a copy host (`background_unavailable`); or a quarantined codex login (`login_quarantined`)", body = ErrorBody),
         (status = 502, description = "herdr refused the creation for another reason (`herdr_refused`), or the background session did not start (`background_refused`), recorded in daemon.log", body = ErrorBody),
@@ -754,6 +797,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
     Response::serialize(
         200,
         &SessionCreated {
+            r#type: PaneTag::Pane,
             ok: true,
             workspace_id: created.workspace_id,
             tab_id: created.tab_id,

@@ -20,6 +20,10 @@
 //! and the fatal-error line, so a gone reader drops the line and the run
 //! continues to its own exit code — exiting there would let a closed stderr
 //! take down a whole `clauth start` session over a background `logline!`.
+//! [`outln_or_drop!`] is stdout's one exception: a reader that left drops the
+//! line there, so it cannot cut short the re-read a settled spend still owes.
+//! [`errln_or_drop!`] is its stderr twin, for the lines a settled spend prints
+//! before that same re-read.
 //!
 //! [`errln!`] is for the FOREGROUND CLI, and keeps the stdout half's strictness
 //! about every other write error: a run that cannot write its own error message
@@ -82,6 +86,38 @@ pub(crate) fn write_chunk<W: Write>(
     }
 }
 
+/// [`emit_or_drop`]'s write: a line nobody read must not take down the work the
+/// run still owes, such as a settled spend's re-read that lands the count. A
+/// write failure that is not a gone reader is named on stderr and the work
+/// continues: for this caller the run still owes more than the line. The stderr
+/// write goes through [`write_chunk_result`] too, so a failure to even name the
+/// failure (both streams on one full disk) still cannot stop the run.
+///
+/// Split out from [`emit_or_drop`] so its failure arms can be driven against
+/// writers that fail on demand, without the process's own streams in the way.
+pub(crate) fn write_or_drop<O: Write, E: Write>(
+    out: &mut O,
+    err: &mut E,
+    args: Arguments<'_>,
+    newline: bool,
+) {
+    if let Err(e) = write_chunk_result(out, args, newline) {
+        let _ = write_chunk_result(
+            err,
+            format_args!("clauth: failed printing to stdout: {e}"),
+            true,
+        );
+    }
+}
+
+/// [`write_or_drop`]'s stderr half: a caller that still owes work, such as the
+/// re-read after a settled spend, must not lose it to a failing stderr. No
+/// second stream is left to name the failure on, so every write error drops the
+/// line.
+pub(crate) fn write_err_or_drop<E: Write>(err: &mut E, args: Arguments<'_>) {
+    let _ = write_chunk_result(err, args, true);
+}
+
 /// [`outln!`] / [`out!`] backend — call the macros, not this.
 ///
 /// A reader that left ends the run at exit 0: it is not this run failing, so a
@@ -96,6 +132,27 @@ pub(crate) fn emit(args: Arguments<'_>, newline: bool) {
     if write_chunk(&mut std::io::stdout().lock(), args, newline, "stdout") == Wrote::ReaderGone {
         std::process::exit(0);
     }
+}
+
+/// [`outln_or_drop!`] backend — call the macro, not this.
+///
+/// [`write_or_drop`] on the process's own streams: a gone reader drops the
+/// line, and the run continues to the work it still owes.
+pub(crate) fn emit_or_drop(args: Arguments<'_>, newline: bool) {
+    #[cfg(test)]
+    if reader_left() {
+        return;
+    }
+    #[cfg(test)]
+    if captured(&args, newline) {
+        return;
+    }
+    write_or_drop(
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+        args,
+        newline,
+    );
 }
 
 /// [`errln!`] backend — call the macro, not this.
@@ -114,6 +171,18 @@ pub(crate) fn emit_err(args: Arguments<'_>) {
     let _ = write_chunk(&mut std::io::stderr().lock(), args, true, "stderr");
 }
 
+/// [`errln_or_drop!`] backend — call the macro, not this.
+///
+/// [`write_err_or_drop`] on the process's own stderr: a failing stderr drops
+/// the line, and the run continues to the work it still owes.
+pub(crate) fn emit_err_or_drop(args: Arguments<'_>) {
+    #[cfg(test)]
+    if captured_err(&args) {
+        return;
+    }
+    write_err_or_drop(&mut std::io::stderr().lock(), args);
+}
+
 /// [`err!`] backend: [`emit_err`] with no newline, flushed, for a prompt
 /// whose answer comes from stdin while stdout stays the command's output.
 #[cfg(target_os = "macos")]
@@ -128,6 +197,15 @@ macro_rules! outln {
     };
 }
 pub(crate) use outln;
+
+/// Like [`outln!`], but a reader that left drops the line instead of ending the
+/// run: for a caller that still owes work a gone reader must not cut short.
+macro_rules! outln_or_drop {
+    ($($arg:tt)*) => {
+        $crate::out::emit_or_drop(::std::format_args!($($arg)*), true)
+    };
+}
+pub(crate) use outln_or_drop;
 
 /// Stdout with no trailing newline, flushed — the prompt form of [`outln!`].
 macro_rules! out {
@@ -144,6 +222,15 @@ macro_rules! errln {
     };
 }
 pub(crate) use errln;
+
+/// Like [`errln!`], but a failing stderr drops the line instead of panicking:
+/// for a caller that still owes work a failed diagnostic must not cut short.
+macro_rules! errln_or_drop {
+    ($($arg:tt)*) => {
+        $crate::out::emit_err_or_drop(::std::format_args!($($arg)*))
+    };
+}
+pub(crate) use errln_or_drop;
 
 /// Stderr with no trailing newline, flushed: the prompt form of [`errln!`].
 #[cfg(target_os = "macos")]
@@ -176,12 +263,19 @@ thread_local! {
 /// original to read them back.
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub(crate) struct OutCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub(crate) struct OutCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>, bool);
 
 #[cfg(test)]
 impl OutCapture {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// A capture standing in for a reader that left: an [`emit`] under it
+    /// panics where the real run would exit 0, so a test can pin that a path
+    /// with work still owed never reaches one.
+    pub(crate) fn reader_gone() -> Self {
+        Self(std::sync::Arc::default(), true)
     }
 
     /// Take every stdout byte the CALLING thread writes until the returned
@@ -235,6 +329,7 @@ fn captured(args: &Arguments<'_>, newline: bool) -> bool {
             c.borrow()
                 .as_ref()
                 .map(|buf| {
+                    assert!(!buf.1, "stdout's reader left: this run exits 0 here");
                     let mut line = args.to_string();
                     if newline {
                         line.push('\n');
@@ -246,6 +341,14 @@ fn captured(args: &Arguments<'_>, newline: bool) -> bool {
                 })
                 .is_some()
         })
+        .unwrap_or(false)
+}
+
+/// Whether this thread's capture stands in for a reader that left.
+#[cfg(test)]
+fn reader_left() -> bool {
+    CAPTURE
+        .try_with(|c| c.borrow().as_ref().is_some_and(|buf| buf.1))
         .unwrap_or(false)
 }
 

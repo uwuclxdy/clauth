@@ -12,7 +12,7 @@ use crate::daemon::proxies::{self, ProxySlot};
     responses(
         (status = 200, description = "the managed proxies' slots, one object per registry row, the array the status feed publishes as its proxies field", body = Vec<ProxySlot>),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))

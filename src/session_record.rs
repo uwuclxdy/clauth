@@ -268,8 +268,12 @@ pub(crate) fn live_cwd(
 /// Whether `/proc/<pid>/stat` field 22 (the start time in clock ticks since
 /// boot) equals `proc_start` (measured 2.1.301). The one field-22 compare,
 /// shared by [`process_matches_record`] and the bridge's gone-or-moved check.
+/// False for a thread's id.
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_start_matches(pid: u32, proc_start: &str) -> bool {
+    if crate::runtime::pid_is_thread(pid) {
+        return false;
+    }
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -309,10 +313,13 @@ pub(crate) fn process_matches_record(pid: u32, record: &SessionRecord) -> bool {
 }
 
 /// The parent of process `pid`, where it can be read: `/proc/<pid>/stat` on
-/// linux, `proc_pidinfo` on macOS. Elsewhere none, the same degraded case as
-/// [`process_matches_record`].
+/// linux, none for a thread's id there; `proc_pidinfo` on macOS. Elsewhere
+/// none, the same degraded case as [`process_matches_record`].
 #[cfg(target_os = "linux")]
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    if crate::runtime::pid_is_thread(pid) {
+        return None;
+    }
     // Field 4 of `/proc/<pid>/stat` is the ppid; the comm (field 2) may hold
     // spaces and parentheses, so the split runs from the closing parenthesis.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

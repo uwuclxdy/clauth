@@ -10,6 +10,7 @@ fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: None,
         sub_type: Some("max".to_string()),
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }
@@ -21,6 +22,7 @@ fn third_party_snapshot(name: &str, base_url: &str, rank: RosterRank) -> Profile
         provider: "DeepSeek".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank,
     }
 }
@@ -317,6 +319,22 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     // the roster is labelled a session-start snapshot with a live-refresh pointer.
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
     assert!(out.contains("call `profiles`"));
+    // the block says it is filtered, so a disabled row in `profiles` never
+    // reads as an account added since.
+    for auth in [
+        SessionAuth::Global,
+        SessionAuth::IsolatedRuntime("work".to_string()),
+        SessionAuth::IsolatedCustom,
+    ] {
+        let block = instructions_block(&profiles, &auth, crate::runtime::LinkProbe::NothingShared);
+        assert!(
+            block.contains(
+                "Profiles, most headroom first (session-start snapshot, disabled accounts left \
+out; call `profiles` for live usage and anything added since):\n"
+            ),
+            "the header names the omission in every tier: {block}",
+        );
+    }
 
     // the tool router survives, because it is the ONLY clauth text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
@@ -477,6 +495,82 @@ fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
     ];
     let out = roster_lines(&profiles, &SessionAuth::Global);
     assert_eq!(out, "- healthy, overdrawn [DeepSeek, api.deepseek.com]\n");
+}
+
+/// A disabled account the roster keeps says so inside its marker paren on every
+/// session tier, while its enabled bracket-mate keeps its plain spelling.
+#[test]
+fn a_kept_disabled_account_reads_disabled_inside_its_marker_on_every_tier() {
+    let roster = |off: ProfileSnapshot, on: ProfileSnapshot, auth: SessionAuth| {
+        let block = instructions_block(&[off, on], &auth, crate::runtime::LinkProbe::NothingShared);
+        let (_, roster) = block
+            .split_once("`profiles` for live usage and anything added since):\n")
+            .expect("the roster header");
+        roster.to_string()
+    };
+    let disabled = |mut p: ProfileSnapshot| {
+        p.disabled = true;
+        p
+    };
+
+    assert_eq!(
+        roster(
+            snapshot("off", true),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session), on [anthropic, max]\n",
+        "an enabled account's marker carries no flag",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::Global
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("on".into()),
+        ),
+        "- off (global active; disabled), on (this session) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedCustom,
+        ),
+        "- off (global active; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (this session; disabled), on (global active) [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", true)),
+            snapshot("on", false),
+            SessionAuth::IsolatedRuntime("off".into()),
+        ),
+        "- off (global active, this session; disabled), on [anthropic, max]\n",
+    );
+    assert_eq!(
+        roster(
+            disabled(snapshot("off", false)),
+            snapshot("on", true),
+            SessionAuth::Global
+        ),
+        "- off (disabled), on (global active, this session) [anthropic, max]\n",
+        "a markerless disabled row still opens a paren for the flag",
+    );
 }
 
 #[test]
@@ -1169,6 +1263,7 @@ fn endpoint_snapshot(name: &str, base_url: &str) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
+        disabled: false,
         rank: RosterRank::Unknown,
     }
 }
@@ -1796,7 +1891,10 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
 /// was writing the record is gone, and the resume id is the only way back
 /// into the run's transcript. A RUNNING row carries none of this: its session
 /// is still held by the live run, and inviting a resume onto a session the
-/// run still holds is the collision the row deliberately does not offer.
+/// run still holds is the collision the row deliberately does not offer. An
+/// orphan whose recorded child still writes the transcript is no handle
+/// either (`resumable: false`): a resume would put a second writer on a live
+/// session.
 #[test]
 fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
     let listed = monitor_state_prose(&serde_json::json!({
@@ -1814,6 +1912,15 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
                 "state": "orphaned",
                 "since_secs": 4000,
                 "session_id": "6cc9c767-1cc3-4e77-a787-a7f8a6d41515",
+                "resumable": true,
+            },
+            {
+                "job_id": "d-e-0",
+                "profile": "five",
+                "state": "orphaned",
+                "since_secs": 10,
+                "session_id": "still-being-written",
+                "resumable": false,
             },
         ],
     }));
@@ -1823,9 +1930,10 @@ fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
             "delegates clauth holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-d-0` orphaned on `four`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1h 6m ago",
+            "  job `d-e-0` orphaned on `five`, last seen 10s ago",
         ]
         .join("\n"),
-        "only the orphaned row offers the handle, and the age phrase stays the row's tail"
+        "only a resumable orphaned row offers the handle, and the age phrase stays the row's tail"
     );
 }
 

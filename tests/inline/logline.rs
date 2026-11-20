@@ -26,22 +26,45 @@ fn daemon_mode_stays_bare_on_stderr() {
 fn only_a_non_daemon_line_on_a_terminal_diverts_to_the_log_file() {
     // The 2026-07-14 corruption: a background scheduler thread's stderr line
     // paints over the TUI's alternate screen. Diverting to the log file is the
-    // fix, and it must fire in exactly one context.
+    // fix, and it must fire only where the process's stderr is, or was, a
+    // terminal: never for the daemon or a redirected stderr.
     assert_eq!(
-        route(false, true),
+        route(false, false, true),
         Sink::LogFile,
         "interactive TUI/CLI on a tty"
     );
-    assert_eq!(route(false, false), Sink::Stderr, "piped/redirected stderr");
     assert_eq!(
-        route(true, true),
+        route(false, false, false),
+        Sink::Stderr,
+        "piped/redirected stderr"
+    );
+    assert_eq!(
+        route(true, false, true),
         Sink::Stderr,
         "daemon in a foreground console"
     );
     assert_eq!(
-        route(true, false),
+        route(true, false, false),
         Sink::Stderr,
         "daemon under a supervisor"
+    );
+}
+
+/// A TUI pins the log file while its stderr is its terminal, so a line raised
+/// after that terminal hung up (stderr no longer a terminal) still goes to the
+/// file rather than the dead stderr. Not seen here: `tui::run`'s call and
+/// `line`'s read of the pin, which no test drives (the pin is process-global).
+#[test]
+fn a_diverted_process_keeps_the_log_file_after_its_terminal_is_gone() {
+    assert_eq!(
+        route(false, true, false),
+        Sink::LogFile,
+        "a TUI whose terminal hung up"
+    );
+    assert_eq!(
+        route(true, true, false),
+        Sink::Stderr,
+        "stamping still means the daemon's stderr"
     );
 }
 

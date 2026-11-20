@@ -24,6 +24,12 @@
 //! shell, because a headless `claude -p` run never waits on one once that
 //! subagent's turn ends, so its output would be lost (measured 2026-11-02,
 //! Claude Code 2.1.314).
+//!
+//! The same file carries the operator's `cleanupPeriodDays` on every shared
+//! launch ([`crate::retention::launch_days`]), so a session on a tree linking
+//! the operator's transcript store sweeps at the operator's number even where
+//! a project's own settings name a lower one; that alone writes the file,
+//! repairs or not.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -42,8 +48,10 @@ pub(crate) const FOREGROUND_SPAWN_HOOK_SUBCOMMAND: &str = "hook-foreground-spawn
 const READ_ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"clauth: this session's own tool result, read through the runtime's projects link"}}"#;
 
 /// The shared tail of every user-`--settings` warning: what the user asked for
-/// still reaches `claude`, what clauth skips is its own exemption.
-const TAIL: &str = "passed to claude unchanged, so auto-memory writes and tool-result reads may prompt this session";
+/// still reaches `claude`, what clauth skips is its own exemption. Shared with
+/// `start.rs`'s demand read, which passes it only to fill
+/// [`parse_settings_value`]'s tail and discards the line.
+pub(crate) const TAIL: &str = "passed to claude unchanged, so auto-memory writes and tool-result reads may prompt this session";
 
 /// Byte cap for a settings file, user `--settings` and probed tiers alike.
 /// A cloned repo can commit `.claude/settings.json` as a symlink to
@@ -247,30 +255,76 @@ fn strip_os_error(s: &str) -> String {
     }
 }
 
-/// Append the exemption `--settings` (when the runtime needs it) and then the
+/// Who wrote a launch's passthrough args, which decides whose
+/// `cleanupPeriodDays` a spawn `--settings` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgsFrom {
+    /// The operator's own `clauth start -- …` args: their number wins.
+    Operator,
+    /// A calling model's delegate `args`: the larger of its number and the
+    /// remembered one wins.
+    Model,
+}
+
+/// Append the spawn `--settings` (when the launch needs one) and then the
 /// caller's `passthrough` args to `command`.
 ///
 /// The symlink repairs are injected when the literal `config_dir/projects`
 /// differs from its resolved spelling (a symlinked `projects`, or a symlinked
 /// ancestor). A `foreground_hook_command` is written into the same file for
 /// every caller that passes one, whether or not the runtime needs those
-/// repairs; with neither, nothing is injected. The merged settings object is
-/// written to `settings_file` (0o600, atomic) and passed as `--settings
-/// <file>` — never inline, so a folded user settings value stays off the
-/// child's argv. The user's last pre-`--` `--settings` is the merge base;
+/// repairs. A SHARED `config_dir` (by its dir name) also carries the
+/// operator's remembered `cleanupPeriodDays` ([`crate::retention::launch_days`]),
+/// so a launch on a tree linking the operator's store resolves Claude Code's
+/// 30-day default only when it carries no number; an isolated tree, nothing
+/// remembered or a record that cannot be read carries none. With none of the
+/// three, nothing is injected. A carried number is decided, written and
+/// registered in the retention record inside one state-flock hold
+/// ([`crate::retention::carry_into_spawn_file`]), and a shared launch that
+/// writes its spawn file for its repairs alone registers it too, so the check
+/// that rewrites registered files when the number changes never misses this
+/// launch's file — a background job's `respawnFlags` carry its launch's
+/// `--settings` file (measured 2026-10-20, Claude Code 2.1.304), so its
+/// respawn reads it again. The operator's own `--settings` value, valid or
+/// not, wins and is never registered; a delegate's own valid value is its
+/// floor, so the file carries the larger of it and the remembered number and
+/// a later change never undercuts it. The merged settings object is written to
+/// `settings_file` (0o600, atomic) and passed as `--settings <file>` — never
+/// inline, so a folded user settings value stays off the child's argv. The
+/// user's last pre-`--` `--settings` is the merge base, and a
+/// `cleanupPeriodDays` it holds, valid or not, stays as it is;
 /// `autoMemoryDirectory` is added unless a settings source or the child's env
 /// already keys it. A user `--settings` that cannot be read or parsed, or
-/// whose `hooks` shape is wrong, disables the injection and comes back as
-/// `Some(warning)`, with the passthrough appended untouched.
+/// whose `hooks` shape is wrong while a hook is injected, disables the
+/// injection with the passthrough appended untouched, and comes back as
+/// `Some(warning)` when a repair or hook was due; an operator launch carrying
+/// only the number gets no warning, its tree's own `settings.json` still
+/// holding it. A delegate's `--settings` that cannot carry the remembered
+/// number — unreadable, unparseable, a `hooks` shape clauth cannot merge into
+/// — comes back as `Err(line)` instead: the model's value would reach claude's
+/// flag tier unchanged, which outranks the user, project and local tiers
+/// (Claude Code merges user, project, local, flag, policy; measured 2026-11-12,
+/// Claude Code 2.1.322), so its own number would outrank the remembered one. A
+/// spawn file that cannot be written is refused the same way, whether or not
+/// the delegate passed a `--settings`, while the number decided under the
+/// state flock is due (the pre-read one when the flock cannot be taken):
+/// without the number in that file, a project-tier `cleanupPeriodDays` in the
+/// delegate's cwd outranks the tree's user-tier `settings.json`. An operator
+/// launch is never refused, nor a delegate with no number due.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one input per distinct part of the spawn-settings step, each handed by both callers"
+)]
 pub(crate) fn apply_spawn_settings(
     command: &mut Command,
     config_dir: &Path,
     cwd: &Path,
     passthrough: &[String],
+    args_from: ArgsFrom,
     read_hook_command: &str,
     foreground_hook_command: Option<&str>,
     settings_file: &Path,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let literal = config_dir.join("projects");
     // `Some` only when the symlink repairs are needed, so the memory dir and
     // the Read hook below are skipped for a runtime whose spellings agree.
@@ -278,35 +332,60 @@ pub(crate) fn apply_spawn_settings(
         crate::canonical::claude_code_spelling(&literal.to_string_lossy())
             != crate::canonical::claude_code_spelling(&real.to_string_lossy())
     });
-    if real.is_none() && foreground_hook_command.is_none() {
+    let repairs = real.is_some() || foreground_hook_command.is_some();
+    let days = crate::retention::launch_days(config_dir);
+    if !repairs && days.is_none() {
         command.args(passthrough);
-        return None;
+        return Ok(None);
     }
 
-    let (merge_value, clean) = match fold_settings_args(passthrough) {
-        Ok(folded) => folded,
-        // A bare `--settings` with no value: CC would refuse it; pass it
-        // through exactly and inject nothing.
-        Err(()) => {
-            command.args(passthrough);
-            return None;
-        }
+    // A bare `--settings` with no value: CC would refuse it; pass it through
+    // exactly and inject nothing.
+    let Ok((merge_value, clean)) = fold_settings_args(passthrough) else {
+        command.args(passthrough);
+        return Ok(None);
+    };
+
+    // A delegate's unusable `--settings` value would reach claude's flag tier
+    // unchanged, which outranks the user, project and local tiers (Claude Code
+    // merges user, project, local, flag, policy; measured 2026-11-12, Claude
+    // Code 2.1.322), where the model's own number outranks the remembered one.
+    // This check runs before any spawn-file hold, so the pre-read number is the
+    // only decision it can make; the write faults below decide again under the
+    // hold. With a number to carry, an unusable value refuses the launch
+    // instead of warning. The operator's own launch owns the number and is
+    // never refused.
+    let refuses = args_from == ArgsFrom::Model && days.is_some();
+    let tail: std::borrow::Cow<'static, str> = match days {
+        Some(days) if refuses => refusal_tail(days).into(),
+        _ => TAIL.into(),
     };
 
     let mut settings = match merge_value {
         Some(value) => {
             let inline = is_inline_settings(&value);
-            match parse_settings_value(&value, cwd, inline) {
+            match parse_settings_value(&value, cwd, inline, &tail) {
                 Ok(map) => {
-                    if let Some(field) = hooks_shape_error(&map) {
+                    // Only our hooks need the user's `hooks` shape; the number
+                    // alone rides any object.
+                    if repairs && let Some(field) = hooks_shape_error(&map) {
+                        if refuses {
+                            return Err(hooks_warning(inline, &value, &field, &tail));
+                        }
                         command.args(passthrough);
-                        return Some(hooks_warning(inline, &value, &field));
+                        return Ok(Some(hooks_warning(inline, &value, &field, &tail)));
                     }
                     map
                 }
+                // Every warning names a skipped exemption, so a launch that
+                // needs none passes the user's settings through silently; the
+                // tree's own `settings.json` still carries the number.
                 Err(warning) => {
+                    if refuses {
+                        return Err(warning);
+                    }
                     command.args(passthrough);
-                    return Some(warning);
+                    return Ok(repairs.then_some(warning));
                 }
             }
         }
@@ -367,53 +446,130 @@ pub(crate) fn apply_spawn_settings(
         }
     }
 
-    let mut ours = Vec::with_capacity(2);
-    if real.is_some() {
-        ours.push(json!({
-            "matcher": "Read",
-            "hooks": [{"type": "command", "command": read_hook_command, "timeout": 10}]
-        }));
-    }
-    if let Some(hook) = foreground_hook_command {
-        ours.push(json!({
-            "matcher": "Bash",
-            "hooks": [{"type": "command", "command": hook, "timeout": 10}]
-        }));
-    }
-    match settings
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Object(Map::new()))
-    {
-        Value::Object(hooks) => {
-            let pre = hooks
-                .entry("PreToolUse".to_string())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            match pre {
-                Value::Array(arr) => arr.extend(ours),
-                other => *other = Value::Array(ours),
+    let ours: Vec<Value> = real
+        .is_some()
+        .then(|| {
+            json!({
+                "matcher": "Read",
+                "hooks": [{"type": "command", "command": read_hook_command, "timeout": 10}]
+            })
+        })
+        .into_iter()
+        .chain(foreground_hook_command.map(|hook| {
+            json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": hook, "timeout": 10}]
+            })
+        }))
+        .collect();
+    if !ours.is_empty() {
+        match settings
+            .entry("hooks".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+        {
+            Value::Object(hooks) => {
+                let pre = hooks
+                    .entry("PreToolUse".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                match pre {
+                    Value::Array(arr) => arr.extend(ours),
+                    other => *other = Value::Array(ours),
+                }
+            }
+            other => {
+                let mut hooks = Map::new();
+                hooks.insert("PreToolUse".to_string(), Value::Array(ours));
+                *other = Value::Object(hooks);
             }
         }
-        other => {
-            let mut hooks = Map::new();
-            hooks.insert("PreToolUse".to_string(), Value::Array(ours));
-            *other = Value::Object(hooks);
+    }
+    // The number decision, the spawn-file write and the registration share
+    // one state-flock hold, and a shared launch that writes its spawn file
+    // registers it, number or not, so a number learned later reaches a
+    // repairs-only file too. The operator's own value wins and is never
+    // registered; a delegate's own valid value is the file's floor, so a
+    // later change never undercuts it. An isolated launch stays off the
+    // flock: it carries and records nothing.
+    let own = crate::retention::own_retention(&settings);
+    let own_valid = own.and_then(crate::retention::valid_days);
+    // The floor a registration stores: none for an operator launch — its own
+    // key, valid or not, never registers — and a delegate's own valid number.
+    let floor = own_valid;
+    let registerable = args_from == ArgsFrom::Model || own.is_none();
+    // The number due: the one the hold decides, else the pre-read's when the
+    // flock is not taken. A spawn file that cannot be written leaves that
+    // number out of the flag tier, and a project-tier `cleanupPeriodDays` in
+    // the delegate's cwd outranks the tree's user-tier `settings.json`; only a
+    // number still due refuses a delegate's write fault, and the refusal names
+    // that number. The operator's own launch is never refused.
+    let mut due = days;
+    let outcome = if registerable && crate::retention::is_shared(config_dir) {
+        crate::retention::carry_into_spawn_file(config_dir, settings_file, floor, |number| {
+            due = number;
+            if number.is_none() && settings.is_empty() {
+                // The number vanished between the pre-read and the flock and
+                // nothing else needs the file: write no empty file, register
+                // nothing.
+                return Ok(false);
+            }
+            if let Some(number) = number {
+                crate::retention::apply_launch_days(&mut settings, number, own_valid);
+            }
+            let json = serde_json::to_vec(&settings)?;
+            crate::profile::atomic_write_600(settings_file, json).map(|()| true)
+        })
+    } else {
+        crate::retention::CarryOutcome::Nothing
+    };
+    let mut written = false;
+    match outcome {
+        crate::retention::CarryOutcome::Carried => written = true,
+        crate::retention::CarryOutcome::Nothing => {
+            // The file is written below unregistered: the operator's own key
+            // wins and is never registered, an isolated tree records nothing,
+            // or the number vanished between the pre-read and the flock. An
+            // empty file with nothing of ours in it is not written.
+            if !repairs && settings.is_empty() {
+                command.args(passthrough);
+                return Ok(None);
+            }
+        }
+        crate::retention::CarryOutcome::WriteFailed(e) => {
+            if args_from == ArgsFrom::Model
+                && let Some(due) = due
+            {
+                return Err(write_fault(settings_file, &e, &refusal_tail(due)));
+            }
+            command.args(passthrough);
+            return Ok(repairs.then(|| write_fault(settings_file, &e, TAIL)));
+        }
+        crate::retention::CarryOutcome::LockedOut => {
+            // The flock was not taken: the file still carries the number the
+            // pre-read decided, unregistered, and the fault was reported once
+            // through the record-fault latch.
+            if let Some(number) = days {
+                crate::retention::apply_launch_days(&mut settings, number, own_valid);
+            }
         }
     }
-
-    let Ok(settings_json) = serde_json::to_string(&Value::Object(settings)) else {
-        command.args(passthrough);
-        return Some("clauth: --settings: could not serialize the injected settings".to_string());
-    };
-    if let Err(e) = crate::profile::atomic_write_600(settings_file, settings_json.as_bytes()) {
-        command.args(passthrough);
-        return Some(format!(
-            "clauth: --settings {:?}: cannot write it ({e}); {TAIL}",
-            settings_file
-        ));
+    if !written {
+        let json = Value::Object(settings).to_string();
+        if let Err(e) = crate::profile::atomic_write_600(settings_file, json.as_bytes()) {
+            if args_from == ArgsFrom::Model
+                && let Some(due) = due
+            {
+                return Err(write_fault(settings_file, &e, &refusal_tail(due)));
+            }
+            command.args(passthrough);
+            // As with an unreadable user `--settings` above, a launch that
+            // needed no repair or hook says nothing: its tree's own
+            // `settings.json` still carries the number.
+            return Ok(repairs.then(|| write_fault(settings_file, &e, TAIL)));
+        }
     }
     command.arg("--settings").arg(settings_file);
     command.args(&clean);
-    None
+    Ok(None)
 }
 
 /// The resolved `config_dir/projects`: the literal's realpath when it exists,
@@ -431,12 +587,16 @@ fn resolve_projects(config_dir: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Every root flag of claude 2.1.311 that takes a required value: claude hands
-/// it the next word whatever that word holds (`--name --zzz -p` names the
-/// session `--zzz`, `--name -- -p` names it `--`), so that word is never a
-/// flag or the separator. Copied from `VALUE_FLAGS` in cc-system-prompts'
-/// `test_shim.py`, which measured each entry against a real claude; the drift
-/// test in `tests/inline/cc_exempt.rs` checks the part `claude --help` lists.
+/// Every root flag of claude 2.1.327 that takes a required value, plus
+/// `--remote`: the one entry whose value 2.1.327 makes optional, kept so a word
+/// after it is never folded as clauth's own. A required-value flag gets the
+/// next word whatever that word holds (`--name --zzz -p` names the session
+/// `--zzz`, `--name -- -p` names it `--`), so that word is never a flag or the
+/// separator. The help-listed entries are copied from `VALUE_FLAGS`
+/// in cc-system-prompts' `test_shim.py`, which measured each against a real
+/// claude; the 9 hidden ones are read off 2.1.327's own value-flag set in its
+/// binary (2026-11-18). The drift test in `tests/inline/cc_exempt.rs` checks
+/// the part `claude --help` lists.
 const VALUE_FLAGS: &[&str] = &[
     "--add-dir",
     "--advisor",
@@ -460,19 +620,24 @@ const VALUE_FLAGS: &[&str] = &[
     "--correlation-id",
     "--dangerously-load-development-channels",
     "--debug-file",
+    "--deep-link-cwd-b64",
     "--deep-link-last-fetch",
     "--deep-link-repo",
     "--disallowed-tools",
     "--disallowedTools",
     "--effort",
     "--environment",
+    "--exec",
     "--fallback-model",
     "--fast-mode",
     "--file",
     "--forward-home-settings",
+    "--handle-uri",
     "--inherit-permission-mode",
+    "--initialize-fields",
     "--input-format",
     "--json-schema",
+    "--lead-verify-key",
     "--managed-settings",
     "--max-budget-usd",
     "--max-thinking-tokens",
@@ -493,6 +658,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--plugin-url",
     "--pool",
     "--prefill",
+    "--prefill-b64",
     "--proactivity",
     "--project-config-root",
     "--ref",
@@ -501,8 +667,10 @@ const VALUE_FLAGS: &[&str] = &[
     "--resume-drops-turn",
     "--resume-session-at",
     "--rewind-files",
+    "--routine",
     "--runner-declares",
     "--sdk-url",
+    "--session-began-as-copy",
     "--session-id",
     "--setting-sources",
     "--settings",
@@ -518,6 +686,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--watch-artifact",
     "--watch-artifact-no-autoreact",
     "--workload",
+    "-m",
     "-n",
 ];
 
@@ -703,15 +872,17 @@ pub(crate) fn is_inline_settings(value: &str) -> bool {
 
 /// The user's `--settings` value as a JSON object, inline JSON or a settings
 /// file path resolved against `cwd` ([`is_inline_settings`] picks). The `Err`
-/// is the full, already-rendered warning.
+/// is the full, already-rendered line carrying the caller's `tail` — the
+/// passthrough warning's, or a refused delegate's.
 pub(crate) fn parse_settings_value(
     value: &str,
     cwd: &Path,
     inline: bool,
+    tail: &str,
 ) -> Result<Map<String, Value>, String> {
     let trimmed = value.trim();
     if inline {
-        parse_json_object(trimmed).map_err(|detail| inline_warning(&detail))
+        parse_json_object(trimmed).map_err(|detail| inline_warning(&detail, tail))
     } else {
         let path = Path::new(trimmed);
         let path = if path.is_absolute() {
@@ -724,9 +895,10 @@ pub(crate) fn parse_settings_value(
                 path_warning(
                     value,
                     &format!("cannot read it ({})", strip_os_error(&detail)),
+                    tail,
                 )
             })?;
-        parse_json_object(&content).map_err(|detail| path_warning(value, &detail.refusal()))
+        parse_json_object(&content).map_err(|detail| path_warning(value, &detail.refusal(), tail))
     }
 }
 
@@ -836,25 +1008,45 @@ fn valid_project_dir_name(value: &std::ffi::OsStr) -> bool {
 }
 
 /// The path-value warning: the value is echoed as the user typed it, Debug
-/// quoted, never interpolated raw.
-fn path_warning(value: &str, reason: &str) -> String {
-    format!("clauth: --settings {value:?}: {reason}; {TAIL}")
+/// quoted, never interpolated raw. The caller's `tail` closes the line.
+fn path_warning(value: &str, reason: &str, tail: &str) -> String {
+    format!("clauth: --settings {value:?}: {reason}; {tail}")
 }
 
 /// The inline-JSON warning: the value is never echoed.
-fn inline_warning(detail: &NotSettingsObject) -> String {
-    format!("clauth: --settings JSON is {}; {TAIL}", detail.refusal())
+fn inline_warning(detail: &NotSettingsObject, tail: &str) -> String {
+    format!("clauth: --settings JSON is {}; {tail}", detail.refusal())
 }
 
 /// The malformed-`hooks` warning: the value IS a settings object, one field
 /// has the wrong shape. Inline never echoes the value; the path form echoes it
 /// as the user typed it.
-fn hooks_warning(inline: bool, value: &str, field: &str) -> String {
+fn hooks_warning(inline: bool, value: &str, field: &str, tail: &str) -> String {
     if inline {
-        format!("clauth: --settings JSON: {field}; {TAIL}")
+        format!("clauth: --settings JSON: {field}; {tail}")
     } else {
-        format!("clauth: --settings {value:?}: {field}; {TAIL}")
+        format!("clauth: --settings {value:?}: {field}; {tail}")
     }
+}
+
+/// The `cannot write it` line for the spawn file, shared by both write-failure
+/// arms: `tail` makes it the passthrough warning or the delegate refusal.
+#[expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "the approved line quotes and escapes the path as Debug does"
+)]
+fn write_fault(settings_file: &Path, e: &std::io::Error, tail: &str) -> String {
+    format!("clauth: --settings {settings_file:?}: cannot write it ({e}); {tail}")
+}
+
+/// The delegate-refusal tail: clauth holds a number the launch's `--settings`
+/// cannot carry, so the delegate does not start rather than sweep at the
+/// model's own number.
+fn refusal_tail(days: u64) -> String {
+    format!(
+        "the delegate was not started, since clauth could not keep \
+         cleanupPeriodDays at {days} or more in it"
+    )
 }
 
 /// The `hook-read-exempt` verdict for one `PreToolUse` payload: `Some(stdout)`

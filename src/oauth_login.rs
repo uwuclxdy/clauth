@@ -20,13 +20,14 @@
 //! [`crate::oauth`] with whichever redirect delivered it. The authorize-host
 //! risk knob is documented on [`AUTHORIZE_URL`].
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::login_page::{self, Id};
 use crate::logline::logline;
 use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
 use crate::usage::{PlanInfo, now_ms};
@@ -493,73 +494,6 @@ pub(crate) enum LoginProgress {
     Verifying,
 }
 
-/// Visual tone of a callback page — picks the card's accent color.
-enum Tone {
-    Success,
-    Warning,
-    Danger,
-}
-
-impl Tone {
-    /// `(dark, light)` accent hex pair (Mocha / Latte semantic colors).
-    fn hex(&self) -> (&'static str, &'static str) {
-        match self {
-            Tone::Success => ("#A6E3A1", "#40A02B"),
-            Tone::Warning => ("#F9E2AF", "#DF8E1D"),
-            Tone::Danger => ("#F38BA8", "#D20F39"),
-        }
-    }
-}
-
-/// One browser-facing callback page. Copy is always static — OAuth error
-/// strings from the query are untrusted input and are never reflected into
-/// the HTML (they go to the terminal error only).
-struct Page {
-    tone: Tone,
-    title: &'static str,
-    detail: &'static str,
-    /// Try `window.close()` after paint. Browsers often refuse to close a tab
-    /// a script didn't open, so the copy always covers closing it by hand.
-    auto_close: bool,
-}
-
-/// Write a small self-contained styled page and close. Dark by default with a
-/// light-scheme override; everything is inline, so the page makes no requests.
-fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
-    let (tone, tone_light) = page.tone.hex();
-    let script = if page.auto_close {
-        // Let the page paint before trying to close; refusal is expected.
-        "<script>setTimeout(function(){window.close()},900)</script>"
-    } else {
-        ""
-    };
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>clauth</title><style>\
-         :root{{--bg:#1E1E2E;--raised:#181825;--line:#313244;--text:#CDD6F4;--dim:#A6ADC8;--faint:#7F849C;--tone:{tone}}}\
-         @media(prefers-color-scheme:light){{:root{{--bg:#EFF1F5;--raised:#FFFFFF;--line:#CCD0DA;--text:#1E1E2E;--dim:#6C6F85;--faint:#9CA0B0;--tone:{tone_light}}}}}\
-         *{{box-sizing:border-box;margin:0;padding:0}}\
-         body{{font-family:Onest,ui-sans-serif,system-ui,\"Segoe UI\",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}\
-         main{{background:var(--raised);border:1px solid var(--line);border-left:3px solid var(--tone);border-radius:1px;padding:32px 40px;max-width:440px}}\
-         .eyebrow{{font-size:11px;font-weight:450;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-bottom:12px}}\
-         h1{{font-size:22px;font-weight:550;letter-spacing:-.01em;margin-bottom:8px}}\
-         p{{font-size:14px;line-height:1.55;color:var(--dim)}}\
-         </style></head><body><main>\
-         <div class=\"eyebrow\">clauth</div><h1>{title}</h1><p>{detail}</p>\
-         </main>{script}</body></html>",
-        title = page.title,
-        detail = page.detail,
-    );
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {len}\r\nConnection: close\r\n\r\n{html}",
-        len = html.len(),
-    );
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
-}
-
 /// Why the authorize callback came back without a code — the browser-redirect
 /// twin of [`crate::oauth::TokenFailure`], typed for the same reason.
 ///
@@ -656,32 +590,12 @@ fn handle_callback(
     let request_line = String::from_utf8_lossy(&bytes);
 
     let Some(target) = request_target(&request_line) else {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "That request didn't parse",
-                detail: "clauth expected an OAuth callback here. clauth is still waiting \
-                         for the real callback; you can close this tab.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeBadRequest);
         return Ok(None);
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/callback" {
-        write_response(
-            &stream,
-            "404 Not Found",
-            Page {
-                tone: Tone::Warning,
-                title: "Nothing at this address",
-                detail: "The login callback arrives at /callback on its own. \
-                         You can close this tab.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeNotFound);
         return Ok(None);
     }
     if let Some(err) = query_param(query, "error") {
@@ -692,23 +606,11 @@ fn handle_callback(
         let rejection = AuthorizeRejection::parse(&err);
         // A user-declined consent screen reads differently from a broken flow.
         let page = if matches!(rejection, AuthorizeRejection::Declined) {
-            Page {
-                tone: Tone::Warning,
-                title: "Login canceled",
-                detail: "You declined the authorization request, so no login was \
-                         captured. Close this tab; you can retry from clauth any time.",
-                auto_close: false,
-            }
+            Id::ClaudeDeclined
         } else {
-            Page {
-                tone: Tone::Danger,
-                title: "Login failed",
-                detail: "Claude reported an error during authorization. Close this \
-                         tab and retry the login from clauth.",
-                auto_close: false,
-            }
+            Id::ClaudeFailed
         };
-        write_response(&stream, "400 Bad Request", page);
+        login_page::write_page(&mut stream, page);
         logline!(
             "clauth: the authorize callback refused the login: {}",
             rejection.log_detail()
@@ -716,50 +618,49 @@ fn handle_callback(
         anyhow::bail!("{}", rejection.user_message());
     }
     let Some(code) = query_param(query, "code") else {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "No code in the callback",
-                detail: "The redirect arrived without an authorization code. Close \
-                         this tab; clauth is still waiting for the real callback.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeNoCode);
         return Ok(None);
     };
     if query_param(query, "state").as_deref() != Some(expected_state) {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "Login blocked",
-                detail: "This callback didn't match the login clauth started, so it \
-                         was rejected for safety. Retry the login from clauth.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeBlocked);
         anyhow::bail!("OAuth state mismatch (possible CSRF); login aborted");
     }
-    write_response(
-        &stream,
-        "200 OK",
-        Page {
-            tone: Tone::Success,
-            title: "You're logged in",
-            detail: "clauth captured the login. This tab will try to close itself; \
-                     if it sticks around, close it and head back to the terminal.",
-            auto_close: true,
-        },
-    );
+    login_page::write_page(&mut stream, Id::ClaudeSuccess);
     Ok(Some(code))
 }
 
+/// The paste door of a wait that races two doors, polled between turns of the
+/// other one: a value on the channel wins it, a dropped sender closes it (the
+/// other door keeps waiting), and an empty channel hands the turn back. The
+/// OAuth login's loopback wait and the proxy login's poll share it.
+pub(crate) struct PasteDoor<'a, T> {
+    rx: &'a std::sync::mpsc::Receiver<T>,
+    open: bool,
+}
+
+impl<'a, T> PasteDoor<'a, T> {
+    pub(crate) fn new(rx: &'a std::sync::mpsc::Receiver<T>) -> Self {
+        Self { rx, open: true }
+    }
+
+    /// The value the door delivered since the last look, if any.
+    pub(crate) fn poll(&mut self) -> Option<T> {
+        if !self.open {
+            return None;
+        }
+        match self.rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.open = false;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+}
+
 /// Accept loop until a code arrives through either door or `deadline` passes.
-/// The paste door is polled first: `Ok` wins it, `Disconnected` closes it (the
-/// listener keeps waiting), `Empty` falls through to the loopback accept.
+/// The paste door is polled first ([`PasteDoor`]), then the loopback accept.
 /// Every accepted connection is read on its own reader thread under one
 /// whole-connection [`callback_read_timeout`] deadline armed at accept, so a
 /// silent or trickling socket never blocks the accept loop behind it; the first
@@ -775,19 +676,15 @@ fn wait_for_code(
     listener.set_nonblocking(true)?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>>>();
     let (wait_over, _wait_over_guard) = WaitOver::new();
-    let mut paste_open = true;
+    let mut paste = PasteDoor::new(paste);
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for the login code (browser callback or pasted code, {LOGIN_TIMEOUT_SECS}s)"
             );
         }
-        if paste_open {
-            match paste.try_recv() {
-                Ok(code) => return Ok((code.0, LoginMethod::Manual)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => paste_open = false,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
+        if let Some(code) = paste.poll() {
+            return Ok((code.0, LoginMethod::Manual));
         }
         // A reader thread's outcome. `tx` stays alive in this loop, so the
         // channel is never disconnected here; the arm only keeps the match

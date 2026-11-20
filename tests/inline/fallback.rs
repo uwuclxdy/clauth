@@ -117,6 +117,8 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             setup_token_digest: None,
             provider: None,
             typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         usage,
         fresh: false,
@@ -2359,7 +2361,7 @@ fn clear_week() -> UsageInfo {
 
 /// The local date `days` from today, the frame a plan date is read in.
 fn local_day_in(days: i64) -> chrono::NaiveDate {
-    let today = crate::usage::local_date_of(now_epoch_secs()).expect("today resolves");
+    let today = crate::format::local_day(now_epoch_secs()).expect("today resolves");
     today + chrono::Duration::days(days)
 }
 
@@ -4654,7 +4656,7 @@ fn walk_skips_broken_last_resort_member() {
     );
 }
 
-// ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
+// ── burn-aware auto-switch (opt-in, default off) ────────────────────────────
 //
 // `is_exhausted_projected` and the ACTIVE-side check
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
@@ -10409,7 +10411,7 @@ fn a_monthly_only_active_walks_off_past_the_weekly_line() {
 
 /// A hybrid active under burn-aware switching never pairs
 /// its OAuth burn history with its provider window — the static threshold
-/// decides (maintainer ruling 2026-09-10). Gamma (third-party) at 92% with a 600 %/h OAuth
+/// decides. Gamma (third-party) at 92% with a 600 %/h OAuth
 /// climb must NOT be walked off, where the burn branch would project past 100.
 #[test]
 fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
@@ -11967,5 +11969,227 @@ fn a_refused_setup_token_beside_an_env_key_clears_on_a_remint() {
     assert!(
         !third_party_key_rejected(&reminted, &reminted.name),
         "a re-minted token clears the dead login"
+    );
+}
+
+// ── auto-switch log line ─────────────────────────────────────────────────────
+
+fn log_window(utilization: f64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at: None,
+    }
+}
+
+#[test]
+fn auto_switch_log_line_names_both_accounts_and_the_reading_against_its_lines() {
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.fallback_threshold = Some(90.0);
+    let usage = UsageInfo {
+        five_hour: Some(log_window(91.4)),
+        seven_day: Some(log_window(70.0)),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some("work"),
+            "perso",
+            false,
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: Some(240),
+            }),
+            98.0
+        ),
+        "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 91% (line 90%), 7d 70% (line 98%) 4m ago",
+    );
+}
+
+#[test]
+fn auto_switch_log_line_reads_the_member_weekly_override_and_default_threshold() {
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.weekly_threshold = Some(85.0);
+    let usage = UsageInfo {
+        seven_day: Some(log_window(86.0)),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth daemon",
+            Some("work"),
+            "perso",
+            false,
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: Some(240),
+            }),
+            98.0
+        ),
+        "clauth daemon: auto-switched to 'perso' from 'work'; 'work' read 7d 86% (line 85%) 4m ago",
+    );
+    let five = UsageInfo {
+        five_hour: Some(log_window(96.0)),
+        ..UsageInfo::default()
+    };
+    let plain = Profile::new("plain".to_string(), None, None);
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some("plain"),
+            "b",
+            false,
+            Some(&LeftAccount {
+                profile: plain,
+                usage: Some(five),
+                age_secs: Some(30),
+            }),
+            98.0
+        ),
+        "clauth: auto-switched to 'b' from 'plain'; 'plain' read 5h 96% (line 95%) just now",
+        "an account with no override is judged at the default 5h line",
+    );
+}
+
+/// Figures with no fetch stamp behind them are a reading clauth cannot date:
+/// the line says so instead of implying the reading is current.
+#[test]
+fn auto_switch_log_line_marks_an_undated_reading() {
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.fallback_threshold = Some(90.0);
+    let usage = UsageInfo {
+        five_hour: Some(log_window(91.0)),
+        ..UsageInfo::default()
+    };
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some("work"),
+            "perso",
+            false,
+            Some(&LeftAccount {
+                profile: work,
+                usage: Some(usage),
+                age_secs: None,
+            }),
+            98.0
+        ),
+        "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 91% (line 90%) at an unknown time",
+    );
+}
+
+#[test]
+fn auto_switch_log_line_names_a_return_home_and_missing_readings() {
+    let perso = Profile::new("perso".to_string(), None, None);
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some("perso"),
+            "work",
+            true,
+            Some(&LeftAccount {
+                profile: perso.clone(),
+                usage: None,
+                age_secs: None,
+            }),
+            98.0
+        ),
+        "clauth: returned to preferred account 'work' from 'perso'; 'perso' read nothing",
+    );
+    // A reading with no figure carries no age, whatever clock the caller holds.
+    assert_eq!(
+        auto_switch_log_line(
+            "clauth",
+            Some("perso"),
+            "work",
+            false,
+            Some(&LeftAccount {
+                profile: perso,
+                usage: Some(UsageInfo::default()),
+                age_secs: Some(240),
+            }),
+            98.0
+        ),
+        "clauth: auto-switched to 'work' from 'perso'; 'perso' read nothing",
+    );
+    assert_eq!(
+        auto_switch_log_line("clauth", None, "work", true, None, 98.0),
+        "clauth: returned to preferred account 'work'",
+    );
+    assert_eq!(
+        auto_switch_log_line("clauth", None, "work", false, None, 98.0),
+        "clauth: auto-switched to 'work'",
+    );
+}
+
+/// The name a switch's own result reports rides the line even when no profile
+/// loads: the profile only fills the figures, so an account clauth cannot load
+/// reads `nothing` rather than dropping out of the line.
+#[test]
+fn auto_switch_log_line_keeps_the_left_name_without_a_profile() {
+    assert_eq!(
+        auto_switch_log_line("clauth", Some("delta"), "gamma", false, None, 98.0),
+        "clauth: auto-switched to 'gamma' from 'delta'; 'delta' read nothing",
+    );
+    assert_eq!(
+        switch_off_log_line("clauth", Some("delta"), None, 98.0),
+        "clauth: switched off: all accounts spent; 'delta' read nothing",
+    );
+}
+
+/// Both processes' wrap-off lines carry the reading and its age; a wrap-off
+/// whose account no longer resolves keeps the bare line.
+#[test]
+fn switch_off_log_line_names_the_left_reading_and_its_age() {
+    let work = Profile::new("work".to_string(), None, None);
+    let usage = UsageInfo {
+        five_hour: Some(log_window(100.0)),
+        seven_day: Some(log_window(99.0)),
+        ..UsageInfo::default()
+    };
+    let read = LeftAccount {
+        profile: work,
+        usage: Some(usage),
+        age_secs: Some(120),
+    };
+    assert_eq!(
+        switch_off_log_line("clauth", Some("work"), Some(&read), 98.0),
+        "clauth: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) 2m ago",
+    );
+    assert_eq!(
+        switch_off_log_line("clauth daemon", Some("work"), Some(&read), 98.0),
+        "clauth daemon: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) 2m ago",
+    );
+    assert_eq!(
+        switch_off_log_line(
+            "clauth",
+            Some("work"),
+            Some(&LeftAccount {
+                profile: read.profile.clone(),
+                usage: read.usage.clone(),
+                age_secs: None,
+            }),
+            98.0
+        ),
+        "clauth: switched off: all accounts spent; 'work' read 5h 100% (line 95%), 7d 99% (line 98%) at an unknown time",
+    );
+    assert_eq!(
+        switch_off_log_line(
+            "clauth",
+            Some("work"),
+            Some(&LeftAccount {
+                profile: read.profile,
+                usage: None,
+                age_secs: None,
+            }),
+            98.0
+        ),
+        "clauth: switched off: all accounts spent; 'work' read nothing",
+    );
+    assert_eq!(
+        switch_off_log_line("clauth", None, None, 98.0),
+        "clauth: switched off: all accounts spent",
     );
 }

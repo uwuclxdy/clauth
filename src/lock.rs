@@ -15,10 +15,12 @@
 //!
 //! Acquiring the cross-process flock is bounded by [`STATE_LOCK_TIMEOUT`]. A
 //! blocking flock has no deadline, so a lease-holding fetcher whose rotation path
-//! waits on a lock another clauth process holds forever would pin the usage-fetch
-//! lease and stand every TUI down permanently (no watchdog covers the scheduler
-//! thread). A bounded wait turns that silent wedge into a [`StateLockTimeout`] the
-//! caller retries instead of a hang.
+//! waits on a lock another clauth process holds forever would stall its tick and
+//! stand the other instances down with it. The bounded wait is the first defence:
+//! one tick returns a [`StateLockTimeout`] the caller retries instead of hanging.
+//! A wedge that outlives it is the scheduler lease watchdog's to break — it
+//! releases the lease once a tick has completed nothing for its bound (5 min of
+//! running time).
 
 use std::cell::Cell;
 use std::fs::File;
@@ -45,8 +47,10 @@ pub(crate) const LOCK_FILENAME: &str = ".lock";
 /// they can never spend 2 × this on waits. What
 /// keeps the first bound from moving is [`SUBPROCESS_BUDGET`], which caps the
 /// shell-outs of one hold in aggregate rather than one at a time. On Linux the
-/// flock is only ever held across sub-millisecond disk writes, so only a
-/// genuine wedge ever reaches this deadline.
+/// flock is held across disk reads and writes, plus a 100 ms pause after each
+/// of the first two failed reads of a member in `retention::remove`
+/// (at most 200 ms per member), so only a genuine wedge ever reaches this
+/// deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The flock deadline [`StateLock::acquire`] waits out: [`STATE_LOCK_TIMEOUT`],

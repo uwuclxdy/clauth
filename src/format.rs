@@ -10,7 +10,7 @@
 //! mint one-caller abstractions, so the split stands over a single grab-bag
 //! `format.rs`.
 
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
 use ratatui::text::Span;
@@ -164,6 +164,16 @@ pub(crate) enum Cause {
     /// `store` is the dir the refusal names (the global store or the account's
     /// own `jobs/`).
     UnreadableJobStoreOnRotatingChain { profile: String, store: String },
+    /// The job store holds a job dir that never clears on its own — a
+    /// record-less dir of no known shape, or a record read whole that fails
+    /// both parses and is older than the mid-create grace — so clauth cannot
+    /// rule out an unfinished job on a rotatable tree. A GLOBAL stuck dir
+    /// blocks every profile on macOS until it is deleted; a tree-local one
+    /// blocks only the profile whose store holds it. Split from
+    /// [`Self::UnreadableJobStoreOnRotatingChain`] because a retry cannot
+    /// help: only deleting the named dir lets the rotation through. The `dir`
+    /// is the job dir, rendered home-relative by the caller.
+    UnreadableJobDirOnRotatingChain { profile: String, dir: String },
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
@@ -264,6 +274,11 @@ impl Cause {
                     "can't read claude code's background job list ({store}), so '{profile}' is not rotated; retry in a moment"
                 )
             }
+            Self::UnreadableJobDirOnRotatingChain { profile, dir } => {
+                format!(
+                    "can't read claude code's background job ({dir}), so '{profile}' is not rotated; delete that dir to rotate"
+                )
+            }
             Self::RotationLockHeld(profile) => {
                 format!("'{profile}' has a token rotation in progress, retry in a moment")
             }
@@ -310,6 +325,7 @@ impl Cause {
 /// The status is deliberately separable: CLI stderr and the daemon log show it
 /// (neither has a companion log to read it out of) while a toast and the MCP
 /// payload do not.
+#[derive(Debug)]
 pub(crate) struct Transient {
     cause: Cause,
     status: Option<u16>,
@@ -406,13 +422,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
-/// pre-flight's quarantine arm, and — through
-/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
-/// the quarantine's own log line, wherever the profile neither serves its own
-/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
-/// same `None` case but words its own sentence, since it also has to say the
-/// arming did not happen.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, and —
+/// through `oauth::third_party_dead_chain_copy`'s `None` case — the MCP
+/// pre-flight's quarantine arm, the rotate toast and the quarantine's own log
+/// line, wherever the profile neither serves its own inference nor is keyless
+/// (`Profile::is_keyless`, or a proxy account with no key). `clauth
+/// rolling-token`'s dead-chain bail takes that same `None` case but words its
+/// own sentence, since it also has to say the arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -431,9 +447,30 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
 /// line, so the surfaces cannot spell one state two ways. A key the provider
-/// refused renders [`api_key_rejected`] on those surfaces instead.
-pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
-    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+/// refused renders [`api_key_rejected`] on those surfaces instead. A proxy
+/// account (`proxy` is its runtime claim's service) takes its key only from a
+/// login through its proxy, so the fix names that login instead.
+pub(crate) fn third_party_keyless(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "profile has no api key: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
+}
+
+/// The command that re-captures `name`'s inference key: `--api-key`, or the
+/// login through its proxy for a proxy account, the only login clauth takes
+/// for one.
+fn key_fix_command(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    match proxy {
+        Some(service) => crate::actions::proxy_login_command(name.as_str(), service),
+        None => format!("clauth login {name} --api-key <key>"),
+    }
 }
 
 /// A third-party api key the provider's dead-key record names rejected
@@ -442,9 +479,16 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// `--api-key`, the command that also lifts a keyless profile — a bare
 /// `clauth login <name>` runs the browser flow and leaves the key untouched.
 /// Rendered by the MCP pre-flight's key-rejected arm and by
-/// `oauth::third_party_dead_chain_copy`'s callers.
-pub(crate) fn api_key_rejected(name: &crate::profile::ProfileName) -> String {
-    format!("api key rejected: {name} (run `clauth login {name} --api-key <key>`)")
+/// `oauth::third_party_dead_chain_copy`'s callers. A proxy account's fix is
+/// the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn api_key_rejected(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
+    format!(
+        "api key rejected: {name} (run `{}`)",
+        key_fix_command(name, proxy)
+    )
 }
 
 /// An OAuth account's setup token that the usage probe found refused
@@ -477,19 +521,26 @@ pub(crate) fn setup_token_rejected(name: &crate::profile::ProfileName) -> String
 /// matches lands on this sentence instead, since "expired" would be false.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
-/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
-/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
-/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
-/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
-/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// the shared arm's up-front quarantine bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line.
+/// `RollingArmRefusal::sentence`'s `DeadChainKeptMint` arm carries a fourth
+/// dead-chain sentence and is deliberately NOT routed: `classify_armed_sidecar`'s
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach
+/// `Broken` for a profile with a `base_url`, so a third-party branch there is
+/// dead code.
 /// The MCP pre-flight admits that target instead of refusing it, so it renders
 /// nothing (owner ruling 2026-08-30).
 /// The command is backticked to match [`third_party_keyless`], which renders
-/// beside it on the same surfaces (owner ruling: house style).
-pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+/// beside it on the same surfaces. A proxy
+/// account's fix is the login through its proxy, as in [`third_party_keyless`].
+pub(crate) fn third_party_dead_chain(
+    name: &crate::profile::ProfileName,
+    proxy: Option<&crate::proxy::Service>,
+) -> String {
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
-         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+         (run `{}` to clear the quarantine)",
+        key_fix_command(name, proxy)
     )
 }
 
@@ -581,9 +632,10 @@ pub(crate) fn unsaved_live_login(name: &str) -> String {
     format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
 }
 
-/// The CLI switch over an unsaved live login whose outgoing account runs on a
+/// A switch over an unsaved live login whose outgoing account runs on a
 /// long-lived token: that account's store cannot take an OAuth login, so the
-/// switch does not offer to save it there.
+/// CLI switch does not offer to save it there and the headless switch's
+/// `Overwrite` default (the plugin, the API) refuses before capturing.
 pub(crate) fn long_lived_cannot_hold_login(name: &str) -> String {
     format!(
         "'{name}' runs on a long-lived token and cannot hold this login; save it as another \
@@ -604,6 +656,13 @@ pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileNa
 /// The one spelling for "go fix this in the app". The surface is the `clauth`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the `clauth` TUI";
+
+/// `message` without its closing `; {RESOLVE_IN_TUI} first` pointer, for a
+/// surface where that pointer leads nowhere or is said elsewhere. `None` on a
+/// message that does not close with it, which each caller answers its own way.
+pub(crate) fn without_resolve_pointer(message: &str) -> Option<&str> {
+    message.strip_suffix(&format!("; {RESOLVE_IN_TUI} first"))
+}
 
 /// The one spelling for a stored login that exists but cannot be read.
 pub(crate) const STORED_LOGIN_UNREADABLE: &str = "its stored login could not be read";
@@ -830,6 +889,38 @@ pub(crate) fn terminal_safe(s: &str) -> String {
     s.chars().filter(|c| !unsafe_on_terminal(*c)).collect()
 }
 
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so a reader gets the
+/// text, not CSI bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+pub(crate) fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Unicode's `Bidi_Control` property, all twelve codepoints: the embeddings and
 /// overrides (`U+202A..=U+202E`), the isolates (`U+2066..=U+2069`), and the
 /// three directional marks — `U+200E` LRM, `U+200F` RLM, and `U+061C` ALM, the
@@ -949,11 +1040,20 @@ pub(crate) fn format_pct(pct: f64) -> String {
 /// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
 /// a surface-local twin of this is a drift, not a specialization.
 pub(crate) fn format_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
-    }
+    let decimals = amount_decimals(n);
+    format!("{n:.decimals$}")
+}
+
+/// Whole amounts print bare, fractions at two decimals.
+fn amount_decimals(n: f64) -> usize {
+    if n.fract() == 0.0 { 0 } else { 2 }
+}
+
+/// [`format_amount`], grouped with `,` thousands separators and the sign ahead
+/// of the first group (`-1,234.50`).
+pub(crate) fn format_amount_grouped(n: f64) -> String {
+    let sign = if n < 0.0 { "-" } else { "" };
+    format!("{sign}{}", group_thousands(n.abs(), amount_decimals(n)))
 }
 
 /// A token threshold in its display form: exact millions as `{n}M` (`2M`),
@@ -967,6 +1067,22 @@ pub(crate) fn format_threshold_tokens(v: u64) -> String {
         format!("{}k", v / 1000)
     } else {
         v.to_string()
+    }
+}
+
+/// A token amount as the pool bar's compact figure: `7.5B`, `285M`, `12k`.
+pub(crate) fn format_compact(n: f64) -> String {
+    let trim = |scaled: String| {
+        scaled
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+    match n.abs() {
+        magnitude if magnitude >= 1e9 => format!("{}B", trim(format!("{:.2}", n / 1e9))),
+        magnitude if magnitude >= 1e6 => format!("{}M", trim(format!("{:.1}", n / 1e6))),
+        magnitude if magnitude >= 1e3 => format!("{:.0}k", n / 1e3),
+        _ => format!("{n:.0}"),
     }
 }
 
@@ -991,27 +1107,32 @@ pub(crate) fn group_thousands(n: f64, decimals: usize) -> String {
     out
 }
 
+/// The local calendar day of an epoch-seconds instant: the one epoch to
+/// local-date conversion, behind [`local_date`] and every plan-date
+/// comparison. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_day(epoch: i64) -> Option<NaiveDate> {
+    Some(
+        DateTime::from_timestamp(epoch, 0)?
+            .with_timezone(&Local)
+            .date_naive(),
+    )
+}
+
 /// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age
 /// spelling (an ISO date, no time). [`local_stamp`] is this plus the time of
 /// day. Returns `None` when the instant falls outside chrono's representable
 /// range.
 pub(crate) fn local_date(epoch: i64) -> Option<String> {
-    let naive = DateTime::from_timestamp(epoch, 0)?
-        .with_timezone(&Local)
-        .naive_local();
-    Some(format!(
-        "{:04}-{:02}-{:02}",
-        naive.year(),
-        naive.month(),
-        naive.day(),
-    ))
+    local_day(epoch).map(|day| format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day()))
 }
 
-/// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
-/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
-/// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
-/// --json`'s `updated` — do not route through here.
+/// The LOCAL prose-stamp formatter: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock.
+/// [`local_minute_stamp`] is the listing-cell spelling beside it; any other
+/// spelling of a LOCAL stamp is a bug in its caller, not a new helper. Machine
+/// timestamps that stay UTC by design — the daemon `logline!` prefix and
+/// `clauth sessions --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
     let naive = DateTime::from_timestamp(epoch, 0)?
@@ -1023,6 +1144,22 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.hour(),
         naive.minute(),
         naive.second(),
+    ))
+}
+
+/// [`local_stamp`] without the seconds: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM` in the operator's local wall clock, the shape a listing
+/// cell shows. Returns `None` when the instant falls outside chrono's
+/// representable range.
+pub(crate) fn local_minute_stamp(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{} {:02}:{:02}",
+        local_date(epoch)?,
+        naive.hour(),
+        naive.minute(),
     ))
 }
 

@@ -79,6 +79,8 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -209,6 +211,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -284,6 +288,8 @@ fn profile_without_refresh_token_excluded() {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -387,6 +393,8 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -430,6 +438,8 @@ fn third_party_config(name: &str) -> AppConfig {
         setup_token_digest: None,
         provider: None,
         typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -697,7 +707,7 @@ fn gate_refreshes_expiring_token_and_installs() {
         &handle,
         &crate::profile::ProfileName::from(name),
         refresher,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     crate::oauth::set_rotation_saved_hook(None);
     assert!(matches!(gate, AuthGate::Refreshed));
@@ -1499,6 +1509,51 @@ mod adopt_live_rotation {
         let on_disk: crate::profile::ClaudeCredentials =
             crate::profile::read_json_file(&store).expect("read store");
         assert_eq!(on_disk.refresh_token(), Some("at-rotated-refresh"));
+    }
+
+    /// A fresher same-account mirror is not adopted into a profile whose
+    /// `config.toml` turned unclassifiable after the config loaded (a
+    /// directory in its place, a `[proxy] # note` header that fails to
+    /// parse): the store and memory keep the old pair.
+    #[test]
+    fn adopts_nothing_into_an_account_whose_config_cannot_be_classified() {
+        use crate::claude::tests::Unclassifiable;
+        let outcomes: Vec<_> = Unclassifiable::BOTH
+            .iter()
+            .enumerate()
+            .map(|(i, shape)| {
+                // A home per shape: `setup` stores one login, which a second
+                // profile in the same home may not hold too.
+                let _home = HomeSandbox::new();
+                let name = format!("adopt-unclassified-{i}");
+                let handle = setup(&name, future_expiry(), future_expiry() + 3_600_000);
+                shape.pose(&name);
+                let store = crate::profile::profile_subpath(
+                    &crate::profile::ProfileName::from(name.as_str()),
+                    "credentials.json",
+                )
+                .unwrap();
+                let before = std::fs::read(&store).ok();
+                let adopted = try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name.as_str()),
+                    &guard(&name),
+                    &|_| Some("uuid-1".into()),
+                );
+                (
+                    adopted,
+                    std::fs::read(&store).ok() == before,
+                    stored_access(&handle, &name),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            outcomes,
+            vec![(None, true, "at-old".to_string()); 2],
+            "(the adopted pair, the store kept, memory's access token) for a directory and a \
+             noted header"
+        );
     }
 
     #[test]
@@ -3088,7 +3143,7 @@ fn kick_emits_cc_message_wire_shape() {
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
-    let _ = kick_to(&url, "TESTTOKEN");
+    let _ = kick_to(&url, "TESTTOKEN", || true);
     let req = server.join().unwrap();
 
     assert!(
@@ -3223,7 +3278,7 @@ fn kick_429_surfaces_limiter_metadata() {
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
     let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
-    let err = kick_to(&url, "TESTTOKEN").expect_err("429 must error");
+    let err = kick_to(&url, "TESTTOKEN", || true).expect_err("429 must error");
     server.join().unwrap();
 
     let KickError::Status(429, Some(rl)) = err else {
@@ -4637,9 +4692,14 @@ fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_co
 fn the_job_store_rotation_refusals_name_their_own_causes() {
     let home = HomeSandbox::new();
     let name = "test-roll-refuse";
+    let sep = std::path::MAIN_SEPARATOR;
     let tree_jobs = home
         .home()
-        .join(".clauth/profiles/test-roll-refuse/runtime-4242-53/jobs");
+        .join(".clauth")
+        .join("profiles")
+        .join("test-roll-refuse")
+        .join("runtime-4242-53")
+        .join("jobs");
     for (block, want) in [
         (
             crate::runtime::RotationBlock::BackgroundJob,
@@ -4650,9 +4710,9 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
         (
             crate::runtime::RotationBlock::UnreadableJobStore(tree_jobs.clone()),
             format!(
-                "can't read claude code's background job list ({}), so \
-                 'test-roll-refuse' is not rotated; retry in a moment",
-                tree_jobs.display()
+                "can't read claude code's background job list (~{sep}.clauth{sep}profiles{sep}\
+                 test-roll-refuse{sep}runtime-4242-53{sep}jobs), so 'test-roll-refuse' is not \
+                 rotated; retry in a moment"
             ),
         ),
     ] {
@@ -4675,6 +4735,187 @@ fn the_job_store_rotation_refusals_name_their_own_causes() {
         assert_eq!(e.text(), want);
         assert_eq!(e.text_with_status(), e.text());
     }
+}
+
+/// Asserts the macOS rotation of `name` is refused and that the refusal renders
+/// `want` through the production leg (`rotation_block_on` into
+/// `rotation_block_transient`). The profile dir is created first: a profile
+/// with no dir reads idle and is never blocked.
+fn assert_job_store_refusal(name: &str, want: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    std::fs::create_dir_all(profile_dir(&name).expect("profile dir")).expect("mkdir profile");
+    let block = crate::runtime::rotation_block_on(&name, true)
+        .expect("a job store that cannot be judged refuses the rotation");
+    assert_eq!(rotation_block_transient(&name, block).text(), want);
+}
+
+/// A job id the refusal tests name.
+const STUCK_JOB: &str = "0123abcd";
+
+/// The sentence a refusal that names no stuck dir renders for the global store.
+fn retry_refusal(name: &str) -> String {
+    format!(
+        "can't read claude code's background job list (~/.claude/jobs), so '{name}' is not \
+         rotated; retry in a moment"
+    )
+}
+
+/// A record-less global job dir holding only a `.DS_Store` is neither a
+/// leftover nor a creation: it never clears on its own, so the refusal names
+/// the dir to delete instead of a retry that cannot help.
+#[test]
+fn a_stuck_global_job_dir_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::write(job.join(".DS_Store"), b"").expect("write .DS_Store");
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-ds",
+        &format!(
+            "can't read claude code's background job (~{sep}.claude{sep}jobs{sep}{STUCK_JOB}), \
+             so 'stuck-ds' is not rotated; delete that dir to rotate"
+        ),
+    );
+}
+
+/// The same stuck dir inside a per-session tree's own `jobs/` is named too.
+#[test]
+fn a_stuck_tree_local_job_dir_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let job = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("stuck-tree")
+        .join("runtime-4242-53")
+        .join("jobs")
+        .join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::write(job.join(".DS_Store"), b"").expect("write .DS_Store");
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-tree",
+        &format!(
+            "can't read claude code's background job (~{sep}.clauth{sep}profiles{sep}stuck-tree{sep}\
+             runtime-4242-53{sep}jobs{sep}{STUCK_JOB}), so 'stuck-tree' is not rotated; delete \
+             that dir to rotate"
+        ),
+    );
+}
+
+/// Write `contents` as the global job `STUCK_JOB`'s `state.json` and return its path.
+fn write_global_record(home: &HomeSandbox, contents: &[u8]) -> std::path::PathBuf {
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    let record = job.join("state.json");
+    std::fs::write(&record, contents).expect("write record");
+    record
+}
+
+/// A record read whole that fails both parses and is older than the mid-create
+/// grace is not a write in progress, so the refusal names its dir.
+#[test]
+fn an_old_unparseable_job_record_refusal_names_the_dir() {
+    let home = HomeSandbox::new();
+    let record = write_global_record(&home, b"{\"state\":");
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60),
+    );
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_job_store_refusal(
+        "stuck-old",
+        &format!(
+            "can't read claude code's background job (~{sep}.claude{sep}jobs{sep}{STUCK_JOB}), \
+             so 'stuck-old' is not rotated; delete that dir to rotate"
+        ),
+    );
+}
+
+/// A fresh unparseable record can be a write in progress: the retry sentence stays.
+#[test]
+fn a_fresh_unparseable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    write_global_record(&home, b"{\"state\":");
+    assert_job_store_refusal("fresh-parse", &retry_refusal("fresh-parse"));
+}
+
+/// A record dated ahead cannot prove its age, so it reads young.
+#[test]
+fn a_future_dated_unparseable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let record = write_global_record(&home, b"{\"state\":");
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(20 * 60),
+    );
+    assert_job_store_refusal("future-parse", &retry_refusal("future-parse"));
+}
+
+/// A record over the read cap is cut by the capped read and fails both parses
+/// only because of the cut — a whole read parses it — so the retry sentence
+/// stays and nothing names the dir for deletion.
+#[test]
+fn an_over_cap_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let cap = usize::try_from(crate::runtime::RECORD_READ_CAP).expect("cap fits usize");
+    let pad = "x".repeat(cap);
+    let record = write_global_record(
+        &home,
+        format!("{{\"state\":\"working\",\"intent\":\"{pad}\"}}").as_bytes(),
+    );
+    crate::testutil::set_mtime(
+        &record,
+        std::time::SystemTime::now() - std::time::Duration::from_mins(20),
+    );
+    assert_job_store_refusal("over-cap", &retry_refusal("over-cap"));
+}
+
+/// A young empty job dir is a creation in flight and clears on its own.
+#[test]
+fn a_young_empty_job_dir_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    assert_job_store_refusal("mid-create", &retry_refusal("mid-create"));
+}
+
+/// A record that cannot be read (a FIFO) is a store fault, not a stuck dir.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_job_record_keeps_the_retry_refusal() {
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    crate::testutil::mkfifo(&job.join("state.json"));
+    assert_job_store_refusal("fifo-record", &retry_refusal("fifo-record"));
+}
+
+/// A job dir that cannot be listed is a store fault, not a stuck dir. Mode
+/// `0o300` lets the `state.json` lookup see no file while the listing fails.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_job_dir_keeps_the_retry_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = HomeSandbox::new();
+    let job = home.home().join(".claude").join("jobs").join(STUCK_JOB);
+    std::fs::create_dir_all(&job).expect("mkdir job dir");
+    std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    if std::fs::read_dir(&job).is_ok() {
+        // Running as root: the mode does not bind, so the fault cannot be posed.
+        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        return;
+    }
+    let name = crate::profile::ProfileName::from("unlistable");
+    std::fs::create_dir_all(profile_dir(&name).expect("profile dir")).expect("mkdir profile");
+    let block = crate::runtime::rotation_block_on(&name, true);
+    std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let block = block.expect("an unlistable job dir refuses the rotation");
+    assert_eq!(
+        rotation_block_transient(&name, block).text(),
+        retry_refusal("unlistable")
+    );
 }
 
 /// The refusal guards a SPEND: a comfortable stored chain stamps the sidecar
@@ -4827,7 +5068,7 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
         &handle,
         &crate::profile::ProfileName::from(name),
         refresher,
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     crate::oauth::set_rotation_saved_hook(None);
     assert!(matches!(gate, AuthGate::Refreshed));
@@ -4869,7 +5110,7 @@ fn rolling_gate_refuses_the_spend_when_stopping() {
         &handle,
         &crate::profile::ProfileName::from(name),
         |_rt: &str, _scopes: Option<&str>| panic!("a stopping gate never refreshes"),
-        Some((&activity, &shutting_down)),
+        Some((&activity, (&shutting_down).into())),
     );
     assert!(matches!(gate, AuthGate::Stopping));
 }
@@ -5358,8 +5599,11 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms() as i64;
     let name = "test-restamp-due";
+    let handle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
     assert!(
-        !rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        !rolling_sidecar_restamp_due(&handle, &crate::profile::ProfileName::from(name), now),
         "absent sidecar is not the timer's job"
     );
     // A rotating pair with 8h of clock — comfortably OUTSIDE the horizon, so
@@ -5383,10 +5627,14 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
     )
     .expect("write misfill");
     assert!(
-        rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        rolling_sidecar_restamp_due(&handle, &crate::profile::ProfileName::from(name), now),
         "a mis-fill is due NOW, whatever its clock says"
     );
     std::fs::remove_file(dir.join("session-token.json")).expect("clean the misfill fixture");
+    // The horizon arm needs a stored chain to stamp from: a logged-in store
+    // whose access token has expired, so the sidecar never reads as behind it.
+    let config = rolling_config(name, Some("rt-chain"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     crate::claude::stamp_rolling_token(
         &crate::profile::ProfileName::from(name),
         &OAuthToken {
@@ -5403,7 +5651,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
     )
     .expect("stamp");
     assert!(
-        !rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        !rolling_sidecar_restamp_due(&handle, &crate::profile::ProfileName::from(name), now),
         "a bearer clear of the horizon is left alone"
     );
     crate::claude::stamp_rolling_token(
@@ -5422,7 +5670,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
     )
     .expect("stamp");
     assert!(
-        rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        rolling_sidecar_restamp_due(&handle, &crate::profile::ProfileName::from(name), now),
         "a bearer inside the horizon is due"
     );
 }
@@ -6159,6 +6407,144 @@ fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
     );
 }
 
+/// A saved rolling-token profile whose live chain (beyond the re-stamp
+/// horizon) carries no recorded grant, the shape `stamp_rolling_token`
+/// refuses.
+fn unrecorded_grant_rolling_config(name: &str) -> crate::profile::ConfigHandle {
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    let mut profile = config.profiles[0].clone();
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = None;
+        oauth.subscription_type = None;
+    }
+    crate::profile::save_profile(&profile).expect("save profile");
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: config.state.clone(),
+        profiles: vec![profile],
+    }))
+}
+
+/// The same profile as the daemon's re-stamp scan sees it: the live mint
+/// reads as due, and no retry can stamp from the unrecorded grant, so the scan
+/// gets the re-login cause (paced on the re-login hold) rather than a Ready
+/// that reruns the gate on the 15-minute hold. A switch still installs the
+/// mint and says why the rolling token is not back.
+#[test]
+fn the_rescan_of_an_unrecorded_grant_beside_a_live_mint_answers_the_relogin_cause() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-scan";
+    let config = unrecorded_grant_rolling_config(name);
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    assert!(
+        rolling_sidecar_restamp_due(&config, &pn(name), crate::usage::now_ms() as i64),
+        "a mint in a rolling profile's sidecar is due"
+    );
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let scan = restamp_rolling_token(&config, &pn(name), refresher);
+
+    drop(capture);
+    assert!(
+        matches!(&scan, AuthGate::Transient(e) if e.permanent_until_relogin()),
+        "{}",
+        gate_verdict(&scan)
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "the scan's own line is the scheduler's: {:?}",
+        lines.snapshot()
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-live-mint",
+        "mint untouched"
+    );
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let switch = ensure_installable(&config, &pn(name), refresher, None);
+    drop(capture);
+    assert_eq!(gate_verdict(&switch), "Ready");
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: 'test-grant-scan' usage chain's recorded grant cannot mint a rolling \
+             bearer (re-run `clauth login test-grant-scan` to record it); installing the \
+             static long-lived mint"
+                .to_string()
+        ]
+    );
+}
+
+/// A scan that heals a mis-fill onto the preserved mint beside the same
+/// unrecorded grant still answers Ready, so its live-slot followers carry the
+/// heal's write; the next scan, with nothing to heal, answers the re-login
+/// cause.
+#[test]
+fn a_scan_that_heals_a_misfill_beside_an_unrecorded_grant_answers_ready_once() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-heal";
+    let config = unrecorded_grant_rolling_config(name);
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    crate::claude::stamp_rolling_token(&pn(name), &fed_bearer("at-fed")).expect("feed");
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the stamp preserved the mint"
+    );
+    let dir = profile_dir(&pn(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+
+    let healed = restamp_rolling_token(&config, &pn(name), refresher);
+
+    assert_eq!(gate_verdict(&healed), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint",
+        "the heal restored the mint"
+    );
+    let next = restamp_rolling_token(&config, &pn(name), refresher);
+    assert!(
+        matches!(&next, AuthGate::Transient(e) if e.permanent_until_relogin()),
+        "{}",
+        gate_verdict(&next)
+    );
+}
+
 // ── stale-config persist gates (lock-race row 3) ─────────────────────────────
 //
 // A daemon leg persists a whole profile/state from an in-memory config that a
@@ -6621,7 +7007,7 @@ fn dead_chain_copy_without_a_verdict_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6656,7 +7042,7 @@ fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6685,7 +7071,7 @@ fn dead_chain_copy_env_token_without_a_key_renders_the_keyless_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_keyless(&profile.name))
+        Some(crate::format::third_party_keyless(&profile.name, None))
     );
 }
 
@@ -6713,7 +7099,7 @@ fn dead_chain_copy_env_carried_api_key_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6798,7 +7184,7 @@ fn dead_chain_copy_alibaba_ignores_a_verdict_for_a_replaced_console() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -6830,7 +7216,7 @@ fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
-        Some(crate::format::third_party_dead_chain(&profile.name))
+        Some(crate::format::third_party_dead_chain(&profile.name, None))
     );
 }
 
@@ -8257,6 +8643,181 @@ fn a_transient_refresh_beside_a_live_rolling_sidecar_installs_it() {
     );
 }
 
+/// A rolling-token profile whose static mint was preserved as the backup, its
+/// sidecar now holding a rolling bearer that expires `bearer_left_ms` from now
+/// over a chain whose refresh is due.
+fn rolling_profile_with_dying_bearer(
+    name: &str,
+    bearer_left_ms: i64,
+) -> crate::profile::ConfigHandle {
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::profile::save_app_state(&config.state).expect("save state");
+    crate::claude::write_session_token(
+        &pn(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let mut bearer = fed_bearer("at-fed-dying");
+    bearer.expires_at = Some(crate::usage::now_ms() as i64 + bearer_left_ms);
+    crate::claude::stamp_rolling_token(&pn(name), &bearer).expect("feed");
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the stamp preserved the mint"
+    );
+    Arc::new(RankedMutex::new(config))
+}
+
+/// The chain cannot be refreshed for hours (a sleeping laptop, a network that
+/// cannot reach anthropic) and the rolling bearer runs out while the
+/// year-long mint sits in its backup. Inside the degrade lead a transient
+/// re-stamp hands the sidecar back to the mint, so sessions keep a live
+/// bearer; the line names the failure and the mint.
+#[test]
+fn a_transient_refresh_beside_a_dying_rolling_bearer_degrades_to_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "roll-outage";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint",
+        "the mint serves again"
+    );
+    assert!(
+        !crate::claude::has_static_backup(&pn(name)),
+        "the backup is consumed by the restore"
+    );
+    assert_eq!(
+        lines.snapshot().last().map(String::as_str),
+        Some(
+            "clauth: 'roll-outage' rolling token is about to expire and its chain cannot be \
+             refreshed (could not reach anthropic: check your connection and retry); sessions \
+             degrade to the static long-lived mint until the rolling token re-arms"
+        )
+    );
+    assert!(
+        rolling_sidecar_restamp_due(&handle, &pn(name), crate::usage::now_ms() as i64),
+        "a degraded mint stays due, so the rolling token comes back once the chain answers"
+    );
+}
+
+/// Outside the degrade lead the same transient keeps the rolling bearer: it
+/// still has a retry's worth of life, and the mint stays in its backup.
+#[test]
+fn a_transient_refresh_beside_a_rolling_bearer_outside_the_lead_keeps_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-early";
+    let handle = rolling_profile_with_dying_bearer(name, ROLLING_DEGRADE_LEAD_MS + 5 * 60 * 1000);
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint stays preserved"
+    );
+}
+
+/// A login change during the refresh is not chain trouble: the store just
+/// took a new login, whose own arming decides what the sidecar holds next. A
+/// dying bearer beside it is left alone, and the mint stays in its backup.
+#[test]
+fn a_login_change_beside_a_dying_rolling_bearer_keeps_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-moved-dying";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old");
+        relogin_into(
+            "roll-moved-dying",
+            crate::usage::now_ms() as i64 + 30 * 60_000,
+        );
+        Ok(minted("at-new", "rt-new"))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        lines.snapshot().last().map(String::as_str),
+        Some(
+            "clauth: 'roll-moved-dying' login changed during its refresh; installing its last \
+             rolling bearer, until that expires, while the rolling token retries"
+        )
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying",
+        "the rolling bearer stays"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint stays preserved"
+    );
+}
+
+/// Once the chain answers again, the degraded mint is superseded by a fresh
+/// rolling bearer and goes back into its backup.
+#[test]
+fn a_degraded_mint_rolls_back_once_the_chain_answers() {
+    let _home = HomeSandbox::new();
+    let name = "roll-recover";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let _ = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "sk-ant-oat01-mint"
+    );
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-fed-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 8 * 3600,
+            scope: Some("user:profile user:inference".to_string()),
+        })
+    });
+
+    assert!(
+        matches!(gate, AuthGate::Ready | AuthGate::Refreshed),
+        "{}",
+        gate_verdict(&gate)
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-new"
+    );
+    assert!(
+        crate::claude::has_static_backup(&pn(name)),
+        "the mint is preserved again"
+    );
+    assert!(!rolling_sidecar_restamp_due(
+        &handle,
+        &pn(name),
+        crate::usage::now_ms() as i64
+    ));
+}
+
 /// A log out lands while the gate refreshes: the store stays empty, and the
 /// gate answers as it does for a logged-out profile with no race at all.
 #[test]
@@ -8617,6 +9178,127 @@ fn a_persist_lands_over_a_store_that_is_the_stages_base() {
 
     assert!(matches!(landing, Landing::Landed));
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+}
+
+/// What the catch-up's lander did to a live stage over the fixture's store
+/// once `fault` posed the account's `config.toml`: its outcome, whether the
+/// stage and the store are byte for byte what they were, and the store's
+/// refresh token.
+fn land_over_config(
+    name: &str,
+    fault: impl FnOnce(&std::path::Path),
+) -> (Result<StageOutcome, String>, bool, bool, Option<String>) {
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+    fault(&profile_dir(&pn(name)).expect("dir").join("config.toml"));
+    let (stage, store) = (
+        std::fs::read(stage_path(name)).expect("the stage"),
+        std::fs::read(store_path(name)).expect("the store"),
+    );
+    let guard = crate::runtime::RotationGuard::acquire(&pn(name)).expect("guard");
+
+    let landed = land_staged_pair(&config, &pn(name), &guard).map_err(|e| format!("{e:#}"));
+
+    (
+        landed,
+        std::fs::read(stage_path(name)).ok() == Some(stage),
+        std::fs::read(store_path(name)).ok() == Some(store),
+        stored_refresh(name),
+    )
+}
+
+/// A landing reads the account's `config.toml` before it writes, and one it
+/// cannot read may hold a `[proxy]` record: a directory in its place (a read
+/// error on every platform) keeps the stage and the store byte for byte. A
+/// missing file is the plain profile every loader reads, and lands.
+#[test]
+fn a_landing_keeps_the_stage_of_an_account_whose_config_cannot_be_read() {
+    let _home = HomeSandbox::new();
+
+    let unreadable = land_over_config("cfg-unreadable", |config| {
+        std::fs::remove_file(config).expect("remove config.toml");
+        std::fs::create_dir(config).expect("a directory in its place");
+    });
+    let missing = land_over_config("cfg-missing", |config| {
+        std::fs::remove_file(config).expect("remove config.toml");
+    });
+
+    assert_eq!(
+        (unreadable, missing),
+        (
+            (
+                Ok(StageOutcome::Kept),
+                true,
+                true,
+                Some("rt-old".to_string())
+            ),
+            (
+                Ok(StageOutcome::Landed),
+                false,
+                false,
+                Some("rt-mid".to_string())
+            ),
+        ),
+        "(outcome, stage kept, store kept, store's refresh token) for an unreadable and a \
+         missing config.toml"
+    );
+}
+
+/// A `config.toml` that fails to parse cannot say it holds no `[proxy]`
+/// record, however its header is spelled: each of these keeps the stage and
+/// the store byte for byte, the last naming the table through a unicode
+/// escape (`["prox` backslash `u0079"]`).
+#[test]
+fn a_landing_keeps_the_stage_of_an_account_whose_config_fails_to_parse() {
+    let _home = HomeSandbox::new();
+    let backslash = char::from(0x5c_u8);
+    let escaped = format!("[\"prox{backslash}u0079\"]");
+    let headers = [
+        "[proxy] # note",
+        "[ proxy ]",
+        "[\"proxy\"]",
+        escaped.as_str(),
+    ];
+    let body = "service = \"stub\"\naccount = \"acct-1\"\n";
+    for header in headers {
+        let table: toml::Table = format!("{header}\n{body}").parse().expect("parses");
+        assert!(
+            table.contains_key("proxy"),
+            "{header} names the proxy table"
+        );
+        assert!(
+            format!("{header}\n{body}broken =\n")
+                .parse::<toml::Table>()
+                .is_err(),
+            "{header}'s config fails to parse"
+        );
+    }
+
+    let landed: Vec<_> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, header)| {
+            land_over_config(&format!("cfg-broken-{i}"), |config| {
+                std::fs::write(config, format!("{header}\n{body}broken =\n"))
+                    .expect("a config that fails to parse");
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        landed,
+        vec![
+            (
+                Ok(StageOutcome::Kept),
+                true,
+                true,
+                Some("rt-old".to_string())
+            );
+            4
+        ],
+        "(outcome, stage kept, store kept, store's refresh token) per header"
+    );
 }
 
 /// A landing keeps its stage on disk until the Keychain mirror has returned: a
@@ -9178,11 +9860,17 @@ fn the_rolling_arm_spends_its_refresh_under_no_keychain_budget() {
     ));
     let budget = std::sync::Mutex::new(None);
 
-    let _ = arm_rolling_token(&config, &pn(name), |rt: &str, _: Option<&str>| {
-        assert_eq!(rt, "rt-old");
-        *budget.lock().expect("budget slot") = Some(crate::lock::armed_budget_remaining());
-        Ok(minted("at-new", "rt-new"))
-    });
+    let guard = RotationGuard::acquire(&pn(name)).expect("the arm's guard");
+    let _ = arm_rolling_token(
+        &config,
+        &pn(name),
+        |rt: &str, _: Option<&str>| {
+            assert_eq!(rt, "rt-old");
+            *budget.lock().expect("budget slot") = Some(crate::lock::armed_budget_remaining());
+            Ok(minted("at-new", "rt-new"))
+        },
+        guard,
+    );
 
     let seen = budget
         .into_inner()
@@ -9213,9 +9901,13 @@ fn the_rolling_arm_lands_a_live_stage_before_it_stamps() {
         crate::profile::load_config().expect("load config"),
     ));
 
-    let _ = arm_rolling_token(&config, &pn(name), |_: &str, _: Option<&str>| {
-        panic!("a comfortable staged chain stamps without a refresh")
-    });
+    let guard = RotationGuard::acquire(&pn(name)).expect("the arm's guard");
+    let _ = arm_rolling_token(
+        &config,
+        &pn(name),
+        |_: &str, _: Option<&str>| panic!("a comfortable staged chain stamps without a refresh"),
+        guard,
+    );
 
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
     assert!(!stage_path(name).exists(), "the landed stage is gone");
@@ -9323,11 +10015,11 @@ fn restamp_catches_a_bearer_the_chain_rotated_past() {
     .expect("stale stamp");
     let now = crate::usage::now_ms() as i64;
     assert!(crate::claude::rolling_sidecar_behind_chain(&profile));
+    let handle = Arc::new(RankedMutex::new(config));
     assert!(
-        rolling_sidecar_restamp_due(&profile, now),
+        rolling_sidecar_restamp_due(&handle, &profile, now),
         "a revoked bearer is due whatever its clock says"
     );
-    let handle = Arc::new(RankedMutex::new(config));
     assert!(matches!(
         restamp_rolling_token(&handle, &profile, never_refresh),
         AuthGate::Ready
@@ -9339,7 +10031,7 @@ fn restamp_catches_a_bearer_the_chain_rotated_past() {
     );
     assert!(oauth.refresh_token.is_none());
     assert!(!crate::claude::rolling_sidecar_behind_chain(&profile));
-    assert!(!rolling_sidecar_restamp_due(&profile, now));
+    assert!(!rolling_sidecar_restamp_due(&handle, &profile, now));
 }
 
 /// A non-rolling profile (no sidecar) is never behind and never due.
@@ -9350,8 +10042,10 @@ fn restamp_never_reaches_a_profile_without_a_rolling_sidecar() {
     let profile = crate::profile::ProfileName::from(name);
     let config = oauth_config(name, Some("rt-new"), Some(beyond_horizon_expiry()));
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
     assert!(!crate::claude::rolling_sidecar_behind_chain(&profile));
     assert!(!rolling_sidecar_restamp_due(
+        &handle,
         &profile,
         crate::usage::now_ms() as i64
     ));
@@ -9693,5 +10387,266 @@ fn a_rolling_rotation_queues_the_bearer_its_stamp_revoked() {
     assert!(
         crate::runtime::take_revoked_bearers().is_empty(),
         "a profile without the rolling flag stamps nothing"
+    );
+}
+
+/// A rolling bearer inside the re-stamp horizon is due while a stored chain
+/// can stamp its successor. Logged out, the store holds no chain (the sidecar
+/// stays), so the gate has nothing to stamp and the bearer is not due: only a
+/// re-login changes that.
+#[test]
+fn a_logged_out_rolling_profile_with_a_dying_bearer_is_not_due() {
+    let _home = HomeSandbox::new();
+    let name = "roll-lo-dying";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let due_with_chain =
+        rolling_sidecar_restamp_due(&handle, &pn(name), crate::usage::now_ms() as i64);
+    let mut cfg = crate::profile::load_config().expect("load config");
+    crate::actions::clear_profile_credentials(&mut cfg, &pn(name)).expect("log out");
+
+    assert_eq!(
+        (
+            due_with_chain,
+            sidecar_oauth(name).expect("sidecar").access_token,
+            rolling_sidecar_restamp_due(&handle, &pn(name), crate::usage::now_ms() as i64),
+        ),
+        (true, "at-fed-dying".to_string(), false),
+        "(due with a chain, sidecar after log-out, due logged out)"
+    );
+}
+
+/// A `[proxy]` record landing after the rolling bearer was armed: the stored
+/// chain is the proxy's, clauth never stamps from it, so the dying bearer is
+/// not due.
+#[test]
+fn a_proxy_claimed_rolling_profile_with_a_dying_bearer_is_not_due() {
+    let _home = HomeSandbox::new();
+    let name = "roll-px-dying";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let due_with_chain =
+        rolling_sidecar_restamp_due(&handle, &pn(name), crate::usage::now_ms() as i64);
+    crate::profile::write_proxy_record(
+        &pn(name),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("proxy record");
+
+    assert_eq!(
+        (
+            due_with_chain,
+            crate::profile::stored_proxy_claim_failing_closed(&pn(name))
+                != crate::profile::ProxyClaim::None,
+            rolling_sidecar_restamp_due(&handle, &pn(name), crate::usage::now_ms() as i64),
+        ),
+        (true, true, false),
+        "(due with a chain, proxy claim on disk, due once claimed)"
+    );
+}
+
+/// A `[proxy]` record landing after the chain rotated past the sidecar's
+/// bearer: the stored chain is the proxy's, clauth never stamps from it, so
+/// the revoked bearer is not due even with hours left on its clock.
+#[test]
+fn a_proxy_claimed_rolling_profile_with_a_bearer_behind_the_chain_is_not_due() {
+    let _home = HomeSandbox::new();
+    let name = "roll-px-behind";
+    let profile = crate::profile::ProfileName::from(name);
+    let config = rolling_config(name, Some("rt-new"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &profile,
+        &OAuthToken {
+            access_token: "at-revoked".to_string(),
+            refresh_token: None,
+            expires_at: Some(beyond_horizon_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("stale stamp");
+    let now = crate::usage::now_ms() as i64;
+    let handle = Arc::new(RankedMutex::new(config));
+    let due_with_chain = rolling_sidecar_restamp_due(&handle, &profile, now);
+    crate::profile::write_proxy_record(
+        &profile,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("proxy record");
+
+    assert_eq!(
+        (
+            due_with_chain,
+            crate::claude::rolling_sidecar_behind_chain(&profile),
+            rolling_sidecar_restamp_due(&handle, &profile, now),
+        ),
+        (true, true, false),
+        "(due with a chain, behind that chain, due once the chain is the proxy's)"
+    );
+}
+
+/// A `[proxy]` record landing beside a mis-filled sidecar: the heal refuses a
+/// claimed account, so a due read would re-run the gate on every retry hold
+/// for good. The mis-fill is due while unclaimed and not due once claimed.
+#[test]
+fn a_proxy_claimed_rolling_profile_with_a_misfilled_sidecar_is_not_due() {
+    let _home = HomeSandbox::new();
+    let name = "roll-px-misfill";
+    let config = rolling_config(name, Some("rt-chain"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+    let dir = crate::profile::profile_dir(&pn(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(beyond_horizon_expiry()),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    let now = crate::usage::now_ms() as i64;
+    let due_unclaimed = rolling_sidecar_restamp_due(&handle, &pn(name), now);
+    crate::profile::write_proxy_record(
+        &pn(name),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        },
+    )
+    .expect("proxy record");
+
+    assert_eq!(
+        (
+            due_unclaimed,
+            rolling_sidecar_restamp_due(&handle, &pn(name), now)
+        ),
+        (true, false),
+        "(mis-fill due unclaimed, due once the proxy claims the account)"
+    );
+}
+
+/// A hybrid rolling profile: a `base_url` beside its OAuth chain (which
+/// `clauth rolling-token` accepts), the chain's access token expiring at
+/// `chain_expiry`. The gate never refreshes a hybrid's chain, so only a chain
+/// that still passes the gate's stamp test can replace the sidecar's bearer.
+fn save_hybrid_rolling_profile(name: &str, chain_expiry: i64) -> crate::profile::ConfigHandle {
+    let mut config = rolling_config(name, Some("rt-hybrid"), Some(chain_expiry));
+    config.profiles[0].base_url = Some("https://gateway.example.test".to_string());
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    Arc::new(RankedMutex::new(config))
+}
+
+/// A hybrid whose chain expired cannot stamp: neither a dying rolling bearer
+/// nor a mint in its sidecar is due, or the scan re-runs a gate that answers
+/// `Ready` without stamping on every retry hold for good.
+#[test]
+fn a_hybrid_rolling_profile_whose_chain_expired_is_not_due() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let dying = "roll-hy-dying";
+    let dying_handle = save_hybrid_rolling_profile(dying, past_expiry());
+    let mut bearer = fed_bearer("at-fed-dying");
+    bearer.expires_at = Some(now + 10 * 60 * 1000);
+    crate::claude::stamp_rolling_token(&pn(dying), &bearer).expect("feed");
+    let minted = "roll-hy-mint";
+    let minted_handle = save_hybrid_rolling_profile(minted, past_expiry());
+    crate::claude::write_session_token(&pn(minted), "sk-ant-oat01-mint", now).expect("mint");
+
+    assert_eq!(
+        (
+            read_raw_store(&pn(dying))
+                .expect("read store")
+                .is_some_and(|s| s.claude_ai_oauth.is_some()),
+            rolling_sidecar_restamp_due(&dying_handle, &pn(dying), now),
+            rolling_sidecar_restamp_due(&minted_handle, &pn(minted), now),
+        ),
+        (true, false, false),
+        "(the store holds a login, dying bearer due, mint due)"
+    );
+}
+
+/// A hybrid whose chain is still fresh keeps its dying rolling bearer due:
+/// the gate stamps the successor from that chain with no refresh.
+#[test]
+fn a_hybrid_rolling_profile_with_a_fresh_chain_keeps_its_dying_bearer_due() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let name = "roll-hy-fresh";
+    let handle = save_hybrid_rolling_profile(name, beyond_horizon_expiry());
+    let mut bearer = fed_bearer("at-fed-dying");
+    bearer.expires_at = Some(now + 10 * 60 * 1000);
+    crate::claude::stamp_rolling_token(&pn(name), &bearer).expect("feed");
+
+    assert!(
+        rolling_sidecar_restamp_due(&handle, &pn(name), now),
+        "a fresh hybrid chain can stamp the dying bearer's successor"
+    );
+}
+
+/// A store holding only MCP logins (`mcpOAuth`, the carrier shape the MCP
+/// login sync writes) has no chain to stamp from, so a dying rolling bearer
+/// beside it is not due.
+#[test]
+fn a_store_holding_only_mcp_logins_leaves_a_dying_bearer_not_due() {
+    let _home = HomeSandbox::new();
+    let name = "roll-mcp-only";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    let now = crate::usage::now_ms() as i64;
+    let due_with_chain = rolling_sidecar_restamp_due(&handle, &pn(name), now);
+    std::fs::write(
+        crate::profile::profile_subpath(&pn(name), "credentials.json").expect("store path"),
+        br#"{"mcpOAuth":{}}"#,
+    )
+    .expect("mcp-only store");
+
+    assert_eq!(
+        (
+            due_with_chain,
+            rolling_sidecar_restamp_due(&handle, &pn(name), now)
+        ),
+        (true, false),
+        "(due with a chain, due over an mcpOAuth-only store)"
+    );
+}
+
+/// A torn `credentials.json` (a half-written hand edit) cannot be read, but
+/// the gate stamps from the in-memory chain: a dying bearer stays due while
+/// that chain holds a login clauth spends, and is not due once memory holds
+/// none, so an unreadable store neither skips a stamp nor loops the gate.
+#[test]
+fn a_torn_store_reads_the_in_memory_chain_the_gate_stamps_from() {
+    let _home = HomeSandbox::new();
+    let name = "roll-torn";
+    let handle = rolling_profile_with_dying_bearer(name, 10 * 60 * 1000);
+    std::fs::write(
+        crate::profile::profile_subpath(&pn(name), "credentials.json").expect("store path"),
+        br#"{"claudeAiOauth":"#,
+    )
+    .expect("torn store");
+    let now = crate::usage::now_ms() as i64;
+    let due_with_chain_in_memory = rolling_sidecar_restamp_due(&handle, &pn(name), now);
+    handle.lock().expect("config").profiles[0].credentials = None;
+
+    assert_eq!(
+        (
+            read_raw_store(&pn(name)).is_err(),
+            due_with_chain_in_memory,
+            rolling_sidecar_restamp_due(&handle, &pn(name), now),
+        ),
+        (true, true, false),
+        "(store unreadable, due with a chain in memory, due with none in memory)"
     );
 }

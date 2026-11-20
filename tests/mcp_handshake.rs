@@ -267,10 +267,6 @@ fn a_modern_client_may_open_on_any_request() {
 /// The two malformed requests a real client can produce. Both must be errors,
 /// and the version one must name what the server does support or the client has
 /// nothing to retry with.
-///
-/// They ride behind a valid opener deliberately. As the very first frame, a
-/// request carrying no `_meta` at all never establishes an era, and rmcp ends
-/// the stdio session instead of answering it.
 #[test]
 fn a_malformed_request_is_refused_with_the_spec_codes() {
     let replies = handshake(&[
@@ -339,6 +335,67 @@ fn a_legacy_initialize_still_negotiates() {
             listed[field]
         );
     }
+}
+
+/// A client may leave before any lifecycle exists, and that ends at exit 0 as
+/// closing an established session does: stdin closed with nothing sent, or a
+/// discover probe whose reader is already gone (the reply meets a closed pipe).
+/// Only a first message that is no request (a notification) is a protocol
+/// failure that exits 1; it also catches an arm that maps every error to 0.
+#[test]
+fn closing_before_a_session_is_clean_but_a_bad_opener_still_fails() {
+    let run = |frames: &[Value], reader_gone: bool| {
+        let home = TempDir::new().unwrap();
+        let mut child = server_command(home.path())
+            .stdin(Stdio::piped())
+            .stdout(if reader_gone {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn clauth mcp");
+        drop(child.stdout.take());
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for frame in frames {
+            writeln!(stdin, "{frame}").expect("write frame");
+        }
+        drop(stdin);
+        child.wait().expect("wait")
+    };
+
+    let silent = run(&[], false);
+    assert_eq!(
+        silent.code(),
+        Some(0),
+        "stdin closed with no frame: {silent}"
+    );
+
+    let probe_then_gone = run(
+        &[json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": { "_meta": client_meta(PROTOCOL) }
+        })],
+        true,
+    );
+    assert_eq!(
+        probe_then_gone.code(),
+        Some(0),
+        "a discover probe whose reader left: {probe_then_gone}"
+    );
+
+    let notification_first = run(
+        &[json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })],
+        false,
+    );
+    assert_eq!(
+        notification_first.code(),
+        Some(1),
+        "a notification cannot open a session: {notification_first}"
+    );
 }
 
 /// Kills the server and unblocks a FIFO reader on drop, so a red run leaves no

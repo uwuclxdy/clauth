@@ -281,6 +281,33 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
     );
 }
 
+/// The disabled ACTIVE account stays listed on a plain run, and its row says
+/// it is disabled.
+#[test]
+fn list_table_marks_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    let mut work = oauth("work");
+    work.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![work],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines, [HEADER, &format!("{WORK_ROW} (disabled)")]);
+}
+
 /// The `clauth list` table for `config`, every profile shown.
 fn rendered_table(config: &AppConfig) -> String {
     render_table(
@@ -495,21 +522,45 @@ fn list_table_leaves_a_live_account_unmarked() {
 }
 
 /// The PLAN cell names when the plan ends or renews, off the profile's
-/// `plan_ends` and `plan_renews`, in plain ASCII.
+/// `plan_ends` and `plan_renews`, in plain ASCII: a coming end `ends`, a past
+/// one `ended` on that same date, a `plan_renews` later than a past end its
+/// renewal, and a canceled plan no renewal.
 #[test]
 fn list_table_names_the_plan_end_in_the_plan_cell() {
     let _home = HomeSandbox::new();
-    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
-    let mut ending = oauth("ending");
-    ending.plan_ends = Some(today + chrono::Duration::days(10));
-    let mut renewing = oauth("renewing");
-    renewing.plan_renews = Some(today + chrono::Duration::days(4));
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    let dated = |name: &str, ends, renews| {
+        let mut p = oauth(name);
+        p.plan_ends = ends;
+        p.plan_renews = renews;
+        p
+    };
     let config = AppConfig {
         state: AppState::default(),
-        profiles: vec![ending, renewing],
+        profiles: vec![
+            dated("ending", day(2099, 11, 20), None),
+            dated("ended", day(2020, 3, 2), None),
+            dated("resubscribed", day(2020, 3, 2), day(2099, 12, 15)),
+            dated("renewing", None, day(2099, 12, 15)),
+            dated("gone", None, day(2099, 12, 15)),
+        ],
     };
-    warm_usage("ending", 10.0, 20.0);
-    warm_usage("renewing", 10.0, 20.0);
+    for name in ["ending", "ended", "resubscribed", "renewing", "gone"] {
+        warm_usage(name, 42.4, 17.6);
+    }
+    let mut canceled = crate::profile_cache::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("gone's warmed cache");
+    if let Some(plan) = canceled.plan.as_mut() {
+        plan.subscription_status = Some("canceled".to_string());
+    }
+    write_profile_cache(
+        &crate::profile::ProfileName::from("gone"),
+        USAGE_CACHE_FILE,
+        &canceled,
+    );
     let table = render_table(
         &config,
         &build_profile_entries(
@@ -520,22 +571,23 @@ fn list_table_names_the_plan_end_in_the_plan_cell() {
             &crate::claude_jobs::job_trees(),
         ),
     );
-    let row = |name: &str| {
-        table
-            .lines()
-            .find(|l| l.split_whitespace().next() == Some(name))
-            .unwrap_or_else(|| panic!("a {name} row in {table:?}"))
-            .to_string()
+    // PROFILE is twelve cells (`resubscribed`), PLAN twenty-three
+    // (`Max (renews 2099-12-15)`).
+    let row = |name: &str, plan: &str, suffix: &str| {
+        format!("  {name:<12}  {plan:<23}    42.4%    17.6%  -{suffix}")
     };
-    let day = |days| crate::usage::render_plan_date(today + chrono::Duration::days(days));
-    assert!(
-        row("ending").contains(&format!("Max (ends {})", day(10))),
-        "got {table:?}"
-    );
-    assert!(
-        row("renewing").contains(&format!("Max (renews {})", day(4))),
-        "got {table:?}"
-    );
+    let expected = [
+        format!(
+            "  {:<12}  {:<23}  5H USED  7D USED  ENDPOINT",
+            "PROFILE", "PLAN"
+        ),
+        row("ending", "Max (ends 2099-11-20)", ""),
+        row("ended", "Max (ended 2020-03-02)", ""),
+        row("resubscribed", "Max (renews 2099-12-15)", ""),
+        row("renewing", "Max (renews 2099-12-15)", ""),
+        row("gone", "Max", " (canceled)"),
+    ];
+    assert_eq!(table, table_of(&expected.each_ref().map(String::as_str)));
 }
 
 /// Both facts render. A user usually disables an account BECAUSE it died,
@@ -2007,5 +2059,61 @@ fn a_halfwidth_katakana_name_keeps_the_plan_column_aligned() {
             "* work      Max     42.4%    17.6%  -",
         ],
         "the PROFILE column sizes and pads by the cells the buffer draws, got:\n{table}"
+    );
+}
+
+/// The ` (keyless)` suffix marks exactly the accounts the delegate refuses as
+/// keyless: a keyless proxy account on its bind (`pb`, as `clauth login <name>
+/// --proxy <service>` creates it, key cleared) gets it, the keyed proxy
+/// account beside it (`pk`) does not, and the keyless third-party control
+/// (`z.ai`) keeps it.
+#[test]
+fn list_table_marks_a_keyless_proxy_account_on_its_bind() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "z.ai".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    ))
+    .expect("save z.ai");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["z.ai".into()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+    let config = crate::profile::load_config().expect("reload");
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai           -        -  https://api.z.ai/api/anthropic (keyless)",
+            "  pb       generic        -        -  http://127.0.0.1:9141 (keyless)",
+            "  pk       generic        -        -  http://127.0.0.1:9141",
+        ],
     );
 }

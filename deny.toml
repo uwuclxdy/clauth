@@ -15,7 +15,9 @@ yanked = "deny"
 # `{ id = "RUSTSEC-YYYY-NNNN", reason = "why it's safe / no fix yet" }`; revisit
 # each on the next audit. cargo-deny v2 has no time-based grace period — this
 # explicit list IS the triage record.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability; rmcp 3.9.0 depends on it too; revisit when rmcp drops chrono" },
+]
 
 # ---------------------------------------------------------------------------
 # Licenses

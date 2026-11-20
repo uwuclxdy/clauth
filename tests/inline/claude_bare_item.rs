@@ -43,7 +43,7 @@ fn store(name: &str) -> std::path::PathBuf {
 fn carry(name: &str, item: &serde_json::Value) -> anyhow::Result<BareItemCarry> {
     carry_bare_item_login_into(
         &ProfileName::from(name),
-        &crate::testutil::profile_id(name),
+        Some(&crate::testutil::profile_id(name)),
         item,
     )
 }
@@ -209,6 +209,83 @@ fn a_writer_replaces_an_item_that_strands_nothing() {
     assert!(lines.snapshot().is_empty(), "{:?}", lines.snapshot());
 }
 
+/// No roster at all: the state a first capture's relink runs in, since the
+/// roster names the new profile only after the link (#158).
+fn empty_roster() {
+    crate::profile::save_app_state(&crate::profile::AppState::default()).expect("persist state");
+}
+
+/// #158: the first capture saves the Keychain login into its new profile,
+/// then installs that profile over the item before the roster names it. The
+/// roster search alone finds no store holding the login; the install's own
+/// source does, so the write strands nothing and goes ahead, unlogged.
+#[test]
+fn a_first_capture_installs_over_the_login_it_just_saved() {
+    let _home = HomeSandbox::new();
+    empty_roster();
+    let item = pair("live-acc", "live-ref", 1000);
+    profile_holding("main", &item, None);
+    let source = read_json(&store("main"));
+    let guard_lines = crate::logline::LogLines::new();
+    let guard_capture = guard_lines.capture_here();
+    assert!(
+        !bare_item_may_be_replaced(&item, None),
+        "the roster search alone misses the new profile's store"
+    );
+    drop(guard_capture);
+    assert_eq!(guard_lines.snapshot(), vec![LEFT.to_string()]);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    assert!(bare_item_may_take_source(&item, &source, None));
+    drop(capture);
+    assert!(lines.snapshot().is_empty(), "{:?}", lines.snapshot());
+}
+
+/// A second capture of another login installs the same way: its store holds
+/// the item's login, whichever profile the roster already names.
+#[test]
+fn a_second_capture_of_another_login_installs_over_it() {
+    let _home = HomeSandbox::new();
+    profile_holding("main", &pair("main-acc", "main-ref", 1000), None);
+    roster(&["main"], "main");
+    let item = pair("work-acc", "work-ref", 2000);
+    profile_holding("work", &item, None);
+    assert!(bare_item_may_take_source(
+        &item,
+        &read_json(&store("work")),
+        None
+    ));
+    let mint = serde_json::json!({ "claudeAiOauth": { "accessToken": "mint-acc" } });
+    assert!(
+        bare_item_may_take_source(&mint, &mint, None),
+        "a mint matches on its access token"
+    );
+}
+
+/// The source's own login is no licence to replace a different one: a create
+/// whose store holds another login than the item's still refuses while no
+/// store saved the item's, roster or not, and says so.
+#[test]
+fn an_install_that_would_orphan_an_unsaved_login_still_refuses() {
+    let _home = HomeSandbox::new();
+    empty_roster();
+    profile_holding("main", &pair("fresh-acc", "fresh-ref", 3000), None);
+    let unsaved = pair("live-acc", "live-ref", 1000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let replaceable = bare_item_may_take_source(&unsaved, &read_json(&store("main")), None);
+    drop(capture);
+    assert!(!replaceable);
+    assert_eq!(lines.snapshot(), vec![LEFT.to_string()]);
+    let same_access = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "live-acc", "refreshToken": "other-ref" }
+    });
+    assert!(
+        !bare_item_may_take_source(&unsaved, &same_access, None),
+        "a rotating pair matches on its refresh token alone"
+    );
+}
+
 /// Every real writer of the bare item runs the guard over the bytes it
 /// replaces, and every switch, sign-out and guarded-relink entry settles the
 /// item before it takes the state flock: the macOS glue cannot build here,
@@ -225,8 +302,12 @@ fn every_bare_item_writer_runs_the_guard_and_settles_first() {
     };
     let mirror = body("fn keychain_mirror_source(");
     assert!(
+        mirror.contains("bare_item_may_take_source(item, &store, placed)"),
+        "the relink's install guards the item it replaces"
+    );
+    assert!(
         mirror.contains("bare_item_may_be_replaced(item, placed)"),
-        "the relink's install and sign-out guard the item they replace"
+        "the relink's sign-out guards the item it replaces"
     );
     assert!(
         body("pub(crate) fn clear_claude_credentials(")
@@ -293,7 +374,12 @@ fn every_settle_runs_above_its_gate_and_no_drain_blocks_on_a_probe() {
             actions,
             "ensure_installable(",
         ),
+        // The rolling arm lives in the shared arm half; both of its callers
+        // settle the bare item above the arm-half call, which keeps the
+        // settle above the arm on every path (the CLI's and the TUI
+        // worker's).
         ("fn cmd_rolling_token(", main, "arm_rolling_token("),
+        ("fn start_rolling_switch(", app, "arm_rolling_token("),
         ("fn spawn_switch_gate<", app, "ensure_installable("),
     ] {
         let body = item_body(text, entry, "\n}\n");
@@ -302,6 +388,23 @@ fn every_settle_runs_above_its_gate_and_no_drain_blocks_on_a_probe() {
             "{entry} settles the bare item above its {gate}"
         );
     }
+    // The pre-arm half runs before the settle in both rolling callers, so a
+    // refused switch settles nothing.
+    for (entry, text) in [
+        ("fn cmd_rolling_token(", main),
+        ("fn start_rolling_switch(", app),
+    ] {
+        let body = item_body(text, entry, "\n}\n");
+        assert!(
+            at(body, "precheck_rolling_token(", entry) < at(body, SETTLE, entry),
+            "{entry} refuses the switch before it settles"
+        );
+    }
+    assert!(
+        item_body(actions, "pub(crate) fn arm_rolling_token(", "\n}\n")
+            .contains("crate::oauth::arm_rolling_token("),
+        "the shared arm half owns the rolling arm"
+    );
     for entry in [
         "pub(super) fn drain_pending_switch(&mut self)",
         "pub(super) fn drain_pending_switch_off(&mut self)",
@@ -453,9 +556,14 @@ fn settle(
     })
 }
 
-fn settled(notice: Option<&str>, placed: Option<[u8; 32]>) -> BareItemSettle {
+fn settled(
+    notice: Option<&str>,
+    saved_into: Option<&str>,
+    placed: Option<[u8; 32]>,
+) -> BareItemSettle {
     BareItemSettle::Settled(BareItemSettled {
-        notice: notice.map(str::to_string),
+        notice: notice.map(|line| crate::claude::BareItemNotice::Saved(line.to_string())),
+        saved_into: saved_into.map(ProfileName::from),
         placed,
     })
 }
@@ -472,10 +580,8 @@ fn a_switch_saves_a_siblings_unsaved_login_before_it_writes() {
     assert_eq!(
         settled,
         self::settled(
-            Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-            ),
+            Some("saved the Keychain login Claude Code wrote into b"),
+            Some("b"),
             None
         )
     );
@@ -492,7 +598,7 @@ fn a_switch_over_a_saved_login_settles_without_a_probe() {
         |_| panic!("a saved login needs no probe"),
     )
     .expect("settle");
-    assert_eq!(settled, self::settled(None, None));
+    assert_eq!(settled, self::settled(None, None, None));
 }
 
 #[test]
@@ -586,10 +692,8 @@ fn a_switch_looks_an_uncached_profiles_account_up_and_saves_into_it() {
     assert_eq!(
         settled,
         self::settled(
-            Some(
-                "the macOS Keychain login was b's, written by a Claude Code still running on \
-                 it; saved it into b"
-            ),
+            Some("saved the Keychain login Claude Code wrote into b"),
+            Some("b"),
             None
         )
     );
@@ -650,7 +754,7 @@ fn an_expired_login_that_strands_nothing_settles_as_before() {
         assert_eq!(
             settle_bare_item_before_write(&item, BareItemWriter::Switch, |_| panic!("no probe"))
                 .expect("settle"),
-            settled(None, None)
+            settled(None, None, None)
         );
     }
 }
@@ -769,7 +873,10 @@ fn a_switch_over_a_login_its_owner_outlived_hands_the_guard_its_key() {
         Ok("uuid-b"),
     )
     .expect("settle");
-    assert_eq!(settled, self::settled(None, Some(sha256("older-acc"))));
+    assert_eq!(
+        settled,
+        self::settled(None, None, Some(sha256("older-acc")))
+    );
     assert_eq!(fs::read(store("b")).expect("read"), before);
 }
 
@@ -788,10 +895,7 @@ fn the_leg_saves_a_siblings_successor_then_puts_the_active_login_back() {
     assert_eq!(leg.restores, vec![None]);
     assert_eq!(
         leg.lines,
-        line(
-            "the macOS Keychain login was b's, written by a Claude Code still running on it; \
-             saved it into b and put a back"
-        )
+        line("saved the Keychain login Claude Code wrote into b and put a back")
     );
 }
 
@@ -810,8 +914,8 @@ fn the_leg_saves_into_the_owner_whatever_the_active_profile_holds() {
     assert_eq!(
         keyless.lines,
         line(
-            "the macOS Keychain login was a's, written by a Claude Code still running on it; \
-             saved it into a and signed the Keychain out, since key has no login to put back"
+            "saved the Keychain login Claude Code wrote into a and signed the Keychain out, \
+             since key has no login to put back"
         )
     );
 
@@ -822,8 +926,8 @@ fn the_leg_saves_into_the_owner_whatever_the_active_profile_holds() {
     assert_eq!(
         none.lines,
         line(
-            "the macOS Keychain login was a's, written by a Claude Code still running on it; \
-             saved it into a and signed the Keychain out, since no clauth account is active"
+            "saved the Keychain login Claude Code wrote into a and signed the Keychain out, \
+             since no clauth account is active"
         )
     );
 }
