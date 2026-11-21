@@ -70,6 +70,7 @@ mod settings_sync;
 mod spinner;
 mod start;
 mod status;
+mod statusline;
 mod throughput;
 mod tls_roots;
 mod token_ledger;
@@ -321,6 +322,7 @@ fn load_notices_apply(command: &Command) -> bool {
             | Command::McpAwaitJob
             | Command::HookProfileChangedNote
             | Command::HookReadExempt
+            | Command::Statusline { .. }
             | Command::HookForegroundSpawn
             | Command::SelfHeal
             | Command::Complete { .. }
@@ -454,6 +456,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
+        Command::Statusline { command } => statusline::run(&command),
         Command::HookReadExempt => {
             cc_exempt::run_read_hook();
             Ok(())
