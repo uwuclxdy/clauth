@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 #![allow(clippy::disallowed_methods)]
 use super::*;
+use crate::claude::build_claude_settings_json;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -21378,6 +21379,9 @@ fn keychain_leg_retry_clears_retries_only_what_clears_on_its_own() {
 /// re-arms them. A landed row, or one never swapped, arms nothing.
 #[test]
 fn an_adoption_rearms_only_an_item_leg_its_row_left_unlanded() {
+    // The outgoing store names no member's own store here, so the retry
+    // carries no levels; the sandbox keeps that lookup off the real home.
+    let _home = HomeSandbox::new();
     let member = crate::profile::ProfileName::from("adopt-retry-b");
     let canonical = Path::new("/profiles/adopt-retry-b/credentials.json");
     let outgoing = Path::new("/profiles/adopt-retry-a/credentials.json");

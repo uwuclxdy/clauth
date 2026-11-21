@@ -716,16 +716,22 @@ fn runtime_copies_are_owner_only_and_the_base_keeps_its_posture() {
 
 #[test]
 fn every_managed_env_key_is_per_profile() {
-    let custom_env = BTreeSet::new();
+    let custom_env = PerProfileKeys::default();
     for key in MANAGED_ENV_KEYS {
         assert_eq!(
-            key_role(KeyPath::Nested(key), &custom_env),
+            key_role(KeyPath::Nested { parent: "env", key }, &custom_env),
             KeyRule::PerProfile,
             "{key} routes or authenticates one account and must never propagate"
         );
     }
     assert_eq!(
-        key_role(KeyPath::Nested("EDITOR"), &custom_env),
+        key_role(
+            KeyPath::Nested {
+                parent: "env",
+                key: "EDITOR"
+            },
+            &custom_env
+        ),
         KeyRule::Shared
     );
 }
@@ -736,7 +742,7 @@ fn every_managed_env_key_is_per_profile() {
 /// pins its login to the wrong org.
 #[test]
 fn every_credential_minting_top_level_key_is_per_profile() {
-    let custom_env = BTreeSet::new();
+    let custom_env = PerProfileKeys::default();
     for key in [
         "apiKeyHelper",
         "proxyAuthHelper",
@@ -818,6 +824,62 @@ fn custom_env_keys_are_unioned_across_every_profile() {
         keys,
         BTreeSet::from(["A_KEY".to_string(), "B_KEY".to_string()])
     );
+}
+
+#[test]
+fn only_a_pinned_models_effort_stays_per_profile() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p", "[model_effort]\nopus = \"high\"\n");
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "low", "autoCompactWindow": 200000},
+            "haiku": {"effortLevel": "medium"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "high", "maxEffortLevel": "xhigh"},
+            "haiku": {"effortLevel": "low"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    let after = read_json(&runtime);
+    assert_eq!(
+        after,
+        serde_json::json!({
+            "modelSettings": {
+                "claude-opus-4-5": {"effortLevel": "high", "autoCompactWindow": 200000},
+                "haiku": {"effortLevel": "medium"}
+            }
+        })
+    );
+}
+
+/// A model the live record still covers stays per-profile though no config
+/// pins it any more, and a record that does not parse pauses the sync.
+#[test]
+fn a_model_only_the_record_covers_stays_per_profile_and_a_torn_record_pauses() {
+    let _home = HomeSandbox::new();
+    let record = crate::claude::saved_base_env_path().unwrap();
+    crate::profile::atomic_write_600(
+        &record,
+        r#"{"v":2,"keys":{},"model_effort":{"claude-opus-4-5":{"base":"low","wrote":"digest"}}}"#,
+    )
+    .unwrap();
+    let keys = per_profile_keys().expect("the record parses");
+    assert!(keys.models.contains("claude-opus-4-5"));
+
+    crate::profile::atomic_write_600(&record, "{torn").unwrap();
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    assert!(
+        per_profile_keys().is_none(),
+        "an unknown cover pauses the sync"
+    );
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 }
 
 /// The union walks the same DIRECTORY listing the member set is derived from

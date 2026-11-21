@@ -1824,6 +1824,7 @@ fn finish_switch(config: &mut AppConfig, target: Profile, held: &StateLockHeld) 
         profile.env = target.env;
         profile.models = target.models;
         profile.effort = target.effort;
+        profile.model_effort = target.model_effort;
     }
     Ok(())
 }
@@ -2039,11 +2040,15 @@ pub(crate) fn edit_profile_model(
     })
 }
 
-/// Persist a profile's effort: `edit` changes what disk holds now, so the
-/// fields the caller does not touch keep a peer's edit to them. Re-applies to
-/// the live `~/.claude/settings.json` when the profile is active, so a running
-/// `claude` picks the new effort up on its next settings read. Mirrors
-/// [`edit_profile_model`].
+/// Persist a profile's effort against the current config on disk. For the
+/// active profile, update the live carrier so running Claude sessions see the
+/// selected model's new level on their next settings read.
+///
+/// The slot `edit` sees is the Setup row's ([`crate::model_effort::row_level`]):
+/// while the `model` row names one model, that model's level, which lands in
+/// `[model_effort]`. The scalar is then cleared, since it was either that
+/// model's level already or an account-wide value the per-model edit
+/// replaces. Otherwise the slot is the account-wide `effort`.
 pub(crate) fn edit_profile_effort(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2052,17 +2057,34 @@ pub(crate) fn edit_profile_effort(
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
         let (fresh, ()) = update_profile_config(name, |fresh| {
-            edit(&mut fresh.effort);
+            match crate::model_effort::selected_model(&fresh.models).map(str::to_string) {
+                Some(model) => {
+                    let mut slot = crate::model_effort::row_level(fresh);
+                    edit(&mut slot);
+                    // Every spelling that lands on this model goes, so the
+                    // row's value is the one in force.
+                    for key in crate::model_effort::selected_entries(fresh, &model) {
+                        fresh.model_effort.remove(&key);
+                    }
+                    if let Some(level) = slot {
+                        fresh.model_effort.insert(model, level);
+                    }
+                    fresh.effort = None;
+                }
+                None => edit(&mut fresh.effort),
+            }
             Ok(())
         })?
         .with_context(|| format!("profile '{name}' not found"))?;
         if let Some(profile) = config.find_mut(name) {
             profile.effort = fresh.effort.clone();
+            profile.model_effort = fresh.model_effort.clone();
         }
 
         if active {
             let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
             apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+            crate::runtime::update_live_effort(&fresh);
         }
         Ok(())
     })
@@ -4530,6 +4552,7 @@ pub(crate) fn duplicate_profile(
         profile.env = src.env.clone();
         profile.models = src.models.clone();
         profile.effort = src.effort.clone();
+        profile.model_effort = src.model_effort.clone();
         profile.fallback_threshold = src.fallback_threshold;
         profile.weekly_threshold = src.weekly_threshold;
         profile.max_auto_spend = src.max_auto_spend;
