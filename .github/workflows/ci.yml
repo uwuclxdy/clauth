@@ -161,6 +161,20 @@ jobs:
           else
             cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
           fi
+      # The coverage report reads only lcov.info, and the later legs build under
+      # target/release and target/debug, so the coverage run's own build and
+      # profraw files can go: the linux runner's disk filled at the debug leg's
+      # link (measured 2026-11-20). Clean them before the debug leg and log the
+      # disk it frees. The instrumented dependency builds under
+      # target/llvm-cov-target stay: rust-cache saves them for the next
+      # coverage run.
+      - name: free the coverage build dir
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          [ -d target/llvm-cov-target ] || echo "::warning::target/llvm-cov-target is absent: the coverage build put nothing there to free"
+          cargo llvm-cov clean --workspace
+          df -h /
       # Every leg above is --release, where debug_assertions is off and
       # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
       # gated on it cannot run at all, so the local gate was catching regressions
