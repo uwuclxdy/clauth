@@ -77,8 +77,14 @@ const CONTINUING_ENDS = new Set(['clear', 'resume'])
 // The capabilities this mod declares to the daemon, on its `start` and on every
 // poll (a restarted daemon meets a live mod by its poll first). The daemon
 // refuses a phone note to a session whose mod does not name `notes`, so a note
-// is refused rather than dropped by a mod that cannot apply it.
-const CAPS = ['notes'] as const
+// is refused rather than dropped by a mod that cannot apply it; it answers a
+// phone answer to a mod naming `answer_receipts` only once this mod's receipt
+// for it lands (`handleAnswer`).
+const CAPS = ['notes', 'answer_receipts'] as const
+// The posts a settled ask's event gets, this far apart: the daemon lists the
+// ask, and a phone answer to it waits, until its close or its receipt lands.
+const POST_TRIES = 3
+const POST_RETRY_MS = 1000
 
 const SEQ = { plugin: 'clauth', key: 'seq' } as const
 const LOAD = { plugin: 'clauth', key: 'load' } as const
@@ -281,6 +287,13 @@ let helds = new Map<string, HeldEntry>()
 // back to the desk — by ask id, each with the session it opened in and the tool
 // call (`tool_use_id`) whose settling closes it.
 let unheldAsks = new Map<string, { session: string; call: string }>()
+// The asks this module load applied a device answer to, for the conversation's
+// length: a parked wait and the poll both carry each answer, and any delivery
+// finding no hold re-reports `applied` rather than the loss a `not_held` would
+// read if the applied post's retry has not landed yet. No count of deliveries
+// is assumed, so ids leave only with their `session.end` (one id per answer
+// the conversation applied); a reload starts empty.
+let appliedAsks = new Set<string>()
 let interruptedTurn: string | null = null
 let askCounter = 0
 // The last cadence run per scope, keyed by agent id, the main thread's key empty.
@@ -523,19 +536,31 @@ async function postEvent(
   fields: Record<string, unknown> = {},
   session: string | null = sessionId,
 ): Promise<boolean> {
-  if (inert || session === null) return false
+  const status = await sendEvent($, kind, fields, session)
+  return status !== null && status >= 200 && status < 300
+}
+
+// `postEvent`'s post, answering the daemon's status: null when the event was
+// never sent or no answer came. The link joins the send chain at the call.
+function sendEvent(
+  $: EngineInterface,
+  kind: string,
+  fields: Record<string, unknown>,
+  session: string | null,
+): Promise<number | null> {
+  if (inert || session === null) return Promise.resolve(null)
   return enqueueSend(async () => {
     const seq = await nextSeq($)
     const body = JSON.stringify({ session, seq, kind, ...fields })
-    if (bodyBytes(body) > BODY_LIMIT) return false
+    if (bodyBytes(body) > BODY_LIMIT) return null
     try {
-      return (await fetchBridge($, '/event', 'POST', body)).ok
+      return (await fetchBridge($, '/event', 'POST', body)).status
     } catch {
       // A refused or unreachable daemon must not stall the session: the event
       // is best-effort, the daemon re-syncs from its own state.
-      return false
+      return null
     }
-  }).catch(() => false)
+  }).catch(() => null)
 }
 
 // Posts `ask_opened` and reads the daemon's hold answer: the session the ask
@@ -597,7 +622,29 @@ function closeUnheldAskWhenSettled(
 }
 
 function closeUnheldAsk($: EngineInterface, ask: string, session: string): void {
-  void postEvent($, 'ask_closed', { ask, by: 'desk' }, session)
+  void postRetried($, 'ask_closed', { ask, by: 'desk' }, session)
+}
+
+// Posts a settled ask's event, settling once this first post has an answer: its
+// close, or the receipt a waiting phone answer needs. A post that drew no
+// answer or a 5xx goes out again in the background, POST_RETRY_MS apart, up to
+// POST_TRIES posts in all, so the caller never waits on a retry; a 4xx is the
+// daemon's last word on the event (the session moved on, or the event was
+// refused), so it is not retried. Both events are idempotent there: a second
+// close drops a kept payload and a second receipt reports what already settled.
+function postRetried(
+  $: EngineInterface,
+  kind: string,
+  fields: Record<string, unknown>,
+  session: string,
+): Promise<void> {
+  const post = async (tries: number): Promise<void> => {
+    const status = await sendEvent($, kind, fields, session)
+    if ((status === null || status >= 500) && tries < POST_TRIES) {
+      $.clock.after(POST_RETRY_MS, () => void post(tries + 1))
+    }
+  }
+  return post(1)
 }
 
 // The engine raises `tool.check` inside the `tool.call` chain's `next` (the
@@ -640,7 +687,7 @@ async function resolveHold(
     // The drawing read is best-effort; the hold itself is over.
   }
   if (postClose) {
-    await postEvent($, 'ask_closed', { ask, by }, entry.session)
+    await postRetried($, 'ask_closed', { ask, by }, entry.session)
   }
   entry.resolve(outcome)
 }
@@ -650,7 +697,7 @@ function answerFromDesk($: EngineInterface, ask: string, decision: 'allow' | 'de
   void resolveHold($, ask, { type: decision, from: 'desk' }, true)
 }
 
-// A phone answer for an ask: the daemon already closed it, so just resolve.
+// A phone answer for an ask: the daemon closes it, so no close is posted.
 function answerFromDevice($: EngineInterface, ask: string, outcome: HoldOutcome): Promise<void> {
   return resolveHold($, ask, outcome, false)
 }
@@ -661,21 +708,20 @@ function releaseToDesk($: EngineInterface, ask: string): void {
   void resolveHold($, ask, { type: 'loss' }, true)
 }
 
-async function handleAnswer($: EngineInterface, ask: string, cmd: Record<string, unknown>): Promise<void> {
-  const entry = helds.get(ask)
-  if (!entry) return
+// The outcome a device answer gives `entry`'s hold, or null for a form the hold
+// does not take.
+function deviceOutcome(entry: HeldEntry, cmd: Record<string, unknown>): HoldOutcome | null {
   if (entry.kind === 'decision') {
     // A permission ask releases only on a decision; the other form is ignored.
-    if (cmd.decision !== 'allow' && cmd.decision !== 'deny') return
-    await answerFromDevice($, ask, { type: cmd.decision, from: 'device' })
-    return
+    if (cmd.decision !== 'allow' && cmd.decision !== 'deny') return null
+    return { type: cmd.decision, from: 'device' }
   }
   // An AskUserQuestion releases only on answers, each value a string, and at
   // least one answer: an empty map holds nothing the engine can use.
-  if (cmd.answers === null || typeof cmd.answers !== 'object') return
+  if (cmd.answers === null || typeof cmd.answers !== 'object') return null
   const pairs = Object.entries(cmd.answers as Record<string, unknown>)
-  if (pairs.length === 0) return
-  if (!pairs.every(([, v]) => typeof v === 'string')) return
+  if (pairs.length === 0) return null
+  if (!pairs.every(([, v]) => typeof v === 'string')) return null
   // Built with `fromEntries`, never by assignment: a question whose exact text
   // is `__proto__` must survive as an own key.
   const answers = Object.fromEntries(pairs) as Record<string, string>
@@ -688,10 +734,44 @@ async function handleAnswer($: EngineInterface, ask: string, cmd: Record<string,
         )
       : []
   const notes = Object.fromEntries(notePairs) as Record<string, string>
-  await answerFromDevice($, ask, { type: 'answers', answers, notes })
+  return { type: 'answers', answers, notes }
 }
 
-async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): Promise<void> {
+// A device answer, off the hold's own wait or the poll under `session`; both
+// carry it, and both report the same receipt. The daemon answers the device
+// once this module's receipt lands: `applied` once a hold took the answer,
+// `not_held` when this module holds nothing for it (the desk or an interrupt
+// resolved it first, or another module load held it). A form the hold does not
+// take reports nothing: this daemon refuses every such form, and the hold's
+// wait resolves it as a loss.
+async function handleAnswer(
+  $: EngineInterface,
+  ask: string,
+  cmd: Record<string, unknown>,
+  session: string,
+): Promise<void> {
+  const entry = helds.get(ask)
+  if (!entry) {
+    // A delivery of an answer this load already applied re-reports `applied`,
+    // so no copy can read as a loss ahead of the applied post's own retry.
+    // Every other answer finding no hold is a loss.
+    const applied = appliedAsks.has(ask)
+    void postRetried($, 'answer_receipt', { ask, state: applied ? 'applied' : 'not_held' }, session)
+    return
+  }
+  const outcome = deviceOutcome(entry, cmd)
+  if (outcome === null) return
+  // The hold is gone once `answerFromDevice` returns, and this `applied` joins
+  // the send chain before anything else runs. Its retry after a 5xx can be
+  // overtaken by the answer's later deliveries, each of which re-reports
+  // `applied` from `appliedAsks` until the conversation ends.
+  const resolved = answerFromDevice($, ask, outcome)
+  appliedAsks.add(ask)
+  void postRetried($, 'answer_receipt', { ask, state: 'applied' }, entry.session)
+  await resolved
+}
+
+async function handleCommand($: EngineInterface, cmd: Record<string, unknown>, session: string): Promise<void> {
   if (typeof cmd !== 'object' || cmd === null) return
   switch (cmd.kind) {
     case 'prompt':
@@ -720,7 +800,7 @@ async function handleCommand($: EngineInterface, cmd: Record<string, unknown>): 
       break
     case 'answer':
       if (typeof cmd.ask === 'string') {
-        await handleAnswer($, cmd.ask, cmd)
+        await handleAnswer($, cmd.ask, cmd, session)
       }
       break
   }
@@ -861,7 +941,7 @@ async function doPoll($: EngineInterface): Promise<void> {
       // conversation ends, and none after it belongs to the next one.
       if (epoch !== promptEpoch) return
       try {
-        await handleCommand($, cmd)
+        await handleCommand($, cmd, session)
       } catch {
         // A refused command must not drop the ones behind it in the reply.
       }
@@ -969,12 +1049,13 @@ async function waitOnce($: EngineInterface, ask: string, session: string): Promi
   }
   if (reply.answer !== null && reply.answer !== undefined) {
     // A device answer, form-matched exactly as a poll answer is.
-    await handleAnswer($, ask, reply.answer)
+    await handleAnswer($, ask, reply.answer, session)
     if (helds.has(ask)) {
       // The answer's form did not match this hold, which only a daemon or mod
       // of another version delivers: the daemon refuses the wrong form and
-      // empty or non-string answers. The daemon already closed the ask, so
-      // resolve it as a loss rather than re-waiting on a closed ask forever.
+      // empty or non-string answers. The daemon took the ask out of its open
+      // asks, so resolve it as a loss (its close settles a route still waiting)
+      // rather than re-waiting on a closed ask forever.
       await resolveHold($, ask, { type: 'loss' }, true)
     }
     return
@@ -2251,6 +2332,9 @@ export const register: Register = on => {
       // A dialog of the ended conversation reopens no pane in the next one.
       dialogCalls.clear()
       paneBeforeDialog = null
+      // An answer applied for the ended conversation is no fact of the next
+      // one: a duplicate arriving under its id reports the loss.
+      appliedAsks.clear()
       // A prompt queued for this conversation must not reach the next one. The
       // daemon reports each dropped prompt itself once it takes the end. The
       // epoch moves before the state write, so a poll reply landing while it

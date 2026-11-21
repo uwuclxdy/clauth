@@ -50,6 +50,11 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
   // An `ask_opened` the daemon refuses (a 403/409 the event route answers
   // before it records the ask).
   const opened = { refuse: false }
+  // The next `fail` `ask_closed` posts answer 500, standing in for any 5xx
+  // (the bridge's own is `503 busy`).
+  const closed = { fail: 0 }
+  // The next `fail` `answer_receipt` posts answer 500, the same way.
+  const receipt = { fail: 0 }
   // A device answer: the daemon closes the ask and keeps the answer for its
   // wait. An ask already closed refuses (the device got `ask_closed`).
   const answer = (ask: string, payload: Record<string, unknown>): void => {
@@ -110,6 +115,14 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
       asks.set(body.ask as string, { answer: null, closed: false })
       return res(200, JSON.stringify({ ok: true, remote: true, hold: askHold }))
     }
+    if (body !== undefined && body.kind === 'ask_closed' && closed.fail > 0) {
+      closed.fail -= 1
+      return res(500, 'boom')
+    }
+    if (body !== undefined && body.kind === 'answer_receipt' && receipt.fail > 0) {
+      receipt.fail -= 1
+      return res(500, 'boom')
+    }
     if (body !== undefined && body.kind === 'ask_closed') {
       const st = asks.get(body.ask as string)
       if (st && !st.closed) st.closed = true
@@ -117,7 +130,7 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     }
     return res(200, JSON.stringify({ ok: true }))
   })
-  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, answer }
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, closed, receipt, answer }
 }
 
 function installBoilerplate(
@@ -1445,8 +1458,8 @@ test('CL3: the clear end goes out under the ended id, and the new id start carri
   expect(bridge.events.filter(b => b.kind === 'end').map(b => b.session)).toEqual(['sid-1'])
   const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, load, ...rest }) => rest)
   expect(starts).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
-    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes'] },
+    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
+    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
   ])
 })
 
@@ -1758,6 +1771,201 @@ test('U4: a held ask that the phone answered posts no close', async ($, on) => {
   expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
 })
 
+// --- answer receipts (group AR) ---
+
+// The answer receipts the mod posted, in post order, as the daemon reads them.
+function receipts(bridge: { events: EventBody[] }) {
+  return bridge.events
+    .filter(e => e.kind === 'answer_receipt')
+    .map(e => ({ session: e.session, ask: e.ask, state: e.state }))
+}
+
+test('AR1: a phone answer the hold takes posts its applied receipt', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.answer(ask, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  expect(receipts(bridge)).toEqual([{ session: 'sid-1', ask, state: 'applied' }])
+})
+
+test('AR2: a phone answer reaching the mod after the desk settled its ask posts not_held', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'allow' })
+  expect(await p).toEqual({ decision: 'allow' })
+  await ui.unmount()
+  // The daemon took the phone's deny before the desk's close reached it, and
+  // hands it over on the poll.
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'deny' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(receipts(bridge)).toEqual([{ session: 'sid-1', ask, state: 'not_held' }])
+})
+
+// The poll's copy of an answer the hold wait took reports the same `applied`:
+// this load did apply it, and the copy never reads as a loss.
+test('AR3: an answer both the hold wait and the poll carry reports applied twice', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  expect(receipts(bridge).map(r => r.state)).toEqual(['applied', 'applied'])
+})
+
+test('AR4: a failed ask_closed post is posted again, three posts at most', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const closes = (ask: string) => bridge.events.filter(b => b.kind === 'ask_closed' && b.ask === ask)
+  const deskAllow = async () => {
+    const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+    await clock.settle()
+    const ask = bridge.lastAsk()!
+    const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+    await ui.press({ key: 'allow' })
+    expect(await p).toEqual({ decision: 'allow' })
+    await ui.unmount()
+    return ask
+  }
+
+  bridge.closed.fail = 1
+  const retried = await deskAllow()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(closes(retried)).toHaveLength(2)
+
+  bridge.closed.fail = 99
+  const refused = await deskAllow()
+  for (let i = 0; i < 10; i++) await clock.advance(1000)
+  expect(closes(refused)).toHaveLength(3)
+})
+
+test('AR6: a failed answer receipt is posted again, three posts at most', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const deviceAnswer = async () => {
+    const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+    await clock.settle()
+    const ask = bridge.lastAsk()!
+    bridge.answer(ask, { decision: 'allow' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'allow' })
+    await clock.settle()
+    return ask
+  }
+  const posted = (ask: string) => receipts(bridge).filter(r => r.ask === ask)
+
+  bridge.receipt.fail = 1
+  const retried = await deviceAnswer()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(posted(retried)).toHaveLength(2)
+
+  bridge.receipt.fail = 99
+  const refused = await deviceAnswer()
+  for (let i = 0; i < 10; i++) await clock.advance(1000)
+  expect(posted(refused)).toHaveLength(3)
+})
+
+// A first `applied` post drew a 5xx, so its retry is still pending when the
+// poll's copy of the same answer arrives. That copy must report `applied`
+// again, never `not_held`: the loss would land ahead of the retry and answer
+// the phone `409` for an answer the hold applied.
+test('AR7: a duplicate of an applied answer re-reports applied when its receipt post failed', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.receipt.fail = 1
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => r.state)).toEqual(['applied', 'applied', 'applied'])
+})
+
+// An applied id leaves with the conversation that applied it: once the answer's
+// posts stopped landing, no duplicate arriving under the next session's poll
+// reports an `applied` the new conversation never made.
+test('AR8: a /clear drops the applied ids, so a duplicate under the next id reports the loss', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  // Every applied post fails, so nothing but the conversation's end takes the
+  // id out.
+  bridge.receipt.fail = 99
+  bridge.answer(ask, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  for (let i = 0; i < 3; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => [r.session, r.state])).toEqual([
+    ['sid-1', 'applied'],
+    ['sid-1', 'applied'],
+    ['sid-1', 'applied'],
+  ])
+  bridge.receipt.fail = 0
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  // Let the next conversation register and settle its first poll: a poll issued
+  // before the end drops the commands it lands with.
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  for (let i = 0; i < 2; i++) await clock.advance(PARK_MS)
+  expect(receipts(bridge).filter(r => r.session === 'sid-2')).toEqual([
+    { session: 'sid-2', ask, state: 'not_held' },
+  ])
+})
+
+test('AR9: a later duplicate of an applied answer still reports applied', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.receipt.fail = 1
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  for (let i = 0; i < 3; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => r.state)).toEqual([
+    'applied',
+    'applied',
+    'applied',
+    'applied',
+  ])
+})
+
 // The unheld question stays open while Claude Code's own dialog is up, and its
 // close goes under the session it opened in even once a `/clear` moved the
 // module on to the next one.
@@ -2017,13 +2225,13 @@ test('PQ8: a delivered prompt is reported by its id, and one with no id reports 
   expect(promptReports(bridge)).toEqual([{ prompt: 'p7', state: 'delivered' }])
 })
 
-test('PQ9: the start event tells the daemon this mod reports prompt outcomes and takes notes', async ($, on) => {
+test('PQ9: the start event tells the daemon this mod reports prompt outcomes, takes notes and sends answer receipts', async ($, on) => {
   const { clock, bridge } = setup(on)
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const starts = bridge.events.filter(e => e.kind === 'start')
   expect(starts.map(({ seq, load, ...rest }) => rest)).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true, caps: ['notes'] },
+    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
   ])
 })
 
@@ -2071,7 +2279,7 @@ test('PQ15: every poll tells the daemon this mod reports prompt outcomes', async
 
 // A restarted daemon meets a live mod by its poll first, so every poll names
 // the mod's capabilities as well as its start.
-test('PQ23: every poll tells the daemon this mod takes notes', async ($, on) => {
+test('PQ23: every poll tells the daemon this mod takes notes and sends answer receipts', async ($, on) => {
   const { clock, bridge } = setup(on)
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   await clock.advance(PARK_MS)
@@ -2079,7 +2287,7 @@ test('PQ23: every poll tells the daemon this mod takes notes', async ($, on) => 
   const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
   expect(polls.length).toBeGreaterThan(1)
   for (const f of polls) {
-    expect(/[?&]caps=notes(&|$)/.test(f.url)).toBe(true)
+    expect(/[?&]caps=notes,answer_receipts(&|$)/.test(f.url)).toBe(true)
   }
 })
 

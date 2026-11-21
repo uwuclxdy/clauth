@@ -88,8 +88,9 @@ pub(crate) struct SessionRow {
     /// reaches the session (`via == ["mod"]`); empty otherwise.
     #[schema(required = false)]
     lacks: Vec<String>,
-    /// The capabilities the session's live mod declared (`notes` today: it
-    /// applies an answer's notes); empty without a live mod, or once every
+    /// The capabilities the session's live mod declared: `notes` (it applies
+    /// an answer's notes) and `answer_receipts` (it confirms each answer, so
+    /// the asks route answers once the answer took); empty without a live mod, or once every
     /// instance on the id is ending (`via` still lists `mod`: an ending
     /// instance takes no more answers). Two live mods on one id list only what
     /// both declared.

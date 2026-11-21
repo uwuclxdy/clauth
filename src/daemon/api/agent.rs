@@ -301,7 +301,8 @@ pub(crate) struct SessionDriveOk {
     prompt: Option<String>,
 }
 
-/// The answer the ask route carries once the answer reached a live mod.
+/// The answer the ask route carries once the session's mod applied the answer,
+/// or, for a mod that confirms none, once the answer is queued for it.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AnswerOk {
     ok: bool,
@@ -345,6 +346,11 @@ const ANSWER_EMPTY: &str = "each answer must be a non-empty string.";
 #[cfg(unix)]
 const NOTES_UNSUPPORTED: &str =
     "this session's mod predates notes and would drop them; send the answers without notes.";
+#[cfg(unix)]
+const ANSWER_WITHDRAWN: &str =
+    "the session's mod did not take the answer in time, so it was taken back; send it again.";
+#[cfg(unix)]
+const ANSWER_UNCONFIRMED: &str = "the session's mod took the answer but did not confirm it in time; it may still apply, and the ask closes if it does.";
 
 /// Where the herdr fallback landed for one session id.
 enum PaneFallback {
@@ -666,7 +672,9 @@ fn all_strings(map: &serde_json::Map<String, serde_json::Value>) -> bool {
 
 /// `POST /api/v1/sessions/{id}/asks/{ask}` — answer a mod-held ask. The first
 /// answer wins and closes the ask, desk or device alike (SB-7, SB-19); a
-/// refused answer leaves it open.
+/// refused or withdrawn answer leaves it open. A session whose mod declares
+/// `answer_receipts` is answered once the mod reports the answer applied or the
+/// ask closes without it, waiting on the mod's receipt for up to 5 s.
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{id}/asks/{ask}",
@@ -676,13 +684,14 @@ fn all_strings(map: &serde_json::Map<String, serde_json::Value>) -> bool {
     ),
     request_body = AnswerBody,
     responses(
-        (status = 200, description = "the answer reached the session's live mod and closes the ask", body = AnswerOk),
+        (status = 200, description = "the session's live mod applied the answer, and the ask closed; a mod that does not declare answer_receipts confirms nothing, so for it this means the answer is queued for the mod and the ask closed", body = AnswerOk),
         (status = 400, description = "the body names neither, or both, of decision and answers (a null names neither), a decision other than allow or deny, notes without answers or beside a decision, an answers or notes that is neither an object nor null, an answers object with no entry, or an answer or note that is not a string (`bad_request`); a decision sent to a question ask, or answers sent to any other ask (`answer_wrong_form`); an answer or non-empty note keyed by anything but one of the ask's questions' exact texts, byte for byte (`answer_unknown_question`); an empty answer (`answer_empty`); a non-empty note to a session whose live mod does not declare the notes capability, which would drop it (`notes_unsupported`). Nothing is queued and the ask stays open", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no live session with that id (`session_not_live`), or no open ask with that id (`ask_not_found`)", body = ErrorBody),
-        (status = 409, description = "two live sessions share that id (`session_ambiguous`), or the ask is already answered (`ask_closed`)", body = ErrorBody),
-        (status = 503, description = "the mod's command queue is full (`session_busy`)", body = ErrorBody),
+        (status = 409, description = "two live sessions share that id (`session_ambiguous`), or the ask is already answered, or closed while the answer waited on the mod's receipt: at the desk, by an interrupt, by the session's end, or with the mod holding nothing for it (`ask_closed`)", body = ErrorBody),
+        (status = 503, description = "the mod's command queue is full (`session_busy`); or the session's mod, which declares answer_receipts, did not take the answer within 5 s, so it was taken back, will never apply, and the ask is open again for a resend (`answer_withdrawn`)", body = ErrorBody),
+        (status = 504, description = "the session's mod, which declares answer_receipts, took the answer but sent no receipt within 5 s: it may still apply, and the ask then closes with a session.ask closed frame by device; until then the ask takes no other answer (`answer_unconfirmed`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["control"]))
@@ -733,7 +742,7 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
     {
         if let Some(hub) = &ctx.bridge {
             match hub.answer(id, ask, command) {
-                AskOutcome::Queued => {
+                AskOutcome::Queued | AskOutcome::Applied => {
                     logline!(
                         "clauth api: device '{}' answered ask '{}' on session '{}' {}",
                         caller.device_for_log(),
@@ -759,6 +768,26 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::refused(503, "session_busy", SESSION_BUSY);
                 }
+                AskOutcome::Withdrawn => {
+                    logline!(
+                        "clauth api: device '{}' answer to ask '{}' on session '{}' withdrawn: the mod did not take it {}",
+                        caller.device_for_log(),
+                        sanitize_for_log(ask),
+                        sanitize_for_log(id),
+                        audit_tail
+                    );
+                    return Response::refused(503, "answer_withdrawn", ANSWER_WITHDRAWN);
+                }
+                AskOutcome::Unconfirmed => {
+                    logline!(
+                        "clauth api: device '{}' answer to ask '{}' on session '{}' unconfirmed: no receipt {}",
+                        caller.device_for_log(),
+                        sanitize_for_log(ask),
+                        sanitize_for_log(id),
+                        audit_tail
+                    );
+                    return Response::refused(504, "answer_unconfirmed", ANSWER_UNCONFIRMED);
+                }
                 AskOutcome::WrongForm => {
                     return Response::refused(400, "answer_wrong_form", ANSWER_WRONG_FORM);
                 }
@@ -776,6 +805,13 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     return Response::refused(400, "notes_unsupported", NOTES_UNSUPPORTED);
                 }
                 AskOutcome::AskClosed => {
+                    logline!(
+                        "clauth api: device '{}' answer to ask '{}' on session '{}' refused: the ask was already answered or closed {}",
+                        caller.device_for_log(),
+                        sanitize_for_log(ask),
+                        sanitize_for_log(id),
+                        audit_tail
+                    );
                     return Response::refused(409, "ask_closed", ASK_CLOSED);
                 }
                 AskOutcome::AskNotFound => {

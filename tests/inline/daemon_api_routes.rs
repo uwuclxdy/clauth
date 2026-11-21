@@ -1902,6 +1902,101 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         );
     }
 
+    // A mod declaring answer receipts, under a short receipt wait: an answer
+    // no poll takes is withdrawn (503), one a poll takes with no receipt
+    // after it is unconfirmed (504).
+    {
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let table = std::sync::Mutex::new(rows);
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| table.lock().unwrap().get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::with_receipt_wait(
+            true,
+            resolver,
+            std::time::Duration::from_secs(1),
+        );
+        let _stream = hub.subscribe_as(Some(&Tier::Control));
+        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "prompt_reports": true, "load": 1, "caps": ["notes", "answer_receipts"]});
+        assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
+        for (seq, ask) in [(2, FIXTURE_ASK_ID), (3, "r2")] {
+            let opened = serde_json::json!({"session": FIXTURE_ID, "seq": seq, "kind": "ask_opened", "ask": ask, "tool": "Bash", "input": {"command": "ls"}});
+            assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
+        }
+        let ctx_receipts = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            std::sync::Arc::clone(&hub),
+        );
+        let answer_withdrawn = call(
+            &ctx_receipts,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            503,
+            &answer_withdrawn,
+            &mut driven,
+            &mut produced,
+        );
+        // The answer runs on its own thread, so the poll below takes it before
+        // the receipt wait ends whatever the box's load; the route still waits
+        // out the bound and answers 504. The poll starts first: it either finds
+        // the answer queued or parks and is woken by it.
+        let route = {
+            let ctx = std::sync::Arc::clone(&ctx_receipts);
+            std::thread::spawn(move || {
+                call(
+                    &ctx,
+                    &req(
+                        "POST",
+                        &format!("{API_PREFIX}/sessions/{FIXTURE_ID}/asks/r2"),
+                        Some(TOKEN),
+                        r#"{"decision":"allow"}"#,
+                    ),
+                )
+            })
+        };
+        let (_, polled) = hub.poll_declaring(
+            100,
+            FIXTURE_ID,
+            std::time::Duration::from_secs(5),
+            &[
+                crate::daemon::bridge::Cap::Notes,
+                crate::daemon::bridge::Cap::AnswerReceipts,
+            ],
+        );
+        let answer_unconfirmed = route.join().expect("the answer thread");
+        assert_eq!(
+            polled["commands"],
+            serde_json::json!([{"kind": "answer", "ask": "r2", "decision": "allow"}])
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            504,
+            &answer_unconfirmed,
+            &mut driven,
+            &mut produced,
+        );
+    }
+
     // The session-creation route, through a herdr table answering tab create,
     // agent start and pane get. The config key and the grant are staged per arm.
     {

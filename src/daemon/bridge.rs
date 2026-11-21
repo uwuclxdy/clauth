@@ -54,6 +54,10 @@ pub(crate) const SUBSCRIBER_BOUND: usize = 64;
 /// never releases a held question to the desk.
 const CONTROL_GRACE: Duration = Duration::from_secs(5);
 
+/// How long the asks route waits for a mod declaring [`Cap::AnswerReceipts`]
+/// to report the answer it was handed.
+const RECEIPT_WAIT: Duration = Duration::from_secs(5);
+
 /// How often the sweep closes silent instances, so a silent session's end
 /// frames go out near the silence bound, never at the next interaction.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -225,6 +229,85 @@ struct OpenAsk {
     held: bool,
 }
 
+/// An answer queued for a mod declaring [`Cap::AnswerReceipts`] that neither a
+/// receipt nor the ask's close has settled. The state sits in a cell shared
+/// with the route waiting on it, so an instance end that removes this entry
+/// still leaves the route the receipt that landed first. The open ask the
+/// answer took out of `open_asks` stays with that route, which alone can put
+/// it back.
+struct Awaited {
+    state: Arc<Mutex<AwaitState>>,
+}
+
+impl Awaited {
+    /// Where the answer stands, from the cell the route waiting on it reads.
+    fn state(&self) -> AwaitState {
+        read_state(&self.state)
+    }
+
+    /// Move the answer to `state`: the route parked on the cell re-reads it.
+    fn settle(&self, state: AwaitState) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+}
+
+/// The state behind an awaited answer's shared cell.
+fn read_state(cell: &Mutex<AwaitState>) -> AwaitState {
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Where one [`Awaited`] answer stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AwaitState {
+    /// The asks route waits on the mod's receipt.
+    Pending,
+    /// The route answered `504` and waits no more: a late `applied` closes
+    /// the ask `by: device`, a late `not_held` leaves the close to the mod.
+    Unconfirmed,
+    /// The mod applied it and the `closed` `by: device` frame went out.
+    Applied,
+    /// The mod held nothing for it. No frame went out: the mod's own
+    /// `ask_closed` sends the ask's close.
+    NotHeld,
+}
+
+/// What a mod declaring [`Cap::AnswerReceipts`] reports of one answer it was
+/// handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receipt {
+    /// A hold took it: the check is answered.
+    Applied,
+    /// The mod held nothing for the ask: the desk, an interrupt or another
+    /// module load settled it first.
+    NotHeld,
+}
+
+/// An `answer_receipt` event's ask and receipt, or `None` for one the daemon
+/// cannot read: a missing or non-string ask, or a state other than `applied`
+/// or `not_held`.
+fn answer_receipt(value: &Value) -> Option<(&str, Receipt)> {
+    let ask = value.get("ask")?.as_str()?;
+    let receipt = match value.get("state")?.as_str()? {
+        "applied" => Receipt::Applied,
+        "not_held" => Receipt::NotHeld,
+        _ => return None,
+    };
+    Some((ask, receipt))
+}
+
+/// An `answer` command's ask id, or `None` for any other command.
+fn answered_ask(command: &Value) -> Option<&str> {
+    if command.get("kind").and_then(Value::as_str) != Some("answer") {
+        return None;
+    }
+    command.get("ask").and_then(Value::as_str)
+}
+
 /// An `ask_opened` post's `start_line`, kept only as a positive integer: the
 /// value goes on to every paired device, so a string, zero, a negative or a
 /// float reads as absent.
@@ -282,6 +365,9 @@ pub(crate) struct Hub {
     /// opening while no open ask is held for the phone announces the session's
     /// `blocked` transition through it (WP-8).
     push: Mutex<Option<crate::push::Queue>>,
+    /// How long [`Hub::answer`] waits on a receipt-declaring mod's receipt:
+    /// [`RECEIPT_WAIT`], or a test's own bound.
+    receipt_wait: Duration,
     /// Test-only: the virtual clock's offset past [`Instant::now`], so a test
     /// pins the silence close without sleeping 40 s.
     #[cfg(test)]
@@ -402,6 +488,10 @@ macro_rules! caps {
 caps! {
     /// The mod applies an answer's `notes`; an older mod drops them.
     Notes => "notes",
+    /// The mod reports each answer it is handed (`answer_receipt`): applied
+    /// to the check it holds, or no hold found for it. The asks route answers
+    /// such a mod's answer only once the receipt says what became of it.
+    AnswerReceipts => "answer_receipts",
 }
 
 impl Cap {
@@ -438,8 +528,14 @@ struct Live {
     /// device queued (`null` for a desk close or the session's end), kept so a
     /// wait arriving after the answer returns it at once; the wait that
     /// delivers the answer drops the payload, keeping only the id, so a live
-    /// instance never accumulates an answer per closed ask (W4).
+    /// instance never accumulates an answer per closed ask (W4). An answer
+    /// awaiting its receipt ([`Live::awaited`]) is here too, until a withdraw
+    /// takes it back out.
     closed_asks: HashMap<String, Value>,
+    /// Answers queued for a mod declaring [`Cap::AnswerReceipts`] that its
+    /// receipt or the ask's close has not settled, by ask id: at most one per
+    /// ask, which is out of `open_asks` while its answer is.
+    awaited: HashMap<String, Awaited>,
     /// Whether this instance sent (or reserved) a `blocked` push: set in the
     /// same lock hold that decides to push, cleared only by
     /// [`Hub::note_ask_opened`]'s rollback when no push queue is wired. Beside
@@ -533,6 +629,7 @@ impl Live {
             seq_high: 0,
             open_asks: Vec::new(),
             closed_asks: HashMap::new(),
+            awaited: HashMap::new(),
             announced: false,
             cwd: Value::Null,
             interactive: Value::Null,
@@ -810,8 +907,20 @@ enum Holders {
 
 /// What [`Hub::answer`] found on the mod side of an ask answer.
 pub(crate) enum AskOutcome {
-    /// The ask was open; the answer is queued and the ask closes.
+    /// The ask was open and the instance's current load declares no
+    /// [`Cap::AnswerReceipts`]: the answer is queued and the ask closes, with
+    /// no word on whether the mod applies it.
     Queued,
+    /// The ask was open, and the mod reported it applied the answer: the ask
+    /// closed.
+    Applied,
+    /// No poll or wait took the answer within the receipt wait: it was taken
+    /// back, never to apply, and the ask is open again for a resend, announced
+    /// with the fields its first `opened` frame carried.
+    Withdrawn,
+    /// A poll or wait took the answer and no receipt came within the receipt
+    /// wait: it may still apply, and the ask closes if it does.
+    Unconfirmed,
     /// Two live instances resolve to the id.
     Ambiguous,
     /// The ask is open but the instance's queue is at [`MAX_QUEUED_COMMANDS`]:
@@ -829,7 +938,9 @@ pub(crate) enum AskOutcome {
     /// [`Cap::Notes`], so it would drop the note: refused, nothing queued, the
     /// ask stays open.
     NotesUnsupported,
-    /// The ask was answered (or closed at the desk) already.
+    /// The ask was answered (or closed at the desk) already, or closed while
+    /// its answer waited on the receipt: at the desk, by an interrupt, by the
+    /// session's end, or with the mod holding nothing for it.
     AskClosed,
     /// The instance never held that ask id.
     AskNotFound,
@@ -896,6 +1007,21 @@ fn mint_prompt_nonce() -> u64 {
 
 impl Hub {
     pub(crate) fn new(listening: bool, resolver: PeerResolver) -> Arc<Self> {
+        Self::build(listening, resolver, RECEIPT_WAIT)
+    }
+
+    /// A hub whose asks route waits `receipt_wait` on a receipt instead of
+    /// [`RECEIPT_WAIT`], so a test drives the deadline in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_receipt_wait(
+        listening: bool,
+        resolver: PeerResolver,
+        receipt_wait: Duration,
+    ) -> Arc<Self> {
+        Self::build(listening, resolver, receipt_wait)
+    }
+
+    fn build(listening: bool, resolver: PeerResolver, receipt_wait: Duration) -> Arc<Self> {
         Arc::new(Self {
             listening,
             resolver,
@@ -904,6 +1030,7 @@ impl Hub {
             changed: Condvar::new(),
             subs: Mutex::new(Subscribers::default()),
             push: Mutex::new(None),
+            receipt_wait,
             #[cfg(test)]
             clock_offset: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1097,13 +1224,19 @@ impl Hub {
             .control_presence(now)
     }
 
-    /// The end frames for a closing instance: every open ask closes `by:
-    /// session_end`, every prompt still queued drops `session_end`, then the
-    /// `end` status (SB-13). Every removal path calls this, so the one notify
-    /// here wakes any wait (and poll) parked on the instance, and no queued
-    /// prompt goes unreported, whatever path removed it.
+    /// The end frames for a closing instance: every open ask, and every ask
+    /// whose awaited answer sent no close frame yet, closes `by: session_end`,
+    /// every prompt still queued drops `session_end`, then the `end` status
+    /// (SB-13). Every removal path calls this, so the one notify here wakes any
+    /// wait, poll or asks route parked on the instance, and no queued prompt
+    /// goes unreported, whatever path removed it.
     fn emit_instance_end(&self, live: &Live) {
-        for (ask, _) in &live.open_asks {
+        let unclosed = live
+            .awaited
+            .iter()
+            .filter(|(_, awaited)| awaited.state() != AwaitState::Applied)
+            .map(|(ask, _)| ask);
+        for ask in live.open_asks.iter().map(|(ask, _)| ask).chain(unclosed) {
             self.broadcast(
                 "session.ask",
                 json!({"session": live.session_id, "ask": ask, "state": "closed", "by": "session_end"}),
@@ -1267,6 +1400,7 @@ impl Hub {
             Some("ask_closed") if value.get("ask").and_then(Value::as_str).is_some() => {
                 "ask_closed"
             }
+            Some("answer_receipt") => "answer_receipt",
             _ => return (400, error_value("bad_request")),
         };
         let report = if kind == "prompt" {
@@ -1274,6 +1408,14 @@ impl Hub {
                 return (400, error_value("bad_request"));
             };
             Some(report)
+        } else {
+            None
+        };
+        let receipt = if kind == "answer_receipt" {
+            let Some(receipt) = answer_receipt(&value) else {
+                return (400, error_value("bad_request"));
+            };
+            Some(receipt)
         } else {
             None
         };
@@ -1327,6 +1469,9 @@ impl Hub {
                     return (200, json!({ "ok": true }));
                 }
                 live.ending = true;
+                // Wake an asks route waiting on this instance: the end answers
+                // it now, however long the final tail's removal waits.
+                self.changed.notify_all();
                 live.generation
             };
             drop(inner);
@@ -1378,6 +1523,16 @@ impl Hub {
         }
 
         let (live, created) = self.reconcile(&mut inner, peer_pid, &resolved, now);
+        // An `ask_opened` for an ask whose answer still waits on a receipt is a
+        // re-post no live mod sends (it mints a fresh id per question): refused
+        // before the sequence advances, so it neither lists the ask open beside
+        // its awaited answer nor drops the payload a withdraw needs.
+        if kind == "ask_opened"
+            && let Some(ask) = value.get("ask").and_then(Value::as_str)
+            && live.awaited.contains_key(ask)
+        {
+            return (409, error_value("ask_awaited"));
+        }
         let generation = live.generation;
         if seq <= live.seq_high {
             // The same A#13 rule as the `end` path: a refused first contact
@@ -1529,6 +1684,26 @@ impl Hub {
                     // or a rejected fetch), so its late `ask_closed` is the ask's
                     // last consumer: drop the kept payload, keep the id.
                     live.closed_asks.insert(ask.to_string(), Value::Null);
+                    // An answer awaiting its receipt sent no close frame: this
+                    // close is the ask's, and it answers a route still waiting.
+                    if live
+                        .awaited
+                        .get(ask)
+                        .is_some_and(|awaited| awaited.state() != AwaitState::Applied)
+                    {
+                        live.awaited.remove(ask);
+                        self.changed.notify_all();
+                        self.broadcast(
+                            "session.ask",
+                            json!({"session": named, "ask": ask, "state": "closed", "by": by}),
+                        );
+                    }
+                }
+                (200, json!({ "ok": true }))
+            }
+            "answer_receipt" => {
+                if let Some((ask, receipt)) = receipt {
+                    self.settle_receipt(live, named, ask, receipt);
                 }
                 (200, json!({ "ok": true }))
             }
@@ -1941,6 +2116,33 @@ impl Hub {
         self.poll_as(peer_pid, session, wait, false)
     }
 
+    /// A written poll answer, as [`poll_as`] serves one, for a poll declaring
+    /// `caps` and `prompt_reports` under load 1: the poll a mod that declares
+    /// those capabilities sends.
+    #[cfg(test)]
+    pub(crate) fn poll_declaring(
+        &self,
+        peer_pid: u32,
+        session: &str,
+        wait: Duration,
+        caps: &[Cap],
+    ) -> (u16, Value) {
+        let announced = Announced {
+            prompt_reports: true,
+            caps: caps.iter().copied().collect(),
+            load: Some(1),
+        };
+        let PollAnswer {
+            status,
+            body,
+            drained,
+        } = self.poll_announced(peer_pid, session, wait, announced);
+        if let Some(drained) = drained {
+            self.consume(drained);
+        }
+        (status, body)
+    }
+
     /// Resolve `peer_pid` to its instance and check `session` against it: the
     /// one guard every poll and wait answer shares, so an unknown peer and a
     /// session mismatch refuse alike. `what` names the route in the audit line.
@@ -2213,8 +2415,7 @@ impl Hub {
         // Drop the kept payload then, keep the id so the ask still reads as
         // closed to a later answer or `ask_closed`.
         for command in &drained.commands {
-            if command.get("kind").and_then(Value::as_str) == Some("answer")
-                && let Some(ask) = command.get("ask").and_then(Value::as_str)
+            if let Some(ask) = answered_ask(command)
                 && !live.parked_waits.contains_key(ask)
             {
                 live.closed_asks.insert(ask.to_string(), Value::Null);
@@ -2353,74 +2554,207 @@ impl Hub {
 
     /// Answer a held ask on the named session's live mod instance: the first
     /// answer [`answer_refusal`] takes, whose notes (if any) the instance's mod
-    /// declared [`Cap::Notes`] for, with room left in the queue wins and closes
-    /// the ask; every other outcome leaves the ask open and queues nothing.
+    /// declared [`Cap::Notes`] for, with room left in the queue wins and is
+    /// taken out of the open asks; every other outcome leaves the ask open and
+    /// queues nothing. A mod whose current load declares no
+    /// [`Cap::AnswerReceipts`] closes the ask at once
+    /// ([`AskOutcome::Queued`]); for one that does, the call blocks until the
+    /// mod's receipt or the ask's close settles the answer, or the receipt
+    /// wait ends ([`Hub::await_receipt`]).
     pub(crate) fn answer(&self, session: &str, ask: &str, command: Value) -> AskOutcome {
-        let records: Vec<(u32, String, String)> = {
-            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            self.close_silent(&mut inner, self.now());
-            inner
-                .instances
-                .iter()
-                .filter(|(_, live)| live.session_id == session)
-                .map(|(pid, live)| (*pid, live.proc_start.clone(), live.session_id.clone()))
-                .collect()
+        let (mut inner, holders) = self.holders(session);
+        let pid = match holders {
+            Holders::None => return AskOutcome::NoSession,
+            Holders::Many => return AskOutcome::Ambiguous,
+            Holders::One(pid) => pid,
         };
-        let moved = self.moved_records(&records);
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        self.close_moved(&mut inner, &moved);
-        let matching: Vec<u32> = inner
+        let live = inner
             .instances
+            .get_mut(&pid)
+            .unwrap_or_else(|| unreachable!("the holder was counted under this lock hold"));
+        let Some((place, (_, info))) = live
+            .open_asks
             .iter()
-            .filter(|(_, live)| live.session_id == session && !live.ending)
-            .map(|(pid, _)| *pid)
-            .collect();
-        match matching.as_slice() {
-            [] => AskOutcome::NoSession,
-            [_, _, ..] => AskOutcome::Ambiguous,
-            [pid] => {
-                let live = inner.instances.get_mut(pid).unwrap_or_else(|| {
-                    unreachable!("the matching pid was counted from the same map")
-                });
-                match live.open_asks.iter().find(|(id, _)| id == ask) {
-                    Some((_, info)) => {
-                        // Only a held ask is answerable (SB-19): the mod holds
-                        // the check only while a control-tier device counted as
-                        // connected at open time, and an unheld ask is never
-                        // answerable whatever the device state at answer time.
-                        if !info.held {
-                            return AskOutcome::AskNotFound;
-                        }
-                        if let Some(refusal) = answer_refusal(&info.tool, &info.input, &command) {
-                            return refusal;
-                        }
-                        // Read under this lock hold: a `/clear` or a reload
-                        // between the check and the queueing could swap in a
-                        // mod that drops the note.
-                        if command.get("notes").is_some() && !live.caps.contains(&Cap::Notes) {
-                            return AskOutcome::NotesUnsupported;
-                        }
-                        if live.owned() >= MAX_QUEUED_COMMANDS {
-                            return AskOutcome::Busy;
-                        }
-                        live.open_asks.retain(|(id, _)| id != ask);
-                        // The answer rides the closed-asks record, so a wait
-                        // arriving after it returns it at once (stripped of the
-                        // `kind`/`ask` wire wrapper the poll command keeps).
-                        live.closed_asks
-                            .insert(ask.to_string(), answer_value(&command));
-                        live.commands.push_back(command);
-                        self.changed.notify_all();
+            .enumerate()
+            .find(|(_, (id, _))| id == ask)
+        else {
+            return if live.closed_asks.contains_key(ask) {
+                AskOutcome::AskClosed
+            } else {
+                AskOutcome::AskNotFound
+            };
+        };
+        // Only a held ask is answerable (SB-19): the mod holds the check only
+        // while a control-tier device counted as connected at open time, and an
+        // unheld ask is never answerable whatever the device state at answer
+        // time.
+        if !info.held {
+            return AskOutcome::AskNotFound;
+        }
+        if let Some(refusal) = answer_refusal(&info.tool, &info.input, &command) {
+            return refusal;
+        }
+        // Read under this lock hold, as the receipts cap below is: a `/clear`
+        // or a reload between the check and the queueing could swap in a mod
+        // that drops the note.
+        if command.get("notes").is_some() && !live.caps.contains(&Cap::Notes) {
+            return AskOutcome::NotesUnsupported;
+        }
+        if live.owned() >= MAX_QUEUED_COMMANDS {
+            return AskOutcome::Busy;
+        }
+        let (_, info) = live.open_asks.remove(place);
+        // The answer rides the closed-asks record, so a wait arriving after it
+        // returns it at once (stripped of the `kind`/`ask` wire wrapper the poll
+        // command keeps).
+        live.closed_asks
+            .insert(ask.to_string(), answer_value(&command));
+        live.commands.push_back(command);
+        self.changed.notify_all();
+        if !live.caps.contains(&Cap::AnswerReceipts) {
+            self.broadcast(
+                "session.ask",
+                json!({"session": session, "ask": ask, "state": "closed", "by": "device"}),
+            );
+            return AskOutcome::Queued;
+        }
+        let state = Arc::new(Mutex::new(AwaitState::Pending));
+        live.awaited.insert(
+            ask.to_string(),
+            Awaited {
+                state: Arc::clone(&state),
+            },
+        );
+        let generation = live.generation;
+        self.await_receipt(inner, pid, generation, ask, &state, (place, info))
+    }
+
+    /// Block on the receipt for the answer to `ask` just queued on `pid`'s
+    /// instance, parked on the hub's own wake: the receipt, the ask's close or
+    /// the instance's end answers at once. The receipt is read from `settled`,
+    /// the cell [`Awaited`] shares with this route, so an `applied` that landed
+    /// before an instance end still answers `Applied` whatever removed the
+    /// instance since. At the receipt wait's end the answer is withdrawn if no
+    /// poll or wait took it, else left out as unconfirmed; that judgement and
+    /// the withdraw share one hold of the hub lock, the lock every poll drains
+    /// and every wait takes its payload under, so an answer is either delivered
+    /// or withdrawn, never both.
+    fn await_receipt(
+        &self,
+        mut inner: MutexGuard<'_, Inner>,
+        pid: u32,
+        generation: u64,
+        ask: &str,
+        settled: &Mutex<AwaitState>,
+        (place, open): (usize, OpenAsk),
+    ) -> AskOutcome {
+        let deadline = Instant::now() + self.receipt_wait;
+        loop {
+            match read_state(settled) {
+                AwaitState::Applied => {
+                    // The mod applied it before whatever ended the instance
+                    // since: the close frame went out, so the answer is 200.
+                    if let Some(live) = inner
+                        .instances
+                        .get_mut(&pid)
+                        .filter(|live| live.generation == generation)
+                    {
+                        live.awaited.remove(ask);
+                    }
+                    return AskOutcome::Applied;
+                }
+                // The entry stays for the mod's own close to announce.
+                AwaitState::NotHeld => return AskOutcome::AskClosed,
+                // Only this loop's deadline sets `Unconfirmed`, and it answers
+                // there in the same iteration: no route reads it here.
+                AwaitState::Unconfirmed => return AskOutcome::Unconfirmed,
+                AwaitState::Pending => {}
+            }
+            // A replaced or closed instance took its answer with it: its end
+            // closed the ask.
+            let Some(live) = inner
+                .instances
+                .get_mut(&pid)
+                .filter(|live| live.generation == generation)
+            else {
+                return AskOutcome::AskClosed;
+            };
+            // A close took the entry out, its frame sent; an ending instance's
+            // end closes the ask once its final tail settles.
+            if live.ending || !live.awaited.contains_key(ask) {
+                return AskOutcome::AskClosed;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(restored) = withdraw_answer(live, ask, place, open) {
+                    // Announce the reopened ask with the fields its first
+                    // `opened` frame carried: a client that dropped it on a
+                    // reconnect during the wait lists the ask again.
+                    if let Some((_, reopened)) = live.open_asks.get(restored) {
                         self.broadcast(
                             "session.ask",
-                            json!({"session": session, "ask": ask, "state": "closed", "by": "device"}),
+                            json!({
+                                "session": live.session_id,
+                                "ask": ask,
+                                "state": "opened",
+                                "tool": reopened.tool,
+                                "input": reopened.input,
+                                "agent_id": reopened.agent_id,
+                                "start_line": reopened.start_line,
+                                "held": reopened.held,
+                            }),
                         );
-                        AskOutcome::Queued
                     }
-                    None if live.closed_asks.contains_key(ask) => AskOutcome::AskClosed,
-                    None => AskOutcome::AskNotFound,
+                    return AskOutcome::Withdrawn;
                 }
+                if let Some(awaited) = live.awaited.get(ask) {
+                    awaited.settle(AwaitState::Unconfirmed);
+                }
+                return AskOutcome::Unconfirmed;
             }
+            inner = self
+                .changed
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Settle the answer to `ask` awaiting `live`'s receipt: `applied` sends
+    /// the ask's `closed` `by: device` frame, `not_held` sends none (the mod's
+    /// own `ask_closed` closes the ask). A receipt for an answer no longer
+    /// awaited, or one reporting what already settled it, changes nothing. An
+    /// `applied` after a `not_held` — two module loads seeing one answer, the
+    /// load that applies it posting after the one that held nothing — still
+    /// sends the close and ends the wait: the second load's report never
+    /// undoes the answer the first applied.
+    fn settle_receipt(&self, live: &mut Live, session: &str, ask: &str, receipt: Receipt) {
+        let Some(state) = live.awaited.get(ask).map(Awaited::state) else {
+            return;
+        };
+        if state == AwaitState::Applied
+            || (receipt == Receipt::NotHeld && state != AwaitState::Pending)
+        {
+            return;
+        }
+        if receipt == Receipt::Applied {
+            self.broadcast(
+                "session.ask",
+                json!({"session": session, "ask": ask, "state": "closed", "by": "device"}),
+            );
+        }
+        if state == AwaitState::Pending {
+            if let Some(awaited) = live.awaited.get(ask) {
+                awaited.settle(match receipt {
+                    Receipt::Applied => AwaitState::Applied,
+                    Receipt::NotHeld => AwaitState::NotHeld,
+                });
+            }
+            self.changed.notify_all();
+        } else {
+            // `Applied` after a 504 or a `not_held`: the frame went out and
+            // nothing waits, so the entry is done.
+            live.awaited.remove(ask);
         }
     }
 
@@ -2742,6 +3076,32 @@ fn leave_wait(inner: &mut Inner, peer_pid: u32, generation: u64, ask: &str) {
             *parked -= 1;
         }
     }
+}
+
+/// Take back the awaited answer to `ask` while no poll or wait took it: its
+/// command still queued (a poll whose write failed requeued it) and its payload
+/// still kept for a wait. The ask goes back to `place` in `open_asks` (`place`
+/// clamped to the asks opened or closed during the wait) with the record it had,
+/// its `held` included, so a resend is taken; the caller announces the reopened
+/// ask. `None`, changing nothing, once a poll or wait took it.
+fn withdraw_answer(live: &mut Live, ask: &str, place: usize, open: OpenAsk) -> Option<usize> {
+    let queued = live
+        .commands
+        .iter()
+        .position(|command| answered_ask(command) == Some(ask));
+    let kept = live
+        .closed_asks
+        .get(ask)
+        .is_some_and(|payload| !payload.is_null());
+    let (Some(at), true) = (queued, kept) else {
+        return None;
+    };
+    live.awaited.remove(ask)?;
+    live.commands.remove(at);
+    live.closed_asks.remove(ask);
+    let place = place.min(live.open_asks.len());
+    live.open_asks.insert(place, (ask.to_string(), open));
+    Some(place)
 }
 
 /// A release to the desk ends the ask's answerability: clear `held` so a
@@ -3348,7 +3708,8 @@ fn serve(
             // loses those commands, and a failed write settling after a newer
             // poll delivered newer commands requeues the older ones behind them
             // (order holds within the queue, not across that race). An
-            // application-level ack per applied command would close both.
+            // application-level ack per applied command would close both; an
+            // answer to a mod declaring answer receipts has one (`Hub::answer`).
             let written = write_response(&mut stream, status, &body);
             match drained {
                 // A failed write never delivered them: put them back at the
@@ -3852,3 +4213,7 @@ mod prompts_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_loads.rs"]
 mod loads_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_receipts.rs"]
+mod receipts_tests;
