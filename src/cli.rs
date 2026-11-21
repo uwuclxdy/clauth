@@ -632,6 +632,10 @@ pub(crate) enum Command {
 
 /// `clauth start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one `clauth start` flag, not state"
+)]
 pub(crate) struct StartArgs {
     /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
     /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.

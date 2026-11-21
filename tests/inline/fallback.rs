@@ -1252,6 +1252,7 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let recovered_usage = |seven_reset: String| {
         usage_both(
@@ -1303,6 +1304,7 @@ fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1368,6 +1370,7 @@ fn walk_order_soonest_and_burn_aware_leave_each_other_identical() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder, burn_aware: bool| ChainSnapshot {
         active: "gamma".into(),
@@ -1560,6 +1563,7 @@ fn walk_order_soonest_recomputed_home_walks_a_healthy_active_and_chain_stays_put
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1620,6 +1624,7 @@ fn walk_order_soonest_recomputed_home_never_outranks_preferred() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "gamma".into(),
@@ -1686,6 +1691,7 @@ fn walk_order_soonest_recomputed_home_requires_clear_and_fresh_on_both_sides() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder, fresh: Vec<ProfileName>| ChainSnapshot {
         active: "gamma".into(),
@@ -1771,6 +1777,7 @@ fn walk_order_soonest_recomputed_home_parks_once_landed_on_the_soonest_member() 
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = |order: WalkOrder| ChainSnapshot {
         active: "beta".into(),
@@ -1942,6 +1949,7 @@ fn headroom_member(name: &str, preferred: bool) -> ChainMember {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }
 }
 
@@ -2327,6 +2335,365 @@ fn start_walk_most_headroom_picks_the_least_used_week_with_the_freshness_pass_in
     );
 }
 
+// ── walk order `soonest-weekly-reset`: a future `plan_ends` caps the key ─────
+//
+// A member loses what it leaves unspent when its week resets, and a canceled
+// plan also loses it at its last day. So `soonest-weekly-reset` ranks each
+// member by the earlier of its weekly reset and the start of its local
+// `plan_ends` day while that day is today or later. A past `plan_ends` caps
+// nothing, and `plan_renews` ranks nothing: a billing day loses no quota.
+
+/// The local date `days` from today, the frame a plan date is read in.
+fn local_day_in(days: i64) -> chrono::NaiveDate {
+    let today = crate::format::local_day(now_epoch_secs()).expect("today resolves");
+    today + chrono::Duration::days(days)
+}
+
+/// A clear member (10% of its 5h window and of its week), read fresh, whose
+/// week resets `reset_secs` from now and whose plan is marked ending `plan_ends`.
+fn weekly_member_resetting_in(
+    name: &str,
+    reset_secs: i64,
+    plan_ends: Option<chrono::NaiveDate>,
+) -> Fixture {
+    let mut fixture = mark_fresh(profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(10.0, Some(reset_in(reset_secs)))),
+        )),
+    ));
+    fixture.profile.plan_ends = plan_ends;
+    fixture
+}
+
+/// A clear member (10% of its 5h window and of its week), read fresh, whose
+/// week resets `reset_days` from now and whose plan is marked ending `ends_in`
+/// days from today.
+fn weekly_member(name: &str, reset_days: i64, ends_in: Option<i64>) -> Fixture {
+    weekly_member_resetting_in(name, reset_days * 86_400, ends_in.map(local_day_in))
+}
+
+/// A spent active: its live 5h window at 100%, no weekly window to rank by.
+fn spent_active(name: &str) -> Fixture {
+    profile_with_util(name, Some(95.0), Some(100.0))
+}
+
+/// One accept pass's `soonest-weekly-reset` visit order over `config`'s chain,
+/// by name, as every walk sorts it.
+fn soonest_order(config: &AppConfig, readings: &TestReadings) -> Vec<String> {
+    let snap = snapshot_chain(config, &HashSet::new()).expect("snapshot");
+    let active = snap
+        .chain
+        .iter()
+        .position(|m| m.name == snap.active)
+        .expect("the active is a chain member");
+    ordered_walk(
+        WalkOrder::SoonestWeeklyReset,
+        active,
+        snap.chain.len(),
+        &|i| readings.usage.get(snap.chain[i].name.as_str()),
+        &|i| snap.chain[i].plan_ends,
+        crate::format::local_day(now_epoch_secs()),
+    )
+    .into_iter()
+    .map(|i| snap.chain[i].name.to_string())
+    .collect()
+}
+
+/// `config` under `soonest-weekly-reset` with `active` live: its visit order
+/// and the walk's decision.
+fn soonest_walk(
+    mut config: AppConfig,
+    readings: &TestReadings,
+    active: &str,
+) -> (Vec<String>, Option<SwitchAction>) {
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    config.state.active_profile = Some(active.into());
+    (
+        soonest_order(&config, readings),
+        walk_config(&config, &HashSet::new(), readings),
+    )
+}
+
+/// The [`soonest_walk`] answer that visits `order` and switches to `target`.
+fn walked<const N: usize>(
+    order: [&str; N],
+    target: Option<&str>,
+) -> (Vec<String>, Option<SwitchAction>) {
+    (
+        order.map(String::from).to_vec(),
+        target.map(|name| SwitchAction::To(name.to_string())),
+    )
+}
+
+/// A plan ending before its week resets loses its quota at the start of its
+/// last day, so it ranks by that day: a (week +6d, plan ends +2d) walks ahead
+/// of b (week +4d).
+#[test]
+fn walk_order_soonest_plan_ends_ranks_a_plan_ending_before_its_reset_by_that_day() {
+    let (config, readings) = config_with_chain(
+        vec![
+            weekly_member("b", 4, None),
+            weekly_member("a", 6, Some(2)),
+            spent_active("gamma"),
+        ],
+        "gamma",
+    );
+    assert_eq!(
+        soonest_walk(config, &readings, "gamma"),
+        walked(["a", "b", "gamma"], Some("a")),
+    );
+}
+
+/// The cap is the START of the last day, not its end: a's plan ends tomorrow
+/// and n's week resets at local noon of that same day, so a ranks first by
+/// midnight while a key at the day's end would put n first.
+#[test]
+fn walk_order_soonest_plan_ends_ranks_by_the_start_of_the_last_day_not_its_end() {
+    crate::testutil::on_one_local_day(|today| {
+        let last_day = today + chrono::Duration::days(1);
+        let noon = last_day
+            .and_hms_opt(12, 0, 0)
+            .expect("noon is a valid time")
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .expect("local noon resolves");
+        let (config, readings) = config_with_chain(
+            vec![
+                weekly_member_resetting_in("n", noon.timestamp() - now_epoch_secs(), None),
+                weekly_member_resetting_in("a", 6 * 86_400, Some(last_day)),
+                spent_active("gamma"),
+            ],
+            "gamma",
+        );
+        assert_eq!(
+            soonest_walk(config, &readings, "gamma"),
+            walked(["a", "n", "gamma"], Some("a")),
+            "a's last day starts before n's reset at noon of that same day"
+        );
+    });
+}
+
+/// A week resetting before the plan's last day ranks by the reset: a
+/// (week +1d, plan ends +25d) walks ahead of c (+2d) and b (+3d), and moving
+/// its end a day later changes nothing.
+#[test]
+fn walk_order_soonest_plan_ends_ranks_a_week_resetting_first_by_the_reset() {
+    for ends_in in [25, 26] {
+        let (config, readings) = config_with_chain(
+            vec![
+                weekly_member("b", 3, None),
+                weekly_member("c", 2, None),
+                weekly_member("a", 1, Some(ends_in)),
+                spent_active("gamma"),
+            ],
+            "gamma",
+        );
+        assert_eq!(
+            soonest_walk(config, &readings, "gamma"),
+            walked(["a", "c", "b", "gamma"], Some("a")),
+            "a's plan ends in {ends_in} days"
+        );
+    }
+}
+
+/// `plan_renews` ranks nothing. Two members billing a week apart keep
+/// the visit order and the home of the same members with no plan dates on
+/// every day across both billing days. A day passing is modelled by moving
+/// both billing days one day earlier.
+#[test]
+fn walk_order_soonest_plan_ends_ranks_nothing_by_a_billing_day() {
+    let chain = |renews: Option<i64>| {
+        let mut a = weekly_member("a", 5, None);
+        let mut b = weekly_member("b", 2, None);
+        if let Some(day) = renews {
+            a.profile.plan_renews = Some(local_day_in(day));
+            b.profile.plan_renews = Some(local_day_in(day + 7));
+        }
+        config_with_chain(vec![a, b, weekly_member("c", 4, None)], "a")
+    };
+    let undated = |active: &str| {
+        let (config, readings) = chain(None);
+        soonest_walk(config, &readings, active)
+    };
+    let order = ["b", "c", "a"];
+    assert_eq!(undated("a"), walked(order, Some("b")), "b resets first");
+    assert_eq!(undated("c"), walked(order, Some("b")), "b resets first");
+    assert_eq!(undated("b"), walked(order, None), "b is home and parks");
+    for day in -12..=12 {
+        for active in ["a", "b", "c"] {
+            let (config, readings) = chain(Some(day));
+            assert_eq!(
+                soonest_walk(config, &readings, active),
+                undated(active),
+                "a bills in {day} days, b a week later, {active} active"
+            );
+        }
+    }
+}
+
+/// A plan whose last day is past caps nothing: the member ranks by its
+/// own reset exactly as with no `plan_ends`. A plan ending today is in its
+/// last day and still caps.
+#[test]
+fn walk_order_soonest_plan_ends_reads_a_past_plan_end_as_no_cap() {
+    crate::testutil::on_one_local_day(|today| {
+        let walk = |ends: Option<chrono::NaiveDate>| {
+            let mut a = weekly_member("a", 6, None);
+            a.profile.plan_ends = ends;
+            let (config, readings) = config_with_chain(
+                vec![weekly_member("b", 4, None), a, spent_active("gamma")],
+                "gamma",
+            );
+            soonest_walk(config, &readings, "gamma")
+        };
+        let by_reset = walked(["b", "a", "gamma"], Some("b"));
+        assert_eq!(walk(None), by_reset, "no plan end: b resets first");
+        assert_eq!(walk(today.pred_opt()), by_reset, "ended yesterday");
+        assert_eq!(
+            walk(Some(today)),
+            walked(["a", "b", "gamma"], Some("a")),
+            "today is the plan's last day"
+        );
+    });
+}
+
+/// The home walk reads the same capped key. With no `preferred`, a
+/// canceled plan in its last week (it ends before every other member's reset)
+/// becomes home and the walk parks there; a `preferred` member still wins.
+#[test]
+fn walk_order_soonest_plan_ends_walks_home_to_a_plan_in_its_last_week() {
+    let walk = |active: &str, ends_in: Option<i64>, preferred: bool| {
+        let y = weekly_member("y", 5, None);
+        let y = if preferred { mark_preferred(y) } else { y };
+        let (config, readings) = config_with_chain(
+            vec![
+                weekly_member("x", 3, None),
+                y,
+                weekly_member("c", 6, ends_in),
+            ],
+            active,
+        );
+        soonest_walk(config, &readings, active)
+    };
+    assert_eq!(
+        walk("x", None, false),
+        walked(["x", "y", "c"], None),
+        "x resets first: it is home already"
+    );
+    assert_eq!(
+        walk("x", Some(1), false),
+        walked(["c", "x", "y"], Some("c")),
+        "c's plan ends tomorrow, before every reset: it is home"
+    );
+    assert_eq!(
+        walk("c", Some(1), false),
+        walked(["c", "x", "y"], None),
+        "landed on the ending plan, the walk parks"
+    );
+    assert_eq!(
+        walk("x", Some(1), true),
+        walked(["c", "x", "y"], Some("y")),
+        "a preferred member still outranks the recomputed home"
+    );
+}
+
+/// The cap orders only within one accept pass, never across the ladder: a spent
+/// member whose plan ends tomorrow sorts first, yet is no headroom target.
+#[test]
+fn walk_order_soonest_plan_ends_never_reorders_across_the_accept_pass_ladder() {
+    let mut spent = spent_active("spent");
+    spent.profile.plan_ends = Some(local_day_in(1));
+    let (config, readings) = config_with_chain(
+        vec![
+            spent,
+            weekly_member("clear", 3, None),
+            spent_active("gamma"),
+        ],
+        "gamma",
+    );
+    assert_eq!(
+        soonest_walk(config, &readings, "gamma"),
+        walked(["spent", "clear", "gamma"], Some("clear")),
+    );
+}
+
+/// A clear chain member whose plan is marked ending on `plan_ends`.
+fn plan_member(name: &str, plan_ends: Option<chrono::NaiveDate>) -> ChainMember {
+    ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        check_credit_cap: true,
+        own_inference: false,
+        plan_ends,
+    }
+}
+
+/// Recovery after a switch-off and `clauth start --auto` read the same
+/// capped key. b's week resets in 3 days; a's in 6, but its plan ends in 2.
+#[test]
+fn walk_order_soonest_plan_ends_orders_recovery_and_the_start_walk() {
+    let week = |reset_days: i64| {
+        usage_both(
+            Some(window(10.0, Some(live_reset()))),
+            Some(window(10.0, Some(reset_in(reset_days * 86_400)))),
+        )
+    };
+    let chain = vec![
+        plan_member("b", None),
+        plan_member("a", Some(local_day_in(2))),
+    ];
+    let store = store_with_infos(vec![("b", week(3)), ("a", week(6))]);
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
+        Some("b".to_string()),
+        "chain mode keeps the first recovered member in chain order"
+    );
+    assert_eq!(
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::SoonestWeeklyReset),
+        Some("a".to_string()),
+        "a's plan ends before b's week resets"
+    );
+
+    let _sb = start_walk_sandbox(&["b", "a"]);
+    let mut a = start_walk_profile("a");
+    a.profile.plan_ends = Some(local_day_in(2));
+    let (mut config, _readings) = config_with_chain(vec![start_walk_profile("b"), a], "b");
+    let fetched = |reset_days: i64| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 60_000),
+        ..week(reset_days)
+    };
+    start_walk_write_usage("b", &fetched(3));
+    start_walk_write_usage("a", &fetched(6));
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
+    assert_eq!(pick, Some(0), "chain order starts on b");
+    config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
+    let (_rows, pick) = start_walk(
+        &config,
+        Isolation::Shared,
+        &[],
+        [None, None, None],
+        false,
+        None,
+    );
+    assert_eq!(pick, Some(1), "a's plan ends before b's week resets");
+}
+
 // ── recovery_target ──────────────────────────────────────────────────────────
 //
 // After switch-off-all (no active profile), find a chain member whose
@@ -2346,6 +2713,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2358,6 +2726,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -2392,6 +2761,7 @@ fn find_recovered_skips_exhausted_members() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2404,6 +2774,7 @@ fn find_recovered_skips_exhausted_members() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -2427,6 +2798,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
         ChainMember {
             name: "b".into(),
@@ -2439,6 +2811,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -2462,6 +2835,7 @@ fn find_recovered_uses_threshold_per_member() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
@@ -2474,6 +2848,7 @@ fn find_recovered_uses_threshold_per_member() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -2499,6 +2874,7 @@ fn find_recovered_recovers_when_window_expired() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -2525,6 +2901,7 @@ fn find_recovered_recovers_when_windowless() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -2548,6 +2925,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -4580,6 +4958,7 @@ fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4714,6 +5093,7 @@ fn a_third_party_active_never_projects_its_burn() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -4902,6 +5282,7 @@ fn weekly_dead_member_never_recovers() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -6243,6 +6624,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
             },
             ChainMember {
                 name: "b".into(),
@@ -6255,6 +6637,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
             },
             ChainMember {
                 name: "c".into(),
@@ -6267,6 +6650,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 check_scoped: true,
                 check_credit_cap: true,
                 own_inference: false,
+                plan_ends: None,
             },
         ],
         switch_off_when_spent: true,
@@ -6343,6 +6727,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
@@ -7039,6 +7424,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
         ChainMember {
             name: "c".into(),
@@ -7051,6 +7437,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             check_scoped: true,
             check_credit_cap: true,
             own_inference: false,
+            plan_ends: None,
         },
     ];
     let store = store_with_infos(vec![
@@ -7089,6 +7476,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     }];
     assert_eq!(
         find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
@@ -7116,6 +7504,7 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let chain = vec![
         mkmember("a", false),
@@ -7173,6 +7562,7 @@ fn recovery_respects_each_members_gates() {
         check_scoped,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
     let store = store_with_infos(vec![
@@ -9338,6 +9728,7 @@ fn start_block_treats_a_key_rejected_third_party_member_as_auth_broken() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -9560,6 +9951,7 @@ fn start_block_leaves_a_console_lapsed_alibaba_member_pickable() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let config = AppConfig {
         state: AppState::default(),
@@ -9733,6 +10125,7 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let profile = config.find(&ProfileName::from("ali")).unwrap();
     assert_eq!(
@@ -10055,6 +10448,7 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let snap = ChainSnapshot {
         active: "gamma".into(),
@@ -10228,6 +10622,7 @@ fn a_credit_demand_leave_lands_on_an_own_endpoint_capped_member() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference,
+        plan_ends: None,
     };
     let snap = ChainSnapshot {
         active: "a".into(),
@@ -10285,6 +10680,7 @@ fn a_capped_own_endpoint_member_recovers() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference,
+        plan_ends: None,
     };
     let chain = vec![member("a", false), member("b", true)];
     let store = store_with_infos(vec![
@@ -10376,6 +10772,7 @@ fn find_recovered_prefers_a_member_whose_credit_cap_is_not_spent() {
         check_scoped: true,
         check_credit_cap: true,
         own_inference: false,
+        plan_ends: None,
     };
     let chain = vec![member("b"), member("c")];
     let store = store_with_infos(vec![

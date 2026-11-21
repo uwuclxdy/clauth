@@ -12040,6 +12040,7 @@ fn scan_recovery_leased(
                         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
                         own_inference: profile
                             .is_some_and(crate::claude::has_own_inference_endpoint),
+                        plan_ends: profile.and_then(|p| p.plan_ends),
                     }
                 })
                 .collect(),

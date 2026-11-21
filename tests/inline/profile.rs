@@ -646,6 +646,24 @@ fn app_state_walk_order_defaults_chain_and_every_value_round_trips() {
     );
 }
 
+// `walk_order` takes exactly three spellings: `soonest-plan-end`, like any
+// other, fails the parse and the error names the three.
+#[test]
+fn app_state_walk_order_refuses_soonest_plan_end_like_any_unknown_spelling() {
+    for spelling in ["soonest-plan-end", "fastest"] {
+        let err =
+            toml::from_str::<AppState>(&format!("profiles = []\nwalk_order = \"{spelling}\"\n"))
+                .expect_err("an unknown walk order fails the parse");
+        assert_eq!(
+            err.message(),
+            format!(
+                "unknown variant `{spelling}`, expected one of `chain`, \
+                 `soonest-weekly-reset`, `most-weekly-headroom`"
+            )
+        );
+    }
+}
+
 // On must round-trip explicitly; off (the default) is omitted entirely from
 // the rendered profiles.toml, matching `show_pace`/`count_cache`'s treatment
 // of their own default-off booleans.

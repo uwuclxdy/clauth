@@ -338,10 +338,9 @@ impl OAuthToken {
 }
 
 #[derive(Debug, Clone)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
-    clippy::allow_attributes,
-    reason = "each bool is a per-profile config.toml switch, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+    reason = "each bool is a per-profile config.toml switch, not state"
 )]
 pub(crate) struct Profile {
     pub(crate) name: ProfileName,
@@ -1371,12 +1370,13 @@ impl Default for PluginSettings {
 /// (`AppState.walk_order`, issue #86). `Chain` (the default) is today's walk
 /// byte for byte: first accept in chain position, starting one slot after the
 /// active and wrapping. `SoonestWeeklyReset` reorders each accept pass by the
-/// soonest-resetting weekly window, so the member whose quota expires soonest
-/// drains first and less expires unspent; `MostWeeklyHeadroom` reorders it by
-/// the least-used week, so hops spread across the chain instead of always
-/// landing on the next slot. The pass ladder (free quota > serving sink >
-/// spend-armed > dead sink > halt) and every exclusion are untouched — the
-/// mode decides only WHERE among the members a pass already accepts to land.
+/// soonest-resetting weekly window, a canceled plan's last day counting as an
+/// earlier reset, so the member whose quota expires soonest drains first and
+/// less expires unspent; `MostWeeklyHeadroom` reorders it by the least-used
+/// week, so hops spread across the chain instead of always landing on the next
+/// slot. The pass ladder (free quota > serving sink > spend-armed > dead sink >
+/// halt) and every exclusion are untouched — the mode decides only WHERE among
+/// the members a pass already accepts to land.
 /// Serialized as a lowercase string with explicit hyphenated spellings:
 /// `walk_order = "soonest-weekly-reset"`, `walk_order = "most-weekly-headroom"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1385,7 +1385,8 @@ pub(crate) enum WalkOrder {
     /// Today's chain-position walk, byte for byte.
     #[default]
     Chain,
-    /// Order each accept pass by the soonest-resetting weekly window.
+    /// Order each accept pass by the soonest-resetting weekly window, or the
+    /// start of a member's `plan_ends` day when that comes first.
     #[serde(rename = "soonest-weekly-reset")]
     SoonestWeeklyReset,
     /// Order each accept pass by the least-used weekly window. Hop targets
@@ -1397,6 +1398,10 @@ pub(crate) enum WalkOrder {
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each serialized bool is one profiles.toml key; `active_moved` is the save-time marker, never serialized"
+)]
 pub(crate) struct AppState {
     #[serde(default)]
     pub(crate) active_profile: LockedSlot<Option<ProfileName>>,
@@ -1436,12 +1441,12 @@ pub(crate) struct AppState {
     /// Which member the fallback-chain walk lands on WITHIN one accept pass
     /// (issue #86): `chain` (the default) walks by chain position exactly as
     /// it always has; `soonest-weekly-reset` lands each pass on the accepted
-    /// member whose weekly window resets soonest, so less quota expires
-    /// unspent; `most-weekly-headroom` on the one whose week is least used.
-    /// `None` = the [`WalkOrder`] default, so an untouched
-    /// profiles.toml carries neither this key nor the setting and walks
-    /// byte-identically to before the key existed. Read through
-    /// [`AppState::walk_order`].
+    /// member whose weekly window resets soonest (or whose `plan_ends` day
+    /// starts sooner), so less quota expires unspent; `most-weekly-headroom`
+    /// on the one whose week is least used. `None` = the [`WalkOrder`]
+    /// default, so an untouched profiles.toml carries neither this key nor
+    /// the setting and walks byte-identically to before the key existed. Read
+    /// through [`AppState::walk_order`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) walk_order: Option<WalkOrder>,
     /// The program the daemon runs when an account's 5h usage crosses its
@@ -2431,10 +2436,9 @@ impl ProfileId {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
-    clippy::allow_attributes,
-    reason = "each bool is one config.toml key this struct mirrors, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+    reason = "each bool is one config.toml key this struct mirrors, not state"
 )]
 struct ProfileConfig {
     base_url: Option<String>,
