@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate, NaiveTime};
 
 use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
-    FetchStatus, KickBlocks, LABEL_30D, PlanDates, PlanInfo, PollStreaks, StatusStore,
-    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, UsageInfo, UsageStore,
-    UsageWindow, five_hour_live, iso_to_epoch_secs, long_window_live, now_epoch_secs,
+    FetchStatus, KickBlocks, LABEL_30D, PlanInfo, PollStreaks, StatusStore, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live,
+    iso_to_epoch_secs, long_window_live, now_epoch_secs,
 };
 
 // Test-only per-thread counter: increments each time an evaluator entry point
@@ -1288,6 +1288,10 @@ pub(crate) fn health_blocked_reason(
 /// avoiding the `config ↔ store` lock inversion against `App::apply_usage`
 /// (which holds `usage_store` then takes `config`).
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one per-member fact the walk reads (a profile flag, today's home, or the own-endpoint derivation), not state"
+)]
 pub(crate) struct ChainMember {
     pub(crate) name: ProfileName,
     pub(crate) threshold: f64,
@@ -1324,23 +1328,9 @@ pub(crate) struct ChainMember {
     /// gates. Folded so the lock-free walk sites that hold only a `ChainMember`
     /// still judge it the same way the profile-holding sites do.
     pub(crate) own_inference: bool,
-    /// Mirrors `Profile::plan_ends` — the day the operator marked this
-    /// member's plan as ending, ranked by the `soonest-plan-end` walk order
-    /// ahead of any renewal ([`plan_end_key`]).
+    /// Mirrors `Profile::plan_ends` — the last day of this member's canceled
+    /// plan, which caps its `soonest-weekly-reset` key ([`soonest_reset_key`]).
     pub(crate) plan_ends: Option<NaiveDate>,
-    /// Mirrors `Profile::plan_renews` — a billing day of this member's
-    /// renewing plan, ranked after every marked end.
-    pub(crate) plan_renews: Option<NaiveDate>,
-}
-
-impl ChainMember {
-    /// The two plan dates the operator gave this member.
-    fn plan_dates(&self) -> PlanDates {
-        PlanDates {
-            ends: self.plan_ends,
-            renews: self.plan_renews,
-        }
-    }
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -1607,7 +1597,6 @@ fn codex_chain_members(state: &crate::codex_profiles::CodexState) -> CodexChain 
                 check_credit_cap: false,
                 own_inference: false,
                 plan_ends: None,
-                plan_renews: None,
             })
             .collect(),
     }
@@ -1738,7 +1727,6 @@ fn chain_member(
         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
         own_inference: profile.is_some_and(crate::claude::has_own_inference_endpoint),
         plan_ends: profile.and_then(|p| p.plan_ends),
-        plan_renews: profile.and_then(|p| p.plan_renews),
     }
 }
 
@@ -1990,11 +1978,12 @@ fn is_exhausted_active_from_usage(
     )
 }
 
-/// The soonest-reset ranking key for one member's cached usage: the epoch min
-/// over the account's long window's `resets_at` and every `weekly_scoped`
-/// entry's, `None` when no weekly window carries a parseable reset (an
-/// idle/cold account). The 5h `resets_at` is deliberately NOT folded in — it
-/// slides at `now + 5h` on idle windows and is not a ranking key (measured).
+/// The weekly-reset input to [`soonest_reset_key`] for one member's cached
+/// usage: the epoch min over the account's long window's `resets_at` and
+/// every `weekly_scoped` entry's, `None` when no weekly window carries a
+/// parseable reset (an idle/cold account). The 5h `resets_at` is deliberately
+/// NOT folded in — it slides at `now + 5h` on idle windows and is not a
+/// ranking key (measured).
 /// Scoped windows carry the aggregate's instant today, so the min is
 /// future-proofing rather than a second source.
 fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
@@ -2015,15 +2004,46 @@ fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
     best
 }
 
-/// The soonest-plan-end ranking key for one member
-/// ([`crate::usage::PlanEnd::rank_key`]): the day its plan was marked ending
-/// (`plan_ends`) while that day is still ahead, else its plan's next billing
-/// day (`plan_renews`, carried forward monthly). Every ending plan ranks
-/// before every renewing one. `None` when neither is set, or the marked day is
-/// past: such a member cannot be proven to end soon. `today` is the local
-/// date, resolved once by the caller for the whole walk.
-fn plan_end_key(dates: PlanDates, today: NaiveDate) -> Option<(u8, i64)> {
-    dates.end(today, false)?.rank_key(today)
+/// The `soonest-weekly-reset` ranking key for one member: the epoch second its
+/// unspent quota is lost. That is its weekly reset ([`weekly_reset_key`] over
+/// `reading`), or the start of its local `plan_ends` day when that comes
+/// first, since a canceled plan loses its quota at its last day too. A
+/// `plan_ends` before `today` caps nothing, so the reading's own reset stands;
+/// `plan_renews` is no input, since a billing day loses no quota. `None` when
+/// neither applies. `today` is the local date, read once per evaluation by the
+/// caller, so a midnight between two reads cannot rank one walk on two days.
+fn soonest_reset_key(
+    reading: Option<&UsageInfo>,
+    plan_ends: Option<NaiveDate>,
+    today: Option<NaiveDate>,
+) -> Option<i64> {
+    let last_day = plan_ends
+        .filter(|day| today.is_some_and(|today| *day >= today))
+        .and_then(local_day_start);
+    reading
+        .and_then(weekly_reset_key)
+        .into_iter()
+        .chain(last_day)
+        .min()
+}
+
+/// The epoch second the local calendar day `day` starts: its local midnight,
+/// or, where a clock change skips midnight, midnight read at the offset the
+/// day before still had. `None` outside chrono's range.
+fn local_day_start(day: NaiveDate) -> Option<i64> {
+    let midnight = day.and_time(NaiveTime::MIN);
+    if let Some(start) = midnight.and_local_timezone(Local).earliest() {
+        return Some(start.timestamp());
+    }
+    let eve = day
+        .pred_opt()?
+        .and_time(NaiveTime::from_hms_opt(12, 0, 0)?)
+        .and_local_timezone(Local)
+        .earliest()?;
+    midnight
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(eve.offset().local_minus_utc()))
 }
 
 /// The most-weekly-headroom ranking key for one member's cached usage: its
@@ -2050,21 +2070,20 @@ fn weekly_headroom_key(info: &UsageInfo, now_secs: i64) -> Option<(f64, f64)> {
 /// helper every fallback walk pass threads through (issue #86). It replaces
 /// the old `walk_chain` primitive: the visit sequence is the same, the
 /// skip/accept folding moved to each call site's `find`. `reading` is a
-/// slot's cached usage, `None` when nothing has been read for it.
+/// slot's cached usage, `None` when nothing has been read for it;
+/// `plan_ends` is a slot's `ChainMember::plan_ends`, and `today` the local
+/// date the caller read once for its whole evaluation.
 ///
 /// `WalkOrder::Chain` returns the old walk's exact visit sequence — every
 /// slot starting one after `idx` and wrapping — so the default is byte for
 /// byte today's walk. `WalkOrder::SoonestWeeklyReset` stable-sorts that
-/// sequence by [`weekly_reset_key`] (soonest first; `None` — no parseable
-/// weekly reset — after every `Some`, since an unknown reset cannot be
-/// proven soon). `WalkOrder::MostWeeklyHeadroom` stable-sorts it by
-/// [`weekly_headroom_key`] (least-used week first, 5h breaking a weekly tie;
-/// no weekly window to read, or no reading at all, after every member that
-/// has one). `WalkOrder::SoonestPlanEnd` stable-sorts it by
-/// [`plan_end_key`] (every plan marked ending by its day, then every
-/// renewing plan by its billing day; `None` after every `Some`); `dates` is
-/// a slot's two plan dates. The stable sort keeps the chain-position walk order as
-/// the tie rule: ties fall back to chain position, the exact tie rule
+/// sequence by [`soonest_reset_key`] (soonest first; `None` — no parseable
+/// weekly reset and no `plan_ends` cap — after every `Some`, since an unknown
+/// reset cannot be proven soon). `WalkOrder::MostWeeklyHeadroom` stable-sorts
+/// it by [`weekly_headroom_key`] (least-used week first, 5h breaking a weekly
+/// tie; no weekly window to read, or no reading at all, after every member
+/// that has one). The stable sort keeps the chain-position walk order as the
+/// tie rule: ties fall back to chain position, the exact tie rule
 /// `soonest_resume` documents and pins. Skip predicates stay at the call
 /// sites, unchanged — the mode reorders only WITHIN one accept pass, never
 /// across the pass ladder.
@@ -2073,23 +2092,16 @@ fn ordered_walk<'u>(
     idx: usize,
     len: usize,
     reading: &dyn Fn(usize) -> Option<&'u UsageInfo>,
-    dates: &dyn Fn(usize) -> PlanDates,
+    plan_ends: &dyn Fn(usize) -> Option<NaiveDate>,
+    today: Option<NaiveDate>,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (1..=len).map(|offset| (idx + offset) % len).collect();
     match mode {
         WalkOrder::Chain => {}
-        WalkOrder::SoonestWeeklyReset => order.sort_by_key(|&i| {
-            let k = reading(i).and_then(weekly_reset_key);
+        WalkOrder::SoonestWeeklyReset => order.sort_by_cached_key(|&i| {
+            let k = soonest_reset_key(reading(i), plan_ends(i), today);
             (k.is_none(), k)
         }),
-        WalkOrder::SoonestPlanEnd => {
-            let now = now_epoch_secs();
-            let today = crate::format::local_day(now);
-            let keys: Vec<Option<(u8, i64)>> = (0..len)
-                .map(|i| today.and_then(|today| plan_end_key(dates(i), today)))
-                .collect();
-            order.sort_by_key(|&i| (keys[i].is_none(), keys[i]));
-        }
         WalkOrder::MostWeeklyHeadroom => {
             let now = now_epoch_secs();
             let keys: Vec<Option<(f64, f64)>> = (0..len)
@@ -2336,9 +2348,9 @@ pub(crate) struct StartCandidate {
 /// its target in [`next_auto_switch_target`]). `env_models` is the process-env
 /// launch triple, read once by `cmd_start`, so this walk never reads the process
 /// environment itself. Each pass follows the `walk_order` mode: chain position
-/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
-/// the least-used week under `most-weekly-headroom`, the plan that ends or
-/// renews first under `soonest-plan-end`.
+/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`
+/// (a future `plan_ends` day counting as an earlier reset), the least-used week
+/// under `most-weekly-headroom`.
 pub(crate) fn start_walk(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
@@ -2389,8 +2401,8 @@ pub(crate) fn start_walk(
     // the ranking modes consult it, so under `chain` (the default) nothing is
     // copied and the walk is byte-identical.
     let mut readings: Vec<Option<UsageInfo>> = Vec::with_capacity(names.len());
-    // Each row's plan dates, parallel to `readings` for the same reason.
-    let mut plan_dates: Vec<PlanDates> = Vec::with_capacity(names.len());
+    // Each row's `plan_ends`, parallel to `readings` for the same reason.
+    let mut plan_ends: Vec<Option<NaiveDate>> = Vec::with_capacity(names.len());
     for name in names {
         let Some(profile) = config.find(name) else {
             continue;
@@ -2581,7 +2593,7 @@ pub(crate) fn start_walk(
         } else {
             usage.cloned()
         });
-        plan_dates.push(member.plan_dates());
+        plan_ends.push(member.plan_ends);
         rows.push(StartCandidate {
             name: name.clone(),
             block,
@@ -2597,9 +2609,14 @@ pub(crate) fn start_walk(
         return (rows, None);
     }
     let len = rows.len();
-    let order = ordered_walk(walk_order, len - 1, len, &|i| readings[i].as_ref(), &|i| {
-        plan_dates[i]
-    });
+    let order = ordered_walk(
+        walk_order,
+        len - 1,
+        len,
+        &|i| readings[i].as_ref(),
+        &|i| plan_ends[i],
+        crate::format::local_day(now),
+    );
     let pick = order
         .iter()
         .copied()
@@ -3157,8 +3174,16 @@ fn next_auto_switch_target_core(
             || refuses_service_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
-    let dates = |i: usize| snapshot.chain[i].plan_dates();
-    let order = ordered_walk(snapshot.walk_order, active_idx, len, &reading, &dates);
+    let plan_ends = |i: usize| snapshot.chain[i].plan_ends;
+    let today = crate::format::local_day(now_epoch_secs());
+    let order = ordered_walk(
+        snapshot.walk_order,
+        active_idx,
+        len,
+        &reading,
+        &plan_ends,
+        today,
+    );
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         order
             .iter()
@@ -3282,16 +3307,13 @@ fn next_auto_switch_target_core(
         // healthy active "home" to the soonest-reset clear+fresh member —
         // the operator's home recomputed as "where the quota expires
         // first", so work parks where it will be spent rather than where it
-        // will expire. `soonest-plan-end` does the same off [`plan_end_key`]:
-        // home is the member whose plan ends first, a plan marked ending
-        // ahead of any renewal, so a canceled plan is spent before its last
-        // day. Its key moves only when a plan renews or a mark changes, so it
-        // walks once per such event. The walk is one-shot in the same
+        // will expire. The key is the walk's own [`soonest_reset_key`], so a
+        // canceled plan whose last day starts before every other member's
+        // reset is home in its last week. The walk is one-shot in the same
         // structural sense as the return-to-preferred pass: the already-home
-        // guard below bars any re-fire once the active IS the soonest
-        // member. The same hard
-        // freshness gates as the return-to-preferred pass above (fresh
-        // ACTIVE and fresh target), and the same absence of a `last_resort`
+        // guard below bars any re-fire once the active IS the soonest member.
+        // The same hard freshness gates as the return-to-preferred pass above
+        // (fresh ACTIVE and fresh target), and the same absence of a `last_resort`
         // guard: a sink is a refuge, not a permanent park, and the
         // recomputed home outranks it. The ordering rides the shared
         // `order` (the soonest-reset sequence with the chain-position tie
@@ -3311,30 +3333,21 @@ fn next_auto_switch_target_core(
         // skipped as a candidate, so the walk always finds a "home" to walk
         // TO — one credential relink per scheduler tick, forever). Ties with
         // the active keep the current position: walking between tied members
-        // buys nothing and oscillates the same way. A candidate with no
-        // parseable reset never outranks a Some active, and an active with
-        // none defers to any candidate that has one.
-        let today = crate::format::local_day(now_epoch_secs());
-        let home_key = |i: usize| -> Option<(u8, i64)> {
-            match snapshot.walk_order {
-                WalkOrder::SoonestWeeklyReset => {
-                    reading(i).and_then(weekly_reset_key).map(|k| (0, k))
-                }
-                WalkOrder::SoonestPlanEnd => today.and_then(|today| plan_end_key(dates(i), today)),
-                WalkOrder::Chain | WalkOrder::MostWeeklyHeadroom => None,
-            }
-        };
+        // buys nothing and oscillates the same way. A candidate with no key
+        // (no parseable reset and no `plan_ends` cap) never outranks a Some
+        // active, and an active with none defers to any candidate that has
+        // one.
+        let home_key = |i: usize| soonest_reset_key(reading(i), plan_ends(i), today);
         let active_key = home_key(active_idx);
-        if matches!(
-            snapshot.walk_order,
-            WalkOrder::SoonestWeeklyReset | WalkOrder::SoonestPlanEnd
-        ) && !snapshot.chain.iter().enumerate().any(|(i, m)| {
-            if i == active_idx {
-                active_preferred
-            } else {
-                m.preferred
-            }
-        }) && snapshot.fresh.iter().any(|n| n == &active.name)
+        if snapshot.walk_order == WalkOrder::SoonestWeeklyReset
+            && !snapshot.chain.iter().enumerate().any(|(i, m)| {
+                if i == active_idx {
+                    active_preferred
+                } else {
+                    m.preferred
+                }
+            })
+            && snapshot.fresh.iter().any(|n| n == &active.name)
             && let Some(pi) = order.iter().copied().find(|&i| {
                 !skip(i)
                     && clear(&snapshot.chain[i])
@@ -3577,7 +3590,8 @@ pub(crate) fn find_recovered_member(
         chain.len().saturating_sub(1),
         chain.len(),
         &|i| usage.get(chain[i].name.as_str()),
-        &|i| chain[i].plan_dates(),
+        &|i| chain[i].plan_ends,
+        crate::format::local_day(now),
     );
     for i in order.iter().copied() {
         if recovered(&chain[i], true) == Some(true) {

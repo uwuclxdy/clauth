@@ -18868,6 +18868,71 @@ fn scan_recovery_queues_a_recovered_chain_member() {
     );
 }
 
+/// Recovery ranks by the plan-end cap the scan copies into its member snapshot:
+/// a's week resets in 6 days but its plan ends tomorrow, so it relinks ahead of
+/// b, whose week resets in 3 days.
+#[test]
+fn scan_recovery_ranks_a_plan_ending_before_the_week_by_its_last_day() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, WalkOrder};
+
+    crate::testutil::on_one_local_day(|today| {
+        let week = |reset_in_secs: i64| UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + reset_in_secs)),
+            }),
+            ..Default::default()
+        };
+        let mut a = logged_in("a");
+        a.plan_ends = Some(today + chrono::Duration::days(1));
+        let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+            state: AppState {
+                active_profile: None,
+                fallback_chain: vec!["a".into(), "b".into()],
+                walk_order: Some(WalkOrder::SoonestWeeklyReset),
+                ..AppState::default()
+            },
+            profiles: vec![a, logged_in("b")],
+        }));
+        let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), week(6 * 86_400)),
+            ("b".to_string(), week(3 * 86_400)),
+        ])));
+        let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), FetchStatus::Fresh),
+            ("b".to_string(), FetchStatus::Fresh),
+        ])));
+        let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+        scan_recovery(
+            &config,
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &kick_blocks,
+            &pending,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashSet::new())),
+        );
+
+        assert_eq!(
+            pending.lock().unwrap().clone(),
+            HashSet::from([super::PendingSwitchTarget {
+                target: "a".to_string(),
+                key_rejected_cause: None,
+            }]),
+            "a's plan ends before b's week resets, so recovery relinks to a"
+        );
+    });
+}
+
 /// The switch-off recovery walk never queues a relink onto a recovered-looking
 /// member that holds no login (no stored pair, no session-token sidecar, no api
 /// key): the relink would install an empty login into the global slot.
@@ -34187,7 +34252,6 @@ fn reset_member(name: &str) -> crate::fallback::ChainMember {
         check_credit_cap: true,
         own_inference: false,
         plan_ends: None,
-        plan_renews: None,
     }
 }
 

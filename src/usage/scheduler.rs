@@ -12041,7 +12041,6 @@ fn scan_recovery_leased(
                         own_inference: profile
                             .is_some_and(crate::claude::has_own_inference_endpoint),
                         plan_ends: profile.and_then(|p| p.plan_ends),
-                        plan_renews: profile.and_then(|p| p.plan_renews),
                     }
                 })
                 .collect(),

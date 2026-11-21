@@ -632,6 +632,10 @@ pub(crate) enum Command {
 
 /// `clauth start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one `clauth start` flag, not state"
+)]
 pub(crate) struct StartArgs {
     /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
     /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.
@@ -657,7 +661,7 @@ pub(crate) struct StartArgs {
     /// with headroom for the models this session will run (`--model`, the
     /// model in your settings, the subagent model, the advisor model), taken
     /// in your `walk_order`: chain position by default, else the soonest
-    /// weekly reset, the most weekly headroom or the soonest plan end.
+    /// weekly reset or the most weekly headroom.
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:

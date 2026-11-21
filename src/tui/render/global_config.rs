@@ -359,9 +359,6 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             WalkOrder::MostWeeklyHeadroom => {
                 "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
             }
-            WalkOrder::SoonestPlanEnd => {
-                "spend the accepted member whose plan ends or renews first, a canceled plan before any renewal"
-            }
         }),
         GlobalConfigRow::BurnFloor => String::from(
             "the burn projection never switches below this share; it does nothing at or above an account's threshold",

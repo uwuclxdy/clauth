@@ -918,7 +918,7 @@ pub(crate) enum GlobalConfigRow {
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
     /// today's chain-position walk) / `soonest weekly reset` / `most weekly
-    /// headroom` / `soonest plan end`. Space cycles.
+    /// headroom`. Space cycles.
     /// Decides WHERE each accept pass lands; `switch mode` decides WHEN the
     /// active is left, so the two stay orthogonal.
     WalkOrder,
@@ -21485,7 +21485,7 @@ fn toggle_burn_aware_switching(app: &mut App) {
 }
 
 /// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
-/// `most weekly headroom` → `soonest plan end` → `chain`.
+/// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
 /// `AppConfig`, `update_app_state`, drain forgets — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
@@ -21495,8 +21495,7 @@ fn cycle_walk_order(app: &mut App) {
     let next = match app.config().state.walk_order() {
         WalkOrder::Chain => WalkOrder::SoonestWeeklyReset,
         WalkOrder::SoonestWeeklyReset => WalkOrder::MostWeeklyHeadroom,
-        WalkOrder::MostWeeklyHeadroom => WalkOrder::SoonestPlanEnd,
-        WalkOrder::SoonestPlanEnd => WalkOrder::Chain,
+        WalkOrder::MostWeeklyHeadroom => WalkOrder::Chain,
     };
     app.save_state_delta(|s, _held| s.walk_order = Some(next));
     app.apply_forgets();
