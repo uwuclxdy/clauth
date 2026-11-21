@@ -2135,7 +2135,7 @@ fn remove_takes_the_number_out_of_a_spawn_file_carrying_the_remembered_one() {
     let l = layout(false);
     remember(&l, 3650);
     apply(&l, &["-p", "hi"]);
-    crate::retention::remove().unwrap();
+    crate::retention::remove(3650).unwrap();
     assert_eq!(spawn_file(&l), json!({}));
 }
 
@@ -2144,7 +2144,7 @@ fn remove_leaves_a_callers_own_number_in_a_spawn_file() {
     let l = layout(false);
     remember(&l, 3650);
     apply(&l, &["--settings", "{\"cleanupPeriodDays\":7}"]);
-    crate::retention::remove().unwrap();
+    crate::retention::remove(3650).unwrap();
     assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 7}));
 }
 
@@ -2195,7 +2195,7 @@ fn remove_leaves_a_delegates_own_number_in_its_spawn_file() {
     let l = layout(false);
     remember(&l, 3650);
     apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":1}"]);
-    crate::retention::remove().unwrap();
+    crate::retention::remove(3650).unwrap();
     assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 1}));
 }
 
@@ -2257,7 +2257,7 @@ fn remove_with_a_record_that_does_not_parse_removes_nothing() {
     apply(&l, &["-p", "hi"]);
     let record = crate::retention::record_path().unwrap();
     fs::write(&record, b"").unwrap();
-    let e = crate::retention::remove().unwrap_err();
+    let e = crate::retention::remove(3650).unwrap_err();
     assert_eq!(
         e.to_string(),
         format!(
@@ -2638,6 +2638,190 @@ fn a_second_flock_fault_after_a_settle_pass_says_so() {
     );
 }
 
+/// A `keep` that lands re-arms the state-flock line like the record's other
+/// writers, so a later timeout says its spawn file is not kept current again.
+#[test]
+fn a_second_flock_fault_after_a_landed_keep_says_so() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    // The key goes missing and the check puts it back: the open question `keep`
+    // answers.
+    fs::write(
+        l.home.home().join(".claude").join("settings.json"),
+        br#"{"theme":"light"}"#,
+    )
+    .unwrap();
+    crate::retention::reconcile().unwrap();
+    assert_eq!(
+        crate::retention::load().unwrap().open_question(),
+        Some(3650),
+        "the put-back opened the question"
+    );
+    let lines = crate::logline::LogLines::new();
+    let wedge = || {
+        let holder = crate::testutil::hold_state_flock();
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+        {
+            let _capture = lines.capture_here();
+            apply(&l, &["-p", "hi"]);
+        }
+        crate::lock::set_state_lock_timeout_override(None);
+        drop(holder);
+    };
+    wedge();
+    crate::retention::keep(3650).expect("keep");
+    wedge();
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            timeout.clone(),
+            not_registered.clone(),
+            timeout,
+            not_registered
+        ]
+    );
+}
+
+/// A `remove` that lands re-arms the state-flock line like the record's other
+/// writers, so a later timeout says its spawn file is not kept current again.
+#[test]
+fn a_second_flock_fault_after_a_landed_remove_says_so() {
+    let l = layout(true);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let lines = crate::logline::LogLines::new();
+    let wedge = || {
+        let holder = crate::testutil::hold_state_flock();
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+        {
+            let _capture = lines.capture_here();
+            apply(&l, &[]);
+        }
+        crate::lock::set_state_lock_timeout_override(None);
+        drop(holder);
+    };
+    wedge();
+    assert_eq!(
+        crate::retention::remove(3650).unwrap(),
+        crate::retention::RemoveOutcome::Removed
+    );
+    wedge();
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            timeout.clone(),
+            not_registered.clone(),
+            timeout,
+            not_registered
+        ]
+    );
+}
+
+/// A `remove` that lands re-arms the record-fault line too, so a later record
+/// write fault says its spawn file is not kept current again.
+#[cfg(unix)]
+#[test]
+fn a_second_record_fault_after_a_landed_remove_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    // Repairs are due, so a launch with no remembered number still registers
+    // its spawn file and reaches the record write this test faults.
+    let l = layout(true);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let clauth_dir = crate::retention::record_path()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let lines = crate::logline::LogLines::new();
+    let failed_write = || {
+        fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        {
+            let _capture = lines.capture_here();
+            apply(&l, &["-p", "hi"]);
+        }
+        fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    failed_write();
+    assert_eq!(
+        crate::retention::remove(3650).unwrap(),
+        crate::retention::RemoveOutcome::Removed
+    );
+    failed_write();
+    let expected = format!(
+        "clauth: failed to write the retention record {}: Permission denied (os error 13); \
+         {} is not kept current",
+        crate::retention::record_path().unwrap().display(),
+        l.settings_file.display()
+    );
+    assert_eq!(lines.snapshot(), vec![expected.clone(), expected]);
+}
+
+/// A `keep` that lands re-arms the record-fault line too, so a later record
+/// write fault says its spawn file is not kept current again.
+#[cfg(unix)]
+#[test]
+fn a_second_record_fault_after_a_landed_keep_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    // Repairs are due, so a launch still registers its spawn file and reaches
+    // the record write this test faults.
+    let l = layout(true);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    // The key goes missing and the check puts it back: the open question `keep`
+    // answers.
+    fs::write(
+        l.home.home().join(".claude").join("settings.json"),
+        br#"{"theme":"light"}"#,
+    )
+    .unwrap();
+    crate::retention::reconcile().unwrap();
+    assert_eq!(
+        crate::retention::load().unwrap().open_question(),
+        Some(3650),
+        "the put-back opened the question"
+    );
+    let clauth_dir = crate::retention::record_path()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let lines = crate::logline::LogLines::new();
+    let failed_write = || {
+        fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        {
+            let _capture = lines.capture_here();
+            apply(&l, &["-p", "hi"]);
+        }
+        fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    failed_write();
+    crate::retention::keep(3650).expect("keep");
+    failed_write();
+    let expected = format!(
+        "clauth: failed to write the retention record {}: Permission denied (os error 13); \
+         {} is not kept current",
+        crate::retention::record_path().unwrap().display(),
+        l.settings_file.display()
+    );
+    assert_eq!(lines.snapshot(), vec![expected.clone(), expected]);
+}
+
 /// `remove it` failing to read a registered spawn file names that file and
 /// keeps the record, so a later pass can retry.
 #[cfg(unix)]
@@ -2648,7 +2832,7 @@ fn remove_failing_to_read_a_spawn_file_names_it() {
     remember(&l, 3650);
     apply(&l, &["-p", "hi"]);
     fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o000)).unwrap();
-    let e = crate::retention::remove().unwrap_err();
+    let e = crate::retention::remove(3650).unwrap_err();
     fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
         e.to_string(),
@@ -2678,7 +2862,7 @@ fn remove_failing_to_write_a_spawn_file_names_it() {
     apply(&l, &["-p", "hi"]);
     let dir = l.settings_file.parent().unwrap().to_path_buf();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
-    let e = crate::retention::remove().unwrap_err();
+    let e = crate::retention::remove(3650).unwrap_err();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         e.to_string(),
@@ -2744,7 +2928,7 @@ fn remove_skips_a_registered_spawn_file_that_is_gone() {
     remember(&l, 3650);
     apply(&l, &["-p", "hi"]);
     fs::remove_file(&l.settings_file).unwrap();
-    crate::retention::remove().unwrap();
+    crate::retention::remove(3650).unwrap();
     assert!(!crate::retention::record_path().unwrap().exists());
     assert!(!l.settings_file.exists());
 }
@@ -2758,7 +2942,7 @@ fn remove_over_a_spawn_file_that_is_not_an_object_names_it() {
     apply(&l, &["-p", "hi"]);
     fs::write(&l.settings_file, b"[]").unwrap();
     let before = crate::retention::load().unwrap();
-    let e = crate::retention::remove().unwrap_err();
+    let e = crate::retention::remove(3650).unwrap_err();
     assert_eq!(
         e.to_string(),
         format!(

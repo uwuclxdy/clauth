@@ -2795,7 +2795,7 @@ fn remove_forgets_the_number_and_deletes_the_key_everywhere_until_a_new_number_a
         "the loss opened the question"
     );
 
-    crate::retention::remove().expect("remove");
+    crate::retention::remove(3650).expect("remove");
 
     let keyless = json!({"theme": "light", "env": {}});
     assert_eq!(read_json(&base), keyless, "the operator file loses the key");
@@ -2821,6 +2821,148 @@ fn remove_forgets_the_number_and_deletes_the_key_everywhere_until_a_new_number_a
         retention(),
         remembered(30, false),
         "a new number arms it again"
+    );
+}
+
+/// The answer names the number the question asked about: a valid number the
+/// operator set in the file since the put-back is honoured silently, and
+/// `remove` changes nothing.
+#[test]
+fn remove_refuses_a_number_the_operator_set_since_the_put_back() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 90, "theme": "light", "env": {}}),
+        t(30),
+    );
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded
+    );
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(90),
+        "the operator's own number stands"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the live copy is untouched"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the record is untouched"
+    );
+}
+
+/// A question about another number is still owed its own answer: a stale
+/// `remove it` naming the old number changes nothing.
+#[test]
+fn remove_refuses_a_question_about_another_number() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(retention(), remembered(3650, true), "the 3650 question");
+
+    // A put-back of another number whose question write landed and whose
+    // operator write did not: the record asks about 7 over a keyless file.
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(30));
+    let mut record = crate::retention::load().expect("load");
+    record.days = Some(7);
+    record.question_open = true;
+    fs::write(
+        crate::retention::record_path().expect("path"),
+        serde_json::to_vec_pretty(&record).expect("serialize"),
+    )
+    .expect("write the record");
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded,
+        "the 7 question is still owed its own answer"
+    );
+    assert_eq!(
+        read_json(&base).get("cleanupPeriodDays"),
+        None,
+        "the keyless file stays keyless"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the live copy is untouched"
+    );
+    assert_eq!(retention(), remembered(7, true), "the record is untouched");
+}
+
+/// An operator save landing in the operator file's read-to-re-stat window is
+/// still honoured: the rewrite refuses to overwrite it, and the re-check on
+/// the retry's read answers `Superseded`, leaving the new number in place.
+#[test]
+fn remove_refuses_a_number_that_lands_after_the_guard_read() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(retention(), remembered(3650, true), "the 3650 question");
+
+    let saved = std::sync::Arc::new(std::sync::Once::new());
+    let base_for_hook = base.clone();
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == base_for_hook.as_path() {
+            saved.call_once(|| {
+                write_json(
+                    &base_for_hook,
+                    &json!({"cleanupPeriodDays": 90, "theme": "light", "env": {}}),
+                    t(40),
+                );
+            });
+        }
+    })));
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded
+    );
+    crate::retention::set_rewrite_hook(None);
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(90),
+        "the save that landed inside the remove stands"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the record is untouched"
     );
 }
 
@@ -3420,7 +3562,7 @@ fn remove_errors_on_a_live_copy_that_does_not_parse_and_says_so() {
     std::fs::write(&copy, br#"{"cleanupPeriodDays": 36"#).expect("tear the copy");
 
     let started = std::time::Instant::now();
-    let err = crate::retention::remove().expect_err("an unparseable copy fails the remove");
+    let err = crate::retention::remove(3650).expect_err("an unparseable copy fails the remove");
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(200),
         "each re-read of the torn copy waits for a write in flight to land"
@@ -3477,7 +3619,7 @@ fn remove_errors_on_a_live_copy_it_cannot_stat_and_keeps_the_record() {
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let restore = ModeGuard(runtime_dir, 0o700);
 
-    let err = crate::retention::remove().expect_err("an unstattable copy fails the remove");
+    let err = crate::retention::remove(3650).expect_err("an unstattable copy fails the remove");
     drop(restore);
 
     assert!(
@@ -3817,7 +3959,8 @@ fn remove_errors_on_a_member_that_keeps_moving_and_keeps_the_record() {
         }
     })));
 
-    let err = crate::retention::remove().expect_err("a member that keeps moving fails the remove");
+    let err =
+        crate::retention::remove(3650).expect_err("a member that keeps moving fails the remove");
     crate::retention::set_rewrite_hook(None);
 
     assert!(
@@ -3868,7 +4011,7 @@ fn remove_succeeds_on_a_member_that_moves_once() {
         }
     })));
 
-    crate::retention::remove().expect("a member that moves once is removed on the retry");
+    crate::retention::remove(3650).expect("a member that moves once is removed on the retry");
     crate::retention::set_rewrite_hook(None);
 
     assert_eq!(

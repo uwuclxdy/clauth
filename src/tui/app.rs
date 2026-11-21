@@ -2794,6 +2794,201 @@ pub(crate) enum Modal {
     /// A capture's login matches no stored one but looks like an account's:
     /// save it into that account, capture it as a new one, or cancel.
     CaptureOwner(CaptureOwnerForm),
+    /// clauth put a lost `cleanupPeriodDays` back: keep the number or remove
+    /// it.
+    TranscriptCleanup(TranscriptCleanupForm),
+}
+
+/// The `TRANSCRIPT CLEANUP` question over the number clauth put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptCleanupForm {
+    /// The remembered number the question is about.
+    pub(crate) days: u64,
+    /// Focused button: `false` = `keep <days>`, `true` = `remove it`.
+    pub(crate) on_remove: bool,
+}
+
+/// The retention record's keep-or-remove question as this TUI last read it,
+/// and its one `remove it` worker. The record is the question's only source:
+/// a put-back opens it in whichever clauth process ran the check, so the tick
+/// follows the record file's own writes rather than any one writer.
+#[derive(Debug)]
+pub(crate) struct TranscriptCleanup {
+    /// The record's write stamp at the read below; the tick reads the record
+    /// again only when it moves.
+    stamp: Option<StoreStamp>,
+    /// The number whose put-back waits for an answer, as last read.
+    question: Option<u64>,
+    /// The number this run already asked about, the open modal's own once it
+    /// follows a changed question. Cleared when a tick reads the record's
+    /// question closed and when a `keep` answer lands, so a later put-back
+    /// asks again; an answer that leaves the record unchanged (a failed keep,
+    /// a closed failed remove) keeps it asked until a restart.
+    asked: Option<u64>,
+    /// A `remove it` worker runs; its result drains each tick.
+    removing: bool,
+    tx: std::sync::mpsc::Sender<anyhow::Result<crate::retention::RemoveOutcome>>,
+    rx: std::sync::mpsc::Receiver<anyhow::Result<crate::retention::RemoveOutcome>>,
+    /// What the question's keys would answer, as a count of its changes:
+    /// every event that changes it moves it, where the event happens
+    /// ([`Self::meaning_changed`]), so a change undone before the next frame
+    /// still counts.
+    meaning: u64,
+    /// The last frame drawn: the meaning it showed and whether the question
+    /// was on top in it. `None` until a frame is drawn.
+    drawn: Option<DrawnMeaning>,
+    /// The clock when the frame loop last found its event queue empty
+    /// ([`App::queue_seen_empty`]): a key read after that may have been typed
+    /// as early as then, so the keys have to have been live at that moment.
+    quiet_at: Option<u64>,
+    /// Whether the frame being drawn showed the buttons live, published by the
+    /// render pass ([`Self::set_drawn_live`]) and taken by
+    /// [`App::frame_drawn`]: the frame's own liveness by the clock the draw
+    /// read, never a recomputation after a draw that returned past the window.
+    drawn_live: std::cell::Cell<bool>,
+}
+
+/// What a drawn frame showed of the transcript question.
+#[derive(Debug, Clone, Copy)]
+struct DrawnMeaning {
+    /// [`TranscriptCleanup::meaning`] when the frame was drawn.
+    meaning: u64,
+    /// The clock ([`App::anim_ms`]) read after the first frame showing this
+    /// meaning returned from its draw.
+    since_ms: u64,
+    /// The clock read after the first frame of this meaning that drew the
+    /// buttons live, `None` until such a frame is drawn: a key typed before it
+    /// was typed before the user could have seen the question's keys act.
+    live_at: Option<u64>,
+    /// The question was the top modal, the one the frame drew.
+    on_top: bool,
+}
+
+/// How long the question's keys do nothing after a frame first shows what
+/// they would answer, so a key typed for what was there before lands
+/// harmlessly.
+const CLEANUP_ARM_MS: u64 = 500;
+
+impl TranscriptCleanup {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            stamp: None,
+            question: None,
+            asked: None,
+            removing: false,
+            tx,
+            rx,
+            meaning: 0,
+            drawn: None,
+            quiet_at: None,
+            drawn_live: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a `remove it` worker runs.
+    pub(crate) fn removing(&self) -> bool {
+        self.removing
+    }
+
+    /// What the question's keys would answer changed: it opened, closed, was
+    /// covered or uncovered, its number changed, or a remove started or
+    /// landed.
+    fn meaning_changed(&mut self) {
+        self.meaning = self.meaning.wrapping_add(1);
+    }
+
+    /// Whether the drawn frame shows the question's buttons live: it shows what
+    /// the keys would answer, the terminal is focused, the window has passed,
+    /// and the event queue was last seen empty no earlier than the window's
+    /// end — the earliest a key read now may have been typed. The render reads
+    /// this; [`Self::keys_live`] adds the live-frame bound.
+    pub(crate) fn buttons_live(&self, now_ms: u64, focus_held: bool) -> bool {
+        let Some(drawn) = self.drawn.filter(|drawn| drawn.meaning == self.meaning) else {
+            return false;
+        };
+        focus_held
+            && now_ms.saturating_sub(drawn.since_ms) >= CLEANUP_ARM_MS
+            && self
+                .quiet_at
+                .is_some_and(|quiet| quiet >= drawn.since_ms.saturating_add(CLEANUP_ARM_MS))
+    }
+
+    /// Whether a key read at `now_ms` reaches the question: the buttons are
+    /// live, and the queue was last seen empty no earlier than the first frame
+    /// drawn live for this meaning. A key read now may have been typed as
+    /// early as that moment, so however late a stalled frame or tick reads it,
+    /// a key typed before the first live frame never answers the question.
+    fn keys_live(&self, now_ms: u64, focus_held: bool) -> bool {
+        self.buttons_live(now_ms, focus_held)
+            && self.drawn.is_some_and(|drawn| {
+                drawn
+                    .live_at
+                    .is_some_and(|live| self.quiet_at.is_some_and(|quiet| quiet >= live))
+            })
+    }
+
+    /// Publish what the frame being drawn shows: the render decides the
+    /// buttons' liveness by the clock it read, and [`App::frame_drawn`] records
+    /// exactly that, so a draw that started inside the window and returned
+    /// past it is no live frame.
+    pub(crate) fn set_drawn_live(&self, live: bool) {
+        self.drawn_live.set(live);
+    }
+
+    /// What the last drawn frame showed live, cleared so a frame drawn without
+    /// the question never leaves a stale mark for a later one.
+    fn take_drawn_live(&self) -> bool {
+        self.drawn_live.replace(false)
+    }
+
+    /// The event queue stood empty at `now_ms`: the earliest a key read later
+    /// may have been typed.
+    fn queue_seen_empty(&mut self, now_ms: u64) {
+        self.quiet_at = Some(now_ms);
+    }
+
+    /// Milliseconds left of the drawn question's window while it is on top and
+    /// its keys are still inert: the frame loop waits no longer, so the frame
+    /// drawn when the window ends shows the buttons live.
+    fn window_left(&self, now_ms: u64) -> Option<u64> {
+        let drawn = self
+            .drawn
+            .filter(|drawn| drawn.meaning == self.meaning && drawn.on_top)?;
+        let left = drawn
+            .since_ms
+            .saturating_add(CLEANUP_ARM_MS)
+            .saturating_sub(now_ms);
+        (left > 0).then_some(left)
+    }
+
+    /// Record the frame just drawn at `now_ms`, which drew the buttons live
+    /// when `live`; whether the events queued ahead of it are to be dropped: it
+    /// shows a meaning no earlier frame showed, and the question is on top in
+    /// it or was in the frame before.
+    fn frame_drawn(&mut self, on_top: bool, now_ms: u64, live: bool) -> bool {
+        let fresh = self.drawn.is_none_or(|drawn| drawn.meaning != self.meaning);
+        let was_on_top = self.drawn.is_some_and(|drawn| drawn.on_top);
+        let since_ms = match self.drawn {
+            Some(drawn) if !fresh => drawn.since_ms,
+            Some(_) | None => now_ms,
+        };
+        let seen_live = self.drawn.and_then(|drawn| drawn.live_at);
+        let live_at = if fresh {
+            None
+        } else if live {
+            seen_live.or(Some(now_ms))
+        } else {
+            seen_live
+        };
+        self.drawn = Some(DrawnMeaning {
+            meaning: self.meaning,
+            since_ms,
+            live_at,
+            on_top,
+        });
+        fresh && (on_top || was_on_top)
+    }
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -6069,6 +6264,8 @@ pub(crate) struct App {
     /// its account's spend is in flight shows `Spending`, so a press cannot
     /// start a second spend. UI-thread-only.
     pub(crate) limit_reset_in_flight: HashSet<String>,
+    /// The `TRANSCRIPT CLEANUP` question and its `remove it` worker.
+    pub(crate) transcript_cleanup: TranscriptCleanup,
     /// Where a TUI spend's calls go: the live endpoints, and in a test build a
     /// port nothing answers until a test points it at its own stub, so no test
     /// can reach a live account.
@@ -6163,6 +6360,12 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
+    /// Whether the terminal reports itself focused. Frames drawn while it is
+    /// lost are unseen, so the transcript question's keys stay inert and its
+    /// buttons faint until focus returns; tracked whether or not the question
+    /// is open, and held at start so a terminal that sends no focus report
+    /// keeps the behaviour the drawn window alone gives.
+    pub(crate) focus_held: bool,
     /// Header mascot playback: one big animation at launch, then a
     /// [`mascot::Cue`] a producer raises or a quiet key's hello, under the
     /// slot rules in [`mascot::Stage`].
@@ -6175,6 +6378,11 @@ pub(crate) struct App {
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
+    /// The animation phase a scripted event source moves during the frame
+    /// loop's own wait or drop, so a test can put a clock step inside one
+    /// pass; read before `anim_phase_ms`. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) anim_phase_shared: Option<Arc<AtomicU64>>,
     /// Pinned wall clock for render tests that must advance a tps snapshot past
     /// its stale window without sleeping. `fresh_tps` reads this when set, so
     /// freshness is still judged per call. Never compiled into the binary.
@@ -7078,6 +7286,7 @@ impl App {
             limit_reset_rx,
             limit_reset_tx,
             limit_reset_in_flight: HashSet::new(),
+            transcript_cleanup: TranscriptCleanup::new(),
             reset_urls: if cfg!(test) {
                 crate::usage::codex_reset::ResetUrls {
                     list: "http://127.0.0.1:9/list".to_string(),
@@ -7127,10 +7336,13 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
+            focus_held: true,
             mascot,
             mascot_seen,
             #[cfg(test)]
             anim_phase_ms: None,
+            #[cfg(test)]
+            anim_phase_shared: None,
             #[cfg(test)]
             tps_now_override: None,
             #[cfg(test)]
@@ -7224,6 +7436,9 @@ impl App {
         refresh_shunt_mark(&mut app);
         app.refresh_unsaved_live_login();
         app.refresh_form_predicates();
+        // Under the re-bind offer, so the offer is asked first, as at any
+        // start, and the transcript question after it.
+        open_startup_transcript_cleanup(&mut app);
         let rebind_form = {
             let config = app.config();
             Self::startup_rebind_form(&config)
@@ -7309,9 +7524,9 @@ impl App {
     /// landing done in `[herdr] first_landing_done` — once, forever. Every other
     /// launch — a plain TUI, and herdr after the first — opens the top-level
     /// `home_tab` (default overview); the herdr header tag is unaffected. A modal
-    /// already open at construction (the startup re-bind confirm) also takes the
-    /// non-landing arm and leaves `first_landing_done` UNSET, so the next herdr
-    /// launch still lands. The
+    /// already open at construction (the startup re-bind confirm or transcript
+    /// cleanup question) also takes the non-landing arm and leaves
+    /// `first_landing_done` UNSET, so the next herdr launch still lands. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
     /// lands on the herdr row by label in the recompute that adopts the probe,
@@ -7445,10 +7660,48 @@ impl App {
     /// opened, wrapped by each effect's own period.
     pub(crate) fn anim_ms(&self) -> u64 {
         #[cfg(test)]
+        if let Some(clock) = &self.anim_phase_shared {
+            return clock.load(Ordering::Relaxed);
+        }
+        #[cfg(test)]
         if let Some(ms) = self.anim_phase_ms {
             return ms;
         }
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Record the frame the loop just drew, its draw returned: a frame showing
+    /// the transcript question's keys a meaning no earlier frame showed starts
+    /// their wait from the clock read now, and the first frame that drew them
+    /// live is the earliest a key typed for the question can have arrived. What
+    /// the frame drew came from the render pass, not a recomputation now, so a
+    /// draw that started inside the window and returned past it is no live
+    /// frame. Whether the events already queued are to be dropped: typed before
+    /// this frame, they were meant for what it replaced.
+    #[must_use]
+    pub(super) fn frame_drawn(&mut self) -> bool {
+        let on_top = matches!(self.modals.last(), Some(Modal::TranscriptCleanup(_)));
+        let now_ms = self.anim_ms();
+        let live = self.transcript_cleanup.take_drawn_live() && on_top;
+        self.transcript_cleanup.frame_drawn(on_top, now_ms, live)
+    }
+
+    /// The event queue stood empty at the clock read now: the earliest a key
+    /// read next may have been typed, and so a moment the transcript
+    /// question's keys have to have been live at to answer it.
+    pub(super) fn queue_seen_empty(&mut self) {
+        let now_ms = self.anim_ms();
+        self.transcript_cleanup.queue_seen_empty(now_ms);
+    }
+
+    /// How long the frame loop's next wait may last at most: the remainder of
+    /// the drawn question's key window while it is on top and its keys are
+    /// still inert, so the frame drawn when the window ends shows the buttons
+    /// live.
+    pub(super) fn key_window_wait(&self) -> Option<Duration> {
+        self.transcript_cleanup
+            .window_left(self.anim_ms())
+            .map(Duration::from_millis)
     }
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
@@ -8555,36 +8808,57 @@ impl App {
         self.modal_generation
             .set(self.modal_generation.get().wrapping_add(1));
         // Opening any modal (help, the action menu, a confirm, a login) moves
-        // focus away: an armed codex/pool 2-step disarms and its label restores
-        // (the cloudy-tui Inline 2-step rule).
+        // focus away: an armed codex/pool 2-step disarms and its label restores.
         disarm_codex_2step(self);
         disarm_pool_2step(self);
+        // The transcript question opening, or a modal covering it.
+        if matches!(modal, Modal::TranscriptCleanup(_)) || self.cleanup_stacked() {
+            self.transcript_cleanup.meaning_changed();
+        }
         self.modals.push(modal);
     }
 
-    /// Every modal closes here. The [`open_modal`] bump alone carries the
-    /// scroll soundness (a reopen bumps the generation past any bound published
-    /// before it), so the close bump is belt-and-braces.
+    /// Every modal closes here. The [`Self::open_modal`] bump alone carries
+    /// the scroll soundness (a reopen bumps the generation past any bound
+    /// published before it), so the close bump is belt-and-braces.
     pub(crate) fn pop_modal(&mut self) -> Option<Modal> {
+        let stacked = self.cleanup_stacked();
         let popped = self.modals.pop();
         if popped.is_some() {
             self.modal_generation
                 .set(self.modal_generation.get().wrapping_add(1));
+            // The transcript question closing, or a modal over it closing.
+            if stacked {
+                self.transcript_cleanup.meaning_changed();
+            }
         }
         popped
     }
 
     /// Drop every modal matching `pred` and bump the modal generation once
     /// when any dropped, so a scroll bound published before the close is
-    /// stale. The login modals close through here; [`pop_modal`] covers the
-    /// top-modal pop.
+    /// stale. The login modals close through here; [`Self::pop_modal`] covers
+    /// the top-modal pop.
     fn retain_modals(&mut self, pred: impl Fn(&Modal) -> bool) {
+        let stacked = self.cleanup_stacked();
         let before = self.modals.len();
         self.modals.retain(pred);
         if self.modals.len() != before {
             self.modal_generation
                 .set(self.modal_generation.get().wrapping_add(1));
+            // The transcript question closing, or a modal over it closing.
+            if stacked {
+                self.transcript_cleanup.meaning_changed();
+            }
         }
+    }
+
+    /// Whether the transcript question is anywhere in the modal stack, so a
+    /// write to the stack can change what its keys answer.
+    fn cleanup_stacked(&self) -> bool {
+        self.modals
+            .iter()
+            .any(|m| matches!(m, Modal::TranscriptCleanup(_)))
     }
 
     /// Every write of [`App::gateway_state`] after construction lands here.
@@ -10225,6 +10499,20 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
         Tab::Services => handle_services_key(app, key),
+    }
+}
+
+/// The terminal lost or regained focus. Frames drawn while it is lost are
+/// unseen, so the transcript question's keys are inert and its buttons draw
+/// faint ([`TranscriptCleanup::keys_live`]) until a regain; a regain while the
+/// question is in the modal stack changes what its keys would answer, so it
+/// bumps the one count at its site, and the next drawn frame starts a fresh
+/// window and drops the keys queued at it. Every focus event reaches here
+/// whatever is on screen; nothing else reacts to it.
+pub(super) fn handle_focus(app: &mut App, held: bool) {
+    app.focus_held = held;
+    if held && app.cleanup_stacked() {
+        app.transcript_cleanup.meaning_changed();
     }
 }
 
@@ -19560,7 +19848,7 @@ where
                 }
                 let gate = if self.settling {
                     SwitchGate::Held(BareItemOutcome::Settled(Err(anyhow::anyhow!(
-                        BARE_ITEM_WORKER_PANICKED
+                        WORKER_PANICKED
                     ))))
                 } else {
                     SwitchGate::Gated {
@@ -19713,8 +20001,8 @@ fn spawn_bare_item_settle(app: &mut App, write: BareItemWrite) {
     });
 }
 
-/// The second line of the toast a held write's panicked worker leaves.
-const BARE_ITEM_WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
+/// The second line of the failure toast a panicked worker's answer lands as.
+const WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
 
 /// A bare-item worker's answer for its held write. Dropped unsent, as a
 /// panicked worker drops it, it posts a failed settle, so the write the user
@@ -19748,10 +20036,10 @@ impl BareItemAnswerGuard {
 impl Drop for BareItemAnswerGuard {
     fn drop(&mut self) {
         if let Some(write) = self.write.take() {
-            let _ = self.tx.send(BareItemAnswer {
+            drop(self.tx.send(BareItemAnswer {
                 write,
-                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED))),
-            });
+                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(WORKER_PANICKED))),
+            }));
         }
     }
 }
@@ -23132,6 +23420,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::BareItem(_) => handle_bare_item_key(app, key),
         Modal::BareItemOwner(_) => handle_bare_item_owner_key(app, key),
         Modal::CaptureOwner(_) => handle_capture_owner_key(app, key),
+        Modal::TranscriptCleanup(_) => handle_transcript_cleanup_key(app, key),
     }
 }
 
@@ -28919,7 +29208,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
                                 crate::claude::BareItemWriter::SignOut,
                             )
                         }))
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)));
                         // The check ends with the settle, not with the
                         // delete's own rescue walk after it.
                         drop(check);
@@ -29117,7 +29406,7 @@ fn start_rolling_switch(app: &mut App, name: &ProfileName) {
                     let settle = catch_unwind(AssertUnwindSafe(|| {
                         settle_bare_keychain_item(source, crate::claude::BareItemWriter::Switch)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)));
                     // The check ends with the settle, not with the arm's
                     // own writes after it.
                     drop(check);
@@ -31258,6 +31547,212 @@ fn store_rebind_digest(app: &mut App, digest: &str) {
             ToastKind::Danger,
             format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
+    }
+}
+
+/// The `TRANSCRIPT CLEANUP` toast after a `remove it` that landed.
+const CLEANUP_REMOVED: &str =
+    "cleanupPeriodDays removed\nclaude code now deletes transcripts older than 30 days";
+
+/// The head of the Danger toast over a `remove it` that failed.
+const CLEANUP_NOT_REMOVED: &str = "cleanupPeriodDays not removed";
+
+/// Keys on the `TRANSCRIPT CLEANUP` question. `←`/`→` pick the button; `↵`
+/// runs it: `keep <n>` closes the question, `remove it` starts the remove on
+/// its worker. `esc`/`q` are `keep <n>`. While the remove runs only `esc`/`q`
+/// act, closing the modal and leaving the remove's answer to land as a toast,
+/// so a second press starts nothing. Every key does nothing while
+/// [`TranscriptCleanup::keys_live`] is false: the terminal is unfocused, no
+/// drawn frame has shown what the key would answer for [`CLEANUP_ARM_MS`], or
+/// the frame loop last saw its event queue empty before the first frame that
+/// drew that answer's buttons live — so a key typed before the user could have
+/// seen it act changes nothing, however late it is read.
+fn handle_transcript_cleanup_key(app: &mut App, key: KeyEvent) {
+    if !app
+        .transcript_cleanup
+        .keys_live(app.anim_ms(), app.focus_held)
+    {
+        return;
+    }
+    let removing = app.transcript_cleanup.removing;
+    let Some(Modal::TranscriptCleanup(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') if removing => {
+            app.pop_modal();
+        }
+        _ if removing => {}
+        KeyCode::Left | KeyCode::Right => form.on_remove = !form.on_remove,
+        KeyCode::Enter if form.on_remove => {
+            let days = form.days;
+            start_transcript_cleanup_remove(app, days);
+        }
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+            let days = form.days;
+            app.pop_modal();
+            match crate::retention::keep(days) {
+                // The answer closes this question, so a later put-back is a
+                // new one and asks again.
+                Ok(()) => app.transcript_cleanup.asked = None,
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+                ),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Run `remove it` on a worker: it holds the state flock and pauses on a
+/// member Claude Code is mid-write on, never on the key thread. The answer
+/// names the number the modal asked about, so a question that moved on
+/// meanwhile is left alone.
+fn start_transcript_cleanup_remove(app: &mut App, days: u64) {
+    app.transcript_cleanup.removing = true;
+    // `esc`/`q` close the modal now rather than answer `keep <n>`.
+    app.transcript_cleanup.meaning_changed();
+    let tx = app.transcript_cleanup.tx.clone();
+    spawn_worker(move || {
+        let result = cleanup_remove_answer(|| crate::retention::remove(days));
+        drop(tx.send(result));
+    });
+}
+
+/// One answer per worker spawn, a crashed remove included: the drain clears
+/// `removing` off the answer, so a run that sent none would leave the question
+/// unanswerable until a restart.
+fn cleanup_remove_answer(
+    run: impl FnOnce() -> anyhow::Result<crate::retention::RemoveOutcome>,
+) -> anyhow::Result<crate::retention::RemoveOutcome> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)))
+}
+
+/// Land a finished `remove it`: a success closes the modal and says what
+/// Claude Code now does; a question that moved on closes it silently, the
+/// operator's own new number honoured; a failure toasts the remove's own error
+/// and keeps the modal open on `remove it`, the question still open in the
+/// record.
+fn drain_transcript_cleanup(app: &mut App) {
+    while let Ok(result) = app.transcript_cleanup.rx.try_recv() {
+        app.transcript_cleanup.removing = false;
+        // `esc`/`q` answer `keep <n>` again on a modal a failure leaves open.
+        app.transcript_cleanup.meaning_changed();
+        match result {
+            Ok(crate::retention::RemoveOutcome::Removed) => {
+                app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_)));
+                app.toast(ToastKind::Success, CLEANUP_REMOVED);
+            }
+            Ok(crate::retention::RemoveOutcome::Superseded) => {
+                app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_)));
+            }
+            Err(e) => {
+                for modal in &mut app.modals {
+                    if let Modal::TranscriptCleanup(form) = modal {
+                        form.on_remove = true;
+                    }
+                }
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "{CLEANUP_NOT_REMOVED}\n{}",
+                        escape_control(&format!("{e:#}"))
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Ask the record's open question at startup, under the re-bind offer, so both
+/// are asked and the offer comes first, as at any start. The write stamp is
+/// taken before the read, like the tick's, so a record that moves between the
+/// two is re-read on the first tick rather than asking a question that is
+/// gone.
+fn open_startup_transcript_cleanup(app: &mut App) {
+    app.transcript_cleanup.stamp = crate::retention::record_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    let Ok(record) = crate::retention::load() else {
+        return;
+    };
+    let Some(days) = record.open_question() else {
+        return;
+    };
+    open_transcript_cleanup(app, days);
+}
+
+/// Ask the record's open question: at startup before the re-bind offer opens
+/// over it, on the tick only while nothing owns the keyboard
+/// ([`keyboard_owner`]), so no modal ever sits under the question.
+fn open_transcript_cleanup(app: &mut App, days: u64) {
+    app.transcript_cleanup.question = Some(days);
+    app.transcript_cleanup.asked = Some(days);
+    app.open_modal(Modal::TranscriptCleanup(TranscriptCleanupForm {
+        days,
+        on_remove: false,
+    }));
+}
+
+/// Follow the retention record's question: re-read the record when its write
+/// stamp moved, then ask a question this run has not asked yet, follow a
+/// changed number, and close the modal once the question reads closed (another
+/// clauth answered it, or `~/.claude/settings.json` holds a number again), with
+/// no toast. A new question waits while a modal or an editor holds the keys
+/// ([`keyboard_owner`]) and never opens during an exit wait, so keys typed for
+/// one never answer it; the startup call opens it under the re-bind offer
+/// instead, so both are asked. While a remove runs its own answer decides the
+/// modal, so nothing here touches it.
+fn poll_transcript_cleanup(app: &mut App) {
+    if app.transcript_cleanup.removing {
+        return;
+    }
+    let stamp = crate::retention::record_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    let watch = &mut app.transcript_cleanup;
+    if stamp != watch.stamp {
+        watch.stamp = stamp;
+        // A record that cannot be read keeps the last question it held: the
+        // check reports the fault, and an open modal's `remove it` and
+        // `keep` each say why they fail.
+        if let Ok(record) = crate::retention::load() {
+            watch.question = record.open_question();
+        }
+        if watch.question.is_none() {
+            watch.asked = None;
+        }
+    }
+    let (question, asked) = (watch.question, watch.asked);
+    let open = app.cleanup_stacked();
+    match question {
+        Some(days) if open => {
+            // The ask moves with the modal: a question that changed number
+            // under it is this run's ask now, so a failed answer on the new
+            // number is not re-asked and a stale `Superseded` does not spend
+            // the new question's ask.
+            app.transcript_cleanup.asked = Some(days);
+            for modal in &mut app.modals {
+                // A new number is a new question: its `keep <n>` takes the
+                // focus back, as when it opens.
+                if let Modal::TranscriptCleanup(form) = modal
+                    && form.days != days
+                {
+                    *form = TranscriptCleanupForm {
+                        days,
+                        on_remove: false,
+                    };
+                    app.transcript_cleanup.meaning_changed();
+                }
+            }
+        }
+        None if open => app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_))),
+        Some(days) if asked != Some(days) && keyboard_owner(app).is_none() && !app.exit_wait => {
+            open_transcript_cleanup(app, days);
+        }
+        Some(_) | None => {}
     }
 }
 
@@ -33584,6 +34079,10 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_services_refresh(app);
     drain_daemon_control(app);
     drain_limit_reset(app);
+    // The drain first: a remove's own answer closes or keeps the modal before
+    // the record it rewrote is read.
+    drain_transcript_cleanup(app);
+    poll_transcript_cleanup(app);
     poll_daemon_health(app);
     poll_tps(app);
     poll_finished_speeds(app);
@@ -34640,14 +35139,18 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
-/// Whether a modal other than the startup re-bind confirm holds the tick: the
-/// confirm never blocks the switch gates, the wrap-off drain, the divergence
-/// poll or bootstrap — a Divergence prompt those raise stacks ABOVE the
-/// confirm. Every other modal keeps the pre-confirm gate, so no prompt stacks
-/// under one. Callers: [`drain_switch_gates`], [`drain_pending_switch_off`],
-/// [`poll_credentials_divergence`], [`maybe_spawn_bootstrap`].
+/// Whether a modal other than the startup re-bind confirm or the transcript
+/// cleanup question holds the tick: neither blocks the switch gates, the
+/// wrap-off drain, the divergence poll or bootstrap — a Divergence prompt
+/// those raise stacks ABOVE them. Every other modal keeps the pre-confirm
+/// gate, so no prompt stacks under one. Callers: [`drain_switch_gates`],
+/// [`drain_pending_switch_off`], [`poll_credentials_divergence`],
+/// [`maybe_spawn_bootstrap`], [`drain_bare_item_answers`],
+/// [`drain_capture_login`] and [`drain_capture_probe`].
 fn blocking_modal_open(app: &App) -> bool {
-    app.modals.iter().any(|m| !matches!(m, Modal::Rebind(_)))
+    app.modals
+        .iter()
+        .any(|m| !matches!(m, Modal::Rebind(_) | Modal::TranscriptCleanup(_)))
 }
 
 /// Complete switches whose off-thread AUTH-1 gate answered: clear the pending

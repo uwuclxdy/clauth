@@ -56,16 +56,17 @@ const KEY: &str = "cleanupPeriodDays";
 
 /// Latch for the record-fault lines — a record that cannot be read and one
 /// that cannot be written share it, so a fault that stays is reported once per
-/// process rather than on every check. Cleared by the next clean write, never
-/// by a clean read: a standing write fault with clean reads would otherwise
-/// report again on every check.
+/// process rather than on every check. Cleared by the next clean write, or by
+/// a `remove` whose record deletion lands, never by a clean read: a standing
+/// write fault with clean reads would otherwise report again on every check.
 static RECORD_FAULT_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Latch for the state-flock fault line: one hold that cannot be taken — an
 /// unresolvable `~/.clauth`, its lock file, or the flock itself — is reported
-/// once, and a record write that lands re-arms it; a hold that writes nothing
-/// leaves it set. Its own latch keeps a lock fault from silencing the record
-/// fault that may follow it.
+/// once, and a record write that lands re-arms it, as does a `remove` whose
+/// record deletion lands; a hold that writes nothing leaves it set. Its own
+/// latch keeps a lock fault from silencing the record fault that may follow
+/// it.
 static STATE_LOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// The files whose put-back or keep-current rewrite last failed, so a write
@@ -92,6 +93,14 @@ pub(crate) struct Retention {
     /// and writes the same bytes as one with it empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) spawn_files: BTreeMap<PathBuf, Option<u64>>,
+}
+
+impl Retention {
+    /// The remembered number while a put-back of it waits for the operator's
+    /// keep-or-remove answer.
+    pub(crate) fn open_question(&self) -> Option<u64> {
+        self.days.filter(|_| self.question_open)
+    }
 }
 
 /// `~/.clauth/settings-retention.json`.
@@ -231,6 +240,9 @@ pub(crate) fn apply_launch_days(map: &mut Map<String, Value>, days: u64, own_val
 /// registers nothing and is never overwritten; a write that fails is reported
 /// once through the record-fault latch and the launch goes on.
 fn register_spawn_file(file: &Path, floor: Option<u64>) {
+    // Unreachable in production: every caller runs under the held state flock,
+    // which resolved this same `~/.clauth` for its lock file, so the record
+    // path resolves here too. The skip keeps a launch going if it ever did not.
     let Ok(record) = record_path() else {
         return;
     };
@@ -312,8 +324,26 @@ pub(crate) fn reconcile() -> Result<()> {
     })
 }
 
-/// The operator's `remove it` answer: the key leaves the operator file and
-/// every live shared copy, and the number and its question are forgotten.
+/// What one [`remove`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    /// The key left every file and the record is gone.
+    Removed,
+    /// The question moved on before the answer landed: `~/.claude/settings.json`
+    /// holds another valid number, or the record's open question is about
+    /// another number. Nothing was written.
+    Superseded,
+}
+
+/// The operator's `remove it` answer to the question about `days`: the key
+/// leaves the operator file and every live shared copy, and the number and its
+/// question are forgotten.
+///
+/// The answer names the number the modal asked about. A question that moved on
+/// before the answer lands — the operator file holds another valid number, or
+/// the record's open question is about another number — changes nothing and
+/// returns [`RemoveOutcome::Superseded`]: the operator's own new number is
+/// honoured silently, and a stale modal never overrules it.
 ///
 /// The record is read first, before any member is touched: it names the spawn
 /// files that still carry the number, so a record that cannot be read or does
@@ -343,11 +373,7 @@ pub(crate) fn reconcile() -> Result<()> {
 /// A path cannot be resolved, the flock cannot be taken, a member cannot be
 /// statted, a write fails, the record cannot be read or does not parse, or a
 /// member kept changing or stayed unreadable across three tries.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no surface offers the remove answer yet")
-)]
-pub(crate) fn remove() -> Result<()> {
+pub(crate) fn remove(days: u64) -> Result<RemoveOutcome> {
     with_state_lock(|_held| {
         let record = record_path()?;
         let stored = read_record(&record).with_context(|| {
@@ -358,6 +384,9 @@ pub(crate) fn remove() -> Result<()> {
             )
         })?;
         let operator = claude_dir()?.join("settings.json");
+        if stored.open_question().is_some_and(|open| open != days) {
+            return Ok(RemoveOutcome::Superseded);
+        }
         let sync_record = crate::settings_sync::written_record_path()?;
         for path in crate::settings_sync::known_paths()? {
             let mut tries = 0;
@@ -377,6 +406,18 @@ pub(crate) fn remove() -> Result<()> {
                 }
                 let mut unreadable = false;
                 if let Some(mut member) = read_member(&path) {
+                    let moved_on = |member: &Member| {
+                        member
+                            .obj
+                            .get(KEY)
+                            .and_then(valid_days)
+                            .is_some_and(|held| held != days)
+                    };
+                    // `known_paths` lists the operator file first, so this
+                    // read decides before any copy is stripped.
+                    if path == operator && moved_on(&member) {
+                        return Ok(RemoveOutcome::Superseded);
+                    }
                     if !member.obj.contains_key(KEY) {
                         break;
                     }
@@ -450,10 +491,41 @@ pub(crate) fn remove() -> Result<()> {
             })?;
         }
         match std::fs::remove_file(&record) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                RECORD_FAULT_WARNED.store(false, Ordering::Relaxed);
+                STATE_LOCK_WARNED.store(false, Ordering::Relaxed);
+                Ok(RemoveOutcome::Removed)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemoveOutcome::Removed),
             Err(e) => Err(e).with_context(|| format!("failed to remove {}", record.display())),
         }
+    })
+}
+
+/// The operator's `keep` answer: the question about `days` closes, and the
+/// number stays remembered and wherever it was put back. A record whose open
+/// question is about another number, or that has none, is left as it is: that
+/// question is still owed its own answer.
+///
+/// # Errors
+///
+/// A path cannot be resolved, the flock cannot be taken, or the record cannot
+/// be read, does not parse or cannot be written.
+pub(crate) fn keep(days: u64) -> Result<()> {
+    with_state_lock(|_held| {
+        let record = record_path()?;
+        let mut stored = read_record(&record)?;
+        if stored.open_question() != Some(days) {
+            return Ok(());
+        }
+        stored.question_open = false;
+        let bytes = serde_json::to_vec_pretty(&stored)
+            .with_context(|| format!("failed to serialize {}", record.display()))?;
+        crate::profile::atomic_write_600(&record, bytes)
+            .with_context(|| format!("failed to write {}", record.display()))?;
+        RECORD_FAULT_WARNED.store(false, Ordering::Relaxed);
+        STATE_LOCK_WARNED.store(false, Ordering::Relaxed);
+        Ok(())
     })
 }
 
@@ -748,7 +820,8 @@ fn record_read_fault(e: &anyhow::Error) -> Retention {
 }
 
 /// Report one record fault under [`RECORD_FAULT_WARNED`]: the first of a run
-/// logs `line`, the rest are silent until a record write lands.
+/// logs `line`, the rest are silent until a record write or a `remove`'s
+/// record deletion lands.
 fn record_fault(line: std::fmt::Arguments<'_>) {
     if !RECORD_FAULT_WARNED.swap(true, Ordering::Relaxed) {
         logline!("{line}");
@@ -756,7 +829,8 @@ fn record_fault(line: std::fmt::Arguments<'_>) {
 }
 
 /// Report one state-flock fault under [`STATE_LOCK_WARNED`]: the first since
-/// a record write last landed logs `line`, the rest are silent.
+/// a record write or a `remove`'s record deletion last landed logs `line`,
+/// the rest are silent.
 fn state_lock_fault(line: std::fmt::Arguments<'_>) {
     if !STATE_LOCK_WARNED.swap(true, Ordering::Relaxed) {
         logline!("{line}");
