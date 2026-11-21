@@ -383,11 +383,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         } else {
             "rotate the login only when a request rejects it"
         }),
-        // The on-state hint names the env override plus the timing: the check
-        // runs at launch (and the daemon's herdr leg at its next reload), so
-        // toggling never cancels a live process.
+        // The on-state hint names the env override plus the cadence: every
+        // daemon and TUI checks hourly, reading the saved toggle before each
+        // check, so an off saved here stops the next one everywhere.
         GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
-            "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+            "checks for updates hourly, unless CLAUTH_NO_UPDATE=1"
         } else {
             "no update checks"
         }),

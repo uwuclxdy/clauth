@@ -14,12 +14,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::codex_reset::{
-    FailureVoice, cap_drawn, quoted_escaped, re_send_deadline, re_send_hint,
-    read_failure as shared_read_failure, read_reply, read_reply_hinted,
-    spend_failure as shared_spend_failure, stamp, trim_padding,
+    FailureVoice, TableRow, cap_drawn, minute_stamp, quoted_escaped, re_send_deadline,
+    re_send_hint, read_failure as shared_read_failure, read_reply, read_reply_hinted, reset_table,
+    shared_not_listed_line, shared_pinned_record_line, spend_failure as shared_spend_failure,
+    stamp, trim_padding,
 };
 pub(crate) use super::codex_reset::{ResetCallError, declined_re_send_line, post_settles};
 use super::fetch::{AuthClient, LimitResets};
@@ -48,27 +49,26 @@ pub(crate) struct ResetStatus {
     #[serde(default)]
     pub(crate) grants: Vec<Grant>,
     #[serde(default)]
-    pub(crate) next_grant_id: Option<String>,
-    #[serde(default)]
     pub(crate) weekly_resets_at: Option<String>,
+    /// One stamp for the whole block: while it lies ahead, no held grant the
+    /// server marks unusable can be spent.
+    #[serde(default)]
+    pub(crate) cooldown_until: Option<String>,
 }
 
 impl ResetStatus {
-    /// The grant the server says is next to spend, by id — never the first
-    /// usable grant. `None` when the server names none, or none matches.
-    pub(crate) fn next_grant(&self) -> Option<&Grant> {
-        let id = self.next_grant_id.as_deref()?;
-        self.grants.iter().find(|g| g.id == id)
-    }
-
-    /// The grant a spend would send now, or why a fresh spend refuses: the
-    /// server's next grant, when the server marks it usable now and its id
-    /// fits the pattern Claude Code sends. The server refuses any grant but
-    /// its next one, and Claude Code refuses to send an id off the pattern
-    /// before it spends. A grant both cooling and off the pattern reads as
-    /// not usable now.
-    pub(crate) fn try_spend_grant(&self) -> Result<&Grant, SpendRefusal<'_>> {
-        let grant = self.next_grant().ok_or(SpendRefusal::NoNextGrant(self))?;
+    /// The grant a spend of `id` would send now, or why it refuses: the grant
+    /// the server lists under that id, when the server marks it usable now and
+    /// its id fits the pattern Claude Code sends, since Claude Code refuses to
+    /// send an id off the pattern before it spends. A grant both cooling and
+    /// off the pattern reads as not usable now. Any listed grant can be named,
+    /// not only the one the server would spend next.
+    pub(crate) fn try_spend_grant_id(&self, id: &str) -> Result<&Grant, SpendRefusal<'_>> {
+        let grant = self
+            .grants
+            .iter()
+            .find(|g| g.id == id)
+            .ok_or(SpendRefusal::NotListed)?;
         if !grant.is_usable_now() {
             return Err(SpendRefusal::NotUsableNow(grant));
         }
@@ -78,25 +78,16 @@ impl ResetStatus {
         Ok(grant)
     }
 
-    /// [`Self::try_spend_grant`] without its reason, for the surfaces that
-    /// only count.
-    pub(crate) fn spend_grant(&self) -> Option<&Grant> {
-        self.try_spend_grant().ok()
-    }
-
-    /// The account's banked resets a fresh spend can use now: the sum of
-    /// `resets_left` over grants the server marks usable, and 0 while the
-    /// server's next reset cannot be spent. The scheduler's side read and the
-    /// CLI's post-spend refresh land this count in `limit_resets.json`.
-    /// Saturated, as the codex arm clamps its server count: a body whose
-    /// grants sum past `u32::MAX` reads as maxed, never wraps or panics.
+    /// The account's banked resets a spend can use now: the sum of
+    /// `resets_left` over every grant [`Self::try_spend_grant_id`] would send.
+    /// The scheduler's side read and the post-spend refresh land this count in
+    /// `limit_resets.json`. Saturated, as the codex arm clamps its server
+    /// count: a body whose grants sum past `u32::MAX` reads as maxed, never
+    /// wraps or panics.
     pub(crate) fn usable_resets(&self) -> u32 {
-        if self.spend_grant().is_none() {
-            return 0;
-        }
         self.grants
             .iter()
-            .filter(|g| g.usable_now)
+            .filter(|g| g.is_usable_now() && grant_id_is_sendable(&g.id))
             .fold(0u32, |acc, g| acc.saturating_add(g.resets_left))
     }
 
@@ -110,39 +101,44 @@ impl ResetStatus {
     }
 }
 
-/// Why [`ResetStatus::try_spend_grant`] refuses, each variant carrying what
+/// Why [`ResetStatus::try_spend_grant_id`] refuses, each variant carrying what
 /// its refusal line names.
 #[derive(Debug)]
 pub(crate) enum SpendRefusal<'a> {
-    /// The server names no next grant, or none it lists matches its id.
-    NoNextGrant(&'a ResetStatus),
-    /// The server does not mark its next grant usable now.
+    /// The server lists no grant under the id.
+    NotListed,
+    /// The server does not mark the grant usable now.
     NotUsableNow(&'a Grant),
-    /// The next grant's id is off `^[a-z0-9_-]{1,40}$`.
+    /// The grant's id is off `^[a-z0-9_-]{1,40}$`.
     UnsendableId,
 }
 
-/// One grant, as the status block lists it. Every field but `id` defaults, so
-/// a grant the server describes more sparsely than Claude Code expects still
-/// lists.
-#[derive(Debug, Clone, Deserialize)]
+/// One grant, as the status block lists it and `limit_resets.json` keeps it.
+/// Every field but `id` defaults, so a grant the server describes more
+/// sparsely than Claude Code expects still lists, and a stored grant an older
+/// clauth wrote still loads.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Grant {
     pub(crate) id: String,
     #[serde(default)]
     label: String,
     #[serde(default)]
+    resets_total: u32,
+    #[serde(default)]
     resets_left: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     ends_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clears: Vec<String>,
     #[serde(default)]
     paused: bool,
     #[serde(default)]
     usable_now: bool,
     #[serde(default)]
+    use_requires_limit: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     percent_used: HashMap<String, u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     unavailable_reason: Option<String>,
 }
 
@@ -152,8 +148,12 @@ impl Grant {
         self.usable_now
     }
 
-    /// The window names this grant clears, raw server spelling — the side
-    /// read's file and the TUI's labels both take them off here.
+    /// The resets this grant still holds.
+    pub(crate) fn resets_left(&self) -> u32 {
+        self.resets_left
+    }
+
+    /// The window names this grant clears, raw server spelling.
     pub(crate) fn clears(&self) -> &[String] {
         &self.clears
     }
@@ -163,9 +163,19 @@ impl Grant {
         self.ends_at.as_deref()
     }
 
+    /// `left/total`, the table's LEFT cell; a total the server never sent
+    /// reads as the resets still held.
+    pub(crate) fn left_of_total(&self) -> String {
+        format!(
+            "{}/{}",
+            self.resets_left,
+            self.resets_total.max(self.resets_left)
+        )
+    }
+
     /// The server's label whole, or the generic name; control characters
     /// dropped, since this text reaches a terminal. The prompt cuts it to 40.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let label = terminal_safe(&self.label);
         if shows_nothing(&label) {
             "limit reset".to_string()
@@ -233,18 +243,20 @@ pub(crate) fn read_status_hinted_at(
 }
 
 /// The reading a banked-reset status lands on disk: the usable count, the
-/// banked total, the next grant's raw window names and end, and the read's own
-/// epoch-ms stamp. The scheduler's hourly side read and the CLI's post-spend
-/// refresh share it, so a spend's re-read lands exactly what the hourly read
-/// would have.
+/// banked total, every grant as the server listed it, the block's cooldown and
+/// limit flag, and the read's own epoch-ms stamp. The scheduler's hourly side
+/// read and the post-spend refresh share it, so a spend's re-read lands
+/// exactly what the hourly read would have.
 pub(crate) fn status_reading(status: &ResetStatus) -> LimitResets {
-    let next = status.next_grant();
     LimitResets {
         usable: status.usable_resets(),
         banked: Some(status.banked_resets()),
-        clears: next.map(|g| g.clears().to_vec()).unwrap_or_default(),
-        ends_at: next.and_then(|g| g.ends_at().map(str::to_string)),
+        grants: status.grants.clone(),
+        cooldown_until: status.cooldown_until.clone(),
+        weekly_resets_at: status.weekly_resets_at.clone(),
+        at_limit: status.at_limit,
         fetched_at: Some(super::now_ms()),
+        ..LimitResets::default()
     }
 }
 
@@ -421,36 +433,60 @@ fn clears_summary(clears: &[String]) -> String {
     }
 }
 
-fn grant_state(grant: &Grant) -> String {
-    if grant.usable_now {
-        "usable now".to_string()
-    } else if grant.paused {
-        "paused".to_string()
-    } else {
-        match grant.unavailable_reason.as_deref() {
-            Some(reason) if !shows_nothing(&terminal_safe(reason)) => {
-                format!("unavailable ({})", cap_drawn(&terminal_safe(reason), 40))
-            }
-            Some(_) | None => "unavailable".to_string(),
-        }
-    }
+/// The windows a grant clears as a table cell and a rail line spell them:
+/// `7d, 7d fable`, empty when the server names none.
+pub(crate) fn windows_cell(clears: &[String]) -> String {
+    clears
+        .iter()
+        .map(|w| window_label(w))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// The tail a `--list` row carries after its windows: nothing on a grant the
-/// server marks usable now, `paused`, else the server's own reason — cleaned
-/// and capped, since this text reaches a terminal. Nothing when it gives none.
-fn row_state(grant: &Grant) -> Option<String> {
+/// The seconds left on the block's cooldown at `now_secs`, `None` once it
+/// lies behind or when the server sent no stamp clauth reads.
+pub(crate) fn cooldown_left(cooldown_until: Option<&str>, now_secs: i64) -> Option<u64> {
+    let until = cooldown_until.and_then(super::fetch::iso_to_epoch_secs)?;
+    u64::try_from(until.saturating_sub(now_secs))
+        .ok()
+        .filter(|left| *left > 0)
+}
+
+/// A grant's STATE word: `used` once it holds none, `ready` while the server
+/// marks it usable now and its id is one a spend would send, `unavailable` for
+/// a usable grant whose id is off that pattern, `cooldown <dur>` for any other
+/// held grant while the block's cooldown lies ahead, `paused`, `at limit only`
+/// for a grant that needs a limit the account is under, else the server's own
+/// reason cut to 20 (terminal-safe), else `unavailable`. The table, the TUI
+/// modal and the refusal of an unusable grant all name it from here.
+pub(crate) fn grant_state(
+    grant: &Grant,
+    cooldown_until: Option<&str>,
+    at_limit: bool,
+    now_secs: i64,
+) -> String {
+    if grant.resets_left == 0 {
+        return "used".to_string();
+    }
     if grant.usable_now {
-        return None;
+        return if grant_id_is_sendable(&grant.id) {
+            "ready".to_string()
+        } else {
+            "unavailable".to_string()
+        };
+    }
+    if let Some(left) = cooldown_left(cooldown_until, now_secs) {
+        return format!("cooldown {}", super::fetch::humanize_duration(left as i64));
     }
     if grant.paused {
-        return Some("paused".to_string());
+        return "paused".to_string();
     }
-    match grant.unavailable_reason.as_deref() {
-        Some(reason) if !shows_nothing(&terminal_safe(reason)) => {
-            Some(cap_drawn(&terminal_safe(reason), 40))
-        }
-        Some(_) | None => None,
+    if grant.use_requires_limit && !at_limit {
+        return "at limit only".to_string();
+    }
+    match grant.unavailable_reason.as_deref().map(terminal_safe) {
+        Some(reason) if !shows_nothing(&reason) => cap_drawn(trim_padding(&reason), 20),
+        Some(_) | None => "unavailable".to_string(),
     }
 }
 
@@ -468,23 +504,43 @@ pub(crate) fn no_resets_available(name: &str, status: &ResetStatus) -> String {
     }
 }
 
-/// `--list`'s extra line when a fresh record exists: a spend sent at a local
-/// time got no answer, and running `limit-reset` again before the window's end
-/// re-sends it.
-pub(crate) fn list_pending_note(name: &str, sent_at_ms: u64) -> String {
+/// The listing's extra line when a fresh record exists: a spend sent at a
+/// local time got no answer, and naming its grant again before the window's
+/// end re-sends it.
+pub(crate) fn list_pending_note(name: &str, grant_id: &str, sent_at_ms: u64) -> String {
     let at = local_stamp((sent_at_ms / 1000) as i64).unwrap_or_else(|| sent_at_ms.to_string());
     format!(
-        "clauth: a limit reset sent at {at} got no answer; run `clauth limit-reset {name}` again \
+        "clauth: a limit reset sent at {at} got no answer; run `clauth limit-reset {name} {}` \
          before {} to re-send it.",
+        terminal_safe(grant_id),
         re_send_deadline(sent_at_ms)
     )
 }
 
-/// The spend path's refusal for a next grant the server does not mark usable.
-pub(crate) fn unusable_next_line(name: &str, grant: &Grant) -> String {
+/// The refusal of a spend naming a grant other than the one a fresh record
+/// holds: the record's grant is the only one sent until its window ends, so
+/// one intent never spends two resets.
+pub(crate) fn pinned_record_line(name: &str, grant_id: &str, sent_at_ms: u64) -> String {
+    shared_pinned_record_line("a limit reset", name, grant_id, sent_at_ms)
+}
+
+/// The refusal of an id the read does not list.
+pub(crate) fn not_listed_line(name: &str, grant_id: &str) -> String {
+    shared_not_listed_line("a limit reset", name, grant_id)
+}
+
+/// The spend path's refusal for a listed grant the server does not mark
+/// usable now, naming its STATE word.
+pub(crate) fn unusable_grant_line(name: &str, status: &ResetStatus, grant: &Grant) -> String {
+    let state = grant_state(
+        grant,
+        status.cooldown_until.as_deref(),
+        status.at_limit,
+        super::now_epoch_secs(),
+    );
     format!(
-        "the limit reset '{name}' would use next is {}, so no reset was used",
-        grant_state(grant)
+        "the limit reset {} on '{name}' cannot be used now ({state}), so no reset was used",
+        quoted_escaped(&grant.id)
     )
 }
 
@@ -497,7 +553,7 @@ pub(crate) fn grant_id_is_sendable(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// The spend path's refusal for a next grant whose id is off that pattern.
+/// The spend path's refusal for a listed grant whose id is off that pattern.
 pub(crate) fn unsendable_grant_line(name: &str) -> String {
     format!(
         "Anthropic named a limit reset on '{name}' with an id clauth does not send, so no reset \
@@ -509,7 +565,16 @@ pub(crate) fn unsendable_grant_line(name: &str) -> String {
 /// (100 − `percent_used`), skipping a cleared window the grant names no
 /// `percent_used` for. `None` when no cleared window has one.
 fn not_at_limit_warning(name: &str, grant: &Grant) -> Option<String> {
-    let best = grant
+    let (window, left) = headroom(grant)?;
+    Some(format!(" '{name}' still has {left}% of its {window} left."))
+}
+
+/// The window this grant clears with the most headroom left (100 −
+/// `percent_used`) and that headroom, skipping a cleared window the grant
+/// names no `percent_used` for: what spending it now throws away. The prompt's
+/// warning and the TUI modal's `now` row both read it.
+pub(crate) fn headroom(grant: &Grant) -> Option<(String, u32)> {
+    grant
         .clears
         .iter()
         .filter_map(|window| {
@@ -518,64 +583,58 @@ fn not_at_limit_warning(name: &str, grant: &Grant) -> Option<String> {
                 .get(window)
                 .map(|used| (window.as_str(), 100u32.saturating_sub(*used)))
         })
-        .max_by_key(|(_, headroom)| *headroom)?;
-    Some(format!(
-        " '{name}' still has {}% of its {} left.",
-        best.1,
-        window_label(best.0)
-    ))
+        .max_by_key(|(_, headroom)| *headroom)
+        .map(|(window, left)| (window_label(window), left))
 }
 
-/// `--list`: a count line — or the no-grant line with the server's
-/// `ineligible_reason` — then every grant, the one the server named next
-/// marked `*`.
+/// The listing: a count line — or, with no grant listed, the no-grant line
+/// with the server's `ineligible_reason` — then a blank line and the table,
+/// one row per grant in the server's order. No grant is marked: the operator
+/// names the one to spend by its id.
 pub(crate) fn describe_grants(name: &str, status: &ResetStatus) -> Vec<String> {
-    let next = status.next_grant();
-    let spendable = status.spend_grant();
-    let mut lines = vec![match next {
-        Some(_) => {
-            let count = status.usable_resets();
-            format!(
-                "clauth: '{name}' has {count} limit reset{} available.",
-                plural(count as usize)
-            )
-        }
-        None => format!("clauth: {}.", no_resets_available(name, status)),
-    }];
-    for grant in &status.grants {
-        let marked = next.is_some_and(|next| next.id == grant.id);
-        let ends = grant
-            .ends_at
-            .as_deref()
-            .filter(|e| !shows_nothing(&terminal_safe(e)))
-            .map(|e| format!(", expires {}", stamp(e)))
-            .unwrap_or_default();
-        let suffix = if marked { "  (used next)" } else { "" };
-        // The row counts the grant's resets the server marks usable now,
-        // against the ones it still holds; with no spendable next grant the
-        // header counts none and every row reads 0 too.
-        let count = if grant.usable_now && spendable.is_some() {
-            grant.resets_left
-        } else {
-            0
-        };
-        let tail = row_state(grant)
-            .map(|state| format!(", {state}"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "  {} {}: {}, resets {}{tail}{ends}{suffix}",
-            if marked { "*" } else { " " },
-            grant.label(),
-            available_of(count, grant.resets_left),
-            clears_summary(&grant.clears),
-        ));
+    if status.grants.is_empty() {
+        return vec![format!("clauth: {}.", no_resets_available(name, status))];
     }
+    let usable = status.usable_resets();
+    let held = status.banked_resets();
+    let mut lines = vec![
+        format!(
+            "clauth: '{name}' has {} limit reset{} available.",
+            if usable == held {
+                usable.to_string()
+            } else {
+                format!("{usable}/{held}")
+            },
+            plural(held.max(usable) as usize)
+        ),
+        String::new(),
+    ];
+    let now = super::now_epoch_secs();
+    lines.extend(reset_table(status.grants.iter().map(|grant| {
+        TableRow {
+            id: grant.id.clone(),
+            left: grant.left_of_total(),
+            state: grant_state(
+                grant,
+                status.cooldown_until.as_deref(),
+                status.at_limit,
+                now,
+            ),
+            resets: windows_cell(&grant.clears),
+            expires: grant
+                .ends_at
+                .as_deref()
+                .filter(|e| !shows_nothing(&terminal_safe(e)))
+                .map_or_else(|| "-".to_string(), minute_stamp),
+            label: grant.label(),
+        }
+    })));
     lines
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
-/// Only the spendable next grant is asked about, so every reset it holds is
-/// usable and the count reads bare.
+/// Only a grant the spend rule accepts is asked about, so every reset it holds
+/// is usable and the count reads bare.
 pub(crate) fn spend_prompt(name: &str, status: &ResetStatus, grant: &Grant) -> String {
     let head = if grant.is_untitled() {
         format!("clauth: use a limit reset on '{name}'?")
@@ -764,6 +823,32 @@ impl SpendReply {
                 "unavailable" => SpendOutcome::Unavailable,
                 other => SpendOutcome::Unknown(other.to_string()),
             },
+        }
+    }
+
+    /// The server's own word for refusing the spend: the reason it named, or
+    /// the result when it names none, terminal-safe and cut like the CLI's
+    /// reason. `None` for a reply that landed, for one reporting the grant
+    /// already spent (that reply still moved the count), and for one whose
+    /// outcome is still open.
+    pub(crate) fn refusal_reason(&self) -> Option<String> {
+        let named = self
+            .reason
+            .as_deref()
+            .map(terminal_safe)
+            .filter(|reason| !shows_nothing(reason));
+        let result = terminal_safe(&self.result);
+        match self.outcome() {
+            SpendOutcome::Reset
+            | SpendOutcome::AlreadyUsed
+            | SpendOutcome::Unconfirmed(_)
+            | SpendOutcome::Unknown(_) => None,
+            SpendOutcome::NotLimited
+            | SpendOutcome::Cooldown
+            | SpendOutcome::Ineligible
+            | SpendOutcome::Unavailable => {
+                Some(cap_drawn(named.as_deref().unwrap_or(result.as_str()), 40))
+            }
         }
     }
 }

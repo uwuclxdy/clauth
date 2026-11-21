@@ -12,14 +12,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus, escape_control,
-    pool_auth_label,
+    App, CodexRow, MainItemKind, NoteBuffer, ReadingsSnapshot, SetupSelection, StatusFocus,
+    escape_control, pool_auth_label,
 };
 use super::super::theme;
 use super::format::{
     NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset,
-    overdue_phrase, past_deadline_age, reading_due_age, relative_age, reset_in_secs_at,
-    reset_phrase, spinner_frame, spinner_style, truncate,
+    overdue_phrase, past_deadline_age, plan_end_text, reading_due_age, relative_age,
+    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
@@ -32,8 +32,8 @@ use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
-    UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
+    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, PlanEnd, ProfileActivity, QueueSlot,
+    StreakCounts, UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
     kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
     switch_grade_kick_lifts, usage_interval_ms,
 };
@@ -485,12 +485,11 @@ fn draw_codex_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .concat(),
         ));
     }
-    if let Some(resets) = row.resets.filter(|n| *n > 0) {
-        lines.push(Line::from(vec![
-            key_span("resets"),
-            Span::styled(format!("{resets} available"), theme::accent()),
-        ]));
-    }
+    lines.extend(codex_resets_block(
+        row,
+        app.codex_resets.get(row.name.as_str()),
+        inner.width,
+    ));
     lines.push(Line::from(vec![
         key_span("status"),
         match row.fetched_at {
@@ -700,10 +699,8 @@ fn build_usage_lines(
     // `limit_resets.json` is written only under a profile with a claude OAuth
     // pair (a hybrid with a pair included), so a pane without a reading
     // draws no row.
-    if let Some(resets) = app.claude_resets.get(profile.name.as_str())
-        && let Some(row) = claude_resets_line(resets, inner_w)
-    {
-        lines.insert(1, row);
+    if let Some(resets) = app.claude_resets.get(profile.name.as_str()) {
+        lines.splice(1..1, claude_resets_block(resets, inner_w));
     }
     // The live speed/rate rows sit under the header, ahead of the usage bars:
     // they are the account's current figures, read off a fresh producer, and
@@ -823,66 +820,165 @@ fn build_usage_lines(
 /// read missed a slot.
 const STALE_RESETS_READ_MS: u64 = 75 * 60 * 1000;
 
-/// The claude pane's `resets` row off the account's limit-reset reading (the
-/// scheduler's hourly side read or the CLI's post-spend refresh): `N available`,
-/// or `N/M available` against a banked total the count falls short of;
-/// the windows the next grant resets, its end as the local month/day, and the
-/// reading's age once it passes 75 min. Each `· …` part drops when its field
-/// is absent; a zero count draws no row unless the reading carries a banked
-/// total above zero. A row past `inner_w` ends on `…`, so a cut date never
-/// reads as a different date.
-fn claude_resets_line(resets: &crate::usage::LimitResets, inner_w: u16) -> Option<Line<'static>> {
+/// The claude pane's `resets` block off the account's limit-reset reading
+/// (the scheduler's hourly side read or the post-spend refresh): the count
+/// line, `N available`, or `N/M available` against a banked total the count
+/// falls short of, `· cooldown (<dur>)` while the block's cooldown holds a
+/// reset back, and the reading's age once it passes 75 min; then one rail
+/// entry per grant still holding a reset (a used grant names nothing to
+/// spend): its label, then `resets <windows> · valid until <day>`, the
+/// grant's STATE word on the tail once it is not `ready` (a cooling grant's
+/// word sits on the count line instead). A zero count draws nothing unless
+/// the reading carries a banked total above zero.
+fn claude_resets_block(resets: &crate::usage::LimitResets, inner_w: u16) -> Vec<Line<'static>> {
+    use crate::usage::claude_reset::{available_of, cooldown_left, grant_state, windows_cell};
     let banked = resets.banked;
     if resets.usable == 0 && banked.unwrap_or(0) == 0 {
-        return None;
+        return Vec::new();
     }
-    let mut parts = vec![crate::usage::claude_reset::available_of(
-        resets.usable,
-        banked.unwrap_or(resets.usable),
-    )];
-    if !resets.clears.is_empty() {
-        let labels = resets
-            .clears
-            .iter()
-            .map(|w| crate::usage::claude_reset::window_label(w))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("resets {labels}"));
-    }
-    if let Some(ends) = local_day(&resets.ends_at) {
-        parts.push(format!("expires {ends}"));
-    }
-    if let Some(stamp) = resets
-        .fetched_at
-        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
-    {
-        parts.push(format!("read {}", relative_age(stamp)));
-    }
-    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
-    Some(Line::from(vec![
-        key_span("resets"),
-        Span::styled(truncate(&parts.join(" · "), value_width), theme::accent()),
-    ]))
+    let mut parts = vec![available_of(resets.usable, banked.unwrap_or(resets.usable))];
+    let held: Vec<&crate::usage::claude_reset::Grant> = resets
+        .grants
+        .iter()
+        .filter(|g| g.resets_left() > 0)
+        .collect();
+    let cooldown_part = cooldown_left(resets.cooldown_until.as_deref(), now_epoch_secs())
+        .filter(|_| held.iter().any(|g| !g.is_usable_now()))
+        .map(|left| {
+            format!(
+                "cooldown ({})",
+                crate::usage::humanize_duration(left as i64)
+            )
+        });
+    parts.extend(cooldown_part.clone());
+    parts.extend(stale_read(resets.fetched_at));
+    let entries = held
+        .iter()
+        .map(|g| {
+            let state = grant_state(
+                g,
+                resets.cooldown_until.as_deref(),
+                resets.at_limit,
+                now_epoch_secs(),
+            );
+            let detail = [
+                Some(windows_cell(g.clears()))
+                    .filter(|w| !w.is_empty())
+                    .map(|w| format!("resets {w}")),
+                g.ends_at().and_then(valid_until_day),
+                // The STATE word rides the tail of every grant a spend would
+                // not send now, so the rail never offers it as if spendable;
+                // a cooling grant's word is already on the count line.
+                (state != "ready" && !(state.starts_with("cooldown ") && cooldown_part.is_some()))
+                    .then_some(state),
+            ];
+            (g.label(), detail.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
+    resets_block(&parts.join(" · "), entries, inner_w)
 }
 
-/// The next grant's end as the line dates it: the local month and day
-/// (`Oct 30`). `None` for an absent or unparseable stamp — the server's
-/// spelling rides through, and a shape clauth cannot date omits the part.
-fn local_day(ends_at: &Option<String>) -> Option<String> {
-    let raw = ends_at.as_deref()?;
-    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
-    Some(
-        parsed
-            .with_timezone(&chrono::Local)
-            .format("%b %-d")
-            .to_string(),
-    )
+/// The codex pane's `resets` block. Off the account's last reset-list read
+/// when it names a credit that reads available: the count of those, the
+/// read's age past the stale cut, and one rail entry per such credit (its
+/// title, then `resets <what> · valid until <day>` or `no expiry`). Else the
+/// usage poll's count alone, the only figure its body carries.
+fn codex_resets_block(
+    row: &CodexRow,
+    reset_list: Option<&crate::usage::LimitResets>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let listed = reset_list.map(|reading| {
+        let held: Vec<_> = reading
+            .credits
+            .iter()
+            .filter(|c| c.is_available())
+            .collect();
+        (reading, held)
+    });
+    if let Some((reading, held)) = listed.filter(|(_, held)| !held.is_empty()) {
+        let mut parts = vec![format!("{} available", held.len())];
+        parts.extend(stale_read(reading.fetched_at));
+        let entries = held
+            .iter()
+            .map(|c| {
+                let valid = match c.expires_at.as_deref() {
+                    Some(raw) if !crate::format::shows_nothing(raw) => valid_until_day(raw),
+                    Some(_) | None => Some("no expiry".to_string()),
+                };
+                let detail = std::iter::once(format!("resets {}", c.resets()))
+                    .chain(valid)
+                    .collect();
+                (c.label(), detail)
+            })
+            .collect();
+        return resets_block(&parts.join(" · "), entries, inner_w);
+    }
+    match row.resets.filter(|n| *n > 0) {
+        Some(n) => resets_block(&format!("{n} available"), Vec::new(), inner_w),
+        None => Vec::new(),
+    }
+}
+
+/// `read <age>` once a resets reading passes the 75-min stale cut.
+fn stale_read(fetched_at: Option<u64>) -> Option<String> {
+    fetched_at
+        .filter(|stamp| crate::usage::now_ms().saturating_sub(*stamp) > STALE_RESETS_READ_MS)
+        .map(|stamp| format!("read {}", relative_age(stamp)))
+}
+
+/// `valid until <day>` off a reset's end: the local month and day (`Dec 10`),
+/// the year added when it is not this one (`Mar 9, 2027`). `None` for a stamp
+/// clauth cannot date.
+fn valid_until_day(raw: &str) -> Option<String> {
+    use chrono::Datelike as _;
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let day = if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d")
+    } else {
+        local.format("%b %-d, %Y")
+    };
+    Some(format!("valid until {day}"))
+}
+
+/// The `resets` block both panes draw: the count line, its value cut with `…`
+/// at the pane's edge, then one entry per reset on the stacked-hints rail at
+/// col 0 — the label's rows, then the detail parts joined by ` · ` — the
+/// label and detail wrapping between words, never cut.
+fn resets_block(
+    count: &str,
+    entries: Vec<(String, Vec<String>)>,
+    inner_w: u16,
+) -> Vec<Line<'static>> {
+    let value_width = inner_w.saturating_sub((KEY_W + KEY_GUTTER) as u16) as usize;
+    let mut lines = vec![Line::from(vec![
+        key_span("resets"),
+        Span::styled(truncate(count, value_width), theme::accent()),
+    ])];
+    let width = super::panes::rail_text_width(inner_w as usize);
+    let last = entries.len().saturating_sub(1);
+    for (i, (label, detail)) in entries.into_iter().enumerate() {
+        // Server text: wrapped plain, so a backtick in a label never reads as
+        // a typed command.
+        let mut rows = prose::plain_wrap(&label, width);
+        if !detail.is_empty() {
+            rows.extend(prose::plain_wrap(&detail.join(" · "), width));
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| vec![Span::styled(row, theme::faint())])
+            .collect();
+        lines.extend(super::panes::rail_lines(rows, i < last));
+    }
+    lines
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
-/// computing the column widths (`max_trailing`/`max_rate_w`/`max_amount_w`) once
-/// so the `%` column lines up across rows. A blank line separates rows. Used by
-/// both the OAuth window path and the third-party bars path.
+/// computing the column widths (`max_trailing`/`max_amount_w`) once so the `%`
+/// column lines up across rows. A blank line separates rows. Used by both the
+/// OAuth window path and the third-party bars path.
 fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let max_trailing = stats
         .iter()
@@ -892,14 +988,9 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
     let bar_width = bar_width_for(inner_w, max_trailing);
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-    let max_rate_w = stats
-        .iter()
-        .map(|s| s.rate_section_width())
-        .max()
-        .unwrap_or(0);
     let max_amount_w = stats
         .iter()
-        .map(|s| s.amount.chars().count())
+        .map(|s| Span::raw(&s.amount).width())
         .max()
         .unwrap_or(0);
 
@@ -908,7 +999,7 @@ fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width, pct_col, max_rate_w, max_amount_w));
+        lines.extend(stat.render(bar_width, pct_col, max_amount_w));
     }
     lines
 }
@@ -955,37 +1046,22 @@ pub(super) fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64>
     (secs > 0).then_some(secs)
 }
 
-fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
-    eta_left_secs(rate, pct, rate_unit).map(crate::usage::humanize_duration)
-}
-
 impl Stat {
-    /// Width of the ` · rate` + optional ` · X left` section, for alignment.
-    fn rate_section_width(&self) -> usize {
-        let Some(rate) = self.burn_rate.filter(|r| *r > 0.0) else {
-            return 0;
-        };
-        let mut w =
-            " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
-        if let Some(pct) = self.pct
-            && let Some(dur) = eta_left(rate, pct, self.rate_unit)
-        {
-            w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
-        }
-        w
+    /// The `{dur} left` clause, drawn only while the window runs dry before it
+    /// resets: past the reset the figure never comes true, and at a low pace it
+    /// can spell a duration longer than the row.
+    fn eta_left_text(&self, rate: f64) -> Option<String> {
+        let eta_secs = eta_left_secs(rate, self.pct?, self.rate_unit)?;
+        self.reset_secs
+            .is_some_and(|reset| eta_secs < reset)
+            .then(|| format!("{} left", humanize_duration(eta_secs)))
     }
 
     /// Eyebrow (label · rate · `used / total` · %) then bar with trailing reset
     /// suffix. `bar_width` shared across rows; `pct_col` = far content edge for %
-    /// alignment. `max_rate_w` / `max_amount_w` keep the rate + amount columns
-    /// fixed across all rows so the `%` column never shifts.
-    fn render(
-        &self,
-        bar_width: usize,
-        pct_col: usize,
-        max_rate_w: usize,
-        max_amount_w: usize,
-    ) -> Vec<Line<'static>> {
+    /// alignment; `max_amount_w` keeps the amount column fixed across all rows
+    /// so the `%` column never shifts.
+    fn render(&self, bar_width: usize, pct_col: usize, max_amount_w: usize) -> Vec<Line<'static>> {
         if let Some(note) = self.note {
             return vec![Line::from(vec![
                 Span::styled(self.label.clone(), theme::faint()),
@@ -1008,11 +1084,93 @@ impl Stat {
         } else {
             0
         };
+        let pct_cells = Span::raw(pct_str.as_ref()).width();
+        let amount_cells = Span::raw(&self.amount).width();
+        // Two cells between the label and the first figure after it, so a label
+        // ending in a figure never runs into it (`20M95%`, `1001234 / 2000`).
+        // The amount column already supplies them: a row with no amount has its
+        // whole column blank before the `%`, and a shorter amount sits behind its
+        // own blank padding. Only a row filling the column needs a gap of its own.
+        let pct_gap = if max_amount_w == 0 {
+            2
+        } else if self.amount.is_empty() {
+            0
+        } else {
+            2usize.saturating_sub(max_amount_w.saturating_sub(amount_cells))
+        };
+        // The rate section and its `{dur} left` clause, built once per row: the
+        // widths, the cut decision and the spans all read the same strings.
+        let rate = self.burn_rate.filter(|r| *r > 0.0);
+        let rate_text = rate.map(|r| format!("{r:.1} %/{}", self.rate_unit));
+        let eta_text = rate.and_then(|r| self.eta_left_text(r));
+        let rate_only_w = rate_text
+            .as_ref()
+            .map_or(0, |t| " · ".chars().count() + grapheme_cells(t));
+        let eta_cells = eta_text.as_ref().map_or(0, |t| grapheme_cells(t));
+        let eta_w = if eta_text.is_some() {
+            " · ".chars().count() + eta_cells
+        } else {
+            0
+        };
+        let rate_w = rate_only_w + eta_w;
+        // The room the label has on its own line, beside this row's own rate
+        // section: another row's wider one leaves blank cells here, never room
+        // to borrow.
+        let label_room = pct_col.saturating_sub(rate_w);
+        // The row's whole content beside its `%`.
+        let content_w = grapheme_cells(&self.label) + rate_w + amount_section_w + pct_cells;
+        // On the `%` line a row without an amount leaves its amount column blank,
+        // so a moved estimate needs only the two-cell gap before the `%`.
+        let (dropped_amount_w, dropped_gap) = if self.amount.is_empty() {
+            (0, 2)
+        } else {
+            (amount_section_w, pct_gap)
+        };
+        // A row whose whole content cannot sit beside its `%` moves the estimate
+        // onto the `%`'s line rather than cut the name: the estimate is the part
+        // that travels, so the name stays whole. That line only takes it when the
+        // estimate, amount and `%` fit there together.
+        let moved_estimate = eta_text.is_some()
+            && content_w + pct_gap > pct_col
+            && eta_cells + dropped_gap + dropped_amount_w + pct_cells <= pct_col;
+        // A label that fits its own line stays whole and the `%` drops a line;
+        // a wider one is cut. With the estimate moved, the first line carries
+        // the label and the rate alone, so the cut only bites once those two no
+        // longer fit. A rate section that alone fills the row leaves no room to
+        // cut to, and that eyebrow still overruns.
+        let label = if moved_estimate {
+            let room = pct_col.saturating_sub(rate_only_w);
+            if room > 0 && grapheme_cells(&self.label) > room {
+                truncate(&self.label, room)
+            } else {
+                self.label.clone()
+            }
+        } else if label_room > 0 && grapheme_cells(&self.label) > label_room {
+            // A bar label carrying its own figures (`… | 205M left of 300M`) is
+            // cut so the granted total cannot reach the pane edge as a smaller
+            // number: to `full_room` when that leaves a name, and otherwise to
+            // its own line's room, since under three cells the cut would leave
+            // dots where the name was. The cut ends on the house `…`, never
+            // flushed against the figure.
+            let full_room = label_room
+                .saturating_sub(amount_section_w)
+                .saturating_sub(pct_gap)
+                .saturating_sub(pct_cells);
+            let cut_room = if full_room >= 3 {
+                full_room
+            } else {
+                label_room
+            };
+            truncate(&self.label, cut_room)
+        } else {
+            self.label.clone()
+        };
+        let label_cells = grapheme_cells(&label);
         let header_pad = pct_col
-            .saturating_sub(self.label.chars().count())
-            .saturating_sub(max_rate_w)
+            .saturating_sub(label_cells)
+            .saturating_sub(rate_w)
             .saturating_sub(amount_section_w)
-            .saturating_sub(pct_str.chars().count());
+            .saturating_sub(pct_cells);
 
         let filled = self.pct.map_or(0, |p| {
             (((p / 100.0) * bar_width as f64).round() as usize).min(bar_width)
@@ -1055,81 +1213,63 @@ impl Stat {
             v
         };
 
-        let mut label_spans = vec![Span::styled(self.label.clone(), theme::label())];
-        if let Some(rate) = self.burn_rate
-            && rate > 0.0
-        {
+        let (eyebrow_eta, moved_eta) = if moved_estimate {
+            (None, eta_text)
+        } else {
+            (eta_text, None)
+        };
+        let mut label_spans = vec![Span::styled(label, theme::label())];
+        if let (Some(rate), Some(text)) = (rate, rate_text) {
             let rate_color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
             label_spans.push(Span::styled(" · ", theme::dim()));
-            let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
-            label_spans.push(Span::styled(rate_str.clone(), rate_color));
-
-            if let Some(pct) = self.pct
-                && let Some(eta_secs) = eta_left_secs(rate, pct, self.rate_unit)
-            {
-                let dur = crate::usage::humanize_duration(eta_secs);
-                // Warn when the window hits 100% before it resets: you run dry
-                // before the limit refreshes. Faint when the reset lands first.
-                let runs_dry_first = self.reset_secs.is_some_and(|r| eta_secs < r);
-                let style = if runs_dry_first {
-                    theme::warning()
-                } else {
-                    theme::faint()
-                };
-                label_spans.push(Span::styled(" · ", theme::faint()));
-                label_spans.push(Span::styled(format!("{dur} left"), style));
-            }
-
-            let my_rate_w = self.rate_section_width();
-            let extra = max_rate_w.saturating_sub(my_rate_w);
-            if extra > 0 {
-                label_spans.push(Span::raw(" ".repeat(extra)));
-            }
-        } else {
-            label_spans.push(Span::raw(" ".repeat(max_rate_w)));
+            label_spans.push(Span::styled(text, rate_color));
+        }
+        if let Some(eta) = eyebrow_eta {
+            label_spans.push(Span::styled(" · ", theme::faint()));
+            label_spans.push(Span::styled(eta, theme::warning()));
         }
 
-        let pct_cells = Span::raw(pct_str.as_ref()).width();
-        let fits =
-            Span::raw(&self.label).width() + max_rate_w + amount_section_w + pct_cells <= pct_col;
+        let pct_span = Span::styled(pct_str, pct_style);
+        let mut amount_spans: Vec<Span<'static>> = Vec::new();
+        if max_amount_w > 0 {
+            // Right-align the amount in its fixed column, then a 2-space gap.
+            amount_spans.push(Span::raw(
+                " ".repeat(max_amount_w.saturating_sub(amount_cells)),
+            ));
+            if !self.amount.is_empty() {
+                amount_spans.push(Span::styled(self.amount.clone(), theme::faint()));
+            }
+            amount_spans.push(Span::raw("  "));
+        }
+
+        let fits = label_cells + rate_w + amount_section_w + pct_gap + pct_cells <= pct_col;
         let mut out: Vec<Line<'static>> = Vec::new();
         if fits {
-            out.push(Line::from({
-                let mut spans = label_spans;
-                spans.push(Span::raw(" ".repeat(header_pad)));
-                if max_amount_w > 0 {
-                    // Right-align the amount in its fixed column, then a 2-space gap.
-                    let pad = max_amount_w.saturating_sub(self.amount.chars().count());
-                    spans.push(Span::raw(" ".repeat(pad)));
-                    if !self.amount.is_empty() {
-                        spans.push(Span::styled(self.amount.clone(), theme::faint()));
-                    }
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(Span::styled(pct_str, pct_style));
-                spans
-            }));
+            let mut spans = label_spans;
+            spans.push(Span::raw(" ".repeat(header_pad)));
+            spans.extend(amount_spans);
+            spans.push(pct_span);
+            out.push(Line::from(spans));
         } else {
             // The eyebrow no longer holds the `%` figure: it drops to its own
             // line, right-aligned to the far edge, carrying the amount with it
-            // so no figure vanishes — the pair never hard-wraps apart.
+            // so no figure vanishes — the pair never hard-wraps apart. A moved
+            // estimate leads that line, in the colour that marks the run-dry.
             out.push(Line::from(label_spans));
             let mut dropped = Vec::new();
-            if max_amount_w > 0 {
-                let amount_cells = Span::raw(&self.amount).width();
-                let right = max_amount_w + 2 + pct_cells;
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(right))));
-                dropped.push(Span::raw(
-                    " ".repeat(max_amount_w.saturating_sub(amount_cells)),
-                ));
-                if !self.amount.is_empty() {
-                    dropped.push(Span::styled(self.amount.clone(), theme::faint()));
-                }
-                dropped.push(Span::raw("  "));
+            let lead_w = if let Some(eta) = moved_eta {
+                dropped.push(Span::styled(eta, theme::warning()));
+                eta_cells
             } else {
-                dropped.push(Span::raw(" ".repeat(pct_col.saturating_sub(pct_cells))));
+                0
+            };
+            dropped.push(Span::raw(" ".repeat(
+                pct_col.saturating_sub(lead_w + dropped_amount_w + pct_cells),
+            )));
+            if !self.amount.is_empty() {
+                dropped.extend(amount_spans);
             }
-            dropped.push(Span::styled(pct_str, pct_style));
+            dropped.push(pct_span);
             out.push(Line::from(dropped));
         }
         if self.value.is_none() {
@@ -1499,25 +1639,36 @@ fn header_lines(
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
-    // as a real plan on the one row an operator checks their plan from.
+    // as a real plan on the one row a user checks their plan from.
     let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
     };
     let plan_key = key_span("plan");
-    let left_w = plan_key.width() + plan_w;
+    let mut left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
+    let row_w = usize::from(inner_w);
     // A plan with no 5h limit has no window the kick could open, and no kick
     // leg spends a chain clauth never spends, so either way the countdown
     // would name a kick that never fires.
-    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
-    if profile.has_effective_auto_start() && !no_five_hour_limit {
-        plan_spans.extend(kick_spans(
-            &kick_text(profile, header, readings),
-            left_w,
-            inner_w as usize,
-        ));
+    let kick = (profile.has_effective_auto_start()
+        && !readings.no_five_hour_limit(profile.name.as_str()))
+    .then(|| kick_text(profile, header, readings));
+    // When the plan ends or renews, beside its name in the room the countdown
+    // leaves: the countdown and its gap stay reserved, so the date drops
+    // before the countdown shortens.
+    let kick_room = kick.as_deref().map_or(0, |k| grapheme_cells(k) + KICK_GAP);
+    if let Some((text, style)) = plan_end_tail(profile, readings) {
+        let tail = format!(" · {text}");
+        let tail_w = grapheme_cells(&tail);
+        if left_w + tail_w + kick_room <= row_w {
+            left_w += tail_w;
+            plan_spans.push(Span::styled(tail, style));
+        }
+    }
+    if let Some(kick) = kick {
+        plan_spans.extend(kick_spans(&kick, left_w, row_w));
     }
     let mut lines = vec![Line::from(plan_spans)];
     if let Some(peak) = header.peak {
@@ -1525,6 +1676,22 @@ fn header_lines(
     }
     lines.extend(status_lines(profile, header, inner_w, readings));
     lines
+}
+
+/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: a plan
+/// marked ending in the warning color, a renewal faint. `None` when no date
+/// applies, a renewal included on a plan whose reading says it cannot serve
+/// (the status the Overview's `⊖` marks).
+fn plan_end_tail(profile: &Profile, readings: &ReadingsSnapshot) -> Option<(String, Style)> {
+    let today = crate::format::local_day(now_epoch_secs())?;
+    let refuses_service =
+        crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name));
+    let end = profile.plan_dates().end(today, refuses_service)?;
+    let style = match end {
+        PlanEnd::Renews(_) => theme::faint(),
+        PlanEnd::Ends(_) => theme::warning(),
+    };
+    Some((plan_end_text(end, today), style))
 }
 
 /// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure
@@ -1719,20 +1886,23 @@ fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapsho
     }
 }
 
+/// The house minimum gap, in cells, between the `plan` row's left content and
+/// its flush-right countdown.
+const KICK_GAP: usize = 3;
+
 /// Spans putting `text` flush against the pane's right edge on the `plan` row,
-/// keeping the house 3-cell minimum gap from the row's left content. Truncates
-/// with `…` when the row can't hold both; drops the kick when not even a
-/// countdown hint fits.
+/// keeping the [`KICK_GAP`] from the row's left content. Truncates with `…`
+/// when the row can't hold both; drops the kick when not even a countdown hint
+/// fits.
 fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
-    let avail = inner_w.saturating_sub(left_w);
-    if avail < 3 {
+    let Some(room) = inner_w.saturating_sub(left_w).checked_sub(KICK_GAP) else {
         return Vec::new();
-    }
-    let text = truncate(text, avail - 3);
+    };
+    let text = truncate(text, room);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - Span::raw(&text).width();
+    let pad = room.saturating_sub(Span::raw(&text).width()) + KICK_GAP;
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),
@@ -2610,13 +2780,21 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
+                // A ` | `-joined composite drops whole parts from the right
+                // (the shunt `requests` row's rule) and a last part still too
+                // wide ends on `…`; the column left is what the pane holds
+                // after this row's own key cell, which widens past TP_KEY_W.
+                let key_lead = 2 + Span::raw(key_cell(&row.label, TP_KEY_W, KEY_GUTTER)).width();
+                let value_width = usize::from(inner_w).saturating_sub(key_lead);
                 let (lead, tail) = row_parts(row);
+                let lead = fit_row_value(&lead, value_width);
                 let pad = if matches!(
                     row.kind,
                     StatRowKind::Body | StatRowKind::Danger | StatRowKind::Faint
                 ) && is_row_figure(row)
                 {
-                    value_w
+                    // Never wider than this row's own value column.
+                    value_w.min(value_width)
                 } else {
                     0
                 };
@@ -2776,11 +2954,12 @@ fn is_row_figure(row: &StatRow) -> bool {
 
 /// Whether a stat-row value reads as a figure — one number (optionally signed)
 /// with an optional unit/currency word — rather than a word (`valid`) or a
-/// no-data glyph (`-`, `—`), or a `·`-joined / parenthesized composite. Figure
-/// rows left-pad to the block's widest figure; everything else starts at the
-/// value column unpadded. Residuals the predicate cannot separate without a
-/// producer to distinguish them: a leading-currency `$5` reads as a word and an
-/// ISO date (`2026-10-01`) as a figure; no current producer emits either shape.
+/// no-data glyph (`-`, `—`), or a `·`- or ` | `-joined / parenthesized
+/// composite. Figure rows left-pad to the block's widest figure; everything
+/// else starts at the value column unpadded. Residuals the predicate cannot
+/// separate without a producer to distinguish them: a leading-currency `$5`
+/// reads as a word and an ISO date (`2026-10-01`) as a figure; no current
+/// producer emits either shape.
 fn is_figure(value: &str) -> bool {
     let mut chars = value.chars();
     let digit_led = match chars.next() {
@@ -2788,7 +2967,24 @@ fn is_figure(value: &str) -> bool {
         Some('-') => chars.next().is_some_and(|c| c.is_ascii_digit()),
         _ => false,
     };
-    digit_led && !value.contains('·') && !value.contains('(')
+    // A ` | `-joined composite is text, never a right-aligned figure column.
+    digit_led && !value.contains('·') && !value.contains('(') && !value.contains(" | ")
+}
+
+/// Fit a labelled row's value to the value column: a ` | `-joined composite
+/// drops whole parts from the right (the shunt `requests` row's rule), and a
+/// single part still wider than the column ends on `…`.
+fn fit_row_value(value: &str, value_width: usize) -> String {
+    let mut parts: Vec<&str> = value.split(" | ").collect();
+    while parts.len() > 1 && Span::raw(parts.join(" | ")).width() > value_width {
+        parts.pop();
+    }
+    let kept = parts.join(" | ");
+    if Span::raw(kept.as_str()).width() > value_width {
+        truncate(&kept, value_width)
+    } else {
+        kept
+    }
 }
 
 fn key_value_span(

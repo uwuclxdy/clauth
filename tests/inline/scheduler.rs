@@ -2143,6 +2143,7 @@ fn a_stand_down_tick_drops_the_instances_own_failed_fetch_mark() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -5532,14 +5533,16 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
 
 // ── per-session decision leg ─────────────────────────────────────────────────
 
-/// One registry row, opted IN and shared-flavor. Tests flip the one field they
-/// are about, so every other value is pinned here rather than per test.
+/// One registry row, opted IN and shared-flavor, its launcher a process no
+/// longer running. Tests flip the one field they are about, so every other
+/// value is pinned here rather than per test.
 fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::LiveSession {
+    let [launcher_pid] = crate::testutil::dead_pids();
     crate::live_sessions::LiveSession {
         session_id: session_id.to_string(),
         start_profile: start_profile.to_string(),
         harness: crate::harness::Harness::Claude,
-        pid: 4242,
+        pid: launcher_pid,
         claude_pid: None,
         launch_families: None,
         started_at: 1_700_000_000_000,
@@ -6075,7 +6078,7 @@ fn moves_off_a_home_that_refuses_credit_with(
     shape: impl FnOnce(&crate::testutil::HomeSandbox) -> Option<std::fs::File>,
 ) -> (usize, bool) {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let probed_names: &[&str] = if probed { &["a"] } else { &[] };
     let config = probed_session_config(&["a", "b"], "fable", probed_names, Some("a"));
     let store = credit_store(&["a", "b"], &[]);
@@ -6130,10 +6133,11 @@ fn a_probed_home_that_refuses_credit_moves_the_session_once() {
 #[test]
 fn a_429_two_rows_join_moves_no_session() {
     let moved = moves_off_a_home_that_refuses_credit_with(false, 0, |home| {
+        let [other_pid] = crate::testutil::dead_pids();
         let mut other = session_row("8101-0", "b");
         other.follows_chain = false;
-        other.claude_pid = Some(77_778);
-        seed_session_record(home, "conv-a", 77_778);
+        other.claude_pid = Some(other_pid);
+        seed_session_record(home, "conv-a", other_pid);
         Some(register_live_row(&other))
     });
     assert_eq!(moved, (0, false));
@@ -6185,12 +6189,13 @@ fn a_429_placed_on_no_one_latches_nothing_beside_a_later_refusal() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
     let _config = session_config_models(&["a", "b"], &[], &[]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
+    let [other_pid] = crate::testutil::dead_pids();
     let mut other = session_row("4243-0", "b");
     other.follows_chain = false;
-    other.claude_pid = Some(77_778);
+    other.claude_pid = Some(other_pid);
     let other_marker = register_live_row(&other);
-    seed_session_record(&home, "conv-a", 77_778);
+    seed_session_record(&home, "conv-a", other_pid);
     record_refusal("a", 60_000);
     let held = refusal_on("a").expect("fixture control: another session's refusal");
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
@@ -6226,7 +6231,7 @@ fn a_429_a_flock_wait_kept_off_the_record_latches_nothing() {
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = credit_store(&["a", "b"], &["a", "b"]);
     let status = all_fresh(&["a", "b"]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -6310,7 +6315,7 @@ fn decision_after_a_refusal_at_home_then(
     then: Option<RefusalStep<'_>>,
 ) -> (Option<String>, Option<usize>) {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = session_store(&[("a", 10.0), ("b", 100.0)]);
     let status = all_fresh(&["a", "b"]);
@@ -6497,7 +6502,7 @@ fn a_turn_after_the_429_in_a_rewritten_file_clears_the_refusal() {
 #[test]
 fn a_clear_after_the_move_keeps_the_refusal_on_record() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
@@ -6551,11 +6556,12 @@ fn a_reused_id_finds_the_refusal_on_record() {
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8300-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     old.launch_families = Some(vec!["fable".to_string()]);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
     assert_eq!(
@@ -6588,7 +6594,7 @@ fn a_reused_id_finds_the_refusal_on_record() {
 #[test]
 fn a_turn_inside_the_swap_grace_does_not_clear_a_refusal() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
@@ -6659,11 +6665,12 @@ fn a_refusal_outlives_the_session_that_was_refused() {
     let config = probed_session_config(&["a", "b"], "fable", &[], Some("a"));
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8700-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let marker = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     append_and_tail(&home, "conv-a", &[spend_cap_row(0)]);
     scan_sessions(&config, &store, &status);
     assert!(
@@ -8422,11 +8429,12 @@ fn a_session_whose_claude_exited_places_its_refusal_through_its_row() {
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
     seed_transcripts(&home, &["conv-d"]);
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9200-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-d", 77_777);
+    seed_session_record(&home, "conv-d", child_pid);
     append_and_tail(&home, "conv-d", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     assert!(refusal_on("a").is_some(), "the row's join places it");
@@ -8525,12 +8533,13 @@ fn a_row_on_a_login_of_its_own_joins_no_refusal() {
     let store = credit_store(&["a", "b"], &[]);
     let status = all_fresh(&["a", "b"]);
     let plain = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9203-0", "a");
     row.pid = plain.pid();
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-o", 77_777);
+    seed_session_record(&home, "conv-o", child_pid);
     append_and_tail(&home, "conv-o", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     let placed = refusal_on("a")
@@ -8668,11 +8677,12 @@ fn a_row_whose_claude_the_service_runs_joins_no_refusal() {
         )
         .unwrap();
     };
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("9207-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
     let _marker = register_live_row(&row);
-    record(77_777);
+    record(child_pid);
     append_and_tail(&home, "conv-s", &[spend_cap_row(2_000)]);
     scan_sessions(&config, &store, &status);
     let placed = refusal_on("a")
@@ -10134,7 +10144,7 @@ impl Drop for LiveChild {
 #[test]
 fn a_session_moves_on_its_own_spend_cap_429_row() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10159,7 +10169,7 @@ fn a_session_moves_on_its_own_spend_cap_429_row() {
 #[test]
 fn a_429_in_a_different_conversation_does_not_move_the_row() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10189,7 +10199,8 @@ fn a_row_without_a_child_pid_ignores_429s() {
     assert!(row.claude_pid.is_none(), "fixture: no recorded child pid");
     let _marker = register_live_row(&row);
 
-    seed_session_record(&home, "conv-a", 77_777);
+    let [record_pid] = crate::testutil::dead_pids();
+    seed_session_record(&home, "conv-a", record_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
 
@@ -10239,7 +10250,7 @@ fn a_credit_billed_launch_does_not_move_on_a_stale_cap_reading() {
 #[test]
 fn a_429_latched_while_no_target_exists_moves_once_a_member_frees() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10301,7 +10312,7 @@ fn a_fable_passthrough_launch_moves_off_a_capped_account() {
 #[test]
 fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10338,7 +10349,7 @@ fn a_session_moves_on_its_own_spend_cap_429_even_with_a_cached_reading() {
 #[test]
 fn a_latched_429_does_not_re_fire_after_the_member_changes() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10390,7 +10401,7 @@ fn a_latched_429_does_not_re_fire_after_the_member_changes() {
 #[test]
 fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_member() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -10418,7 +10429,7 @@ fn a_stale_429_followed_by_a_success_does_not_move_a_session_off_its_healthy_mem
 #[test]
 fn a_429_followed_by_a_successful_turn_is_history() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10597,7 +10608,7 @@ fn write_subagent(home: &crate::testutil::HomeSandbox, conv: &str, lines: &[Stri
 #[test]
 fn a_429_older_than_the_last_swap_does_not_move_the_session() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -10627,7 +10638,7 @@ fn a_429_older_than_the_last_swap_does_not_move_the_session() {
 #[test]
 fn a_latched_429_is_cleared_by_a_later_successful_turn() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10667,7 +10678,7 @@ fn a_latched_429_is_cleared_by_a_later_successful_turn() {
 fn same_file_success_pin(ok_ago: u64, cap_ago: u64) -> (Option<String>, Option<usize>) {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -10777,14 +10788,15 @@ fn scan_with_no_target() -> (Option<String>, Option<usize>) {
     decision_of("4242-0")
 }
 
-/// A live row on `a` joined to `conv-a` through its child pid.
-fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
-    let child_pid = 77_777;
+/// A live row on `a` joined to `conv-a` through its child pid: the row's
+/// liveness marker and that pid.
+fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> (std::fs::File, u32) {
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let marker = register_live_row(&row);
     seed_session_record(home, "conv-a", child_pid);
-    marker
+    (marker, child_pid)
 }
 
 /// A clock step back between a 429 and the session's next successful turn: the
@@ -10795,7 +10807,7 @@ fn spend_cap_order_row(home: &crate::testutil::HomeSandbox) -> std::fs::File {
 fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     let ok = ok_row_at(now - 602_000);
     write_conv(&home, "conv-a", &[cap.clone(), ok.clone()]);
@@ -10830,7 +10842,7 @@ fn a_success_line_after_the_429_stamped_below_it_drops_the_latch() {
 fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -10874,7 +10886,7 @@ fn a_later_appended_success_stamped_below_the_latched_429_drops_it() {
 fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     write_conv(
         &home,
         "conv-a",
@@ -10900,7 +10912,7 @@ fn a_later_429_line_stamped_below_an_earlier_one_keeps_the_latch() {
 fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -10937,7 +10949,7 @@ fn a_success_replayed_by_a_shrink_does_not_drop_a_later_429s_latch() {
 fn a_success_replayed_by_a_walk_miss_does_not_drop_a_later_429s_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -10986,7 +10998,7 @@ fn pad_row(c: char) -> String {
 fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11014,7 +11026,7 @@ fn a_success_after_the_429_in_a_replaced_file_drops_the_latch() {
 fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", &[cap.clone(), pad_row('z')]);
     super::tps_producer_tick(now);
@@ -11042,7 +11054,7 @@ fn a_success_after_the_429_in_a_rewritten_file_drops_the_latch() {
 fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11079,7 +11091,7 @@ fn a_success_after_the_429_in_a_cold_re_entered_file_drops_the_latch() {
 fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -11087,7 +11099,9 @@ fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
     assert!(order_row_latched(), "control: the 429 latched");
 
     write_conv(&home, "conv-a", &[cap, ok_row_at(now - 500_000)]);
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     assert!(record.exists(), "control: the fixture's session record");
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
@@ -11113,14 +11127,14 @@ fn a_success_read_while_the_session_record_is_unreadable_drops_the_latch() {
 fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
     assert!(order_row_latched(), "control: the 429 latched");
 
-    seed_session_record(&home, "conv-b", 77_777);
+    seed_session_record(&home, "conv-b", child_pid);
     super::tps_producer_tick(now + 1_000);
     assert_eq!(
         scan_with_b_free(),
@@ -11153,14 +11167,16 @@ fn a_new_conversation_on_the_row_drops_the_old_conversations_latch() {
 fn an_unreadable_session_record_keeps_the_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
     assert!(order_row_latched(), "control: the 429 latched");
 
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     assert!(record.exists(), "control: the fixture's session record");
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
@@ -11179,7 +11195,7 @@ fn an_unreadable_session_record_keeps_the_latch() {
 fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 500_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -11224,7 +11240,7 @@ fn a_uuid_less_429_falls_back_to_stamps_when_a_shrink_drops_its_line() {
 fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let ok = ok_row_at(now - 700_000);
     write_conv(&home, "conv-a", std::slice::from_ref(&ok));
     super::tps_producer_tick(now);
@@ -11266,7 +11282,7 @@ fn an_older_replayed_success_keeps_a_uuid_less_429_latch_after_a_shrink() {
 fn a_scan_that_skips_the_latch_loses_no_position() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, child_pid) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", &[cap.clone(), filler_row()]);
     super::tps_producer_tick(now);
@@ -11276,7 +11292,9 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
     // The shrink re-reads the line in a new life, and this scan never joins
     // the conversation, so it cannot touch the latch.
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
-    let record = home.home().join(".claude/sessions/77777.json");
+    let record = home
+        .home()
+        .join(format!(".claude/sessions/{child_pid}.json"));
     std::fs::remove_file(&record).unwrap();
     super::tps_producer_tick(now + 1_000);
     assert_eq!(scan_with_no_target(), (None, None), "control: no target");
@@ -11287,7 +11305,7 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
 
     // The record returns and a success lands after the 429 in its new life,
     // stamped below it: line order still drops the latch.
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     write_conv(&home, "conv-a", &[cap, ok_row_at(now - 602_000)]);
     super::tps_producer_tick(now + 2_000);
     assert_eq!(
@@ -11306,7 +11324,7 @@ fn a_scan_that_skips_the_latch_loses_no_position() {
 fn the_highest_stamp_across_files_latches_its_429() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     // Main file: the higher-stamped 429 first, the later line (lower stamp)
     // second, then a success after both.
     write_conv(
@@ -11344,7 +11362,7 @@ fn the_highest_stamp_across_files_latches_its_429() {
 #[test]
 fn a_subagent_success_does_not_clear_the_main_loops_429() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11481,7 +11499,7 @@ fn a_fable_session_does_not_walk_home_to_a_capped_soonest_reset_member() {
 #[test]
 fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11542,7 +11560,7 @@ fn an_unknown_demand_session_stays_off_its_capped_gate_off_home_after_a_429_move
 #[test]
 fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11569,7 +11587,7 @@ fn a_later_subagent_success_does_not_mask_the_main_loops_recovery() {
 #[test]
 fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -11644,7 +11662,7 @@ fn the_credit_seen_mark_survives_a_scan_with_the_member_out_of_the_chain() {
 #[test]
 fn the_credit_seen_mark_is_rebuilt_after_a_scheduler_restart() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
@@ -12000,7 +12018,7 @@ fn a_session_that_must_leave_a_serving_sink_takes_a_serving_sibling_before_a_dea
 #[test]
 fn a_session_that_must_leave_a_spend_armed_active_takes_a_refusing_member_with_headroom() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("4242-0", "a");
     row.claude_pid = Some(child_pid);
     row.launch_families = Some(vec!["fable".to_string()]);
@@ -12117,7 +12135,7 @@ fn a_fable_session_skips_two_capped_gate_off_members_for_the_uncapped_third() {
 #[test]
 fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     // A current stint start: the 429 seeded a beat later postdates it, and the
     // reused row below keeps the SAME stint so the `started_at` key matches —
     // only the empty-scan clear then separates the dead session's mark from
@@ -12182,7 +12200,7 @@ fn a_dead_sessions_mark_is_not_inherited_through_an_empty_scan() {
 #[test]
 fn a_non_empty_scan_prunes_the_dead_sessions_latch() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8022-0", "a");
     row.claude_pid = Some(child_pid);
     let marker = register_live_row(&row);
@@ -12263,14 +12281,15 @@ fn an_opus_session_does_not_move_on_another_sessions_429_in_a_shared_conversatio
 #[test]
 fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
     let home = crate::testutil::HomeSandbox::new();
+    let [first_pid, second_pid] = crate::testutil::dead_pids();
     let mut first = session_row("8026-0", "a");
-    first.claude_pid = Some(77_777);
+    first.claude_pid = Some(first_pid);
     let _m1 = register_live_row(&first);
     let mut second = session_row("8027-0", "a");
-    second.claude_pid = Some(88_888);
+    second.claude_pid = Some(second_pid);
     let _m2 = register_live_row(&second);
-    seed_session_record(&home, "conv-a", 77_777);
-    seed_session_record(&home, "conv-b", 88_888);
+    seed_session_record(&home, "conv-a", first_pid);
+    seed_session_record(&home, "conv-b", second_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -12297,7 +12316,7 @@ fn a_second_live_row_on_a_different_conversation_does_not_mask_the_429() {
 #[test]
 fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8028-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12331,7 +12350,7 @@ fn a_joined_429_from_before_the_session_start_does_not_mark_it() {
 #[test]
 fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8029-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12378,7 +12397,7 @@ fn a_429_drained_while_the_member_is_out_of_the_chain_still_marks_the_session() 
 #[test]
 fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8030-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12414,7 +12433,7 @@ fn a_429_does_not_latch_while_the_row_names_the_outgoing_members_store() {
 #[test]
 fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8031-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12448,7 +12467,7 @@ fn a_429_still_moves_after_a_landed_swap_names_the_incoming_store() {
 #[test]
 fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8033-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12480,7 +12499,7 @@ fn a_429_still_moves_when_the_store_names_a_sidecar_that_is_not_on_disk() {
 #[test]
 fn a_429_within_the_in_flight_grace_does_not_latch() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8034-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12512,7 +12531,7 @@ fn a_429_within_the_in_flight_grace_does_not_latch() {
 #[test]
 fn a_429_past_the_in_flight_grace_latches_and_moves() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8035-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -12546,7 +12565,7 @@ fn a_429_past_the_in_flight_grace_latches_and_moves() {
 #[test]
 fn a_latched_429_survives_a_same_member_convergence_restamp() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8032-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -14759,6 +14778,7 @@ fn third_party_state_at_interval(
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -14993,6 +15013,51 @@ fn land_on_a_dead_key(
         before,
         crate::fallback::third_party_key_rejected(profile, &profile.name),
     )
+}
+
+/// A `[proxy]` table clauth cannot read is still a proxy account to the
+/// scheduler: its usage entry keeps today's generic arm, never the whole-pool
+/// read a profile with no table at all takes on the same bind.
+#[test]
+fn an_unreadable_proxy_record_never_targets_the_pool() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["px"]);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a free port");
+    let port = listener.local_addr().expect("local addr").port();
+    let registry = crate::proxy::registry_path().expect("registry path");
+    std::fs::create_dir_all(registry.parent().expect("registry dir")).expect("registry dir");
+    std::fs::write(
+        &registry,
+        format!("[stub]\nport = {port}\nenabled = true\n"),
+    )
+    .expect("write the registry");
+    let name = crate::profile::ProfileName::from("px");
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("clp_stub-key-0".to_string()),
+    );
+    crate::profile::save_profile(&profile).expect("save profile");
+    let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    let mut text = std::fs::read_to_string(&path).expect("config text");
+    text.push_str("\n[proxy]\nservice = \"stub\"\naccount = \"\"\n");
+    std::fs::write(&path, text).expect("write the broken record");
+    assert!(
+        matches!(
+            crate::profile::stored_proxy_claim(&name),
+            crate::profile::ProxyClaim::Unreadable
+        ),
+        "fixture control: the record is unreadable"
+    );
+    let profile = crate::profile::load_profile(&name).expect("load profile");
+    let entry = super::third_party_entry_for(&profile).expect("a third-party entry");
+    assert!(
+        matches!(
+            entry.target,
+            crate::providers::ThirdPartyTarget::Generic { .. }
+        ),
+        "an unreadable record keeps today's generic arm"
+    );
 }
 
 /// Alibaba's usage fetch reads the console session alone, so a live console
@@ -16373,6 +16438,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16471,6 +16537,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -16614,6 +16681,7 @@ fn a_stood_down_mirror_blanks_a_suppressed_endpoint_row_from_its_durable_record(
         kick_blocks: Arc::clone(&app.kick_blocks),
         weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
         claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
         auto_start_queue: Arc::clone(&app.auto_start_queue),
         pending_switch: Arc::clone(&app.pending_switch),
         pending_switch_off: Arc::clone(&app.pending_switch_off),
@@ -16739,6 +16807,7 @@ fn a_stood_down_daemon_publishes_the_durable_auth_expired_verdict() {
         kick_blocks: Arc::clone(&app.kick_blocks),
         weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
         claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
         auto_start_queue: Arc::clone(&app.auto_start_queue),
         pending_switch: Arc::clone(&app.pending_switch),
         pending_switch_off: Arc::clone(&app.pending_switch_off),
@@ -16862,6 +16931,7 @@ fn no_reader_observes_a_refused_name_as_fresh_or_cached_across_standdown_ticks()
         kick_blocks: Arc::clone(&app.kick_blocks),
         weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
         claude_resets_memo: Arc::clone(&app.claude_resets_memo),
+        codex_resets_memo: Arc::clone(&app.codex_resets_memo),
         auto_start_queue: Arc::clone(&app.auto_start_queue),
         pending_switch: Arc::clone(&app.pending_switch),
         pending_switch_off: Arc::clone(&app.pending_switch_off),
@@ -17225,6 +17295,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17339,6 +17410,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17461,6 +17533,7 @@ fn a_rebuilt_entry_partitioned_after_a_bump_still_lands() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17561,6 +17634,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -17683,6 +17757,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: auto_start_queue.clone(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -18299,6 +18374,7 @@ fn completion_order_state() -> super::SchedulerState {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -19202,6 +19278,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -19318,6 +19395,7 @@ fn spawn_refresher_seeds_the_kick_block_of_an_account_without_a_pair() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -19914,6 +19992,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -22651,12 +22730,14 @@ fn tick_refreshes_a_due_codex_chain_under_its_own_spend_marker() {
         })
     };
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
-    // The codex usage leg runs in the same tick: keep it on a refused port.
+    // The codex legs run in the same tick: keep them on a refused port.
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     write_due_codex_chain("cx-tick-own");
 
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(handle.join().expect("join stub"), ["/oauth/token"]);
     assert_eq!(
@@ -22676,6 +22757,7 @@ fn a_shutting_down_tick_leaves_a_due_codex_chain() {
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, "http://127.0.0.1:9");
     let state = third_party_state(stub_ok_stats);
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     write_due_codex_chain("cx-tick-quit");
     state
         .shutting_down
@@ -22683,6 +22765,7 @@ fn a_shutting_down_tick_leaves_a_due_codex_chain() {
 
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert!(
         !codex_attempt_memo_exists("cx-tick-quit"),
@@ -23778,6 +23861,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -24034,6 +24118,7 @@ fn auto_start_queue_election_drops_a_canceled_account_from_the_store_only() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -24173,6 +24258,7 @@ fn auto_start_queue_election_leaves_out_a_plan_with_no_five_hour_limit() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -24327,6 +24413,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -28009,6 +28096,7 @@ fn tps_state(lease: Arc<crate::daemon::FetchLease>) -> super::SchedulerState {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -29551,7 +29639,8 @@ fn due_oauth_state() -> super::SchedulerState {
 }
 
 /// Two codex profiles, due (the process-global poll memo is empty for these
-/// fresh names), pointing at `base` through the codex URL override.
+/// fresh names), pointing at `base` through the two codex URL overrides: the
+/// poll and the banked-reset list share one host in production.
 fn write_codex_due(base: &str) {
     crate::testutil::write_codex_roster(&["qc1", "qc2"]);
     for n in ["qc1", "qc2"] {
@@ -29565,6 +29654,7 @@ fn write_codex_due(base: &str) {
         .expect("auth.json");
     }
     crate::usage::set_codex_usage_url_override(base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(base);
     crate::usage::reset_request_slots();
 }
 
@@ -29661,6 +29751,7 @@ fn a_tick_with_codex_due_under_a_wedge_takes_one_wait() {
     super::tick(&state);
 
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     let _ = server.join().expect("listener");
     drop(holder);
     crate::lock::set_state_lock_timeout_override(None);
@@ -29783,6 +29874,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -29813,6 +29905,7 @@ fn a_tick_with_all_legs_due_under_a_wedge_takes_one_wait() {
 
     let seen = server.join().expect("listener");
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     drop(holder);
     crate::lock::set_state_lock_timeout_override(None);
 
@@ -29942,6 +30035,7 @@ fn a_tick_with_no_codex_due_under_a_wedge_takes_one_wait() {
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         claude_resets_memo: super::new_claude_resets_memo(),
+        codex_resets_memo: super::new_codex_resets_memo(),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -30105,12 +30199,13 @@ fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
     other.follows_chain = false;
     other.claude_pid = Some(other_child.pid());
     let _m1 = register_live_row(&other);
+    let [opus_pid] = crate::testutil::dead_pids();
     let mut opus = session_row("8051-0", "a");
-    opus.claude_pid = Some(88_888);
+    opus.claude_pid = Some(opus_pid);
     opus.launch_families = Some(vec!["opus".to_string()]);
     let _m2 = register_live_row(&opus);
     seed_live_session_record(&home, "conv-a", other_child.pid());
-    seed_session_record(&home, "conv-a", 88_888);
+    seed_session_record(&home, "conv-a", opus_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -30134,11 +30229,12 @@ fn a_non_chain_row_on_the_same_conversation_does_not_move_the_opus_row() {
 fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [opus_pid] = crate::testutil::dead_pids();
     let mut opus = session_row("8052-0", "a");
-    opus.claude_pid = Some(88_888);
+    opus.claude_pid = Some(opus_pid);
     opus.launch_families = Some(vec!["opus".to_string()]);
     let _m = register_live_row(&opus);
-    seed_session_record(&home, "conv-a", 88_888);
+    seed_session_record(&home, "conv-a", opus_pid);
     seed_live_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30161,10 +30257,11 @@ fn an_unregistered_process_on_the_same_conversation_does_not_move_the_opus_row()
 #[test]
 fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
     let home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8055-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     let config = session_config_models(&["a", "b"], &[], &["a"]);
@@ -30214,8 +30311,9 @@ fn a_reused_id_does_not_inherit_the_credit_seen_mark() {
 fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8057-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
     row.intended_member = Some("b".to_string());
     row.chain_cursor = Some(1);
@@ -30227,7 +30325,7 @@ fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
         .find_mut(&crate::profile::ProfileName::from("a"))
         .unwrap()
         .preferred = true;
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_live_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30252,10 +30350,11 @@ fn an_ambiguous_429_sets_no_mark_and_the_row_returns_home() {
 fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8058-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     let sessions = home.home().join(".claude/sessions");
     std::fs::write(
         sessions.join(format!("{}.json", other.pid())),
@@ -30282,7 +30381,7 @@ fn a_live_pid_record_with_a_mismatched_start_does_not_make_the_429_ambiguous() {
 #[test]
 fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8090-0", "a");
     row.claude_pid = Some(child_pid);
     row.started_at = crate::usage::now_ms().saturating_sub(5_000);
@@ -30306,7 +30405,7 @@ fn a_fresh_sessions_own_429_moves_it_without_a_swap() {
 #[test]
 fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8091-0", "a");
     row.claude_pid = Some(child_pid);
     row.started_at = crate::usage::now_ms().saturating_sub(60_000);
@@ -30332,10 +30431,11 @@ fn a_fresh_sessions_own_429_moves_it_a_minute_after_start() {
 #[test]
 fn a_reused_id_on_the_same_member_does_not_fire_the_dead_latch() {
     let home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut old = session_row("8092-0", "a");
-    old.claude_pid = Some(77_777);
+    old.claude_pid = Some(child_pid);
     let marker = register_live_row(&old);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
     scan_sessions(
@@ -30381,10 +30481,11 @@ fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
     let dead_start = crate::testutil::proc_start_of(dead_pid)
         .expect("the zombie's start is still readable before reaping");
     dead.wait().expect("reap");
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8094-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _marker = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     #[cfg(target_os = "linux")]
     {
         let sessions = home.home().join(".claude/sessions");
@@ -30418,7 +30519,7 @@ fn a_dead_pid_record_does_not_make_the_429_ambiguous() {
 #[test]
 fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8095-0", "a");
     row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
@@ -30457,8 +30558,9 @@ fn a_429_inside_the_grace_marks_the_session_and_it_stays() {
 #[test]
 fn an_unmarked_swapped_row_returns_home() {
     let _home = crate::testutil::HomeSandbox::new();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8096-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     row.current_member = Some("b".to_string());
     row.intended_member = Some("b".to_string());
     row.chain_cursor = Some(1);
@@ -30492,10 +30594,11 @@ fn an_unmarked_swapped_row_returns_home() {
 fn a_live_pid_record_with_an_empty_start_does_not_make_the_429_ambiguous() {
     let home = crate::testutil::HomeSandbox::new();
     let other = LiveChild::spawn();
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8197-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     seed_session_record(&home, "conv-a", other.pid());
     seed_spend_cap_transcript(&home, "conv-a");
     tail_transcripts();
@@ -30526,10 +30629,11 @@ fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
     let start = crate::testutil::proc_start_of(gone_pid).expect("the child's start");
     gone.kill().expect("kill");
     gone.wait().expect("reap");
+    let [child_pid] = crate::testutil::dead_pids();
     let mut row = session_row("8198-0", "a");
-    row.claude_pid = Some(77_777);
+    row.claude_pid = Some(child_pid);
     let _m = register_live_row(&row);
-    seed_session_record(&home, "conv-a", 77_777);
+    seed_session_record(&home, "conv-a", child_pid);
     let sessions = home.home().join(".claude/sessions");
     std::fs::write(
         sessions.join(format!("{gone_pid}.json")),
@@ -31016,7 +31120,7 @@ fn the_tps_heartbeat_writes_on_the_first_tick_after_a_step_back() {
 fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -31060,7 +31164,7 @@ fn a_scan_that_returns_early_keeps_the_success_for_the_next_scan() {
 fn a_subagent_success_does_not_drop_the_main_files_latch() {
     let now = crate::usage::now_ms();
     let home = crate::testutil::HomeSandbox::new();
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -33760,7 +33864,7 @@ fn credit_capped_home_moves_launched(
     launch_families: Option<Vec<String>>,
 ) -> usize {
     let home = crate::testutil::HomeSandbox::new();
-    let child_pid = 77_777;
+    let [child_pid] = crate::testutil::dead_pids();
     let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
     {
         let mut cfg = config.lock().unwrap();
@@ -35705,6 +35809,7 @@ fn a_tick_returns_while_one_codex_usage_fetch_hangs() {
     )
     .expect("write auth.json");
     crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&silent.base);
     crate::usage::reset_request_slots();
 
     let state = hung_third_party_state(&[("landed", OK_URL)]);
@@ -35714,6 +35819,7 @@ fn a_tick_returns_while_one_codex_usage_fetch_hangs() {
     super::tick(&state);
     let took = started.elapsed();
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(
         silent.accepted(),
@@ -35774,6 +35880,7 @@ fn a_tick_returns_while_three_codex_usage_fetches_hang() {
         write_codex_account(name);
     }
     crate::usage::set_codex_usage_url_override(&silent.base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&silent.base);
     crate::usage::reset_request_slots();
 
     let state = hung_third_party_state(&[("landed", OK_URL)]);
@@ -35783,6 +35890,7 @@ fn a_tick_returns_while_three_codex_usage_fetches_hang() {
     super::tick(&state);
     let took = started.elapsed();
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
 
     assert_eq!(
         silent.accepted(),
@@ -36738,13 +36846,13 @@ fn a_claude_reset_read_runs_once_an_hour_per_oauth_account() {
             "{name}: g-old + g-week, not the cooling g-cool"
         );
         assert_eq!(
-            body["clears"],
+            body["grants"][1]["clears"],
             serde_json::json!(["five_hour", "seven_day"]),
-            "{name}: the next grant's windows"
+            "{name}: each grant's own windows, the weekly one's here"
         );
         assert!(
-            body["ends_at"].is_null(),
-            "{name}: the next grant names no end"
+            body["grants"][1]["ends_at"].is_null(),
+            "{name}: the weekly grant names no end"
         );
         let stamped = body["fetched_at"].as_u64().expect("stamped");
         assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
@@ -36949,33 +37057,782 @@ fn tick_runs_the_claude_resets_side_read() {
     assert!(file.exists(), "the read landed its file");
 }
 
-/// A read whose next grant the spend path would refuse lands an available
-/// count of 0. Two usable grants sit in the fixture; only `next_grant_id`
-/// moves between the three accounts, one read each.
+// ── the codex reset side read ───────────────────────────────────────────────
+
+/// Production wiring pin for the codex side read: `tick` runs the leg, so a
+/// codex roster account's `limit_resets.json` lands on a real tick (the
+/// cadence tests drive `codex_resets_tick_at` directly and never reach it).
+/// The poll parses its own body, so its matched arm is the one that must let
+/// the same tick's read through.
 #[test]
-fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
+fn tick_runs_the_codex_resets_side_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-tickpin"]);
+    crate::testutil::write_codex_store(
+        "cx-tickpin",
+        &crate::testutil::codex_auth_body("at.cx-tickpin", "rt.cx-tickpin"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(6, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CODEX_RESET_LIST_BODY.to_string())
+            } else {
+                (200, CODEX_SPENT.to_string())
+            }
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    let state = completion_order_state();
+
+    super::tick(&state);
+
+    drop(endpoints);
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    crate::usage::clear_codex_usage_url_override();
+    drop(server.join().expect("listener"));
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the tick ran the leg");
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cx-tickpin"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    assert!(file.exists(), "the read landed its file");
+}
+
+/// The production leg reads ONE codex account a tick: with two accounts due,
+/// the first tick sends one list request and the next tick the other, never
+/// both in one pass. `codex_resets_tick` passes `Some(1)` where the test seam
+/// passes `None`, so a tick-level drive is what binds the production limit.
+#[test]
+fn a_tick_reads_one_due_codex_account_and_the_next_tick_the_other() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx2a", "cx2b"]);
+    for name in ["cx2a", "cx2b"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(&format!("at.{name}"), &format!("rt.{name}")),
+        );
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(8, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    let state = completion_order_state();
+
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "one account read in the first tick"
+    );
+    super::tick(&state);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the other account reads the next tick, never both in one pass"
+    );
+
+    drop(endpoints);
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    crate::usage::clear_codex_usage_url_override();
+    drop(server.join().expect("listener"));
+    for name in ["cx2a", "cx2b"] {
+        let file = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "limit_resets.json",
+        )
+        .expect("path");
+        assert!(file.exists(), "{name}: the read landed its file");
+    }
+}
+
+/// A landed `limit_resets.json` whose `fetched_at` sits inside the hour seeds
+/// a fresh scheduler's memo: the first pass sends no list request, and the
+/// hour runs out at the file's stamp rather than the scheduler's start.
+#[test]
+fn a_landed_codex_reading_inside_the_hour_seeds_a_fresh_scheduler() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxseed"]);
+    crate::testutil::write_codex_store(
+        "cxseed",
+        &crate::testutil::codex_auth_body("at.cxseed", "rt.cxseed"),
+    );
+    let t = 1_900_000_000_000;
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cxseed"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &file,
+        format!(r#"{{"usable":1,"fetched_at":{}}}"#, t - 10 * 60 * 1000),
+    )
+    .expect("write the landed reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The poll answers first, so the account is not held off; the seed is
+    // what must keep the first pass quiet.
+    super::codex_usage_tick(&state);
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "the landed reading's stamp holds the hour on a fresh scheduler"
+    );
+    super::codex_resets_tick_at(&state, t + 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the hour runs out at the file's stamp and the read runs once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(file.exists(), "the read re-landed the file");
+}
+
+/// The due set is computed before the login snapshot: a tick whose codex
+/// accounts all sit inside their hour runs no precondition at all (no
+/// `auth.json` read, no quarantine read), and the first due account pays them
+/// once.
+#[test]
+fn a_tick_inside_every_codex_hour_runs_no_precondition() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxquiet"]);
+    crate::testutil::write_codex_store(
+        "cxquiet",
+        &crate::testutil::codex_auth_body("at.cxquiet", "rt.cxquiet"),
+    );
+    let t = 1_900_000_000_000;
+    let file = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cxquiet"),
+        "limit_resets.json",
+    )
+    .expect("path");
+    std::fs::write(
+        &file,
+        format!(r#"{{"usable":1,"fetched_at":{}}}"#, t - 10 * 60 * 1000),
+    )
+    .expect("write the landed reading");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The poll answers first, so the account is not held off; only the hour
+    // keeps the first pass from reading.
+    super::codex_usage_tick(&state);
+    crate::limit_reset::CODEX_PRECONDITION_RUNS.with(|c| c.set(0));
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        crate::limit_reset::CODEX_PRECONDITION_RUNS.with(std::cell::Cell::get),
+        0,
+        "an account inside its hour pays no login or quarantine read"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "nothing to read yet");
+
+    super::codex_resets_tick_at(&state, t + 60 * 60 * 1000);
+    assert_eq!(
+        crate::limit_reset::CODEX_PRECONDITION_RUNS.with(std::cell::Cell::get),
+        1,
+        "the due account's preconditions run once"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the hour ran out");
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+}
+
+/// The credit-list path the codex side read hits, as the CLI sends it.
+const CODEX_RESET_LIST_PATH: &str = "/backend-api/wham/rate-limit-reset-credits";
+
+/// Two credits: one available, one redeemed. The reading lands `usable` 1
+/// (the count of credits the list marks available, not the body's
+/// `available_count` 2), `banked` 1, and every credit it names.
+const CODEX_RESET_LIST_BODY: &str = r#"{"credits": [
+    {"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"},
+    {"id": "c2", "reset_type": "codex_rate_limits", "status": "redeemed"}
+], "available_count": 2}"#;
+
+/// The codex reset side read runs once an hour per codex roster account with
+/// a stored login: each read lands the credit list in that account's own
+/// `limit_resets.json`, the file the codex rail names each credit from, and a
+/// second tick inside the hour sends no request.
+#[test]
+fn a_codex_reset_read_lands_the_list_once_an_hour() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxr1", "cxr2"]);
+    for name in ["cxr1", "cxr2"] {
+        crate::testutil::write_codex_store(
+            name,
+            &crate::testutil::codex_auth_body(&format!("at.{name}"), &format!("rt.{name}")),
+        );
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(4, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+    let hour = 60 * 60 * 1000;
+    let t = 1_900_000_000_000;
+    let before = crate::usage::now_ms();
+
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "one read per codex account"
+    );
+    super::codex_resets_tick_at(&state, t + hour - 60_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "nothing inside the hour");
+    super::codex_resets_tick_at(&state, t + hour);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        4,
+        "each account again once the hour is up"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    let seen = server.join().expect("listener");
+    let mut bearers: Vec<String> = seen
+        .iter()
+        .filter_map(|r| crate::testutil::request_header(r, "authorization"))
+        .collect();
+    bearers.sort();
+    assert_eq!(
+        bearers,
+        [
+            "Bearer at.cxr1",
+            "Bearer at.cxr1",
+            "Bearer at.cxr2",
+            "Bearer at.cxr2"
+        ],
+        "each read carries its own account's token"
+    );
+    for name in ["cxr1", "cxr2"] {
+        let profile = crate::profile::ProfileName::from(name);
+        let path = crate::profile::profile_subpath(&profile, "limit_resets.json").expect("path");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the read landed"))
+                .expect("json");
+        assert_eq!(
+            body["usable"], 1,
+            "{name}: only the available credit is spendable"
+        );
+        assert_eq!(
+            body["credits"].as_array().expect("the credits").len(),
+            2,
+            "{name}: every credit the list names"
+        );
+        let stamped = body["fetched_at"].as_u64().expect("stamped");
+        assert!(stamped >= before, "{name}: stamped by the read, epoch ms");
+        let usage =
+            crate::profile::profile_subpath(&profile, super::USAGE_CACHE_FILE).expect("path");
+        assert!(
+            !usage.exists(),
+            "{name}: the side read writes no usage cache"
+        );
+    }
+}
+
+/// A codex login that moved since the read was spawned lands nothing: the
+/// lander re-reads `auth.json` under the state flock, so the old account's
+/// credit list never lands under the new account's login.
+#[test]
+fn a_codex_reset_read_across_an_account_change_lands_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxm"]);
+    let name = crate::profile::ProfileName::from("cxm");
+    crate::testutil::write_codex_store(
+        "cxm",
+        r#"{"tokens":{"access_token":"tok-a","account_id":"account-a"}}"#,
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    // A codex login to account B lands after the read, before the compare.
+    super::set_codex_compare_hook("cxm", |n| {
+        let p = crate::profile::profile_subpath(n, "auth.json").expect("path");
+        std::fs::write(
+            &p,
+            r#"{"tokens":{"access_token":"tok-b","account_id":"account-b"}}"#,
+        )
+        .expect("rewrite auth.json");
+    });
+    let state = completion_order_state();
+
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the read ran");
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "the old account's list must not land"
+    );
+}
+
+/// A refused codex list read stamps the back-off: the account gets no second
+/// request inside it, and no file, while a later pass reads again once the gap
+/// is out.
+#[test]
+fn a_refused_codex_reset_read_stamps_the_backoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx429"]);
+    crate::testutil::write_codex_store(
+        "cx429",
+        &crate::testutil::codex_auth_body("at.cx429", "rt.cx429"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (
+                    429,
+                    vec![("retry-after".to_string(), "2".to_string())],
+                    String::new(),
+                )
+            } else {
+                (200, Vec::new(), String::new())
+            }
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+    let t = 1_900_000_000_000;
+
+    super::codex_resets_tick_at(&state, t);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first read");
+    super::codex_resets_tick_at(&state, t + 60_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "no second request inside the back-off"
+    );
+    super::codex_resets_tick_at(&state, t + 2 * 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the gap out, the account reads again"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    let name = crate::profile::ProfileName::from("cx429");
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "a refused read lands no file"
+    );
+}
+
+/// A quarantined codex login gets no reset read: the leg runs the CLI's own
+/// refusals before anything leaves the machine, so a dead chain costs no
+/// request and lands no file.
+#[test]
+fn a_quarantined_codex_login_gets_no_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cxq"]);
+    crate::testutil::write_codex_store(
+        "cxq",
+        &crate::testutil::codex_auth_body("at.cxq", "rt.cxq"),
+    );
+    crate::codex_auth::quarantine_for_test("cxq", "reused", "rt.cxq");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(1, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "nothing leaves the machine"
+    );
+
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    let name = crate::profile::ProfileName::from("cxq");
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::profile_cache::LIMIT_RESETS_FILE)
+            .is_some_and(|p| p.exists()),
+        "a quarantined chain lands no file"
+    );
+}
+
+/// A codex poll that got no answer stamps the poll memo's `answered: false`
+/// flag, and the side read skips that account without a list request or a
+/// stamp while it stands; once a later poll answers, the next pass reads the
+/// list once.
+#[test]
+fn a_codex_poll_that_got_no_answer_holds_off_the_reset_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-na"]);
+    crate::testutil::write_codex_store(
+        "cx-na",
+        &crate::testutil::codex_auth_body("at.cx-na", "rt.cx-na"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // A refused connection is the no-answer outcome the record is about, and
+    // it ends the poll at once instead of an 8 s stall.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-na"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the no-answer poll stamped the memo's hold-off flag"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "no list request while the poll's last outcome is no answer"
+    );
+    let memo = state.codex_resets_memo.lock().unwrap();
+    assert!(
+        memo.last_read_at.is_empty() && memo.due.is_empty() && memo.retry.is_empty(),
+        "the held-off account's memo stays unstamped"
+    );
+    drop(memo);
+
+    // A later poll answers and clears the flag; the next pass reads once.
+    super::forget_codex_polled("cx-na");
+    crate::usage::set_codex_usage_url_override(&base);
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-na"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the answered poll overwrote the memo's hold-off flag"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000 + 60 * 60 * 1000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the cleared hold reads the list once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-na"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// Control: an account whose codex poll answered this pass carries no
+/// hold-off flag, so the side read's same-pass read runs as it did before the
+/// hold-off existed.
+#[test]
+fn a_codex_poll_that_answered_reads_the_list_in_the_same_pass() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-ctl"]);
+    crate::testutil::write_codex_store(
+        "cx-ctl",
+        &crate::testutil::codex_auth_body("at.cx-ctl", "rt.cx-ctl"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, CODEX_RESET_LIST_BODY.to_string())
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::set_codex_usage_url_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-ctl"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the answered poll stamped the memo's answered flag, not a hold-off"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the answered account read in the same pass"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-ctl"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// A poll answering a status after a no-answer poll clears the hold-off: the
+/// answering poll overwrites the memo's flag with `answered: true` (a 429 is
+/// an answer — the host responded), so the next side-read pass reads the list
+/// once instead of staying held off until a 200.
+#[test]
+fn a_later_poll_answering_429_clears_the_no_answer_holdoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-429a"]);
+    crate::testutil::write_codex_store(
+        "cx-429a",
+        &crate::testutil::codex_auth_body("at.cx-429a", "rt.cx-429a"),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, {
+        let reads = Arc::clone(&reads);
+        move |path, _| {
+            if path.ends_with(CODEX_RESET_LIST_PATH) {
+                reads.fetch_add(1, Ordering::SeqCst);
+                (200, CODEX_RESET_LIST_BODY.to_string())
+            } else {
+                (429, String::new())
+            }
+        }
+    });
+    crate::usage::codex_reset::set_codex_reset_list_origin_override(&base);
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    // The no-answer poll stamps the hold-off flag.
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-429a"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the no-answer poll held the account off"
+    );
+    // The 429-answering poll overwrites the flag; it must be due, so the
+    // cadence is forgotten first.
+    super::forget_codex_polled("cx-429a");
+    crate::usage::set_codex_usage_url_override(&base);
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-429a"))
+            .map(|poll| poll.answered),
+        Some(true),
+        "the 429-answering poll cleared the hold-off"
+    );
+    super::codex_resets_tick_at(&state, 1_900_000_000_000);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the cleared hold reads the list once"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
+    drop(server.join().expect("listener"));
+    assert!(
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("cx-429a"),
+            crate::profile_cache::LIMIT_RESETS_FILE
+        )
+        .is_some_and(|p| p.exists()),
+        "the read landed the account's file"
+    );
+}
+
+/// A no-answer poll writes the hold-off on the poll's own cadence memo only:
+/// the shared StatusStore gains no `Failed` entry under the codex name, so
+/// the claude surfaces reading that store never see a codex poll's failure.
+#[test]
+fn a_no_answer_poll_writes_no_failed_status_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx-nas"]);
+    crate::testutil::write_codex_store(
+        "cx-nas",
+        &crate::testutil::codex_auth_body("at.cx-nas", "rt.cx-nas"),
+    );
+    crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::reset_request_slots();
+    let state = completion_order_state();
+
+    super::codex_usage_tick(&state);
+    assert_eq!(
+        super::CODEX_POLLED_AT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|seen| seen.get("cx-nas"))
+            .map(|poll| poll.answered),
+        Some(false),
+        "the hold-off rides the poll's own memo"
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("cx-nas"),
+        None,
+        "no Failed entry reaches the shared StatusStore"
+    );
+
+    crate::usage::clear_codex_usage_url_override();
+}
+
+/// A read lands the count of every grant a spend of its id would send, and
+/// 0 where no grant is one: which grant the server would spend next moves
+/// nothing. Two usable grants sit in the fixture; one account reads it with no
+/// next grant, one with a cooling one named next, and one with every grant
+/// marked unusable, one read each.
+#[test]
+fn a_claude_reset_read_lands_the_count_a_spend_by_id_would_use() {
     let home = crate::testutil::HomeSandbox::new();
     let none = save_unanchored_login("lr4n", "lr4n-tok");
     let cooling = save_unanchored_login("lr4c", "lr4c-tok");
-    let usable = save_unanchored_login("lr4u", "lr4u-tok");
+    let unusable = save_unanchored_login("lr4u", "lr4u-tok");
     crate::testutil::register_names(&["lr4n", "lr4c", "lr4u"]);
     let (base, server) = crate::testutil::serve_endpoints_by_request(4, |raw, _| {
-        let next = match crate::testutil::request_header(raw, "authorization").as_deref() {
-            Some("Bearer lr4n-tok") => r#""next_grant_id": null"#,
-            Some("Bearer lr4c-tok") => r#""next_grant_id": "g-cool""#,
-            _ => r#""next_grant_id": "g-week""#,
+        let body = match crate::testutil::request_header(raw, "authorization").as_deref() {
+            Some("Bearer lr4n-tok") => CEDAR_EMBER_THREE_GRANTS.replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": null"#,
+                1,
+            ),
+            Some("Bearer lr4c-tok") => CEDAR_EMBER_THREE_GRANTS.replacen(
+                r#""next_grant_id": "g-week""#,
+                r#""next_grant_id": "g-cool""#,
+                1,
+            ),
+            _ => {
+                CEDAR_EMBER_THREE_GRANTS.replace(r#""usable_now": true"#, r#""usable_now": false"#)
+            }
         };
-        let body = CEDAR_EMBER_THREE_GRANTS.replacen(r#""next_grant_id": "g-week""#, next, 1);
         (200, Vec::new(), body)
     });
     let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let state = resets_state(vec![none, cooling, usable]);
+    let state = resets_state(vec![none, cooling, unusable]);
 
     super::claude_resets_tick_at(&state, 1_900_000_000_000);
 
     drop(endpoints);
     let _ = server.join().expect("listener");
-    for (name, want) in [("lr4n", 0), ("lr4c", 0), ("lr4u", 2)] {
+    for (name, want) in [("lr4n", 2), ("lr4c", 2), ("lr4u", 0)] {
         let path = crate::profile::profile_subpath(
             &crate::profile::ProfileName::from(name),
             "limit_resets.json",
@@ -36986,6 +37843,11 @@ fn a_claude_reset_read_lands_zero_where_the_spend_would_refuse() {
                 .expect("json");
         assert_eq!(body["usable"], want, "{name}");
         assert_eq!(body["banked"], 3, "{name}: every grant left, usable or not");
+        assert_eq!(
+            body["grants"].as_array().map(Vec::len),
+            Some(3),
+            "{name}: every grant the read listed"
+        );
     }
 }
 
@@ -39932,7 +40794,7 @@ fn a_session_scan_under_a_spent_ticket_records_no_credit_refusal() {
     let config = session_config_models(&["a", "b"], &[], &[]);
     let store = credit_store(&["a", "b"], &["a", "b"]);
     let status = all_fresh(&["a", "b"]);
-    let _marker = spend_cap_order_row(&home);
+    let (_marker, _) = spend_cap_order_row(&home);
     let cap = spend_cap_row_uuid_at(now - 600_000, "cap-1");
     write_conv(&home, "conv-a", std::slice::from_ref(&cap));
     super::tps_producer_tick(now);
@@ -40919,6 +41781,7 @@ fn the_refresher_starts_the_watchdog_on_the_states_lease_and_stamps_each_tick() 
         crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         super::new_claude_resets_memo(),
+        super::new_codex_resets_memo(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -41168,6 +42031,7 @@ fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
     let (addr, handle) = crate::testutil::serve_endpoints(2, |_path, _i| (404, "{}".to_string()));
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
     crate::usage::set_codex_usage_url_override("http://127.0.0.1:9");
+    crate::usage::codex_reset::set_codex_reset_list_origin_override("http://127.0.0.1:9");
     crate::testutil::write_codex_roster(&["cx-belt-kept"]);
     crate::testutil::write_codex_store(
         "cx-belt-kept",
@@ -41178,6 +42042,7 @@ fn a_tick_that_kept_the_lease_writes_the_codex_belt() {
     );
     super::tick(&state);
     crate::usage::clear_codex_usage_url_override();
+    crate::usage::codex_reset::clear_codex_reset_list_origin_override();
     let _ = handle.join();
     let belt = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-belt-kept"))
         .expect("dir")

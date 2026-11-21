@@ -413,6 +413,57 @@ fn what_a_newer_build_wrote_survives_a_rewrite() {
     assert_eq!(found.tier, Tier::Unknown("readonly".to_string()));
 }
 
+// ── the flush after a write ─────────────────────────────────────────────────
+
+/// The flush's own failure, planted in place of the directory's sync, fails
+/// the store write instead of reporting a landed one: a swallow of the sync's
+/// result cannot ship green. Runs as root too, where the chmod fixture below
+/// skips.
+#[cfg(unix)]
+#[test]
+fn a_planted_directory_sync_fault_fails_the_store_write() {
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    fail_next_dir_sync(&path);
+    let err = seed_for_tests("phone", Tier::View, TOKEN)
+        .expect_err("the planted directory sync failure propagates");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("failed to flush"), "{rendered}");
+    assert!(
+        rendered.contains("planted directory sync fault"),
+        "{rendered}"
+    );
+}
+
+/// The atomic writer already synced the store's bytes, so the flush after it
+/// is the directory entry alone: a store file this process could no longer
+/// open for writing still flushes, and a directory it cannot read still fails
+/// the flush.
+#[cfg(unix)]
+#[test]
+fn the_flush_after_a_store_write_syncs_the_directory_not_the_file() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    let dir = path.parent().expect("parent").to_path_buf();
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    if std::fs::metadata(&dir).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any directory");
+        return;
+    }
+    std::fs::write(&path, b"{}").expect("plant the store");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+
+    sync_to_disk(&path).expect("the flush needs no writable file");
+
+    let mode = std::fs::metadata(&dir).expect("mode").permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("drop read");
+    let flushed = sync_to_disk(&path);
+    std::fs::set_permissions(&dir, mode).expect("restore");
+    let err = flushed.expect_err("a directory it cannot read fails the flush");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
 // ── legacy import ───────────────────────────────────────────────────────────
 
 /// The upgrade path: the bytes the tray already holds authenticate as the

@@ -2528,6 +2528,7 @@ fn remembered(days: u64, question_open: bool) -> crate::retention::Retention {
     crate::retention::Retention {
         days: Some(days),
         question_open,
+        spawn_files: std::collections::BTreeMap::new(),
     }
 }
 

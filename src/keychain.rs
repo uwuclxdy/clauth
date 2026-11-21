@@ -1351,7 +1351,7 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
         SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // A locked keychain's read exits 36 with nothing on stderr
-            // (measured 2026-10-29 on mac-6), so the classification's literal
+            // (measured 2026-10-29 on macOS), so the classification's literal
             // names the cause the empty bytes cannot.
             let shown = match (op, stderr.trim(), class.cause()) {
                 (SecurityOp::Read, "", Some(cause)) => cause,

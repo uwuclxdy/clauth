@@ -20,7 +20,7 @@ use super::panes::{
 };
 use super::routes::{ApiContext, Caller, ErrorBody};
 #[cfg(unix)]
-use crate::daemon::bridge::{PromptDelivery, PromptRefusal};
+use crate::daemon::bridge::{AskOutcome, PromptDelivery, PromptRefusal};
 use crate::logline::logline;
 
 /// The one field `POST /api/v1/panes/{id}/prompt` accepts.
@@ -342,6 +342,9 @@ const ANSWER_UNKNOWN_QUESTION: &str =
     "each answer and note must name one of the ask's questions by its exact text.";
 #[cfg(unix)]
 const ANSWER_EMPTY: &str = "each answer must be a non-empty string.";
+#[cfg(unix)]
+const NOTES_UNSUPPORTED: &str =
+    "this session's mod predates notes and would drop them; send the answers without notes.";
 
 /// Where the herdr fallback landed for one session id.
 enum PaneFallback {
@@ -674,7 +677,7 @@ fn all_strings(map: &serde_json::Map<String, serde_json::Value>) -> bool {
     request_body = AnswerBody,
     responses(
         (status = 200, description = "the answer reached the session's live mod and closes the ask", body = AnswerOk),
-        (status = 400, description = "the body names neither, or both, of decision and answers (a null names neither), a decision other than allow or deny, notes without answers or beside a decision, an answers or notes that is neither an object nor null, an answers object with no entry, or an answer or note that is not a string (`bad_request`); a decision sent to a question ask, or answers sent to any other ask (`answer_wrong_form`); an answer or non-empty note keyed by anything but one of the ask's questions' exact texts, byte for byte (`answer_unknown_question`); an empty answer (`answer_empty`). Nothing is queued and the ask stays open", body = ErrorBody),
+        (status = 400, description = "the body names neither, or both, of decision and answers (a null names neither), a decision other than allow or deny, notes without answers or beside a decision, an answers or notes that is neither an object nor null, an answers object with no entry, or an answer or note that is not a string (`bad_request`); a decision sent to a question ask, or answers sent to any other ask (`answer_wrong_form`); an answer or non-empty note keyed by anything but one of the ask's questions' exact texts, byte for byte (`answer_unknown_question`); an empty answer (`answer_empty`); a non-empty note to a session whose live mod does not declare the notes capability, which would drop it (`notes_unsupported`). Nothing is queued and the ask stays open", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "no live session with that id (`session_not_live`), or no open ask with that id (`ask_not_found`)", body = ErrorBody),
@@ -730,7 +733,7 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
     {
         if let Some(hub) = &ctx.bridge {
             match hub.answer(id, ask, command) {
-                crate::daemon::bridge::AskOutcome::Queued => {
+                AskOutcome::Queued => {
                     logline!(
                         "clauth api: device '{}' answered ask '{}' on session '{}' {}",
                         caller.device_for_log(),
@@ -740,7 +743,7 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::serialize(200, &AnswerOk { ok: true });
                 }
-                crate::daemon::bridge::AskOutcome::Ambiguous => {
+                AskOutcome::Ambiguous => {
                     logline!(
                         "clauth api: device '{}' refused on session '{}': ambiguous",
                         caller.device_for_log(),
@@ -748,7 +751,7 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::refused(409, "session_ambiguous", SESSION_AMBIGUOUS);
                 }
-                crate::daemon::bridge::AskOutcome::Busy => {
+                AskOutcome::Busy => {
                     logline!(
                         "clauth api: device '{}' refused on session '{}': busy",
                         caller.device_for_log(),
@@ -756,26 +759,29 @@ pub(crate) fn session_answer(ctx: &ApiContext, req: &Request, caller: &Caller<'_
                     );
                     return Response::refused(503, "session_busy", SESSION_BUSY);
                 }
-                crate::daemon::bridge::AskOutcome::WrongForm => {
+                AskOutcome::WrongForm => {
                     return Response::refused(400, "answer_wrong_form", ANSWER_WRONG_FORM);
                 }
-                crate::daemon::bridge::AskOutcome::UnknownQuestion => {
+                AskOutcome::UnknownQuestion => {
                     return Response::refused(
                         400,
                         "answer_unknown_question",
                         ANSWER_UNKNOWN_QUESTION,
                     );
                 }
-                crate::daemon::bridge::AskOutcome::EmptyAnswer => {
+                AskOutcome::EmptyAnswer => {
                     return Response::refused(400, "answer_empty", ANSWER_EMPTY);
                 }
-                crate::daemon::bridge::AskOutcome::AskClosed => {
+                AskOutcome::NotesUnsupported => {
+                    return Response::refused(400, "notes_unsupported", NOTES_UNSUPPORTED);
+                }
+                AskOutcome::AskClosed => {
                     return Response::refused(409, "ask_closed", ASK_CLOSED);
                 }
-                crate::daemon::bridge::AskOutcome::AskNotFound => {
+                AskOutcome::AskNotFound => {
                     return Response::refused(404, "ask_not_found", ASK_NOT_FOUND);
                 }
-                crate::daemon::bridge::AskOutcome::NoSession => {
+                AskOutcome::NoSession => {
                     return Response::refused(404, "session_not_live", ASK_NOT_LIVE);
                 }
             }

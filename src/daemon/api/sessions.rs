@@ -10,6 +10,7 @@
 //! needs a clauth release, and the clients hand-model what they render.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -87,10 +88,17 @@ pub(crate) struct SessionRow {
     /// reaches the session (`via == ["mod"]`); empty otherwise.
     #[schema(required = false)]
     lacks: Vec<String>,
+    /// The capabilities the session's live mod declared (`notes` today: it
+    /// applies an answer's notes); empty without a live mod, or once every
+    /// instance on the id is ending (`via` still lists `mod`: an ending
+    /// instance takes no more answers). Two live mods on one id list only what
+    /// both declared.
+    #[schema(required = false)]
+    caps: Vec<String>,
 }
 
 impl SessionRow {
-    fn new(info: SessionInfo, labels: Labels, (via, lacks): (Vec<String>, Vec<String>)) -> Self {
+    fn new(info: SessionInfo, labels: Labels, Reach { via, lacks, caps }: Reach) -> Self {
         Self {
             id: info.id,
             last_ran_profile: info.last_ran_profile,
@@ -106,8 +114,17 @@ impl SessionRow {
             },
             via,
             lacks,
+            caps,
         }
     }
+}
+
+/// How a command reaches one listed session: [`SessionRow`]'s `via`, `lacks`
+/// and `caps`.
+struct Reach {
+    via: Vec<String>,
+    lacks: Vec<String>,
+    caps: Vec<String>,
 }
 
 /// `GET /api/v1/sessions/{id}`'s answer.
@@ -207,7 +224,7 @@ fn limit_param(req: &Request, default: usize, max: usize) -> Option<usize> {
         ("before" = Option<String>, Query, description = "the `next_before` of an earlier page; absent for the newest page")
     ),
     responses(
-        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach, its `title` and `git_branch` (both `null` when the tail window holds none), at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
+        (status = 200, description = "a page of the Claude Code transcript index across the shared store and every live isolated store, newest first, previews redacted like `clauth sessions --json`; each row also carries its `via`/`lacks` reach and the `caps` its live mod declared, its `title` and `git_branch` (both `null` when the tail window holds none), at the cost of one `herdr pane list` at 2 s per request", body = SessionsBody),
         (status = 400, description = "a limit outside 1..=200, or a before that no earlier page issued (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
@@ -252,7 +269,7 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
     };
     // The reach inputs, each at most one bounded call per listing: the bridge's
     // live instances, and one `herdr pane list` through the seam.
-    let mod_ids = mod_session_ids(ctx);
+    let mod_sessions = mod_sessions(ctx);
     let pane_ids = herdr_session_ids(ctx);
     Response::serialize(
         200,
@@ -261,7 +278,7 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
             sessions: page
                 .into_iter()
                 .map(|(info, labels)| {
-                    let reach = reach(&mod_ids, &pane_ids, &info.id);
+                    let reach = reach(&mod_sessions, &pane_ids, &info.id);
                     SessionRow::new(info, labels, reach)
                 })
                 .collect(),
@@ -270,25 +287,34 @@ pub(crate) fn sessions(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Respo
     )
 }
 
-/// The session ids a live mod instance holds, from the bridge's own table.
-/// Empty on platforms with no bridge (Windows).
-fn mod_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
+/// The session ids a live mod instance holds, each with the capability names
+/// its live mods declared, from the bridge's own table. An id whose only
+/// instances are ending keeps its entry with no names, so the row still reads
+/// `mod`. Empty on platforms with no bridge (Windows).
+fn mod_sessions(ctx: &ApiContext) -> HashMap<String, Vec<String>> {
     #[cfg(unix)]
     {
         if let Some(hub) = &ctx.bridge {
-            return hub.live_session_ids().into_iter().collect();
+            return hub
+                .live_session_caps()
+                .into_iter()
+                .map(|(id, caps)| {
+                    let names = crate::daemon::bridge::Cap::names(&caps);
+                    (id, names.into_iter().map(str::to_string).collect())
+                })
+                .collect();
         }
     }
     #[cfg(not(unix))]
     let _ = ctx;
-    std::collections::HashSet::new()
+    HashMap::new()
 }
 
 /// The session ids a live herdr pane joins on, through at most one bounded
 /// `herdr pane list` call. herdr absent or unanswerable reads as no pane.
-fn herdr_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
+fn herdr_session_ids(ctx: &ApiContext) -> HashSet<String> {
     let Ok(panes) = super::panes::listed_panes(ctx) else {
-        return std::collections::HashSet::new();
+        return HashSet::new();
     };
     panes
         .into_iter()
@@ -296,22 +322,24 @@ fn herdr_session_ids(ctx: &ApiContext) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// One row's `via`/`lacks`: `via` is the sorted reach set, and `lacks` names the
-/// surfaces missing when the mod alone reaches the session (SB-12, MB-7).
+/// One row's reach: `via` is the sorted reach set, `lacks` names the surfaces
+/// missing when the mod alone reaches the session (SB-12, MB-7), and `caps`
+/// what its live mod declared.
 fn reach(
-    mod_ids: &std::collections::HashSet<String>,
-    pane_ids: &std::collections::HashSet<String>,
+    mod_sessions: &HashMap<String, Vec<String>>,
+    pane_ids: &HashSet<String>,
     id: &str,
-) -> (Vec<String>, Vec<String>) {
+) -> Reach {
+    let mod_caps = mod_sessions.get(id);
     let mut via = Vec::new();
-    if mod_ids.contains(id) {
+    if mod_caps.is_some() {
         via.push("mod".to_string());
     }
     if pane_ids.contains(id) {
         via.push("herdr".to_string());
     }
     via.sort();
-    let lacks = if via == ["mod".to_string()] {
+    let lacks = if via == ["mod"] {
         ["terminal_mirror", "engine_dialogs", "plan_approval"]
             .into_iter()
             .map(str::to_string)
@@ -319,7 +347,11 @@ fn reach(
     } else {
         Vec::new()
     };
-    (via, lacks)
+    Reach {
+        via,
+        lacks,
+        caps: mod_caps.cloned().unwrap_or_default(),
+    }
 }
 
 /// `GET /api/v1/sessions/{id}` — a page of one transcript's records, paged

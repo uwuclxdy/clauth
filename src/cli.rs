@@ -194,25 +194,29 @@ pub(crate) enum Command {
         profile: String,
     },
 
-    /// Spend one of a codex or Claude Code account's banked usage-limit resets
+    /// List a codex or Claude Code account's banked usage-limit resets, or spend one
     ///
-    /// Reopens that account's usage windows now, the reset codex's own `/usage`
-    /// menu offers, or a claude grant Claude Code's own `/limit-reset` offers.
-    /// Prompts `[y/N]` naming the reset it will use (codex: a `codex_rate_limits`
-    /// reset first, then the one that expires first; claude: the grant the
-    /// server names next) unless `--yes`, which a spend on a non-TTY stdin or
-    /// stdout must pass: a used reset cannot be given back. `--list` shows the
-    /// account's resets, spends nothing and never prompts. Uses the profile's
-    /// stored login as it stands and never refreshes it.
+    /// With no id, prints the account's resets as a table, one row per reset
+    /// under the id that spends it, and spends nothing. With an id, spends that
+    /// reset (a codex reset codex's own `/usage` menu offers, or a claude grant
+    /// Claude Code's own `/limit-reset` offers), reopening the windows it covers
+    /// now; nothing picks a reset for you. Prompts `[y/N]` naming the reset
+    /// unless `--yes`, which a spend on a non-TTY stdin or stdout must pass: a
+    /// used reset cannot be given back. While a spend whose answer never
+    /// arrived can still be re-sent, only its own id is accepted, and naming it
+    /// re-sends that request. Uses the profile's stored login as it stands and
+    /// never refreshes it.
     #[command(name = "limit-reset")]
     LimitReset {
-        /// Codex or Claude Code profile to reset.
+        /// Codex or Claude Code profile whose resets to list or spend.
         profile: String,
-        /// Show the account's resets and which one would be used; spend none.
-        #[arg(long, conflicts_with = "yes")]
+        /// The id of the reset to spend, as the listing names it.
+        id: Option<String>,
+        /// List the account's resets and spend none, as with no id.
+        #[arg(long, conflicts_with_all = ["yes", "id"])]
         list: bool,
         /// Skip the confirm prompt. Required on a non-TTY stdin or stdout.
-        #[arg(long, short = 'y')]
+        #[arg(long, short = 'y', requires = "id")]
         yes: bool,
     },
 
@@ -425,6 +429,15 @@ pub(crate) enum Command {
             ]
         )]
         dump_openapi: bool,
+        /// The restart-handover probe's answer, before anything else runs: a
+        /// replacement that will serve the API (`--listen` given and
+        /// `CLAUTH_NO_API` unset) loads its certificate first, then prints the
+        /// handover token and exits 0, or the cert-refused marker with the
+        /// reason and exits 1. Hidden: it is the daemon's probe protocol, never
+        /// a user flag, so it stays out of --help and the hand-written
+        /// completions.
+        #[arg(long = "__exec-handover", hide = true)]
+        exec_handover: bool,
     },
 
     /// Pair, list, grant sessions to, and revoke the devices that may call the
@@ -484,6 +497,19 @@ pub(crate) enum Command {
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCommand,
+    },
+
+    /// Set the Rex plugin up, or take it back out
+    ///
+    /// `clauth rex install` writes the plugin bundled in this binary to
+    /// `clauth/` beside Rex's `init.lua` and appends one marked
+    /// `require("clauth")` block that loads it. The plugin opens Claude Code
+    /// through `clauth start`, shows the dashboard in a floating pane, and
+    /// labels each pane with the account it spends. Rex support is experimental.
+    /// `clauth rex uninstall` takes the block and the files back out.
+    Rex {
+        #[command(subcommand)]
+        cmd: RexCommand,
     },
 
     /// Work with clauth-compatible proxies
@@ -847,6 +873,30 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth rex <cmd>`: install and uninstall the Rex plugin.
+#[derive(Subcommand, Debug)]
+pub(crate) enum RexCommand {
+    /// Write the plugin beside Rex's init.lua and load it
+    ///
+    /// Rerun it after upgrading clauth to refresh the plugin files. A plugin
+    /// directory clauth did not write, or a symlink onto a checkout, refuses
+    /// the install rather than being overwritten.
+    Install {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Remove the plugin and the block install added to init.lua
+    Uninstall {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 

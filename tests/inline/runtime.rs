@@ -4716,7 +4716,8 @@ fn a_shared_build_from_a_keyless_operator_file_puts_the_remembered_number_back()
             crate::retention::load().expect("load"),
             crate::retention::Retention {
                 days: Some(3650),
-                question_open: true
+                question_open: true,
+                spawn_files: std::collections::BTreeMap::new()
             }
         );
     });
@@ -9105,17 +9106,21 @@ fn unfinished_under_fails_closed_under_a_global_mid_create_store() {
             .expect("mkdir the record-less dir");
 
         let jobs = crate::claude_jobs::job_trees();
-        let store = match jobs.unfinished_under(&profiles.join("anyaccount")) {
-            Err(store) => store,
+        let refusal = match jobs.unfinished_under(&profiles.join("anyaccount")) {
+            Err(refusal) => refusal,
             Ok(trees) => panic!(
                 "a global mid-create store must fail the rotation term closed, got {trees:?}"
             ),
         };
         assert_eq!(
-            store,
+            refusal.store,
             std::path::PathBuf::from("~/.claude/jobs"),
             "the refusal names the conventional global store, as every other \
              global-store refusal spells it"
+        );
+        assert_eq!(
+            refusal.stuck_dir, None,
+            "a mid-create dir clears on its own"
         );
     });
 }
@@ -9191,7 +9196,10 @@ fn a_fresh_staged_record_in_an_old_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a record staged inside the grace is still a creation in flight"
         );
         assert!(
@@ -9219,7 +9227,10 @@ fn a_minute_old_empty_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a minute-old mid-create dir is a creation in flight and fails closed"
         );
         assert!(
@@ -9279,7 +9290,10 @@ fn a_future_dated_empty_job_dir_still_blocks_rotation() {
         let jobs = crate::claude_jobs::job_trees();
         assert_eq!(
             jobs.unfinished_under(&profiles.join("anyaccount")),
-            Err(std::path::PathBuf::from("~/.claude/jobs")),
+            Err(crate::claude_jobs::StoreRefusal {
+                store: std::path::PathBuf::from("~/.claude/jobs"),
+                stuck_dir: None,
+            }),
             "a future-dated mid-create dir cannot prove it is old and must fail closed"
         );
         assert!(
@@ -17160,6 +17174,59 @@ fn fake_convergence_breaks_a_full_tie_by_the_boundarys_prior() {
     );
 }
 
+/// Every arm that writes the STORE lands through the synced owner-only
+/// writer: a sync fault planted on the store's path fails the converge and
+/// leaves the store's bytes as they were. The session-side copy keeps the
+/// unsynced mirror, so the same fault on the copy's path does not stop a
+/// store→copy converge.
+#[test]
+fn fake_convergence_writes_the_store_through_the_synced_writer() {
+    crate::profile::sync_in_tests();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store.json");
+    let copy = tmp.path().join("copy.json");
+    let store_bytes = stamped_auth("2026-09-16T10:00:00Z", "rt.store");
+    let copy_bytes = stamped_auth("2026-09-16T11:00:00Z", "rt.copy");
+
+    // The `copy_wins` arm: the session rotated later, so the store takes the
+    // copy's bytes through a synced write whose planted failure keeps the
+    // store's old bytes.
+    fs::write(&store, &store_bytes).expect("write store");
+    fs::write(&copy, &copy_bytes).expect("write copy");
+    crate::profile::fail_next_sync(&store);
+    let err = converge_fake_codex_auth(&store, &copy, ConvergePrior::Build)
+        .expect_err("the store write's planted sync failure propagates");
+    assert!(format!("{err:#}").contains("planted sync fault"), "{err:#}");
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        store_bytes.as_bytes(),
+        "a failed store sync keeps the store's old bytes"
+    );
+
+    // The store-only arm writes the store too.
+    fs::remove_file(&store).expect("remove store");
+    crate::profile::fail_next_sync(&store);
+    let err = converge_fake_codex_auth(&store, &copy, ConvergePrior::Build)
+        .expect_err("the store-only arm's planted sync failure propagates");
+    assert!(format!("{err:#}").contains("planted sync fault"), "{err:#}");
+    assert!(!store.exists(), "a failed store sync leaves no store");
+
+    // The mirror stays unsynced: the same fault on the copy's path never
+    // fires on a store→copy converge, which keeps [`copy_file`]'s unsynced
+    // publish.
+    let store_bytes2 = stamped_auth("2026-09-16T12:00:00Z", "rt.store2");
+    fs::write(&store, &store_bytes2).expect("write store");
+    fs::write(&copy, &copy_bytes).expect("write copy");
+    crate::profile::fail_next_sync(&copy);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Teardown)
+        .expect("the session-side mirror never syncs");
+    assert_eq!(
+        fs::read(&copy).expect("read copy"),
+        store_bytes2.as_bytes(),
+        "the store's later rotation still reaches the unsynced copy"
+    );
+}
+
 /// A crashed session's per-session home is collected once its marker reads
 /// dead — and the bare durable store is never touched, whatever GC runs.
 #[test]
@@ -20061,6 +20128,99 @@ fn pid_liveness_reads_self_alive_and_a_reaped_child_dead() {
     assert!(
         !namespaced_keychain_ledger::pid_alive(pid),
         "the probe reads the reaped child dead"
+    );
+}
+
+/// A thread's id is no process: linux answers `kill(tid, 0)` and every
+/// `/proc/<tid>/…` file for a thread as it does for a process (the tid is only
+/// missing from the `/proc` listing), so a recorded pid the kernel reissued as
+/// another program's thread id must read as no live process, with no
+/// environment, argv or parent to read. The thread-group leader stays a live
+/// process with an environment, so a reader that refuses everything fails too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_id_reads_as_no_process() {
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let link = fs::read_link("/proc/thread-self").expect("read /proc/thread-self");
+        let tid: u32 = link
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse().ok())
+            .expect("/proc/thread-self ends in the tid");
+        tid_tx.send(tid).expect("send the tid");
+        let _ = release_rx.recv();
+    });
+    let tid = tid_rx.recv().expect("the thread reports its tid");
+    let leader = std::process::id();
+    assert_ne!(tid, leader, "the spawned thread is no thread-group leader");
+    let thread_files_read = fs::read(format!("/proc/{tid}/environ")).is_ok();
+    let verdicts = (
+        namespaced_keychain_ledger::pid_alive(tid),
+        process_environ(tid).is_some(),
+        process_argv(tid).is_some(),
+        crate::session_record::parent_pid(tid),
+    );
+    release_tx.send(()).expect("release the thread");
+    thread.join().expect("join the thread");
+    assert!(thread_files_read, "the live thread's /proc entry reads");
+    assert_eq!(
+        verdicts,
+        (false, false, false, None),
+        "(pid_alive, environ read, argv read, parent) for a thread's tid"
+    );
+    assert!(
+        namespaced_keychain_ledger::pid_alive(leader),
+        "the leader reads alive"
+    );
+    assert!(
+        process_environ(leader).is_some(),
+        "the leader's environment reads"
+    );
+}
+
+/// A supervisor's thread id is no supervisor: the thread answers with the
+/// parked `daemon run` process's argv, environment and liveness, so a recorded
+/// supervisor pid the kernel reissued as one of its threads would verify as
+/// this tree's supervisor and draw the SIGTERM, which linux delivers to the
+/// whole process. The leader still verifies as the tree's supervisor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_supervisors_thread_id_reads_as_no_supervisor() {
+    let home = HomeSandbox::new();
+    let tree = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p1")
+        .join("runtime-4243-2");
+    fs::create_dir_all(&tree).expect("mkdir tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    let tid = crate::testutil::a_thread_of(sup.pid);
+    let tid_start = crate::testutil::proc_start_of(tid).expect("the thread's start");
+    crate::testutil::write_daemon_lock(&tree, tid, &tid_start);
+    let verdicts = (
+        supervisor_state(&tree),
+        matches!(
+            supervisor_liveness_at_start(tid, &tid_start),
+            SupervisorLiveness::Gone
+        ),
+        process_is_claude_service(tid),
+    );
+    assert_eq!(
+        verdicts,
+        (SupervisorState::Gone, true, false),
+        "(verify, liveness gone, claude service) for a supervisor's thread id"
+    );
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    assert_eq!(
+        supervisor_state(&tree),
+        SupervisorState::Ours {
+            pid: sup.pid,
+            start: sup.proc_start.clone(),
+        },
+        "the leader verifies as the tree's supervisor"
     );
 }
 

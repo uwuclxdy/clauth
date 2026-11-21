@@ -383,15 +383,29 @@ struct Applied {
 }
 
 fn apply_with(l: &Layout, command: &mut Command, passthrough: &[&str]) -> Applied {
+    apply_from(l, command, passthrough, Operator)
+}
+
+fn apply_from<O: LaunchOwner>(
+    l: &Layout,
+    command: &mut Command,
+    passthrough: &[&str],
+    owner: O,
+) -> Applied
+where
+    O::Refusal: std::fmt::Debug,
+{
     let warning = apply_spawn_settings(
         command,
         &l.runtime,
         &l.cwd,
         &strings(passthrough),
+        owner,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .expect("an operator launch, or a delegate whose spawn file is written, is never refused");
     let argv = args_of(command);
     // Ours is the leading `--settings` naming `l.settings_file`; a pass-through
     // run may lead with the user's own `--settings <value>` instead.
@@ -468,10 +482,12 @@ fn a_fully_resolved_runtime_gets_nothing_injected() {
         &l.runtime,
         &l.cwd,
         &passthrough,
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     assert_eq!(args_of(&command), passthrough);
     assert_eq!(warning, None);
     assert!(!l.settings_file.exists());
@@ -491,10 +507,12 @@ fn a_runtime_reached_through_a_symlinked_parent_is_injected_too() {
         &alias.join("runtime"),
         &l.cwd,
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     assert_eq!(warning, None);
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
@@ -529,10 +547,12 @@ fn an_isolated_runtime_without_projects_yet_is_judged_by_its_parent() {
         &alias.join("runtime"),
         &l.cwd,
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     assert_eq!(args_of(&through_link)[0], "--settings");
 
     let direct_file = l.root.join("state").join("direct.json");
@@ -542,10 +562,12 @@ fn an_isolated_runtime_without_projects_yet_is_judged_by_its_parent() {
         &l.runtime,
         &l.cwd,
         &[],
+        Operator,
         HOOK,
         None,
         &direct_file,
-    );
+    )
+    .unwrap();
     assert!(args_of(&direct).is_empty());
     assert!(!direct_file.exists());
 }
@@ -776,10 +798,12 @@ fn a_memory_dir_in_a_worktrees_main_checkout_local_tier_suppresses_ours() {
         &l.runtime,
         &l.root.join("work/wt"),
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     assert_eq!(settings, json!({ "hooks": { "PreToolUse": [our_hook()] } }));
@@ -810,10 +834,12 @@ fn a_memory_dir_in_a_worktrees_own_root_local_tier_does_not_suppress_ours() {
         &l.runtime,
         &cwd,
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     assert_eq!(settings["autoMemoryDirectory"], json!(memory_dir(&l)));
@@ -841,10 +867,12 @@ fn a_memory_dir_in_the_home_local_tier_does_not_suppress_ours_from_a_subdir() {
         &l.runtime,
         &cwd,
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -874,10 +902,12 @@ fn a_project_tier_claude_code_skips_at_home_does_not_suppress_ours() {
         &l.runtime,
         &home,
         &[],
+        Operator,
         HOOK,
         None,
         &l.settings_file,
-    );
+    )
+    .unwrap();
     let settings: Value =
         serde_json::from_str(&fs::read_to_string(&l.settings_file).unwrap()).unwrap();
     let key = home
@@ -1157,10 +1187,12 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
                 &runtime,
                 &cwd,
                 &strings(&["--settings", user]),
+                Operator,
                 HOOK,
                 None,
                 &settings_file,
-            );
+            )
+            .unwrap();
             tx.send((user, warning)).unwrap();
         }
     });
@@ -1189,10 +1221,12 @@ fn a_fifo_or_oversize_settings_file_never_blocks_or_balloons() {
             &runtime,
             &cwd,
             &[],
+            Operator,
             HOOK,
             None,
             &settings_file,
-        );
+        )
+        .unwrap();
         tx.send(()).unwrap();
     });
     rx.recv_timeout(std::time::Duration::from_secs(5))
@@ -1438,23 +1472,28 @@ fn the_value_flags_cover_every_help_listed_value_option() {
 
 // ── call sites ───────────────────────────────────────────────────────────────
 //
-// Neither spawn site can run without a real `claude` child, so the wiring is
-// pinned by source scan, the mechanism `mcp_delegate_args.rs` uses.
+// Both spawn sites run for real under `FakeClaude`: `start.rs` drives a whole
+// shared start and reads the settings file the fake `claude` was handed
+// (`a_started_session_carries_no_foreground_spawn_hook`), and `mcp_run.rs`
+// does the same for a delegate. The scans below stay as the cheap pin on each
+// call itself, the mechanism `mcp_delegate_args.rs` uses.
 
 fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
     let rest = src.split_once(signature).expect("function exists").1;
-    match rest
-        .split_once("\nfn ")
-        .or_else(|| rest.split_once("\npub(crate) fn "))
-    {
-        Some((body, _)) => body,
-        None => rest,
-    }
+    let end = ["\nfn ", "\npub(crate) fn "]
+        .iter()
+        .filter_map(|delim| rest.find(delim))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
 fn clauth_start_routes_its_claude_args_through_the_exemption_settings() {
-    let body = body_of(include_str!("../../src/start.rs"), "pub(crate) fn run(");
+    let body = body_of(
+        include_str!("../../src/start.rs"),
+        "pub(crate) fn run_for_code(",
+    );
     assert!(
         body.contains("cc_exempt::apply_spawn_settings("),
         "clauth start must build its claude argv through apply_spawn_settings"
@@ -1466,7 +1505,10 @@ fn clauth_start_routes_its_claude_args_through_the_exemption_settings() {
 /// ends.
 #[test]
 fn only_a_delegate_names_the_foreground_spawn_hook() {
-    let start = body_of(include_str!("../../src/start.rs"), "pub(crate) fn run(");
+    let start = body_of(
+        include_str!("../../src/start.rs"),
+        "pub(crate) fn run_for_code(",
+    );
     let delegate = body_of(include_str!("../../src/mcp/mod.rs"), "fn run_delegate(");
     assert!(
         delegate.contains("FOREGROUND_SPAWN_HOOK_SUBCOMMAND"),
@@ -1807,4 +1849,1615 @@ fn the_advisor_flag_stays_in_the_clean_args_and_rides_beside_settings() {
         last_advisor_arg(&strings(&["--advisor", "opus", "--settings"])),
         None
     );
+}
+
+// ── the remembered transcript retention ──────────────────────────────────────
+
+/// Remember `days` the way production learns it: the daemon's check over an
+/// operator file holding it.
+fn remember(l: &Layout, days: u64) {
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::create_dir_all(operator.parent().unwrap()).unwrap();
+    fs::write(
+        &operator,
+        serde_json::to_vec(&json!({"cleanupPeriodDays": days})).unwrap(),
+    )
+    .unwrap();
+    crate::retention::reconcile().unwrap();
+    assert_eq!(crate::retention::load().unwrap().days, Some(days));
+}
+
+/// A shared tree whose spellings agree needs none of the repairs, so the
+/// number alone makes the spawn settings file.
+#[test]
+fn a_shared_launch_carries_the_remembered_retention() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let a = apply(&l, &["-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+    assert_eq!(a.rest, strings(&["-p", "hi"]));
+    assert_eq!(a.warning, None);
+}
+
+#[test]
+fn a_linked_shared_launch_carries_the_retention_beside_the_repairs() {
+    let l = layout(true);
+    remember(&l, 3650);
+    let a = apply(&l, &[]);
+    assert_eq!(
+        a.settings,
+        Some(json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] },
+            "cleanupPeriodDays": 3650
+        }))
+    );
+}
+
+#[test]
+fn the_callers_own_retention_on_settings_wins() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let a = apply(&l, &["--settings", "{\"cleanupPeriodDays\":7}", "-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 7})));
+    assert_eq!(a.rest, strings(&["-p", "hi"]));
+}
+
+/// An isolated tree links no store, so its sweep reaches nothing of the
+/// operator's and it carries nothing.
+#[test]
+fn an_isolated_launch_carries_no_retention() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let isolated = l.root.join("runtime-isolated-4242-0");
+    fs::create_dir_all(isolated.join("projects")).unwrap();
+    let passthrough = strings(&["-p", "hi"]);
+    let mut command = Command::new("claude");
+    let warning = apply_spawn_settings(
+        &mut command,
+        &isolated,
+        &l.cwd,
+        &passthrough,
+        Operator,
+        HOOK,
+        None,
+        &l.settings_file,
+    )
+    .unwrap();
+    assert_eq!(args_of(&command), passthrough);
+    assert_eq!(warning, None);
+    assert!(!l.settings_file.exists());
+}
+
+/// A retention record that does not parse never costs a launch anything: no
+/// number, no warning, and the repairs a linked tree needs are still written.
+#[test]
+fn a_record_that_does_not_parse_leaves_the_launch_as_it_was() {
+    let l = layout(true);
+    let record = crate::retention::record_path().unwrap();
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"{ not json").unwrap();
+    let a = apply(&l, &["-p", "hi"]);
+    assert_eq!(
+        a.settings,
+        Some(json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] }
+        }))
+    );
+    assert_eq!(a.rest, strings(&["-p", "hi"]));
+    assert_eq!(a.warning, None);
+}
+
+/// A launch that needs only the number and whose own `--settings` cannot be
+/// read passes it through untouched and says nothing: every warning names a
+/// skipped repair, and the tree's own `settings.json` still holds the number.
+#[test]
+fn a_number_only_launch_passes_an_unreadable_settings_value_through_silently() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let missing = l.root.join("missing.json");
+    let passthrough = strings(&["--settings", missing.to_str().unwrap(), "-p", "hi"]);
+    let mut command = Command::new("claude");
+    let warning = apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &l.cwd,
+        &passthrough,
+        Operator,
+        HOOK,
+        None,
+        &l.settings_file,
+    )
+    .unwrap();
+    assert_eq!(args_of(&command), passthrough);
+    assert_eq!(warning, None);
+    assert!(!l.settings_file.exists());
+}
+
+/// A launch carries the operator file's own number, the one its tree build
+/// keeps, over a record that lags it (a record write that failed when the
+/// operator raised the number): the flag outranks the tree's copy, so a stale
+/// lower number there would sweep at the lower cutoff.
+#[test]
+fn a_launch_carries_the_operator_files_number_over_a_stale_record() {
+    let l = layout(false);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::create_dir_all(operator.parent().unwrap()).unwrap();
+    fs::write(&operator, br#"{"cleanupPeriodDays":3650}"#).unwrap();
+    let record = crate::retention::record_path().unwrap();
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, br#"{"days":14,"question_open":false}"#).unwrap();
+    let a = apply(&l, &["-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+}
+
+/// A launch that needs only the number and whose spawn file cannot be written
+/// passes its args through and says nothing, for the same reason.
+#[test]
+fn a_number_only_launch_whose_spawn_file_cannot_be_written_says_nothing() {
+    let l = layout(false);
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let passthrough = strings(&["-p", "hi"]);
+    let mut command = Command::new("claude");
+    let warning = apply_spawn_settings(
+        &mut command,
+        &l.runtime,
+        &l.cwd,
+        &passthrough,
+        Operator,
+        HOOK,
+        None,
+        &l.settings_file,
+    )
+    .unwrap();
+    assert_eq!(args_of(&command), passthrough);
+    assert_eq!(warning, None);
+}
+
+/// Only an injected hook needs the caller's `hooks` shape: a launch that needs
+/// only the number carries it past a malformed one, silently.
+#[test]
+fn a_number_only_launch_carries_the_number_past_a_malformed_hooks_value() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let a = apply(&l, &["--settings", "{\"hooks\":5}"]);
+    assert_eq!(
+        a.settings,
+        Some(json!({"hooks": 5, "cleanupPeriodDays": 3650}))
+    );
+    assert_eq!(a.warning, None);
+}
+
+/// A record that does not parse is reported once however many launches read
+/// it, by the line naming what the fault costs a launch, and stays as it is.
+#[test]
+fn a_record_that_does_not_parse_is_reported_once_across_launches() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    let record = crate::retention::record_path().unwrap();
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"").unwrap();
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+        apply(&l, &["-p", "hi"]);
+    }
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: failed to parse {}; clauth forgot the cleanupPeriodDays it remembered, so \
+             while ~/.claude/settings.json holds no number it is neither put back nor passed to a \
+             launch, and sessions already running keep the number they hold now",
+            record.display()
+        )]
+    );
+    assert_eq!(fs::read(&record).unwrap(), b"");
+}
+
+// ── spawn files kept current ─────────────────────────────────────────────────
+
+fn apply_delegate(l: &Layout, passthrough: &[&str]) -> Applied {
+    apply_from(l, &mut Command::new("claude"), passthrough, Model)
+}
+
+/// The operator sets `days` in `~/.claude/settings.json` with the daemon
+/// running: its check reads the file.
+fn operator_sets(l: &Layout, days: u64) {
+    fs::write(
+        l.home.home().join(".claude").join("settings.json"),
+        serde_json::to_vec(&json!({"cleanupPeriodDays": days})).unwrap(),
+    )
+    .unwrap();
+    crate::retention::reconcile().unwrap();
+}
+
+/// The spawn settings file as it stands now: what a respawn reads.
+fn spawn_file(l: &Layout) -> Value {
+    serde_json::from_slice(&fs::read(&l.settings_file).unwrap()).unwrap()
+}
+
+/// A background job re-reads its spawn file on every respawn, so a number the
+/// operator raises after the launch reaches that file, or a respawn would
+/// sweep at the old cutoff.
+#[test]
+fn a_raised_number_reaches_a_spawn_file_carrying_the_remembered_one() {
+    let l = layout(false);
+    remember(&l, 14);
+    let a = apply(&l, &["-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 14})));
+    operator_sets(&l, 3650);
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 3650}));
+}
+
+#[test]
+fn a_lowered_number_reaches_a_spawn_file_and_keeps_its_repairs() {
+    let l = layout(true);
+    remember(&l, 3650);
+    apply(&l, &[]);
+    operator_sets(&l, 14);
+    assert_eq!(
+        spawn_file(&l),
+        json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] },
+            "cleanupPeriodDays": 14
+        })
+    );
+}
+
+#[test]
+fn a_callers_own_number_in_a_spawn_file_is_never_rewritten() {
+    let l = layout(false);
+    remember(&l, 14);
+    let a = apply(&l, &["--settings", "{\"cleanupPeriodDays\":7}", "-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 7})));
+    operator_sets(&l, 3650);
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 7}));
+}
+
+/// A spawn file the GC collected stays gone: the check never writes one back.
+#[test]
+fn a_collected_spawn_file_is_not_written_back() {
+    let l = layout(false);
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::remove_file(&l.settings_file).unwrap();
+    operator_sets(&l, 3650);
+    assert!(!l.settings_file.exists());
+}
+
+/// `remove it` stops passing the number on launches, a respawn's included.
+#[test]
+fn remove_takes_the_number_out_of_a_spawn_file_carrying_the_remembered_one() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    crate::retention::remove().unwrap();
+    assert_eq!(spawn_file(&l), json!({}));
+}
+
+#[test]
+fn remove_leaves_a_callers_own_number_in_a_spawn_file() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["--settings", "{\"cleanupPeriodDays\":7}"]);
+    crate::retention::remove().unwrap();
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 7}));
+}
+
+// ── a delegate's own number ──────────────────────────────────────────────────
+
+/// A delegate's args come from the calling model, so its number is a floor
+/// under the remembered one, never a way to shorten the operator's retention.
+#[test]
+fn a_delegates_lower_number_gives_way_to_the_remembered_one() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let a = apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":1}", "-p", "hi"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+    assert_eq!(a.rest, strings(&["-p", "hi"]));
+}
+
+#[test]
+fn a_delegates_higher_number_stays() {
+    let l = layout(false);
+    remember(&l, 365);
+    let a = apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":5000}"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 5000})));
+}
+
+#[test]
+fn a_delegates_invalid_number_gives_way_to_the_remembered_one() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let a = apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":0}"]);
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+}
+
+/// The delegate's own number stays its floor when the operator's moves: raised
+/// past it, the spawn file follows; lowered under it, the delegate's stays.
+#[test]
+fn a_delegates_own_number_stays_its_floor_when_the_operators_moves() {
+    let l = layout(false);
+    remember(&l, 365);
+    apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":5000}"]);
+    operator_sets(&l, 60000);
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 60000}));
+    operator_sets(&l, 14);
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 5000}));
+}
+
+#[test]
+fn remove_leaves_a_delegates_own_number_in_its_spawn_file() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":1}"]);
+    crate::retention::remove().unwrap();
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 1}));
+}
+
+// ── a number learned after the launch, faults on the way ─────────────────────
+
+/// A shared launch made while nothing is remembered still writes its spawn
+/// file for its repairs, and a background job re-reads that file on every
+/// respawn, so a number learned later reaches it too.
+#[test]
+fn a_number_learned_after_the_launch_reaches_its_spawn_file() {
+    let l = layout(true);
+    let a = apply(&l, &[]);
+    assert_eq!(
+        a.settings,
+        Some(json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] }
+        }))
+    );
+    fs::create_dir_all(l.home.home().join(".claude")).unwrap();
+    operator_sets(&l, 3650);
+    assert_eq!(
+        spawn_file(&l),
+        json!({
+            "autoMemoryDirectory": memory_dir(&l),
+            "hooks": { "PreToolUse": [our_hook()] },
+            "cleanupPeriodDays": 3650
+        })
+    );
+}
+
+#[test]
+fn a_delegates_own_number_launched_with_nothing_remembered_stays_its_floor() {
+    let l = layout(true);
+    apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":5000}"]);
+    fs::create_dir_all(l.home.home().join(".claude")).unwrap();
+    operator_sets(&l, 365);
+    assert_eq!(spawn_file(&l)["cleanupPeriodDays"], json!(5000));
+    operator_sets(&l, 60000);
+    assert_eq!(spawn_file(&l)["cleanupPeriodDays"], json!(60000));
+}
+
+#[test]
+fn a_callers_own_number_launched_with_nothing_remembered_is_never_rewritten() {
+    let l = layout(true);
+    apply(&l, &["--settings", "{\"cleanupPeriodDays\":7}"]);
+    fs::create_dir_all(l.home.home().join(".claude")).unwrap();
+    operator_sets(&l, 3650);
+    assert_eq!(spawn_file(&l)["cleanupPeriodDays"], json!(7));
+}
+
+/// A record that does not parse cannot say which spawn files carry the
+/// number, so `remove it` removes nothing anywhere and says so, rather than
+/// report a removal that left a respawn sweeping at the old number.
+#[test]
+fn remove_with_a_record_that_does_not_parse_removes_nothing() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    let record = crate::retention::record_path().unwrap();
+    fs::write(&record, b"").unwrap();
+    let e = crate::retention::remove().unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{} cannot be read or does not parse, so cleanupPeriodDays was not removed; \
+             the key may still be there",
+            record.display()
+        )
+    );
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 3650}));
+    let operator: Value = serde_json::from_slice(
+        &fs::read(l.home.home().join(".claude").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(operator, json!({"cleanupPeriodDays": 3650}));
+    assert_eq!(fs::read(&record).unwrap(), b"");
+}
+
+/// A spawn file whose rewrite fails, lands, then fails again is reported
+/// twice: a rewrite that lands re-arms its line, so a fault that comes back
+/// is never silent.
+#[cfg(unix)]
+#[test]
+fn a_spawn_file_rewrite_that_fails_again_after_landing_is_reported_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    let dir = l.settings_file.parent().unwrap().to_path_buf();
+    let set_mode = |mode: u32| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        set_mode(0o500);
+        operator_sets(&l, 3650);
+        set_mode(0o700);
+        operator_sets(&l, 36500);
+        set_mode(0o500);
+        operator_sets(&l, 365);
+        set_mode(0o700);
+    }
+    let prefix = format!(
+        "clauth: failed to keep cleanupPeriodDays current in {}: ",
+        l.settings_file.display()
+    );
+    let logged = lines.snapshot();
+    let expected = format!("{prefix}Permission denied (os error 13)");
+    let pinned: Vec<&String> = logged
+        .iter()
+        .filter(|line| line.starts_with(&prefix))
+        .collect();
+    assert_eq!(pinned, vec![&expected, &expected], "{logged:?}");
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 36500}));
+}
+
+// ── fault lines and the record's guards ─────────────────────────────────────
+
+/// A registration that cannot read the record says the spawn file is not kept
+/// current, by the line naming both, and changes nothing else: the file
+/// carries the number the launch decided and the record stays as it was.
+#[test]
+fn a_registration_read_fault_says_the_spawn_file_is_not_kept_current() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::create_dir_all(operator.parent().unwrap()).unwrap();
+    fs::write(&operator, br#"{"cleanupPeriodDays":3650}"#).unwrap();
+    let record = crate::retention::record_path().unwrap();
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(&record, b"").unwrap();
+    let lines = crate::logline::LogLines::new();
+    let a = {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"])
+    };
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: failed to parse {}; {} is not kept current",
+            record.display(),
+            l.settings_file.display()
+        )]
+    );
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+    assert_eq!(fs::read(&record).unwrap(), b"");
+}
+
+/// A registration whose record write fails says the spawn file is not kept
+/// current, naming both, and the launch still carries the number.
+#[cfg(unix)]
+#[test]
+fn a_registration_write_fault_says_the_spawn_file_is_not_kept_current() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let clauth_dir = crate::retention::record_path()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let lines = crate::logline::LogLines::new();
+    let a = {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"])
+    };
+    fs::set_permissions(&clauth_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: failed to write the retention record {}: Permission denied (os error 13); \
+             {} is not kept current",
+            crate::retention::record_path().unwrap().display(),
+            l.settings_file.display()
+        )]
+    );
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+    assert!(crate::retention::load().unwrap().spawn_files.is_empty());
+}
+
+/// A launch whose flock wait times out says its spawn file is not registered
+/// and so not kept current, and still writes the file with the pre-read
+/// number, unregistered.
+#[test]
+fn a_locked_out_launch_says_its_spawn_file_is_not_kept_current() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let dir = crate::profile::clauth_dir().unwrap();
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).unwrap();
+    holder.lock().unwrap();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    let lines = crate::logline::LogLines::new();
+    let a = {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"])
+    };
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: timed out after 0s acquiring the state lock; another clauth process holds \
+             ~/.clauth/.lock"
+                .to_string(),
+            format!(
+                "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                 holds ~/.clauth/.lock; the spawn settings file {} is not registered, so it is \
+                 not kept current",
+                l.settings_file.display()
+            )
+        ]
+    );
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+    assert!(crate::retention::load().unwrap().spawn_files.is_empty());
+}
+
+/// A state-flock timeout and a record that stops parsing are separate faults:
+/// the timeout's line must not latch the record's off, or a record that stops
+/// parsing logs nothing until a record write lands.
+#[test]
+fn a_record_that_stops_parsing_after_a_flock_timeout_still_says_so() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::write(&operator, b"{}").unwrap();
+    let record = crate::retention::record_path().unwrap();
+    fs::write(&record, b"").unwrap();
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+        apply(&l, &["-p", "hi"]);
+    }
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: timed out after 0s acquiring the state lock; another clauth process holds \
+             ~/.clauth/.lock"
+                .to_string(),
+            format!(
+                "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                 holds ~/.clauth/.lock; the spawn settings file {} is not registered, so it is \
+                 not kept current",
+                l.settings_file.display()
+            ),
+            format!(
+                "clauth: failed to parse {}; clauth forgot the cleanupPeriodDays it remembered, \
+                 so while ~/.claude/settings.json holds no number it is neither put back nor \
+                 passed to a launch, and sessions already running keep the number they hold now",
+                record.display()
+            ),
+        ]
+    );
+}
+
+/// The mirror order: a record that stops parsing must not latch a later
+/// state-flock timeout's line off either.
+#[test]
+fn a_flock_timeout_after_a_record_that_stops_parsing_still_says_so() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::write(&operator, b"{}").unwrap();
+    let record = crate::retention::record_path().unwrap();
+    fs::write(&record, b"").unwrap();
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    fs::write(&operator, br#"{"cleanupPeriodDays":3650}"#).unwrap();
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            format!(
+                "clauth: failed to parse {}; clauth forgot the cleanupPeriodDays it remembered, \
+                 so while ~/.claude/settings.json holds no number it is neither put back nor \
+                 passed to a launch, and sessions already running keep the number they hold now",
+                record.display()
+            ),
+            timeout,
+            not_registered,
+        ]
+    );
+}
+
+/// A state-flock fault's line re-arms when the recovery launch's record write
+/// lands, so a later timeout says its spawn file is not kept current again.
+#[test]
+fn a_second_flock_timeout_after_a_written_recovery_says_so() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let lines = crate::logline::LogLines::new();
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    // The next launch takes the flock again and registers its file; that record
+    // write re-arms the line.
+    apply(&l, &["-p", "hi"]);
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            timeout.clone(),
+            not_registered.clone(),
+            timeout,
+            not_registered
+        ]
+    );
+}
+
+/// A state-flock fault's line re-arms only on a record write that lands: a
+/// wedge, a recovery whose record write keeps failing, then a second wedge
+/// prints the second timeout alone.
+#[test]
+fn a_second_flock_fault_after_an_unwritten_recovery_stays_silent() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let lines = crate::logline::LogLines::new();
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    // The next launch takes the flock again while every record write fails, so
+    // nothing re-arms the line.
+    let _unwritable =
+        crate::testutil::UnwritableDir::new(&crate::profile::clauth_dir().expect("clauth dir"));
+    apply(&l, &["-p", "hi"]);
+    let holder = crate::testutil::hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    {
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"]);
+    }
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![timeout.clone(), not_registered, timeout]
+    );
+}
+
+/// A settle pass between two state-flock wedges takes the flock and writes the
+/// record, so the second wedge says its spawn file is not kept current again.
+#[test]
+fn a_second_flock_fault_after_a_settle_pass_says_so() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let lines = crate::logline::LogLines::new();
+    let wedge = || {
+        let holder = crate::testutil::hold_state_flock();
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+        {
+            let _capture = lines.capture_here();
+            apply(&l, &["-p", "hi"]);
+        }
+        crate::lock::set_state_lock_timeout_override(None);
+        drop(holder);
+    };
+    wedge();
+    operator_sets(&l, 14);
+    wedge();
+    let timeout = "clauth: timed out after 0s acquiring the state lock; another clauth process \
+                   holds ~/.clauth/.lock"
+        .to_string();
+    let not_registered = format!(
+        "{timeout}; the spawn settings file {} is not registered, so it is not kept current",
+        l.settings_file.display()
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            timeout.clone(),
+            not_registered.clone(),
+            timeout,
+            not_registered
+        ]
+    );
+}
+
+/// `remove it` failing to read a registered spawn file names that file and
+/// keeps the record, so a later pass can retry.
+#[cfg(unix)]
+#[test]
+fn remove_failing_to_read_a_spawn_file_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let e = crate::retention::remove().unwrap_err();
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "failed to read {}, so its cleanupPeriodDays was not removed; the key may still \
+             be there",
+            l.settings_file.display()
+        )
+    );
+    assert_eq!(
+        e.root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(crate::retention::load().unwrap().days, Some(3650));
+}
+
+/// `remove it` failing to rewrite a registered spawn file names that file and
+/// keeps the record, so a later pass can retry.
+#[cfg(unix)]
+#[test]
+fn remove_failing_to_write_a_spawn_file_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    let dir = l.settings_file.parent().unwrap().to_path_buf();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let e = crate::retention::remove().unwrap_err();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "failed to write {}, so its cleanupPeriodDays was not removed; the key may still \
+             be there",
+            l.settings_file.display()
+        )
+    );
+    assert_eq!(
+        e.root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(crate::retention::load().unwrap().days, Some(3650));
+}
+
+/// A spawn file the GC collected drops its record entry on the next check, so
+/// nothing later rewrites it.
+#[test]
+fn a_collected_spawn_file_leaves_the_record() {
+    let l = layout(false);
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::remove_file(&l.settings_file).unwrap();
+    operator_sets(&l, 3650);
+    assert!(crate::retention::load().unwrap().spawn_files.is_empty());
+}
+
+/// A registered spawn file that is not a JSON object keeps its entry and
+/// stays as it is: the check never rewrites bytes it cannot parse.
+#[test]
+fn settle_keeps_the_entry_of_a_spawn_file_that_is_not_a_json_object() {
+    let l = layout(false);
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::write(&l.settings_file, b"not json").unwrap();
+    operator_sets(&l, 3650);
+    let record = crate::retention::load().unwrap();
+    assert_eq!(record.spawn_files.get(&l.settings_file), Some(&None));
+    assert_eq!(fs::read(&l.settings_file).unwrap(), b"not json");
+}
+
+/// With no number to carry, a check never takes one away: a delegate's own
+/// value stays in its spawn file, even one Claude Code's schema refuses.
+#[test]
+fn a_check_with_nothing_remembered_leaves_a_delegates_own_value() {
+    let l = layout(true);
+    apply_delegate(&l, &["--settings", "{\"cleanupPeriodDays\":0}"]);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::create_dir_all(operator.parent().unwrap()).unwrap();
+    fs::write(&operator, br#"{"theme":"dark"}"#).unwrap();
+    crate::retention::reconcile().unwrap();
+    assert_eq!(spawn_file(&l)["cleanupPeriodDays"], json!(0));
+}
+
+/// A registered spawn file the GC already collected is nothing to remove, so
+/// `remove it` still succeeds and forgets the record.
+#[test]
+fn remove_skips_a_registered_spawn_file_that_is_gone() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    fs::remove_file(&l.settings_file).unwrap();
+    crate::retention::remove().unwrap();
+    assert!(!crate::retention::record_path().unwrap().exists());
+    assert!(!l.settings_file.exists());
+}
+
+/// A registered spawn file that is not a JSON object fails the remove by
+/// equality, naming the file, and leaves both it and the record as they were.
+#[test]
+fn remove_over_a_spawn_file_that_is_not_an_object_names_it() {
+    let l = layout(false);
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    fs::write(&l.settings_file, b"[]").unwrap();
+    let before = crate::retention::load().unwrap();
+    let e = crate::retention::remove().unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{} cannot be read or does not parse, so its cleanupPeriodDays was not removed; \
+             the key may still be there",
+            l.settings_file.display()
+        )
+    );
+    assert_eq!(fs::read(&l.settings_file).unwrap(), b"[]");
+    assert_eq!(crate::retention::load().unwrap(), before);
+}
+
+// ── a delegate's --settings the number cannot ride ──────────────────────────
+
+/// A delegate launch as `run_delegate` builds it: the model's args, and the
+/// foreground-spawn hook every delegate carries.
+fn apply_model_args(
+    l: &Layout,
+    command: &mut Command,
+    passthrough: &[&str],
+) -> Result<Option<String>, String> {
+    apply_spawn_settings(
+        command,
+        &l.runtime,
+        &l.cwd,
+        &strings(passthrough),
+        Model,
+        HOOK,
+        Some("fg-hook"),
+        &l.settings_file,
+    )
+}
+
+const REFUSED: &str = "the delegate was not started, since clauth could not keep \
+                       cleanupPeriodDays at 3650 or more in it";
+
+/// JSON serde_json refuses (`1e400` is out of range) and `JSON.parse` takes.
+const UNPARSEABLE: &str = "{\"cleanupPeriodDays\":1,\"x\":1e400}";
+
+/// Inline JSON clauth's parser refuses and Claude Code's takes (`1e400`)
+/// would reach claude with the model's own number: the delegate is refused
+/// before it starts, the value never echoed, and nothing is written or
+/// registered.
+#[test]
+fn a_delegate_whose_inline_settings_do_not_parse_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let before = crate::retention::load().unwrap();
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", UNPARSEABLE, "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings JSON is not a settings object (line 1, column 32); {REFUSED}"
+        ))
+    );
+    assert!(!l.settings_file.exists());
+    assert_eq!(crate::retention::load().unwrap(), before);
+}
+
+/// A settings file over the read cap is refused by the path form, the value
+/// echoed as the model typed it.
+#[test]
+fn a_delegate_whose_settings_file_cannot_be_read_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let big = l.root.join("big-settings.json");
+    let pad = "x".repeat((1 << 20) + 16);
+    fs::write(
+        &big,
+        format!("{{\"cleanupPeriodDays\":1,\"pad\":\"{pad}\"}}"),
+    )
+    .unwrap();
+    let value = big.to_str().unwrap();
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", value, "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {value:?}: cannot read it (1048624 bytes over the 1048576 \
+             byte cap); {REFUSED}"
+        ))
+    );
+    assert!(!l.settings_file.exists());
+}
+
+/// A settings file that parses but holds no object is refused by the path
+/// form's own reason.
+#[test]
+fn a_delegate_whose_settings_file_holds_no_object_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let file = l.root.join("list-settings.json");
+    fs::write(&file, b"[1]").unwrap();
+    let value = file.to_str().unwrap();
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", value, "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {value:?}: not a settings object (not a JSON object); {REFUSED}"
+        ))
+    );
+    assert!(!l.settings_file.exists());
+}
+
+/// A `--` that claude reads as a value flag's value ends no options: a
+/// delegate's `--settings` after it is merged into the spawn file and floored,
+/// never passed as a second `--settings` that would replace clauth's.
+#[test]
+fn a_delegates_settings_behind_a_hidden_value_flag_is_merged() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let mut command = Command::new("claude");
+    let warning = apply_model_args(
+        &l,
+        &mut command,
+        &[
+            "--session-began-as-copy",
+            "--",
+            "--settings",
+            "{\"cleanupPeriodDays\":1}",
+        ],
+    );
+    assert_eq!(warning, Ok(None));
+    let argv = args_of(&command);
+    assert_eq!(
+        argv.iter().filter(|a| a.as_str() == "--settings").count(),
+        1,
+        "{argv:?}"
+    );
+    assert_eq!(spawn_file(&l)["cleanupPeriodDays"], json!(3650));
+}
+
+/// A `hooks` shape clauth cannot merge its own hook into would pass the
+/// model's settings through untouched: refused by the hooks reason.
+#[test]
+fn a_delegate_whose_settings_hooks_cannot_take_the_hook_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let value = "{\"cleanupPeriodDays\":1,\"hooks\":[]}";
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", value, "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings JSON: hooks is not an object; {REFUSED}"
+        ))
+    );
+    assert!(!l.settings_file.exists());
+}
+
+/// A spawn file that cannot be written leaves only the model's own
+/// `--settings` to pass: refused by the write reason.
+#[cfg(unix)]
+#[test]
+fn a_delegate_whose_spawn_file_cannot_be_written_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", "{\"cleanupPeriodDays\":1}", "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); {REFUSED}",
+            l.settings_file
+        ))
+    );
+}
+
+/// A delegate that passes no `--settings` of its own still needs its spawn
+/// file: without the number there, a project-tier value in the model's cwd
+/// outranks the tree's own `settings.json`. A spawn file it cannot write
+/// refuses it by the write reason.
+#[cfg(unix)]
+#[test]
+fn a_delegate_with_no_settings_whose_spawn_file_cannot_be_written_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let refused = apply_model_args(&l, &mut Command::new("claude"), &["-p", "hi"]);
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); {REFUSED}",
+            l.settings_file
+        ))
+    );
+}
+
+/// A delegate whose flock wait times out and whose spawn file then cannot be
+/// written would pass the model's `--settings` unchanged: refused by the
+/// write reason.
+#[cfg(unix)]
+#[test]
+fn a_locked_out_delegate_whose_spawn_file_cannot_be_written_is_refused() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let dir = crate::profile::clauth_dir().unwrap();
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).unwrap();
+    holder.lock().unwrap();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", "{\"cleanupPeriodDays\":1}", "-p", "hi"],
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); {REFUSED}",
+            l.settings_file
+        ))
+    );
+}
+
+/// A settings file whose `hooks` clauth cannot merge into is refused by the
+/// path form, the value echoed as the model typed it.
+#[test]
+fn a_delegate_whose_settings_file_hooks_cannot_take_the_hook_is_refused() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let file = l.root.join("hooks-settings.json");
+    fs::write(&file, br#"{"cleanupPeriodDays":1,"hooks":[]}"#).unwrap();
+    let value = file.to_str().unwrap();
+    let refused = apply_model_args(
+        &l,
+        &mut Command::new("claude"),
+        &["--settings", value, "-p", "hi"],
+    );
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {value:?}: hooks is not an object; {REFUSED}"
+        ))
+    );
+    assert!(!l.settings_file.exists());
+}
+
+/// With no number to carry, a delegate's unusable `--settings` is passed
+/// through with the auto-memory warning, as before the number rode launches.
+#[test]
+fn a_delegate_with_nothing_remembered_passes_unusable_settings_through() {
+    let l = layout(false);
+    let passthrough = ["--settings", UNPARSEABLE, "-p", "hi"];
+    let mut command = Command::new("claude");
+    let warning = apply_model_args(&l, &mut command, &passthrough);
+    assert_eq!(
+        warning,
+        Ok(Some(
+            "clauth: --settings JSON is not a settings object (line 1, column 32); passed to \
+             claude unchanged, so auto-memory writes and tool-result reads may prompt this \
+             session"
+                .to_string()
+        ))
+    );
+    assert_eq!(args_of(&command), strings(&passthrough));
+}
+
+/// The operator's own `--settings` wins even when clauth cannot read it: an
+/// operator launch is never refused.
+#[test]
+fn an_operator_settings_value_that_does_not_parse_is_passed_through() {
+    let l = layout(false);
+    remember(&l, 3650);
+    let passthrough = ["--settings", UNPARSEABLE, "-p", "hi"];
+    let a = apply(&l, &passthrough);
+    assert_eq!(a.warning, None);
+    assert_eq!(a.argv, strings(&passthrough));
+}
+
+// ── spawn files a check cannot follow ───────────────────────────────────────
+
+/// A registered spawn file the check cannot read is reported once instead of
+/// skipped in silence, and a pass whose only work is that file still counts
+/// as a write owed, so the next wake reads it again.
+#[cfg(unix)]
+#[test]
+fn a_registered_spawn_file_that_cannot_be_read_is_reported_and_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::write(
+        &operator,
+        serde_json::to_vec(&json!({"cleanupPeriodDays": 3650})).unwrap(),
+    )
+    .unwrap();
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let settle = || {
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator, &[], &sync_record)
+        })
+        .unwrap()
+    };
+    let lines = crate::logline::LogLines::new();
+    let second = {
+        let _capture = lines.capture_here();
+        settle();
+        settle()
+    };
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: failed to keep cleanupPeriodDays current in {}: Permission denied (os \
+             error 13)",
+            l.settings_file.display()
+        )]
+    );
+    assert!(second.attempted_write, "the unreadable file is still owed");
+    assert!(
+        crate::retention::load()
+            .unwrap()
+            .spawn_files
+            .contains_key(&l.settings_file),
+        "the unreadable file keeps its entry, so a later pass retries it"
+    );
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 14}));
+}
+
+/// A registered spawn file that holds no JSON object is reported once and
+/// left as it is.
+#[test]
+fn a_registered_spawn_file_that_holds_no_object_is_reported() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::write(&l.settings_file, b"[]").unwrap();
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        operator_sets(&l, 3650);
+        operator_sets(&l, 36500);
+    }
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: failed to keep cleanupPeriodDays current in {}: it does not hold a JSON \
+             object",
+            l.settings_file.display()
+        )]
+    );
+    assert_eq!(fs::read(&l.settings_file).unwrap(), b"[]");
+}
+
+/// A pass whose only work is a registered spawn file holding no JSON object
+/// still counts that file as a write owed, so the next wake reads it again.
+#[test]
+fn a_registered_spawn_file_that_holds_no_object_is_retried() {
+    let l = layout(false);
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    fs::write(&l.settings_file, b"[]").unwrap();
+    operator_sets(&l, 3650);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let again = crate::lock::with_state_lock(|held| {
+        crate::retention::settle(held, &operator, &[], &sync_record)
+    })
+    .unwrap();
+    assert!(
+        again.attempted_write,
+        "the file that holds no object is still owed"
+    );
+}
+
+/// A read fault that clears while the file is already current, then comes
+/// back, is reported again: the fault was over, so the next one is news.
+#[cfg(unix)]
+#[test]
+fn a_spawn_file_read_fault_that_returns_after_recovering_is_reported_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let settle = || {
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator, &[], &sync_record)
+        })
+        .unwrap()
+    };
+    let set_mode = |mode: u32| {
+        fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        set_mode(0o000);
+        settle();
+        set_mode(0o600);
+        settle();
+        set_mode(0o000);
+        settle();
+    }
+    set_mode(0o600);
+    let line = format!(
+        "clauth: failed to keep cleanupPeriodDays current in {}: Permission denied (os error 13)",
+        l.settings_file.display()
+    );
+    assert_eq!(lines.snapshot(), vec![line.clone(), line]);
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 14}));
+}
+
+/// A registered file with no number to keep in it (nothing remembered, no
+/// floor) owes nothing: an unreadable one is neither reported nor retried.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_spawn_file_with_no_number_to_keep_owes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let l = layout(true);
+    crate::retention::reset_latches();
+    apply(&l, &["-p", "hi"]);
+    assert!(
+        crate::retention::load()
+            .unwrap()
+            .spawn_files
+            .contains_key(&l.settings_file),
+        "precondition: a repairs-only launch registers its spawn file"
+    );
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let lines = crate::logline::LogLines::new();
+    let outcome = {
+        let _capture = lines.capture_here();
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator, &[], &sync_record)
+        })
+        .unwrap()
+    };
+    fs::set_permissions(&l.settings_file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(outcome.days, None);
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+    assert!(
+        !outcome.attempted_write,
+        "nothing is owed with no number to keep"
+    );
+}
+
+/// A registered file holding no JSON object, with no number to keep in it,
+/// owes nothing either: neither reported nor retried.
+#[test]
+fn a_spawn_file_holding_no_object_with_no_number_to_keep_owes_nothing() {
+    let l = layout(true);
+    crate::retention::reset_latches();
+    apply(&l, &["-p", "hi"]);
+    assert!(
+        crate::retention::load()
+            .unwrap()
+            .spawn_files
+            .contains_key(&l.settings_file),
+        "precondition: a repairs-only launch registers its spawn file"
+    );
+    fs::write(&l.settings_file, b"[]").unwrap();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let lines = crate::logline::LogLines::new();
+    let outcome = {
+        let _capture = lines.capture_here();
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator, &[], &sync_record)
+        })
+        .unwrap()
+    };
+    assert_eq!(outcome.days, None);
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+    assert!(
+        !outcome.attempted_write,
+        "nothing is owed with no number to keep"
+    );
+}
+
+/// A launch whose spawn file the record already lists with the same floor
+/// writes no record: a record write that cannot land stays silent, where a
+/// redundant rewrite would report a fault on every launch.
+#[cfg(unix)]
+#[test]
+fn a_launch_registers_an_already_listed_spawn_file_without_touching_the_record() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    apply(&l, &["-p", "hi"]);
+    let lines = crate::logline::LogLines::new();
+    let a = {
+        let _unwritable =
+            crate::testutil::UnwritableDir::new(&crate::profile::clauth_dir().unwrap());
+        let _capture = lines.capture_here();
+        apply(&l, &["-p", "hi"])
+    };
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+    assert_eq!(a.settings, Some(json!({"cleanupPeriodDays": 3650})));
+}
+
+/// A registered spawn file already at the number the check decided is not
+/// rewritten: a rewrite that cannot land stays silent, where an unconditional
+/// one would report a fault on every pass.
+#[cfg(unix)]
+#[test]
+fn a_spawn_file_already_at_the_decided_number_is_not_rewritten() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 14);
+    apply(&l, &["-p", "hi"]);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let sync_record = crate::settings_sync::written_record_path().unwrap();
+    let lines = crate::logline::LogLines::new();
+    let outcome = {
+        let _unwritable = crate::testutil::UnwritableDir::new(l.settings_file.parent().unwrap());
+        let _capture = lines.capture_here();
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator, &[], &sync_record)
+        })
+        .unwrap()
+    };
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+    assert!(!outcome.attempted_write, "a current file owes no write");
+    assert_eq!(spawn_file(&l), json!({"cleanupPeriodDays": 14}));
+}
+
+/// A locked-out delegate that passed no `--settings` of its own, whose spawn
+/// file then cannot be written, is refused like one that did.
+#[cfg(unix)]
+#[test]
+fn a_locked_out_delegate_with_no_settings_whose_spawn_file_cannot_be_written_is_refused() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let dir = crate::profile::clauth_dir().unwrap();
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME)).unwrap();
+    holder.lock().unwrap();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    let refused = apply_model_args(&l, &mut Command::new("claude"), &["-p", "hi"]);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+    assert_eq!(
+        refused,
+        Err(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); {REFUSED}",
+            l.settings_file
+        ))
+    );
+}
+
+/// Run a launch whose state-flock wait is parked, apply `between` while it
+/// waits, then let it take the flock.
+#[cfg(unix)]
+fn around_flock_wait<T: Send>(run: impl FnOnce() -> T + Send, between: impl FnOnce()) -> T {
+    let park = crate::lock::flock_wait_park::arm();
+    std::thread::scope(|s| {
+        let launch = s.spawn(run);
+        park.parked.recv().unwrap();
+        between();
+        park.release.send(()).unwrap();
+        launch.join().unwrap()
+    })
+}
+
+/// Run a delegate launch whose state-flock wait is parked, apply `between`
+/// while it waits, then let it take the flock.
+#[cfg(unix)]
+fn apply_model_args_around_flock_wait(
+    l: &Layout,
+    passthrough: &[&str],
+    between: impl FnOnce(),
+) -> Result<Option<String>, String> {
+    around_flock_wait(
+        || apply_model_args(l, &mut Command::new("claude"), passthrough),
+        between,
+    )
+}
+
+/// Run an operator launch whose state-flock wait is parked, apply `between`
+/// while it waits, then let it take the flock.
+#[cfg(unix)]
+fn apply_around_flock_wait(l: &Layout, passthrough: &[&str], between: impl FnOnce()) -> Applied {
+    around_flock_wait(|| apply(l, passthrough), between)
+}
+
+/// The number that decides a refusal is the one the launch holds under the
+/// state flock: one gone by then is no longer due, so a spawn-file write
+/// fault warns instead of refusing.
+#[cfg(unix)]
+#[test]
+fn a_number_gone_by_the_flock_does_not_refuse_a_delegate_on_a_write_fault() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let record = crate::retention::record_path().unwrap();
+    let got = apply_model_args_around_flock_wait(&l, &["-p", "hi"], || {
+        fs::write(&operator, b"{}").unwrap();
+        fs::remove_file(&record).unwrap();
+    });
+    assert_eq!(
+        got,
+        Ok(Some(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); passed to \
+             claude unchanged, so auto-memory writes and tool-result reads may prompt this \
+             session",
+            l.settings_file
+        )))
+    );
+}
+
+/// A number learned while the launch waited for the state flock is due: a
+/// spawn-file write fault then refuses the delegate, naming that number.
+#[cfg(unix)]
+#[test]
+fn a_number_learned_by_the_flock_refuses_a_delegate_on_a_write_fault() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let operator = l.home.home().join(".claude").join("settings.json");
+    fs::create_dir_all(operator.parent().unwrap()).unwrap();
+    let got = apply_model_args_around_flock_wait(&l, &["-p", "hi"], || {
+        fs::write(
+            &operator,
+            serde_json::to_vec(&json!({"cleanupPeriodDays": 3650})).unwrap(),
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        got,
+        Err(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); {REFUSED}",
+            l.settings_file
+        ))
+    );
+}
+
+/// The number a launch re-reads under the state flock can be gone by then: a
+/// launch that needs nothing else then writes no empty spawn file and passes
+/// no `--settings`, so the vanished number adds neither to a launch that had
+/// nothing.
+#[cfg(unix)]
+#[test]
+fn a_launch_whose_number_vanishes_before_the_flock_writes_no_empty_file() {
+    let l = layout(false);
+    crate::retention::reset_latches();
+    remember(&l, 3650);
+    let operator = l.home.home().join(".claude").join("settings.json");
+    let record = crate::retention::record_path().unwrap();
+    let a = apply_around_flock_wait(&l, &["-p", "hi"], || {
+        fs::write(&operator, b"{}").unwrap();
+        fs::remove_file(&record).unwrap();
+    });
+    assert_eq!(a.argv, strings(&["-p", "hi"]));
+    assert_eq!(a.warning, None);
+    assert!(!l.settings_file.exists(), "no empty spawn file is written");
+    assert!(!record.exists(), "no registration is written");
+}
+
+/// A linked launch whose spawn file cannot be written says which file and
+/// why, and passes its args through.
+#[cfg(unix)]
+#[test]
+fn a_linked_launch_whose_spawn_file_cannot_be_written_says_so() {
+    let l = layout(true);
+    remember(&l, 3650);
+    fs::create_dir_all(&l.settings_file).unwrap();
+    let a = apply(&l, &["-p", "hi"]);
+    assert_eq!(
+        a.warning,
+        Some(format!(
+            "clauth: --settings {:?}: cannot write it (Is a directory (os error 21)); passed to \
+             claude unchanged, so auto-memory writes and tool-result reads may prompt this \
+             session",
+            l.settings_file
+        ))
+    );
+    assert_eq!(a.argv, strings(&["-p", "hi"]));
 }

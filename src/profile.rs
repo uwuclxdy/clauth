@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Local, Weekday};
+use chrono::{Datelike, Local, NaiveDate, Weekday};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -338,6 +338,11 @@ impl OAuthToken {
 }
 
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    clippy::allow_attributes,
+    reason = "each bool is a per-profile config.toml switch, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+)]
 pub(crate) struct Profile {
     pub(crate) name: ProfileName,
     pub(crate) base_url: Option<String>,
@@ -398,6 +403,14 @@ pub(crate) struct Profile {
     /// answered and which only lets serving chain members claim. Lets one account own the weekend without an external
     /// job rewriting `config.toml` twice a day.
     pub(crate) preferred_days: Vec<Weekday>,
+    /// The local day this account's canceled plan ends, copied by the user off
+    /// claude.ai's billing page. Read through [`Profile::plan_dates`], which
+    /// says when it wins over `plan_renews`: see [`crate::usage::PlanDates`].
+    pub(crate) plan_ends: Option<NaiveDate>,
+    /// A local billing day of this account's renewing plan, copied by the
+    /// user off claude.ai's billing page; once it passes, the plan renews on
+    /// its monthly anniversaries. No endpoint clauth reads names it.
+    pub(crate) plan_renews: Option<NaiveDate>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
     /// usage chain's current access token on every rotation (full scopes,
     /// `subscriptionType` and `rateLimitTier`, no refresh token — sessions get
@@ -523,6 +536,15 @@ fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth
 }
 
 impl Profile {
+    /// The two plan dates the user gave this profile (`plan_ends`,
+    /// `plan_renews`), the one input every plan-end surface reads.
+    pub(crate) fn plan_dates(&self) -> crate::usage::PlanDates {
+        crate::usage::PlanDates {
+            ends: self.plan_ends,
+            renews: self.plan_renews,
+        }
+    }
+
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
@@ -540,6 +562,8 @@ impl Profile {
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -1312,10 +1336,10 @@ fn origin_host_is_lowercase_name(host: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateSettings {
-    /// Run the background update work (default on): the binary check on
-    /// launch and the daemon's remote herdr reinstall. `CLAUTH_NO_UPDATE=1`
-    /// still disables every leg even when this is on — the env kill-switch
-    /// stays authoritative.
+    /// Run the background update work (default on): the hourly update check of
+    /// every daemon and TUI and the daemon's remote herdr reinstall.
+    /// `CLAUTH_NO_UPDATE=1` still disables every leg even when this is on — the
+    /// env kill-switch stays authoritative.
     pub(crate) auto_update: bool,
 }
 
@@ -2407,6 +2431,11 @@ impl ProfileId {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    clippy::allow_attributes,
+    reason = "each bool is one config.toml key this struct mirrors, not state; the lint is on only under the curated floor, so an expect would go unfulfilled elsewhere"
+)]
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
@@ -2443,6 +2472,16 @@ struct ProfileConfig {
     /// drops it from disk, which is the visible signal it was not understood.
     #[serde(default)]
     preferred_days: Vec<String>,
+    /// The `YYYY-MM-DD` behind [`Profile::plan_ends`], quoted or a bare TOML
+    /// date ([`plan_date_text`]). Text rather than a date so a date clauth
+    /// cannot read costs this key alone: the load reads it as unset and
+    /// comments the line out. A value of any other type fails the account's
+    /// load.
+    #[serde(default, deserialize_with = "plan_date_text")]
+    plan_ends: Option<String>,
+    /// The `YYYY-MM-DD` behind [`Profile::plan_renews`], read the same way.
+    #[serde(default, deserialize_with = "plan_date_text")]
+    plan_renews: Option<String>,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -2462,6 +2501,25 @@ struct ProfileConfig {
     /// must render after every scalar key in `render_config_toml`.
     #[serde(default)]
     console: ConsoleConfig,
+}
+
+/// A plan date as `config.toml` holds it: a quoted string as typed, or an
+/// unquoted TOML date, time or date-time in its TOML spelling, which a bare
+/// `plan_ends = 2026-11-20` is. Either then meets
+/// [`crate::usage::parse_plan_date`], so a date it cannot read costs this key
+/// alone: the load reads it as unset and comments the line out. A value of
+/// any other type fails the account's load.
+fn plan_date_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::String(text) => Ok(Some(text)),
+        toml::Value::Datetime(when) => Ok(Some(when.to_string())),
+        other => Err(serde::de::Error::invalid_type(
+            serde::de::Unexpected::Other(other.type_str()),
+            &"a date, quoted or bare",
+        )),
+    }
 }
 
 /// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
@@ -3382,6 +3440,10 @@ pub(crate) fn read_validated_handle(
     Ok(text.to_string())
 }
 
+/// Durable: the temp's bytes are synced before the rename and, on Unix, the
+/// directory after it ([`publish_temp`]), so on Unix the new file outlasts a
+/// power loss or a kernel panic as well as a crashed process; on Windows the
+/// bytes are flushed but nothing flushes the rename.
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     atomic_write_with(path, |f| {
         use std::io::Write;
@@ -3401,21 +3463,41 @@ pub(crate) fn atomic_write_with(
     }
     let tmp = tmp_sibling(path);
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write, None)
+    publish_temp(&tmp, path, f, write, None, true)
 }
 
 /// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
 /// `path`; the temp is removed when either step fails, so a failing writer
 /// never leaves one behind (each temp name is used once). With `modified` the
 /// closed temp takes that mtime before the rename.
+///
+/// `durable` syncs the temp's bytes before the rename and, on Unix, the
+/// directory after it. A rename alone is atomic for readers but not across a
+/// power loss: the new name can reach the disk before the bytes it names, so
+/// the file comes back empty or torn, or the rename itself is lost and the old
+/// bytes come back. Either is a lost login when the file held a refresh token
+/// the server has already spent. A failed sync fails the write as a failed
+/// `write` does. The directory sync is best-effort, since the file has landed
+/// by then, and Unix-only, since Windows opens no directory as a file. The
+/// mtime a dated write sets after the sync is not itself synced. A test build
+/// skips both syncs unless [`sync_in_tests`] turned them on.
 fn publish_temp(
     tmp: &Path,
     path: &Path,
     mut f: std::fs::File,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     modified: Option<std::time::SystemTime>,
+    durable: bool,
 ) -> std::io::Result<()> {
-    let written = write(&mut f);
+    #[cfg(test)]
+    let durable = durable && TEST_SYNCS.load(std::sync::atomic::Ordering::Relaxed);
+    let written = write(&mut f).and_then(|()| if durable { f.sync_all() } else { Ok(()) });
+    #[cfg(test)]
+    let written = if durable {
+        written.and_then(|()| take_sync_fault(path))
+    } else {
+        written
+    };
     drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(tmp);
@@ -3438,7 +3520,13 @@ fn publish_temp(
         }
     }
     match land(tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(unix)]
+            if durable && let Some(dir) = path.parent() {
+                let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
             Err(e)
@@ -3446,12 +3534,47 @@ fn publish_temp(
     }
 }
 
+/// Whether a test build's durable writes sync. Off by default: the suite
+/// writes thousands of stores, and on macOS each sync is an `F_FULLFSYNC`,
+/// which made the write-heavy modules' tests about seven times slower
+/// (17.3 s against 117.8 s with the syncs on, measured on macOS on
+/// 2026-11-16). Nothing a test reads tells a synced file from an unsynced
+/// one, so only the tests that drive the sync path itself turn this on
+/// ([`sync_in_tests`]).
+#[cfg(test)]
+static TEST_SYNCS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn on the syncs [`TEST_SYNCS`] skips, for the rest of this test process:
+/// one test under nextest, every test sharing the process under `cargo test`,
+/// which only makes those slower.
+#[cfg(test)]
+pub(crate) fn sync_in_tests() {
+    TEST_SYNCS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
 /// so the file is never world-readable even for the instant before the rename,
 /// and a stale temp at its name is removed first, so the mode is applied at
-/// creation.
+/// creation. Durable, as [`atomic_write`] is.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     atomic_write_600_dated(path, content, None)
+}
+
+/// [`atomic_write_600`] without the syncs, for a file rewritten every tick
+/// that the next tick rebuilds (`status.json`, `tps_cache.json`): a sync costs
+/// milliseconds on macOS, where it flushes the drive's cache (`F_FULLFSYNC`),
+/// and one a second buys such a file nothing. Readers still see old or new,
+/// never partial; a power loss can leave it empty until its next write.
+pub(crate) fn atomic_write_600_fast(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_600_dated_with(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())
+        },
+        None,
+        false,
+    )
 }
 
 /// [`atomic_write_600`] whose file lands already carrying the mtime
@@ -3471,6 +3594,7 @@ pub(crate) fn atomic_write_600_dated(
             f.write_all(content.as_ref())
         },
         modified,
+        true,
     )
 }
 
@@ -3482,15 +3606,16 @@ pub(crate) fn atomic_write_600_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    atomic_write_600_dated_with(path, write, None)
+    atomic_write_600_dated_with(path, write, None, true)
 }
 
 /// [`atomic_write_600_with`] landing with the mtime `modified` when given
-/// ([`atomic_write_600_dated`]).
+/// ([`atomic_write_600_dated`]), synced when `durable` ([`publish_temp`]).
 fn atomic_write_600_dated_with(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     modified: Option<std::time::SystemTime>,
+    durable: bool,
 ) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -3517,7 +3642,7 @@ fn atomic_write_600_dated_with(
     };
     #[cfg(not(unix))]
     let f = std::fs::File::create(&tmp)?;
-    publish_temp(&tmp, path, f, write, modified)
+    publish_temp(&tmp, path, f, write, modified, durable)
 }
 
 /// [`publish_temp`]'s rename. In a test build the file is read at the instant
@@ -3596,6 +3721,35 @@ fn take_dating_fault(path: &Path) -> std::io::Result<()> {
         .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
     if planted {
         Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The paths whose next durable write fails at its sync step, as a failing
+/// disk's `sync_all` would; each fault fires once.
+#[cfg(test)]
+static SYNC_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_sync(path: &Path) {
+    if let Ok(mut faults) = SYNC_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The sync's result in a test build: an armed fault answers in place of the
+/// real call's, so the writer's handling of a failed sync is what a test
+/// exercises.
+#[cfg(test)]
+fn take_sync_fault(path: &Path) -> std::io::Result<()> {
+    let planted = SYNC_FAULTS
+        .lock()
+        .is_ok_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted sync fault"))
     } else {
         Ok(())
     }
@@ -5994,6 +6148,14 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         last_resort: config.last_resort,
         preferred: config.preferred,
         preferred_days: parse_preferred_days(&config.preferred_days),
+        plan_ends: config
+            .plan_ends
+            .as_deref()
+            .and_then(crate::usage::parse_plan_date),
+        plan_renews: config
+            .plan_renews
+            .as_deref()
+            .and_then(crate::usage::parse_plan_date),
         rolling_token: config.rolling_token,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -6046,6 +6208,8 @@ fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
         last_resort: profile.last_resort,
         preferred: profile.preferred,
         preferred_days: render_preferred_days(&profile.preferred_days),
+        plan_ends: profile.plan_ends.map(crate::usage::render_plan_date),
+        plan_renews: profile.plan_renews.map(crate::usage::render_plan_date),
         rolling_token: profile.rolling_token,
         max_auto_spend: profile.max_auto_spend,
         // Default-on booleans render as commented examples when on, so the
@@ -6952,7 +7116,7 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
 /// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
 /// added to the model without a doc block and example fails a test.
 #[cfg(test)]
-const MODELLED_SCALARS: [&str; 18] = [
+const MODELLED_SCALARS: [&str; 20] = [
     "base_url",
     "api_key",
     "auto_start",
@@ -6963,6 +7127,8 @@ const MODELLED_SCALARS: [&str; 18] = [
     "last_resort",
     "preferred",
     "preferred_days",
+    "plan_ends",
+    "plan_renews",
     "rolling_token",
     "max_auto_spend",
     "check_weekly",
@@ -7065,6 +7231,16 @@ fn push_scalar_doc(out: &mut String, key: &str) {
             );
             out.push_str("# does not is dropped on the next rewrite.\n");
         }
+        "plan_ends" => {
+            out.push_str("# The day this account's canceled plan ends (YYYY-MM-DD, local time), as\n");
+            out.push_str("# claude.ai's billing page states it. Wins over plan_renews until it\n");
+            out.push_str("# passes; after that, a later plan_renews wins.\n");
+        }
+        "plan_renews" => {
+            out.push_str("# The next day this account's plan bills (YYYY-MM-DD, local time), as\n");
+            out.push_str("# claude.ai's billing page states it; once it passes, the plan renews\n");
+            out.push_str("# on the same day of each following month. clauth cannot read it.\n");
+        }
         "rolling_token" => {
             out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
             out.push_str("# chain's current access token on every rotation (plan-gated models\n");
@@ -7146,6 +7322,8 @@ fn scalar_example(key: &str) -> String {
         "last_resort" => "# last_resort = true\n".to_string(),
         "preferred" => "# preferred = true\n".to_string(),
         "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n".to_string(),
+        "plan_ends" => "# plan_ends = \"2026-12-31\"\n".to_string(),
+        "plan_renews" => "# plan_renews = \"2026-12-15\"\n".to_string(),
         "rolling_token" => "# rolling_token = true\n".to_string(),
         "max_auto_spend" => "# max_auto_spend = 5.0\n".to_string(),
         "check_weekly" => "# check_weekly = false\n".to_string(),
@@ -7315,6 +7493,21 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("]\n");
     }
     out.push('\n');
+
+    for (key, date) in [
+        ("plan_ends", profile.plan_ends),
+        ("plan_renews", profile.plan_renews),
+    ] {
+        push_scalar_doc(&mut out, key);
+        match date {
+            Some(date) => out.push_str(&format!(
+                "{key} = {}\n",
+                toml_str(&crate::usage::render_plan_date(date))
+            )),
+            None => out.push_str(&scalar_example(key)),
+        }
+        out.push('\n');
+    }
 
     push_scalar_doc(&mut out, "rolling_token");
     if profile.rolling_token {
@@ -7499,6 +7692,14 @@ fn known_doc_blocks(key: &str) -> Vec<String> {
              # no running window. ~0.001{CENT} per ping. OAuth profiles only.\n\
              # Old name `kick_timer = true` is still accepted.\n"
         )),
+        // The plan-dates feature's first form, before the win-over rule was
+        // corrected for a past end.
+        "plan_ends" => docs.push(
+            "# The day this account's canceled plan ends (YYYY-MM-DD, local time), as\n\
+             # claude.ai's billing page states it. clauth cannot read a cancellation\n\
+             # before the plan ends. Wins over plan_renews.\n"
+                .to_string(),
+        ),
         // ce69b154 reworded the alert copy (90205d2d wrote the older block).
         "bell_threshold" => docs.push(
             "# 5-hour utilization percentage at/above which clauth fires a bell\n\
@@ -8460,6 +8661,8 @@ enum KeyShape {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScalarKind {
     Str,
+    /// A string, or a bare TOML date-time ([`plan_date_text`]).
+    Date,
     F64,
     U64,
     Bool,
@@ -8474,6 +8677,8 @@ fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
         "base_url" => (ScalarKind::Str, "base_url"),
         "api_key" => (ScalarKind::Str, "api_key"),
         "effort" => (ScalarKind::Str, "effort"),
+        "plan_ends" => (ScalarKind::Date, "plan_ends"),
+        "plan_renews" => (ScalarKind::Date, "plan_renews"),
         "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
         "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
         "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
@@ -8512,13 +8717,15 @@ fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
         return KeyShape::Unreadable; // a table or array-of-tables where a value belongs
     };
     match kind {
-        ScalarKind::Str => {
+        ScalarKind::Str | ScalarKind::Date => {
             if v.is_str() {
                 if is_multiline_string(v) {
                     KeyShape::NonPlain
                 } else {
                     KeyShape::Plain
                 }
+            } else if kind == ScalarKind::Date && v.is_datetime() {
+                KeyShape::Plain
             } else {
                 KeyShape::Unreadable
             }
@@ -8639,6 +8846,8 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
         "last_resort" => on_disk.last_resort != canonical.last_resort,
         "preferred" => on_disk.preferred != canonical.preferred,
         "preferred_days" => on_disk.preferred_days != canonical.preferred_days,
+        "plan_ends" => on_disk.plan_ends != canonical.plan_ends,
+        "plan_renews" => on_disk.plan_renews != canonical.plan_renews,
         "rolling_token" => on_disk.rolling_token != canonical.rolling_token,
         "max_auto_spend" => on_disk.max_auto_spend != canonical.max_auto_spend,
         "check_weekly" => on_disk.check_weekly != canonical.check_weekly,
@@ -8774,6 +8983,19 @@ fn apply_config_edits(
             edit_preferred_days_load(doc, &od.preferred_days, &canonical.preferred_days);
         }
     }
+    for (key, od_date, ca_date) in [
+        ("plan_ends", &od.plan_ends, &canonical.plan_ends),
+        ("plan_renews", &od.plan_renews, &canonical.plan_renews),
+    ] {
+        match mode {
+            ConfigEditMode::Save => edit_string_scalar(doc, od_date, ca_date, key),
+            ConfigEditMode::Load => {
+                edit_scalar_load(doc, od_date.as_ref(), ca_date.as_ref(), key, |doc| {
+                    edit_string_scalar(doc, od_date, ca_date, key);
+                });
+            }
+        }
+    }
     edit_bool_scalar(
         doc,
         od.rolling_token,
@@ -8827,13 +9049,30 @@ fn edit_threshold_load(
     ca: Option<f64>,
     key: &str,
 ) {
+    edit_scalar_load(doc, od.as_ref(), ca.as_ref(), key, |doc| {
+        edit_f64_scalar(doc, od, ca, key);
+    });
+}
+
+/// The load's repair of a scalar it reads leniently: a value it ignores
+/// outright (an ignored threshold, a plan date that is no date) is commented
+/// out in place, the visible signal it was not understood; one it reads but
+/// spells another way (a clamped threshold, an unpadded date) goes back
+/// through `write`.
+fn edit_scalar_load<T: PartialEq>(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<&T>,
+    ca: Option<&T>,
+    key: &str,
+    write: impl FnOnce(&mut toml_edit::DocumentMut),
+) {
     if od == ca {
         return;
     }
     if ca.is_none() {
         comment_out_scalar(doc, key);
     } else {
-        edit_f64_scalar(doc, od, ca, key);
+        write(doc);
     }
 }
 
