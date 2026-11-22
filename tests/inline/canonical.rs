@@ -49,6 +49,23 @@ fn plain_of_a_long_path_keeps_the_verbatim_prefix() {
     assert_eq!(plain, crate::testutil::plain_path(&p));
 }
 
+/// Codex keys hook trust with std's resolved `CODEX_HOME`, verbatim prefix and all, so the codex purpose must never take `plain`'s spelling.
+#[cfg(windows)]
+#[test]
+fn codex_home_of_a_short_path_keeps_the_verbatim_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolved = crate::canonical::codex_home(dir.path()).unwrap();
+    assert!(
+        resolved.to_string_lossy().starts_with(r"\\?\"),
+        "the verbatim prefix codex keys with stays: {resolved:?}"
+    );
+    assert_ne!(
+        resolved,
+        crate::canonical::plain(dir.path()).unwrap(),
+        "a short path's plain spelling drops the prefix, so the two differ"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn display_of_an_identity_path_equals_plain() {
