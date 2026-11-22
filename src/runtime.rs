@@ -65,7 +65,7 @@
 //! profile's delete does the same for its own trees first
 //! ([`rescue_profile_trees`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14433,21 +14433,55 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
 const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
 const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
 
-/// Copy the operator's `config.toml` into a session home with the escape keys
-/// removed. An unparseable config copies through verbatim: codex will reject it
-/// the same way, and a session that cannot start is a better answer than one
-/// silently reshaped by a parse this function got wrong. Comments and key order
-/// are lost in the rewrite, which costs nothing — the copy is codex's to write
-/// in place and is discarded at teardown, never synced back over the original.
+/// What a copied config does with the hooks declared inline under its `[hooks]` table.
+/// Inline hooks execute code like `hooks.json` does, so they ride the same opt-in: kept only on a shared home whose profile sets [`CodexProfileOpts::hooks_json`], stripped everywhere else.
+#[derive(Debug, Clone, Copy)]
+enum InlineHooks<'a> {
+    /// Drop every inline hook entry, and every `[hooks.state]` entry keyed to one of these session spellings: a copy with no operator file left has no trust to derive it from, so a hook the operator trusted must ask again.
+    /// The operator's own entries stay.
+    Strip(&'a [PathBuf]),
+    /// Keep them, and re-key the operator's trust onto the session home.
+    Carry(&'a HookTrust),
+}
+
+/// Where the operator's hook trust is keyed, and where a session's must be.
+/// Codex keys trust as `<source>:<event>:<group>:<handler>`, `<source>` being the resolved `CODEX_HOME` joined with the declaring file (`hooks.json`, `config.toml` or a `<name>.config.toml` layer).
+#[derive(Debug)]
+struct HookTrust {
+    /// The operator home's spellings, resolved first, then the raw one when it differs.
+    /// Codex writes the resolved spelling when `CODEX_HOME` is set, so that one wins when both spellings key one hook.
+    operator: Vec<PathBuf>,
+    /// The session home as codex resolves it, never the link's target, which would be the operator's own file.
+    session: PathBuf,
+    /// Every file name a hook can be declared in.
+    sources: Vec<String>,
+}
+
+/// The spellings a codex home may be keyed under: the resolved form codex writes when `CODEX_HOME` is set, then `home` itself when the two differ.
+/// A home that does not resolve yet keeps its given spelling.
+fn codex_home_spellings(home: &Path) -> Result<Vec<PathBuf>> {
+    match crate::canonical::codex_home(home) {
+        Ok(resolved) if resolved.as_path() != home => Ok(vec![resolved, home.to_path_buf()]),
+        Ok(_) => Ok(vec![home.to_path_buf()]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![home.to_path_buf()]),
+        Err(e) => Err(e).with_context(|| format!("failed to resolve {}", home.display())),
+    }
+}
+
+/// The `<source>:` prefix of every trust key a hook declared in `source` gets, `source` spelled byte for byte as given: a Windows verbatim `\\?\` home stays verbatim, the spelling codex keys with.
+fn hook_trust_prefix(source: &Path) -> String {
+    format!("{}:", source.display())
+}
+
+/// Copy the operator's `config.toml` (or a `<name>.config.toml` layer) into a session home with the escape keys removed and its inline hooks handled per `hooks`.
+/// An unparseable config copies through verbatim: codex will reject it the same way, and a session that cannot start is a better answer than one silently reshaped by a parse this function got wrong.
+/// Comments and key order are lost in the rewrite.
+/// The copy is derived, never synced back: every build rewrites it from the operator's current file, which drops what codex wrote into it in place, the state a per-session home loses at teardown anyway.
 ///
-/// Every branch lands owner-only: the copy sits in a tree the perms sweep
-/// stops short of, so the operator's own mode would otherwise be what it keeps.
-///
-/// `hook_trust` is `(operator hooks.json, session hooks.json)` when the profile
-/// links the operator's hooks — see [`carry_hook_trust`].
-fn copy_codex_config(src: &Path, dst: &Path, hook_trust: Option<(&Path, &Path)>) -> Result<()> {
+/// Every branch lands owner-only through the atomic writer, so a sibling codex reading mid-build sees the old file or the new one, never a partial one: the copy sits in a tree the perms sweep stops short of, so the operator's own mode would otherwise be what it keeps.
+fn copy_codex_config(src: &Path, dst: &Path, hooks: InlineHooks<'_>) -> Result<()> {
     let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let bytes = match rewritten_codex_config(&raw, hook_trust) {
+    let bytes = match rewritten_codex_config(&raw, hooks) {
         Some(parsed) => toml::to_string(&parsed)
             .with_context(|| format!("failed to re-render {}", src.display()))?
             .into_bytes(),
@@ -14457,10 +14491,8 @@ fn copy_codex_config(src: &Path, dst: &Path, hook_trust: Option<(&Path, &Path)>)
         .with_context(|| format!("failed to write {}", dst.display()))
 }
 
-/// The parsed config with the escape keys removed and the operator's hook
-/// trust carried over, or `None` when neither changed anything or the bytes do
-/// not parse, so the copy goes verbatim.
-fn rewritten_codex_config(raw: &[u8], hook_trust: Option<(&Path, &Path)>) -> Option<toml::Value> {
+/// The parsed config with the escape keys removed and its inline hooks stripped or their trust carried, or `None` when nothing changed or the bytes do not parse, so the copy goes verbatim.
+fn rewritten_codex_config(raw: &[u8], hooks: InlineHooks<'_>) -> Option<toml::Value> {
     let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
     let table = parsed.as_table_mut()?;
     let mut changed = false;
@@ -14472,21 +14504,38 @@ fn rewritten_codex_config(raw: &[u8], hook_trust: Option<(&Path, &Path)>) -> Opt
             changed |= sub.remove(*key).is_some();
         }
     }
-    if let Some((from, to)) = hook_trust {
-        changed |= carry_hook_trust(table, from, to);
-    }
+    changed |= match hooks {
+        InlineHooks::Strip(session) => {
+            let stripped = strip_inline_hooks(table);
+            let dropped = drop_session_trust(table, session);
+            stripped || dropped
+        }
+        InlineHooks::Carry(trust) => carry_hook_trust(table, trust),
+    };
     changed.then_some(parsed)
 }
 
-/// Codex keys a hook's trust by the path of the `hooks.json` it came from
-/// (`[hooks.state."<CODEX_HOME>/hooks.json:<event>:<i>:<j>"] trusted_hash`),
-/// and every session home is a new path — so a hook the operator trusted in
-/// `~/.codex` reads as new in each session and codex asks again. Re-key the
-/// entries for exactly that `hooks.json` onto the session home's link to it.
-/// The hash is copied, never computed: a hook changed since the operator
-/// trusted it still fails codex's check and still asks. The operator's own
-/// entries stay, and an entry already present under the session key wins.
-fn carry_hook_trust(table: &mut toml::Table, from: &Path, to: &Path) -> bool {
+/// Drop every key of the `[hooks]` table but `state`: codex reads the fourteen event keys there as hook declarations and ignores any other key, so nothing else is a hook that could run.
+/// The operator's trust entries stay.
+/// A `hooks` that is not a table is left for codex to reject.
+fn strip_inline_hooks(table: &mut toml::Table) -> bool {
+    let Some(hooks) = table.get_mut("hooks").and_then(toml::Value::as_table_mut) else {
+        return false;
+    };
+    let before = hooks.len();
+    hooks.retain(|key, _| key == "state");
+    if hooks.len() == before {
+        return false;
+    }
+    if hooks.is_empty() {
+        table.remove("hooks");
+    }
+    true
+}
+
+/// Drop the `[hooks.state]` entries keyed to one of `session`'s spellings: the carry wrote them for this home, so keeping them would run a hook trusted after the operator took the trust away with their config.
+/// The operator's own entries stay.
+fn drop_session_trust(table: &mut toml::Table, session: &[PathBuf]) -> bool {
     let Some(state) = table
         .get_mut("hooks")
         .and_then(toml::Value::as_table_mut)
@@ -14495,18 +14544,47 @@ fn carry_hook_trust(table: &mut toml::Table, from: &Path, to: &Path) -> bool {
     else {
         return false;
     };
-    let prefix = format!("{}:", from.display());
-    let carried: Vec<(String, toml::Value)> = state
+    let prefixes: Vec<String> = session
         .iter()
-        .filter_map(|(key, value)| {
-            let rest = key.strip_prefix(&prefix)?;
-            Some((format!("{}:{rest}", to.display()), value.clone()))
-        })
+        .map(|home| format!("{}{}", home.display(), std::path::MAIN_SEPARATOR))
         .collect();
+    let before = state.len();
+    state.retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
+    state.len() != before
+}
+
+/// Codex keys a hook's trust by the resolved path of the file that declares it, and a session home is not the operator's home, so a hook the operator trusted reads as new in a session and codex asks again.
+/// Re-key each entry whose source is one of the operator's hook files onto the same file under the session home.
+/// The hash is copied, never computed: a hook changed since the operator trusted it still fails codex's check and still asks.
+/// The operator's own entries stay, and an entry already present under the session key wins.
+/// When both operator spellings key one hook, the resolved spelling's entry is the one carried.
+fn carry_hook_trust(table: &mut toml::Table, trust: &HookTrust) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let mut carried: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for file in &trust.sources {
+        let to = hook_trust_prefix(&trust.session.join(file));
+        for operator in &trust.operator {
+            let from = hook_trust_prefix(&operator.join(file));
+            for (key, value) in state.iter() {
+                if let Some(rest) = key.strip_prefix(&from) {
+                    carried
+                        .entry(format!("{to}{rest}"))
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
     let mut changed = false;
     for (key, value) in carried {
-        if !state.contains_key(&key) {
-            state.insert(key, value);
+        if let toml::map::Entry::Vacant(slot) = state.entry(key) {
+            slot.insert(value);
             changed = true;
         }
     }
@@ -14653,7 +14731,7 @@ fn last_refresh_ms_of(path: &Path) -> Option<i64> {
 /// reader and unknown keys stay tolerated.
 #[derive(Default, serde::Deserialize)]
 struct CodexProfileOpts {
-    /// Link the operator codex home's `hooks.json` into shared session homes.
+    /// Link the operator codex home's `hooks.json` into shared session homes and keep the inline hooks of their copied configs, carrying the operator's trust for both.
     #[serde(default)]
     hooks_json: bool,
 }
@@ -14668,9 +14746,22 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
     }
 }
 
-/// Build one codex session home. Additive over an existing tree, like the
-/// claude build: a link already in place is left alone, so a rebuild over a
-/// live shared tree cannot yank entries out from under a sibling.
+/// The names in `dir` codex reads as a config: `config.toml` and each `<name>.config.toml` profile layer.
+/// An unreadable `dir` lists none.
+fn codex_config_names(dir: &Path) -> impl Iterator<Item = String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name == "config.toml" || name.ends_with(".config.toml")).then_some(name)
+        })
+}
+
+/// Build one codex session home.
+/// Links are additive over an existing tree, like the claude build: a link already in place is left alone, so a rebuild over a live shared tree cannot yank entries out from under a sibling.
+/// The derived copies are the exception: `config.toml`, each layer and the fake transport's `hooks.json` copy are rewritten from the operator's current files on every build, because a home can outlive the build that made it (the fake transport's bare stems, a per-session home under a recycled sid) and which hooks it runs must follow the profile's current opt-in.
 ///
 /// The table (from the codex plan):
 /// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
@@ -14681,9 +14772,8 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   already documents, sharpened by codex's single-use refresh chain: the
 ///   copy is a second carrier whose refreshes strand the store, and a
 ///   fake-mode host accepts that or does not run codex sessions.
-/// - `config.toml` — a COPY of the operator's (codex writes it in place, so a
-///   link would mutate the operator's own file). Absent operator config copies
-///   nothing.
+/// - `config.toml` and each layer — a COPY of the operator's (codex writes it in place, so a link would mutate the operator's own file), its inline hooks kept and their trust carried only where `hooks.json` links in.
+///   Absent operator config copies nothing, and a copy whose operator file is gone is stripped in place with the trust carried for this home.
 /// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
 ///   links (fake: copies); isolated links nothing from the operator.
 /// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
@@ -14729,29 +14819,52 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
 
     let link_hooks = isolation == Isolation::Shared && codex_profile_opts(name).hooks_json;
     let (operator_hooks, session_hooks) = (operator.join("hooks.json"), home.join("hooks.json"));
-    let hook_trust = link_hooks.then_some((operator_hooks.as_path(), session_hooks.as_path()));
+    let session_homes = codex_home_spellings(home)?;
 
-    let operator_config = operator.join("config.toml");
-    if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
-        copy_codex_config(&operator_config, &home.join("config.toml"), hook_trust)?;
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the base config, and CODEX_HOME is this session home, so without the layers the flag resolves to an empty layer and silently runs the base config.
+    // They are sanitized like the base file: a layer can spell the same escapes, and declare hooks of its own.
+    let operator_configs: BTreeSet<String> = codex_config_names(&operator)
+        .filter(|file| operator.join(file).exists())
+        .collect();
+    let trust = if link_hooks {
+        Some(HookTrust {
+            operator: codex_home_spellings(&operator)?,
+            session: session_homes[0].clone(),
+            sources: std::iter::once("hooks.json".to_owned())
+                .chain(operator_configs.iter().cloned())
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let inline = trust
+        .as_ref()
+        .map_or(InlineHooks::Strip(&[]), InlineHooks::Carry);
+    for file in &operator_configs {
+        copy_codex_config(&operator.join(file), &home.join(file), inline)?;
     }
-    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
-    // base config, and CODEX_HOME is this session home — so without these the
-    // flag resolves to an empty layer and silently runs the base config. They
-    // are sanitized like the base file: a layer can spell the same escapes.
-    if let Ok(entries) = std::fs::read_dir(&operator) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if !name.ends_with(".config.toml") {
-                continue;
-            }
-            let dst = home.join(name);
-            if dst.symlink_metadata().is_err() {
-                copy_codex_config(&entry.path(), &dst, None)?;
-            }
+    // A copy whose operator file is gone derives from no declaration at all, so it keeps no inline hook and no trust carried for this home.
+    // Stripped in place rather than removed: codex may have created it itself.
+    for file in codex_config_names(home).filter(|file| !operator_configs.contains(file)) {
+        let dst = home.join(&file);
+        if dst.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+            copy_codex_config(&dst, &dst, InlineHooks::Strip(&session_homes))?;
+        }
+    }
+
+    // Under Fake the home's `hooks.json` is clauth's copy, derived like the configs: rewritten from the operator's current file while the opt-in holds, removed once it does not.
+    if mode == LinkMode::Fake {
+        if link_hooks && operator_hooks.is_file() {
+            let bytes = std::fs::read(&operator_hooks)
+                .with_context(|| format!("failed to read {}", operator_hooks.display()))?;
+            crate::profile::atomic_write_600(&session_hooks, bytes)
+                .with_context(|| format!("failed to write {}", session_hooks.display()))?;
+        } else if session_hooks
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_file())
+        {
+            std::fs::remove_file(&session_hooks)
+                .with_context(|| format!("failed to remove {}", session_hooks.display()))?;
         }
     }
 
@@ -14759,7 +14872,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         for entry in CODEX_OPERATOR_ENTRIES {
             place(&operator.join(entry), &home.join(entry))?;
         }
-        if link_hooks {
+        if link_hooks && mode == LinkMode::Real {
             place(&operator_hooks, &session_hooks)?;
         }
         if mode == LinkMode::Real {

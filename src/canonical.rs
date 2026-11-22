@@ -16,6 +16,15 @@ pub(crate) fn identity(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
+/// `path` resolved the way codex resolves its `CODEX_HOME` before keying hook trust: std's resolution, so on Windows the `\\?\` verbatim prefix stays, since codex keys trust with that spelling and a plain one never matches it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this module is the one place that calls it"
+)]
+pub(crate) fn codex_home(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
 /// `dunce::canonicalize`: `path` resolved for showing or handing to another
 /// program. Windows' `\\?\` verbatim prefix goes wherever a plain spelling
 /// exists; past 260 characters and on UNC paths it stays, as Windows needs.
