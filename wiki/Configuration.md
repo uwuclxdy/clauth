@@ -252,7 +252,7 @@ clauth edits `config.toml` in place: a save changes only the keys whose setting 
 | `effort` | string | none | the account's reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` or a custom value; every value rides `CLAUDE_CODE_EFFORT_LEVEL` in settings.json ([above](Configuration#model-routing)). The Setup tab's `effort` row edits it |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent`, `advisor` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
-| `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
+| `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes and keep the hooks declared inline under `[hooks]` in the copied `config.toml` and `*.config.toml` layers, carrying your codex's trust for both onto each session home, so those hooks run inside `clauth start` sessions too. Off, or in an `--isolated` session, `hooks.json` is left out and the inline hooks are stripped from every copy, `[hooks.state]` kept ([Codex](Codex#run)). A change takes effect at the next session start, also on a host that cannot symlink |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
