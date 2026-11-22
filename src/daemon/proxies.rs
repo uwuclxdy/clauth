@@ -923,16 +923,24 @@ fn manage(slots: ProxySlots, stop: Receiver<()>) {
 }
 
 /// One coordinator round: read the registry, start a supervisor per enabled
-/// row that has none, reap a removed row's supervisor off-thread, drop every
-/// slot no supervisor it owns published, log an unreadable registry once per
-/// distinct error, and reclaim orphans. Split out of [`manage`] so a test
-/// drives rounds deterministically, never by a wall clock.
+/// row that has none and whose removed-row reapers have all finished, reap a
+/// removed row's supervisor off-thread, drop every slot no supervisor it
+/// owns published, log an unreadable registry once per distinct error, and
+/// reclaim orphans. Split out of [`manage`] so a test drives rounds
+/// deterministically, never by a wall clock.
 fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) {
     match Registry::load() {
         Ok(registry) => {
             note_registry_read_ok();
             for (service, row) in registry.iter() {
-                if row.enabled && !coordinator.threads.contains_key(service) {
+                // A re-enabled service whose reaper still owns the stop waits
+                // it out: a supervisor starting beside the reaper would read
+                // the same child marker, and its reclaim could reap the
+                // draining child out from under the reaper's `try_wait`.
+                if row.enabled
+                    && !coordinator.threads.contains_key(service)
+                    && !coordinator.reaping.contains_key(service)
+                {
                     match start_kind(
                         Proxy {
                             service: service.clone(),
@@ -1068,20 +1076,26 @@ fn reclaim_unwatched_orphans(
 /// ones already stopping on their own threads. The wait for each stop's
 /// answer ends within `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`; each join
 /// after an answer then waits out that stop's deferred log and marker writes
-/// with no bound.
+/// with no bound. A refused stop-thread spawn keeps its supervisor and stops
+/// it inline on this thread instead (the same degraded path the daemon's
+/// stop takes), so a thread limit never panics the coordinator.
 #[cfg(unix)]
 fn shutdown_threads(
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,
     reaping: BTreeMap<Service, Vec<JoinHandle<()>>>,
 ) {
-    let mut joins = Vec::new();
-    for (_, supervisor) in threads {
-        joins.push(std::thread::spawn(move || {
-            supervisor.shutdown(super::gateway::DAEMON_STOP_BUDGET);
-        }));
+    let stops: Vec<super::gateway::StopThread<SupervisorThread<Proxy>>> = threads
+        .into_values()
+        .map(|supervisor| {
+            super::gateway::spawn_stop_thread(supervisor, |supervisor| {
+                supervisor.shutdown(super::gateway::DAEMON_STOP_BUDGET);
+            })
+        })
+        .collect();
+    for stop in stops {
+        stop.finish();
     }
-    joins.extend(reaping.into_values().flatten());
-    for join in joins {
+    for join in reaping.into_values().flatten() {
         let _ = join.join();
     }
 }

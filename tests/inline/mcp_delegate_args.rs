@@ -379,6 +379,33 @@ fn a_resolved_prompt_path_reads_the_file() {
     );
 }
 
+/// A prompt file whose text starts with `-` would reach claude right after
+/// `-p`, where claude reads it as an option: refused, relative and absolute
+/// alike.
+#[test]
+fn a_prompt_file_whose_text_starts_with_a_dash_is_refused() {
+    let home = HomeSandbox::new();
+    let cwd = work_dir(home.home());
+    std::fs::write(
+        cwd.join("task.md"),
+        "--managed-settings={\"cleanupPeriodDays\":1}",
+    )
+    .expect("fixture file");
+    let cwd = cwd.to_str().unwrap();
+    let refusal = "`prompt` cannot start with `-`: claude would read it as an option".to_string();
+    assert_eq!(
+        super::read_prompt_path(Some(cwd), "task.md"),
+        Err(refusal.clone())
+    );
+    let abs = std::path::absolute(cwd)
+        .expect("absolute cwd")
+        .join("task.md");
+    assert_eq!(
+        super::read_prompt_path(None, abs.to_str().expect("utf8")),
+        Err(refusal)
+    );
+}
+
 /// A FIFO blocks a read-only open until a writer appears, and the MCP server
 /// runs on the only thread of its current-thread runtime, so reading one as a
 /// prompt path would freeze every tool until the process dies. The type check
@@ -553,9 +580,8 @@ fn args_carry_flag_matches_both_spellings() {
 }
 
 /// The wiring the shadow rule protects: `subagent_type` reaches the child as
-/// `--agent <name>`. `run_delegate` cannot run without a real `claude` child,
-/// so the pin is a source scan, the same mechanism the heartbeat wiring pins
-/// use.
+/// `--agent <name>`. The argv test below runs `run_delegate` under
+/// `FakeClaude`; this source scan stays as the cheap pin on the arm itself.
 #[test]
 fn subagent_type_is_passed_as_the_agent_flag() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -631,38 +657,93 @@ fn raw_session_flags_in_args_are_refused() {
     }
 }
 
-/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: one binding
-/// feeds both the env var and the `--session-id`/`--resume` flag, so the
-/// exported id is always the id the child runs under. `run_delegate` cannot
-/// run without a real `claude` child, so the pin is a source scan, the same
-/// mechanism the agent-flag wiring pin uses.
+/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: the id the
+/// spawn exports is the id the child runs under, pinned by `--session-id` on
+/// a fresh run and continued by `--resume=<id>` on a resume. The resumed id
+/// rides one word, so claude never reads an id as an option of its own.
+#[cfg(unix)]
 #[test]
 fn the_exported_session_id_is_the_id_the_child_runs_under() {
-    let src = include_str!("../../src/mcp/mod.rs");
-    let body = src
-        .split_once("fn run_delegate(")
-        .expect("run_delegate is defined")
-        .1;
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let mut fake = FakeClaude::new(&home);
+    let dump = home.home().join("env-dump");
+    fake.set_env_dump(&dump);
+    let exported = || {
+        std::fs::read_to_string(&dump)
+            .expect("the shim dumped its env")
+            .lines()
+            .find_map(|line| line.strip_prefix("CLAUTH_DELEGATE_SESSION_ID="))
+            .map(str::to_owned)
+            .expect("the spawn exports its session id")
+    };
+    let last_argv = || {
+        fake.spawns()
+            .last()
+            .map(|(_, argv)| argv.split(' ').map(str::to_owned).collect::<Vec<_>>())
+            .expect("the delegate spawned claude")
+    };
+
+    // The shim prints no stream-json, so each envelope may be an error: the
+    // run under test is the argv and env, not the result.
+    drop(call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        ..base()
+    }));
+    let fresh = exported();
+    let argv = last_argv();
+    let pin = argv
+        .iter()
+        .position(|word| word == "--session-id")
+        .expect("a fresh run pins its id");
     assert_eq!(
-        body.match_indices("delegate_session_id(").count(),
-        1,
-        "exactly one place mints the delegate's session id",
+        argv.get(pin + 1),
+        Some(&fresh),
+        "a fresh run pins the id it exports: {argv:?}"
+    );
+
+    // The transcript a resume resolves: the id under a workspace slug in the
+    // sandbox's global store.
+    let id = "sess-resume-1";
+    let workspace = home.home().join("w-resume");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let slug = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects")
+        .join("-w-resume");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    std::fs::write(
+        slug.join(format!("{id}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+        ),
+    )
+    .expect("transcript fixture");
+    drop(call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        session_id: Some(id.to_string()),
+        ..base()
+    }));
+    assert_eq!(exported(), id, "a resume exports the id it continues");
+    let argv = last_argv();
+    assert!(
+        argv.contains(&format!("--resume={id}")),
+        "a resume continues its id as one word: {argv:?}"
     );
     assert!(
-        body.contains("let session_id = delegate_session_id(opts.resume)?;"),
-        "the mint binds the name the env stamp and the flag both read",
-    );
-    let tail = body
-        .split_once("if let Some(id) = opts.resume {")
-        .expect("the resume arm exists")
-        .1;
-    assert!(
-        tail.contains(r#"["--resume", id]"#),
-        "a resume keeps the id it continues",
+        !argv.iter().any(|word| word == "--resume" || word == "-r"),
+        "no word of its own carries the resumed id: {argv:?}"
     );
     assert!(
-        tail.contains(r#"["--session-id", &session_id]"#),
-        "a fresh run pins the very binding the env var names",
+        !argv.iter().any(|word| word == "--session-id"),
+        "a resume pins no fresh id: {argv:?}"
     );
 }
 
@@ -2287,4 +2368,145 @@ fn args_carry_flag_stops_at_the_separator() {
     ));
     assert!(!args_carry_flag(&svec(&["--", "--agent", "x"]), "--agent"));
     assert!(!args_carry_flag(&svec(&["--", "--agent=x"]), "--agent"));
+}
+
+/// A quarantined proxy account holding no key and no bind (a stored pair the
+/// load read as an OAuth login) is told the login through its proxy, the only
+/// login clauth takes for it; the same account with no proxy record keeps the
+/// browser-login sentence, byte for byte.
+#[test]
+fn a_quarantined_proxy_target_is_told_the_login_through_its_proxy() {
+    let _home = HomeSandbox::new();
+    let mut px = crate::profile::Profile::new("px".to_string(), None, None);
+    px.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let plain = crate::profile::Profile::new("pn".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            auth_broken: vec!["px".into(), "pn".into()],
+            ..AppState::default()
+        },
+        profiles: vec![px, plain],
+    };
+    let refusal = |name: &str| {
+        let pn = crate::profile::ProfileName::from(name);
+        let profile = config.find(&pn).unwrap();
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[])
+    };
+    assert_eq!(
+        (refusal("px"), refusal("pn")),
+        (
+            Err("profile has no api key: px (run `clauth login px --proxy stub`)".to_string()),
+            Err(
+                "login for 'pn' has expired: refresh token revoked or invalid: run \
+                 `clauth login pn`"
+                    .to_string()
+            ),
+        ),
+        "(the proxy account's refusal, the plain account's)"
+    );
+}
+
+/// Ends the held delegate if the test leaves before its own signal: the shim
+/// records its pid before it waits, so a drop after a panic past that read
+/// still finds the pid, and a second signal to a group already gone does
+/// nothing. Without it, a panic between the spawn and the signal leaves the
+/// run thread blocked on a child only a signal ends, and the scoped join hangs.
+/// Residual: a shim that records nothing inside the pid wait's ten seconds
+/// leaves no pid to find, so a panic there waits on the child; a shim that
+/// starts at all records before it waits.
+#[cfg(target_os = "linux")]
+struct HeldDelegate<'a> {
+    hold: &'a std::path::Path,
+    pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldDelegate<'_> {
+    /// Record the pid the test read, so the drop signals even if the file it
+    /// was read from is unreadable by then.
+    fn record(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldDelegate<'_> {
+    fn drop(&mut self) {
+        let recorded = std::fs::read_to_string(self.hold)
+            .ok()
+            .and_then(|text| text.lines().next()?.parse::<u32>().ok());
+        if let Some(pid) = self.pid.or(recorded) {
+            jobs::signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// A delegate's child reads stdin from `/dev/null`: claude 2.1.327 takes
+/// settings and managed settings from a piped stdin's initialize line, and no
+/// scan of `args` sees them, so a piped stdin would open a settings channel
+/// clauth never judged.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_delegate_spawns_claude_with_a_null_stdin() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let mut fake = FakeClaude::new(&home);
+    let hold = home.home().join("stdin-hold.log");
+    fake.set_signal_hold(&hold);
+    let stdin = std::thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            call_delegate(DelegateArgs {
+                profiles: Some(vec!["solo".to_string()]),
+                prompt: Some("hi".to_string()),
+                ..base()
+            })
+        });
+        let mut held = HeldDelegate {
+            hold: &hold,
+            pid: None,
+        };
+        let pid = super::tests::wait_for_recorded_pid(&hold);
+        held.record(pid);
+        let stdin = std::fs::read_link(format!("/proc/{pid}/fd/0"));
+        // The group signal ends the held child and the grandchild holding its
+        // pipes; a group already gone signals nothing.
+        jobs::signal_group(pid, libc::SIGTERM);
+        run.join().expect("the delegate returns a tool result");
+        stdin
+    });
+    assert_eq!(
+        stdin.expect("the held child still has its stdin"),
+        std::path::Path::new("/dev/null"),
+        "the delegate's claude reads stdin from /dev/null, never a settings channel"
+    );
+}
+
+/// The delegate spawn names its stdin exactly once: an inherited one is the MCP
+/// server's own JSON-RPC pipe, and a later `.stdin(..)` on the same builder
+/// overrides the null. The runtime test above cannot tell an inherited stdin
+/// from `/dev/null` when the runner itself hands the test `/dev/null`.
+#[test]
+fn run_delegate_names_a_null_stdin() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let rest = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let body = rest.split_once("\nfn ").map_or(rest, |(body, _)| body);
+    assert!(
+        body.contains(".stdin(Stdio::null())"),
+        "run_delegate must spawn claude with a null stdin"
+    );
+    assert_eq!(
+        body.matches(".stdin(").count(),
+        1,
+        "run_delegate sets claude's stdin once, so nothing overrides the null"
+    );
 }

@@ -116,6 +116,16 @@ impl super::Daemon {
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+        // Keep MCP server logins in step across every account's store.
+        // Throttled and detached inside, so it never spends this tick's window;
+        // its toggle off the config this tick's reload refreshed, a poisoned
+        // config mutex reading on like the file's default.
+        let sync_mcp = self
+            .config
+            .lock()
+            .map(|c| c.state.sync_mcp_logins)
+            .unwrap_or(true);
+        crate::runtime::sync_mcp_logins_detached(sync_mcp);
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every
@@ -360,18 +370,28 @@ impl super::Daemon {
     /// its retry window closes, rather than dropped after one attempt. Every
     /// skip/failure logs once per distinct reason (see [`SwitchBackoff`]).
     pub(super) fn drain_pending_switch(&mut self) {
+        // The generation this drain started under: the gate's ticket is built
+        // from it, so a release landing anywhere after the guard — including
+        // in the span before the gate is even built — spends the ticket.
+        let generation = self.fetch_lease.generation();
         // The set holds at most one scheduler target in practice
         // (`scan_auto_switch` skips while one is pending); `min_by` keeps the
         // pick deterministic anyway.
-        let decision: Option<PendingSwitchTarget> = self
-            .pending_switch
-            .lock()
-            .map(|mut g| {
+        let decision: Option<PendingSwitchTarget> =
+            self.pending_switch.lock().map_or_default(|mut g| {
                 let d = g.iter().min_by(|a, b| a.target.cmp(&b.target)).cloned();
                 g.clear();
                 d
-            })
-            .unwrap_or_default();
+            });
+        // A decision queued under a ticket this instance no longer holds must
+        // not execute — the holder that took over decides. The record clears
+        // here (the queue drained above, the backoff below), so the next
+        // holder's scan re-derives the walk from scratch. Checked on every
+        // drain, so a deferred retry past a release never fires.
+        if !self.fetch_lease.fetches_here() {
+            self.switch_backoff = None;
+            return;
+        }
         let Some(decision) = decision else {
             return;
         };
@@ -498,7 +518,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_ref().cloned());
+            .and_then(|c| Option::clone(&c.state.active_profile));
         if let Some(active) = outgoing
             && active != target
             && active_diverged_unsaved(&active)
@@ -548,13 +568,28 @@ impl super::Daemon {
         // The spend is claimed inside the gate, under the rotation lock, right
         // before the POST: a stop signal that lands while the gate is parked on
         // the lock refuses the spend (the gate answers `Stopping`) and the
-        // switch stays queued rather than failing.
-        match crate::oauth::ensure_installable_from_main_loop(
+        // switch stays queued rather than failing. The claim carries this
+        // instance's lease ticket, so a watchdog release in that same window
+        // refuses the refresh too.
+        let gate = crate::usage::SpendGate::new(
+            self.shutting_down.as_ref(),
+            Some(self.fetch_lease.ticket_at(generation)),
+        );
+        let answer = crate::oauth::ensure_installable_from_main_loop(
             &self.config,
             &target,
             crate::oauth::refresh_result,
-            Some((&self.activity, &self.shutting_down)),
-        ) {
+            Some((&self.activity, gate)),
+        );
+        // The decision came from the queue, not from the user: a lease this
+        // instance lost while the gate ran must not execute the switch — the
+        // holder that took over decides. The record clears with the skip, as
+        // on the guard above.
+        if !self.fetch_lease.fetches_here() {
+            self.switch_backoff = None;
+            return;
+        }
+        match answer {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
             crate::oauth::AuthGate::Stopping => {
                 self.requeue_quiet(&decision);
@@ -588,13 +623,12 @@ impl super::Daemon {
         // flock — the order `lockorder` asserts), held across the switch, and
         // dropped before the republish below so its disk sweep runs under no
         // config guard.
-        let broken_snapshot: HashMap<String, u64> = self
-            .third_party_broken
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
+        let broken_snapshot: HashMap<String, u64> =
+            self.third_party_broken.lock().map_or_default(|m| m.clone());
+        // The account the switch moves off, for its log line.
+        let mut switched_from = None;
         let result = {
-            #[allow(
+            #[expect(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
@@ -616,8 +650,7 @@ impl super::Daemon {
                     decision
                         .key_rejected_cause
                         .as_ref()
-                        .map(|(active, _)| active.as_str())
-                        .unwrap_or("")
+                        .map_or("", |(active, _)| active.as_str())
                 );
                 return;
             }
@@ -627,13 +660,22 @@ impl super::Daemon {
             // log names the two apart without threading the cause through the
             // switch action.
             let returning = cfg.is_home_today(&target, &key_rejected);
+            let chain_weekly = cfg.state.weekly_switch_threshold_pct();
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
                 // The AUTH-1 gate ran above (`ensure_installable_from_main_loop`).
-                let changed = switch_profile_locked_gated(&mut cfg, &target, true)?;
-                Ok((returning, changed))
+                let outcome = switch_profile_locked_gated(&mut cfg, &target, true)?;
+                // The account left is the one `profiles.toml` named under the
+                // switch's own hold, never this process's copy read before it:
+                // a peer switch can land between the two, and a profile it
+                // renamed or added since the last reload is on disk alone.
+                if outcome.left.as_ref() != Some(&target) {
+                    let cached = outcome.left.as_ref().and_then(|f| cfg.find(f)).cloned();
+                    switched_from = Some((outcome.left, cached, chain_weekly));
+                }
+                Ok((returning, outcome.changed))
             })
         };
         match result {
@@ -651,10 +693,21 @@ impl super::Daemon {
                 // landed on another profile is picked up instead of swallowed.
                 self.apply_forgets();
                 self.switch_backoff = None;
-                if returning {
-                    logline!("clauth daemon: returned to preferred account '{target}'");
-                } else {
-                    logline!("clauth daemon: switched to '{target}'");
+                match switched_from {
+                    Some((left, cached, chain_weekly)) => {
+                        let line = self.auto_switch_log_line(
+                            left.as_ref(),
+                            cached,
+                            &target,
+                            returning,
+                            chain_weekly,
+                        );
+                        logline!("{line}");
+                    }
+                    None if returning => {
+                        logline!("clauth daemon: returned to preferred account '{target}'");
+                    }
+                    None => logline!("clauth daemon: switched to '{target}'"),
                 }
                 // The `cfg` guard is dropped at the block's end above, so this
                 // republish holds no config lock. A no-op switch (target already
@@ -704,6 +757,64 @@ impl super::Daemon {
         self.requeue_quiet(decision);
     }
 
+    /// The log line of an auto-switch from `left` onto `target`
+    /// ([`crate::fallback::auto_switch_log_line`]) with `left`'s last reading.
+    /// `left` is the name the switch's own hold reported and `cached` the copy
+    /// it held for it; the name rides the line whatever a profile lookup can
+    /// load. Called with no config guard held: the usage stores rank below it.
+    fn auto_switch_log_line(
+        &self,
+        left: Option<&ProfileName>,
+        cached: Option<crate::profile::Profile>,
+        target: &ProfileName,
+        returning: bool,
+        chain_weekly: f64,
+    ) -> String {
+        let account = left.and_then(|name| self.left_account(name, cached));
+        crate::fallback::auto_switch_log_line(
+            "clauth daemon",
+            left.map(ProfileName::as_str),
+            target.as_str(),
+            returning,
+            account.as_ref(),
+            chain_weekly,
+        )
+    }
+
+    /// The log line of a wrap-off ([`crate::fallback::switch_off_log_line`])
+    /// with the account it left and that account's last reading. Called with no
+    /// config guard held: the usage stores rank below it.
+    fn switch_off_log_line(
+        &self,
+        left: Option<&ProfileName>,
+        cached: Option<crate::profile::Profile>,
+        chain_weekly: f64,
+    ) -> String {
+        let account = left.and_then(|name| self.left_account(name, cached));
+        crate::fallback::switch_off_log_line(
+            "clauth daemon",
+            left.map(ProfileName::as_str),
+            account.as_ref(),
+            chain_weekly,
+        )
+    }
+
+    /// The account behind a chain-move log line: `name`'s profile from `cached`,
+    /// else from disk, with the last reading held against it. `None` when
+    /// neither loads — the line names the account and reads no figure.
+    fn left_account(
+        &self,
+        name: &ProfileName,
+        cached: Option<crate::profile::Profile>,
+    ) -> Option<crate::fallback::LeftAccount> {
+        crate::fallback::left_account(
+            name,
+            cached,
+            &self.usage_store,
+            &self.third_party_usage_store,
+        )
+    }
+
     /// [`Self::fail_switch`] for a wait that is no failure (a bare-item
     /// lookup still running): the same backoff and retry window, logging
     /// nothing and keeping the last reason a failure gave.
@@ -750,16 +861,21 @@ impl super::Daemon {
         let off = self
             .pending_switch_off
             .lock()
-            .map(|mut g| std::mem::replace(&mut *g, false))
-            .unwrap_or(false);
+            .is_ok_and(|mut g| std::mem::replace(&mut *g, false));
         if !off {
+            return;
+        }
+        // A switch-off queued under a ticket this instance no longer holds
+        // must not execute — the holder that took over decides. The flag was
+        // consumed above, so the record clears with the skip.
+        if !self.fetch_lease.fetches_here() {
             return;
         }
         let active = self
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_ref().cloned());
+            .and_then(|c| Option::clone(&c.state.active_profile));
         let Some(active) = active else {
             return; // already off
         };
@@ -793,18 +909,23 @@ impl super::Daemon {
         // taken first, held across the locked switch-off, and dropped before
         // the gated republish below.
         let result = {
-            #[allow(
+            #[expect(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|_held| {
-                let changed = switch_off_locked(&mut cfg)?;
-                Ok(changed)
+            // The account left comes back from the switch-off's own hold, never
+            // this process's copy read before it: a peer switch can land between
+            // the two, and a profile it renamed or added since the last reload is
+            // on disk alone.
+            switch_off_locked(&mut cfg).map(|left| {
+                let cached = left.as_ref().and_then(|a| cfg.find(a)).cloned();
+                (left, cached, cfg.state.weekly_switch_threshold_pct())
             })
         };
         match result {
-            Ok(changed) => {
+            Ok((left, cached, chain_weekly)) => {
+                let changed = left.is_some();
                 if changed {
                     crate::claude_json::strip_home_oauth_account();
                 }
@@ -812,7 +933,8 @@ impl super::Daemon {
                 // Drain the switch-off's own forgets; the write is left
                 // unadopted, so the next tick's reload re-reads disk.
                 self.apply_forgets();
-                logline!("clauth daemon: switched off: all accounts spent");
+                let line = self.switch_off_log_line(left.as_ref(), cached, chain_weekly);
+                logline!("{line}");
                 if changed {
                     crate::daemon::publish_status(&self.config);
                 }
@@ -821,7 +943,9 @@ impl super::Daemon {
                 // Apply so the dropped login's reading does not survive in the
                 // daemon's stores.
                 self.apply_forgets();
-                logline!("clauth daemon: switch-off failed: {e}");
+                if !crate::actions::switch_off_hold_said(&e) {
+                    logline!("clauth daemon: switch-off failed: {e}");
+                }
             }
         }
     }

@@ -7304,6 +7304,77 @@ fn a_newer_attribution_file_is_never_saved_over_and_holds_the_fold() {
     );
 }
 
+/// One kerry transcript with a finished turn, so a pass over it owes a day and
+/// holds an unsaved timeline entry.
+fn write_kerry_turn(home: &HomeSandbox) {
+    reg(None);
+    write_lines(
+        &iso_kerry(home.home()).join("l.jsonl"),
+        &[
+            user("2026-09-21T12:00:00.000Z", "l"),
+            assistant("2026-09-21T12:00:20.000Z", "l", "msg_l", 2000),
+            user("2026-09-21T12:05:00.000Z", "l"),
+        ],
+    );
+}
+
+/// A pass whose fetch tick lost the lease writes neither the owed-day list nor
+/// the attribution timeline nor the speed ledger; the same pass under a current
+/// ticket writes the first two.
+#[test]
+fn a_pass_under_a_spent_ticket_writes_none_of_the_producers_files() {
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    let clauth = home.home().join(".clauth");
+    let lease = crate::daemon::FetchLease::new();
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+
+    Producer::new().tick_leased(ms("2026-09-21T12:06:00.000Z"), Some(spent));
+
+    for file in [TPS_DAYS_FILE, TPS_ATTRIBUTION_FILE, "token_speed.json"] {
+        assert!(
+            !clauth.join(file).exists(),
+            "a pass under a spent ticket wrote {file}"
+        );
+    }
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    Producer::new().tick_leased(ms("2026-09-21T12:06:00.000Z"), Some(current));
+    for file in [TPS_DAYS_FILE, TPS_ATTRIBUTION_FILE] {
+        assert!(
+            clauth.join(file).exists(),
+            "control: a pass under a current ticket writes {file}"
+        );
+    }
+}
+
+/// The fold of a day that left the window is a speed-ledger write too: a pass
+/// under a spent ticket leaves the day owed, and the same pass under a current
+/// ticket folds it.
+#[test]
+fn a_fold_under_a_spent_ticket_writes_no_speed_ledger() {
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    Producer::new().tick(ms("2026-09-21T12:06:00.000Z"));
+    let ledger = home.home().join(".clauth/token_speed.json");
+    let lease = crate::daemon::FetchLease::new();
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+
+    Producer::new().tick_leased(ms("2026-09-23T00:00:10.000Z"), Some(spent));
+    assert!(
+        !ledger.exists() || ledger_day_output(home.home(), "2026-09-21") == 0,
+        "a day folded under a spent ticket wrote the ledger"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    Producer::new().tick_leased(ms("2026-09-23T00:00:10.000Z"), Some(current));
+    assert_eq!(
+        ledger_day_output(home.home(), "2026-09-21"),
+        2000,
+        "control: the same pass under a current ticket folds the day"
+    );
+}
+
 /// The names of the `tps_days.json.corrupt-*` files beside the owed-day list.
 fn days_asides(clauth: &Path) -> Vec<String> {
     std::fs::read_dir(clauth)
@@ -10536,4 +10607,201 @@ fn two_files_429s_pick_the_same_429_in_either_insertion_order() {
             "an equal stamp breaks by path"
         );
     }
+}
+
+// ── a re-taken producer re-joins the shared files ────────────────────────────
+
+fn retake_m_turn(home: &HomeSandbox) {
+    write_lines(
+        &iso_kerry(home.home()).join("m.jsonl"),
+        &[
+            user("2026-09-22T12:00:00.000Z", "m"),
+            assistant("2026-09-22T12:00:20.000Z", "m", "msg_m", 3000),
+            user("2026-09-22T12:05:00.000Z", "m"),
+        ],
+    );
+}
+
+/// A loses the lease, B holds and folds 09-22, B exits, A re-joins its files
+/// and folds 09-21: the day B folded survives A's next save.
+#[test]
+fn a_retaken_producer_keeps_a_day_another_holder_folded() {
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    let mut a = Producer::new();
+    a.tick(ms("2026-09-21T12:06:00.000Z"));
+    retake_m_turn(&home);
+    let mut b = Producer::new();
+    b.tick(ms("2026-09-22T12:06:00.000Z"));
+    b.tick(ms("2026-09-24T00:00:10.000Z"));
+    let folded_by_b = ledger_day_output(home.home(), "2026-09-22");
+    assert_eq!(folded_by_b, 3000, "fixture control: B folded 09-22");
+    drop(b);
+    a.rejoin_files(ms("2026-09-24T00:00:20.000Z"));
+    a.tick(ms("2026-09-24T00:00:20.000Z"));
+    assert_eq!(
+        ledger_day_output(home.home(), "2026-09-21"),
+        2000,
+        "fixture control: A folded its own 09-21"
+    );
+    assert_eq!(
+        ledger_day_output(home.home(), "2026-09-22"),
+        3000,
+        "A's re-take dropped the day B folded"
+    );
+}
+
+/// Same shape on a fresh-life control: a Producer loaded after B's fold keeps it.
+#[test]
+fn a_fresh_producer_keeps_a_day_another_holder_folded() {
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    Producer::new().tick(ms("2026-09-21T12:06:00.000Z"));
+    retake_m_turn(&home);
+    let mut b = Producer::new();
+    b.tick(ms("2026-09-22T12:06:00.000Z"));
+    b.tick(ms("2026-09-24T00:00:10.000Z"));
+    assert_eq!(ledger_day_output(home.home(), "2026-09-22"), 3000);
+    drop(b);
+    let mut a = Producer::new();
+    a.tick(ms("2026-09-24T00:00:20.000Z"));
+    assert_eq!(
+        ledger_day_output(home.home(), "2026-09-22"),
+        3000,
+        "control: a fresh life keeps it"
+    );
+}
+
+/// B dies owing 09-22 (it left no fold); A re-joins and keeps the owed day.
+#[test]
+fn a_retaken_producer_keeps_a_day_another_holder_owed() {
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    let clauth = home.home().join(".clauth");
+    let mut a = Producer::new();
+    a.tick(ms("2026-09-21T12:06:00.000Z"));
+    retake_m_turn(&home);
+    let mut b = Producer::new();
+    b.tick(ms("2026-09-22T12:06:00.000Z"));
+    drop(b);
+    let owed_before = owed_file(&clauth)["owed"].to_string();
+    assert!(
+        owed_before.contains("2026-09-22"),
+        "control: B owes 09-22: {owed_before}"
+    );
+    a.rejoin_files(ms("2026-09-25T00:00:20.000Z"));
+    a.tick(ms("2026-09-25T00:00:20.000Z"));
+    let owed_after = owed_file(&clauth)["owed"].to_string();
+    let mut c = Producer::new();
+    c.tick(ms("2026-09-25T00:00:30.000Z"));
+    assert!(
+        owed_after.contains("2026-09-22") || ledger_day_output(home.home(), "2026-09-22") == 3000,
+        "A's re-take dropped the day B owed: before {owed_before}, after {owed_after}, ledger {}",
+        ledger_day_output(home.home(), "2026-09-22")
+    );
+}
+
+/// A re-take whose timeline reload cannot read the file keeps the
+/// pre-stand-down copy only to refuse its saves: the unsaved entries of a life
+/// whose save failed never land over the other holder's file, and a readable
+/// reload still replaces the copy.
+#[cfg(unix)]
+#[test]
+fn a_retake_whose_timeline_reload_is_unreadable_writes_nothing_over_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    // The named guard: root ignores permission bits, so the chmod-000 leg
+    // cannot fail and this test proves nothing.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores permission bits");
+        return;
+    }
+    let home = HomeSandbox::new();
+    write_kerry_turn(&home);
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).unwrap();
+
+    // A's pass cannot save (a .clauth that refuses new files), so A holds its
+    // session's entry as unsaved.
+    let mut a = Producer::new();
+    {
+        let _unwritable = crate::testutil::UnwritableDir::new(&clauth);
+        a.tick(ms("2026-09-21T12:06:00.000Z"));
+    }
+    assert!(
+        a.timeline.unsaved,
+        "fixture control: A's timeline save failed"
+    );
+    assert!(
+        !a.timeline.by_session.is_empty(),
+        "fixture control: A holds an unsaved entry"
+    );
+
+    // Another holder writes its own timeline after A stood down.
+    retake_m_turn(&home);
+    let mut b = Producer::new();
+    b.tick(ms("2026-09-22T12:06:00.000Z"));
+    drop(b);
+    let tl = clauth.join(TPS_ATTRIBUTION_FILE);
+    let theirs = std::fs::read(&tl).expect("B wrote the timeline");
+    assert!(!theirs.is_empty(), "fixture control: B's file");
+
+    // The re-take's reload cannot read the file, then a save pass runs while
+    // it still cannot: a write would land (the publish is a rename over it).
+    std::fs::set_permissions(&tl, std::fs::Permissions::from_mode(0o000)).unwrap();
+    a.rejoin_files(ms("2026-09-24T00:00:20.000Z"));
+    a.tick(ms("2026-09-24T00:00:20.000Z"));
+    std::fs::set_permissions(&tl, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::read(&tl).unwrap(),
+        theirs,
+        "A wrote its stale timeline over the other holder's file"
+    );
+
+    // A readable reload still replaces the kept copy.
+    a.rejoin_files(ms("2026-09-24T00:00:30.000Z"));
+    assert_eq!(
+        a.timeline.disk,
+        DiskState::Usable,
+        "the readable reload is kept"
+    );
+    assert!(
+        !a.timeline.unsaved,
+        "A's unsaved entries drop with the old copy"
+    );
+    assert_eq!(
+        std::fs::read(&tl).unwrap(),
+        theirs,
+        "the reload itself writes nothing"
+    );
+}
+
+// ── the speed-ledger gate on a spent ticket ──────────────────────────────────
+
+/// Doc on tick_leased: "checked before every write this pass makes (... the
+/// speed ledger)". An owed-day rebuild probes `saves_land`, which itself
+/// writes `token_speed.json` — a spent ticket must not.
+#[test]
+fn a_rebuild_under_a_spent_ticket_writes_no_speed_ledger() {
+    let home = HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(&clauth).unwrap();
+    std::fs::write(
+        clauth.join(TPS_DAYS_FILE),
+        br#"{"version":1,"owed":["2026-09-20"]}"#,
+    )
+    .unwrap();
+    let lease = crate::daemon::FetchLease::new();
+    let spent = crate::testutil::spent_lease_ticket(&lease);
+    Producer::new().tick_leased(ms("2026-09-22T12:06:00.000Z"), Some(spent));
+    assert!(
+        !clauth.join("token_speed.json").exists(),
+        "an owed-day rebuild under a spent ticket wrote token_speed.json"
+    );
+
+    // Control: the same rebuild under a live (ticket-less) pass writes it.
+    Producer::new().tick_leased(ms("2026-09-22T12:06:00.000Z"), None);
+    assert!(
+        clauth.join("token_speed.json").exists(),
+        "control: a live rebuild writes the speed ledger"
+    );
 }

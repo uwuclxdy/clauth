@@ -1605,3 +1605,107 @@ fn the_flagged_active_switch_over_its_own_login_keeps_the_exemption() {
         "active stays flagged"
     );
 }
+
+/// A proxy account holding a stored login whose live login diverged: the
+/// headless switch with an `Overwrite` default (`clauth mcp`, the daemon's
+/// REST `switch`; the CLI prompt runs the same reconcile) never saves that
+/// live login into the proxy account, and the switch goes ahead, dropping it.
+#[test]
+fn an_overwrite_switch_never_saves_a_login_into_a_proxy_account() {
+    let _home = HomeSandbox::new();
+    let live = creds("cc-own-a", "cc-own-r");
+    let config = handle(seed_diverged(
+        "px",
+        creds("drained-a", "drained-r"),
+        &live,
+        "target",
+        Some(creds("target-a", "target-r")),
+    ));
+    crate::profile::write_proxy_record(
+        &crate::profile::ProfileName::from("px"),
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+
+    let result = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        Some(DivergenceChoice::Overwrite),
+        no_network,
+        None,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string());
+
+    let stored: ClaudeCredentials = read_json_file(
+        &profile_dir(&crate::profile::ProfileName::from("px"))
+            .unwrap()
+            .join("credentials.json"),
+    )
+    .expect("read px creds");
+    let claim_is_account = matches!(
+        crate::profile::stored_proxy_claim(&crate::profile::ProfileName::from("px")),
+        crate::profile::ProxyClaim::Account(_)
+    );
+    assert_eq!(
+        (claim_is_account, result, stored.refresh_token()),
+        (true, Ok(()), Some("drained-r")),
+        "(px still a proxy account, the switch, px's stored login)"
+    );
+}
+
+/// The headless `Overwrite` switch onto the proxy account already active,
+/// whose live login diverged, saves that login into nothing: it answers as
+/// the plain switch onto the active account does, `px` keeps its stored login
+/// and the live file stays where Claude Code wrote it.
+#[test]
+fn an_overwrite_switch_onto_the_active_proxy_account_never_saves_into_it() {
+    let _home = HomeSandbox::new();
+    let live = creds("cc-own-a", "cc-own-r");
+    let config = handle(seed_diverged(
+        "px",
+        creds("drained-a", "drained-r"),
+        &live,
+        "target",
+        Some(creds("target-a", "target-r")),
+    ));
+    let px = crate::profile::ProfileName::from("px");
+    crate::profile::write_proxy_record(
+        &px,
+        &crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-px".to_string(),
+        },
+    )
+    .expect("write the proxy record");
+
+    let result = switch_profile_noninteractive(
+        &config,
+        &px,
+        Some(DivergenceChoice::Overwrite),
+        no_network,
+        None,
+    )
+    .map_err(|e| e.to_string());
+
+    let stored: ClaudeCredentials =
+        read_json_file(&profile_dir(&px).unwrap().join("credentials.json")).expect("read px creds");
+    let live_now: ClaudeCredentials = read_json_file(
+        &crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json"),
+    )
+    .expect("read the live file");
+    assert_eq!(
+        (result, stored.refresh_token(), live_now.refresh_token()),
+        (
+            Ok((Some("px".to_string()), "px".to_string(), None)),
+            Some("drained-r"),
+            Some("cc-own-r")
+        ),
+        "(the switch's reply, px's stored login, the live login)"
+    );
+}

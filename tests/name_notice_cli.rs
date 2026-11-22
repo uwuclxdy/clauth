@@ -12,10 +12,10 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 const DASH_NOTICE: &str = "clauth: -x: a name starting with '-' reads as a flag, so the commands \
-                           clauth prints for it fail; rename it on the TUI's Setup tab";
+                           clauth prints for it fail; rename it with `clauth rename -- -x <new-name>`";
 const SUBCOMMAND_NOTICE: &str = "clauth: list: a bare `clauth list` runs clauth's own list command, \
                                  never a switch to this account; switch with `clauth switch list`, \
-                                 or rename it on the TUI's Setup tab";
+                                 or rename it with `clauth rename list <new-name>`";
 const CODEX_DASH_NOTICE: &str = "clauth: -c: a name starting with '-' reads as a flag, so the \
                                 commands clauth prints for it fail; delete it and log in again \
                                 under another name";
@@ -164,7 +164,7 @@ fn a_codex_roster_names_its_unaddressable_accounts_once() {
 /// A name both rosters hold (a hand edit: creation refuses a cross-roster
 /// duplicate) is one account to the CLI, as to the TUI and the daemon: it
 /// prints one line, the claude account's, since that is the one a bare name
-/// resolves to and the one the Setup tab can rename.
+/// resolves to and the one `clauth rename` can rename.
 #[test]
 fn a_name_in_both_rosters_prints_the_claude_line_once() {
     let home = tempfile::tempdir().unwrap();

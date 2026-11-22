@@ -353,7 +353,7 @@ fn an_env_no_color_process_draws_no_colour_on_both_tiers() {
 /// above re-enters this binary with `NO_COLOR=1` and must pass, then again
 /// without it and must fail, which proves that child ran and would see colour.
 /// A filter matching no test exits 0, so the failing control is what keeps
-/// this pin from passing vacuously. Residual: `ratatui::try_init()`'s own
+/// this pin from passing vacuously. Residual: `tui::open_terminal`'s own
 /// setup (its `Stdout` sink, raw mode, the alternate screen) is not exercised,
 /// nor is a production backend other than `CrosstermBackend`; windows runs no
 /// re-entry, so there only the switch-level test above holds.

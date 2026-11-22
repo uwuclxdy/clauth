@@ -15,11 +15,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::daemon::api::devices::{self, Tier};
+use super::{Drained, drain_frames};
+use crate::daemon::api::devices::{self, RowWatch, Tier};
 use crate::daemon::api::http::{Request, Response, WsHeaders};
 use crate::daemon::api::panes::{HerdrOut, HerdrProbeOut};
 use crate::daemon::api::routes::{ApiContext, handle};
 use crate::daemon::api::tests as server_tests;
+use crate::daemon::api::ticket::{Stamp, Tickets};
 use crate::daemon::api::{Limits, serve_connection, tls};
 use crate::testutil::{HomeSandbox, body_json};
 
@@ -129,6 +131,7 @@ fn ws_request(method: &str, path: &str, bearer: &str) -> Request {
         path: path.to_string(),
         query: String::new(),
         bearer: Some(bearer.to_string()),
+        authorization_seen: true,
         if_none_match: None,
         body: Vec::new(),
         keep_alive: true,
@@ -137,7 +140,10 @@ fn ws_request(method: &str, path: &str, bearer: &str) -> Request {
             protocol: Some("websocket".to_string()),
             key: Some(WS_KEY.to_string()),
             version: Some("13".to_string()),
+            offer: Default::default(),
         },
+        cross_origin: Default::default(),
+        content_type: Default::default(),
     }
 }
 
@@ -510,6 +516,186 @@ fn wait_for_argv(path: &Path, want: &[&str]) -> Vec<String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("{path:?} never held an argv");
+}
+
+// --- The browser ticket, over TLS --------------------------------------------
+
+const TICKET_ORIGIN: &str = "https://app.example.com";
+const TICKET_PATH: &str = "/api/v1/panes/w9:p1/ticket";
+const STREAM_PATH: &str = "/api/v1/panes/w9:p1/stream";
+const HOLD_A_FRAME: &str =
+    "printf '%s\\n' '{\"type\":\"terminal.frame\",\"seq\":1}'; cat > /dev/null";
+
+/// One mint on its own connection, answered as `(head, body)`.
+fn mint(served: &Served, bearer: &str, origin: Option<&str>) -> (String, Vec<u8>) {
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    let origin = origin.map_or(String::new(), |origin| format!("Origin: {origin}\r\n"));
+    client
+        .send(
+            format!(
+                "POST {TICKET_PATH} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Authorization: Bearer {bearer}\r\n\
+                 {origin}\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the mint");
+    let head = client.read_head().expect("read the mint's head");
+    let length = head
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")?
+                .parse::<usize>()
+                .ok()
+        })
+        .expect("a sized body");
+    let mut body = std::mem::take(&mut client.buf);
+    let mut chunk = [0u8; 512];
+    while body.len() < length {
+        let n = client.stream.read(&mut chunk).expect("read the body");
+        assert_ne!(n, 0, "eof inside the body");
+        body.extend_from_slice(&chunk[..n]);
+    }
+    (head, body)
+}
+
+/// The live ticket out of a `201`.
+fn minted(served: &Served, bearer: &str) -> String {
+    let (head, body) = mint(served, bearer, Some(TICKET_ORIGIN));
+    assert!(head.starts_with("HTTP/1.1 201 "), "the head: {head}");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    body["ticket"].as_str().expect("a ticket").to_string()
+}
+
+/// An upgrade carrying no `Authorization`, as a browser's does. `offer` is the
+/// whole `Sec-WebSocket-Protocol` value.
+fn present(served: &Served, origin: &str, offer: &str) -> (WsClient, String) {
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .send(
+            format!(
+                "GET {STREAM_PATH} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Origin: {origin}\r\n\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Key: {WS_KEY}\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Protocol: {offer}\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let head = client.read_head().expect("read the upgrade's head");
+    (client, head)
+}
+
+fn offer_of(ticket: &str) -> String {
+    format!("clauth.terminal.v1, clauth.ticket.{ticket}")
+}
+
+#[test]
+fn a_mint_answers_a_ticket_that_nothing_may_cache() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served(ctx(HOLD_A_FRAME)) else {
+        return;
+    };
+    let (head, body) = mint(&served, VIEW_TOKEN, Some(TICKET_ORIGIN));
+    assert!(head.starts_with("HTTP/1.1 201 "), "the head: {head}");
+    assert!(
+        head.contains("Cache-Control: no-store\r\n"),
+        "the head: {head}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    let ticket = body["ticket"].as_str().expect("a ticket");
+    assert_eq!(ticket.len(), 64, "{ticket:?}");
+    assert!(
+        ticket
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert_eq!(
+        body,
+        serde_json::json!({"ticket": ticket, "expires_in": 30})
+    );
+}
+
+#[test]
+fn a_mint_with_no_origin_mints_nothing() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served(ctx(HOLD_A_FRAME)) else {
+        return;
+    };
+    let (head, body) = mint(&served, TOKEN, None);
+    assert!(head.starts_with("HTTP/1.1 400 "), "the head: {head}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("origin_required"), "the body: {body}");
+    assert!(!body.contains("\"ticket\""), "the body: {body}");
+}
+
+#[test]
+fn a_ticket_attaches_at_its_devices_tier_and_selects_a_fixed_protocol() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv = dir.path().join("argv");
+    let script = format!("printf '%s\\n' \"$@\" > {}; {HOLD_A_FRAME}", argv.display());
+    let Some(served) = served_cfg(ctx(&script), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, VIEW_TOKEN);
+    let (mut client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    assert!(
+        head.contains("Sec-WebSocket-Protocol: clauth.terminal.v1\r\n"),
+        "the head: {head}"
+    );
+    assert!(!head.contains(&ticket), "the head: {head}");
+    let (opcode, payload) = client.recv_frame().expect("a frame");
+    assert_eq!(opcode, 0x1);
+    assert_eq!(payload, br#"{"type":"terminal.frame","seq":1}"#);
+    wait_for_argv(
+        &argv,
+        &[
+            "terminal", "session", "observe", "w9:p1", "--cols", "88", "--rows", "57",
+        ],
+    );
+}
+
+/// A spent ticket, a ticket from the wrong page and no ticket at all answer the
+/// same bytes, and the wrong page's try burns the ticket it held.
+#[test]
+fn a_dead_or_misused_ticket_answers_what_no_ticket_answers() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served_cfg(ctx(HOLD_A_FRAME), 7, Limits::DEFAULT) else {
+        return;
+    };
+    let (_, absent) = present(&served, TICKET_ORIGIN, "clauth.terminal.v1");
+    assert!(absent.starts_with("HTTP/1.1 401 "), "the head: {absent}");
+    assert!(
+        absent.contains("Connection: close\r\n"),
+        "the head: {absent}"
+    );
+
+    let spent = minted(&served, TOKEN);
+    let (client, head) = present(&served, TICKET_ORIGIN, &offer_of(&spent));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    drop(client);
+    let (_, replay) = present(&served, TICKET_ORIGIN, &offer_of(&spent));
+    assert_eq!(replay, absent);
+
+    let burned = minted(&served, TOKEN);
+    let (_, wrong_page) = present(&served, "https://b.example", &offer_of(&burned));
+    assert_eq!(wrong_page, absent);
+    let (_, right_page) = present(&served, TICKET_ORIGIN, &offer_of(&burned));
+    assert_eq!(right_page, absent);
 }
 
 #[test]
@@ -1247,4 +1433,1007 @@ fn a_stream_ends_at_the_connection_lifetime() {
         started.elapsed() < Duration::from_secs(5),
         "the lifetime ended the stream, not the client timeout"
     );
+}
+
+/// A pane printing without pause behind a client that reads slowly: the client
+/// leaves its socket unread for the first second, then reads one 3 MB frame
+/// every 200 ms, so the socket stays full and the drain stays inside its frame
+/// loop instead of returning to the loop top. A frame that big empties the few
+/// buffered rows ahead of the close at the client's own 15 MB/s, and the
+/// 16-slot queue absorbs any pause of the relay. The stream can end only at
+/// the drain's own between-frames check, never at a pass boundary that read the
+/// queue empty.
+#[test]
+fn a_saturated_stream_ends_at_the_lifetime() {
+    let _home = HomeSandbox::new();
+    let pane_dir = tempfile::tempdir().expect("tempdir");
+    let row = pane_dir.path().join("row");
+    std::fs::write(&row, "x".repeat(3_000_000)).expect("write the pane's row");
+    let flood = format!("while :; do cat '{}'; echo; done", row.display());
+    let limits = Limits {
+        io_timeout: Duration::from_secs(10),
+        lifetime: Duration::from_secs(2),
+        max_requests: 100,
+    };
+    let Some(served) = served_cfg(ctx(&flood), 1, limits) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .upgrade_request(STREAM_PATH, VIEW_TOKEN)
+        .expect("upgrade");
+    assert_101(&mut client);
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    loop {
+        // Below the row's own 5 s check, so a close from there cannot pass for
+        // the lifetime's, and above the 2 s lifetime plus the queued rows'
+        // drain and one paced read.
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the stream outlived its 2 s lifetime"
+        );
+        match client.recv_frame() {
+            Ok((0x8, payload)) => {
+                assert_eq!(&payload[..2], &1000u16.to_be_bytes());
+                break;
+            }
+            Ok((0x1, _)) => std::thread::sleep(Duration::from_millis(200)),
+            Ok((opcode, _)) => panic!("an unexpected opcode {opcode}"),
+            Err(e) => panic!("the stream stayed open: {e}"),
+        }
+    }
+}
+
+// --- The ticket on the wire, and an open stream's revoke -----------------------
+
+/// A revoke closes a stream within 5 s plus one 200 ms read slice; the rest of
+/// this bound is scheduling room on a loaded box.
+const REVOKE_BOUND: Duration = Duration::from_secs(7);
+const STREAM_LINE_401: &str = "GET /api/v1/panes/w9:p1/stream -> 401 origin=unlisted";
+
+/// `[serve] app_origins`, as a hand edit leaves it.
+fn list_origin(origin: &str) {
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+        format!("profiles = []\n\n[serve]\napp_origins = [{origin:?}]\n"),
+    )
+    .expect("write profiles.toml");
+}
+
+/// An upgrade with these extra header lines and no `Authorization`.
+fn upgrade_with(served: &Served, path: &str, lines: &[String]) -> (WsClient, String) {
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    let extra: String = lines.iter().map(|line| format!("{line}\r\n")).collect();
+    client
+        .send(
+            format!(
+                "GET {path} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 {extra}\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Key: {WS_KEY}\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the upgrade");
+    let head = client.read_head().expect("read the upgrade's head");
+    (client, head)
+}
+
+/// Every byte of a closed answer: its head, then the body to the close.
+fn whole_answer((mut client, head): (WsClient, String)) -> Vec<u8> {
+    let mut bytes = head.into_bytes();
+    bytes.append(&mut client.buf);
+    let mut chunk = [0u8; 512];
+    loop {
+        match client.stream.read(&mut chunk) {
+            Ok(0) => return bytes,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) => panic!("the answer did not close: {e}"),
+        }
+    }
+}
+
+fn offer_line(ticket: &str) -> String {
+    format!("Sec-WebSocket-Protocol: {}", offer_of(ticket))
+}
+
+fn origin_line(origin: &str) -> String {
+    format!("Origin: {origin}")
+}
+
+/// The context [`ctx`] builds with a clock the test moves.
+fn ctx_with_clock(script: &str) -> (Arc<ApiContext>, Arc<std::sync::Mutex<Stamp>>) {
+    let mut ctx = ctx(script);
+    let clock = Arc::new(std::sync::Mutex::new(Stamp::now()));
+    let reader = Arc::clone(&clock);
+    Arc::get_mut(&mut ctx).expect("a fresh context").tickets =
+        Tickets::new(Box::new(move || *reader.lock().expect("the clock")));
+    (ctx, clock)
+}
+
+/// Read until the close frame, past any text frames, and return its code.
+fn close_code(client: &mut WsClient) -> u16 {
+    close_frame(client).0
+}
+
+/// [`close_code`] with the close frame's reason beside its code.
+fn close_frame(client: &mut WsClient) -> (u16, String) {
+    loop {
+        match client.recv_frame() {
+            Ok((0x8, payload)) => {
+                return (
+                    u16::from_be_bytes([payload[0], payload[1]]),
+                    String::from_utf8_lossy(&payload[2..]).into_owned(),
+                );
+            }
+            Ok((0x1, _)) => {}
+            Ok((opcode, _)) => panic!("an unexpected opcode {opcode}"),
+            Err(e) => panic!("the stream stayed open: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_listed_origin_can_read_its_mint() {
+    let _home = HomeSandbox::new();
+    let context = ctx(HOLD_A_FRAME);
+    list_origin(TICKET_ORIGIN);
+    let Some(served) = served(context) else {
+        return;
+    };
+    let (head, _) = mint(&served, VIEW_TOKEN, Some(TICKET_ORIGIN));
+    assert!(head.starts_with("HTTP/1.1 201 "), "the head: {head}");
+    assert!(
+        head.contains(&format!("Access-Control-Allow-Origin: {TICKET_ORIGIN}\r\n")),
+        "the head: {head}"
+    );
+}
+
+/// The wire half of "an `Origin` no page can be bound to": the parser is what
+/// turns these two shapes into an unusable header.
+#[test]
+fn two_origin_lines_or_bytes_that_are_not_text_mint_nothing() {
+    let _home = HomeSandbox::new();
+    let context = ctx(HOLD_A_FRAME);
+    let table = Arc::clone(&context);
+    let Some(served) = served_cfg(context, 2, Limits::DEFAULT) else {
+        return;
+    };
+    for origins in [
+        b"Origin: https://a.example\r\nOrigin: https://a.example\r\n".to_vec(),
+        b"Origin: https://\xff.example\r\n".to_vec(),
+    ] {
+        let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+        let mut request = format!(
+            "POST {TICKET_PATH} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Authorization: Bearer {TOKEN}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n",
+            server_tests::SERVER_NAME
+        )
+        .into_bytes();
+        request.extend_from_slice(&origins);
+        request.extend_from_slice(b"\r\n");
+        client.send(&request).expect("send the mint");
+        let head = client.read_head().expect("read the mint's head");
+        let answer = String::from_utf8(whole_answer((client, head))).expect("text");
+        assert!(answer.starts_with("HTTP/1.1 403 "), "the answer: {answer}");
+        assert!(
+            answer.contains("origin_not_allowed"),
+            "the answer: {answer}"
+        );
+    }
+    assert_eq!(table.tickets.held(), 0);
+}
+
+#[test]
+fn an_offer_on_two_header_lines_attaches() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served_cfg(ctx(HOLD_A_FRAME), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, VIEW_TOKEN);
+    let (mut client, head) = upgrade_with(
+        &served,
+        STREAM_PATH,
+        &[
+            origin_line(TICKET_ORIGIN),
+            "Sec-WebSocket-Protocol: clauth.terminal.v1".to_string(),
+            format!("Sec-WebSocket-Protocol: clauth.ticket.{ticket}"),
+        ],
+    );
+    assert_eq!(
+        head,
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {WS_ACCEPT}\r\n\
+             Sec-WebSocket-Protocol: clauth.terminal.v1\r\n\
+             \r\n"
+        )
+    );
+    let (opcode, _) = client.recv_frame().expect("a frame");
+    assert_eq!(opcode, 0x1);
+}
+
+/// Absent, malformed, unknown, spent, expired, wrong pane, wrong `Origin` and
+/// revoked: one answer, byte for byte, closed, and `-` on each line.
+#[test]
+fn eight_dead_presentations_answer_one_set_of_bytes() {
+    let _home = HomeSandbox::new();
+    let (context, clock) = ctx_with_clock(HOLD_A_FRAME);
+    let Some(served) = served_cfg(context, 14, Limits::DEFAULT) else {
+        return;
+    };
+    let origin = origin_line(TICKET_ORIGIN);
+    let at = |path: &str, origin: String, offer: String| {
+        whole_answer(upgrade_with(&served, path, &[origin, offer]))
+    };
+
+    let absent = whole_answer(upgrade_with(
+        &served,
+        STREAM_PATH,
+        std::slice::from_ref(&origin),
+    ));
+    let text = String::from_utf8_lossy(&absent);
+    assert!(text.starts_with("HTTP/1.1 401 "), "the answer: {text}");
+    assert!(text.contains("Connection: close\r\n"), "the answer: {text}");
+    assert!(
+        text.ends_with(r#"{"ok":false,"error":"unauthorized"}"#),
+        "the answer: {text}"
+    );
+
+    let malformed = at(
+        STREAM_PATH,
+        origin.clone(),
+        "Sec-WebSocket-Protocol: clauth.terminal.v1, clauth.ticket.nope".to_string(),
+    );
+    assert_eq!(malformed, absent, "malformed");
+
+    let unknown = at(STREAM_PATH, origin.clone(), offer_line(&"a".repeat(64)));
+    assert_eq!(unknown, absent, "unknown");
+
+    let ticket = minted(&served, TOKEN);
+    let (client, head) = upgrade_with(&served, STREAM_PATH, &[origin.clone(), offer_line(&ticket)]);
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    drop(client);
+    let spent = at(STREAM_PATH, origin.clone(), offer_line(&ticket));
+    assert_eq!(spent, absent, "spent");
+
+    let ticket = minted(&served, TOKEN);
+    {
+        let mut clock = clock.lock().expect("the clock");
+        clock.mono += Duration::from_secs(30);
+        clock.wall += Duration::from_secs(30);
+    }
+    let expired = at(STREAM_PATH, origin.clone(), offer_line(&ticket));
+    assert_eq!(expired, absent, "expired");
+
+    let ticket = minted(&served, TOKEN);
+    let wrong_pane = at(
+        "/api/v1/panes/w9:p2/stream",
+        origin.clone(),
+        offer_line(&ticket),
+    );
+    assert_eq!(wrong_pane, absent, "wrong pane");
+
+    let ticket = minted(&served, TOKEN);
+    let wrong_origin = at(
+        STREAM_PATH,
+        origin_line("https://b.example"),
+        offer_line(&ticket),
+    );
+    assert_eq!(wrong_origin, absent, "wrong origin");
+
+    let ticket = minted(&served, VIEW_TOKEN);
+    devices::revoke(VIEWER).expect("revoke");
+    let revoked = at(STREAM_PATH, origin.clone(), offer_line(&ticket));
+    assert_eq!(revoked, absent, "revoked");
+
+    let lines = captured_lines(&served);
+    let dashes = lines
+        .iter()
+        .filter(|line| line.ends_with(&format!(" - {STREAM_LINE_401}")))
+        .count();
+    assert_eq!(dashes, 7, "the lines: {lines:?}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(
+                |line| line.ends_with(" - GET /api/v1/panes/w9:p2/stream -> 401 origin=unlisted")
+            )
+            .count(),
+        1,
+        "the lines: {lines:?}"
+    );
+}
+
+#[test]
+fn a_ticket_attach_names_its_device_its_origin_and_its_credential() {
+    let _home = HomeSandbox::new();
+    let context = ctx(HOLD_A_FRAME);
+    list_origin(TICKET_ORIGIN);
+    let Some(served) = served_cfg(context, 3, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, TOKEN);
+    let (client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    drop(client);
+    let mut bearer = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    bearer.upgrade_request(STREAM_PATH, TOKEN).expect("upgrade");
+    assert_101(&mut bearer);
+    drop(bearer);
+
+    let lines = captured_lines(&served);
+    let of = |suffix: &str| lines.iter().filter(|line| line.ends_with(suffix)).count();
+    assert_eq!(
+        of(&format!(
+            " {DRIVER} GET {STREAM_PATH} -> 101 origin={TICKET_ORIGIN} auth=ticket"
+        )),
+        1,
+        "the lines: {lines:?}"
+    );
+    assert_eq!(
+        of(&format!(" {DRIVER} GET {STREAM_PATH} -> 101")),
+        1,
+        "the bearer's line carries no auth field: {lines:?}"
+    );
+    assert_eq!(
+        of(&format!(
+            "clauth api: device '{DRIVER}' opened control on pane 'w9:p1'"
+        )),
+        2,
+        "the lines: {lines:?}"
+    );
+}
+
+/// The bearer upgrade's head, as the code before the ticket wrote it, with a
+/// live ticket on the request and without one.
+#[test]
+fn a_bearer_upgrade_writes_todays_head() {
+    let _home = HomeSandbox::new();
+    let context = ctx(HOLD_A_FRAME);
+    let table = Arc::clone(&context);
+    let Some(served) = served_cfg(context, 3, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, VIEW_TOKEN);
+    let want = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {WS_ACCEPT}\r\n\
+         \r\n"
+    );
+    let mut plain = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    plain.upgrade_request(STREAM_PATH, TOKEN).expect("upgrade");
+    assert_eq!(plain.read_head().expect("the head"), want);
+    drop(plain);
+
+    let (mut both, head) = upgrade_with(
+        &served,
+        STREAM_PATH,
+        &[
+            format!("Authorization: Bearer {TOKEN}"),
+            origin_line(TICKET_ORIGIN),
+            offer_line(&ticket),
+        ],
+    );
+    assert_eq!(head, want);
+    let (opcode, _) = both.recv_frame().expect("a frame");
+    assert_eq!(opcode, 0x1);
+    assert_eq!(table.tickets.held(), 1, "the bearer left the ticket live");
+}
+
+#[test]
+fn a_view_tickets_input_closes_1008() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served_cfg(ctx(HOLD_A_FRAME), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, VIEW_TOKEN);
+    let (mut client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    client
+        .send_text(r#"{"type":"terminal.input","text":"x"}"#)
+        .expect("send input");
+    assert_eq!(close_code(&mut client), 1008);
+}
+
+#[test]
+fn a_control_tickets_attach_takes_over() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv = dir.path().join("argv");
+    let script = format!("printf '%s\\n' \"$@\" > {}; {HOLD_A_FRAME}", argv.display());
+    let Some(served) = served_cfg(ctx(&script), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, TOKEN);
+    let (mut client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    client.recv_frame().expect("a frame");
+    wait_for_argv(
+        &argv,
+        &[
+            "terminal",
+            "session",
+            "control",
+            "w9:p1",
+            "--takeover",
+            "--cols",
+            "88",
+            "--rows",
+            "57",
+        ],
+    );
+}
+
+/// The row at the upgrade decides the mode, never the row at the mint: a tier
+/// moving under one pairing is a hand edit, and the read honours it.
+#[test]
+fn a_tier_edited_after_the_mint_decides_the_mode() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv = dir.path().join("argv");
+    let script = format!("printf '%s\\n' \"$@\" > {}; {HOLD_A_FRAME}", argv.display());
+    let Some(served) = served_cfg(ctx(&script), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, VIEW_TOKEN);
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("devices.json");
+    let text = std::fs::read_to_string(&path).expect("read the list");
+    assert!(text.contains("\"view\""), "the fixture holds the tier");
+    std::fs::write(&path, text.replace("\"view\"", "\"control\"")).expect("edit the list");
+    let (mut client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    client.recv_frame().expect("a frame");
+    wait_for_argv(
+        &argv,
+        &[
+            "terminal",
+            "session",
+            "control",
+            "w9:p1",
+            "--takeover",
+            "--cols",
+            "88",
+            "--rows",
+            "57",
+        ],
+    );
+}
+
+#[test]
+fn no_line_holds_a_ticket() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served_cfg(ctx(HOLD_A_FRAME), 6, Limits::DEFAULT) else {
+        return;
+    };
+    let attached = minted(&served, TOKEN);
+    let (client, head) = present(&served, TICKET_ORIGIN, &offer_of(&attached));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    drop(client);
+    let wrong_page = minted(&served, TOKEN);
+    let (_, head) = present(&served, "https://b.example", &offer_of(&wrong_page));
+    assert!(head.starts_with("HTTP/1.1 401 "), "the head: {head}");
+    let unmatched = "c".repeat(64);
+    let (_, head) = present(&served, TICKET_ORIGIN, &offer_of(&unmatched));
+    assert!(head.starts_with("HTTP/1.1 401 "), "the head: {head}");
+    let (_, head) = present(&served, TICKET_ORIGIN, &offer_of(&attached));
+    assert!(head.starts_with("HTTP/1.1 401 "), "the head: {head}");
+
+    let lines = captured_lines(&served);
+    assert!(
+        lines.iter().any(|line| line.contains(" -> 101 ")),
+        "the capture holds the attach: {lines:?}"
+    );
+    for canary in [&attached, &wrong_page, &unmatched] {
+        assert!(
+            !lines.iter().any(|line| line.contains(canary.as_str())),
+            "a line holds a ticket"
+        );
+    }
+}
+
+#[test]
+fn a_revoke_closes_an_open_ticket_stream() {
+    let _home = HomeSandbox::new();
+    // Reset so the silence asserted below is this test's, never a latch an
+    // earlier test flipped; every flipper holds a sandbox.
+    crate::daemon::api::routes::READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(served) = served_cfg(ctx(HOLD_A_FRAME), 2, Limits::DEFAULT) else {
+        return;
+    };
+    let ticket = minted(&served, TOKEN);
+    let (mut client, head) = present(&served, TICKET_ORIGIN, &offer_of(&ticket));
+    assert!(head.starts_with("HTTP/1.1 101 "), "the head: {head}");
+    client.recv_frame().expect("a frame");
+    let revoked = Instant::now();
+    devices::revoke(DRIVER).expect("revoke");
+    assert_eq!(close_code(&mut client), 1008);
+    assert!(revoked.elapsed() < REVOKE_BOUND, "{:?}", revoked.elapsed());
+    drop(client);
+    let lines = captured_lines(&served);
+    let want = "clauth api: device 'driver' control stream on pane 'w9:p1' closed (device no longer paired)";
+    assert_eq!(
+        lines.iter().filter(|line| line.as_str() == want).count(),
+        1,
+        "the revoke's one close line: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("clauth api: refusing every request until")),
+        "a revoke is no unreadable list: {lines:?}"
+    );
+}
+
+#[test]
+fn a_revoke_closes_an_open_bearer_stream() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served(ctx(HOLD_A_FRAME)) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .upgrade_request(STREAM_PATH, VIEW_TOKEN)
+        .expect("upgrade");
+    assert_101(&mut client);
+    client.recv_frame().expect("a frame");
+    let revoked = Instant::now();
+    devices::revoke(VIEWER).expect("revoke");
+    assert_eq!(close_code(&mut client), 1008);
+    assert!(revoked.elapsed() < REVOKE_BOUND, "{:?}", revoked.elapsed());
+}
+
+/// A pane printing without pause behind a client that reads slower than it
+/// prints: the close lands behind a full socket, and 60 KB frames at 5 ms each
+/// read those few MB back inside the bound.
+#[test]
+fn a_revoke_closes_a_stream_whose_pane_outruns_its_client() {
+    let _home = HomeSandbox::new();
+    let flood = "line=$(head -c 60000 /dev/zero | tr '\\0' x); yes \"$line\"";
+    let Some(served) = served(ctx(flood)) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .upgrade_request(STREAM_PATH, VIEW_TOKEN)
+        .expect("upgrade");
+    assert_101(&mut client);
+    let revoked = Instant::now();
+    devices::revoke(VIEWER).expect("revoke");
+    let code = loop {
+        match client.recv_frame() {
+            Ok((0x8, payload)) => break u16::from_be_bytes([payload[0], payload[1]]),
+            Ok((0x1, _)) => std::thread::sleep(Duration::from_millis(5)),
+            Ok((opcode, _)) => panic!("an unexpected opcode {opcode}"),
+            Err(e) => panic!("the stream stayed open: {e}"),
+        }
+    };
+    assert_eq!(code, 1008);
+    assert!(revoked.elapsed() < REVOKE_BOUND, "{:?}", revoked.elapsed());
+}
+
+/// An unreadable list closes the stream as a server fault, never as an unpair
+/// the user did not make: `1011 "device list unreadable"`, a close line saying
+/// so, and the read error itself through the once-per-process refusal line.
+#[test]
+fn a_device_list_that_stops_reading_closes_an_open_stream() {
+    let _home = HomeSandbox::new();
+    crate::daemon::api::routes::READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(served) = served(ctx(HOLD_A_FRAME)) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .upgrade_request(STREAM_PATH, VIEW_TOKEN)
+        .expect("upgrade");
+    assert_101(&mut client);
+    client.recv_frame().expect("a frame");
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("devices.json"),
+        "not a list",
+    )
+    .expect("corrupt the list");
+    assert_eq!(
+        close_frame(&mut client),
+        (1011, "device list unreadable".to_string())
+    );
+    drop(client);
+    let lines = captured_lines(&served);
+    let want = "clauth api: device 'viewer' observe stream on pane 'w9:p1' closed (device list unreadable)";
+    assert_eq!(
+        lines.iter().filter(|line| line.as_str() == want).count(),
+        1,
+        "the one close line: {lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line
+                .starts_with("clauth api: refusing every request until the device list reads: "))
+            .count(),
+        1,
+        "the read error's one line: {lines:?}"
+    );
+}
+
+/// The `/events` twin: the stream ends, and the read error reaches the log
+/// through the same once-per-process line.
+#[test]
+fn a_device_list_that_stops_reading_ends_an_events_stream_and_logs_why() {
+    let _home = HomeSandbox::new();
+    crate::daemon::api::routes::READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(served) = served(ctx(":")) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .send(
+            format!(
+                "GET /api/v1/events HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Authorization: Bearer {VIEW_TOKEN}\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the request");
+    let head = client.read_head().expect("the head");
+    assert!(head.starts_with("HTTP/1.1 200 "), "the head: {head}");
+    let damaged = Instant::now();
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("devices.json"),
+        "not a list",
+    )
+    .expect("corrupt the list");
+    let mut chunk = [0u8; 512];
+    loop {
+        match client.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the stream stayed open: {e}"),
+        }
+    }
+    assert!(damaged.elapsed() < REVOKE_BOUND, "{:?}", damaged.elapsed());
+    drop(client);
+    let lines = captured_lines(&served);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line
+                .starts_with("clauth api: refusing every request until the device list reads: "))
+            .count(),
+        1,
+        "the read error's one line: {lines:?}"
+    );
+}
+
+/// The stream lives through its row checks while its device stays paired: a
+/// second frame arrives after the first check would have closed it.
+#[test]
+fn a_paired_devices_stream_outlives_the_row_check() {
+    let _home = HomeSandbox::new();
+    let script =
+        "printf '%s\\n' '{\"seq\":1}'; sleep 6; printf '%s\\n' '{\"seq\":2}'; cat > /dev/null";
+    let Some(served) = served(ctx(script)) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .upgrade_request(STREAM_PATH, VIEW_TOKEN)
+        .expect("upgrade");
+    assert_101(&mut client);
+    assert_eq!(client.recv_frame().expect("a frame").1, br#"{"seq":1}"#);
+    assert_eq!(client.recv_frame().expect("a frame").1, br#"{"seq":2}"#);
+}
+
+#[test]
+fn a_revoke_closes_an_open_events_stream() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served(ctx(":")) else {
+        return;
+    };
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .send(
+            format!(
+                "GET /api/v1/events HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Authorization: Bearer {VIEW_TOKEN}\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the request");
+    let head = client.read_head().expect("the head");
+    assert!(head.starts_with("HTTP/1.1 200 "), "the head: {head}");
+    let revoked = Instant::now();
+    devices::revoke(VIEWER).expect("revoke");
+    let mut chunk = [0u8; 512];
+    loop {
+        match client.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the stream stayed open: {e}"),
+        }
+    }
+    assert!(revoked.elapsed() < REVOKE_BOUND, "{:?}", revoked.elapsed());
+}
+
+/// A long poll whose device is revoked mid-wait answers 401 on the wire and
+/// closes its connection, like every 401 no device earned: a revoked device
+/// keeps no slot.
+#[test]
+fn a_long_poll_revoked_mid_wait_closes_its_connection() {
+    let _home = HomeSandbox::new();
+    let Some(served) = served(ctx(":")) else {
+        return;
+    };
+    std::fs::write(status_path(), r#"{"schema":1,"active_profile":"alpha"}"#).expect("feed");
+    let (_, tag) =
+        crate::daemon::api::routes::read_feed_tagged(&status_path()).expect("the feed's tag");
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .send(
+            format!(
+                "GET /api/v1/status?wait=10 HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Authorization: Bearer {VIEW_TOKEN}\r\n\
+                 If-None-Match: {tag}\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the request");
+    let path = status_path();
+    let revoker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        devices::revoke(VIEWER).expect("revoke");
+        std::fs::write(&path, r#"{"schema":1,"active_profile":"beta"}"#).expect("republish");
+    });
+    let head = client.read_head().expect("the head");
+    revoker.join().expect("revoker thread");
+    assert!(head.starts_with("HTTP/1.1 401 "), "the head: {head}");
+    assert!(
+        head.contains("\r\nConnection: close\r\n"),
+        "a revoked device keeps no connection: {head}"
+    );
+    drop(client);
+    // Only the mid-wait 401 names its device: a 401 at the request's start
+    // logs `-`, so this line proves the request authenticated before the
+    // revoke and the close is the waited answer's.
+    let lines = captured_lines(&served);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(" {VIEWER} GET /api/v1/status")) && line.ends_with(" -> 401")
+            })
+            .count(),
+        1,
+        "the waited 401's access line: {lines:?}"
+    );
+}
+
+/// The twin: with its device paired, an `/events` stream runs past its first
+/// row check to the 6 s lifetime this test gives it.
+#[test]
+fn a_paired_devices_events_stream_outlives_the_row_check() {
+    let _home = HomeSandbox::new();
+    let limits = Limits {
+        io_timeout: Duration::from_secs(10),
+        lifetime: Duration::from_secs(6),
+        max_requests: 100,
+    };
+    let Some(served) = served_cfg(ctx(":"), 1, limits) else {
+        return;
+    };
+    // Stamped before the connect, so the server's own 6 s clock starts after
+    // this instant: a correct stream necessarily reads at least 6 s.
+    let opened = Instant::now();
+    let mut client = WsClient::connect(served.port, &served.client_tls).expect("connect");
+    client
+        .send(
+            format!(
+                "GET /api/v1/events HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 Authorization: Bearer {VIEW_TOKEN}\r\n\
+                 \r\n",
+                server_tests::SERVER_NAME
+            )
+            .as_bytes(),
+        )
+        .expect("send the request");
+    client.read_head().expect("the head");
+    let mut chunk = [0u8; 512];
+    loop {
+        match client.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the stream outlived its lifetime: {e}"),
+        }
+    }
+    assert!(
+        opened.elapsed() >= Duration::from_secs(6),
+        "the stream ended at its lifetime, not at the check: {:?}",
+        opened.elapsed()
+    );
+}
+
+// --- The frames drain, between frames --------------------------------------------
+
+/// A clock that moves 1 s on every read, from `start`.
+fn ticking(start: Instant) -> impl FnMut() -> Instant {
+    let mut reads = 0u64;
+    move || {
+        reads += 1;
+        start + Duration::from_secs(reads)
+    }
+}
+
+/// 16 queued frames behind a sender the caller keeps, so the drain never reads
+/// the queue empty or ended before it runs out of frames.
+fn full_queue() -> (
+    std::sync::mpsc::SyncSender<Vec<u8>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    for _ in 0..16 {
+        tx.send(b"{}".to_vec()).expect("queue a frame");
+    }
+    (tx, rx)
+}
+
+/// The view device's row, its first check due 5 s after `opened`.
+fn row_opened_at(opened: Instant) -> RowWatch {
+    seed_devices();
+    let device = devices::authenticate(Some(VIEW_TOKEN))
+        .expect("the list reads")
+        .expect("the device");
+    RowWatch::new(&device, opened)
+}
+
+#[test]
+fn a_row_check_coming_due_stops_a_drain_whose_queue_never_empties() {
+    let _home = HomeSandbox::new();
+    let opened = Instant::now();
+    let row = row_opened_at(opened);
+    let (_tx, rx) = full_queue();
+    let mut written = 0;
+    let drained = drain_frames(
+        &rx,
+        opened + Duration::from_secs(3600),
+        &row,
+        ticking(opened),
+        |_| {
+            written += 1;
+            Ok(())
+        },
+    );
+    assert_eq!((drained, written), (Drained::Due, 4), "due at the 5th read");
+}
+
+#[test]
+fn a_lifetime_coming_due_stops_a_drain_whose_queue_never_empties() {
+    let _home = HomeSandbox::new();
+    let opened = Instant::now();
+    let row = row_opened_at(opened);
+    let (_tx, rx) = full_queue();
+    let mut written = 0;
+    let drained = drain_frames(
+        &rx,
+        opened + Duration::from_secs(3),
+        &row,
+        ticking(opened),
+        |_| {
+            written += 1;
+            Ok(())
+        },
+    );
+    assert_eq!((drained, written), (Drained::Due, 2), "due at the 3rd read");
+}
+
+/// The drain's other three ends, as the loop before it ended them.
+#[test]
+fn a_drain_stops_where_the_queue_or_the_client_says() {
+    let _home = HomeSandbox::new();
+    let opened = Instant::now();
+    let row = row_opened_at(opened);
+    let deadline = opened + Duration::from_secs(3600);
+    let now = || opened;
+
+    let (_tx, empty) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    assert_eq!(
+        drain_frames(&empty, deadline, &row, now, |_| Ok(())),
+        Drained::Empty
+    );
+
+    let (tx, ended) = full_queue();
+    drop(tx);
+    let mut written = 0;
+    let drained = drain_frames(&ended, deadline, &row, now, |_| {
+        written += 1;
+        Ok(())
+    });
+    assert_eq!((drained, written), (Drained::Ended, 16));
+
+    let (_tx, refused) = full_queue();
+    let mut tried = 0;
+    let drained = drain_frames(&refused, deadline, &row, now, |_| {
+        tried += 1;
+        Err(std::io::Error::other("the client left"))
+    });
+    assert_eq!((drained, tried), (Drained::WriteFailed, 1));
+}
+
+/// The frame left queued when the row comes due is the first the next drain
+/// writes: a drain that took it before checking the row would lose it, and one
+/// that wrote it twice would show here too.
+#[test]
+fn a_frame_left_queued_when_the_row_comes_due_is_written_next() {
+    let _home = HomeSandbox::new();
+    let opened = Instant::now();
+    let row = row_opened_at(opened);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+    for seq in 0..16u8 {
+        tx.send(vec![seq]).expect("queue a frame");
+    }
+    let mut first = Vec::new();
+    let drained = drain_frames(
+        &rx,
+        opened + Duration::from_secs(3600),
+        &row,
+        ticking(opened),
+        |line| {
+            first.push(line[0]);
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (drained, first.len()),
+        (Drained::Due, 4),
+        "due at the 5th read"
+    );
+    let mut rest = Vec::new();
+    let drained = drain_frames(
+        &rx,
+        opened + Duration::from_secs(3600),
+        &row,
+        || opened,
+        |line| {
+            rest.push(line[0]);
+            Ok(())
+        },
+    );
+    assert_eq!(drained, Drained::Empty);
+    assert_eq!(first, vec![0, 1, 2, 3], "every frame before the due check");
+    assert_eq!(
+        rest,
+        (4u8..16).collect::<Vec<u8>>(),
+        "the frame the due check left queued goes out first, none lost or twice"
+    );
+    drop(tx);
 }

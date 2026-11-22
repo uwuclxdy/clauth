@@ -70,6 +70,52 @@ fn lines(result: &CallToolResult) -> Vec<String> {
     first_text(result).lines().map(str::to_string).collect()
 }
 
+/// A row names the available resets its account's last read found, singular
+/// at one, and says nothing at zero or with no reading.
+#[test]
+fn a_row_names_the_banked_limit_resets_it_read() {
+    let _home = HomeSandbox::new();
+    seed_two_profiles();
+    let row = || lines(&call_profiles(Some(vec!["solo"]), None));
+
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "no reading names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("solo", 2, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             2 limit resets available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 1, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec![
+            "- solo (global active) [anthropic]: usage unknown; tier unknown; \
+             1 limit reset available"
+        ],
+    );
+    crate::testutil::write_claude_limit_resets("solo", 0, &[], None, 1);
+    assert_eq!(
+        row(),
+        vec!["- solo (global active) [anthropic]: usage unknown; tier unknown"],
+        "a reading of zero names nothing",
+    );
+    crate::testutil::write_claude_limit_resets("vendor", 1, &[], None, 1);
+    assert_eq!(
+        lines(&call_profiles(Some(vec!["vendor"]), None)),
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; 1 limit reset available; \
+             no api key"
+        ],
+        "the file decides, on an api-key account too",
+    );
+}
+
 #[test]
 fn names_filter_selects_one_profile_case_insensitively() {
     let _home = HomeSandbox::new();
@@ -686,8 +732,9 @@ fn seed_auth_states() {
 }
 
 /// `keyless` is the only-when-news signal a picker needs before a `delegate`:
-/// true on a third-party profile with no inference auth source, absent (never
-/// `false`) on a keyed third-party and on an OAuth profile.
+/// true on a profile whose inference needs a key it does not carry
+/// (`Profile::is_keyless`), absent (never `false`) on a keyed third-party and
+/// on an OAuth profile.
 #[test]
 fn keyless_flag_names_only_the_keyless_third_party_profile() {
     let _home = HomeSandbox::new();
@@ -1366,6 +1413,7 @@ fn the_runway_payload_carries_the_funded_wallets_balance() {
     let payload = windows_payload(&ProfileWindows::ThirdParty {
         stats: Some(stats),
         age_secs: None,
+        chain_age_secs: None,
         provider: None,
         wallet_rate: Some(rate),
     });
@@ -1394,6 +1442,7 @@ fn the_runway_reaches_the_delegate_receipt_through_live_usage_json() {
         Some(&ProfileWindows::ThirdParty {
             stats: Some(stats),
             age_secs: None,
+            chain_age_secs: None,
             provider: None,
             wallet_rate: Some(rate),
         }),
@@ -1974,41 +2023,175 @@ fn a_named_accounts_advisor_row_prints_among_its_binds() {
     );
 }
 
-/// A row names when its plan ends or renews, and only when the operator gave
-/// a date: the marked `plan_ends` day, else the next `plan_renews` day.
+/// A row names when its plan ends or renews, and only when the user gave
+/// a date: the marked `plan_ends` day (still `ends` once past), a
+/// `plan_renews` later than a past end, else the next `plan_renews` day. A
+/// plan whose cached reading says canceled or refused names no renewal. The
+/// JSON row carries the same `plan_end` object `status.json` publishes.
 #[test]
 fn the_roster_names_when_a_plan_ends_or_renews() {
     let _home = HomeSandbox::new();
-    let today = crate::usage::local_date_of(crate::usage::now_epoch_secs()).unwrap();
-    let mut ending = Profile::new("ending".to_string(), None, None);
-    ending.plan_ends = Some(today + chrono::Duration::days(10));
-    save_profile(&ending).expect("save ending");
-    let mut renewing = Profile::new("renewing".to_string(), None, None);
-    renewing.plan_renews = Some(today + chrono::Duration::days(4));
-    save_profile(&renewing).expect("save renewing");
+    let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    let dated = |name: &str, ends, renews| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.plan_ends = ends;
+        p.plan_renews = renews;
+        save_profile(&p).expect("save a dated profile");
+    };
+    dated("ending", day(2099, 11, 20), day(2099, 4, 10));
+    dated("ended", day(2020, 3, 2), None);
+    dated("resubscribed", day(2020, 3, 2), day(2099, 12, 15));
+    dated("renewing", None, day(2099, 12, 15));
+    dated("gone", None, day(2099, 12, 15));
+    dated("held", None, day(2099, 12, 15));
     save_profile(&Profile::new("plain".to_string(), None, None)).expect("save plain");
+    let names = [
+        "ending",
+        "ended",
+        "resubscribed",
+        "renewing",
+        "gone",
+        "held",
+        "plain",
+    ];
     save_app_state(&AppState {
         active_profile: Some("plain".into()),
-        profiles: vec!["ending".into(), "renewing".into(), "plain".into()],
+        profiles: names.iter().map(|n| (*n).into()).collect(),
         ..Default::default()
     })
     .expect("save state");
+    for (name, status) in [
+        ("gone", "canceled"),
+        ("held", crate::usage::ORG_REFUSED_STATUS),
+    ] {
+        write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                plan: Some(PlanInfo {
+                    tier: PlanTier::Free,
+                    plan_display_name: None,
+                    subscription_status: Some(status.to_string()),
+                    codex_plan: None,
+                    email: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
 
-    let rows = lines(&call_profiles(None, None));
-    let row = |name: &str| {
-        rows.iter()
-            .find(|l| l.starts_with(&format!("- {name} ")))
-            .unwrap_or_else(|| panic!("a {name} row in {rows:?}"))
-            .clone()
+    let config = crate::profile::load_config().expect("config");
+    let live = crate::live_sessions::LiveTally::collect(&config);
+    let plan_end = |name: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("seeded");
+        profile_row(p, &config, crate::usage::now_epoch_secs(), &live)
+            .get("plan_end")
+            .cloned()
     };
-    let day = |days| crate::usage::render_plan_date(today + chrono::Duration::days(days));
-    assert!(
-        row("ending").contains(&format!("; plan ends {}", day(10))),
-        "{rows:?}"
+    assert_eq!(
+        (
+            lines(&call_profiles(None, None)),
+            names.map(plan_end).to_vec(),
+        ),
+        (
+            vec![
+                "- ending [anthropic]: usage unknown; tier unknown; plan ends 2099-11-20"
+                    .to_string(),
+                "- ended [anthropic]: usage unknown; tier unknown; plan ends 2020-03-02"
+                    .to_string(),
+                "- resubscribed [anthropic]: usage unknown; tier unknown; plan renews 2099-12-15"
+                    .to_string(),
+                "- renewing [anthropic]: usage unknown; tier unknown; plan renews 2099-12-15"
+                    .to_string(),
+                "- gone [anthropic, Free]: usage unknown; subscription canceled".to_string(),
+                "- held [anthropic, Free]: usage unknown; org refused".to_string(),
+                "- plain (global active) [anthropic]: usage unknown; tier unknown".to_string(),
+            ],
+            vec![
+                Some(serde_json::json!({ "kind": "ends", "date": "2099-11-20" })),
+                Some(serde_json::json!({ "kind": "ends", "date": "2020-03-02" })),
+                Some(serde_json::json!({ "kind": "renews", "date": "2099-12-15" })),
+                Some(serde_json::json!({ "kind": "renews", "date": "2099-12-15" })),
+                None,
+                None,
+                None,
+            ],
+        ),
+        "(the reply's rows, each row's JSON `plan_end`)"
     );
-    assert!(
-        row("renewing").contains(&format!("; plan renews {}", day(4))),
-        "{rows:?}"
+}
+
+/// A keyless third-party control (`vendor`), then two proxy accounts on their
+/// proxy's loopback bind as `clauth login <name> --proxy <service>` creates
+/// them: `pb` with its key cleared, `pk` keyed.
+fn seed_proxy_auth_states() {
+    save_profile(&Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    ))
+    .expect("save vendor");
+    save_app_state(&AppState {
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+}
+
+/// The roster flags exactly the accounts the delegate refuses as keyless: a
+/// keyless proxy account on its bind carries `keyless` and renders `no api
+/// key`, the keyed proxy account beside it carries neither, and the keyless
+/// third-party control keeps its flag.
+#[test]
+fn the_roster_flags_a_keyless_proxy_account_on_its_bind_keyless() {
+    let _home = HomeSandbox::new();
+    seed_proxy_auth_states();
+
+    let config = crate::profile::load_config().expect("config");
+    let live = crate::live_sessions::LiveTally::collect(&config);
+    let keyless = |name: &str| {
+        let p = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("seeded");
+        profile_row(p, &config, crate::usage::now_epoch_secs(), &live)
+            .get("keyless")
+            .cloned()
+    };
+    assert_eq!(
+        (
+            lines(&call_profiles(None, None)),
+            [keyless("vendor"), keyless("pb"), keyless("pk")],
+        ),
+        (
+            vec![
+                "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
+                "- pb [generic, 127.0.0.1:9141, local endpoint]: usage unknown; no api key"
+                    .to_string(),
+                "- pk [generic, 127.0.0.1:9141, local endpoint]: usage unknown".to_string(),
+            ],
+            [
+                Some(serde_json::json!(true)),
+                Some(serde_json::json!(true)),
+                None
+            ],
+        ),
+        "(the reply's rows, the JSON `keyless` value of vendor, pb, pk)"
     );
-    assert!(!row("plain").contains("; plan "), "{rows:?}");
 }

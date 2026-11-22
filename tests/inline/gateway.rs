@@ -6312,6 +6312,55 @@ fn the_pool_read_sends_the_token_and_hits_the_pool_route() {
     );
 }
 
+/// Under an `ALL_PROXY` pin a real pool read still reaches its own stub: the
+/// read's agent is built by `direct_config`, which clears the proxy whatever
+/// the env holds, so the pin's dead proxy is never consulted and the stub
+/// records the request. `NO_PROXY` is deliberately not `*`: ureq parses `*` as
+/// match-all, so with `NO_PROXY=*` a pool agent that took the env proxy would
+/// still dial the stub directly and the pin would have nothing to bite on —
+/// which is exactly what an ambient `NO_PROXY=127.0.0.1` on a developer box
+/// would do, so `NO_PROXY`/`no_proxy` are pinned unset beside it.
+///
+/// The pin stands for everything outside this test, so it runs only where
+/// every test is its own process (nextest's `process-per-test` mode, read off
+/// `NEXTEST_EXECUTION_MODE`): under the threaded `cargo test` fallback an
+/// unsandboxed sibling that first-uses a shared `LazyLock` ureq agent while
+/// the pin stands takes the proxy for the rest of the run. Off nextest it
+/// skips.
+#[test]
+fn the_pool_read_reaches_its_stub_under_an_env_proxy_pin() {
+    if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+        eprintln!(
+            "skipped: the ALL_PROXY pin here holds no NO_PROXY=*, so under a threaded \
+             cargo test an unsandboxed sibling first-using a shared LazyLock agent \
+             takes the proxy for the run; runs only under nextest's process-per-test"
+        );
+        return;
+    }
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let _proxy = EnvPin::new(
+        &home,
+        &[
+            ("ALL_PROXY", Some(OsStr::new("http://127.0.0.1:9"))),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ],
+    );
+    let (base, seen) = serve_endpoints_raw(1, |_, _| (200, POOL_BODY.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    assert_eq!(
+        chatgpt_oauth_providers_needing_login(&record).expect("providers"),
+        vec!["A".to_string(), "D".to_string()]
+    );
+    let raw = seen.join().expect("listener");
+    assert_eq!(request_path(&raw[0]), "/admin/api/pool");
+    assert_eq!(
+        request_header(&raw[0], "x-api-key").as_deref(),
+        Some(POOL_TOKEN)
+    );
+}
+
 #[test]
 fn the_pinned_single_file_short_circuits_the_pool_read() {
     let home = HomeSandbox::new();
@@ -6496,6 +6545,67 @@ fn a_pool_body_of_another_shape_is_the_unparseable_typed_error() {
     seen.join().expect("listener");
 }
 
+/// The broken-body pool stub's one accept loop, the loop both the
+/// broken-body test and the [`PoolStubStop`] pin drive: a dial answered with a
+/// 200 head whose body breaks off, `WouldBlock` polling `exit` between
+/// accepts. Returns whether a dial was served.
+fn pool_broken_body_stub_loop(listener: TcpListener, exit: &std::sync::atomic::AtomicBool) -> bool {
+    use std::io::{Read as _, Write as _};
+    // A nonblocking accept: a read that returns without dialing ends the wait
+    // at once, so the test reds instead of parking on a blocking `accept`.
+    // The flag is read BEFORE each `accept`: a dial completes before the read
+    // returns, so once the flag reads set, any dialed connection is already
+    // queued for that `accept`.
+    let mut stream = loop {
+        let read_done = exit.load(std::sync::atomic::Ordering::SeqCst);
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if read_done {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).expect("blocking stream");
+    let mut request = [0u8; 4096];
+    let _ = stream.read(&mut request).expect("request");
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"marker-broken")
+        .expect("head");
+    true
+}
+
+/// Stops the broken-body pool stub whatever its test's outcome: `served` ends
+/// the accept loop and joins for the test's own dial assertion, and the `Drop`
+/// does the same when the test panics first, so no stub thread outlives a
+/// failed test polling its listener. `Drop` never asserts — a panic there
+/// aborts the whole test binary.
+struct PoolStubStop {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl PoolStubStop {
+    fn served(&mut self) -> bool {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.handle
+            .take()
+            .is_some_and(|handle| handle.join().expect("the stub thread panicked"))
+    }
+}
+
+impl Drop for PoolStubStop {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A 200 whose body stops before its declared length is its own typed error,
 /// never a transport failure's "did not answer", and carries none of the body.
 #[test]
@@ -6507,40 +6617,16 @@ fn a_pool_body_that_breaks_off_is_its_own_typed_error() {
     listener
         .set_nonblocking(true)
         .expect("nonblocking listener");
-    // A nonblocking accept: a read that returns without dialing ends the wait
-    // at once, so the test reds instead of parking on a blocking `accept`.
-    // The flag is read BEFORE each `accept`: a dial completes before the read
-    // returns, so once the flag reads set, any dialed connection is already
-    // queued for that `accept`.
     let read_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let returned = std::sync::Arc::clone(&read_returned);
-    let server = std::thread::spawn(move || {
-        use std::io::{Read as _, Write as _};
-        let mut stream = loop {
-            let read_done = returned.load(std::sync::atomic::Ordering::SeqCst);
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if read_done {
-                        return false;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking stream");
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request).expect("request");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"marker-broken")
-            .expect("head");
-        true
-    });
+    let server = std::thread::spawn(move || pool_broken_body_stub_loop(listener, &returned));
+    let mut stub = PoolStubStop {
+        done: std::sync::Arc::clone(&read_returned),
+        handle: Some(server),
+    };
     let record = pool_record(&home, addr);
     let err = chatgpt_oauth_providers_needing_login(&record).expect_err("broken");
-    read_returned.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(server.join().expect("server"), "the pool read never dialed");
+    assert!(stub.served(), "the pool read never dialed");
     let typed = err
         .downcast_ref::<ChatgptOauthProvidersError>()
         .expect("a typed ChatgptOauthProvidersError");
@@ -6549,6 +6635,50 @@ fn a_pool_body_that_breaks_off_is_its_own_typed_error() {
         "a body that breaks off is the BodyBroken variant, got {typed:?}"
     );
     assert_eq!(format!("{err:#}"), "the gateway's pool response broke off");
+}
+
+/// The guard, not the test's happy path, ends the stub thread when its test
+/// panics: the guard dropped by a forced panic's unwind before any dial, and
+/// the stub's own exit flag must flip inside the bound. The pin drives the
+/// same accept loop the broken-body test drives
+/// ([`pool_broken_body_stub_loop`]), so a `Drop` that stores no flag and joins
+/// nothing, or skips its work while unwinding, leaves that loop polling, the
+/// flag down and this red.
+#[test]
+fn a_pool_stub_stop_guard_ends_the_stub_thread_on_a_panicking_test() {
+    let _home = HomeSandbox::new();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (loop_done, loop_stopped) = (
+        std::sync::Arc::clone(&done),
+        std::sync::Arc::clone(&stopped),
+    );
+    let server = std::thread::spawn(move || {
+        let served = pool_broken_body_stub_loop(listener, &loop_done);
+        loop_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        served
+    });
+    let stub = PoolStubStop {
+        done,
+        handle: Some(server),
+    };
+    let forced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = stub;
+        panic!("forced: the panic the guard must survive");
+    }));
+    assert!(forced.is_err(), "fixture: the panic fired");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stub thread outlived the forced panic: the stop guard did not end it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A live daemon with no env record naming it: the gateway's address cannot be

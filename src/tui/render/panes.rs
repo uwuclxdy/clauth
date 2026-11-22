@@ -1055,11 +1055,26 @@ pub(super) fn draw_selector_list(
 /// The one rail drawer: the Usage tab's `status` block and the Fallback card's
 /// blocked-reason pills both render through it, so the two can't drift apart.
 pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 2; // glyph + 1 space, text at col 2
+    rail_lines(
+        prose::wrap(text, rail_text_width(width), theme::faint()),
+        more_follow,
+    )
+}
+
+/// The cells a rail line leaves its text: `width` less the glyph and its
+/// space, never under 8.
+pub(super) fn rail_text_width(width: usize) -> usize {
+    width.saturating_sub(2).max(8)
+}
+
+/// One rail entry's leads on its already-wrapped rows: the branch glyph on
+/// the first, the continuation on every other. The Usage tab's `resets` block
+/// hands it a reset's label rows then its detail rows, so the detail sits
+/// under the label as a wrapped label's continuation does.
+pub(super) fn rail_lines(rows: Vec<Vec<Span<'static>>>, more_follow: bool) -> Vec<Line<'static>> {
     let lead = if more_follow { "├ " } else { "└ " };
     let cont = if more_follow { "│ " } else { "  " };
-    prose::wrap(text, width.saturating_sub(LEAD_W).max(8), theme::faint())
-        .into_iter()
+    rows.into_iter()
         .enumerate()
         .map(|(i, seg)| {
             let mut spans = vec![Span::styled(
@@ -1220,15 +1235,24 @@ pub(super) fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
                 Span::styled(part, if c == '─' { theme::line() } else { state })
             })
             .collect(),
-        theme::Tier::Compatible => {
-            let word = glyph.trim_start_matches('[').trim_end_matches(']');
-            vec![
-                Span::styled("[", theme::dim()),
-                Span::styled(word, state),
-                Span::styled("]", theme::dim()),
-            ]
-        }
+        theme::Tier::Compatible => compatible_toggle_spans(glyph, state),
     }
+}
+
+/// The compatible tier's toggle frame: the glyph's word between dim brackets.
+/// Only the outermost bracket pair is the frame's — a glyph carrying its own
+/// (`[[on]]`) keeps the inner pair in the word, so the glyph renders whole
+/// instead of shedding every bracket it has.
+pub(super) fn compatible_toggle_spans(glyph: &'static str, state: Style) -> Vec<Span<'static>> {
+    let word = glyph
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(glyph);
+    vec![
+        Span::styled("[", theme::dim()),
+        Span::styled(word, state),
+        Span::styled("]", theme::dim()),
+    ]
 }
 
 /// Rounded box with contract-compliant chrome.

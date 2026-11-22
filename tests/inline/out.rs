@@ -109,6 +109,61 @@ fn a_reachable_reader_gets_the_bytes() {
     assert_eq!(String::from_utf8(buf).unwrap(), "hi 1\np: ");
 }
 
+/// [`emit_or_drop`]'s writes, on writers that fail on demand: a line after a
+/// settled spend never stops the run. A gone reader drops it silently, any
+/// other stdout failure is named on stderr, and a stderr that fails too is
+/// dropped as well; none of them panics.
+#[test]
+fn a_dropping_write_never_panics_and_names_only_a_real_failure() {
+    let mut err: Vec<u8> = Vec::new();
+    write_or_drop(
+        &mut Failing(ErrorKind::BrokenPipe),
+        &mut err,
+        format_args!("a line"),
+        true,
+    );
+    assert!(err.is_empty(), "a gone reader is no failure to name");
+
+    write_or_drop(
+        &mut Failing(ErrorKind::StorageFull),
+        &mut err,
+        format_args!("a line"),
+        true,
+    );
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        format!(
+            "clauth: failed printing to stdout: {}\n",
+            Error::from(ErrorKind::StorageFull)
+        ),
+    );
+
+    write_or_drop(
+        &mut Failing(ErrorKind::StorageFull),
+        &mut Failing(ErrorKind::StorageFull),
+        format_args!("a line"),
+        true,
+    );
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    write_or_drop(&mut out, &mut err, format_args!("hi {}", 1), true);
+    assert_eq!(String::from_utf8(out).unwrap(), "hi 1\n");
+    assert!(err.is_empty());
+}
+
+/// The stderr twin of [`write_or_drop`]: a line before work the run still owes
+/// never stops that work, whatever the write hits.
+#[test]
+fn a_dropping_error_write_never_panics() {
+    write_err_or_drop(&mut Failing(ErrorKind::StorageFull), format_args!("a line"));
+    write_err_or_drop(&mut Failing(ErrorKind::BrokenPipe), format_args!("a line"));
+
+    let mut err: Vec<u8> = Vec::new();
+    write_err_or_drop(&mut err, format_args!("hi {}", 1));
+    assert_eq!(String::from_utf8(err).unwrap(), "hi 1\n");
+}
+
 /// Both bugs come back the moment a bare macro lands in `src/`: `println!`
 /// exits 101 on a gone reader, `eprintln!` panics on one. Routing is the whole
 /// mechanism, so it is the thing worth failing on. No file is exempt, `out.rs`
@@ -172,10 +227,9 @@ fn calls(code: &str, macro_name: &str) -> bool {
 ///
 /// Out of scope, each named: the TUI (`src/tui/`) and the MCP server's replies
 /// (`src/mcp/`) keep their own text rules, `src/testutil.rs` is test-only; [`GLYPH_EXEMPT`] lists the other
-/// surfaces outside the CLI's own text (the generated `config.toml` comments,
-/// the codex login browser page, the daemon API's OpenAPI document, which
-/// `daemon --dump-openapi` prints verbatim). [`glyph_allowed`] holds
-/// the two glyph kinds the CLI keeps.
+/// surfaces outside the CLI's own text (the generated `config.toml` comments
+/// and the daemon API's OpenAPI document, which `daemon --dump-openapi` prints
+/// verbatim). [`glyph_allowed`] holds the two glyph kinds the CLI keeps.
 ///
 /// A `\u{...}` escape in a string counts as the character it spells. Limits shared with
 /// `no_bare_print_macro_under_src`: a `//` inside a string literal hides the
@@ -252,27 +306,9 @@ fn glyph_allowed(c: char) -> bool {
     c == '\u{2192}' || ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
-/// Lines outside the CLI's own text, by file and a fragment of the line: each
-/// codex browser reply is quoted whole, so the CLI errors beside them stay
-/// scanned.
-const GLYPH_EXEMPT: [(&str, &str); 6] = [
+/// Lines outside the CLI's own text, by file and a fragment of the line.
+const GLYPH_EXEMPT: [(&str, &str); 2] = [
     ("src/profile.rs", "out.push_str(\"# "),
-    (
-        "src/codex_login.rs",
-        "\"waiting for the codex login\u{2026}\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"login state mismatch \u{2014} close this and retry\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"codex login complete \u{2014} return to your terminal.\"",
-    ),
-    (
-        "src/codex_login.rs",
-        "\"codex login failed \u{2014} return to your terminal\"",
-    ),
     (
         "src/daemon/api/events.rs",
         "description = \"a server-sent-events stream",

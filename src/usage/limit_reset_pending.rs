@@ -142,12 +142,12 @@ pub(crate) fn take_fresh<T: PendingSpend>(path: &Path) -> anyhow::Result<Option<
     }
 }
 
-/// The fresh record's stamp, for `--list`'s note: read-only, removes nothing,
-/// so a list never mutates the store.
-pub(crate) fn fresh_stamp<T: PendingSpend>(path: &Path) -> Option<u64> {
+/// The fresh record, for the listing's note and the TUI's pinned-reset
+/// refusal: read-only, removes nothing, so a list never mutates the store.
+pub(crate) fn fresh_record<T: PendingSpend>(path: &Path) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
     let record: T = serde_json::from_str(&text).ok()?;
-    is_current(now_ms(), &record).then_some(record.sent_at_ms())
+    is_current(now_ms(), &record).then_some(record)
 }
 
 /// Remove the record. An already-absent record is already gone; anything else
@@ -189,9 +189,9 @@ impl LimitResetLock {
 
     /// Acquire the per-account spend lock, blocking until any in-flight spend
     /// on the same account releases it. Creates the `limit-reset-locks`
-    /// directory if missing. A held lock prints one stderr line, then waits;
+    /// directory if missing. A held lock hands `waiting` one line, then waits;
     /// any other lock failure refuses the spend naming the lock file.
-    pub(crate) fn acquire(name: &ProfileName) -> anyhow::Result<Self> {
+    pub(crate) fn acquire(name: &ProfileName, waiting: impl FnOnce(&str)) -> anyhow::Result<Self> {
         let path = Self::path(name)?;
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
@@ -202,9 +202,9 @@ impl LimitResetLock {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                crate::out::errln!(
+                waiting(&format!(
                     "clauth: another limit-reset on '{name}' is running; waiting for it."
-                );
+                ));
                 file.lock()
                     .with_context(|| format!("failed to lock {}", path.display()))?;
             }

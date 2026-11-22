@@ -138,6 +138,18 @@ pub(crate) enum Command {
         force: bool,
     },
 
+    /// Rename a profile, keeping its credentials, chain slot, and settings
+    ///
+    /// The same rename as the TUI's Setup tab. Stops the profile's background
+    /// supervisors first. Refused while a live `clauth start` session holds the
+    /// profile or a supervisor can't be stopped, and for a codex profile.
+    Rename {
+        /// Profile to rename.
+        profile: String,
+        /// The new name.
+        new_name: String,
+    },
+
     /// Hide a profile from auto-switch, usage polling, and the status feed
     ///
     /// Its dir and credentials stay on disk untouched. Refused for the active
@@ -161,8 +173,8 @@ pub(crate) enum Command {
     /// the preserved mint backup, and the rolling-token flag together, so the
     /// profile's stored OAuth login is what switches install again and
     /// nothing re-creates a sidecar afterwards. The live credentials are
-    /// relinked when the profile is active, and the clear is refused when the
-    /// profile stores no other login.
+    /// relinked when the profile is active, and the clear is refused when it
+    /// would remove the profile's last stored credential.
     #[command(name = "static-token")]
     StaticToken {
         /// Profile whose long-lived token to operate on.
@@ -182,25 +194,29 @@ pub(crate) enum Command {
         profile: String,
     },
 
-    /// Spend one of a codex or Claude Code account's banked usage-limit resets
+    /// List a codex or Claude Code account's banked usage-limit resets, or spend one
     ///
-    /// Reopens that account's usage windows now, the reset codex's own `/usage`
-    /// menu offers, or a claude grant Claude Code's own `/limit-reset` offers.
-    /// Prompts `[y/N]` naming the reset it will use (codex: a `codex_rate_limits`
-    /// reset first, then the one that expires first; claude: the grant the
-    /// server names next) unless `--yes`, which a spend on a non-TTY stdin or
-    /// stdout must pass: a used reset cannot be given back. `--list` shows the
-    /// account's resets, spends nothing and never prompts. Uses the profile's
-    /// stored login as it stands and never refreshes it.
+    /// With no id, prints the account's resets as a table, one row per reset
+    /// under the id that spends it, and spends nothing. With an id, spends that
+    /// reset (a codex reset codex's own `/usage` menu offers, or a claude grant
+    /// Claude Code's own `/limit-reset` offers), reopening the windows it covers
+    /// now; nothing picks a reset for you. Prompts `[y/N]` naming the reset
+    /// unless `--yes`, which a spend on a non-TTY stdin or stdout must pass: a
+    /// used reset cannot be given back. While a spend whose answer never
+    /// arrived can still be re-sent, only its own id is accepted, and naming it
+    /// re-sends that request. Uses the profile's stored login as it stands and
+    /// never refreshes it.
     #[command(name = "limit-reset")]
     LimitReset {
-        /// Codex or Claude Code profile to reset.
+        /// Codex or Claude Code profile whose resets to list or spend.
         profile: String,
-        /// Show the account's resets and which one would be used; spend none.
-        #[arg(long, conflicts_with = "yes")]
+        /// The id of the reset to spend, as the listing names it.
+        id: Option<String>,
+        /// List the account's resets and spend none, as with no id.
+        #[arg(long, conflicts_with_all = ["yes", "id"])]
         list: bool,
         /// Skip the confirm prompt. Required on a non-TTY stdin or stdout.
-        #[arg(long, short = 'y')]
+        #[arg(long, short = 'y', requires = "id")]
         yes: bool,
     },
 
@@ -347,7 +363,7 @@ pub(crate) enum Command {
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
     /// `--listen` also serves the REST API to the devices `clauth devices`
-    /// pairs (see the Daemon wiki page); `--status` prints and exits without
+    /// pairs (see the REST API wiki page); `--status` prints and exits without
     /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
@@ -370,8 +386,8 @@ pub(crate) enum Command {
         /// another. TLS comes from this host's lego certificate: from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
-        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
-        /// device's token; see `clauth devices`.
+        /// ~/.clauth/tls.json. Every request but a pairing or a CORS preflight
+        /// needs a paired device's token; see `clauth devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
         /// flag is for: a client on another machine. It is the same exposure
@@ -413,22 +429,31 @@ pub(crate) enum Command {
             ]
         )]
         dump_openapi: bool,
+        /// The restart-handover probe's answer, before anything else runs: a
+        /// replacement that will serve the API (`--listen` given and
+        /// `CLAUTH_NO_API` unset) loads its certificate first, then prints the
+        /// handover token and exits 0, or the cert-refused marker with the
+        /// reason and exits 1. Hidden: it is the daemon's probe protocol, never
+        /// a user flag, so it stays out of --help and the hand-written
+        /// completions.
+        #[arg(long = "__exec-handover", hide = true)]
+        exec_handover: bool,
     },
 
     /// Pair, list, grant sessions to, and revoke the devices that may call the
     /// REST API
     ///
-    /// Every `clauth daemon --listen` request but a pairing authenticates as
-    /// one named device, and each device holds a tier fixed here, on this
-    /// machine: `view` reads the status feed, `control` may also switch
-    /// accounts and, with the `sessions` grant, create sessions through the API
-    /// while `[serve] session_creation` is on.
+    /// Every `clauth daemon --listen` request but a pairing or a CORS preflight
+    /// authenticates as one named device, and each device holds a tier fixed
+    /// here, on this machine: `view` reads the status feed, `control` may also
+    /// switch accounts and, with the `sessions` grant, create sessions through
+    /// the API while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
-    #[command(args_conflicts_with_subcommands = true)]
     Devices {
-        /// Emit a JSON array instead of the table.
-        #[arg(long)]
+        /// Emit a JSON array instead of the table; with `pair`, a
+        /// {"code","link"} object instead of the bare code.
+        #[arg(long, global = true)]
         json: bool,
         #[command(subcommand)]
         cmd: Option<DevicesCommand>,
@@ -472,6 +497,19 @@ pub(crate) enum Command {
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCommand,
+    },
+
+    /// Set the Rex plugin up, or take it back out
+    ///
+    /// `clauth rex install` writes the plugin bundled in this binary to
+    /// `clauth/` beside Rex's `init.lua` and appends one marked
+    /// `require("clauth")` block that loads it. The plugin opens Claude Code
+    /// through `clauth start`, shows the dashboard in a floating pane, and
+    /// labels each pane with the account it spends. Rex support is experimental.
+    /// `clauth rex uninstall` takes the block and the files back out.
+    Rex {
+        #[command(subcommand)]
+        cmd: RexCommand,
     },
 
     /// Work with clauth-compatible proxies
@@ -548,8 +586,8 @@ pub(crate) enum Command {
         session_id: String,
     },
 
-    /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
-    /// on stdin, wait for a background delegate, and wake the model.
+    /// The bundled PostToolUse and Stop `asyncRewake` hook body: read the hook
+    /// payload on stdin, wait for a background delegate, and wake the model.
     #[command(hide = true)]
     McpAwaitJob,
 
@@ -594,6 +632,10 @@ pub(crate) enum Command {
 
 /// `clauth start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one `clauth start` flag, not state"
+)]
 pub(crate) struct StartArgs {
     /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
     /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.
@@ -723,6 +765,16 @@ pub(crate) struct LoginArgs {
     /// untouched. Requires --codex.
     #[arg(long, requires = "codex")]
     pub(crate) browser: bool,
+    /// Register the profile on a clauth proxy instead of logging in to any
+    /// provider directly. Runs the proxy's login flow (its page opens, paste
+    /// accepted), then stores the proxy-local inference key as the profile's
+    /// api key. The upstream credential stays in the proxy's own state dir.
+    #[arg(
+        long,
+        value_name = "SERVICE",
+        conflicts_with_all = ["base_url", "api_key", "setup_token", "codex", "browser"]
+    )]
+    pub(crate) proxy: Option<String>,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
@@ -741,6 +793,7 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--setup-token",
     "--codex",
     "--browser",
+    "--proxy",
     "--yes",
     "-y",
     "--model",
@@ -824,6 +877,30 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth rex <cmd>`: install and uninstall the Rex plugin.
+#[derive(Subcommand, Debug)]
+pub(crate) enum RexCommand {
+    /// Write the plugin beside Rex's init.lua and load it
+    ///
+    /// Rerun it after upgrading clauth to refresh the plugin files. A plugin
+    /// directory clauth did not write, or a symlink onto a checkout, refuses
+    /// the install rather than being overwritten.
+    Install {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Remove the plugin and the block install added to init.lua
+    Uninstall {
+        /// Skip the confirm prompt. Required on a non-TTY stdin or stdout, which
+        /// gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -921,8 +998,12 @@ pub(crate) enum DevicesCommand {
     /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
     /// device posts it to `POST /api/v1/pair` on this host's
     /// `clauth daemon --listen` and gets its token in the answer. The code
-    /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
-    /// the code if it is still waiting.
+    /// prints alone on stdout (`clauth devices --json pair` prints
+    /// {"code","link"}) and the wait reports on stderr; Ctrl-C withdraws the
+    /// code if it is still waiting. When stderr is a terminal, a pairing link
+    /// for the app and its QR code print there too: the app's page is
+    /// [serve] app_url (else the one [serve] app_origins entry), the address
+    /// [serve] public_address (else the one a `--listen` daemon publishes).
     Pair {
         /// Name for the device: letters, digits and - _ . @ +.
         name: String,
@@ -934,6 +1015,9 @@ pub(crate) enum DevicesCommand {
         /// --control: a view device cannot mint sessions.
         #[arg(long, requires = "control")]
         sessions: bool,
+        /// Print the pairing link without its QR code.
+        #[arg(long)]
+        no_qr: bool,
     },
 
     /// Mint a token for a device on this machine and print it once
@@ -953,7 +1037,7 @@ pub(crate) enum DevicesCommand {
         sessions: bool,
     },
 
-    /// Remove a device; its next request is refused
+    /// Remove a device; its next request is refused and its open streams close within seconds
     Revoke {
         /// Device to remove.
         name: String,
