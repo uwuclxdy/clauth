@@ -59,7 +59,9 @@ const CONTROL_GRACE: Duration = Duration::from_secs(5);
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 
 /// How often the sweep closes silent instances, so a silent session's end
-/// frames go out near the silence bound, never at the next interaction.
+/// frames go out near the silence bound, never at the next interaction, and
+/// drops the prompts a silence close kept once their process is gone or its
+/// pid's record moved.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An instance whose poll has been silent this long closes: twice the server's
@@ -451,6 +453,33 @@ struct Inner {
     /// The last minted prompt id's counter, hub-wide, so no client ever sees
     /// one id name two prompts; the hub's nonce keeps ids unique across runs.
     last_prompt: u64,
+    /// Prompts silence closes set aside, keyed by the closed instance's pid.
+    /// A pid never holds a kept set and a live instance at once: the contact
+    /// that mints the pid's next instance settles its kept set first
+    /// ([`Hub::reconcile`]).
+    kept: HashMap<u32, Kept>,
+}
+
+impl Inner {
+    /// Each kept set's pid with the process start and session it was kept
+    /// for: the records a re-resolve judges ([`Hub::moved_records`]).
+    fn kept_records(&self) -> Vec<(u32, String, String)> {
+        self.kept
+            .iter()
+            .map(|(pid, kept)| (*pid, kept.proc_start.clone(), kept.session_id.clone()))
+            .collect()
+    }
+
+    /// Remove the instance a refused first contact just minted at `pid`,
+    /// putting back the prompts it took from the pid's kept set: a refused
+    /// contact changes nothing, so those prompts wait for the next one.
+    fn unmint(&mut self, pid: u32) {
+        if let Some(mut fresh) = self.instances.remove(&pid)
+            && let Some(kept) = Kept::set_aside(&mut fresh)
+        {
+            self.kept.insert(pid, kept);
+        }
+    }
 }
 
 /// Defines `Cap`, its wire names and its variant list from one table, so a
@@ -760,6 +789,52 @@ impl Loads {
 struct MintedPrompt {
     id: String,
     state: PromptState,
+}
+
+/// What a silence close keeps of the instance it closed: a module that stops
+/// polling may only be stopped (a desk `claude` suspended with Ctrl+Z), and
+/// it keeps its own prompt queue, so the prompts it may still run wait here
+/// instead of dropping. They go back, ids unchanged, to the next instance on
+/// the same pid, process start and session id ([`Hub::reconcile`]), and drop
+/// `session_end` once nothing can run them: the pid's record moved or its
+/// process is gone ([`Hub::sweep`], or the pid's next contact), or an `end`
+/// for the session lands, since the mod empties its queue at every session
+/// end.
+struct Kept {
+    proc_start: String,
+    session_id: String,
+    /// The closed instance's prompts with no outcome yet, in mint order.
+    prompts: Vec<MintedPrompt>,
+    /// Its prompt commands no poll drained, in queue order. Its other
+    /// commands answered or interrupted a session that has ended.
+    commands: VecDeque<Value>,
+}
+
+impl Kept {
+    /// Take `live`'s prompts with no outcome yet and its undrained prompt
+    /// commands out of it; `None` when it holds neither.
+    fn set_aside(live: &mut Live) -> Option<Self> {
+        let (prompts, settled): (Vec<_>, Vec<_>) = std::mem::take(&mut live.prompts)
+            .into_iter()
+            .partition(|minted| minted.state == PromptState::Queued);
+        live.prompts = settled;
+        let (commands, others): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut live.commands)
+            .into_iter()
+            .partition(|command| command.get("kind").and_then(Value::as_str) == Some("prompt"));
+        live.commands = others;
+        (!prompts.is_empty() || !commands.is_empty()).then(|| Self {
+            proc_start: live.proc_start.clone(),
+            session_id: live.session_id.clone(),
+            prompts,
+            commands,
+        })
+    }
+
+    /// Whether `resolved` is the process and session these prompts were kept
+    /// for.
+    fn belongs_to(&self, resolved: &Instance) -> bool {
+        self.proc_start == resolved.proc_start && self.session_id == resolved.session_id
+    }
 }
 
 /// Where one minted prompt stands.
@@ -1227,9 +1302,13 @@ impl Hub {
     /// The end frames for a closing instance: every open ask, and every ask
     /// whose awaited answer sent no close frame yet, closes `by: session_end`,
     /// every prompt still queued drops `session_end`, then the `end` status
-    /// (SB-13). Every removal path calls this, so the one notify here wakes any
-    /// wait, poll or asks route parked on the instance, and no queued prompt
-    /// goes unreported, whatever path removed it.
+    /// (SB-13). Every removal path that emits end frames calls this, so the one
+    /// notify here wakes any wait, poll or asks route parked on the instance,
+    /// and every prompt the instance still holds queued gets its drop. The two
+    /// first-contact arms emit nothing: a refused one puts its prompts back
+    /// ([`Inner::unmint`]), an `end` one drops them through
+    /// [`Hub::drop_queued`]. A silence close that is not ending takes the
+    /// queued prompts out into a [`Kept`] set first, so it sends no drop.
     fn emit_instance_end(&self, live: &Live) {
         let unclosed = live
             .awaited
@@ -1242,15 +1321,7 @@ impl Hub {
                 json!({"session": live.session_id, "ask": ask, "state": "closed", "by": "session_end"}),
             );
         }
-        for minted in &live.prompts {
-            if minted.state == PromptState::Queued {
-                self.broadcast(
-                    "session.prompt",
-                    PromptState::Dropped(DropReason::SessionEnd)
-                        .frame(&live.session_id, &minted.id),
-                );
-            }
-        }
+        self.drop_queued(&live.session_id, &live.prompts);
         self.broadcast(
             "session.status",
             json!({"session": live.session_id, "state": "end"}),
@@ -1258,25 +1329,44 @@ impl Hub {
         self.changed.notify_all();
     }
 
+    /// One `dropped` `session_end` frame for each of `prompts` still queued:
+    /// nothing can run it any more.
+    fn drop_queued(&self, session: &str, prompts: &[MintedPrompt]) {
+        for minted in prompts {
+            if minted.state == PromptState::Queued {
+                self.broadcast(
+                    "session.prompt",
+                    PromptState::Dropped(DropReason::SessionEnd).frame(session, &minted.id),
+                );
+            }
+        }
+    }
+
     /// The snapshot a (re)connecting stream opens with: one entry per live mod
     /// instance (two entries share a session id when two instances hold it),
-    /// every open ask and every kept prompt, sessions sorted by id then the
-    /// instance's peer pid, asks and prompts in that same instance order, each
-    /// instance's asks in open order and its prompts in mint order. An entry's
-    /// `caps` are the instance's own, none once its `end` owns the final read:
-    /// an ending instance takes no more answers. The revalidation closes moved
-    /// or silent instances first, with the peer resolve running off every hub
-    /// lock (SB-10, SB-13).
+    /// every open ask and every kept prompt (a silence close's [`Kept`] set
+    /// included, listed `queued` under its session id, which may have no
+    /// session entry),
+    /// sessions sorted by id then the instance's peer pid, asks and prompts in
+    /// that same instance order, each instance's asks in open order and its
+    /// prompts in mint order. An entry's `caps` are the instance's own, none
+    /// once its `end` owns the final read: an ending instance takes no more
+    /// answers. The revalidation closes moved or silent instances and drops
+    /// kept sets whose process is gone or moved first, with the peer resolve
+    /// running off every hub lock (SB-10, SB-13).
     pub(crate) fn snapshot(&self) -> Value {
         let records: Vec<(u32, String, String)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let now = self.now();
             self.close_silent(&mut inner, now);
-            inner
-                .instances
-                .iter()
-                .map(|(pid, live)| (*pid, live.proc_start.clone(), live.session_id.clone()))
-                .collect()
+            let mut records = inner.kept_records();
+            records.extend(
+                inner
+                    .instances
+                    .iter()
+                    .map(|(pid, live)| (*pid, live.proc_start.clone(), live.session_id.clone())),
+            );
+            records
         };
         let moved = self.moved_records(&records);
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1323,23 +1413,54 @@ impl Hub {
                 })
             })
             .collect();
-        let prompts: Vec<Value> = sessions
+        let mut holders: Vec<(&str, u32, &[MintedPrompt])> = sessions
             .iter()
-            .flat_map(|(_, live)| {
-                live.prompts
+            .map(|(pid, live)| (live.session_id.as_str(), *pid, live.prompts.as_slice()))
+            .chain(
+                inner
+                    .kept
                     .iter()
-                    .map(|minted| minted.state.frame(&live.session_id, &minted.id))
+                    .map(|(pid, kept)| (kept.session_id.as_str(), *pid, kept.prompts.as_slice())),
+            )
+            .collect();
+        holders.sort_by(|(a_session, a_pid, _), (b_session, b_pid, _)| {
+            a_session.cmp(b_session).then_with(|| a_pid.cmp(b_pid))
+        });
+        let prompts: Vec<Value> = holders
+            .iter()
+            .flat_map(|(session, _, prompts)| {
+                prompts
+                    .iter()
+                    .map(|minted| minted.state.frame(session, &minted.id))
             })
             .collect();
         json!({"sessions": session_entries, "asks": asks, "prompts": prompts})
     }
 
-    /// The periodic silence sweep: close every instance silent past the bound
-    /// now, so its end frames go out near the bound, not at the next
-    /// interaction (SB-13).
+    /// The periodic sweep: close every instance silent past the bound now, so
+    /// its end frames go out near the bound, not at the next interaction
+    /// (SB-13), then re-resolve every kept set's pid off the hub lock and drop
+    /// each set whose process is gone or whose pid's record moved, so a
+    /// process that exits while silent has its prompts dropped within one
+    /// sweep with no later contact (SB-10).
     pub(crate) fn sweep(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        self.close_silent(&mut inner, self.now());
+        let records = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.close_silent(&mut inner, self.now());
+            inner.kept_records()
+        };
+        if records.is_empty() {
+            return;
+        }
+        let moved = self.moved_records(&records);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.close_moved(&mut inner, &moved);
     }
 
     /// Wire the push sender's inbox (production, after the sender starts): an
@@ -1452,15 +1573,19 @@ impl Hub {
                     // (A#13): a fresh instance still holds its registration tail
                     // slot, so leaving it would wedge every later tail.
                     if created {
-                        inner.instances.remove(&peer_pid);
+                        inner.unmint(peer_pid);
                     }
                     return (409, error_value("stale_sequence"));
                 }
                 // A first-contact end mints the instance this call owns: nothing
-                // to relay, nothing to emit, and the fresh instance still holds
-                // its registration tail slot, so remove it (A#13).
+                // to relay, and the fresh instance still holds its registration
+                // tail slot, so remove it (A#13). Its only frames are the drops
+                // of the prompts a silence close kept for this session, which
+                // the mod's end emptied from its own queue.
                 if created {
-                    inner.instances.remove(&peer_pid);
+                    if let Some(fresh) = inner.instances.remove(&peer_pid) {
+                        self.drop_queued(&fresh.session_id, &fresh.prompts);
+                    }
                     return (200, json!({ "ok": true }));
                 }
                 // A duplicate end while the first one still runs its final
@@ -1538,7 +1663,7 @@ impl Hub {
             // The same A#13 rule as the `end` path: a refused first contact
             // must not leave its freshly minted instance holding the tail slot.
             if created {
-                inner.instances.remove(&peer_pid);
+                inner.unmint(peer_pid);
             }
             return (409, error_value("stale_sequence"));
         }
@@ -2849,7 +2974,9 @@ impl Hub {
 
     /// Close every instance whose poll is silent past [`SILENCE_LIMIT`], each
     /// with its end frames. No resolver call: liveness is the poll alone
-    /// (SB-13).
+    /// (SB-13). A silent module may only be stopped, so its prompts with no
+    /// outcome yet go into a [`Kept`] set instead of dropping, unless its own
+    /// `end` already landed: the mod emptied its queue then.
     fn close_silent(&self, inner: &mut Inner, now: Instant) {
         let pids: Vec<u32> = inner
             .instances
@@ -2858,7 +2985,12 @@ impl Hub {
             .map(|(pid, _)| *pid)
             .collect();
         for pid in pids {
-            if let Some(live) = inner.instances.remove(&pid) {
+            if let Some(mut live) = inner.instances.remove(&pid) {
+                if !live.ending
+                    && let Some(kept) = Kept::set_aside(&mut live)
+                {
+                    inner.kept.insert(pid, kept);
+                }
                 self.emit_instance_end(&live);
             }
         }
@@ -2866,8 +2998,12 @@ impl Hub {
 
     /// Find or create the instance at `pid`; a record whose id or process start
     /// moved closes the old instance first (with its end frames), so a recycled
-    /// pid or `/clear` never inherits the session that used to be there. A
-    /// second live instance on an id another instance holds is audited (SB-4).
+    /// pid or `/clear` never inherits the session that used to be there. A new
+    /// instance settles the pid's [`Kept`] set: kept for this very process and
+    /// session, its prompts and commands are the new instance's, ids and order
+    /// unchanged; kept for another, they drop `session_end`, as nothing can run
+    /// them now. A second live instance on an id another instance holds is
+    /// audited (SB-4).
     fn reconcile<'a>(
         &self,
         inner: &'a mut Inner,
@@ -2892,6 +3028,11 @@ impl Hub {
                 .map(|(other, _)| *other)
                 .collect()
         };
+        let kept = if existed {
+            None
+        } else {
+            inner.kept.remove(&pid)
+        };
         let (live, created) = match inner.instances.entry(pid) {
             Entry::Occupied(slot) => (slot.into_mut(), false),
             Entry::Vacant(slot) => {
@@ -2902,6 +3043,14 @@ impl Hub {
                 )
             }
         };
+        match kept {
+            Some(kept) if kept.belongs_to(resolved) => {
+                live.prompts = kept.prompts;
+                live.commands = kept.commands;
+            }
+            Some(kept) => self.drop_queued(&kept.session_id, &kept.prompts),
+            None => {}
+        }
         // A pid that resolves is registered, so forget its "unknown, logged
         // once" memo: the set stays bounded to pids still unknown (A#7).
         inner.unknown_logged.remove(&pid);
@@ -2952,9 +3101,10 @@ impl Hub {
     }
 
     /// Close every pid in `moved` whose live instance still carries the
-    /// identity the resolve compared against, with its end frames. The identity
-    /// re-check keeps a pid replaced while the resolve ran from closing as its
-    /// successor (SB-4).
+    /// identity the resolve compared against, with its end frames, and drop
+    /// `session_end` the prompts of a [`Kept`] set kept for that identity. The
+    /// identity re-check keeps a pid replaced while the resolve ran from
+    /// closing as its successor (SB-4).
     fn close_moved(&self, inner: &mut Inner, moved: &HashMap<u32, (String, String)>) {
         for (pid, (proc_start, session_id)) in moved {
             let matches = inner.instances.get(pid).is_some_and(|live| {
@@ -2962,6 +3112,12 @@ impl Hub {
             });
             if matches && let Some(live) = inner.instances.remove(pid) {
                 self.emit_instance_end(&live);
+            }
+            let kept_matches = inner.kept.get(pid).is_some_and(|kept| {
+                kept.proc_start == *proc_start && kept.session_id == *session_id
+            });
+            if kept_matches && let Some(kept) = inner.kept.remove(pid) {
+                self.drop_queued(&kept.session_id, &kept.prompts);
             }
         }
     }
@@ -3987,17 +4143,20 @@ fn write_response(stream: &mut UnixStream, status: u16, body: &Value) -> bool {
 
 /// The production resolver: reads the peer pid's Claude Code session record
 /// under the config dir the peer's `live_sessions` row joins (else `~/.claude`)
-/// and verifies `procStart` against `/proc/<pid>/stat` field 22 on linux.
+/// and verifies the record belongs to a live peer: `procStart` against
+/// `/proc/<pid>/stat` field 22 on linux, liveness on macOS.
 pub(crate) fn production_resolver() -> PeerResolver {
     Box::new(|pid| {
         let dir = session_config_dir_for(pid)?;
         let record = crate::session_record::session_record(&dir.join("sessions"), pid)?;
-        // The record's `procStart` must equal field 22 of `/proc/<pid>/stat`
-        // (measured equal); a mismatch is a stale record a recycled pid left,
-        // so the peer reads as unknown.
-        // The macOS `procStart` form is unmeasured, so nothing there compares it
-        // and a recycled pid is not detectable on macOS until it is measured.
-        #[cfg(target_os = "linux")]
+        // The record must belong to a live process. On linux its `procStart`
+        // must equal field 22 of `/proc/<pid>/stat` (measured equal), so a
+        // stale record a recycled pid left reads as unknown. On macOS the pid
+        // must be alive: the `procStart` form there is unmeasured, so nothing
+        // compares it and a recycled pid stays undetectable until it is
+        // measured, while a dead peer's lingering record (an unclean exit
+        // leaves it) reads as unknown too.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !crate::session_record::process_matches_record(pid, &record) {
             return None;
         }
@@ -4042,7 +4201,9 @@ pub(crate) fn start() -> Option<Arc<Hub>> {
 
 /// The periodic silence sweep, detached for the daemon's life: a `Weak` handle
 /// so the thread never keeps the hub alive past its last owner, and the sweep
-/// closes silent instances near the bound, not at the next interaction (SB-13).
+/// closes silent instances near the bound, not at the next interaction (SB-13),
+/// and drops kept prompts whose process is gone or whose pid's record moved
+/// ([`Hub::sweep`]).
 fn spawn_sweep(hub: &Arc<Hub>) {
     let weak = Arc::downgrade(hub);
     let spawned = std::thread::Builder::new()
@@ -4213,6 +4374,10 @@ mod prompts_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_loads.rs"]
 mod loads_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_kept.rs"]
+mod kept_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_receipts.rs"]

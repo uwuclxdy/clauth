@@ -527,6 +527,38 @@ fn the_production_resolver_reads_the_global_store_for_an_unjoined_peer() {
     assert_eq!(resolved.proc_start, start);
 }
 
+/// The record a dead peer leaves behind reads as unknown on macOS: an unclean
+/// exit (no `/exit` cleanup) keeps `sessions/<pid>.json`, and the `procStart`
+/// form there is unmeasured, so liveness is the one check the record gets. A
+/// live peer resolves first, so the run pins both sides of the check.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_production_resolver_reads_a_dead_peers_lingering_record_as_unknown() {
+    let _home = HomeSandbox::new();
+    let mut peer = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("the peer child");
+    let peer_pid = peer.id();
+    let sessions = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join(format!("{peer_pid}.json")),
+        format!(r#"{{"sessionId":"4242-0","pid":{peer_pid},"procStart":""}}"#),
+    )
+    .expect("record");
+    let resolved = production_resolver()(peer_pid).expect("a live peer resolves");
+    assert_eq!(resolved.session_id, "4242-0");
+    peer.kill().expect("kill the peer");
+    peer.wait().expect("reap the peer");
+    assert!(
+        production_resolver()(peer_pid).is_none(),
+        "a dead peer whose record lingers must read as unknown"
+    );
+}
+
 /// A peer trickling one byte at a time is cut off at the whole-request
 /// deadline, not at any per-read bound (A#2/A#9).
 #[test]

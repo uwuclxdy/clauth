@@ -670,11 +670,12 @@ fn queued_prompts_are_capped_even_when_polled_out() {
     minted(&answer);
 }
 
-/// The silence close is a removal path like an `end`: a prompt still queued
-/// when the sweep closes the instance is reported dropped `session_end`
-/// before the `end` status.
+/// The silence close ends the session's stream view but keeps its queued
+/// prompts aside: a module 40 s without a poll may only be stopped, so the
+/// `end` status goes out with no prompt drop, and a reconnecting stream's
+/// snapshot still lists each such prompt `queued` under its session id.
 #[test]
-fn a_silence_close_drops_every_queued_prompt() {
+fn a_silence_close_keeps_every_queued_prompt_listed() {
     let _home = HomeSandbox::new();
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
@@ -692,16 +693,16 @@ fn a_silence_close_drops_every_queued_prompt() {
     }
     assert_eq!(
         frames,
-        vec![
-            (
-                "session.prompt".to_string(),
-                json!({"session": "s-one", "prompt": id, "state": "dropped", "reason": "session_end"})
-            ),
-            (
-                "session.status".to_string(),
-                json!({"session": "s-one", "state": "end"})
-            ),
-        ]
+        vec![(
+            "session.status".to_string(),
+            json!({"session": "s-one", "state": "end"})
+        )]
+    );
+    let snapshot = hub.snapshot();
+    assert_eq!(snapshot["sessions"], json!([]));
+    assert_eq!(
+        snapshot["prompts"],
+        json!([{"session": "s-one", "prompt": id, "state": "queued"}])
     );
 }
 
