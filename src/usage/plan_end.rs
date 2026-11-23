@@ -1,5 +1,6 @@
 //! When an account's paid plan ends or renews: the date the Usage tab,
-//! `clauth list` and the feeds show.
+//! `clauth list` and the feeds show, and whether it lands before the
+//! account's week resets, which the Overview flags.
 //!
 //! No endpoint clauth reads names a billing date: the Claude Code 2.1.319
 //! binary carries no billing-day field (measured 2026-11-06). So both dates
@@ -39,6 +40,24 @@ impl PlanDates {
                 .map(PlanEnd::Renews),
         }
     }
+
+    /// The end a plan that still serves names on the local day of `now`
+    /// ([`Self::end`]) when it lands before the account's week renews: its
+    /// day is today or later, and starts
+    /// ([`crate::format::local_day_start`]) before `week_reset`, the epoch
+    /// second the account's 7d window resets. A day starting at or after
+    /// the reset falls in a later week, however few days off. A reset at or
+    /// before `now` names a week that is over, whose successor clauth has
+    /// not read, so it brings nothing forward.
+    pub(crate) fn end_before_reset(self, now: i64, week_reset: i64) -> Option<PlanEnd> {
+        if week_reset <= now {
+            return None;
+        }
+        let today = crate::format::local_day(now)?;
+        let end = self.end(today, false)?;
+        (end.day() >= today && crate::format::local_day_start(end.day())? < week_reset)
+            .then_some(end)
+    }
 }
 
 /// When a plan stops serving or renews, each a local calendar day.
@@ -56,6 +75,12 @@ impl PlanEnd {
         match self {
             Self::Ends(day) | Self::Renews(day) => day,
         }
+    }
+
+    /// Whole calendar days from `today` to this end's day: `0` on the day
+    /// itself, negative once it has passed.
+    pub(crate) fn days_left(self, today: NaiveDate) -> i64 {
+        (self.day() - today).num_days()
     }
 
     /// The word a printed surface names this end by on `today`: an end whose
