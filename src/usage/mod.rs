@@ -18,6 +18,10 @@ pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
+// When a plan ends or renews, off the two dates the user copies from
+// claude.ai's billing page.
+mod plan_end;
+pub(crate) use plan_end::{PlanDates, PlanEnd, parse_plan_date, render_plan_date};
 // The auto-start kick sends the probe's request, so the two cannot drift apart.
 pub(crate) use inference::anthropic::send as anthropic_send;
 mod scheduler;
@@ -51,8 +55,8 @@ pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, AccountEmail, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LABEL_30D,
     LimitResets, LoginProfile, ORG_REFUSED_STATUS, PlanInfo, PlanTier, ProfileFetchDecision,
     ProfileUnauthorized, ScopedWindow, SpendInfo, USAGE_HTTP_DEADLINES, UsageInfo, UsageWindow,
-    WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch, epoch_secs_to_iso,
-    expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
+    WindowDollars, await_request_slot, cli_user_agent, correct_cached_plan, decide_profile_fetch,
+    epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
     forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
     long_window_live, mark_profile_read_stale, ms_to_iso, no_five_hour_limit_cached,
     note_profile_memo, now_epoch_secs, now_ms, parse_retry_after, parse_retry_after_at,

@@ -671,9 +671,9 @@ fn a_composite_alias_remaps_through_the_member_opus_alias() {
     assert_eq!(r.expect_err("refused"), REFUSES_FABLE);
 }
 
-/// A `--settings` passthrough is the top settings tier: its `model` names the
-/// demand, so a fable inline settings refuses on a capped target with the gate
-/// off.
+/// A `--settings` passthrough is the flag tier, which outranks the user,
+/// project and local tiers: its `model` names the demand, so a fable inline
+/// settings refuses on a capped target with the gate off.
 #[test]
 fn a_settings_flag_model_is_demand() {
     let home = HomeSandbox::new();
@@ -3628,6 +3628,231 @@ fn args_refuse_every_resume_spelling_clauth_cannot_pin() {
         .map(|rd| rd.flatten().count())
         .unwrap_or(0);
     assert_eq!(job_count, 0, "a refused call writes no job file");
+}
+
+/// `--managed-settings` is Claude Code's SDK-only policy tier, which outranks
+/// the flag tier clauth's own `--settings` rides, so a model could shorten the
+/// shared store's retention through it: `args` refuses it in every spelling,
+/// before any spawn.
+#[test]
+fn args_refuse_managed_settings_in_every_spelling() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal = "delegate failed: `args` cannot carry `--managed-settings`: it is Claude \
+                   Code's SDK-only policy tier, which outranks every setting clauth passes";
+    for args in [
+        &["--managed-settings", "{\"cleanupPeriodDays\":1}"][..],
+        &["--managed-settings={\"cleanupPeriodDays\":1}"][..],
+        &["--managed-settings"][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            refusal,
+            "args {args:?}"
+        );
+    }
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map_or(0, |rd| rd.flatten().count());
+    assert_eq!(job_count, 0, "a refused call writes no job file");
+}
+
+/// `--managed-settings` is refused wherever it sits in `args`: after a `--`,
+/// or behind a value flag claude knows and clauth's list may not, claude can
+/// still read it as an option.
+#[test]
+fn args_refuse_managed_settings_anywhere() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal = "delegate failed: `args` cannot carry `--managed-settings`: it is Claude \
+                   Code's SDK-only policy tier, which outranks every setting clauth passes";
+    for args in [
+        &["--", "--managed-settings", "{\"cleanupPeriodDays\":1}"][..],
+        &["--", "--managed-settings={\"cleanupPeriodDays\":1}"][..],
+        &[
+            "--session-began-as-copy",
+            "--",
+            "--managed-settings",
+            "{\"cleanupPeriodDays\":1}",
+        ][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            refusal,
+            "args {args:?}"
+        );
+    }
+}
+
+/// A `--settings` word clauth's fold did not merge is refused wherever it
+/// sits: after `--`, or taken as another flag's value (`-pn`, `--remote`,
+/// `-n`, `--initialize-fields`). claude's own early settings reader skips a
+/// word only after a flag it knows exactly, so it can take that word in place
+/// of the settings file that carries the number.
+#[test]
+fn args_refuse_a_settings_flag_clauth_did_not_merge() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal = "delegate failed: `args` cannot carry a `--settings` after `--` or as \
+                   another flag's value: claude would read it in place of the settings \
+                   clauth passes";
+    for args in [
+        &["-pn", "--settings={\"cleanupPeriodDays\":1}"][..],
+        &["-pn", "--settings", "{\"cleanupPeriodDays\":1}"][..],
+        &["--remote", "--settings", "{\"cleanupPeriodDays\":1}"][..],
+        &["--remote", "--settings={\"cleanupPeriodDays\":1}"][..],
+        &["-n", "--settings={\"cleanupPeriodDays\":1}"][..],
+        &[
+            "--initialize-fields",
+            "--settings={\"cleanupPeriodDays\":1}",
+        ][..],
+        &[
+            "--initialize-fields",
+            "--settings",
+            "{\"cleanupPeriodDays\":1}",
+        ][..],
+        &["--", "--settings", "{\"cleanupPeriodDays\":1}"][..],
+        &["--", "--settings={\"cleanupPeriodDays\":1}"][..],
+        &["-p", "--", "--settings", "{}"][..],
+        &["--", "--settings"][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            refusal,
+            "args {args:?}"
+        );
+    }
+}
+
+/// A `--settings` with no word left to take ends clauth's fold with nothing
+/// merged, so every `--settings` word before it would reach claude as the
+/// model wrote it: refused, whatever comes before it. A bare one after `--`
+/// is an operand, refused by the unmerged-word refusal above instead.
+#[test]
+fn args_refuse_a_trailing_bare_settings_flag() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal = "delegate failed: `args` cannot end in a `--settings` with no value: claude \
+                   would refuse it";
+    for args in [
+        &["--settings"][..],
+        &["-p", "--settings"][..],
+        &["--settings={\"cleanupPeriodDays\":1}", "--settings"][..],
+        &["--settings", "{\"cleanupPeriodDays\":1}", "--settings"][..],
+        &["-pn", "--settings={\"cleanupPeriodDays\":1}", "--settings"][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            refusal,
+            "args {args:?}"
+        );
+    }
+}
+
+/// A `--settings` before clauth's end of options is merged into clauth's own
+/// settings file, never refused: the call goes on to the account checks (here
+/// the capped target's refusal answers).
+#[test]
+fn args_keep_a_settings_flag_before_dash_dash() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let capped = "delegate failed: credit cap spent: capped names no model to run, and its \
+                  default may bill usage credits; name another account or a model";
+    for args in [
+        &["--settings", "{}"][..],
+        &["--settings={}", "--", "go on"][..],
+        &["-p", "--settings", "{}"][..],
+        // the first `--settings` takes the second as its value: nothing is
+        // left bare, so the fold merges it
+        &["--settings", "--settings"][..],
+    ] {
+        assert_eq!(
+            delegate_reply_with_args(args, &cwd),
+            capped,
+            "args {args:?}"
+        );
+    }
+}
+
+/// A prompt starting with `-` reaches claude right after `-p`, where claude
+/// reads it as an option: refused before anything starts.
+#[test]
+fn a_prompt_that_starts_with_a_dash_is_refused() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let refusal =
+        "delegate failed: `prompt` cannot start with `-`: claude would read it as an option";
+    for prompt in [
+        "--managed-settings={\"cleanupPeriodDays\":1}",
+        "--settings={\"cleanupPeriodDays\":1}",
+        "-x",
+    ] {
+        let reply = delegate_reply(DelegateArgs {
+            profiles: Some(vec!["capped".to_string()]),
+            prompt: Some(prompt.to_string()),
+            model: None,
+            cwd: cwd.to_str().map(str::to_owned),
+            env: None,
+            args: None,
+            session_id: None,
+            subagent_type: None,
+            allowed_tools: None,
+            permission_mode: None,
+            result: None,
+            isolated: None,
+            background: Some(true),
+        });
+        assert_eq!(reply, refusal, "prompt {prompt:?}");
+    }
+}
+
+/// The tool reads a prompt file through the same check: a file whose text
+/// starts with `-` is refused at the call, before anything starts.
+#[test]
+fn a_prompt_file_starting_with_a_dash_is_refused_by_the_tool() {
+    let home = HomeSandbox::new();
+    let cwd = seed_credit_spend_target(&home, None, false, true);
+    let task = home.home().join("task.md");
+    std::fs::write(&task, "--settings={\"cleanupPeriodDays\":1}").expect("fixture file");
+    let reply = delegate_reply(DelegateArgs {
+        profiles: Some(vec!["capped".to_string()]),
+        prompt: task.to_str().map(str::to_owned),
+        model: None,
+        cwd: cwd.to_str().map(str::to_owned),
+        env: None,
+        args: None,
+        session_id: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        result: None,
+        isolated: None,
+        background: Some(true),
+    });
+    assert_eq!(
+        reply,
+        "delegate failed: `prompt` cannot start with `-`: claude would read it as an option"
+    );
+}
+
+/// The `args` doc tells a model which `--settings` words are refused before
+/// it hits the refusal.
+#[test]
+fn the_delegate_args_doc_names_every_refused_settings_word() {
+    let text = tool_entry_text("delegate");
+    assert!(
+        text.contains(
+            "A `--settings` after `--` or as another flag's value is refused, and so is one \
+             clauth cannot read or merge while it carries a `cleanupPeriodDays` for the \
+             shared transcript store."
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("A `--settings` after `--` is refused,"),
+        "the args doc no longer says only a --settings after -- is refused: {text}"
+    );
 }
 
 /// A model string the caller supplied is echoed through the same flattening,
@@ -7203,8 +7428,8 @@ fn a_streamed_session_id_round_trips_through_the_running_record() {
 /// reader thread's heartbeat must write the session id its capture holds, or a
 /// crashed run's record carries no resume handle however well the store
 /// round-trips a value handed it directly. The closure lives inside
-/// `run_delegate`, which cannot run without a real `claude` child, so the pin is
-/// a source scan — the same mechanism the capture-take guarantee uses.
+/// `run_delegate`; the pin is a source scan, the same mechanism the
+/// capture-take guarantee uses.
 #[test]
 fn the_production_heartbeat_passes_the_captured_session_id() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -7728,10 +7953,10 @@ fn a_tick_on_a_token_less_peer_builds_nothing_and_sends_nothing() {
 
 /// The three tests above drive [`super::join_ticking`] directly, which leaves
 /// one link they cannot see: whether the handler's blocking path still goes
-/// through it. Reaching that behaviourally needs a `claude` child that outlives
-/// one throttle window, and this crate deliberately never fakes a child, so the
-/// link is pinned structurally instead — the same posture, and the same
-/// justification, as `run_delegate_never_returns_between_spawning_the_reader…`.
+/// through it. A `FakeClaude` signal hold can keep a child past one throttle
+/// window, so a runtime test could reach that link; the link is pinned
+/// structurally instead — the same posture as
+/// `run_delegate_never_returns_between_spawning_the_reader…`.
 ///
 /// Three assertions over the blocking wait's source: the `join_ticking` call is
 /// present, the argument list it is given names `progress.tick(`, and nothing
@@ -7749,7 +7974,7 @@ fn a_tick_on_a_token_less_peer_builds_nothing_and_sends_nothing() {
 /// `a_blocking_delegate_ticks_progress_on_the_heartbeat_throttle` over the loop
 /// and `a_tick_sends_one_message_per_throttle_window_and_nothing_inside_it` over
 /// the sink; this test only carries the link between them, which needs a child
-/// process to reach and this crate never fakes one.
+/// process that outlives a throttle window to reach.
 #[test]
 fn the_blocking_delegate_awaits_its_task_through_the_progress_ticker() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -10783,10 +11008,9 @@ fn record_dead_key_on_alibaba_marks_the_key_and_leaves_the_usage_credential_live
 /// not hand back a bare stderr string with the text and the resume handle
 /// sitting in locals two lines away.
 ///
-/// Driven through the classifier rather than a hand-built envelope: the live
-/// spawn paths have no unit test by standing decision (no fake `claude` on
-/// PATH — a fake binary would assert nothing about the real envelope contract),
-/// so a real `ExitStatus` is the only way in. `#[cfg(unix)]` because
+/// Driven through the classifier rather than a hand-built envelope: a fake
+/// `claude` asserts nothing about the real envelope contract, so the salvage is
+/// pinned on a real `ExitStatus` instead. `#[cfg(unix)]` because
 /// `ExitStatusExt::from_raw` is the only constructor for one, and its wait-status
 /// encoding is a unix thing.
 #[cfg(unix)]
@@ -11936,9 +12160,9 @@ fn the_prespawn_cancel_promises_no_session_handle() {
 
 /// 659's pin, the supervision half: a cancel caught by the supervision loop
 /// hands the PINNED id — a child exists, its transcript is real, and the id is
-/// the handle. This arm cannot be driven (it sits past the spawn, the one path
-/// this repo never fakes), so the source scan is the whole pin; the forward's
-/// value and its position in the call are pinned together.
+/// the handle. This arm sits past the spawn, where a cancelled run reaches it;
+/// the source scan pins the forward's value and its position in the call
+/// together.
 #[test]
 fn the_supervision_cancel_forwards_the_pinned_session_id() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -12211,7 +12435,7 @@ fn job_files() -> Vec<String> {
 ///
 /// `mark_spawned` IS "the child exists" — `run_delegate` sets it on the line
 /// after `command.spawn()` returns — so staging the cancel after it stages it
-/// after the child, without faking a child this crate deliberately never fakes.
+/// after the child, with no child at all.
 #[test]
 fn an_abandoned_run_with_a_live_child_hands_off_to_a_job_file() {
     let _home = HomeSandbox::new();
@@ -13050,8 +13274,9 @@ fn a_handed_off_run_is_not_reaped_by_the_monitor_that_comes_to_read_it() {
 ///
 /// This drives the real `run_delegate` to a refusal that returns before the
 /// acquire, so it reds for any `mark_spawned` hoisted anywhere above it. The
-/// narrower window — between the acquire and the spawn — is where a child cannot
-/// be faked, and the scan below carries it.
+/// narrower window — between the acquire and the spawn — has no child to
+/// observe, and a spawn that fails after the acquire could show a hoist there
+/// at runtime instead; the scan below carries that ordering structurally.
 #[test]
 fn a_run_that_refused_before_spawning_leaves_the_seam_unarmed() {
     let home = HomeSandbox::new();
@@ -13103,10 +13328,10 @@ fn a_run_that_refused_before_spawning_leaves_the_seam_unarmed() {
 }
 
 /// The half the test above cannot reach: `mark_spawned` sits AFTER the spawn and
-/// nowhere earlier. A child between the acquire and `command.spawn()` cannot be
-/// faked, and this crate never fakes one, so the ordering is pinned structurally
-/// — but by POSITION rather than by spelling, so a renamed method or a reflowed
-/// call still passes while any hoist reds.
+/// nowhere earlier. A spawn that fails after the acquire could show a hoist at
+/// runtime; the ordering is pinned structurally instead — but by POSITION
+/// rather than by spelling, so a renamed method or a reflowed call still passes
+/// while any hoist reds.
 ///
 /// Position is the whole argument: `command.spawn()` ends in `?`, so everything
 /// below it runs only on a successful spawn. Exactly one call site, because a
@@ -13146,13 +13371,12 @@ fn run_delegate_records_the_spawn_only_after_the_child_exists() {
 /// (`an_abandoned_blocking_delegate_reply_never_consumes_the_digest`), but
 /// nothing reds if the handler between them passes a literal instead.
 ///
-/// Reaching that at runtime needs a `claude` child that outlives a cancel, which
-/// this crate never fakes, so it is pinned over the source — rejecting the two
-/// shapes that lose the bit rather than blessing one spelling: a literal
-/// argument, and a return to the unconditional `DigestMode::Report` this
-/// replaced. What it cannot decide, stated because a scan reads stronger than it
-/// is: whether `abandoned` is ever TRUE at that point. The `join_ticking` test
-/// above owns that half.
+/// A whole cancelled delegate run reaches that wiring at runtime; it is pinned
+/// over the source instead — rejecting the two shapes that lose the bit rather
+/// than blessing one spelling: a literal argument, and a return to the
+/// unconditional `DigestMode::Report` this replaced. What it cannot decide,
+/// stated because a scan reads stronger than it is: whether `abandoned` is ever
+/// TRUE at that point. The `join_ticking` test above owns that half.
 #[test]
 fn the_blocking_delegate_folds_its_digest_on_the_abandoned_bit() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -15281,7 +15505,7 @@ fn spawn_tagged_sleep(bin: &std::path::Path, tag: &str) -> std::process::Child {
 /// Wait until the shim recorded a spawned process's pid (one line), failing by
 /// name past the bound.
 #[cfg(target_os = "linux")]
-fn wait_for_recorded_pid(path: &std::path::Path) -> u32 {
+pub(super) fn wait_for_recorded_pid(path: &std::path::Path) -> u32 {
     for _ in 0..100 {
         if let Ok(text) = std::fs::read_to_string(path)
             && let Some(pid) = text.lines().next().and_then(|l| l.parse::<u32>().ok())

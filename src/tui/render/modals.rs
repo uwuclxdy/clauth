@@ -17,9 +17,9 @@ use super::super::app::{
     LoginMethod, LoginStage, LossWarningButton, LossWarningState, MainItemKind, Modal,
     NamePromptForm, PageAction, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
     RebindForm, ScrollStamp, ServicesFocus, SetupSelection, StatusFocus, Tab, TokenPickerForm,
-    TokenView, action_menu_opens, chain_candidates, chain_enter_acts, chain_items,
-    chain_reorder_moves, config_rows, config_step_lands, dash_walks, detail_scrolls, fallback_hint,
-    fallback_row_acts, fallback_row_steps, global_config_row_live, herdr_space_acts,
+    TokenView, TranscriptCleanupForm, action_menu_opens, chain_candidates, chain_enter_acts,
+    chain_items, chain_reorder_moves, config_rows, config_step_lands, dash_walks, detail_scrolls,
+    fallback_hint, fallback_row_acts, fallback_row_steps, global_config_row_live, herdr_space_acts,
     main_reorder_moves, minted_key_row, overview_edit_acts, overview_enter_switches, page_keys_act,
     pane_state, services_fix_keys_act, setup_card_row_count, shunt_esc_folds, token_model_count,
     walk_moves,
@@ -101,6 +101,16 @@ pub(super) fn draw(
         Modal::BareItem(form) => draw_bare_item(frame, area, form),
         Modal::BareItemOwner(form) => draw_bare_item_owner(frame, area, form),
         Modal::CaptureOwner(form) => draw_capture_owner(frame, area, form),
+        Modal::TranscriptCleanup(form) => {
+            // What this frame shows, published for the frame loop's record:
+            // the liveness by the clock this draw reads, so a draw that runs
+            // past the window's end is not the frame that shows the keys act.
+            let live = app
+                .transcript_cleanup
+                .buttons_live(app.anim_ms(), app.focus_held);
+            app.transcript_cleanup.set_drawn_live(live);
+            draw_transcript_cleanup(frame, area, form, live);
+        }
     }
 }
 
@@ -1436,6 +1446,58 @@ fn loss_warning_buttons(state: &LossWarningState) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// The `TRANSCRIPT CLEANUP` question: what went missing, the number clauth
+/// put back, and what letting it go costs, over `keep <n>` (the default) and
+/// the destructive `remove it`. Its body never scrolls, the loss warning's
+/// shape. Until a drawn frame has shown this answer for half a second, with
+/// the queue seen empty past that and the terminal focused, both buttons draw
+/// faint, the limit-reset modal's unpressable-button shape; the first frame
+/// drawn live still refuses a key read before the loop next finds the queue
+/// empty.
+fn draw_transcript_cleanup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &TranscriptCleanupForm,
+    live: bool,
+) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "cleanupPeriodDays is gone from ~/.claude/settings.json",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            format!("clauth put {} back", form.days),
+            theme::dim(),
+        )),
+        Line::from(Span::styled(
+            "was removing it intentional? without it claude code deletes every transcript older than 30 days",
+            theme::dim(),
+        )),
+    ];
+    let keep = format!("keep {}", form.days);
+    let buttons = if live {
+        choice_buttons(form.on_remove, &keep, true, "remove it")
+    } else {
+        Line::from(vec![
+            Span::styled(format!(" {keep} "), theme::faint()),
+            Span::raw(" "),
+            Span::styled(" remove it ", theme::faint()),
+        ])
+    };
+    draw_modal_scrolled(
+        frame,
+        area,
+        "TRANSCRIPT CLEANUP",
+        BodyLine::all(lines),
+        0,
+        None,
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
 }
 
 /// The startup re-bind confirm: grouped account moves, one checkbox row per

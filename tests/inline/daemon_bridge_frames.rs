@@ -83,7 +83,8 @@ fn line(value: &serde_json::Value) -> Vec<u8> {
     bytes
 }
 
-/// Start and turn events reach every subscriber as `session.status`.
+/// Start and turn events reach every subscriber as `session.status`; a start
+/// from a mod that declares no capabilities carries an empty `caps`.
 #[test]
 fn session_state_reaches_subscribers() {
     let _home = HomeSandbox::new();
@@ -106,7 +107,7 @@ fn session_state_reaches_subscribers() {
         next(&sub, WAIT),
         Some((
             "session.status".into(),
-            serde_json::json!({"session": "s-one", "state": "start", "cwd": "/w/app", "interactive": true})
+            serde_json::json!({"session": "s-one", "state": "start", "cwd": "/w/app", "interactive": true, "caps": []})
         ))
     );
     assert_eq!(
@@ -1038,13 +1039,63 @@ fn asks_reach_subscribers_opened_and_closed() {
     assert_eq!(next(&sub, NONE), None);
 }
 
-/// The snapshot a stream opens with: every live session and every open ask.
+/// A start carries the capabilities its mod declares, on its `session.status`
+/// frame and in the snapshot: only names this daemon knows, each once. A later
+/// start (a module reload) replaces them, so a reload onto an older mod that
+/// declares none leaves none.
+#[test]
+fn a_start_carries_its_mods_caps_and_a_reload_replaces_them() {
+    let _home = HomeSandbox::new();
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let sub = hub.subscribe();
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes", "teleport", 7, "notes"]}),
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]})
+        ))
+    );
+    assert_eq!(
+        hub.snapshot()["sessions"],
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}])
+    );
+
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "start", "cwd": "/w/app", "interactive": true}),
+    );
+    assert_eq!(
+        next(&sub, WAIT),
+        Some((
+            "session.status".into(),
+            serde_json::json!({"session": "s-one", "state": "start", "cwd": "/w/app", "interactive": true, "caps": []})
+        ))
+    );
+    assert_eq!(
+        hub.snapshot()["sessions"],
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": []}])
+    );
+}
+
+/// The snapshot a stream opens with: every live session with its mod's
+/// capabilities (none for a mod that declares none), and every open ask.
 #[test]
 fn the_snapshot_lists_live_sessions_and_open_asks() {
     let _home = HomeSandbox::new();
     let (_t, resolver) = table(&[(100, instance("s-one", "1")), (200, instance("s-two", "2"))]);
     let hub = Hub::new(true, resolver);
-    start(&hub, 100, "s-one");
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}),
+    );
     start(&hub, 200, "s-two");
     event(
         &hub,
@@ -1066,8 +1117,8 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
         hub.snapshot(),
         serde_json::json!({
             "sessions": [
-                {"session": "s-one", "cwd": "/w/app", "interactive": true},
-                {"session": "s-two", "cwd": "/w/app", "interactive": true}
+                {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"]},
+                {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": []}
             ],
             "asks": [
                 {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null, "held": false}
@@ -1075,6 +1126,118 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
             "prompts": []
         })
     );
+}
+
+/// An instance whose `end` has landed takes no more answers, so its snapshot
+/// entry carries no capabilities while the entry itself stays listed; a live
+/// instance that declared `notes` still carries them.
+#[test]
+fn an_ending_instances_snapshot_entry_carries_no_caps() {
+    let sb = HomeSandbox::new();
+    append_raw(&transcript_path(&sb, "s-one"), b"");
+    let (_t, resolver) = table(&[(100, instance("s-one", "1")), (200, instance("s-two", "2"))]);
+    let hub = Hub::new(true, resolver);
+    event(
+        &hub,
+        100,
+        serde_json::json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}),
+    );
+    event(
+        &hub,
+        200,
+        serde_json::json!({"session": "s-two", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}),
+    );
+    let generation = hold_tail(&hub, 100);
+    let ended = post_end(&hub, 2);
+    wait_for_ending(&hub, 100);
+
+    assert_eq!(
+        hub.snapshot()["sessions"],
+        serde_json::json!([
+            {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": []},
+            {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}
+        ])
+    );
+
+    hub.finish_tail(100, generation);
+    assert_eq!(
+        ended.recv_timeout(WAIT),
+        Ok((200, serde_json::json!({ "ok": true })))
+    );
+}
+
+/// Two live instances on one session id (SB-4) list their snapshot entries,
+/// asks and prompts in one order — the session id, then each instance's own
+/// key, its peer pid — never the hub `HashMap`'s iteration order. A third
+/// instance on a later id with the lowest pid binds the session id as the
+/// first key. Every hub draws a fresh `HashMap` seed, so an order read the
+/// same 20 times is imposed by the code.
+#[test]
+fn two_instances_on_one_id_snapshot_in_a_fixed_order() {
+    let _home = HomeSandbox::new();
+    // The higher pid starts first and holds the lower `proc_start`, so a
+    // tie-break on start order or on `proc_start` reads `/w/b` first.
+    let instances = [
+        (200, "s-one", "/w/b"),
+        (100, "s-one", "/w/a"),
+        (50, "s-two", "/w/c"),
+    ];
+    for round in 0..20 {
+        let (_t, resolver) = table(&[
+            (100, instance("s-one", "2")),
+            (200, instance("s-one", "1")),
+            (50, instance("s-two", "3")),
+        ]);
+        let hub = Hub::new(true, resolver);
+        for (pid, session, cwd) in instances {
+            event(
+                &hub,
+                pid,
+                serde_json::json!({"session": session, "seq": 1, "kind": "start", "cwd": cwd, "interactive": true, "caps": ["notes"]}),
+            );
+            event(
+                &hub,
+                pid,
+                serde_json::json!({"session": session, "seq": 2, "kind": "ask_opened", "ask": format!("a-{pid}"), "tool": "Bash", "input": {}}),
+            );
+        }
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            for (pid, _, _) in instances {
+                inner
+                    .instances
+                    .get_mut(&pid)
+                    .expect("the started instance")
+                    .prompts
+                    .push(MintedPrompt {
+                        id: format!("p-{pid}"),
+                        state: PromptState::Queued,
+                    });
+            }
+        }
+        let snapshot = hub.snapshot();
+        let column = |key: &str, field: &str| -> Vec<String> {
+            snapshot[key]
+                .as_array()
+                .expect("a snapshot array")
+                .iter()
+                .map(|row| row[field].as_str().expect("a string field").to_string())
+                .collect()
+        };
+        assert_eq!(
+            (
+                column("sessions", "cwd"),
+                column("asks", "ask"),
+                column("prompts", "prompt")
+            ),
+            (
+                vec!["/w/a".to_string(), "/w/b".to_string(), "/w/c".to_string()],
+                vec!["a-100".to_string(), "a-200".to_string(), "a-50".to_string()],
+                vec!["p-100".to_string(), "p-200".to_string(), "p-50".to_string()]
+            ),
+            "hub {round}"
+        );
+    }
 }
 
 /// The opened frame carries the line the mod posted, a positive integer alone:

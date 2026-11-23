@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
+use chrono::{Local, NaiveDate, NaiveTime};
 
 use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::lock::with_state_lock;
@@ -71,6 +72,123 @@ pub(crate) const MAX_THRESHOLD: f64 = 100.0;
 
 pub(crate) fn threshold_in_range(value: f64) -> bool {
     value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
+}
+
+/// What a chain-move log line reports about the account it left: the profile
+/// behind it, when one loads, and the last reading held against it with the
+/// reading's age. The profile's thresholds fill each figure's line, so a profile
+/// that will not load costs the figures, never the name: the line takes the
+/// name from the switch's own result ([`auto_switch_log_line`]).
+pub(crate) struct LeftAccount {
+    pub(crate) profile: Profile,
+    pub(crate) usage: Option<UsageInfo>,
+    pub(crate) age_secs: Option<u64>,
+}
+
+/// The account behind a chain-move log line: `name`'s profile from the
+/// process's own copy (`cached`), else from disk, with the last reading held
+/// against it. `None` when neither loads — the line still names the account and
+/// reads no figure, since the lines its figures would be judged against are
+/// unknowable.
+pub(crate) fn left_account(
+    name: &ProfileName,
+    cached: Option<Profile>,
+    usage_store: &UsageStore,
+    third_party_store: &ThirdPartyUsageStore,
+) -> Option<LeftAccount> {
+    let profile = cached.or_else(|| crate::profile::read_profile(name).ok())?;
+    let (usage, age_secs) = picked_reading(&profile, usage_store, third_party_store);
+    Some(LeftAccount {
+        profile,
+        usage,
+        age_secs,
+    })
+}
+
+/// The log line a chain move of the global account leaves behind: the account
+/// it landed on, the one it left (`from`, the name the switch's own result
+/// reports), and what that one last read against its lines (`left`, when its
+/// profile loads; `chain_weekly` is the chain-wide weekly line). A toast
+/// vanishes with the TUI, so without this line a window that still ran out
+/// leaves no trace of when (or whether) the chain moved off it. `role` is the
+/// process prefix ([`crate::logline::role`]); `returning` names a move onto the
+/// home account.
+pub(crate) fn auto_switch_log_line(
+    role: &str,
+    from: Option<&str>,
+    to: &str,
+    returning: bool,
+    left: Option<&LeftAccount>,
+    chain_weekly: f64,
+) -> String {
+    let moved = if returning {
+        "returned to preferred account"
+    } else {
+        "auto-switched to"
+    };
+    let Some(from) = from else {
+        return format!("{role}: {moved} '{to}'");
+    };
+    let read = match left {
+        Some(left) => read_with_age(left, chain_weekly),
+        None => "nothing".to_string(),
+    };
+    format!("{role}: {moved} '{to}' from '{from}'; '{from}' read {read}")
+}
+
+/// The log line a switch-off leaves once every account is spent: the account it
+/// left (`from`) and its last reading ([`auto_switch_log_line`]'s reading half).
+/// Both processes write the one shape, so a wrap-off says the same in either
+/// log.
+pub(crate) fn switch_off_log_line(
+    role: &str,
+    from: Option<&str>,
+    left: Option<&LeftAccount>,
+    chain_weekly: f64,
+) -> String {
+    let Some(from) = from else {
+        return format!("{role}: switched off: all accounts spent");
+    };
+    let read = match left {
+        Some(left) => read_with_age(left, chain_weekly),
+        None => "nothing".to_string(),
+    };
+    format!("{role}: switched off: all accounts spent; '{from}' read {read}")
+}
+
+/// What a chain-move log line reports for the account it left: each figure
+/// against its line, then how long ago the reading was taken. A reading with no
+/// figure reads `nothing` and carries no age; one with figures but no clock says
+/// the time is unknown, never implying the figures are current.
+fn read_with_age(left: &LeftAccount, chain_weekly: f64) -> String {
+    let from = &left.profile;
+    let five = left
+        .usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| {
+            format!(
+                "5h {:.0}% (line {:.0}%)",
+                w.utilization,
+                threshold_for(from)
+            )
+        });
+    let long = left
+        .usage
+        .as_ref()
+        .and_then(UsageInfo::long_window)
+        .map(|(label, w)| {
+            let line = member_weekly_line(from, chain_weekly);
+            format!("{label} {:.0}% (line {line:.0}%)", w.utilization)
+        });
+    let read = five.into_iter().chain(long).collect::<Vec<_>>().join(", ");
+    if read.is_empty() {
+        return "nothing".to_string();
+    }
+    match left.age_secs {
+        Some(secs) => format!("{read} {}", crate::format::humanize_age(secs)),
+        None => format!("{read} at an unknown time"),
+    }
 }
 
 /// Parse a typed threshold, valid only inside [`threshold_in_range`].
@@ -1170,6 +1288,10 @@ pub(crate) fn health_blocked_reason(
 /// avoiding the `config ↔ store` lock inversion against `App::apply_usage`
 /// (which holds `usage_store` then takes `config`).
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one per-member fact the walk reads (a profile flag, today's home, or the own-endpoint derivation), not state"
+)]
 pub(crate) struct ChainMember {
     pub(crate) name: ProfileName,
     pub(crate) threshold: f64,
@@ -1206,6 +1328,9 @@ pub(crate) struct ChainMember {
     /// gates. Folded so the lock-free walk sites that hold only a `ChainMember`
     /// still judge it the same way the profile-holding sites do.
     pub(crate) own_inference: bool,
+    /// Mirrors `Profile::plan_ends` — the last day of this member's canceled
+    /// plan, which caps its `soonest-weekly-reset` key ([`soonest_reset_key`]).
+    pub(crate) plan_ends: Option<NaiveDate>,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -1471,6 +1596,7 @@ fn codex_chain_members(state: &crate::codex_profiles::CodexState) -> CodexChain 
                 check_scoped: false,
                 check_credit_cap: false,
                 own_inference: false,
+                plan_ends: None,
             })
             .collect(),
     }
@@ -1600,6 +1726,7 @@ fn chain_member(
         check_scoped: profile.is_none_or(|p| p.check_scoped),
         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
         own_inference: profile.is_some_and(crate::claude::has_own_inference_endpoint),
+        plan_ends: profile.and_then(|p| p.plan_ends),
     }
 }
 
@@ -1851,11 +1978,12 @@ fn is_exhausted_active_from_usage(
     )
 }
 
-/// The soonest-reset ranking key for one member's cached usage: the epoch min
-/// over the account's long window's `resets_at` and every `weekly_scoped`
-/// entry's, `None` when no weekly window carries a parseable reset (an
-/// idle/cold account). The 5h `resets_at` is deliberately NOT folded in — it
-/// slides at `now + 5h` on idle windows and is not a ranking key (measured).
+/// The weekly-reset input to [`soonest_reset_key`] for one member's cached
+/// usage: the epoch min over the account's long window's `resets_at` and
+/// every `weekly_scoped` entry's, `None` when no weekly window carries a
+/// parseable reset (an idle/cold account). The 5h `resets_at` is deliberately
+/// NOT folded in — it slides at `now + 5h` on idle windows and is not a
+/// ranking key (measured).
 /// Scoped windows carry the aggregate's instant today, so the min is
 /// future-proofing rather than a second source.
 fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
@@ -1874,6 +2002,48 @@ fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
         }
     }
     best
+}
+
+/// The `soonest-weekly-reset` ranking key for one member: the epoch second its
+/// unspent quota is lost. That is its weekly reset ([`weekly_reset_key`] over
+/// `reading`), or the start of its local `plan_ends` day when that comes
+/// first, since a canceled plan loses its quota at its last day too. A
+/// `plan_ends` before `today` caps nothing, so the reading's own reset stands;
+/// `plan_renews` is no input, since a billing day loses no quota. `None` when
+/// neither applies. `today` is the local date, read once per evaluation by the
+/// caller, so a midnight between two reads cannot rank one walk on two days.
+fn soonest_reset_key(
+    reading: Option<&UsageInfo>,
+    plan_ends: Option<NaiveDate>,
+    today: Option<NaiveDate>,
+) -> Option<i64> {
+    let last_day = plan_ends
+        .filter(|day| today.is_some_and(|today| *day >= today))
+        .and_then(local_day_start);
+    reading
+        .and_then(weekly_reset_key)
+        .into_iter()
+        .chain(last_day)
+        .min()
+}
+
+/// The epoch second the local calendar day `day` starts: its local midnight,
+/// or, where a clock change skips midnight, midnight read at the offset the
+/// day before still had. `None` outside chrono's range.
+fn local_day_start(day: NaiveDate) -> Option<i64> {
+    let midnight = day.and_time(NaiveTime::MIN);
+    if let Some(start) = midnight.and_local_timezone(Local).earliest() {
+        return Some(start.timestamp());
+    }
+    let eve = day
+        .pred_opt()?
+        .and_time(NaiveTime::from_hms_opt(12, 0, 0)?)
+        .and_local_timezone(Local)
+        .earliest()?;
+    midnight
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(eve.offset().local_minus_utc()))
 }
 
 /// The most-weekly-headroom ranking key for one member's cached usage: its
@@ -1900,18 +2070,20 @@ fn weekly_headroom_key(info: &UsageInfo, now_secs: i64) -> Option<(f64, f64)> {
 /// helper every fallback walk pass threads through (issue #86). It replaces
 /// the old `walk_chain` primitive: the visit sequence is the same, the
 /// skip/accept folding moved to each call site's `find`. `reading` is a
-/// slot's cached usage, `None` when nothing has been read for it.
+/// slot's cached usage, `None` when nothing has been read for it;
+/// `plan_ends` is a slot's `ChainMember::plan_ends`, and `today` the local
+/// date the caller read once for its whole evaluation.
 ///
 /// `WalkOrder::Chain` returns the old walk's exact visit sequence — every
 /// slot starting one after `idx` and wrapping — so the default is byte for
 /// byte today's walk. `WalkOrder::SoonestWeeklyReset` stable-sorts that
-/// sequence by [`weekly_reset_key`] (soonest first; `None` — no parseable
-/// weekly reset — after every `Some`, since an unknown reset cannot be
-/// proven soon). `WalkOrder::MostWeeklyHeadroom` stable-sorts it by
-/// [`weekly_headroom_key`] (least-used week first, 5h breaking a weekly tie;
-/// no weekly window to read, or no reading at all, after every member that
-/// has one). The stable sort keeps the chain-position walk order as the tie
-/// rule: ties fall back to chain position, the exact tie rule
+/// sequence by [`soonest_reset_key`] (soonest first; `None` — no parseable
+/// weekly reset and no `plan_ends` cap — after every `Some`, since an unknown
+/// reset cannot be proven soon). `WalkOrder::MostWeeklyHeadroom` stable-sorts
+/// it by [`weekly_headroom_key`] (least-used week first, 5h breaking a weekly
+/// tie; no weekly window to read, or no reading at all, after every member
+/// that has one). The stable sort keeps the chain-position walk order as the
+/// tie rule: ties fall back to chain position, the exact tie rule
 /// `soonest_resume` documents and pins. Skip predicates stay at the call
 /// sites, unchanged — the mode reorders only WITHIN one accept pass, never
 /// across the pass ladder.
@@ -1920,12 +2092,14 @@ fn ordered_walk<'u>(
     idx: usize,
     len: usize,
     reading: &dyn Fn(usize) -> Option<&'u UsageInfo>,
+    plan_ends: &dyn Fn(usize) -> Option<NaiveDate>,
+    today: Option<NaiveDate>,
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (1..=len).map(|offset| (idx + offset) % len).collect();
     match mode {
         WalkOrder::Chain => {}
-        WalkOrder::SoonestWeeklyReset => order.sort_by_key(|&i| {
-            let k = reading(i).and_then(weekly_reset_key);
+        WalkOrder::SoonestWeeklyReset => order.sort_by_cached_key(|&i| {
+            let k = soonest_reset_key(reading(i), plan_ends(i), today);
             (k.is_none(), k)
         }),
         WalkOrder::MostWeeklyHeadroom => {
@@ -2174,8 +2348,9 @@ pub(crate) struct StartCandidate {
 /// its target in [`next_auto_switch_target`]). `env_models` is the process-env
 /// launch triple, read once by `cmd_start`, so this walk never reads the process
 /// environment itself. Each pass follows the `walk_order` mode: chain position
-/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
-/// the least-used week under `most-weekly-headroom`.
+/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`
+/// (a future `plan_ends` day counting as an earlier reset), the least-used week
+/// under `most-weekly-headroom`.
 pub(crate) fn start_walk(
     config: &AppConfig,
     isolation: crate::runtime::Isolation,
@@ -2226,6 +2401,8 @@ pub(crate) fn start_walk(
     // the ranking modes consult it, so under `chain` (the default) nothing is
     // copied and the walk is byte-identical.
     let mut readings: Vec<Option<UsageInfo>> = Vec::with_capacity(names.len());
+    // Each row's `plan_ends`, parallel to `readings` for the same reason.
+    let mut plan_ends: Vec<Option<NaiveDate>> = Vec::with_capacity(names.len());
     for name in names {
         let Some(profile) = config.find(name) else {
             continue;
@@ -2416,6 +2593,7 @@ pub(crate) fn start_walk(
         } else {
             usage.cloned()
         });
+        plan_ends.push(member.plan_ends);
         rows.push(StartCandidate {
             name: name.clone(),
             block,
@@ -2431,7 +2609,14 @@ pub(crate) fn start_walk(
         return (rows, None);
     }
     let len = rows.len();
-    let order = ordered_walk(walk_order, len - 1, len, &|i| readings[i].as_ref());
+    let order = ordered_walk(
+        walk_order,
+        len - 1,
+        len,
+        &|i| readings[i].as_ref(),
+        &|i| plan_ends[i],
+        crate::format::local_day(now),
+    );
     let pick = order
         .iter()
         .copied()
@@ -2726,6 +2911,40 @@ pub(crate) fn picked_usage(
     }
 }
 
+/// The reading a chain-move log line reports for `profile`, paired with how long
+/// ago it was read. An OAuth account's age is its fetch stamp
+/// ([`crate::profile_json::oauth_age`]); a third-party account's is the write
+/// time of the cache file its figures land in, the clock
+/// [`crate::profile_json::ProfileWindows`] dates it by. `None` when nothing dates
+/// the reading. Only the half the account's figures come from is locked, once
+/// and released, so the caller holds no config guard across this.
+pub(crate) fn picked_reading(
+    profile: &Profile,
+    store: &UsageStore,
+    third_party_store: &ThirdPartyUsageStore,
+) -> (Option<UsageInfo>, Option<u64>) {
+    let name = profile.name.as_str();
+    if profile.usage_cache_is_third_party() {
+        let usage = third_party_store
+            .lock()
+            .ok()
+            .and_then(|s| picked_usage(true, None, s.get(name)));
+        let age_secs = crate::profile_json::cache_age_secs(
+            &profile.name,
+            crate::profile_json::usage_cache_file(profile),
+        );
+        (usage, age_secs)
+    } else {
+        let usage = store
+            .lock()
+            .ok()
+            .and_then(|s| picked_usage(false, s.get(name), None));
+        let age_secs =
+            crate::profile_json::oauth_age(usage.as_ref(), crate::usage::now_ms()).secs();
+        (usage, age_secs)
+    }
+}
+
 /// The in-memory twin of `profile_json::windows_of`: the chain walk's usage
 /// snapshot, with each member's windows picked from its own half — the OAuth
 /// (or codex) reading in the merged store, or a third-party member's
@@ -2955,7 +3174,16 @@ fn next_auto_switch_target_core(
             || refuses_service_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
-    let order = ordered_walk(snapshot.walk_order, active_idx, len, &reading);
+    let plan_ends = |i: usize| snapshot.chain[i].plan_ends;
+    let today = crate::format::local_day(now_epoch_secs());
+    let order = ordered_walk(
+        snapshot.walk_order,
+        active_idx,
+        len,
+        &reading,
+        &plan_ends,
+        today,
+    );
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         order
             .iter()
@@ -3079,11 +3307,13 @@ fn next_auto_switch_target_core(
         // healthy active "home" to the soonest-reset clear+fresh member —
         // the operator's home recomputed as "where the quota expires
         // first", so work parks where it will be spent rather than where it
-        // will expire. The walk is one-shot in the same structural sense as
-        // the return-to-preferred pass: the already-home guard below bars
-        // any re-fire once the active IS the soonest member. The same hard
-        // freshness gates as the return-to-preferred pass above (fresh
-        // ACTIVE and fresh target), and the same absence of a `last_resort`
+        // will expire. The key is the walk's own [`soonest_reset_key`], so a
+        // canceled plan whose last day starts before every other member's
+        // reset is home in its last week. The walk is one-shot in the same
+        // structural sense as the return-to-preferred pass: the already-home
+        // guard below bars any re-fire once the active IS the soonest member.
+        // The same hard freshness gates as the return-to-preferred pass above
+        // (fresh ACTIVE and fresh target), and the same absence of a `last_resort`
         // guard: a sink is a refuge, not a permanent park, and the
         // recomputed home outranks it. The ordering rides the shared
         // `order` (the soonest-reset sequence with the chain-position tie
@@ -3103,10 +3333,12 @@ fn next_auto_switch_target_core(
         // skipped as a candidate, so the walk always finds a "home" to walk
         // TO — one credential relink per scheduler tick, forever). Ties with
         // the active keep the current position: walking between tied members
-        // buys nothing and oscillates the same way. A candidate with no
-        // parseable reset never outranks a Some active, and an active with
-        // none defers to any candidate that has one.
-        let active_key = usage.get(active.name.as_str()).and_then(weekly_reset_key);
+        // buys nothing and oscillates the same way. A candidate with no key
+        // (no parseable reset and no `plan_ends` cap) never outranks a Some
+        // active, and an active with none defers to any candidate that has
+        // one.
+        let home_key = |i: usize| soonest_reset_key(reading(i), plan_ends(i), today);
+        let active_key = home_key(active_idx);
         if snapshot.walk_order == WalkOrder::SoonestWeeklyReset
             && !snapshot.chain.iter().enumerate().any(|(i, m)| {
                 if i == active_idx {
@@ -3120,8 +3352,7 @@ fn next_auto_switch_target_core(
                 !skip(i)
                     && clear(&snapshot.chain[i])
                     && snapshot.fresh.iter().any(|n| n == &snapshot.chain[i].name)
-                    && reading(i)
-                        .and_then(weekly_reset_key)
+                    && home_key(i)
                         .is_some_and(|candidate_key| active_key.is_none_or(|a| candidate_key < a))
             })
         {
@@ -3359,6 +3590,8 @@ pub(crate) fn find_recovered_member(
         chain.len().saturating_sub(1),
         chain.len(),
         &|i| usage.get(chain[i].name.as_str()),
+        &|i| chain[i].plan_ends,
+        crate::format::local_day(now),
     );
     for i in order.iter().copied() {
         if recovered(&chain[i], true) == Some(true) {
@@ -3530,11 +3763,21 @@ fn auto_decision_gap(action: &SwitchAction) {
         .expect("gap controller releases the actor");
 }
 
+/// What the startup one-shot did, and the account it left doing it: the name
+/// `profiles.toml` held active under the dispatch's own hold, which a log line
+/// takes as the account the move left (the target's own name on a no-move
+/// relink, `None` when disk named none).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StartupSwitch {
+    pub(crate) action: SwitchAction,
+    pub(crate) left: Option<ProfileName>,
+}
+
 /// If the active profile is a chain member the scheduler walk leaves — past its
 /// threshold, a kick/canceled/dead-reading bypass, or a healthy return home —
 /// switch to the next viable member, or, in wrap-off mode when the whole chain
-/// is spent and no sink exists, turn off all accounts. Returns the action taken,
-/// or None.
+/// is spent and no sink exists, turn off all accounts. Returns the action taken
+/// with the account it left, or None.
 ///
 /// The decision is the scheduler walk's ([`next_auto_switch_target_with_usage`])
 /// over a [`ChainSnapshot`] + usage map built from the caller's stores, with the
@@ -3566,7 +3809,7 @@ pub(crate) fn auto_switch_if_needed(
     streaks: &PollStreaks,
     third_party_streaks: &ThirdPartyStreaks,
     kick_blocks: &KickBlocks,
-) -> Result<Option<SwitchAction>> {
+) -> Result<Option<StartupSwitch>> {
     let (decided_active, decision) = {
         let (mut snapshot, third_party_names, polled, key_rejected) = {
             #[allow(
@@ -3625,7 +3868,7 @@ pub(crate) fn auto_switch_if_needed(
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let (action, changed) = with_state_lock(|_held| {
+    let (taken, left, changed) = with_state_lock(|_held| {
         let config = &mut *guard;
         // Re-validate under the hold: the decision was made about
         // `decided_active`; an explicit switch that landed in the gap between
@@ -3638,11 +3881,11 @@ pub(crate) fn auto_switch_if_needed(
         if config.state.active_profile.as_deref() != Some(decided_active.as_str())
             || disk_active.as_deref() != Some(decided_active.as_str())
         {
-            return Ok((None, false));
+            return Ok((None, None, false));
         }
         #[cfg(test)]
         auto_decision_rendezvous(&action);
-        let changed = match &action {
+        let (left, changed) = match &action {
             SwitchAction::To(target) => {
                 // The drains' twin at the one-shot's dispatch: re-read the
                 // target's stored login on disk before linking. A store that
@@ -3659,21 +3902,26 @@ pub(crate) fn auto_switch_if_needed(
                         // the members flagged in this process's config copy
                         // (`snapshot.broken`); a flag that copy lacks is not
                         // re-checked in this hold.
-                        switch_profile_locked_gated(
+                        let outcome = switch_profile_locked_gated(
                             config,
                             &ProfileName::from(target.clone()),
                             true,
-                        )?
+                        )?;
+                        (outcome.left, outcome.changed)
                     }
                     crate::profile::StoredLogin::HoldsNone
                     | crate::profile::StoredLogin::Unknown => {
-                        return Ok((None, false));
+                        return Ok((None, None, false));
                     }
                 }
             }
-            SwitchAction::Off => switch_off_locked(config)?,
+            SwitchAction::Off => {
+                let departed = switch_off_locked(config)?;
+                let changed = departed.is_some();
+                (departed, changed)
+            }
         };
-        Ok((Some(action), changed))
+        Ok((Some(action), left, changed))
     })?;
     drop(guard);
     if changed {
@@ -3683,7 +3931,7 @@ pub(crate) fn auto_switch_if_needed(
         crate::claude_json::strip_home_oauth_account();
         crate::daemon::publish_status(config);
     }
-    Ok(action)
+    Ok(taken.map(|action| StartupSwitch { action, left }))
 }
 
 #[cfg(test)]

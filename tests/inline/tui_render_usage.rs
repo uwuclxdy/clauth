@@ -1439,6 +1439,237 @@ fn header_lines_plan_shows_the_server_plan_name() {
     );
 }
 
+/// The `plan` row names the next billing day off `plan_renews`, faint, and a
+/// marked `plan_ends` in its place in the warning color, `ended` once past
+/// unless a `plan_renews` later than it is set; a row too narrow for the
+/// phrase keeps the plan name alone. Dates are seeded off the same local day
+/// the render reads.
+#[test]
+fn header_lines_plan_names_the_renewal_or_the_marked_end() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "dated",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let row = |profile: &crate::profile::Profile, width: u16| -> Vec<Span<'static>> {
+        header_lines(profile, &header, width, &readings)
+            .first()
+            .map(|l| l.spans.clone())
+            .unwrap_or_default()
+    };
+    // Each case: the row's text and its last span's style.
+    let shown = |profile: &crate::profile::Profile, width: u16| {
+        let spans = row(profile, width);
+        let style = spans.last().map_or_default(|s| s.style);
+        (
+            spans.iter().map(|s| s.content.clone()).collect::<String>(),
+            style,
+        )
+    };
+    let body = crate::tui::theme::body();
+    let faint = crate::tui::theme::faint();
+    let warning = crate::tui::theme::warning();
+    let (cases, expected) = crate::testutil::on_one_local_day(|today| {
+        // `nov 2`: chrono's own month and day, never the render's table.
+        let spoken = |days: i64| {
+            (today + chrono::Duration::days(days))
+                .format("%b %-d")
+                .to_string()
+                .to_lowercase()
+        };
+        let mut profile = profile.clone();
+        let mut cases = vec![shown(&profile, 52)];
+        profile.plan_renews = Some(today + chrono::Duration::days(20));
+        cases.push(shown(&profile, 52));
+        profile.plan_ends = Some(today + chrono::Duration::days(10));
+        cases.push(shown(&profile, 52));
+        cases.push(shown(&profile, 24));
+        profile.plan_ends = Some(today);
+        cases.push(shown(&profile, 52));
+        profile.plan_ends = Some(today - chrono::Duration::days(1));
+        profile.plan_renews = None;
+        cases.push(shown(&profile, 52));
+        // A billing day set after the plan's marked end: the plan came back.
+        profile.plan_ends = Some(today - chrono::Duration::days(30));
+        profile.plan_renews = Some(today + chrono::Duration::days(20));
+        cases.push(shown(&profile, 52));
+        let expected = vec![
+            ("plan      Claude Ultra".to_string(), body),
+            (
+                format!("plan      Claude Ultra · renews {} (20d)", spoken(20)),
+                faint,
+            ),
+            (
+                format!("plan      Claude Ultra · ends {} (10d)", spoken(10)),
+                warning,
+            ),
+            ("plan      Claude Ultra".to_string(), body),
+            ("plan      Claude Ultra · ends today".to_string(), warning),
+            (
+                format!("plan      Claude Ultra · ended {}", spoken(-1)),
+                warning,
+            ),
+            (
+                format!("plan      Claude Ultra · renews {} (20d)", spoken(20)),
+                faint,
+            ),
+        ];
+        (cases, expected)
+    });
+    assert_eq!(
+        cases, expected,
+        "no date; a renewal; a marked end over it; no room; ending today; \
+         ended; a renewal later than a past end"
+    );
+}
+
+/// A plan whose reading says it cannot serve, canceled or refused by its
+/// organization, shows no renewal on the `plan` row: the row reads exactly
+/// as it does with no date given.
+#[test]
+fn header_lines_plan_shows_no_renewal_for_a_plan_that_cannot_serve() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let plan_row = |status: &str, renews: Option<chrono::NaiveDate>| -> String {
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+        profile.plan_renews = renews;
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "dated",
+            crate::usage::UsageInfo {
+                plan: Some(crate::usage::PlanInfo {
+                    tier: crate::usage::PlanTier::Max(Some(20)),
+                    subscription_status: Some(status.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        // Wide enough for `· renews dec 15, 2099 (…d)` beside the plan name.
+        header_lines(&profile, &header, 80, &readings)
+            .first()
+            .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    };
+    let renews = chrono::NaiveDate::from_ymd_opt(2099, 12, 15);
+    assert_eq!(
+        [
+            plan_row("canceled", renews),
+            plan_row(crate::usage::ORG_REFUSED_STATUS, renews),
+        ],
+        [
+            plan_row("canceled", None),
+            plan_row(crate::usage::ORG_REFUSED_STATUS, None),
+        ],
+        "(canceled, org refused) with a billing day read as with none"
+    );
+    assert_eq!(
+        plan_row("canceled", None),
+        "plan      Claude Ultra",
+        "control: the dateless row"
+    );
+}
+
+/// The `usage auto-start in …` countdown keeps its room on the `plan` row: at
+/// 52 and 48 cells it reads whole and the plan date, which no longer fits
+/// beside it, drops; a row wide enough for both draws both, the countdown
+/// flush right past the house 3-cell gap.
+#[test]
+fn header_lines_plan_date_takes_only_the_room_the_countdown_leaves() {
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(crate::testutil::countdown_reset_in(8880)),
+            }),
+            ..Default::default()
+        },
+    );
+    let kick = "usage auto-start in 2h 28m";
+    let (rows, expected) = crate::testutil::on_one_local_day(|today| {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.auto_start = true;
+        profile.plan_renews = Some(today + chrono::Duration::days(20));
+        let rows = [52, 48, 72].map(|width| {
+            header_lines(&profile, &header, width, &readings)
+                .first()
+                .map_or_default(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.clone())
+                        .collect::<String>()
+                })
+        });
+        let tail = format!(
+            " · renews {} (20d)",
+            (today + chrono::Duration::days(20))
+                .format("%b %-d")
+                .to_string()
+                .to_lowercase()
+        );
+        // `plan` + the no-data dash measure 11 cells.
+        let flush = |width: usize, left: &str| {
+            format!(
+                "{left}{}{kick}",
+                " ".repeat(width - left.chars().count() - kick.chars().count())
+            )
+        };
+        let expected = [
+            flush(52, "plan      —"),
+            flush(48, "plan      —"),
+            flush(72, &format!("plan      —{tail}")),
+        ];
+        (rows, expected)
+    });
+    assert_eq!(rows, expected, "(52, 48, 72) cells");
+}
+
 /// With no fetched plan AND no tier the token can claim, the `plan` row takes
 /// the house no-data dash in the faint no-data treatment. The bare "Claude" it
 /// printed before named a plan the account never had.

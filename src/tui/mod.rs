@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event, KeyEventKind};
 
 use crate::profile::AppConfig;
 
@@ -50,9 +50,9 @@ const GIVE_BACK_BOUND: Duration = Duration::from_millis(500);
 /// back, so it waits longer than [`GIVE_BACK_BOUND`] for one that stopped
 /// taking output (a stalled ssh link, a suspended terminal window), and one
 /// that resumes in time gets a clean shell. A quit over one that never resumes
-/// ends the TUI at this bound with the alternate screen still up and the
-/// cursor hidden; a stop signal arriving meanwhile does not shorten the wait,
-/// as the watcher stood down when the frame loop returned.
+/// ends the TUI at this bound with the alternate screen still up, focus reports
+/// still on and the cursor hidden; a stop signal arriving meanwhile does not
+/// shorten the wait, as the watcher stood down when the frame loop returned.
 const QUIT_GIVE_BACK_BOUND: Duration = Duration::from_secs(10);
 
 /// A stop signal's ask to end the TUI. On unix a `clauth-tui-sig` thread takes
@@ -239,7 +239,7 @@ pub(crate) fn run(config: AppConfig, herdr_mode: bool, full_sprite: bool) -> Res
                 Some(Err(err)) => {
                     crate::out::errln_or_drop!("Failed to restore terminal: {err}");
                 }
-                // The terminal keeps the alternate screen and a hidden cursor:
+                // The terminal keeps the alternate screen, focus reports and a hidden cursor:
                 // leave a trace in the log, since the terminal cannot take one.
                 None => crate::logline::logline!(
                     "clauth: the terminal hand-back did not finish within {bound:?}"
@@ -260,9 +260,10 @@ pub(crate) fn run(config: AppConfig, herdr_mode: bool, full_sprite: bool) -> Res
 }
 
 /// Raw mode, the alternate screen and a terminal over stdout, as
-/// `ratatui::try_init` sets them up, under a panic hook that hands the
-/// terminal back through [`give_back_terminal_within`] before the previous
-/// hook prints. Not `try_init` itself: its hook restores through
+/// `ratatui::try_init` sets them up, plus the focus-report ask of
+/// [`enter_screen`], under a panic hook that hands the terminal back through
+/// [`give_back_terminal_within`] before the previous hook prints. Not
+/// `try_init` itself: its hook restores through
 /// `ratatui::restore`, whose `eprintln!` panics on a closed terminal, and a
 /// panic inside the panic hook aborts (measured 2026-11-10: a core dump from a
 /// TUI whose output terminal closed). A step that fails after raw mode is on
@@ -276,11 +277,7 @@ fn open_terminal() -> std::io::Result<std::mem::ManuallyDrop<DefaultTerminal>> {
         previous(info);
     }));
     ratatui::crossterm::terminal::enable_raw_mode()?;
-    let opened = ratatui::crossterm::execute!(
-        std::io::stdout(),
-        ratatui::crossterm::terminal::EnterAlternateScreen
-    )
-    .and_then(|()| {
+    let opened = enter_screen(&mut std::io::stdout()).and_then(|()| {
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
     });
     if opened.is_err() {
@@ -289,12 +286,42 @@ fn open_terminal() -> std::io::Result<std::mem::ManuallyDrop<DefaultTerminal>> {
     opened.map(std::mem::ManuallyDrop::new)
 }
 
-/// Hand the terminal back: raw mode off, the alternate screen left, the cursor
-/// shown. Prints nothing, so on a closed terminal it only returns the error.
+/// Enter the alternate screen and ask the terminal for focus reports: the
+/// transcript question's keys are inert while the terminal is unfocused, so
+/// the TUI has to learn when its frames reach the user. The ask follows the
+/// screen it is reported on and is best-effort: a terminal that keeps no focus
+/// state ignores it and sends no report, and a failed write of it must not stop
+/// the TUI, so that failure is logged and the window's drawn timing stands.
+fn enter_screen(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    ratatui::crossterm::execute!(out, ratatui::crossterm::terminal::EnterAlternateScreen)?;
+    if let Err(e) = ratatui::crossterm::execute!(out, EnableFocusChange) {
+        crate::logline::logline!("clauth: could not ask the terminal for focus reports: {e}");
+    }
+    Ok(())
+}
+
+/// Hand the terminal back: raw mode off and the alternate screen left by
+/// `restore`, then focus reports stopped and the cursor shown. Raw mode comes
+/// off first since it writes nothing to stdout, so a terminal that stopped
+/// reading gets its line discipline back before a write waits on it. Every
+/// step runs even when an earlier one fails, though `restore` itself stops
+/// at a failed raw-mode reset and leaves the alternate screen up; the first
+/// failure is returned. Prints nothing, so on a closed terminal it only
+/// returns the error.
+fn give_back_steps<W: std::io::Write>(
+    out: &mut W,
+    restore: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let restored = restore();
+    let focus = ratatui::crossterm::execute!(out, DisableFocusChange);
+    let shown = ratatui::crossterm::execute!(out, ratatui::crossterm::cursor::Show);
+    restored.and(focus).and(shown)
+}
+
+/// [`give_back_steps`] over the process's stdout and ratatui's restore: the
+/// one path every hand-back takes.
 fn give_back_terminal() -> std::io::Result<()> {
-    let restored = ratatui::try_restore();
-    let shown = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
-    restored.and(shown)
+    give_back_steps(&mut std::io::stdout(), ratatui::try_restore)
 }
 
 /// [`give_back_terminal`] on a `clauth-tui-restore` thread, waited for at most
@@ -358,7 +385,14 @@ fn run_loop(
     let shutdown = Arc::clone(&application.shutdown);
     frames_then_exit(
         watch,
-        |stop_requested| run_frames(terminal, &mut application, stop_requested),
+        |stop_requested| {
+            run_frames(
+                terminal,
+                &mut application,
+                &mut TerminalEvents,
+                stop_requested,
+            )
+        },
         || {
             shutdown.run();
             Ok(())
@@ -399,9 +433,33 @@ fn exit_outcome(frames: Result<()>, signal: Option<i32>, shutdown: Result<()>) -
     shutdown
 }
 
+/// Where the frame loop reads its input: the terminal's own queue in the TUI
+/// ([`TerminalEvents`]), a scripted one in tests.
+trait EventSource {
+    /// Whether an event is ready within `timeout`; [`Duration::ZERO`] answers
+    /// for what is queued now.
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<bool>;
+    /// The next event, waiting for one when none is queued.
+    fn read(&mut self) -> std::io::Result<Event>;
+}
+
+/// The terminal's input queue, through crossterm.
+struct TerminalEvents;
+
+impl EventSource for TerminalEvents {
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> std::io::Result<Event> {
+        event::read()
+    }
+}
+
 fn run_frames<B>(
     terminal: &mut ratatui::Terminal<B>,
     application: &mut app::App,
+    events: &mut impl EventSource,
     stop_requested: &mut dyn FnMut() -> bool,
 ) -> Result<()>
 where
@@ -416,28 +474,84 @@ where
         if stop_requested() {
             return Ok(());
         }
-        terminal.draw(|frame| render::draw(frame, application))?;
-        let size = terminal.size()?;
-        // Update compact + width-floor state each frame so the banner appears as
-        // soon as the terminal shrinks below 14 rows or the width floor (and
-        // clears when it grows back).
-        application.update_compact(size.height, size.width);
-
-        let timeout = TICK.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app::handle_key(application, key);
-                }
-                Event::Resize(_, _) => { /* redraw next iteration */ }
-                _ => {}
-            }
-        }
+        run_frame(terminal, application, events, last_tick)?;
 
         if last_tick.elapsed() >= TICK {
             app::on_tick(application);
             last_tick = Instant::now();
         }
+    }
+    Ok(())
+}
+
+/// One pass of the frame loop: draw, then handle at most one event, waiting
+/// for one until the next tick is due. A frame that shows the transcript
+/// question a meaning no earlier frame showed, or takes it off the screen,
+/// first drops every key already queued: those keys were typed before the
+/// frame that shows what they would answer. A focus report reaches the app
+/// either way, since the question's keys are only live while the terminal is
+/// focused. Every poll that finds the queue empty records that clock as the
+/// earliest a key read next may have been typed, each pass's own check
+/// included, and while the question's keys are inert the wait ends with their
+/// window, so the frame drawn then shows the buttons live.
+fn run_frame<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    application: &mut app::App,
+    events: &mut impl EventSource,
+    last_tick: Instant,
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
+    // The queue's own emptiness before this pass draws: a key arriving during
+    // the draw or the wait may have been typed any time after this moment. A
+    // key arriving inside the wait keeps the poll from timing out, so a stream
+    // of keys would otherwise never re-certify that moment.
+    if !events.poll(Duration::ZERO)? {
+        application.queue_seen_empty();
+    }
+    terminal.draw(|frame| render::draw(frame, application))?;
+    if application.frame_drawn() {
+        // Zero-timeout polls read only what is queued now, so the drop ends
+        // while keys keep arriving. Keys are dropped; a focus report still
+        // reaches the app, since losing one would leave the question inert
+        // (or answering while unseen) for want of an event.
+        while events.poll(Duration::ZERO)? {
+            match events.read()? {
+                Event::FocusGained => app::handle_focus(application, true),
+                Event::FocusLost => app::handle_focus(application, false),
+                _ => {}
+            }
+        }
+        // The drop's last poll found the queue empty.
+        application.queue_seen_empty();
+    }
+    let size = terminal.size()?;
+    // Update compact + width-floor state each frame so the banner appears as
+    // soon as the terminal shrinks below 14 rows or the width floor (and
+    // clears when it grows back).
+    application.update_compact(size.height, size.width);
+
+    let tick_wait = TICK.saturating_sub(last_tick.elapsed());
+    let timeout = application
+        .key_window_wait()
+        .map_or(tick_wait, |left| tick_wait.min(left));
+    if events.poll(timeout)? {
+        match events.read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                app::handle_key(application, key);
+            }
+            // Focus reports reach the app whatever is on screen; nothing else
+            // reacts to them. A resize needs nothing here: every pass draws
+            // anew.
+            Event::FocusGained => app::handle_focus(application, true),
+            Event::FocusLost => app::handle_focus(application, false),
+            _ => {}
+        }
+    } else {
+        // No event within the wait: the queue stood empty at its end.
+        application.queue_seen_empty();
     }
     Ok(())
 }

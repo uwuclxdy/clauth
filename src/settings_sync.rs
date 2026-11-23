@@ -388,16 +388,19 @@ pub(crate) struct SyncPass {
     /// Whether the merge ran: `false` when a failed operator put-back skipped
     /// it, or an unreadable `config.toml` paused it.
     pub(crate) merged: bool,
-    /// Whether the pass wrote a file or failed to: a retention put-back or
-    /// record write, a merge write.
+    /// Whether the pass wrote a file, failed to, or could not read or parse a
+    /// registered spawn file it had a number for: a retention put-back or
+    /// record write, a spawn-file keep-current rewrite, a merge write.
     pub(crate) attempted_write: bool,
 }
 
 impl SyncPass {
-    /// Whether the fast path may key this pass: the merge ran, and the pass
-    /// wrote no file and failed to write none. A stat key taken before a pass
-    /// that wrote describes bytes the pass replaced, so the same bytes
-    /// restored at the same stat would read as settled.
+    /// Whether the fast path may key this pass: the merge ran, the pass wrote
+    /// no file and failed to write none, and it could read and parse every
+    /// spawn file it had a number for. A stat key taken before a pass that
+    /// wrote describes bytes the pass replaced, so the same bytes restored at
+    /// the same stat would read as settled; one taken before a pass that owes
+    /// a retry would skip the retry.
     pub(crate) fn cacheable(self) -> bool {
         self.merged && !self.attempted_write
     }

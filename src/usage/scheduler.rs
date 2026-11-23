@@ -7195,7 +7195,8 @@ fn tps_producer_tick_leased(now_ms: u64, lease: Option<LeaseTicket<'_>>) {
     if !write {
         return;
     }
-    if let Err(e) = crate::profile::atomic_write_600(&dir.join(crate::tps::TPS_CACHE_FILE), &bytes)
+    if let Err(e) =
+        crate::profile::atomic_write_600_fast(&dir.join(crate::tps::TPS_CACHE_FILE), &bytes)
     {
         logline!("clauth: failed to publish tps_cache.json: {e}");
         // Do not advance the stamp: the next tick retries the write.
@@ -12039,6 +12040,7 @@ fn scan_recovery_leased(
                         check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
                         own_inference: profile
                             .is_some_and(crate::claude::has_own_inference_endpoint),
+                        plan_ends: profile.and_then(|p| p.plan_ends),
                     }
                 })
                 .collect(),

@@ -194,14 +194,19 @@ Without `--pid`, `clauth which --json` carries `tps`: `speed` (float or `null`) 
   - `--yes` skips every prompt: the key prompt (the key falls back to `prefix+a` unless `--key` names one) and both confirms, herdr's install preview included. `--yes` is required on a non-TTY stdin or stdout.
   - **`herdr uninstall`** reverses both halves behind one confirm, and declining leaves both alone; it removes only the blocks clauth marked as its own.
   - For either command `--no-config` covers the plugin and leaves `config.toml` untouched.
-  - After that, clauth keeps the plugin current on its own: it lands the plugin at the latest release and compares the installed checkout's commit against that release's commit, reinstalling when they differ, up to once per 30 minutes (`CLAUTH_NO_UPDATE=1` opts out).
+  - After that, clauth keeps the plugin current on its own: it lands the plugin at the latest release and compares the installed checkout's commit against that release's commit, reinstalling when they differ, up to once per 30 minutes (turning off the Config tab's `auto-update` row, or `CLAUTH_NO_UPDATE=1`, opts out).
   - The whole surface, including the per-pane account tag: [herdr plugin](Herdr-Plugin).
+- **`rex install`** writes the Rex plugin bundled in the binary to `clauth/` beside Rex's `init.lua` and appends one marked `require("clauth")` block that loads it, after a `[y/N]`.
+  - **Rex support is experimental**: nothing heals or updates the install on its own, the Services tab's `rex` row only reports it (naming `clauth rex install` when it is missing or stale), and a new Rex build can break it.
+  - The plugin opens Claude Code through `clauth start --auto --with-fallback`, shows the dashboard in a floating pane, and labels each pane with the account it spends.
+  - Rerun it after upgrading clauth to refresh the files; it stops the running pane-label watcher so Rex's reload starts one on the new files. **`rex uninstall`** takes the block and the files back out, stops the watcher and removes its state under `~/.local/state/clauth-rex/`; it refuses while a string outside a comment and outside clauth's block in `init.lua` names `clauth`, and while the block holds a line clauth did not write. `--yes` skips the prompt for either.
+  - The whole surface: [Rex plugin](Rex-Plugin).
 
 ### Environment variables
 
 | Variable | Effect |
 |----------|--------|
-| `CLAUTH_NO_UPDATE=1` | disables the background update check and self-replacement even when the Config tab's `auto-update` toggle is on |
+| `CLAUTH_NO_UPDATE=1` | disables the hourly background update check and self-replacement in the process it is set for, even when the Config tab's `auto-update` toggle is on |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
 | `CLAUTH_NO_API=1` | disables the daemon's REST listener whatever `--listen` says |
 | `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |

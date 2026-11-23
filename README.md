@@ -41,7 +41,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 - 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Ultra / Team / Enterprise) or a custom API endpoint, plan tier detected for you
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
-- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts on a plan with a 5h limit queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
+- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. It can also spend the plan that ends first, so a canceled plan is used up before it lapses. Opted-in accounts on a plan with a 5h limit queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, tells a session when the account behind it changed, and, with `daemon --listen`, can hand its permission asks to a connected phone
 - 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves to another machine over HTTPS with `--listen`: that feed, the account switch, the herdr panes with their terminal streams, Claude Code session history, prompts and key presses into a pane, and prompts and interrupts into a session
@@ -67,7 +67,7 @@ cargo install clauth
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
 ```
 
-Binary installs update themselves in the background, checksum and signature verified before anything is replaced; the Config tab's `auto-update` toggle turns that off, and `CLAUTH_NO_UPDATE=1` overrides it. Cargo installs upgrade with `cargo install clauth`. On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
+Binary installs update themselves in the background within their major version: the running daemon and every TUI check at their start and then hourly, and the release is checksum and signature verified before anything is replaced. A new major version is never installed automatically; clauth names it, and you install it by hand after reading its release note. The Config tab's `auto-update` toggle turns updates off, and `CLAUTH_NO_UPDATE=1` overrides it. Cargo installs upgrade with `cargo install clauth`. On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
 
 ## Quickstart
 
@@ -187,6 +187,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [REST API](https://github.com/uwuclxdy/clauth/wiki/REST-API) | what `clauth daemon --listen` serves: TLS, device pairing, every route, push, CORS |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server, `delegate` in full, answering a session from your phone |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
+| [Rex plugin](https://github.com/uwuclxdy/clauth/wiki/Rex-Plugin) | experimental: Claude Code panes through clauth in Rex, the dashboard, the per-pane account label |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |
 | [Codex](https://github.com/uwuclxdy/clauth/wiki/Codex) | ChatGPT logins as codex profiles: capture, sessions, the codex chain |
 | [Security](https://github.com/uwuclxdy/clauth/wiki/Security) | where credentials live and how they move |

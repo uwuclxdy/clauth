@@ -206,6 +206,7 @@ fn the_listing_pages_newest_first_across_both_stores_with_a_round_trip_cursor() 
                 "store": "global",
                 "via": [],
                 "lacks": [],
+                "caps": [],
             }],
             "next_before": null,
         })

@@ -944,7 +944,7 @@ fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
     let hint_on = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
     assert_eq!(
         hint_on,
-        "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+        "checks for updates hourly, unless CLAUTH_NO_UPDATE=1"
     );
     let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
     assert_eq!(hint_off, "no update checks");

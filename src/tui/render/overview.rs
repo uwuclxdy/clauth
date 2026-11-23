@@ -135,11 +135,12 @@ fn more_members_line(hidden: usize) -> Line<'static> {
 
 /// The accounts panel's title-right meta: one count per harness — every
 /// harness whatever the filter shows, since the counts describe the rows the
-/// table lists, never the view. A roster with no accounts drops out of the
-/// words; with all empty there is nothing to count and no slot renders.
+/// table lists, never the view; a disabled account has no row, so no count.
+/// A roster with no accounts drops out of the words; with all empty there is
+/// nothing to count and no slot renders.
 fn harness_counts(app: &App) -> String {
     let mut terms: Vec<String> = Vec::new();
-    let claude_n = app.config().profiles.len();
+    let claude_n = app.config().enabled_profiles().count();
     if claude_n > 0 {
         terms.push(format!("{claude_n} claude"));
     }
@@ -186,13 +187,32 @@ fn draw_overview_accounts(
             ShuntPool::NotRead(_) => true,
             ShuntPool::Absent => false,
         };
-    if app.config().profiles.is_empty() && codex.is_empty() && !shunt_draws {
+    // A disabled account draws no row, so a roster of disabled accounts alone
+    // leaves the claude rows as empty as no roster at all; it says which. A
+    // filter hiding the claude rows is what empties them then, so the filter's
+    // own empty table draws instead.
+    let (roster_n, shown_n) = {
+        let cfg = app.config();
+        (cfg.profiles.len(), cfg.enabled_profiles().count())
+    };
+    let all_disabled = roster_n > 0 && shown_n == 0 && app.harness_filter.shows_claude();
+    if (roster_n == 0 || all_disabled) && codex.is_empty() && !shunt_draws {
         app.overview_selector.offset.set(0);
         app.overview_selector.viewport.set(0);
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        if all_disabled {
+            empty_state(
+                frame,
+                inner,
+                "every claude account is disabled",
+                "\u{2325}4",
+                "to enable one on the setup tab",
+            );
+        } else {
+            empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        }
         return;
     }
 
@@ -214,7 +234,7 @@ fn draw_overview_accounts(
         let cfg = app.config();
         (ResetFmt::from_state(&cfg.state), cfg.state.reduce_motion)
     };
-    let entries = app.band_entries(app.harness_filter);
+    let entries = app.band_entries(app.harness_filter, true);
     let ranges = App::heading_ranges(&entries);
 
     // One pass over the shared band walk builds both the rendered rows and the
@@ -249,8 +269,8 @@ fn draw_overview_accounts(
             BandEntry::Item(item) => {
                 starts.push(rendered);
                 let line = match *item {
-                    MainItemKind::Profile(_) => {
-                        render_overview_row(app, flat, &widths, flat == sel, focused, readings)
+                    MainItemKind::Profile(idx) => {
+                        render_overview_row(app, idx, &widths, flat == sel, focused, readings)
                     }
                     MainItemKind::Codex(idx) => render_codex_row(
                         &codex[idx],
@@ -597,17 +617,17 @@ impl OverviewWidths {
 
     fn build(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
+        // Sized off the rows the table draws: a disabled account has none.
         let max_name = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
         let fmt = ResetFmt::from_state(&app.config().state);
         let shows_clock = fmt.shows_clock();
         let claude_labels = if app.harness_filter.shows_claude() {
-            LabelWidths::of(app.config().profiles.iter().map(|p| {
+            LabelWidths::of(app.config().enabled_profiles().map(|p| {
                 let (five, seven) = overview_windows(p, readings);
                 // A DeepSeek row's 5h cell holds its balance, not a reading.
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
@@ -664,8 +684,7 @@ impl OverviewWidths {
         };
         let claude_chip_text = if app.harness_filter.shows_claude() {
             app.config()
-                .profiles
-                .iter()
+                .enabled_profiles()
                 .filter_map(|p| app.claude_resets.get(p.name.as_str()))
                 .map(|r| r.usable)
                 .filter(|count| *count > 0)
@@ -848,8 +867,7 @@ impl OverviewWidths {
 
         let deepseek_amount_w = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
@@ -951,7 +969,7 @@ fn column_facts(app: &App, readings: &ReadingsSnapshot) -> ColumnFacts {
         }
     };
     if app.harness_filter.shows_claude() {
-        for profile in &app.config().profiles {
+        for profile in app.config().enabled_profiles() {
             let (five_window, seven_window) = overview_windows(profile, readings);
             // A DeepSeek row's 5h cell holds its balance, not a window; every
             // other row draws the column's bar shape even with no reading (the
@@ -1414,7 +1432,7 @@ fn render_pool_row(
     spans.push(gap(widths, Gap::Timer));
     spans.push(timer);
     // Flatten the bar's threshold colors and reset countdown to dim for a
-    // paused/disabled row, the same pass the claude row applies.
+    // paused/disabled row.
     let flatten = |mut spans: Vec<Span<'static>>| {
         if disabled {
             for s in &mut spans {
@@ -1542,9 +1560,14 @@ fn render_overview_row(
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
+    // The row's place in the drawn list, the step its crest staggers by: the
+    // claude rows lead the list, less every disabled account, which has none.
+    let position = cfg.profiles[..idx]
+        .iter()
+        .filter(|p| !p.is_disabled())
+        .count();
 
     let active = cfg.is_active(&profile.name);
-    let disabled = profile.is_disabled();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
@@ -1576,23 +1599,12 @@ fn render_overview_row(
     let timer_span = if not_current {
         // An unpolled row drawing a cached reading carries the amber `⋯` where a
         // polled row would count down to its next refresh: the figures beside it
-        // are last-known, and no fetch leg currently refreshes them (a re-enable,
-        // a login or a key puts the profile back on a list). Styled directly
-        // rather than through `hue`, so a disabled row keeps this one hue while
-        // every other span still flattens to dim.
+        // are last-known, and no fetch leg currently refreshes them (a login or
+        // a key puts the profile back on a list).
         Span::styled(
             format!("{:>inner$} ", NOT_CURRENT_MARK, inner = inner),
             theme::warning(),
         )
-    } else if disabled {
-        // A disabled account is filtered out of the scheduler's polling set
-        // (`AppConfig::enabled_profiles`), and `publish_countdowns` republishes
-        // the `next_refresh_per_profile` map from the work-list snapshots on
-        // every tick, so its entry is dropped rather than left to tick to zero.
-        // With no reading to mark stale, blank the slot rather than claim a
-        // countdown, keeping its width so no column shifts. The spinner goes too —
-        // nothing can be in flight for a profile nothing polls.
-        Span::raw(" ".repeat(TIMER_SLOT))
     } else if token_refused {
         Span::raw(" ".repeat(TIMER_SLOT))
     } else if !app.fetch_lease.fetches_here()
@@ -1693,11 +1705,6 @@ fn render_overview_row(
     let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
-    // A disabled row flattens every semantic hue to dim — the whole row reads as
-    // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
-    // mark/`▲` still distinguish themselves without the color.
-    let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: a running delete (its spinner) > canceled subscription
     // or organization refusal (⊖) > broken login (×) > token danger (⊘) > bell
     // (!) > active (✻ / its working frame / ⏣ / ⥋) > peak hours (▲). A refused
@@ -1710,30 +1717,27 @@ fn render_overview_row(
     // authenticates as beats a schedule the Usage tab's pricing row already names.
     let auth_broken = cfg.is_auth_broken(&profile.name);
     if app.deleting.as_ref() == Some(&profile.name) {
-        spans.push(Span::styled(
-            spinner_frame(app.tick_count),
-            hue(theme::accent()),
-        ));
+        spans.push(Span::styled(spinner_frame(app.tick_count), theme::accent()));
         spans.push(Span::raw(" "));
     } else if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
-        spans.push(Span::styled("⊖", hue(theme::danger())));
+        spans.push(Span::styled("⊖", theme::danger()));
         spans.push(Span::raw(" "));
     } else if auth_broken {
         spans.push(Span::styled(
             theme::dead_credential_glyph(),
-            hue(theme::danger()),
+            theme::danger(),
         ));
         spans.push(Span::raw(" "));
     } else if token_danger {
-        spans.push(Span::styled("⊘", hue(theme::danger())));
+        spans.push(Span::styled("⊘", theme::danger()));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.is_ringing(profile.name.as_str()) {
-        spans.push(Span::styled("!", hue(theme::danger())));
+        spans.push(Span::styled("!", theme::danger()));
         spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
             active_mark(app, profile),
-            hue(Style::default().fg(theme::accent_2_color())),
+            Style::new().fg(theme::accent_2_color()),
         ));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
@@ -1741,22 +1745,13 @@ fn render_overview_row(
         // so an active profile on peak hours keeps its mark and the `▲` reads
         // "this other account is on the surcharged rate right now". The
         // pricing row on the Usage tab names the schedule and the flip.
-        spans.push(Span::styled("▲", hue(theme::warning())));
+        spans.push(Span::styled("▲", theme::warning()));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    // A disabled account can never be active (the disable action itself
-    // refuses on an active target), so dim always wins over `name_color`.
-    let ns = bold_when(
-        if disabled {
-            theme::dim()
-        } else {
-            name_color(active)
-        },
-        selected && focused,
-    );
+    let ns = bold_when(name_color(active), selected && focused);
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths, Gap::Kind));
@@ -1766,22 +1761,20 @@ fn render_overview_row(
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
     // The identity wave is ambient MOTION, which reads as "this thing is live".
-    // A disabled or quarantined account is not, so it renders the same flat dim
-    // cell an unrecognized provider gets — dimming the crest would still animate.
+    // A quarantined account is not, so it renders the same flat dim cell an
+    // unrecognized provider gets — dimming the crest would still animate.
     if let Some(provider) = crest_provider(profile)
-        && !disabled
         && !auth_broken
         && !no_tier
     {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), idx);
-        spans.extend(identity_wave_spans(&clamped, provider, idx, wave_ms));
+        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), position);
+        spans.extend(identity_wave_spans(&clamped, provider, position, wave_ms));
         spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
-        // whole cell. A disabled row still flattens to dim, outranking no-data
-        // the way it outranks stale.
-        let style = if no_tier && !disabled {
+        // whole cell.
+        let style = if no_tier {
             theme::faint()
         } else {
             theme::dim()
@@ -1807,28 +1800,12 @@ fn render_overview_row(
         )
     };
     let reset_fmt = ResetFmt::from_state(&cfg.state);
-    // Flatten the bar's threshold colors and drain-colored reset countdown to dim
-    // for a disabled row. The NUMBERS stay — they're the last real reading and
-    // still informative; it's the semantic hue that lies once the data is frozen.
-    // Post-processed here rather than threaded through
-    // `window_summary_spans_bracketed`: that helper lives in the shared
-    // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
-    // future caller the way a new parameter would. Widths are unaffected (the
-    // pad math measures display cells, not styles).
-    let flatten = |mut spans: Vec<Span<'static>>| {
-        if disabled {
-            for s in &mut spans {
-                s.style = theme::dim();
-            }
-        }
-        spans
-    };
     let five_spans = if profile.provider == Some(Provider::DeepSeek) {
-        flatten(deepseek_balance_cell(
+        deepseek_balance_cell(
             widths.five_hour,
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
-        ))
+        )
     } else if readings
         .usage_of(&profile.name)
         .is_some_and(|usage| usage.no_five_hour_limit)
@@ -1837,9 +1814,9 @@ fn render_overview_row(
         // Opens the cell where a bar's `[` does; the row pad fills the rest,
         // so the 7d column keeps its place. A narrower cell falls through to
         // the dash, since `overview_windows` hides the 5h window under the mark.
-        flatten(vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())])
+        vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())]
     } else {
-        flatten(window_summary_spans_bracketed(
+        window_summary_spans_bracketed(
             five_window.as_ref(),
             widths.five_hour,
             widths.claude_labels.five,
@@ -1850,7 +1827,7 @@ fn render_overview_row(
             0,
             widths.five_bar_grow,
             widths.fill,
-        ))
+        )
     };
     let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
@@ -1884,14 +1861,11 @@ fn render_overview_row(
         );
         if seven_monthly && seven_bar {
             // The header stays `7d`, so the cell names the window itself.
-            // Inserted BEFORE the disabled-row flatten so a disabled monthly
-            // row dims it with the rest of the cell.
             seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
         }
-        let seven_spans = flatten(seven_cell);
-        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
+        let seven_len: usize = seven_cell.iter().map(|s| grapheme_cells(&s.content)).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
-        spans.extend(seven_spans);
+        spans.extend(seven_cell);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
     let resets = app
@@ -1918,8 +1892,7 @@ fn render_overview_row(
 /// The row's speed cell: the account's live speed off a fresh producer, blank
 /// when absent (never a dash standing in for a figure clauth did not read).
 /// Right-aligned to the column, and a figure ≥ 10 000 abbreviates to whole `k`
-/// (`12k`) so the column never clips a number into `…`. Already the `TEXT_DIM`
-/// tier a disabled row flattens to, so it needs no `hue` pass of its own.
+/// (`12k`) so the column never clips a number into `…`.
 fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
     let speed = app
         .fresh_tps()
@@ -1942,8 +1915,7 @@ fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
 /// names the one profile a bare `claude` authenticates as; an account can
 /// carry either, both, or neither.
 /// That is why the header reads `live` and not `active` — `active` is the
-/// active mark's sense app-wide. Already the `TEXT_DIM` tier a disabled row
-/// flattens to, so it needs no `hue` pass of its own.
+/// active mark's sense app-wide.
 fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
@@ -1963,8 +1935,7 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
 /// column header and the per-row cell both swap to carry it.
 fn any_deepseek(app: &App) -> bool {
     app.config()
-        .profiles
-        .iter()
+        .enabled_profiles()
         .any(|p| p.provider == Some(Provider::DeepSeek))
 }
 

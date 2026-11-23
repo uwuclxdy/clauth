@@ -65,9 +65,9 @@ The session home is `~/.clauth/profiles/work/codex-home-<sid>/`:
 | Entry | Shared (default) | `--isolated` |
 |-------|------------------|--------------|
 | `auth.json` | a link to the profile's chain | the same link |
-| `config.toml`, and every `*.config.toml` layer `codex --profile` reads | copies of the ones in the home your own codex reads with `sqlite_home`, `cli_auth_credentials_store` and `debug.config_lockfile` removed (codex writes its config in place, so it is never a link) | the same copies |
+| `config.toml`, and every `*.config.toml` layer `codex --profile` reads | copies of the ones in the home your own codex reads with `sqlite_home`, `cli_auth_credentials_store` and `debug.config_lockfile` removed, and the hooks declared inline under `[hooks]` removed unless the profile sets `hooks_json = true`, which keeps them and carries your codex's trust for them onto the session home; `[hooks.state]` always stays. Rewritten from your files at every session start (codex writes its config in place, so it is never a link, and what it writes there lasts until the profile's next session starts; on a host that cannot symlink, that includes a second session starting beside a running one) | the same copies, inline hooks always removed |
 | `skills`, `rules`, `agents`, `templates`, `references`, `AGENTS.md`, `plugins` | links to your own codex home's entries | absent |
-| `hooks.json` | linked only when the profile's `config.toml` sets `hooks_json = true` | absent |
+| `hooks.json` | linked only when the profile's `config.toml` sets `hooks_json = true` (copied, on a host that cannot symlink), with your codex's trust for its hooks carried onto the session home's resolved path, so a hook you trusted runs without asking again; a change to `hooks_json` takes effect at the next session start, also on a host that cannot symlink | absent |
 | `sessions/`, `archived_sessions/`, `history.jsonl`, the `*.sqlite` state stores | links into `~/.clauth/profiles/work/codex-home/`, the store every session of the profile shares | per session, discarded at exit |
 
 A thread is in the profile's store the moment codex writes it, so a later session lists it, and archiving one keeps it. The per-session home is removed when the session ends; the store never is.

@@ -858,6 +858,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         cert,
         key,
         dump_openapi,
+        exec_handover,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -870,6 +871,10 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
     assert!(
         !dump_openapi,
         "the document dump is opt-in exactly like the listener"
+    );
+    assert!(
+        !exec_handover,
+        "the hidden probe argument is opt-in like the document dump"
     );
     assert_eq!(
         listen, None,
@@ -896,6 +901,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             cert: _,
             key: _,
             dump_openapi: _,
+            exec_handover: _,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -1844,6 +1850,7 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             cert: None,
             key: None,
             dump_openapi: false,
+            exec_handover: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");

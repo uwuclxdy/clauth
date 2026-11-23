@@ -89,7 +89,7 @@ fn session_with_asks(asks: &[&str]) -> (HeldHome, Arc<Hub>, Arc<ApiContext>) {
         _stream: hub.subscribe_as(Some(&Tier::Control)),
         _home: home,
     };
-    let start = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true});
+    let start = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]});
     assert_eq!(ev(&hub, 100, start).0, 200);
     for (i, ask) in asks.iter().enumerate() {
         // A `q` ask is a question the answers name; any other a permission ask.

@@ -65,7 +65,7 @@
 //! profile's delete does the same for its own trees first
 //! ([`rescue_profile_trees`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2513,18 +2513,31 @@ pub(crate) mod namespaced_keychain_ledger {
 
     /// Whether a pid names a running process — `kill(pid, 0)` semantics on
     /// unix: the probe succeeds when the process exists, and `EPERM` (a
-    /// process this user may not signal) still proves existence. False on
-    /// non-unix, where no guarded delete ever runs and every row falls back
-    /// to the age bound.
-    #[allow(unsafe_code)]
+    /// process this user may not signal) still proves existence. On linux a
+    /// thread's id, which `kill` answers as well, reads false
+    /// (`pid_is_thread`). False on non-unix, where no guarded delete
+    /// ever runs and every row falls back to the age bound.
     pub(crate) fn pid_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
+            #[expect(
+                unsafe_code,
+                reason = "kill has no safe std wrapper; signal 0 probes existence and sends nothing"
+            )]
             // SAFETY: `pid` is a plain integer the OS interprets as a process
             // id; signal 0 probes existence and sends nothing (the same shape
             // `start::forward_signal` uses).
             let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            let exists =
+                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            #[cfg(target_os = "linux")]
+            {
+                exists && !super::pid_is_thread(pid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                exists
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8594,12 +8607,17 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     }
 }
 
-/// The per-spawn `--settings` file for the CC permission exemption
+/// The per-spawn `--settings` file for the CC permission exemption and a
+/// shared launch's remembered `cleanupPeriodDays`
 /// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
 /// (the profile dir), not inside it, so the fake-mode mirror never publishes
 /// it into `~/.claude` and `settings_sync` (which reconciles only
-/// `settings.json`) never reads it. Unique per session id; kept while
-/// [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
+/// `settings.json`) never reads it. A launch that carries the number into
+/// this file registers it in the retention record, which rewrites the file
+/// when the number changes — a delegate's own value sits as a floor under the
+/// remembered number, and a value the operator passed on their own
+/// `clauth start -- --settings` is never registered. Unique per session id;
+/// kept while [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
 pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
     // The name carries the session's flavor so GC can find its marker: an
     // isolated session's marker lives in `sessions-isolated-<sid>`, a shared
@@ -8881,13 +8899,52 @@ fn environ_bytes_config_dir_is(environ: &[u8], tree: &Path) -> bool {
     }
 }
 
+/// Whether `<proc_root>/<pid>` is a thread that is not its thread-group
+/// leader. Linux answers `kill(tid, 0)` and every `/proc/<tid>/…` file for
+/// such a thread as for a process (measured 2026-11-17; only the `/proc`
+/// listing leaves it out), so a recorded pid the kernel reissued as another
+/// program's thread id would read as that program. `status` names the leader
+/// in `Tgid` and the entry in `Pid`. False when `status` cannot be read or
+/// parsed (the pid gone, a `hidepid` mount): each reader then keeps the
+/// verdict its own read gives.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_entry_is_thread(proc_root: &Path, pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")) else {
+        return false;
+    };
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(':')?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+    };
+    matches!((field("Tgid"), field("Pid")), (Some(tgid), Some(own)) if tgid != own)
+}
+
+/// [`proc_entry_is_thread`] under the host's `/proc`: every linux per-pid
+/// reader of a recorded pid asks it before trusting a read, except the
+/// daemon's inherited-children reads (`gateway::zombie_start`,
+/// `gateway::probe_inherited`), whose start-time match already refuses a
+/// reused pid. The children listing reads only ids the `/proc` listing
+/// names, which leaves threads out.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_is_thread(pid: u32) -> bool {
+    proc_entry_is_thread(Path::new("/proc"), pid)
+}
+
 /// The process `pid`'s environment as NUL-separated `KEY=value` bytes, read as
 /// the supervisor checks read it: `/proc/<pid>/environ` on linux, the
-/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, and on
-/// every other platform.
+/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, for a
+/// thread's id on linux, and on every other platform.
 pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         std::fs::read(format!("/proc/{pid}/environ")).ok()
     }
     #[cfg(target_os = "macos")]
@@ -8903,10 +8960,13 @@ pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
 
 /// The process `pid`'s argv, argv0 first: `/proc/<pid>/cmdline` on linux with
 /// empty words dropped, the `KERN_PROCARGS2` argv on macOS. `None` where it
-/// cannot be read, and on every other platform.
+/// cannot be read, for a thread's id on linux, and on every other platform.
 pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         Some(
             cmdline
@@ -9284,9 +9344,10 @@ fn supervisor_state(tree: &Path) -> SupervisorState {
 #[cfg(target_os = "linux")]
 fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
     // kill(0) proves the pid still names a process — live, zombie, or a
-    // hidepid-hidden one — without reading /proc. False means the pid is
-    // positively gone (only that counts as dead, never an unreadable or
-    // hidden `/proc/<pid>/stat`).
+    // hidepid-hidden one — and a readable `status` naming another thread-group
+    // leader turns it down as a thread's id. False means the pid is
+    // positively gone or a thread (only that counts as dead, never an
+    // unreadable or hidden `/proc/<pid>/stat`).
     if !namespaced_keychain_ledger::pid_alive(pid) {
         return SupervisorState::Gone;
     }
@@ -9703,9 +9764,12 @@ fn supervisor_argv_and_config_dir_match(pid: u32, tree: &Path) -> bool {
 
 /// Whether the process `pid`'s cmdline holds `daemon` immediately followed by
 /// `run` — the transient supervisor's argv shape (`claude daemon run --origin
-/// transient`, measured).
+/// transient`, measured). False for a thread's id.
 #[cfg(target_os = "linux")]
 fn cmdline_holds_daemon_run(pid: u32) -> bool {
+    if pid_is_thread(pid) {
+        return false;
+    }
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -9718,10 +9782,7 @@ fn cmdline_holds_daemon_run(pid: u32) -> bool {
 /// mismatch is another tree's supervisor.
 #[cfg(target_os = "linux")]
 fn environ_config_dir_is(pid: u32, tree: &Path) -> bool {
-    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
-        return false;
-    };
-    environ_bytes_config_dir_is(&environ, tree)
+    process_environ(pid).is_some_and(|environ| environ_bytes_config_dir_is(&environ, tree))
 }
 
 /// Whether the process `pid` holds the transient supervisor's argv AND its
@@ -14420,18 +14481,55 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
 const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
 const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
 
-/// Copy the operator's `config.toml` into a session home with the escape keys
-/// removed. An unparseable config copies through verbatim: codex will reject it
-/// the same way, and a session that cannot start is a better answer than one
-/// silently reshaped by a parse this function got wrong. Comments and key order
-/// are lost in the rewrite, which costs nothing — the copy is codex's to write
-/// in place and is discarded at teardown, never synced back over the original.
+/// What a copied config does with the hooks declared inline under its `[hooks]` table.
+/// Inline hooks execute code like `hooks.json` does, so they ride the same opt-in: kept only on a shared home whose profile sets [`CodexProfileOpts::hooks_json`], stripped everywhere else.
+#[derive(Debug, Clone, Copy)]
+enum InlineHooks<'a> {
+    /// Drop every inline hook entry, and every `[hooks.state]` entry keyed to one of these session spellings: a copy with no operator file left has no trust to derive it from, so a hook the operator trusted must ask again.
+    /// The operator's own entries stay.
+    Strip(&'a [PathBuf]),
+    /// Keep them, and re-key the operator's trust onto the session home.
+    Carry(&'a HookTrust),
+}
+
+/// Where the operator's hook trust is keyed, and where a session's must be.
+/// Codex keys trust as `<source>:<event>:<group>:<handler>`, `<source>` being the resolved `CODEX_HOME` joined with the declaring file (`hooks.json`, `config.toml` or a `<name>.config.toml` layer).
+#[derive(Debug)]
+struct HookTrust {
+    /// The operator home's spellings, resolved first, then the raw one when it differs.
+    /// Codex writes the resolved spelling when `CODEX_HOME` is set, so that one wins when both spellings key one hook.
+    operator: Vec<PathBuf>,
+    /// The session home as codex resolves it, never the link's target, which would be the operator's own file.
+    session: PathBuf,
+    /// Every file name a hook can be declared in.
+    sources: Vec<String>,
+}
+
+/// The spellings a codex home may be keyed under: the resolved form codex writes when `CODEX_HOME` is set, then `home` itself when the two differ.
+/// A home that does not resolve yet keeps its given spelling.
+fn codex_home_spellings(home: &Path) -> Result<Vec<PathBuf>> {
+    match crate::canonical::codex_home(home) {
+        Ok(resolved) if resolved.as_path() != home => Ok(vec![resolved, home.to_path_buf()]),
+        Ok(_) => Ok(vec![home.to_path_buf()]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![home.to_path_buf()]),
+        Err(e) => Err(e).with_context(|| format!("failed to resolve {}", home.display())),
+    }
+}
+
+/// The `<source>:` prefix of every trust key a hook declared in `source` gets, `source` spelled byte for byte as given: a Windows verbatim `\\?\` home stays verbatim, the spelling codex keys with.
+fn hook_trust_prefix(source: &Path) -> String {
+    format!("{}:", source.display())
+}
+
+/// Copy the operator's `config.toml` (or a `<name>.config.toml` layer) into a session home with the escape keys removed and its inline hooks handled per `hooks`.
+/// An unparseable config copies through verbatim: codex will reject it the same way, and a session that cannot start is a better answer than one silently reshaped by a parse this function got wrong.
+/// Comments and key order are lost in the rewrite.
+/// The copy is derived, never synced back: every build rewrites it from the operator's current file, which drops what codex wrote into it in place, the state a per-session home loses at teardown anyway.
 ///
-/// Every branch lands owner-only: the copy sits in a tree the perms sweep
-/// stops short of, so the operator's own mode would otherwise be what it keeps.
-fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+/// Every branch lands owner-only through the atomic writer, so a sibling codex reading mid-build sees the old file or the new one, never a partial one: the copy sits in a tree the perms sweep stops short of, so the operator's own mode would otherwise be what it keeps.
+fn copy_codex_config(src: &Path, dst: &Path, hooks: InlineHooks<'_>) -> Result<()> {
     let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let bytes = match stripped_codex_config(&raw) {
+    let bytes = match rewritten_codex_config(&raw, hooks) {
         Some(parsed) => toml::to_string(&parsed)
             .with_context(|| format!("failed to re-render {}", src.display()))?
             .into_bytes(),
@@ -14441,21 +14539,104 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("failed to write {}", dst.display()))
 }
 
-/// The parsed config with the escape keys removed, or `None` when there was
-/// nothing to strip or the bytes do not parse, so the copy goes verbatim.
-fn stripped_codex_config(raw: &[u8]) -> Option<toml::Value> {
+/// The parsed config with the escape keys removed and its inline hooks stripped or their trust carried, or `None` when nothing changed or the bytes do not parse, so the copy goes verbatim.
+fn rewritten_codex_config(raw: &[u8], hooks: InlineHooks<'_>) -> Option<toml::Value> {
     let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
     let table = parsed.as_table_mut()?;
-    let mut stripped = false;
+    let mut changed = false;
     for key in CODEX_CONFIG_STRIP_KEYS {
-        stripped |= table.remove(*key).is_some();
+        changed |= table.remove(*key).is_some();
     }
     for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
         if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
-            stripped |= sub.remove(*key).is_some();
+            changed |= sub.remove(*key).is_some();
         }
     }
-    stripped.then_some(parsed)
+    changed |= match hooks {
+        InlineHooks::Strip(session) => {
+            let stripped = strip_inline_hooks(table);
+            let dropped = drop_session_trust(table, session);
+            stripped || dropped
+        }
+        InlineHooks::Carry(trust) => carry_hook_trust(table, trust),
+    };
+    changed.then_some(parsed)
+}
+
+/// Drop every key of the `[hooks]` table but `state`: codex reads the fourteen event keys there as hook declarations and ignores any other key, so nothing else is a hook that could run.
+/// The operator's trust entries stay.
+/// A `hooks` that is not a table is left for codex to reject.
+fn strip_inline_hooks(table: &mut toml::Table) -> bool {
+    let Some(hooks) = table.get_mut("hooks").and_then(toml::Value::as_table_mut) else {
+        return false;
+    };
+    let before = hooks.len();
+    hooks.retain(|key, _| key == "state");
+    if hooks.len() == before {
+        return false;
+    }
+    if hooks.is_empty() {
+        table.remove("hooks");
+    }
+    true
+}
+
+/// Drop the `[hooks.state]` entries keyed to one of `session`'s spellings: the carry wrote them for this home, so keeping them would run a hook trusted after the operator took the trust away with their config.
+/// The operator's own entries stay.
+fn drop_session_trust(table: &mut toml::Table, session: &[PathBuf]) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let prefixes: Vec<String> = session
+        .iter()
+        .map(|home| format!("{}{}", home.display(), std::path::MAIN_SEPARATOR))
+        .collect();
+    let before = state.len();
+    state.retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
+    state.len() != before
+}
+
+/// Codex keys a hook's trust by the resolved path of the file that declares it, and a session home is not the operator's home, so a hook the operator trusted reads as new in a session and codex asks again.
+/// Re-key each entry whose source is one of the operator's hook files onto the same file under the session home.
+/// The hash is copied, never computed: a hook changed since the operator trusted it still fails codex's check and still asks.
+/// The operator's own entries stay, and an entry already present under the session key wins.
+/// When both operator spellings key one hook, the resolved spelling's entry is the one carried.
+fn carry_hook_trust(table: &mut toml::Table, trust: &HookTrust) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let mut carried: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for file in &trust.sources {
+        let to = hook_trust_prefix(&trust.session.join(file));
+        for operator in &trust.operator {
+            let from = hook_trust_prefix(&operator.join(file));
+            for (key, value) in state.iter() {
+                if let Some(rest) = key.strip_prefix(&from) {
+                    carried
+                        .entry(format!("{to}{rest}"))
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
+    let mut changed = false;
+    for (key, value) in carried {
+        if let toml::map::Entry::Vacant(slot) = state.entry(key) {
+            slot.insert(value);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
@@ -14532,6 +14713,19 @@ enum ConvergePrior {
     Teardown,
 }
 
+/// Land a fake-mode session copy's bytes in the profile store through the
+/// synced owner-only writer: the store is what the rotation and capture
+/// machinery read, and it holds a single-use refresh token, so a power loss
+/// must not bring it back as its old bytes. The session-side copy keeps
+/// [`copy_file`], whose sync per file the bulk `~/.claude` mirror cannot
+/// afford.
+fn publish_copy_to_store(copy: &Path, store: &Path) -> Result<()> {
+    let bytes =
+        std::fs::read(copy).with_context(|| format!("failed to read {}", copy.display()))?;
+    crate::profile::atomic_write_600(store, bytes)
+        .with_context(|| format!("failed to write {}", store.display()))
+}
+
 /// Converge the profile store and a fake-mode home's `auth.json` copy at a
 /// session boundary; content-equal is a no-op. The chain's own event decides:
 /// the later `last_refresh` wins, mtime only where a side has no parseable
@@ -14549,7 +14743,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
         (true, false) => copy_file(store, copy),
         // The store must never lag a chain that exists only in the copy: the
         // rotation and capture machinery read the STORE.
-        (false, true) => copy_file(copy, store),
+        (false, true) => publish_copy_to_store(copy, store),
         (true, true) => {
             if files_match(store, copy).unwrap_or(false) {
                 return Ok(());
@@ -14562,7 +14756,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
                 },
             };
             if copy_wins {
-                copy_file(copy, store)
+                publish_copy_to_store(copy, store)
             } else {
                 copy_file(store, copy)
             }
@@ -14585,7 +14779,7 @@ fn last_refresh_ms_of(path: &Path) -> Option<i64> {
 /// reader and unknown keys stay tolerated.
 #[derive(Default, serde::Deserialize)]
 struct CodexProfileOpts {
-    /// Link the operator codex home's `hooks.json` into shared session homes.
+    /// Link the operator codex home's `hooks.json` into shared session homes and keep the inline hooks of their copied configs, carrying the operator's trust for both.
     #[serde(default)]
     hooks_json: bool,
 }
@@ -14600,9 +14794,22 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
     }
 }
 
-/// Build one codex session home. Additive over an existing tree, like the
-/// claude build: a link already in place is left alone, so a rebuild over a
-/// live shared tree cannot yank entries out from under a sibling.
+/// The names in `dir` codex reads as a config: `config.toml` and each `<name>.config.toml` profile layer.
+/// An unreadable `dir` lists none.
+fn codex_config_names(dir: &Path) -> impl Iterator<Item = String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name == "config.toml" || name.ends_with(".config.toml")).then_some(name)
+        })
+}
+
+/// Build one codex session home.
+/// Links are additive over an existing tree, like the claude build: a link already in place is left alone, so a rebuild over a live shared tree cannot yank entries out from under a sibling.
+/// The derived copies are the exception: `config.toml`, each layer and the fake transport's `hooks.json` copy are rewritten from the operator's current files on every build, because a home can outlive the build that made it (the fake transport's bare stems, a per-session home under a recycled sid) and which hooks it runs must follow the profile's current opt-in.
 ///
 /// The table (from the codex plan):
 /// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
@@ -14613,9 +14820,8 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   already documents, sharpened by codex's single-use refresh chain: the
 ///   copy is a second carrier whose refreshes strand the store, and a
 ///   fake-mode host accepts that or does not run codex sessions.
-/// - `config.toml` — a COPY of the operator's (codex writes it in place, so a
-///   link would mutate the operator's own file). Absent operator config copies
-///   nothing.
+/// - `config.toml` and each layer — a COPY of the operator's (codex writes it in place, so a link would mutate the operator's own file), its inline hooks kept and their trust carried only where `hooks.json` links in.
+///   Absent operator config copies nothing, and a copy whose operator file is gone is stripped in place with the trust carried for this home.
 /// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
 ///   links (fake: copies); isolated links nothing from the operator.
 /// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
@@ -14659,27 +14865,54 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
     }
 
-    let operator_config = operator.join("config.toml");
-    if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
-        copy_codex_config(&operator_config, &home.join("config.toml"))?;
+    let link_hooks = isolation == Isolation::Shared && codex_profile_opts(name).hooks_json;
+    let (operator_hooks, session_hooks) = (operator.join("hooks.json"), home.join("hooks.json"));
+    let session_homes = codex_home_spellings(home)?;
+
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the base config, and CODEX_HOME is this session home, so without the layers the flag resolves to an empty layer and silently runs the base config.
+    // They are sanitized like the base file: a layer can spell the same escapes, and declare hooks of its own.
+    let operator_configs: BTreeSet<String> = codex_config_names(&operator)
+        .filter(|file| operator.join(file).exists())
+        .collect();
+    let trust = if link_hooks {
+        Some(HookTrust {
+            operator: codex_home_spellings(&operator)?,
+            session: session_homes[0].clone(),
+            sources: std::iter::once("hooks.json".to_owned())
+                .chain(operator_configs.iter().cloned())
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let inline = trust
+        .as_ref()
+        .map_or(InlineHooks::Strip(&[]), InlineHooks::Carry);
+    for file in &operator_configs {
+        copy_codex_config(&operator.join(file), &home.join(file), inline)?;
     }
-    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
-    // base config, and CODEX_HOME is this session home — so without these the
-    // flag resolves to an empty layer and silently runs the base config. They
-    // are sanitized like the base file: a layer can spell the same escapes.
-    if let Ok(entries) = std::fs::read_dir(&operator) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if !name.ends_with(".config.toml") {
-                continue;
-            }
-            let dst = home.join(name);
-            if dst.symlink_metadata().is_err() {
-                copy_codex_config(&entry.path(), &dst)?;
-            }
+    // A copy whose operator file is gone derives from no declaration at all, so it keeps no inline hook and no trust carried for this home.
+    // Stripped in place rather than removed: codex may have created it itself.
+    for file in codex_config_names(home).filter(|file| !operator_configs.contains(file)) {
+        let dst = home.join(&file);
+        if dst.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+            copy_codex_config(&dst, &dst, InlineHooks::Strip(&session_homes))?;
+        }
+    }
+
+    // Under Fake the home's `hooks.json` is clauth's copy, derived like the configs: rewritten from the operator's current file while the opt-in holds, removed once it does not.
+    if mode == LinkMode::Fake {
+        if link_hooks && operator_hooks.is_file() {
+            let bytes = std::fs::read(&operator_hooks)
+                .with_context(|| format!("failed to read {}", operator_hooks.display()))?;
+            crate::profile::atomic_write_600(&session_hooks, bytes)
+                .with_context(|| format!("failed to write {}", session_hooks.display()))?;
+        } else if session_hooks
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_file())
+        {
+            std::fs::remove_file(&session_hooks)
+                .with_context(|| format!("failed to remove {}", session_hooks.display()))?;
         }
     }
 
@@ -14687,8 +14920,8 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         for entry in CODEX_OPERATOR_ENTRIES {
             place(&operator.join(entry), &home.join(entry))?;
         }
-        if codex_profile_opts(name).hooks_json {
-            place(&operator.join("hooks.json"), &home.join("hooks.json"))?;
+        if link_hooks && mode == LinkMode::Real {
+            place(&operator_hooks, &session_hooks)?;
         }
         if mode == LinkMode::Real {
             crate::profile::mkdir_700(&global)
