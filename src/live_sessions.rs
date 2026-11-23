@@ -390,9 +390,17 @@ pub(crate) struct LiveTally {
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
     unattributed: usize,
-    /// The registry or the bare-marker dir could not be listed (it exists but
-    /// refuses, or `~/.clauth` itself does not resolve), so [`LiveTally::total`]
-    /// has no reading to give.
+    /// Each registry row's session id and the account the row runs on — the
+    /// row's `current_member`, or its start account before the first swap
+    /// writes one — so a reader can tell a session starting from one moving
+    /// accounts. Bare sessions and background jobs carry no registry id: they
+    /// reach the counts only.
+    session_members: std::collections::BTreeMap<String, String>,
+    /// The registry, the bare-marker dir, the job store or a profile dir could
+    /// not be listed (it exists but refuses, the OS fails to yield one of its
+    /// entries, or `~/.clauth` itself does not resolve), or a running job's
+    /// supervisor record could not be read, so [`LiveTally::total`] has no
+    /// reading to give.
     unread: bool,
 }
 
@@ -400,6 +408,10 @@ pub(crate) struct LiveTally {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MemberSessions {
     pub(crate) sessions: usize,
+    /// How many of `sessions` are delegate runs: one-shot headless runs a
+    /// clauth MCP spawned, counted inside `sessions` as every per-account
+    /// surface counts them.
+    pub(crate) delegates: usize,
     /// How many of `sessions` the fallback chain is allowed to move.
     pub(crate) following: usize,
     /// The newest swap ONTO this account. `None` when no session here has ever
@@ -408,21 +420,48 @@ pub(crate) struct MemberSessions {
 }
 
 impl LiveTally {
-    /// Read the registry and drop rows whose session is gone. Row GC runs from
+    /// Every live session on the account it currently runs as: registry rows
+    /// whose marker is still held, the bare `claude` sessions the credential
+    /// link resolves onto, and the background jobs Claude Code still runs after
+    /// their launcher released its marker.
+    ///
+    /// A row is dropped once its session is gone. Row GC runs from
     /// `runtime::gc_stale_runtimes` at daemon STARTUP, not per tick, so a
     /// SIGKILLed session's row outlives it for the whole daemon run. Gates on
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
-        let rows = read_registry();
+        Self::collect_in(config, &crate::claude_jobs::job_trees())
+    }
+
+    /// [`LiveTally::collect`] against a job store the caller already read, so a
+    /// pass-level caller reads the store once and shares that snapshot (the
+    /// [`crate::runtime::has_live_session_in`] precedent).
+    pub(crate) fn collect_in(config: &AppConfig, jobs: &crate::claude_jobs::JobTrees) -> Self {
+        Self::collect_with_registry(config, jobs, registry_listing())
+    }
+
+    /// [`LiveTally::collect_in`] against a registry listing the caller already
+    /// took, so a test can replay an entry the OS fails to yield. The rows come
+    /// from [`read_registry_tally`], never [`read_registry`]: the total counts
+    /// every session, so it may not be built from a dir clauth only half read.
+    fn collect_with_registry(
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        registry: Option<crate::runtime::DirListing>,
+    ) -> Self {
+        let rows = registry.and_then(read_registry_tally);
         let unread = rows.is_none();
-        let mut tally = Self::from_live_rows(
-            rows.unwrap_or_default()
-                .into_iter()
-                .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held()),
-        );
+        let rows = rows.unwrap_or_default();
+        let live: Vec<LiveSession> = rows
+            .iter()
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
+            .cloned()
+            .collect();
+        let mut tally = Self::from_live_rows(live.clone());
         tally.unread = unread;
         tally.add_bare_sessions(config);
+        tally.add_background_jobs(config, jobs, &rows, &live);
         tally
     }
 
@@ -467,6 +506,43 @@ impl LiveTally {
         slot.following += bare;
     }
 
+    /// Fold in the background jobs Claude Code still runs whose `clauth start`
+    /// launcher already exited: the marker flock released, so no row above
+    /// counts the session, while the job store still names its tree — one of
+    /// the account's slots is in use. A counted row on the same tree is the
+    /// same session, so each tree's jobs are netted against the rows holding it
+    /// ([`crate::runtime::live_background_jobs`]). A job on an account the
+    /// config no longer holds counts on the account whose dir its tree sits
+    /// under, the way a registry row of a deleted account already lands here:
+    /// the session still spends that account's window.
+    ///
+    /// An unreadable job store adds no session to the account it covers and
+    /// leaves the fleet total unread, the direction
+    /// [`LiveTally::add_bare_sessions`] takes: a bg session nothing could read
+    /// must not read as idle on screen. The unknown stays with the account it
+    /// covers: a TREE-local store contributes no jobs for THAT account alone,
+    /// while every readable account's running job still counts on its own
+    /// account. [`LiveTally::own`] and [`LiveTally::delegates`] are single
+    /// fleet numbers, so the one unknown contribution still leaves the fleet
+    /// total unknown — folding it in as zero is the direction this tally
+    /// already refuses.
+    fn add_background_jobs(
+        &mut self,
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        rows: &[LiveSession],
+        counted: &[LiveSession],
+    ) {
+        let (background, unread) =
+            crate::runtime::live_background_jobs(config, jobs, rows, counted);
+        self.unread |= unread;
+        for job in background {
+            let slot = self.members.entry(job.member).or_default();
+            slot.sessions += 1;
+            slot.following += usize::from(job.follows_chain);
+        }
+    }
+
     /// Tally rows already known to be live. Attribution is `current_member`,
     /// which the executor writes only on a session's FIRST swap — so a session
     /// that never moved (every pinned one, and every follower before it swaps)
@@ -475,11 +551,15 @@ impl LiveTally {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
         let mut delegates = 0;
+        let mut session_members = std::collections::BTreeMap::new();
         for row in rows {
-            delegates += usize::from(row.is_delegate);
             let member = row.current_member.unwrap_or(row.start_profile);
+            session_members.insert(row.session_id, member.clone());
+            let is_delegate = usize::from(row.is_delegate);
+            delegates += is_delegate;
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
+            slot.delegates += is_delegate;
             slot.following += usize::from(row.follows_chain);
             slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
         }
@@ -487,13 +567,15 @@ impl LiveTally {
             members: per_member,
             delegates,
             unattributed: 0,
+            session_members,
             unread: false,
         }
     }
 
     /// A tally straight from rows, for tests in other modules that need a fleet
-    /// without laying registry files down. Skips the liveness filter, which is
-    /// the half [`LiveTally::collect`] adds and this module's own tests pin.
+    /// without laying registry files down. Skips the liveness filter and the
+    /// job-store term, which are the halves [`LiveTally::collect`] adds and this
+    /// module's own tests pin.
     #[cfg(test)]
     pub(crate) fn of(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self::from_live_rows(rows)
@@ -505,7 +587,7 @@ impl LiveTally {
     }
 
     /// A tally that read `rows` but not every dir it counts from (the bare
-    /// markers refused), for tests in other modules.
+    /// markers or the job store refused), for tests in other modules.
     #[cfg(test)]
     pub(crate) fn partly_read(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self {
@@ -524,8 +606,8 @@ impl LiveTally {
     }
 
     /// Every live session across the fleet: those on a deleted account and bare
-    /// ones on a link no profile matches included. `None` when a dir it counts
-    /// from could not be listed.
+    /// ones on a link no profile matches included. `None` when a dir or record it counts
+    /// from could not be read.
     pub(crate) fn total(&self) -> Option<usize> {
         if self.unread {
             return None;
@@ -534,8 +616,8 @@ impl LiveTally {
     }
 
     /// Own (non-delegate) live sessions across the fleet: `clauth start` and
-    /// codex rows plus bare sessions. `None` when a dir it counts from could
-    /// not be listed.
+    /// codex rows plus bare sessions. `None` when a dir or record it counts from could
+    /// not be read.
     pub(crate) fn own(&self) -> Option<usize> {
         if self.unread {
             return None;
@@ -546,13 +628,20 @@ impl LiveTally {
         )
     }
 
-    /// Delegate live sessions across the fleet. `None` when a dir it counts
-    /// from could not be listed.
+    /// Delegate live sessions across the fleet. `None` when a dir or record it counts
+    /// from could not be read.
     pub(crate) fn delegates(&self) -> Option<usize> {
         if self.unread {
             return None;
         }
         Some(self.delegates)
+    }
+
+    /// Every registry session's id and the account it runs on. `None` when a
+    /// dir or record the tally counts from could not be read, as
+    /// [`LiveTally::total`] is.
+    pub(crate) fn session_members(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        (!self.unread).then_some(&self.session_members)
     }
 }
 
@@ -603,9 +692,15 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// Snapshot of every registered row. Read-only: the returned rows are owned
 /// copies, so nothing a caller does to one reaches disk. An unreadable or
 /// unparseable file is skipped rather than failing the sweep, and so is an
-/// unlistable registry.
+/// entry the OS fails to yield, and an unlistable registry.
 pub(crate) fn list() -> Vec<LiveSession> {
-    read_registry().unwrap_or_default()
+    list_in(registry_listing())
+}
+
+/// [`list`] over a registry listing the caller already took, so a test can
+/// replay an entry the OS fails to yield through `list`'s own reader choice.
+fn list_in(registry: Option<crate::runtime::DirListing>) -> Vec<LiveSession> {
+    registry.and_then(read_registry).unwrap_or_default()
 }
 
 /// The running sessions' rows: drop the daemon's hold of the account's fixed
@@ -615,32 +710,120 @@ pub(crate) fn list() -> Vec<LiveSession> {
 /// stays. `None` when the registry cannot be listed or located, an empty vec
 /// when no row is live.
 pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
-    read_registry().map(|rows| {
+    live_rows_in(registry_listing())
+}
+
+/// [`live_rows`] over a registry listing the caller already took, the
+/// [`list_in`] split.
+fn live_rows_in(registry: Option<crate::runtime::DirListing>) -> Option<Vec<LiveSession>> {
+    registry.and_then(read_registry).map(|rows| {
         rows.into_iter()
             .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
             .collect()
     })
 }
 
-/// [`list`], telling an absent registry (nothing ever registered: empty) from
-/// one that cannot be listed or located (`None`).
-fn read_registry() -> Option<Vec<LiveSession>> {
-    let dir = registry_dir().ok()?;
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
-    };
-    Some(
-        entries
-            .flatten()
-            .filter_map(|entry| read_row(&entry.path()))
-            .collect(),
+/// Every row `entries` yields. An entry the OS fails to yield is skipped,
+/// because the daemon decision leg and GC sweep every row they can read — the
+/// tally's stricter reading is [`read_registry_tally`]. Whether the registry
+/// could be listed at all is [`registry_listing`]'s answer.
+fn read_registry(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(entries, read_row_entry, crate::runtime::EntryFailure::Skip)
+}
+
+/// The row an entry of the registry holds. A staging sibling a row write
+/// leaves while it renames into place (or a crashed writer left behind) is no
+/// row: every reader of the registry skips it alike.
+fn read_row_entry(entry: &std::fs::DirEntry) -> Option<LiveSession> {
+    if crate::watchdog::is_staging(&entry.file_name()) {
+        return None;
+    }
+    read_row(&entry.path())
+}
+
+/// Whether the registry lists whole: it can be located and opened, and every
+/// entry the OS yields. An absent registry lists whole (empty). Unparseable
+/// row files are not looked at here; [`read_registry`] skips them.
+pub(crate) fn registry_lists_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |_| Some(()),
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some()
+}
+
+/// Whether every row the registry holds reads: it lists whole
+/// ([`registry_lists_whole`]) and each row file parses, staging siblings
+/// skipped as every reader skips them ([`read_row_entry`]). A reader that only
+/// observes (the MCP login sync's sources) treats a `false` as a session it
+/// may have missed, so it never concludes from that pass that no session
+/// holds something.
+pub(crate) fn registry_reads_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |entry| {
+                    (!crate::watchdog::is_staging(&entry.file_name()))
+                        .then(|| read_row_entry(entry).is_some())
+                },
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some_and(|rows| rows.into_iter().all(|read| read))
+}
+
+/// [`read_registry`] as the fleet total counts it: an entry the OS fails to
+/// yield leaves the listing unknown, the reading
+/// [`crate::runtime::live_sessions_at`] already gives a failed bare-marker
+/// entry. Folding one in as a skip would render a total built from a dir clauth
+/// only half read.
+fn read_registry_tally(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(
+        entries,
+        read_row_entry,
+        crate::runtime::EntryFailure::Unknown,
     )
 }
 
+/// The registry dir's ONE listing, through the same [`crate::runtime::entries_in`]
+/// read the bare markers are counted by, so an entry error has one reading
+/// across the two dirs the total counts from. `None` when the dir cannot be
+/// located or opened; an absent registry is an empty listing, not an unknown.
+fn registry_listing() -> Option<crate::runtime::DirListing> {
+    crate::runtime::entries_in(&registry_dir().ok()?)
+}
+
 fn read_row(path: &Path) -> Option<LiveSession> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    // A regular file only, bounded: the row path was never typed, and an
+    // `open` on a FIFO blocks forever — the registry read runs every tally
+    // tick. A non-regular or unreadable row drops the way an unreadable one
+    // always did.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Every parseable row under an arbitrary registry dir, each with its file's
+/// mtime. `clauth which --pid` reads a dir it is handed (a test injects one)
+/// and picks the newest row when a recycled pid matches more than one; the
+/// production readers above stay on the real registry dir.
+pub(crate) fn rows_in(dir: &Path) -> Vec<(LiveSession, Option<std::time::SystemTime>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let row = read_row_entry(&entry)?;
+            let mtime = entry.metadata().and_then(|meta| meta.modified()).ok();
+            Some((row, mtime))
+        })
+        .collect()
 }
 
 /// One session's own row, or `None` when it is absent or unparseable. Read

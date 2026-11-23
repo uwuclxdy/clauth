@@ -4,8 +4,19 @@ use crate::tui::app::{App, Tab};
 use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
 use ratatui::style::Color;
-use std::collections::BTreeMap;
+
+/// Tall enough that the art header renders at the widths these pins use, so a
+/// width-only pin still exercises the art rows.
+const HEADER_TEST_ROWS: u16 = 24;
+use std::collections::{BTreeMap, HashSet};
+
+/// The art header's logo slot: the mascot's own columns plus its pad, the
+/// width `draw` gives the logo before the info column starts.
+fn logo_slot_cols() -> usize {
+    App::MASCOT_SIZE.0 + usize::from(LOGO_PAD)
+}
 
 fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
     (
@@ -18,11 +29,14 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -36,6 +50,9 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>)
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -58,11 +75,14 @@ fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -76,6 +96,9 @@ fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         None,
     )
@@ -104,10 +127,9 @@ fn app_with(profiles: Vec<(Profile, Option<UsageInfo>)>, active: Option<&str>) -
     app
 }
 
-/// Renders only the header block (sized by `header_height`).
+/// Renders the header into a `HEADER_TEST_ROWS`-row frame.
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
-    let height = header_height(app);
-    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
     let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
@@ -120,8 +142,7 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
 /// The logo column's cells as `(glyph, fg, bg)`: a style claim pins the whole
 /// row rather than the cells a defect happens to leave alone.
 fn styled_logo_rows(app: &App, width: u16) -> Vec<Vec<(String, Color, Color)>> {
-    let height = header_height(app);
-    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
     let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
@@ -129,7 +150,7 @@ fn styled_logo_rows(app: &App, width: u16) -> Vec<Vec<(String, Color, Color)>> {
     })
     .unwrap();
     let buf = term.backend().buffer();
-    (0..header_height(app))
+    (0..header_height(Rect::new(0, 0, width, HEADER_TEST_ROWS)))
         .map(|y| {
             (0..10)
                 .map(|x| {
@@ -157,7 +178,8 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
 /// A wide-glyph active name sizes the row-1 gauge and the right-edge gap by
 /// cells, not chars, so `● status.claude.ai` stays whole at every width — the
 /// char sum left it mid-word off the edge. Pinned whole-row for an ASCII, a
-/// CJK and an emoji active name at every width.
+/// CJK and an emoji active name at every width; under the art's fit width the
+/// row carries no logo column, so the no-art header's whole row is pinned.
 #[test]
 fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -165,27 +187,27 @@ fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
         (
             "abcdefghijklmnopqrstuvwxyz",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "abcdefg… 49%    ● status.claude.ai"),
                 (45, "▝▜██████▀ abcdefgh… 49%    ● status.claude.ai"),
             ],
         ),
         (
             "cjk-日本語アカウント",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "cjk-日 … 49%     ● status.claude.ai"),
                 (45, "▝▜██████▀ cjk-日 本 … 49%    ● status.claude.ai"),
             ],
         ),
         (
             "emoji-🧭⚠️-account",
             &[
-                (27, "▝▜█████"),
-                (28, "▝▜██████"),
-                (34, "▝▜██████▀       ● status.claude.ai"),
+                (27, "49%      ● status.claude.ai"),
+                (28, "49%       ● status.claude.ai"),
+                (34, "emoji-… 49%     ● status.claude.ai"),
                 (45, "▝▜██████▀ emoji-🧭 … 49%    ● status.claude.ai"),
             ],
         ),
@@ -211,6 +233,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
         GaugeFit {
             name_w: 8,
             bar_cells: 10,
+            age_w: 0,
             visible: true,
         }
     );
@@ -262,6 +285,7 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         GaugeFit {
             name_w: 10,
             bar_cells: 0,
+            age_w: 0,
             visible: true
         }
     );
@@ -281,17 +305,18 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
 // ── `header_height` ─────────────────────────────────────────────────────
 
 #[test]
-fn header_height_is_always_three() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let with_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    assert_eq!(header_height(&with_active), 3);
+fn header_height_follows_the_art_fit() {
+    let fit = 10
+        + "clauth".len()
+        + format!(" v{}", env!("CARGO_PKG_VERSION")).len()
+        + 3
+        + "[ daemon ]".len();
+    let fit = u16::try_from(fit).expect("narrow");
 
-    let no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
-    assert_eq!(header_height(&no_active), 3);
-
-    let mut compact = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    compact.compact = true;
-    assert_eq!(header_height(&compact), 3);
+    assert_eq!(header_height(Rect::new(0, 0, fit, 14)), 3);
+    assert_eq!(header_height(Rect::new(0, 0, fit - 1, 24)), 2);
+    assert_eq!(header_height(Rect::new(0, 0, 120, 14)), 3);
+    assert_eq!(header_height(Rect::new(0, 0, 120, 13)), 2);
 }
 
 // ── Row 1: the live count, the gauge and the status indicator ────────────
@@ -328,6 +353,200 @@ fn row1_is_the_live_count_the_gauge_and_the_status_indicator_when_wide() {
         "the elastic gap carries whitespace alone: {gap:?}"
     );
     assert_eq!(dot, "● status.claude.ai", "the indicator closes the row");
+}
+
+/// Once the active account's refresh is overdue on an instance that runs no
+/// countdown, the gauge dates its figure between the percent and the bar.
+#[test]
+fn row1_gauge_dates_an_overdue_reading_between_the_percent_and_the_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 4m ago [████░░░░░░]",
+        "the age rides inside the gauge, before the bar"
+    );
+}
+
+/// A reading whose refresh is still ahead carries no age, overdue-only.
+#[test]
+fn row1_gauge_carries_no_age_before_the_refresh_is_due() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 30_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() + 60_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]");
+}
+
+/// A past-due reading whose leg the scheduler deliberately blanked (a spent
+/// skip, a suppressed credential) carries no gauge age: the absent deadline
+/// is not a stuck worker's, so the gauge must not date the figure as overdue.
+#[test]
+fn row1_gauge_carries_no_age_for_a_blanked_countdown_leg() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    crate::usage::publish_blanked_countdowns(
+        &app.activity,
+        &HashSet::from([crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy"))]),
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]");
+}
+
+/// A late worker's withdrawn countdown publishes no deadline, and the
+/// reading is past its own cadence: the gauge dates the reading — the
+/// no-deadline arm's positive case, beside the blanked negative twin.
+#[test]
+fn row1_gauge_dates_a_late_workers_reading_with_no_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "a late worker belongs to the instance that fetches"
+    );
+    // The left slice the frozen dated pin derives: the two chips, their gap,
+    // the separator, the name, the percent, the age's 9 cells and the full
+    // bar's 13 — 60 display cells.
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 6m ago [████░░░░░░]",
+        "the reading dates itself: the 90 s interval plus the 270 s reading age"
+    );
+}
+
+/// Between the bootstrap's Queued marks and the first publish, a due
+/// reading has a fetch coming: the no-deadline arm must not date it as
+/// overdue (the Overview spins `queued` for it), so the age draws only
+/// once the account reads idle again.
+#[test]
+fn row1_gauge_dates_no_reading_while_its_leg_reads_queued() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let interval =
+        crate::usage::usage_interval_ms(&profile, AppState::default().refresh_interval_ms);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - interval - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    crate::usage::mark_fetch_activity(
+        &app.activity,
+        &crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::ProfileActivity::Queued,
+    );
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "a queued leg has a fetch coming: no overdue age until it reads idle"
+    );
+}
+
+/// A body with no `fetched_at` stamp has no date clauth read: the gauge
+/// draws no age for it, even where the cache mtime's due time reads past —
+/// the mtime dates the due time, never the read.
+#[test]
+fn row1_gauge_draws_no_age_for_an_undated_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: None,
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    // The undated body's cache, dated far past its refresh: the per-tick
+    // clock map falls back to its mtime (the production `apply_usage` pass).
+    crate::testutil::register_names(&["uwuclxdy"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("uwuclxdy"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("uwuclxdy"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("usage cache path");
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(360_000),
+    );
+    app.apply_usage();
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "an undated reading draws no age even past its deadline"
+    );
 }
 
 /// The ladder's first rung on the buffer: the bar gives a cell before the name
@@ -402,7 +621,7 @@ fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
     );
     for (case, app) in [("compact", &compact), ("no active profile", &no_active)] {
         let rows = render_header_rows(app, 90);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(header_height(Rect::new(0, 0, 90, HEADER_TEST_ROWS)), 3);
         assert!(
             !rows.iter().any(|r| r.contains("uwuclxdy")),
             "{case}: the gauge is on no header row"
@@ -439,7 +658,8 @@ fn row1_gauge_falls_to_the_name_and_percent_before_the_name_clips() {
 
 /// The gauge's last rung is the percent alone, and the indicator is charged
 /// the gauge as rendered: it holds the row at that rung and one column under
-/// it, when the gauge has gone.
+/// it, when the gauge has gone. Both widths sit under the art's fit, so the
+/// no-art row's whole width is the budget.
 #[test]
 fn row1_gauge_falls_to_the_percent_alone_and_then_away() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -447,12 +667,12 @@ fn row1_gauge_falls_to_the_percent_alone_and_then_away() {
     app.tab = Tab::Tokens;
 
     assert_eq!(
-        row_content(&app, 35, 1).trim_end(),
+        render_header_rows(&app, 25)[1].trim_end(),
         "42%    ● status.claude.ai",
-        "the percent holds a `W - 31 >= 4` budget down to 35"
+        "the percent holds a `W - 21 >= 4` budget down to 25"
     );
     assert_eq!(
-        row_content(&app, 34, 1).trim_end(),
+        render_header_rows(&app, 24)[1].trim_end(),
         "      ● status.claude.ai",
         "one column narrower the gauge is gone, the indicator staying"
     );
@@ -631,8 +851,7 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
         let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(n));
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -750,8 +969,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(crate::live_sessions::LiveTally::unread());
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -789,8 +1007,7 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 80.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -839,8 +1056,7 @@ fn the_split_live_chip_renders_own_then_delegates_with_their_styles() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(split_tally(6, 7));
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -900,8 +1116,7 @@ fn a_lone_delegate_part_renders_in_accent_alone() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     app.set_live_sessions(split_tally(0, 7));
-    let height = header_height(&app);
-    let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, &app, &app.readings_snapshot());
@@ -1040,8 +1255,7 @@ fn the_daemon_chip_cells_carry_the_pill_grammar() {
     ] {
         app.daemon_health = health;
         let width = 100;
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1147,7 +1361,7 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
         app.gateway_state = state;
         let expected = expected_shunt_color(state);
         let width = 100;
-        let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1190,23 +1404,21 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
 
 /// The status indicator is right-aligned across an elastic gap, and it DROPS
 /// whole when the row cannot hold it: a dot left to render would clip the feed
-/// mid-word. With no gauge on the row, the indicator's own fit (`col >= 18 + 3`)
-/// never passes inside the sub-30 band — there the logo column yields its
-/// cells to the `Min(20)` text column, capping it at 20 — so the gate decides
-/// at the band's edge: at 31 the text column is 21 and the indicator renders
-/// with its 3-cell gap; at 30 it drops whole.
+/// mid-word. With the art gone the row has the whole frame width, so with no
+/// gauge on it the indicator's own fit (`col >= 18 + 3`) decides: at 21 it
+/// renders with its 3-cell gap; at 20 it drops whole.
 #[test]
 fn the_status_indicator_drops_rather_than_clipping_when_the_row_runs_short() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
 
     assert_eq!(
-        row_content(&app, 31, 1),
+        render_header_rows(&app, 21)[1],
         "   ● status.claude.ai",
         "exact fit: the indicator renders with its 3-cell gap"
     );
     assert_eq!(
-        row_content(&app, 30, 1).trim_end(),
+        render_header_rows(&app, 20)[1].trim_end(),
         "",
         "one column narrower it drops whole rather than clipping the feed"
     );
@@ -1298,7 +1510,11 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
-    for (y, row) in rows.iter().take(header_height(&app) as usize).enumerate() {
+    for (y, row) in rows
+        .iter()
+        .take(header_height(Rect::new(0, 0, 100, 30)) as usize)
+        .enumerate()
+    {
         assert!(
             !row.contains("ACCOUNTS"),
             "header row {y} carries no ACCOUNTS: {row:?}"
@@ -1405,9 +1621,10 @@ fn the_header_gauge_label_keeps_two_rounded_decimals() {
             let fit = GaugeFit {
                 name_w: 0,
                 bar_cells,
+                age_w: 0,
                 visible: true,
             };
-            let spans = gauge_spans(fit, "", Some(pct), 0);
+            let spans = gauge_spans(fit, "", Some(pct), None, 0);
             let labels: Vec<&str> = spans
                 .iter()
                 .map(|s| s.content.as_ref())
@@ -1515,8 +1732,7 @@ fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(0));
         app.set_tps(Some(tps_snapshot(1_000, rate, None)));
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1574,8 +1790,7 @@ fn the_tps_chip_cells_carry_the_counter_chip_grammar() {
         app.tab = Tab::Tokens;
         app.set_live_sessions(tally_of(0));
         app.set_tps(None);
-        let height = header_height(&app);
-        let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, HEADER_TEST_ROWS)).unwrap();
         term.draw(|f| {
             let area = f.area();
             super::draw(f, area, &app, &app.readings_snapshot());
@@ -1717,7 +1932,7 @@ fn the_header_logo_rests_on_the_clawd_default_pose() {
 fn the_wink_frame_paints_its_cut_outs_black() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1774,7 +1989,7 @@ fn the_coin_hop_shadow_frame_paints_its_marks_inactive_and_the_rest_body() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     // Frame index = elapsed / 80 ms, so frame 2 draws 160 ms in.
     const FRAME_MS: u64 = 80;
-    app.clawd.play(crate::tui::clawd::Anim::CoinHop, 0);
+    app.mascot.play(crate::tui::clawd::Anim::CoinHop, 0);
     app.anim_phase_ms = Some(FRAME_MS * 2);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1887,7 +2102,7 @@ fn the_simplified_sprite_arm_replaces_the_full_one() {
 fn the_turned_pose_paints_its_facing_cut_black() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Turn, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Turn, 0);
     app.anim_phase_ms = Some(0);
     use crate::tui::theme;
     let bg = theme::bg();
@@ -1935,16 +2150,50 @@ fn the_turned_pose_paints_its_facing_cut_black() {
     assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
 }
 
+/// The chip counts the job-store term, not held markers alone: a launcher that
+/// exited releases its marker while Claude Code still runs the job, so the
+/// app's own collection totals the held row and that job at two.
+#[test]
+fn a_launcher_exited_bg_job_and_a_held_row_render_two_live_sessions() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("uwuclxdy");
+    crate::live_sessions::register(&crate::testutil::live_row("4242-0", "uwuclxdy"))
+        .expect("register the held row");
+    let _m0 = crate::runtime::hold_session_row_marker(&name, false, "4242-0")
+        .expect("hold the row's marker");
+    let tree = crate::runtime::background_runtime_tree(&name).expect("background tree");
+    std::fs::create_dir_all(&tree).expect("build the fixed background tree");
+    crate::testutil::write_live_supervisor(&tree);
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        background: true,
+        ..crate::testutil::live_row("4243-0", "uwuclxdy")
+    })
+    .expect("register the launcher row");
+    crate::testutil::write_claude_job(home.home(), "jobrun", &tree);
+
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Overview;
+    assert_eq!(
+        row_content(&app, 90, 1),
+        format!(
+            "[ 2 live ]  [ — tok/s ]{}● status.claude.ai",
+            " ".repeat(39)
+        ),
+        "the chip counts the launcher-exited job beside the held row"
+    );
+}
+
 /// On an xterm-256 terminal the cut-outs take palette index 16, the cube's
-/// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint.
+/// `rgb(0,0,0)`, never the 16-colour `Black` a terminal theme can repaint; the
+/// body surface itself is unpainted.
 #[test]
 fn the_cut_outs_stay_black_on_the_compatible_tier() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.clawd.play(crate::tui::clawd::Anim::Wink, 0);
+    app.mascot.play(crate::tui::clawd::Anim::Wink, 0);
     app.anim_phase_ms = Some(0);
-    let bg = Color::Indexed(235);
+    let bg = Color::Reset;
     let body = Color::Indexed(173);
     let text = Color::Indexed(189);
     let black = Color::Indexed(16);
@@ -1987,4 +2236,457 @@ fn the_cut_outs_stay_black_on_the_compatible_tier() {
         ],
     ];
     assert_eq!(styled_logo_rows(&app, 80), want.to_vec());
+}
+
+// ── Pulse grapheme safety ────────────────────────────────────────────────
+
+/// Mid-sweep the pulse splits its text one span per unit, so a VS16 sequence
+/// (`⚠️`, U+26A0 + U+FE0F, one grapheme) must stay inside one span: split
+/// across spans, the bare base renders a cell narrow and the selector lands
+/// alone, which the buffer draws as nothing. The buffer's measure — each
+/// span's own graphemes, widths summed (`grapheme_cells`) — must equal the
+/// text's at-rest width at the sampled mid-sweep frames (450ms and 675ms of
+/// the 900ms sweep), and the bytes must survive whole.
+///
+/// Widths are hand-derived off the width rules, never read off the code:
+/// `⚠️` is an emoji-presentation sequence, 2 cells; each of ` `, `p`, `r`,
+/// `o`, `d` is 1 — `⚠️ prod` sits on 7.
+fn pulse_keeps_rest_width(build: impl Fn(&str, u64) -> Vec<Span<'static>>) {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for elapsed_ms in [450, 675] {
+        let spans = build("⚠️ prod", elapsed_ms);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text, "⚠️ prod",
+            "the sweep must keep every byte at {elapsed_ms}ms"
+        );
+        let cells: usize = spans
+            .iter()
+            .map(|s| super::super::format::grapheme_cells(s.content.as_ref()))
+            .sum();
+        assert_eq!(
+            cells, 7,
+            "mid-sweep width must equal the at-rest width at {elapsed_ms}ms"
+        );
+    }
+    // Control: the sweep really animates, so the width checks above cannot be
+    // greened by a flat render. At 0ms the envelope is sin(0) = 0, so every
+    // span leans 0 and sits on the base fg; at 450ms (progress 0.5, envelope
+    // sin(π/2) = 1) the crest grapheme leans crest 1 × envelope 1 ×
+    // PULSE_DEPTH 0.4 = 0.4, and a tint that moved nothing would make the
+    // whole pulse invisible.
+    let flat = build("⚠️ prod", 0);
+    let base = flat
+        .first()
+        .and_then(|s| s.style.fg)
+        .expect("the pulse always emits at least one span");
+    assert!(
+        flat.iter().all(|s| s.style.fg == Some(base)),
+        "control: at 0ms the envelope is 0, so every span sits on the base color"
+    );
+    assert!(
+        build("⚠️ prod", 450)
+            .iter()
+            .any(|s| s.style.fg != Some(base)),
+        "control: at 450ms the sweep must tint at least one grapheme"
+    );
+}
+
+#[test]
+fn the_gauge_name_pulse_keeps_whole_graphemes_across_sweep_frames() {
+    // The header gauge's own seam: `gauge_spans` fits the name, then pulses
+    // it; its trailing name-to-percent gap is dropped before the checks.
+    pulse_keeps_rest_width(|name, elapsed_ms| {
+        let fit = GaugeFit {
+            name_w: 8,
+            bar_cells: 0,
+            age_w: 0,
+            visible: true,
+        };
+        let mut spans = gauge_spans(fit, name, None, None, elapsed_ms);
+        spans.pop();
+        spans
+    });
+}
+
+#[test]
+fn the_accent_pulse_keeps_whole_graphemes_across_sweep_frames() {
+    // The bare pulse in ACCENT, the colour the Services value pulses in (the
+    // Overview kind cell pulses in DIM); the Services seam itself is pinned
+    // through `field_text_spans` in the services render tests.
+    pulse_keeps_rest_width(|name, elapsed_ms| pulse_name_spans(name, theme::accent(), elapsed_ms));
+}
+
+/// The composed row keeps the emoji grapheme whole mid-sweep: the buffer draws
+/// `⚠️` as one 2-cell glyph (the selector never draws alone; the skip cell
+/// after a wide glyph reads as an extra space in the row's symbol concat), and
+/// the sweep's per-grapheme recolor cannot move a cell — every drawn row is
+/// symbol-identical to the at-rest (1000ms) row, the 900ms sweep being over.
+#[test]
+fn the_drawn_row_keeps_the_emoji_name_whole_mid_sweep() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = app_with(vec![oauth_profile("⚠️ prod", 49.0)], Some("⚠️ prod"));
+    app.tab = Tab::Usage;
+    let rows: Vec<Vec<String>> = [0, 450, 675, 1000]
+        .iter()
+        .map(|&phase| {
+            app.anim_phase_ms = Some(phase);
+            render_header_rows(&app, 45)
+        })
+        .collect();
+    // The rest frame first: 0ms is a sweep frame too, so only the at-rest
+    // comparison catches a sweep path that moves a cell.
+    assert_eq!(
+        rows[1], rows[3],
+        "the 450ms sweep frame must draw the at-rest (1000ms) row cell for cell"
+    );
+    for (phase, rows_at) in [0, 450, 675, 1000].iter().zip(&rows) {
+        let row = &rows_at[1];
+        assert!(
+            row.contains("⚠️"),
+            "row 1 must draw the whole emoji grapheme at {phase}ms: {row:?}"
+        );
+        assert!(
+            row.contains("prod 49%") && row.contains("● status.claude.ai"),
+            "the compose after the name must stay whole at {phase}ms: {row:?}"
+        );
+    }
+    assert_eq!(
+        rows[0], rows[1],
+        "the sweep must not move a cell between 0ms and 450ms"
+    );
+    assert_eq!(
+        rows[1], rows[2],
+        "the sweep must not move a cell between 450ms and 675ms"
+    );
+}
+
+/// A row held still samples its rest phase: at every list position, for every
+/// provider, the wave draws the plain dim label there, while the same position
+/// crests somewhere else in its cycle.
+#[test]
+fn the_identity_waves_rest_phase_draws_the_plain_label_at_every_position() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let label = "Ultra";
+    let plain = vec![Span::styled(label.to_string(), theme::dim())];
+    for provider in theme::CrestProvider::ALL {
+        for position in 0..64 {
+            assert_eq!(
+                identity_wave_spans(label, provider, position, identity_wave_rest_ms(position)),
+                plain,
+                "{provider:?} at position {position}"
+            );
+            assert!(
+                (0..PULSE_CYCLE_MS)
+                    .step_by(50)
+                    .any(|ms| identity_wave_spans(label, provider, position, ms) != plain),
+                "control: {provider:?} at position {position} never crests"
+            );
+        }
+    }
+}
+
+/// The age rides only while the full gauge plus it fits the text column: it
+/// sheds first, whole, so an overdue reading never shrinks the bar (the
+/// gauge's own ladder is untouched, and a deadline passing never reflows a
+/// gauge that already fit). The row counts the full gauge at 26 cells (the
+/// percent's 4-cell budget, `42%` rendering in 3), and the age's ` · ` + 6
+/// cells of `4m ago` draw only in what is left of the budget, so they need
+/// 35 cells in all: at `W = 66` the text column holds them, at `W = 65` the
+/// age drops and the bar stays full.
+#[test]
+fn row1_overdue_age_sheds_whole_before_the_bar_shrinks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    assert_eq!(
+        row_content(&app, 65, 1).trim_end(),
+        "uwuclxdy 42% [████░░░░░░]            ● status.claude.ai",
+        "one cell short of the aged gauge, the age sheds and the bar stays full"
+    );
+    assert_eq!(
+        row_content(&app, 66, 1).trim_end(),
+        "uwuclxdy 42% · 4m ago [████░░░░░░]    ● status.claude.ai",
+        "the aged gauge fits whole once the budget reaches 35"
+    );
+}
+
+/// Row 1 of a stood-down mirror whose published deadline is `deadline_ago_ms`
+/// past, its reading 5m30s old (the `5m ago` label holds 30 s from either
+/// minute boundary).
+fn mirror_gauge_row_at_deadline(deadline_ago_ms: u64) -> String {
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 330_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - deadline_ago_ms,
+    );
+    row_content(&app, 120, 1)
+}
+
+/// A mirror's published deadline dates the gauge only past the tick's fetch
+/// deadline (90 s): 89 s past due (one second inside the grace) carries no
+/// age, 91 s (one second past it) dates the figure. The fixtures sit one
+/// second either side of the grace boundary, the margin this pin holds
+/// against the wall clock moving between stamp and render.
+#[test]
+fn row1_gauge_dates_a_mirrors_deadline_only_past_the_tick_deadline_grace() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let chars: Vec<char> = mirror_gauge_row_at_deadline(89_000).chars().collect();
+    let left: String = chars[..51].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% [████░░░░░░]",
+        "inside the grace the gauge carries no age"
+    );
+
+    let chars: Vec<char> = mirror_gauge_row_at_deadline(91_000).chars().collect();
+    let left: String = chars[..60].iter().collect();
+    assert_eq!(
+        left, "[ 0 live ]  [ — tok/s ] · uwuclxdy 42% · 5m ago [████░░░░░░]",
+        "past the grace the gauge dates the figure"
+    );
+}
+
+/// An overdue age rides only in the slack the chips' own ceilings and the
+/// speed suffix leave beside the gauge: at the width where every chip fits but
+/// the slack does not hold the age, the chips draw and the age sheds; one
+/// cell wider than the dated header's drawn width, the age draws. Every width
+/// below derives from the spans' display cells, never a char count. The
+/// reading's stamp sits 31 days back, one day past the 30-day flip where
+/// `relative_age` switches to the 10-cell local ISO date — the age's widest
+/// form, the one this pin needs.
+#[test]
+fn row1_overdue_age_rides_only_in_the_chips_leftover_slack() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let stamp = crate::usage::now_ms() - 31 * 86_400_000;
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(stamp),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_live_sessions(split_tally(999, 999));
+    app.set_tps(Some(tps_snapshot(1_000, 9_999.0, Some(67.2))));
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+    let date = chrono::DateTime::from_timestamp((stamp / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .naive_local()
+        .date()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let readings = app.readings_snapshot();
+    let gauge = active_gauge(&app, &readings).expect("the gauge renders");
+    let live_w: usize = live_chip_spans(&app).iter().map(|s| s.width()).sum();
+    let tps_w: usize = tps_chip_spans(&app).iter().map(|s| s.width()).sum();
+    let gap_w = Span::raw(CHIP_GAP).width();
+    let sep_w = Span::raw(" · ").width();
+    let status_w = Span::raw(format!("{} status.claude.ai", theme::DOT_ON)).width();
+    let suffix_w: usize = speed_suffix_spans(&app, Some(&gauge))
+        .iter()
+        .map(|s| s.width())
+        .sum();
+    let aged_fit = GaugeFit {
+        age_w: gauge_age_w(gauge.age.as_deref()),
+        ..gauge_fit(
+            usize::MAX,
+            Span::raw(gauge.name.as_str()).width(),
+            gauge.pct,
+        )
+    };
+    let aged_spans = gauge_spans(aged_fit, &gauge.name, gauge.pct, gauge.age.as_deref(), 0);
+    let aged_w: usize = aged_spans.iter().map(|s| s.width()).sum();
+    // logo + chips + separator + gauge + suffix + content gap + indicator.
+    let dated_w = logo_slot_cols()
+        + live_w
+        + gap_w
+        + tps_w
+        + sep_w
+        + aged_w
+        + suffix_w
+        + CONTENT_GAP
+        + status_w;
+
+    let short = row_content(&app, dated_w as u16, 1);
+    assert_eq!(
+        short.trim_end(),
+        format!(
+            "[ 999+999 live ]  [ 9999 tok/s ] · uwuclxdy 42% [████░░░░░░] (67 t/s){}● status.claude.ai",
+            " ".repeat(16)
+        ),
+        "every chip fits, so the chips draw and the age sheds whole"
+    );
+    assert!(
+        !short.contains(&format!(" · {date}")),
+        "no age renders beside the chips: {short:?}"
+    );
+
+    let fit = row_content(&app, (dated_w + 1) as u16, 1);
+    assert_eq!(
+        fit.trim_end(),
+        format!(
+            "[ 999+999 live ]  [ 9999 tok/s ] · uwuclxdy 42% · {date} [████░░░░░░] (67 t/s){}● status.claude.ai",
+            " ".repeat(4)
+        ),
+        "one cell wider, the age draws in the slack the chips leave"
+    );
+}
+
+/// The overdue age takes only what the age-less row leaves, so it sheds before
+/// the speed suffix: at the width where the gauge's charged rung plus the
+/// suffix fits the text column exactly, the suffix draws and the age is
+/// absent; the age's own width wider, both draw.
+#[test]
+fn row1_overdue_age_sheds_before_the_speed_suffix() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (profile, usage) = oauth_profile("uwuclxdy", 42.0);
+    let usage = usage.map(|u| UsageInfo {
+        fetched_at: Some(crate::usage::now_ms() - 270_000),
+        ..u
+    });
+    let mut app = app_with(vec![(profile, usage)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    app.set_tps(Some(tps_snapshot(1_000, 12.0, Some(12.0))));
+    app.fetch_lease
+        .acquire_ticket()
+        .expect("fixture: the sandbox lease is free");
+    assert!(
+        app.fetch_lease.release_if_stale(
+            crate::usage::now_ms() + 2 * crate::daemon::LEASE_STALE_BOUND.as_millis() as u64,
+            crate::daemon::LEASE_STALE_BOUND,
+        ),
+        "fixture: stood down"
+    );
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        crate::usage::FetchLeg::OAuth.key(ProfileName::from("uwuclxdy")),
+        crate::usage::now_ms() - 240_000,
+    );
+
+    let readings = app.readings_snapshot();
+    let gauge = active_gauge(&app, &readings).expect("the gauge renders");
+    let age = gauge
+        .age
+        .as_deref()
+        .expect("fixture: the reading is overdue");
+    let suffix_w: usize = speed_suffix_spans(&app, Some(&gauge))
+        .iter()
+        .map(Span::width)
+        .sum();
+    assert!(suffix_w > 0, "fixture: the account has a fresh live speed");
+    let bare = gauge_fit(
+        usize::MAX,
+        Span::raw(gauge.name.as_str()).width(),
+        gauge.pct,
+    );
+    // The cells the layout charges: the age-less gauge's rung plus the suffix.
+    let row_cells = gauge_total_w(bare.name_w, bare.bar_cells, gauge.pct) + suffix_w;
+    let status_w = Span::raw(format!("{} status.claude.ai", theme::DOT_ON)).width();
+    let width =
+        u16::try_from(logo_slot_cols() + row_cells + CONTENT_GAP + status_w).expect("narrow");
+
+    assert_eq!(
+        row_content(&app, width, 1).trim_end(),
+        "uwuclxdy 42% [████░░░░░░] (12 t/s)    ● status.claude.ai",
+        "the age-less gauge and the suffix fit exactly, so the suffix keeps its place"
+    );
+    let age_w = u16::try_from(gauge_age_w(Some(age))).expect("narrow");
+    assert_eq!(
+        row_content(&app, width + age_w, 1).trim_end(),
+        "uwuclxdy 42% · 4m ago [████░░░░░░] (12 t/s)    ● status.claude.ai",
+        "one age wider, the age draws beside the kept suffix"
+    );
+}
+
+/// `reduce_motion` holds the header gauge's active name on its resting `TEXT`
+/// colour at every phase of the pulse cycle, read off the drawn row-1 cells.
+#[test]
+fn reduce_motion_holds_the_header_gauge_name_on_its_resting_colour() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = "alpha";
+    let name_fgs = |still: bool, phase: u64| -> Vec<Color> {
+        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
+        app.tab = Tab::Usage;
+        app.config().state.reduce_motion = still;
+        app.anim_phase_ms = Some(phase);
+        let mut term = Terminal::new(TestBackend::new(100, HEADER_TEST_ROWS)).unwrap();
+        let readings = app.readings_snapshot();
+        term.draw(|f| {
+            let area = f.area();
+            super::draw(f, area, &app, &readings);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let start = (0..100 - 5)
+            .find(|&x| (0..5).all(|i| buf[(x + i, 1)].symbol() == &name[i as usize..=i as usize]))
+            .expect("row 1 carries the active name");
+        (start..start + 5).map(|x| buf[(x, 1)].fg).collect()
+    };
+    let resting = vec![theme::text_color(); 5];
+    for phase in (0..PULSE_CYCLE_MS).step_by(25) {
+        assert_eq!(
+            name_fgs(true, phase),
+            resting,
+            "the name moved under reduce_motion at {phase}ms"
+        );
+    }
+    assert!(
+        (0..PULSE_CYCLE_MS)
+            .step_by(25)
+            .any(|phase| name_fgs(false, phase) != resting),
+        "control: with motion on the name pulse tints a cell somewhere in the cycle"
+    );
 }

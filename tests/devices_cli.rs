@@ -19,6 +19,7 @@ fn clauth(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_clauth"));
     cmd.env("HOME", home)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null());
     cmd
 }

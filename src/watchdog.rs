@@ -174,8 +174,16 @@ fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'
     let matched = event.paths.iter().any(|p| wants(specs, p));
     EventVerdict {
         // A dropped-event overflow says the queue lost changes nobody can
-        // name, so it must reconcile even though it carries no path.
-        wake: matched || event.need_rescan(),
+        // name, so it must reconcile even though it carries no path. An open
+        // changes nothing (a write also raises a modify or close-write), and
+        // waking on one lets any reader of a watched child, clauth's own
+        // job-store walk included, schedule the next reconcile forever.
+        wake: (matched
+            && !matches!(
+                event.kind,
+                notify::EventKind::Access(notify::event::AccessKind::Open(_))
+            ))
+            || event.need_rescan(),
         matched,
         // Only for an event nothing took: one that matched is accounted for,
         // and this walks every spec a second time on the callback thread.
@@ -194,8 +202,8 @@ fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'
 /// itself: inotify leaves `name` empty there and notify then reports the watch
 /// root (`inotify.rs`, `None => self.paths.get(&event.wd).cloned()`), with
 /// `WatchMask::OPEN` armed, so every `opendir` of a watched directory lands
-/// here. clauth's own config leg does two of them per reconcile
-/// (`runtime::shared_runtime_dirs` reads the profile store directory), which
+/// here. clauth's own config leg does at least two of them per reconcile
+/// (`runtime::live_shared_runtime_dirs` reads the profile store directory), which
 /// is enough on its own to cross the orphan floor on a healthy install. Such
 /// an event came from a watch we armed, so it is accounted for by definition.
 fn attributable(specs: &[WatchSpec], path: &Path) -> bool {

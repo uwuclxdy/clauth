@@ -287,6 +287,7 @@ fn oauth_profile(
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -299,9 +300,10 @@ fn oauth_profile(
         extra_usage: extra,
         spend,
         codex_limit_reached: None,
-        codex_reset_credits: None,
+        limit_resets: None,
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     };
     (
         Profile {
@@ -313,11 +315,14 @@ fn oauth_profile(
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold,
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -343,6 +348,9 @@ fn oauth_profile(
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         Some(usage),
         fetch_status,
@@ -361,11 +369,14 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -379,6 +390,9 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     (profile, None, None)
 }
@@ -394,11 +408,14 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(90.0),
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
             preferred_days: Vec::new(),
+            plan_ends: None,
+            plan_renews: None,
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -412,6 +429,9 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             unreadable_credentials_store: None,
             setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         None,
         Some(FetchStatus::Failed),
@@ -806,7 +826,7 @@ fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> boo
 fn base_url_of(app: &app::App, name: &str) -> Option<String> {
     app.config()
         .find(&crate::profile::ProfileName::from(name))
-        .and_then(|p| p.base_url.clone())
+        .and_then(|p| p.saved_base_url())
 }
 
 fn auto_start_of(app: &app::App, name: &str) -> bool {
@@ -1095,11 +1115,13 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "sk-test-key-0000");
     press(&mut app, KeyCode::Enter); // commit ApiKey
 
-    // Navigate to Create row and commit (skipping over the base model row and
-    // the collapsed overrides — left untouched, so every model stays unset).
+    // Navigate to Create row and commit (skipping over the base model row, the
+    // collapsed overrides and the effort row — left untouched, so every model
+    // and the effort stay unset).
     press(&mut app, KeyCode::Down); // ApiKey → Model
     press(&mut app, KeyCode::Down); // Model → + model override
-    press(&mut app, KeyCode::Down); // + model override → Create
+    press(&mut app, KeyCode::Down); // + model override → Effort
+    press(&mut app, KeyCode::Down); // Effort → Create
 
     assert!(
         app.config_draft

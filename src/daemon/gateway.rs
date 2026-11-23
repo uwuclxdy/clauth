@@ -33,6 +33,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -109,9 +113,10 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 /// draining past it is left running with its stop deadline in its child
 /// marker; the next daemon start waits out the rest and kills it there.
 ///
-/// The token-spend drain needs no longer budget here: it runs CONCURRENTLY
-/// with these stops ([`stop_for_exit`]), so the exit takes the longer of the
-/// two rather than their sum, and [`REPLACE_WAIT`] covers that longer term.
+/// The drain (the token spend in flight and the tick thread's exit save)
+/// needs no longer budget here: it runs CONCURRENTLY with these stops
+/// ([`stop_for_exit`]), so the exit takes the longer of the two rather than
+/// their sum, and [`REPLACE_WAIT`] covers that longer term.
 pub(crate) const DAEMON_STOP_BUDGET: Duration = Duration::from_secs(4);
 
 /// How often a supervisor wait re-checks its subject: the child inside
@@ -144,7 +149,7 @@ fn stop_poll(remaining: Duration) -> Duration {
 /// one-poll grace raced every stop whose child outlived its budget. The grace
 /// stays inside the escalation margin [`REPLACE_WAIT`] leaves over the budget,
 /// so `--replace` still sees the flock go.
-const STOP_ANSWER_GRACE: Duration = Duration::from_millis(500);
+pub(crate) const STOP_ANSWER_GRACE: Duration = Duration::from_millis(500);
 const _: () = assert!(
     DAEMON_STOP_BUDGET.as_millis() + STOP_ANSWER_GRACE.as_millis() + REPLACE_POLL.as_millis()
         < REPLACE_WAIT.as_millis()
@@ -1375,6 +1380,18 @@ impl<K: Supervised> Supervisor<K> {
                 killed,
             } => {
                 if process_start_time(*pid).as_ref() != Some(start) {
+                    #[cfg(unix)]
+                    {
+                        // The pid may be our own zombie: a child the previous
+                        // image stopped and left draining, whose reaper thread
+                        // the re-exec killed. Only a pid the boot capture
+                        // listed as inherited is reaped (a child this image
+                        // spawned is never in that set), so the reap cannot
+                        // take a status a handle this image owns.
+                        if is_inherited_child(*pid, start) {
+                            reap_inherited_zombie(*pid, start);
+                        }
+                    }
                     logline!(
                         "clauth daemon: {} a previous daemon left running (pid {pid}) is gone",
                         self.kind.name()
@@ -1470,6 +1487,18 @@ pub(crate) fn stop_left_behind(path: &Path, name: &str, now_ms: u64) -> Option<L
         }
     };
     let Some(start) = live_start(&marker) else {
+        // The pid reads gone, which includes our own un-reaped zombie (a
+        // child the previous image left, whose reaper the re-exec killed):
+        // reap it so it is not left defunct, then drop the marker. Only a
+        // pid the boot capture listed as inherited is reaped, so a marker
+        // naming a child this image spawned is never waited on. (Windows
+        // never re-execs, so no such zombie exists there.)
+        #[cfg(unix)]
+        if let Some(start) = marker.start.as_deref()
+            && is_inherited_child(marker.pid, start)
+        {
+            reap_inherited_zombie(marker.pid, start);
+        }
         remove_marker_at(path);
         return None;
     };
@@ -2528,9 +2557,13 @@ fn remove_marker_at(path: &Path) {
 /// When `pid` started, as an opaque token two reads of one live process
 /// agree on; `None` for a pid that is gone, a zombie, or unreadable.
 ///
-/// Linux: field 22 of `/proc/<pid>/stat`, clock ticks since boot.
+/// Linux: field 22 of `/proc/<pid>/stat`, clock ticks since boot; `None` for
+/// a thread's id.
 #[cfg(target_os = "linux")]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    if crate::runtime::pid_is_thread(pid) {
+        return None;
+    }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) is parenthesized and may hold spaces or
     // parens itself, so the fields are counted from its last `)`.
@@ -2557,17 +2590,24 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    let (stat, lstart) = text.trim().split_once(char::is_whitespace)?;
+    let (stat, lstart) = crate::which::split_stat_lstart(&text)?;
     if stat.starts_with('Z') {
         return None;
     }
-    Some(lstart.trim().to_string())
+    // The column's own spelling, trimmed: the token every reader stores and
+    // compares, so a marker written by a released binary (which trimmed the
+    // same column) still matches after an update.
+    Some(lstart.to_string())
 }
 
 /// Windows: the .NET process start time in UTC ticks, through the PowerShell
 /// the TLS listener's FQDN lookup already runs.
 #[cfg(windows)]
 pub(crate) fn process_start_time(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    // A daemon started without a console would otherwise give each lookup a
+    // visible window of its own.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -2577,6 +2617,7 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     let ticks = String::from_utf8(output.stdout).ok()?;
@@ -2584,6 +2625,306 @@ pub(crate) fn process_start_time(pid: u32) -> Option<String> {
     (output.status.success() && !ticks.is_empty() && ticks.bytes().all(|b| b.is_ascii_digit()))
         .then(|| ticks.to_string())
 }
+
+// ── the inherited-child reap ────────────────────────────────────────────────
+
+/// The start time of `pid` when it is a zombie, the one state
+/// [`process_start_time`] reads as gone: a zombie keeps its start in its
+/// `/proc` entry until it is reaped. Linux: field 22 of `/proc/<pid>/stat`,
+/// read only when the state is `Z`.
+#[cfg(target_os = "linux")]
+fn zombie_start(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name (field 2) is parenthesized and may hold spaces or
+    // parens itself, so the fields are counted from its last `)`.
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    if fields.next()? != "Z" {
+        return None;
+    }
+    fields.nth(18).map(str::to_string)
+}
+
+/// macOS: `ps -o stat=,lstart=`, the start time to the second, taken when
+/// the state reads `Z`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn zombie_start(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (stat, lstart) = crate::which::split_stat_lstart(&text)?;
+    stat.starts_with('Z').then(|| lstart.to_string())
+}
+
+/// Reap an inherited child the previous image left: the re-exec killed the
+/// detached reaper thread that used to own its reap, so this image reclaims
+/// it. Callers pass only pids in the set captured at boot
+/// ([`is_inherited_child`]) — children this image inherited across the exec
+/// and never spawned a `Child` handle for — so the wait can never take a
+/// status a handle this image owns. Only a pid that sits as our zombie and
+/// still carries its recorded start time is reaped: the start match rejects
+/// a recycled pid (a live process with the same pid reads as not-a-zombie,
+/// or as a zombie with a different start), and the zombie state keeps the
+/// reap off a live pid. `true` once the pid is no longer this image's to
+/// track: the wait reaped it, or the pid reads as not this process's child.
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "the one wait on a pid this image never spawned a handle for, which no safe std API can wait on"
+)]
+pub(crate) fn reap_inherited_zombie(pid: u32, start: &str) -> bool {
+    if zombie_start(pid).as_deref() != Some(start) {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: a null status pointer writes no memory of ours and `WNOHANG`
+    // never blocks; a pid that is not this process's child fails with
+    // `ECHILD`. Any nonzero return means the entry is done: the pid for a
+    // reaped child, `ECHILD` for a pid this process does not own.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) != 0 }
+}
+
+/// The children this image inherited across the re-exec: the exec keeps the
+/// pid, so the children the replaced image spawned are this image's too,
+/// each recorded with its start time when the boot capture listed it, before
+/// this image spawned anything of its own. `None` until
+/// [`capture_inherited_children`] runs, which the daemon's `serve` calls
+/// before it spawns anything (right after the handover take): a fresh
+/// start captures an empty set, and no reap runs without a capture.
+#[cfg(unix)]
+static INHERITED_CHILDREN: std::sync::Mutex<Option<Vec<(u32, String)>>> =
+    std::sync::Mutex::new(None);
+
+/// Capture this image's inherited children once, at boot, before it spawns
+/// anything: the listing runs through [`crate::which::SystemProcs`] (linux
+/// `/proc`, macOS `ps`), and only pids whose parent is this process enter
+/// the set, so a reap over it never waits on a pid this process does not
+/// own. The first capture wins; the daemon's one call runs before `serve`
+/// spawns anything. A failed listing leaves the set unset and logs one daemon
+/// line, so the reap reads as "never captured", never as "no children".
+#[cfg(unix)]
+pub(crate) fn capture_inherited_children() {
+    let mut children = INHERITED_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if children.is_none() {
+        match list_inherited_children() {
+            Ok(list) => *children = Some(list),
+            Err(e) => logline!(
+                "clauth daemon: cannot list the children inherited across the re-exec; none will be reaped: {e:#}"
+            ),
+        }
+    }
+}
+
+/// The boot listing, with the test seam posing the one failure the box
+/// cannot (a broken `/proc` read or a missing `ps`).
+#[cfg(unix)]
+fn list_inherited_children() -> anyhow::Result<Vec<(u32, String)>> {
+    #[cfg(all(test, unix))]
+    if probe_seam::children_listing_refused() {
+        anyhow::bail!("the listing was refused by the test seam");
+    }
+    crate::which::SystemProcs
+        .children_of(std::process::id())
+        .context("listing the inherited children")
+}
+
+/// Clear the captured set, so a test starts from the never-captured state.
+#[cfg(all(test, unix))]
+pub(crate) fn reset_inherited_children() {
+    *INHERITED_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Whether `pid` with its recorded `start` sits in the boot-captured set:
+/// the marker reap's call sites reap only these, children this image never
+/// spawned a `Child` handle for, which is what keeps a reclaim off a status
+/// this image still owns.
+#[cfg(unix)]
+pub(crate) fn is_inherited_child(pid: u32, start: &str) -> bool {
+    INHERITED_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|children| children.iter().any(|(p, s)| *p == pid && s == start))
+}
+
+/// One run-loop tick's inherited reap: reap the captured children that have
+/// exited as this image's zombies, pruning every entry that can no longer
+/// be this image's inherited child. A no-op without a capture, and a no-op
+/// on an empty set: the reap never waits on a pid outside the set.
+#[cfg(unix)]
+pub(crate) fn reap_inherited_tick() {
+    let mut set = INHERITED_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(children) = set.as_mut() else {
+        return;
+    };
+    reap_inherited(children);
+}
+
+/// What one inherited-child probe reads: the pid alive with its start
+/// token, a zombie with its start token, the pid gone, or the read failed.
+/// The reap treats only an observed state as a fact: a failed read keeps
+/// the entry tracked, because a live child must never read as gone through
+/// a transient error.
+#[cfg(unix)]
+enum InheritedState {
+    Live(String),
+    Zombie(String),
+    Gone,
+    Failed,
+}
+
+/// One inherited-child probe on linux: `/proc/<pid>/stat`, read once.
+/// `NotFound` is the one read that means the pid is gone; any other read
+/// error or an unparseable stat keeps the entry, and the state letter
+/// splits live from zombie.
+#[cfg(target_os = "linux")]
+fn probe_inherited(pid: u32) -> InheritedState {
+    #[cfg(all(test, unix))]
+    if probe_seam::inherited_read_refused() {
+        return InheritedState::Failed;
+    }
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return InheritedState::Gone,
+        Err(_) => return InheritedState::Failed,
+    };
+    // The command name (field 2) is parenthesized and may hold spaces or
+    // parens itself, so the fields are counted from its last `)`.
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return InheritedState::Failed;
+    };
+    let mut fields = rest.split_whitespace();
+    let (Some(state), Some(start)) = (fields.next(), fields.nth(18)) else {
+        return InheritedState::Failed;
+    };
+    match state {
+        "Z" | "X" | "x" => InheritedState::Zombie(start.to_string()),
+        _ => InheritedState::Live(start.to_string()),
+    }
+}
+
+/// One inherited-child probe on macOS: one `ps -o stat=,lstart=` read. Only
+/// a `ps` that ran and found no such pid reads as gone (its no-match exit
+/// with no output); a spawn failure or any other error keeps the entry, and
+/// the state letter splits live from zombie.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn probe_inherited(pid: u32) -> InheritedState {
+    #[cfg(all(test, unix))]
+    if probe_seam::inherited_read_refused() {
+        return InheritedState::Failed;
+    }
+    let output = match Command::new("ps")
+        .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        // A spawn failure (no `ps`, a fork failure) is a failed read, never
+        // "gone".
+        Err(_) => return InheritedState::Failed,
+    };
+    if !output.status.success() {
+        // BSD `ps` exits 1 with no output when the pid does not exist, but
+        // any other failing `ps` with that shape must not read as gone:
+        // the kernel settles it (`kill(pid, 0)` reports `ESRCH` only for a
+        // pid that does not exist), and a live child is never pruned off a
+        // read it could not take.
+        return match (output.status.code(), output.stdout.is_empty()) {
+            (Some(1), true) => match pid_exists(pid) {
+                Some(false) => InheritedState::Gone,
+                _ => InheritedState::Failed,
+            },
+            _ => InheritedState::Failed,
+        };
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return InheritedState::Failed;
+    };
+    let Some((stat, lstart)) = crate::which::split_stat_lstart(&text) else {
+        return InheritedState::Failed;
+    };
+    if stat.starts_with('Z') {
+        InheritedState::Zombie(lstart.to_string())
+    } else {
+        InheritedState::Live(lstart.to_string())
+    }
+}
+
+/// Whether the kernel reports `pid` as existing: `kill(pid, 0)` delivers no
+/// signal and answers the pid's existence with `ESRCH` when it does not.
+/// macOS-only companion to the gone read, so a `ps` that failed with the
+/// no-match shape reads as gone only when the kernel agrees; `None` when
+/// the kernel answers neither way (EPERM or another error), which keeps
+/// the entry as a failed read.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(unsafe_code)]
+fn pid_exists(pid: u32) -> Option<bool> {
+    // SAFETY: `kill(pid, 0)` sends no signal; the return value and errno
+    // are the existence answer, and no memory of ours is written.
+    let rc = unsafe { libc::kill(libc::pid_t::try_from(pid).ok()?, 0) };
+    if rc == 0 {
+        Some(true)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The reap over one set (the test seam beside the tick): each entry that
+/// reads as this image's zombie with its recorded start is reaped, and
+/// every entry that can no longer be this image's inherited child is
+/// pruned — one the reap finished, a gone pid, or a live pid with a new
+/// start (a recycled one after the marker reap freed it). A live child with
+/// its recorded start stays tracked, and a failed read keeps the entry:
+/// only an observed state prunes.
+#[cfg(unix)]
+fn reap_inherited(children: &mut Vec<(u32, String)>) {
+    children.retain(|(pid, start)| match probe_inherited(*pid) {
+        // A zombie with the recorded start: the one wait the set exists
+        // for. The reap re-reads the zombie state itself (another reclaim
+        // may have reaped it between the probe and the wait), and a
+        // finished reap prunes.
+        InheritedState::Zombie(zstart) if zstart == *start => !reap_inherited_zombie(*pid, start),
+        // A zombie with another start is a recycled pid: prune without a
+        // wait, it can never carry this image's recorded start again. An
+        // observed gone pid is pruned the same way.
+        InheritedState::Zombie(_) | InheritedState::Gone => false,
+        // A live child with its recorded start stays tracked; a live pid
+        // with another start is a recycled one.
+        InheritedState::Live(lstart) => &lstart == start,
+        // A failed read is never read as a fact: keep the entry tracked.
+        InheritedState::Failed => true,
+    });
+}
+
+/// Platforms that never re-exec have no inherited children to capture or
+/// reap.
+#[cfg(not(unix))]
+pub(crate) fn capture_inherited_children() {}
+
+#[cfg(not(unix))]
+pub(crate) fn reap_inherited_tick() {}
 
 // ── the thread ──────────────────────────────────────────────────────────────
 
@@ -2953,18 +3294,161 @@ fn inherited_ignored(signal: libc::c_int) -> bool {
     old.sa_sigaction == libc::SIG_IGN
 }
 
+/// The stop kit's payload: the spend drain plus the supervised children.
+#[cfg(unix)]
+type StopKitParts = (
+    super::SpendDrain,
+    Option<SupervisorThread<Gateway>>,
+    ProxySupervision,
+);
+
+/// The supervised children plus the spend drain, in one take-once slot shared
+/// by the signal watcher and the main loop's re-exec path. Both end the
+/// process right after their stop, so whoever takes first runs the one
+/// [`stop_for_exit`] and the other finds the slot empty. On non-unix nothing
+/// ever takes it — it exists so [`super::serve`] holds the children alive for
+/// the process's life, the pre-re-exec shape.
+pub(crate) struct StopKit {
+    #[cfg(unix)]
+    inner: Mutex<Option<StopKitParts>>,
+    /// The spare drain for the watcher-lost re-exec: the spawn-failure arm
+    /// drops the drain in the slot with the children (that drop is what
+    /// stops them), so the due re-exec waits the token spend in flight out
+    /// through this one before it execs. Only that arm's re-exec takes it —
+    /// the signal path and the ordinary re-exec take the slot's drain — so
+    /// exactly one drain runs per process end.
+    #[cfg(unix)]
+    spare_drain: Mutex<Option<super::SpendDrain>>,
+    /// A stop signal the watcher read while the re-exec path owned the stop,
+    /// parked for the re-exec path's post-stop check: it dies of that signal
+    /// then instead of exec'ing, exactly as the signal path would. 0 = none.
+    #[cfg(unix)]
+    pending_stop_signal: AtomicI32,
+    /// A stop signal the flag handler recorded on delivery, shared with the
+    /// handler. The re-exec path's post-stop check reads it after the parked
+    /// one: the watcher parks only once it wakes, so a signal in that
+    /// wake-to-park gap would otherwise be lost and the daemon would exec
+    /// past a stop. 0 = none.
+    #[cfg(unix)]
+    caught_stop_signal: Arc<AtomicUsize>,
+    /// The watcher never started (its spawn failed at boot): the slot stays
+    /// empty forever with no stop owner, so a due re-exec runs on — after
+    /// the spare drain's wait — the children were already stopped by the
+    /// spawn-failure arm.
+    #[cfg(unix)]
+    watcher_lost: AtomicBool,
+    /// Never taken on non-unix: it exists so the children stay alive (and are
+    /// stopped by the drop) exactly as the pre-re-exec `_supervisor` did.
+    #[cfg(not(unix))]
+    #[allow(dead_code)]
+    supervisors: (Option<SupervisorThread<Gateway>>, ProxySupervision),
+}
+
+#[cfg(unix)]
+impl StopKit {
+    pub(crate) fn new(
+        spends: super::SpendDrain,
+        gateway: Option<SupervisorThread<Gateway>>,
+        proxies: ProxySupervision,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Some((spends.clone(), gateway, proxies))),
+            spare_drain: Mutex::new(Some(spends)),
+            pending_stop_signal: AtomicI32::new(0),
+            caught_stop_signal: Arc::new(AtomicUsize::new(0)),
+            watcher_lost: AtomicBool::new(false),
+        })
+    }
+
+    /// The one taker: the whole stop (spends + children), or `None` when the
+    /// other end-of-process path already took it — that path owns the exit,
+    /// and the loser must not run a second stop or cut the winner's drain
+    /// short.
+    pub(crate) fn take(&self) -> Option<StopKitParts> {
+        match self.inner.lock() {
+            Ok(mut inner) => inner.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    /// The spare drain for the watcher-lost re-exec (see the field): `None`
+    /// once taken, and that arm refuses to exec without one.
+    pub(crate) fn take_spare_drain(&self) -> Option<super::SpendDrain> {
+        match self.spare_drain.lock() {
+            Ok(mut spare) => spare.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    /// Park a stop signal read while the re-exec path owns the stop (the
+    /// signal path lost the race): the re-exec path's post-stop check takes
+    /// it and dies of it. Release/Acquire: the store is a publication the
+    /// other thread's load consumes, and no shared lock remains between the
+    /// two sides (the take slot was the last one).
+    pub(crate) fn park_stop_signal(&self, signal: libc::c_int) {
+        self.pending_stop_signal.store(signal, Ordering::Release);
+    }
+
+    /// The stop signal for the post-stop check, consumed by the read: the
+    /// parked one when the watcher already read it, else the one the flag
+    /// handler caught — a signal delivered while the watcher was still
+    /// waking would otherwise be lost and the daemon would exec past a
+    /// stop. A parked hit leaves the caught flag set (each check runs once,
+    /// right before the process end, so a stale flag is never read again).
+    /// A signal delivered after this read and before the exec's `execve`
+    /// still execs: that residual window is the instructions between the
+    /// two, which no handler can close on the exec path. The caught flag is
+    /// a signal indicator with nothing published beside it, so both sides
+    /// run `Relaxed`; the parked store keeps its Release to this Acquire.
+    pub(crate) fn take_pending_stop_signal(&self) -> Option<libc::c_int> {
+        let parked = self.pending_stop_signal.swap(0, Ordering::Acquire);
+        if parked != 0 {
+            return Some(parked);
+        }
+        let caught = self.caught_stop_signal.swap(0, Ordering::Relaxed);
+        (caught != 0).then_some(caught as libc::c_int)
+    }
+
+    /// The spawn-failure arm's marker: the watcher never started. Relaxed —
+    /// the marker and its read sit on the same boot-to-loop thread.
+    pub(crate) fn mark_watcher_lost(&self) {
+        self.watcher_lost.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the watcher never started (see [`StopKit::mark_watcher_lost`]).
+    pub(crate) fn watcher_lost(&self) -> bool {
+        self.watcher_lost.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(not(unix))]
+impl StopKit {
+    pub(crate) fn new(
+        gateway: Option<SupervisorThread<Gateway>>,
+        proxies: ProxySupervision,
+    ) -> Self {
+        Self {
+            supervisors: (gateway, proxies),
+        }
+    }
+}
+
 /// Stop the gateway and every proxy before the daemon dies of SIGTERM, SIGINT
 /// or SIGHUP, waiting out a token spend in flight first, then die of that same
-/// signal, so a supervisor reads the exit it always read. Returns the
-/// supervisors back when no watcher could take them; the caller keeps them
-/// alive for the process's life either way.
+/// signal, so a supervisor reads the exit it always read. Returns the stop
+/// kit; the caller keeps it alive for the process's life either way.
 #[cfg(unix)]
+#[expect(
+    clippy::exit,
+    reason = "the watcher must die of the caught stop signal with the conventional 128+signal status, after the children and the drain finished"
+)]
 pub(crate) fn stop_on_signal(
     spends: super::SpendDrain,
     gateway: Option<SupervisorThread<Gateway>>,
     proxies: ProxySupervision,
-) -> Option<(Option<SupervisorThread<Gateway>>, ProxySupervision)> {
+) -> Arc<StopKit> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    let kit = StopKit::new(spends, gateway, proxies);
     // Watch only the signals this daemon did not inherit as ignored (nohup, a
     // non-interactive shell's `&`): signal-hook installs its handler over an
     // inherited SIG_IGN without chaining it, so watching an ignored signal
@@ -2974,42 +3458,81 @@ pub(crate) fn stop_on_signal(
         .filter(|signal| !inherited_ignored(*signal))
         .collect();
     if watched.is_empty() {
-        return Some((gateway, proxies));
+        return kit;
     }
-    let mut signals = match signal_hook::iterator::Signals::new(watched) {
+    let mut signals = match signal_hook::iterator::Signals::new(watched.clone()) {
         Ok(signals) => signals,
         Err(e) => {
             logline!(
                 "clauth daemon: cannot catch the stop signals ({e}); the children outlive this daemon, and the next start stops them"
             );
-            return Some((gateway, proxies));
+            return kit;
         }
     };
+    let signal_kit = Arc::clone(&kit);
     let spawned = std::thread::Builder::new()
         .name("clauth-daemon-sig".into())
         .spawn(move || {
-            let Some(signal) = signals.forever().next() else {
-                return;
-            };
-            // Stop the children and wait out the token spend in flight
-            // together, then die of the signal that arrived.
-            stop_for_exit(&spends, gateway, proxies);
-            if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
-                logline!("clauth daemon: cannot re-raise signal {signal}: {e}");
+            loop {
+                let Some(signal) = signals.forever().next() else {
+                    return;
+                };
+                let Some((spends, gateway, proxies)) = signal_kit.take() else {
+                    // The re-exec path is mid-stop: it ends the process (exec,
+                    // abort, or the parked signal's exit) on its own, so park
+                    // the signal for its post-stop check rather than dying here
+                    // and cutting its token-save drain short, then wait for the
+                    // next signal.
+                    signal_kit.park_stop_signal(signal);
+                    continue;
+                };
+                // Stop the children and wait out the token spend in flight
+                // together, then die of the signal that arrived.
+                stop_for_exit(&spends, gateway, proxies);
+                if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
+                    logline!("clauth daemon: cannot re-raise signal {signal}: {e}");
+                }
+                std::process::exit(128 + signal);
             }
-            std::process::exit(128 + signal);
         });
-    if let Err(e) = spawned {
-        logline!(
-            "clauth daemon: failed to spawn the signal watcher ({e}); the children were stopped"
-        );
+    match spawned {
+        Ok(_) => {
+            // Recorded only once a watcher exists: without one, a flag
+            // handler alone would swallow every stop signal and a daemon
+            // whose watcher never started would stop dying of them.
+            for signal in watched {
+                if let Err(e) = signal_hook::flag::register_usize(
+                    signal,
+                    Arc::clone(&kit.caught_stop_signal),
+                    signal as usize,
+                ) {
+                    logline!(
+                        "clauth daemon: cannot record stop signal {signal} for the re-exec check ({e})"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // The pre-kit shape dropped the closure that had moved the children
+            // in, which stops them; taking the kit here keeps that drop before
+            // the line below claims it. The drain drops with them, and the kit's
+            // spare drain is what a due re-exec waits on. No watcher will ever
+            // come, so a due re-exec must run anyway — the marker tells the
+            // empty-kit arm.
+            kit.mark_watcher_lost();
+            drop(kit.take());
+            logline!(
+                "clauth daemon: failed to spawn the signal watcher ({e}); the children were stopped"
+            );
+        }
     }
-    None
+    kit
 }
 
-/// Send every child its stop on its own thread, wait out the token spend in
-/// flight on the calling thread, then join the stops. Concurrent on purpose:
-/// the exit then takes max(spend, children), never their sum. Split from
+/// Send every child its stop on its own thread, run the drain (the token
+/// spend in flight and the tick thread's exit save, sharing one bound) on
+/// the calling thread, then finish the stops. Concurrent on purpose: the
+/// exit then takes max(drain, children), never their sum. Split from
 /// [`stop_on_signal`]'s watcher so a test can pin the wait without dying.
 #[cfg(unix)]
 pub(crate) fn stop_for_exit(
@@ -3021,15 +3544,92 @@ pub(crate) fn stop_for_exit(
     // concurrently): the wait for each answer ends within one
     // `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, never N serial budgets,
     // and each join after an answer then waits out that stop's deferred log
-    // and marker writes with no bound.
-    let gateway =
-        gateway.map(|gateway| std::thread::spawn(move || gateway.shutdown(DAEMON_STOP_BUDGET)));
-    let proxies = std::thread::spawn(move || proxies.shutdown());
+    // and marker writes with no bound. A refused spawn keeps its payload for
+    // the finish below, so a thread limit can only ever slow a children's
+    // stop, never the drain: the drain runs before any inline stop, and the
+    // watchdog abort then cuts a stop the next start reclaims, never a save
+    // in flight.
+    let gateway = gateway.map(|gateway| {
+        spawn_stop_thread(gateway, |gateway| {
+            gateway.shutdown(DAEMON_STOP_BUDGET);
+        })
+    });
+    let proxies = spawn_stop_thread(proxies, ProxySupervision::shutdown);
     spends.drain(super::SPEND_DRAIN_BOUND);
     if let Some(gateway) = gateway {
-        let _ = gateway.join();
+        gateway.finish();
     }
-    let _ = proxies.join();
+    proxies.finish();
+}
+
+/// One stop thread that keeps its payload when the spawn is refused, so the
+/// caller can drain first and run the stop inline only afterwards (the
+/// supervisors' own `Drop` stops the child on the finishing thread): a
+/// thread limit slows the stop, never panics past the drain, and never runs
+/// an inline stop before it. `Running` joins the spawned stop; `Refused`
+/// drops its payload, which is the inline stop.
+#[cfg(unix)]
+pub(crate) enum StopThread<T> {
+    Running(std::thread::JoinHandle<()>),
+    Refused(Option<T>),
+}
+
+#[cfg(unix)]
+impl<T> StopThread<T> {
+    /// End the stop: join the spawned thread, or drop the refused payload so
+    /// its `Drop` stops the child inline.
+    pub(crate) fn finish(self) {
+        match self {
+            Self::Running(handle) => {
+                drop(handle.join());
+            }
+            Self::Refused(payload) => drop(payload),
+        }
+    }
+}
+
+/// Spawn `stop(payload)` on its own thread, seam-aware; when the spawn is
+/// refused the payload comes back in [`StopThread::Refused`] instead of
+/// dropping at the spawn site (which would run the stop inline there).
+#[cfg(unix)]
+pub(crate) fn spawn_stop_thread<T: Send + 'static>(
+    payload: T,
+    stop: impl FnOnce(T) + Send + 'static,
+) -> StopThread<T> {
+    let slot = Arc::new(Mutex::new(Some(payload)));
+    let theirs = Arc::clone(&slot);
+    #[cfg(all(test, unix))]
+    let builder = if probe_seam::stop_spawn_refused() {
+        // No kernel grants a stack this size: the real `spawn` refusal is
+        // `EINVAL` (Invalid argument (os error 22) on linux, measured
+        // 2026-11-18), not a thread limit's `EAGAIN`; posed on demand.
+        std::thread::Builder::new().stack_size(usize::MAX)
+    } else {
+        std::thread::Builder::new()
+    };
+    #[cfg(not(all(test, unix)))]
+    let builder = std::thread::Builder::new();
+    let spawned = builder.spawn(move || {
+        let payload = theirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(payload) = payload {
+            stop(payload);
+        }
+    });
+    match spawned {
+        Ok(handle) => StopThread::Running(handle),
+        Err(_) => {
+            #[cfg(all(test, unix))]
+            probe_seam::count_stop_spawn_failure();
+            StopThread::Refused(
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            )
+        }
+    }
 }
 
 /// Windows delivers no SIGTERM to a console process: the daemon ends by
@@ -3042,8 +3642,8 @@ pub(crate) fn stop_on_signal(
     _spends: super::SpendDrain,
     gateway: Option<SupervisorThread<Gateway>>,
     proxies: ProxySupervision,
-) -> Option<(Option<SupervisorThread<Gateway>>, ProxySupervision)> {
-    Some((gateway, proxies))
+) -> StopKit {
+    StopKit::new(gateway, proxies)
 }
 
 // ── the slot's stamped fields ───────────────────────────────────────────────
@@ -3129,6 +3729,7 @@ impl Tick {
     reason = "the seam installs its channels together in `arm`, so a missing one is a test bug"
 )]
 pub(super) mod probe_seam {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Mutex, OnceLock};
@@ -3153,6 +3754,106 @@ pub(super) mod probe_seam {
     /// Count one probe, from the probe hook.
     pub fn count_probe() {
         PROBES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Per-thread: the stop-thread spawns on this thread fail as if a thread
+    // limit was hit, and each real spawn failure is counted. The refusal
+    // poses the one failure a test cannot (the box always has threads
+    // left); the count lets a test tell a refused spawn from a successful
+    // one, which both still stop the children.
+    thread_local! {
+        static STOP_SPAWN_REFUSED: Cell<bool> = const { Cell::new(false) };
+        static STOP_SPAWN_FAILURES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Refuse the stop-thread spawns on this thread and start counting their
+    /// real failures from zero. The returned guard disarms it on drop.
+    pub(crate) fn fail_stop_spawns() -> StopSpawnFailArm {
+        STOP_SPAWN_REFUSED.with(|refused| refused.set(true));
+        STOP_SPAWN_FAILURES.with(|failures| failures.set(0));
+        StopSpawnFailArm
+    }
+
+    pub(crate) struct StopSpawnFailArm;
+
+    impl Drop for StopSpawnFailArm {
+        fn drop(&mut self) {
+            STOP_SPAWN_REFUSED.with(|refused| refused.set(false));
+        }
+    }
+
+    /// Whether a stop-thread spawn on this thread must fail.
+    pub(crate) fn stop_spawn_refused() -> bool {
+        STOP_SPAWN_REFUSED.with(Cell::get)
+    }
+
+    /// Count one real stop-thread spawn failure, from the spawn site.
+    pub(crate) fn count_stop_spawn_failure() {
+        STOP_SPAWN_FAILURES.with(|failures| failures.set(failures.get() + 1));
+    }
+
+    /// The real stop-thread spawn failures counted since the last arm.
+    pub(crate) fn stop_spawn_failures() -> usize {
+        STOP_SPAWN_FAILURES.with(Cell::get)
+    }
+
+    // Per-thread: the inherited-children listing on this thread fails as if
+    // the process table could not be read, posing the one listing failure a
+    // test cannot (a broken `/proc` read or a missing `ps`).
+    thread_local! {
+        static CHILDREN_LISTING_REFUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Refuse the inherited-children listing on this thread. The returned
+    /// guard disarms it on drop.
+    pub(crate) fn fail_children_listing() -> ChildrenListingFailArm {
+        CHILDREN_LISTING_REFUSED.with(|refused| refused.set(true));
+        ChildrenListingFailArm
+    }
+
+    pub(crate) struct ChildrenListingFailArm;
+
+    impl Drop for ChildrenListingFailArm {
+        fn drop(&mut self) {
+            CHILDREN_LISTING_REFUSED.with(|refused| refused.set(false));
+        }
+    }
+
+    /// Whether an inherited-children listing on this thread must fail.
+    pub(crate) fn children_listing_refused() -> bool {
+        CHILDREN_LISTING_REFUSED.with(Cell::get)
+    }
+
+    // Per-thread: the inherited-child start read on this thread fails as if
+    // the process table could not be read, posing the one read failure a
+    // test cannot (a transient /proc read error).
+    thread_local! {
+        static INHERITED_READ_REFUSED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Refuse the inherited-child start reads on this thread. The returned
+    /// guard disarms it on drop. Linux-gated like its only caller (the
+    /// failed-read test): on macOS the arm is dead code and reds the
+    /// clippy leg.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fail_inherited_reads() -> InheritedReadFailArm {
+        INHERITED_READ_REFUSED.with(|refused| refused.set(true));
+        InheritedReadFailArm
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) struct InheritedReadFailArm;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for InheritedReadFailArm {
+        fn drop(&mut self) {
+            INHERITED_READ_REFUSED.with(|refused| refused.set(false));
+        }
+    }
+
+    /// Whether an inherited-child start read on this thread must fail.
+    pub(crate) fn inherited_read_refused() -> bool {
+        INHERITED_READ_REFUSED.with(Cell::get)
     }
 
     struct State {

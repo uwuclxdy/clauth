@@ -23,10 +23,10 @@ use crate::profile_cache::{
 use crate::providers::Provider;
 
 use super::scheduler::{
-    KickBlocks, LastFetchedAt, NextRefreshPerProfile, PollStreaks, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyStatusStore, ThirdPartyStreaks,
-    ThirdPartyUsageStore, UsageStore, WeeklyResetKicks, forget_codex_polled, seed_codex_name,
-    seed_third_party_name, third_party_credentialed_fields, try_seed_cache,
+    ClaudeResetsMemoLock, CodexResetsMemoLock, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
+    PollStreaks, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, UsageStore, WeeklyResetKicks, forget_codex_polled,
+    seed_codex_name, seed_third_party_name, third_party_credentialed_fields, try_seed_cache,
 };
 use super::{AutoStartQueueState, FetchLeg, forget_profile_memo, now_ms};
 
@@ -840,6 +840,7 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
             remove_profile_cache(name, USAGE_CACHE_FILE);
             remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
             remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
+            remove_profile_cache(name, crate::profile_cache::LIMIT_RESETS_FILE);
         }
         Half::ThirdParty => {
             // `third_party_auth.json` and `dead_key.json` stay: both verdicts
@@ -849,8 +850,10 @@ pub(crate) fn forget_disk(name: &ProfileName, half: Half) {
         }
         Half::Codex => {
             // The codex reading shares `usage_cache.json` with the OAuth half;
-            // an account change must drop the old account's reading now.
+            // an account change must drop the old account's reading now, and
+            // the credits its last list read named with it.
             remove_profile_cache(name, USAGE_CACHE_FILE);
+            remove_profile_cache(name, crate::profile_cache::LIMIT_RESETS_FILE);
         }
         Half::Throughput => {
             remove_profile_cache(name, crate::throughput::THROUGHPUT_CACHE_FILE);
@@ -925,6 +928,8 @@ pub(crate) struct MemoryStores {
     pub(crate) poll_streaks: PollStreaks,
     pub(crate) kick_blocks: KickBlocks,
     pub(crate) weekly_reset_kicks: WeeklyResetKicks,
+    pub(crate) claude_resets_memo: ClaudeResetsMemoLock,
+    pub(crate) codex_resets_memo: CodexResetsMemoLock,
     pub(crate) auto_start_queue: AutoStartQueueState,
     pub(crate) third_party_usage: ThirdPartyUsageStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
@@ -984,6 +989,8 @@ impl MemoryStores {
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+            claude_resets_memo: super::scheduler::new_claude_resets_memo(),
+            codex_resets_memo: super::scheduler::new_codex_resets_memo(),
             auto_start_queue: super::new_auto_start_queue_state(),
             third_party_usage: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
@@ -1176,6 +1183,11 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(name);
+            stores
+                .claude_resets_memo
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget(name.as_str());
             super::forget_election_failures(&stores.auto_start_queue, name);
             forget_profile_memo(name);
         }
@@ -1192,6 +1204,11 @@ fn clear_memory(stores: &MemoryStores, name: &ProfileName, half: Half) {
             remove_name_entry(&stores.usage, name);
             remove_name_entry(&stores.usage_status, name);
             forget_codex_polled(name.as_str());
+            stores
+                .codex_resets_memo
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget(name.as_str());
         }
         Half::Throughput => {}
     }
@@ -1405,6 +1422,20 @@ pub(crate) fn forget_memory_rename(stores: &MemoryStores, old: &ProfileName, new
     move_leg_entries(&stores.next_refresh, old, new);
     move_name_set(&stores.weekly_reset_kicks, old, new);
     super::move_election_failures(&stores.auto_start_queue, old, new);
+    // The old name's hour is dropped, never moved: the profile directory (the
+    // reading inside it) rode to `new`, so the next pass seeds `new`'s hour
+    // from that file and the account keeps the reading's hour under its new
+    // name. The codex memo's hour drops the same way.
+    stores
+        .claude_resets_memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .forget(old.as_str());
+    stores
+        .codex_resets_memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .forget(old.as_str());
     // The durable `/profile` stamp rode the directory to `new`; only the old
     // name's memo is left, so `new` re-reads the moved stamp fresh.
     forget_profile_memo(old);

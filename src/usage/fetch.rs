@@ -1,15 +1,18 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::harness::Harness;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
-    remove_profile_cache, write_profile_cache,
+    remove_profile_cache, write_profile_cache_for,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
@@ -72,7 +75,10 @@ pub(crate) fn clear_usage_endpoint_override() {
     *guard = None;
 }
 
-fn usage_endpoint() -> std::borrow::Cow<'static, str> {
+/// The `/usage` URL every OAuth leg resolves through, so a test's
+/// `testutil::EndpointSandbox` redirects the poll and the claude banked-reset
+/// side read alike.
+pub(crate) fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
         if let Some(url) = USAGE_ENDPOINT_OVERRIDE
@@ -145,7 +151,7 @@ static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, ProfileStamp>, rank
 /// window-reset kick fan-out) can't trip a 429; accounts on distinct hosts (each
 /// api-key provider) reserve independent slots and never wait on each other. Steady
 /// polling sits well below this rate, so it only bites on bursts.
-const REQUEST_SPACING_MS: u64 = 5_000;
+pub(crate) const REQUEST_SPACING_MS: u64 = 5_000;
 
 /// Origin all OAuth `/usage`, `/profile`, and `/v1/messages` kick requests target —
 /// they are hardcoded to this host regardless of a profile's `base_url`, so it is
@@ -185,9 +191,56 @@ pub(crate) fn await_request_slot(host: &str) {
         *slot = next;
         wait
     };
+    let wait = Duration::from_millis(wait_ms);
+    SLOT_CLOCK.with_borrow(|clock| {
+        if let Some(clock) = clock {
+            clock.restart_at(Instant::now() + wait);
+        }
+    });
     if wait_ms > 0 {
-        std::thread::sleep(Duration::from_millis(wait_ms));
+        std::thread::sleep(wait);
     }
+}
+
+/// When a fan-out worker last left, or is booked to leave, its host's request
+/// queue: the instant its tick's fetch deadline counts from. Starts at the
+/// worker's spawn; every [`await_request_slot`] the worker's thread makes moves
+/// it to that request's slot, so a worker queued behind [`REQUEST_SPACING_MS`]
+/// never spends its deadline waiting for its turn.
+pub(crate) struct RequestClock {
+    base: Instant,
+    started_ms: AtomicU64,
+}
+
+impl RequestClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            started_ms: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn started(&self) -> Instant {
+        self.base + Duration::from_millis(self.started_ms.load(Ordering::Relaxed))
+    }
+
+    fn restart_at(&self, at: Instant) {
+        let offset =
+            u64::try_from(at.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX);
+        self.started_ms.store(offset, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// The clock this thread's request slots move; set by a fan-out worker.
+    static SLOT_CLOCK: std::cell::RefCell<Option<Arc<RequestClock>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make every [`await_request_slot`] the calling thread makes move `clock`.
+/// Called first on a fan-out worker's own thread, which it then serves for life.
+pub(crate) fn watch_request_slots(clock: Arc<RequestClock>) {
+    SLOT_CLOCK.set(Some(clock));
 }
 
 /// Clear every host's reserved spacing slot. Test-only: a real-bytes listener
@@ -410,16 +463,34 @@ impl UsageInfo {
 /// Canonical account tier, computed once at fetch time. The single source of
 /// truth that `format::account_tier` renders from — collapses the old
 /// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
-/// in the `usage_cache.json` shape; a field rename simply misses → refetches.
+/// in the `usage_cache.json` shape; a value this build cannot read (a newer
+/// clauth's variant) arrives as `Unknown` and costs the label alone.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) enum PlanTier {
     Max(#[serde(default)] Option<u16>),
+    Ultra,
     Pro,
     Team,
     Enterprise,
     Free,
     #[default]
     Unknown,
+}
+
+/// The plan name Claude Code 2.1.314 displays off `/profile`
+/// `organization.plan_display_name`: 1 to 40 characters, a Unicode letter or
+/// digit at each end (a `+` may also end it), and only letters, digits, space,
+/// `.`, `+` and `-` between. Anything else would render a stray control
+/// character or an unbounded label.
+#[allow(clippy::expect_used, reason = "the plan-name pattern is a literal")]
+static PLAN_DISPLAY_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[\p{L}\p{N}](?:[\p{L}\p{N} .+-]{0,38}[\p{L}\p{N}+])?$")
+        .expect("the plan-name pattern is a literal")
+});
+
+/// The one plan-name check: the wire read and the cache read both go through it.
+fn is_plan_display_name(name: &str) -> bool {
+    PLAN_DISPLAY_NAME.is_match(name)
 }
 
 impl PlanTier {
@@ -431,7 +502,11 @@ impl PlanTier {
         has_pro: bool,
         rate_limit_tier: Option<&str>,
     ) -> Self {
-        match org_type.unwrap_or("") {
+        let org_type = org_type.unwrap_or("");
+        if org_type.contains("ultra") {
+            return PlanTier::Ultra;
+        }
+        match org_type {
             "claude_max" => PlanTier::Max(max_multiplier(rate_limit_tier)),
             "claude_pro" => PlanTier::Pro,
             "claude_team" | "claude_teams" => PlanTier::Team,
@@ -456,14 +531,20 @@ impl PlanTier {
     /// fabricated paid tier: `Unknown` renders neutrally (both `short_label` and
     /// `display` omit it) instead of a "Pro" out of thin air.
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
+        let Some(s) = s else {
+            return PlanTier::Unknown;
+        };
+        if s.contains("ultra") {
+            return PlanTier::Ultra;
+        }
         match s {
-            Some("pro") => PlanTier::Pro,
-            Some("max") => PlanTier::Max(None),
-            Some("team") | Some("teams") => PlanTier::Team,
-            Some("enterprise") => PlanTier::Enterprise,
+            "pro" => PlanTier::Pro,
+            "max" => PlanTier::Max(None),
+            "team" | "teams" => PlanTier::Team,
+            "enterprise" => PlanTier::Enterprise,
             // `login_profile_from_raw` mints this token for a `Free` account, so
             // without the arm clauth fails to read back its own write.
-            Some("free") => PlanTier::Free,
+            "free" => PlanTier::Free,
             _ => PlanTier::Unknown,
         }
     }
@@ -472,14 +553,19 @@ impl PlanTier {
     /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
     /// as a real plan the account never claimed, so each surface renders its own
     /// no-data form instead.
+    ///
+    /// The wire still sends `default_claude_max_20x` / `default_claude_max_5x`
+    /// for the plans whose labels here read `Ultra` / `Max`.
     pub(crate) fn display(&self) -> Option<String> {
         Some(match self {
+            PlanTier::Max(Some(20)) => "Claude Ultra".to_string(),
+            PlanTier::Max(Some(5)) | PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Max(Some(n)) => format!("Claude Max {n}x"),
-            PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Pro => "Claude Pro".to_string(),
             PlanTier::Team => "Claude Team".to_string(),
             PlanTier::Enterprise => "Claude Enterprise".to_string(),
             PlanTier::Free => "Claude Free".to_string(),
+            PlanTier::Ultra => "Claude Ultra".to_string(),
             PlanTier::Unknown => return None,
         })
     }
@@ -489,15 +575,73 @@ impl PlanTier {
     /// `None` for an unknown tier so callers can omit it entirely.
     pub(crate) fn short_label(&self) -> Option<String> {
         Some(match self {
+            PlanTier::Max(Some(20)) => "Ultra".to_string(),
+            PlanTier::Max(Some(5)) | PlanTier::Max(None) => "Max".to_string(),
             PlanTier::Max(Some(n)) => format!("Max {n}x"),
-            PlanTier::Max(None) => "Max".to_string(),
             PlanTier::Pro => "Pro".to_string(),
             PlanTier::Team => "Team".to_string(),
             PlanTier::Enterprise => "Enterprise".to_string(),
             PlanTier::Free => "Free".to_string(),
+            PlanTier::Ultra => "Ultra".to_string(),
             PlanTier::Unknown => return None,
         })
     }
+}
+
+impl PlanInfo {
+    /// The server's own plan name, kept only when it passes the rule Claude
+    /// Code applies: a value read back off a hand-edited cache gets the same
+    /// check the wire did.
+    fn display_name(&self) -> Option<&str> {
+        self.plan_display_name
+            .as_deref()
+            .filter(|name| is_plan_display_name(name))
+    }
+
+    /// Whether this plan names a plan at all: a classified tier or the server's
+    /// own valid name. An unclassified bare tier is no answer, so a surface
+    /// falls through to the OAuth token claim the way its sibling does.
+    pub(crate) fn is_classified(&self) -> bool {
+        self.tier != PlanTier::Unknown || self.display_name().is_some()
+    }
+
+    /// The server's own name, when it may name the plan: never on a `Free`
+    /// tier, whatever the subscription status. The tier is the organization's
+    /// own answer that no paid plan is live (a canceled subscription drops it
+    /// to `claude_free`), so a name beside it never outranks it.
+    fn server_label(&self) -> Option<&str> {
+        self.display_name().filter(|_| self.tier != PlanTier::Free)
+    }
+
+    /// Compact plan label for this fetched plan: the server's own name wins over
+    /// the local map, except where [`Self::server_label`] keeps it out.
+    pub(crate) fn short_label(&self) -> Option<String> {
+        match self.server_label() {
+            Some(name) => Some(name.to_string()),
+            None => self.tier.short_label(),
+        }
+    }
+
+    /// The long `Claude <plan>` label for this fetched plan: the server's own
+    /// name wins over the local map, except where [`Self::server_label`] keeps
+    /// it out.
+    pub(crate) fn display(&self) -> Option<String> {
+        match self.server_label() {
+            Some(name) => Some(format!("Claude {name}")),
+            None => self.tier.display(),
+        }
+    }
+}
+
+/// A tier this build does not know reads `Unknown` instead of failing the whole
+/// `usage_cache.json` parse: a newer clauth's variant, or a known name with a
+/// payload this build cannot read, costs the tier label and no other field.
+fn lenient_tier<'de, D>(deserializer: D) -> Result<PlanTier, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
 }
 
 /// Pull the trailing `Nx` multiplier out of a rate-limit tier like
@@ -514,8 +658,14 @@ fn max_multiplier(tier: Option<&str>) -> Option<u16> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct PlanInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_tier")]
     pub(crate) tier: PlanTier,
+    /// `/profile` `organization.plan_display_name`, the server's own name for
+    /// the plan. The fetch keeps it only when it passes
+    /// [`is_plan_display_name`]; every read re-checks it, since the cache is a
+    /// file the user can edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_display_name: Option<String>,
     /// `/profile` `organization.subscription_status` verbatim (`active`,
     /// `trialing`, `canceled`, …). A canceled subscription drops the org to the
     /// `claude_free` tier while its 5h window stays cached, so the raw status is
@@ -580,6 +730,43 @@ impl PlanInfo {
 /// `/profile` sends no such status.
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
+/// One provider-neutral banked limit-reset reading. A codex poll fills
+/// `usable` alone (its body lists no reset); a read of the resets themselves
+/// (the claude scheduler's hourly side read, the post-spend refresh, the codex
+/// listing) fills every field, keeping each reset the server lists so every
+/// surface names them all. The enclosing `None` means the harness carried no
+/// reading, never that the count was zero. Every field past `usable` is
+/// skipped while empty, so a codex poll's cache bytes and an older file's
+/// load do not change.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct LimitResets {
+    pub(crate) usable: u32,
+    /// Every reset left, usable or not: the Usage row counts `usable` against
+    /// this total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) banked: Option<u32>,
+    /// Every claude grant the read listed, in the server's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) grants: Vec<super::claude_reset::Grant>,
+    /// Every codex credit the list read named, in the server's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) credits: Vec<super::codex_reset::ResetCredit>,
+    /// The claude block's one cooldown stamp, raw server spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cooldown_until: Option<String>,
+    /// The claude block's weekly reset, raw server spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_resets_at: Option<String>,
+    /// Whether the claude account sat at a limit a reset covers when read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) at_limit: bool,
+    /// Epoch ms of the read that produced this reading, the reading's own
+    /// stamp. `None` on a codex poll's reading (its poll stamps the surrounding
+    /// [`UsageInfo`] instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fetched_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct UsageInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,12 +799,13 @@ pub(crate) struct UsageInfo {
     /// the reason, for a surface that wants to say why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_limit_reached: Option<String>,
-    /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
-    /// the account can spend to reopen a window early. Rides the same response,
-    /// so it costs no extra request. The poll only reads the count; spending one
-    /// is `clauth limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
+    /// Banked usage-limit resets the account can spend to reopen a window
+    /// early. A codex poll fills it from its reset-credits block, which rides
+    /// the same response; the claude arm's side read writes `limit_resets.json`
+    /// and never fills this field. The poll only reads it; spending one is
+    /// `clauth limit-reset`, run by the operator, which reads the block directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) codex_reset_credits: Option<i64>,
+    pub(crate) limit_resets: Option<LimitResets>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
     /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
     /// `mark_window_open`): a history line carrying it is clauth's own durable
@@ -636,6 +824,18 @@ pub(crate) struct UsageInfo {
     /// STALE with no age published rather than fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
+    /// The account's plan carries no 5h limit at all: a live `/usage` body sent
+    /// neither a `session` limit nor a top-level `five_hour` object while it did
+    /// carry a weekly window (the aggregate one or a per-model `weekly_scoped`
+    /// one). Absence alone is ordinary (an unread body, a header reading, a cold
+    /// cache), so this is a verdict about the PLAN, not about a reading. The
+    /// `/usage` body assembly ([`body_plan_verdict`]) sets it from the body's own
+    /// windows — `true` with no 5h window but a weekly one, `false` with a 5h
+    /// window — and the landing keeps the stored value for a body that states
+    /// none; a header reading never moves it, and every other writer carries the
+    /// stored value forward.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) no_five_hour_limit: bool,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -984,6 +1184,29 @@ fn windows_from_raw(raw: &RawUsage) -> DerivedWindows {
     }
 }
 
+/// The plan verdict a `/usage` body states, read off the windows it carries:
+/// `Some(true)` when it has no 5h window while it does carry a weekly one —
+/// the aggregate `weekly_all` entry or any per-model `weekly_scoped` one —
+/// `Some(false)` when it carries a 5h window, and `None` when it carries no
+/// window at all, which states nothing about the plan.
+///
+/// One predicate for both readers, so they cannot disagree: [`assemble_usage`]
+/// stores it as [`UsageInfo::no_five_hour_limit`], and the scheduler's landing
+/// keeps the stored mark for the `None` case.
+pub(crate) fn body_plan_verdict(
+    five_hour: Option<&UsageWindow>,
+    seven_day: Option<&UsageWindow>,
+    weekly_scoped: &[ScopedWindow],
+) -> Option<bool> {
+    if five_hour.is_some() {
+        Some(false)
+    } else if seven_day.is_some() || !weekly_scoped.is_empty() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 struct RawProfile {
     #[serde(default)]
@@ -1012,6 +1235,8 @@ struct RawProfileOrg {
     rate_limit_tier: Option<String>,
     #[serde(default)]
     subscription_status: Option<String>,
+    #[serde(default)]
+    plan_display_name: Option<String>,
 }
 
 /// HTTP layer error. `Status` carries an HTTP code so the fetch path can
@@ -1028,9 +1253,11 @@ pub(crate) enum FetchError {
     /// has been observed to keep 429ing `/usage` (one sample), so the profile
     /// leg is the only place its cancellation has been observed. `None` from the
     /// low-level `get_json` (no profile context there); populated by [`fetch_raw`].
+    /// Boxed so a plan field this build grows again never inflates every
+    /// `Result<_, FetchError>` into `clippy::result_large_err`.
     RateLimited {
         retry_after: Option<Duration>,
-        plan: Option<PlanInfo>,
+        plan: Option<Box<PlanInfo>>,
     },
     Network,
     Parse,
@@ -1129,7 +1356,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 const USAGE_HTTP_CONNECT_SECS: u64 = 4;
 /// Response-HEADER deadline for the same — the header phase's bound, armed from
 /// the phase's start and stopping once the headers arrive.
-const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
+pub(crate) const USAGE_HTTP_RECV_HEADERS_SECS: u64 = 8;
 
 /// The two deadlines a usage-style call carries, added — and the whole call's
 /// bound: [`usage_config`] arms `timeout_global` with this sum, whose upstream
@@ -1154,6 +1381,11 @@ pub(super) fn usage_config(
         // Without this flag those branches are unreachable and every HTTP error
         // collapses into `Network`.
         .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 /// A usage-style agent with `whole` as its end-to-end bound — built once for
@@ -1198,11 +1430,36 @@ pub(crate) fn cli_user_agent() -> &'static str {
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
 /// with no `anthropic-beta`.
 #[derive(Clone, Copy)]
-enum AuthClient {
+pub(crate) enum AuthClient {
     /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.
     Usage,
     /// `/profile`: `axios/1.15.2` UA + `Cache-Control: no-cache`, no beta.
     Profile,
+}
+
+/// The headers the usage poll's `/usage` ([`AuthClient::Usage`]) and `/profile`
+/// ([`AuthClient::Profile`]) GETs carry, applied over a request built on
+/// [`http_agent`]: bearer, Accept, Content-Type, then the client's
+/// UA/beta/cache-control split. Shared so an operator command's reads send
+/// exactly what the poll sends, without the poll's request-slot spacing or
+/// activity marks — an operator command spaces nothing, as the codex arm does.
+pub(crate) fn apply_auth_headers<B>(
+    req: ureq::RequestBuilder<B>,
+    access_token: &str,
+    client: AuthClient,
+) -> ureq::RequestBuilder<B> {
+    let req = req
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Content-Type", "application/json");
+    match client {
+        AuthClient::Usage => req
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", USER_AGENT.as_str()),
+        AuthClient::Profile => req
+            .header("User-Agent", crate::oauth::TOKEN_USER_AGENT)
+            .header("Cache-Control", "no-cache"),
+    }
 }
 
 fn get_json(
@@ -1221,19 +1478,7 @@ fn get_json(
     }
     // Both CC clients send Accept + Content-Type (the latter even without a body);
     // the UA and the beta/cache-control headers are what split the two.
-    let req = AGENT
-        .get(url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Content-Type", "application/json");
-    let req = match client {
-        AuthClient::Usage => req
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("User-Agent", USER_AGENT.as_str()),
-        AuthClient::Profile => req
-            .header("User-Agent", crate::oauth::TOKEN_USER_AGENT)
-            .header("Cache-Control", "no-cache"),
-    };
+    let req = apply_auth_headers(AGENT.get(url), access_token, client);
     let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
     if status == 429 {
@@ -1389,7 +1634,12 @@ pub(crate) fn decide_profile_fetch(name: &ProfileName, force: bool, now: u64) ->
 /// still stamps — the rate cap), and inside the re-anchor's hold after the
 /// anchor write (whose `forget_disk` removed the stamp).
 pub(crate) fn stamp_profile_fetch(name: &ProfileName, now: u64) -> bool {
-    crate::profile_cache::write_profile_cache_reported(name, PROFILE_FETCHED_CACHE_FILE, &now)
+    crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
+        name,
+        PROFILE_FETCHED_CACHE_FILE,
+        &now,
+    )
 }
 
 /// Write the in-memory `/profile` memo. Called by section 2 on a match, and on a
@@ -1426,7 +1676,11 @@ pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> b
 /// the durable stamp and memo gate on the landing's identity rather than the
 /// worker's own writes.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct ProfileFetchDecision {
+pub(crate) struct ProfileFetchDecision<'a> {
+    /// The fetch tick's lease ticket, when the worker runs under one: the
+    /// ride-along's writes check it inside their state-flock hold, so a worker
+    /// that resumes after the tick lost the lease writes none of them.
+    pub(crate) lease: Option<crate::daemon::LeaseTicket<'a>>,
     /// [`decide_profile_fetch`] elected a `/profile` fetch.
     pub(crate) wanted: bool,
     /// The attempt instant the durable stamp + memo record, when `wanted`.
@@ -1436,9 +1690,10 @@ pub(crate) struct ProfileFetchDecision {
     pub(crate) reanchored: bool,
 }
 
-/// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier + raw
-/// subscription status). The single place the fetch path turns `/profile` into a
-/// plan, shared by the normal leg and the 429-bail leg.
+/// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier, the server's
+/// own plan name and the raw subscription status). The single place the fetch
+/// path turns `/profile` into a plan, shared by the normal leg and the 429-bail
+/// leg.
 fn plan_from_profile(p: &RawProfile) -> PlanInfo {
     let org = p.organization.as_ref();
     PlanInfo {
@@ -1448,6 +1703,10 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
             p.account.as_ref().is_some_and(|a| a.has_claude_pro),
             org.and_then(|o| o.rate_limit_tier.as_deref()),
         ),
+        plan_display_name: org
+            .and_then(|o| o.plan_display_name.as_deref())
+            .filter(|name| is_plan_display_name(name))
+            .map(str::to_string),
         // Verbatim, but never clauth's own word for an organization's refusal:
         // only the usage probe's landing may write that.
         subscription_status: org
@@ -1480,7 +1739,7 @@ pub(crate) fn fetch_profile_plan(
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> Option<PlanInfo> {
     let now = now_ms();
     if !decide_profile_fetch(name, force_profile, now) {
@@ -1512,8 +1771,13 @@ pub(crate) fn fetch_profile_plan(
     // same hold: `forget_disk`, the disk seed of this body's plan, the anchor
     // write, then the `/profile` stamp re-written (its `forget_disk` removed it).
     let tier = raw_rate_limit_tier(&p);
+    let lease = decision.lease;
     let ride_along = crate::lock::with_state_lock(|held| {
-        if !crate::profile::stored_token_matches(name, &token) {
+        // A tick that lost the fetch lease leaves the identity, plan and tier
+        // writes to the new holder's own `/profile` read.
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current)
+            || !crate::profile::stored_token_matches(name, &token)
+        {
             return Ok(());
         }
         let uuid = p
@@ -1569,7 +1833,8 @@ pub(crate) fn fetch_profile_plan(
                     crate::usage::forget_disk(name, crate::usage::Half::Throughput);
                 }
                 let plan = plan_from_profile(&p);
-                write_profile_cache(
+                write_profile_cache_for(
+                    Harness::Claude,
                     name,
                     USAGE_CACHE_FILE,
                     &UsageInfo {
@@ -1621,6 +1886,18 @@ fn assemble_usage(
             let plan = fetch_plan().or(prev_plan);
             let windows = windows_from_raw(&raw);
             let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
+            // The body's own plan verdict: no 5h window while a weekly one is
+            // present is a plan without a 5h limit, not an unread 5h window. A
+            // body carrying neither window states nothing about the plan; the
+            // landing keeps the stored mark for it.
+            let no_five_hour_limit = matches!(
+                body_plan_verdict(
+                    windows.five_hour.as_ref(),
+                    windows.seven_day.as_ref(),
+                    &windows.weekly_scoped,
+                ),
+                Some(true)
+            );
             Ok(UsageInfo {
                 plan,
                 five_hour: windows.five_hour,
@@ -1633,14 +1910,15 @@ fn assemble_usage(
                 spend,
                 // Codex-only readings: the claude body carries neither.
                 codex_limit_reached: None,
-                codex_reset_credits: None,
+                limit_resets: None,
                 open_at: None,
                 fetched_at: None,
+                no_five_hour_limit,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
             retry_after,
-            plan: fetch_plan(),
+            plan: fetch_plan().map(Box::new),
         }),
         Err(e) => Err(e),
     }
@@ -1659,7 +1937,7 @@ pub(crate) fn fetch_raw(
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
-    decision: &mut ProfileFetchDecision,
+    decision: &mut ProfileFetchDecision<'_>,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
         usage_endpoint().as_ref(),
@@ -1730,8 +2008,12 @@ pub(crate) fn reconcile_identity_anchor_to_held(
     // Write the new anchor first (an atomic replace), so a reader never sees
     // the anchor absent over a still-present login; only a failed write removes
     // it, leaving the profile unanchored, never on the displaced account.
-    let landed =
-        crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
+    let landed = crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
+        name,
+        ACCOUNT_ID_CACHE_FILE,
+        &new_uuid,
+    );
     if !landed {
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         logline!("clauth: {name}: could not write the identity anchor");
@@ -1813,7 +2095,7 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
             PlanTier::Team => Some("team".to_string()),
             PlanTier::Enterprise => Some("enterprise".to_string()),
             PlanTier::Free => Some("free".to_string()),
-            PlanTier::Unknown => None,
+            PlanTier::Ultra | PlanTier::Unknown => None,
         },
         account_uuid: p
             .account
@@ -1907,7 +2189,8 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
     // write was meant to replace.
     #[cfg(test)]
     run_compare_hook(name.as_str());
-    if !crate::profile_cache::write_profile_cache_reported(
+    if !crate::profile_cache::write_profile_cache_reported_for(
+        Harness::Claude,
         name,
         ACCOUNT_ID_CACHE_FILE,
         &AccountId::from(uuid.to_string()),
@@ -1924,7 +2207,7 @@ pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&Accoun
 /// writes (credentials, `config.toml`, the anchor), so a reloading process that
 /// re-seeds from disk after the writes finds the seed already there, and this
 /// process's `forget_memory` re-seed picks it up once the hold drops. Writes the
-/// profile path DIRECTLY (never `write_profile_cache`): the new-account seed runs
+/// profile path DIRECTLY (never `write_profile_cache_for`): the new-account seed runs
 /// before the roster carries the name, so the off-roster gate would drop it. No
 /// `/profile` stamp and no TTL memo — the plan's next `/profile` stays due right
 /// after the login, and a failed one still keeps the seed.
@@ -1958,6 +2241,69 @@ pub(crate) fn seed_plan_cache(
     if let Err(e) = crate::profile::atomic_write_600(&path, json) {
         logline!("clauth: {name}: could not save the login's plan: {e}");
     }
+}
+
+/// Replace the plan in `name`'s usage cache with the one a same-account re-login
+/// just read, when the two disagree on tier or subscription status. Resubscribing
+/// changes the plan without changing the account, so [`seed_plan_cache`] never
+/// runs for it, and a cached `canceled` would keep the account out of every walk
+/// until the next `/profile` read. A cache holding no plan has nothing to correct
+/// and is left to that read. Answers whether the two disagreed — once they do,
+/// every exit answers `true`, a cache path that will not resolve or a body that
+/// will not serialize included — the caller's cue to expire the `/profile`
+/// clock for processes holding the old plan in memory.
+///
+/// Only the plan moves, and the file keeps its mtime: the windows beside it are
+/// as old as they were, and for a body carrying no `fetched_at` the mtime is
+/// the age clock, so a plan-only rewrite must not advance it.
+pub(crate) fn correct_cached_plan(
+    name: &ProfileName,
+    plan: PlanInfo,
+    account_uuid: &AccountId,
+) -> bool {
+    if plan
+        .email
+        .as_ref()
+        .is_some_and(|email| account_uuid.trim() != email.account.trim())
+    {
+        return false;
+    }
+    let Some(mut info) =
+        load_profile_cache::<UsageInfo>(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return false;
+    };
+    let agrees = info.plan.as_ref().is_none_or(|cached| {
+        cached.tier == plan.tier && cached.subscription_status == plan.subscription_status
+    });
+    if agrees {
+        return false;
+    }
+    let Some(path) =
+        crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return true;
+    };
+    let dated = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    info.plan = Some(plan);
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return true;
+    };
+    if let Err(e) = crate::profile::atomic_write_600_dated(&path, &json, dated) {
+        logline!("clauth: {name}: could not save the login's plan: {e}");
+    }
+    true
+}
+
+/// Whether `name`'s stored `/usage` body says its plan has no 5h limit. Reads
+/// the cache file, not an in-memory store: the CLI's one-shot paths
+/// (`clauth switch`'s window prime) have no scheduler behind them.
+pub(crate) fn no_five_hour_limit_cached(name: &ProfileName) -> bool {
+    crate::profile_cache::load_profile_cache::<UsageInfo>(
+        name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .is_some_and(|info| info.no_five_hour_limit)
 }
 
 /// Remove a profile's durable `/profile` stamp — the cross-process half of

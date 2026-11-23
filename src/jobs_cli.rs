@@ -16,8 +16,8 @@
 
 use anyhow::Result;
 
-use crate::format::{humanize_span, terminal_safe, truncate};
-use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
+use crate::format::{col_width, humanize_span, pad_cells, terminal_safe, truncate};
+use crate::mcp::jobs::{self, JobPhase, RecordKind, RunningLiveness, StoredJob};
 use crate::usage::now_ms;
 use crate::{out, outln};
 
@@ -70,9 +70,9 @@ pub(crate) struct JobRow {
     /// which is exactly what `retention_anchor` answers, so a row is dated by
     /// the same field that decides how long it survives.
     pub(crate) age_secs: u64,
-    /// The run's liveness at `now`, or `None` on a finished or orphaned record,
-    /// where every countdown it would carry has already stopped meaning
-    /// anything.
+    /// The run's liveness at `now`, or `None` on a finished, orphaned or
+    /// stopped record, where every countdown it would carry has already
+    /// stopped meaning anything.
     pub(crate) live: Option<RunningLiveness>,
     /// The run's own session id — the handle `delegate({resume})` takes. Read
     /// here because a record outlives the server that wrote it, so after a
@@ -91,6 +91,11 @@ pub(crate) struct JobRow {
     /// finished record: its envelope carries the whole result, so a tail beside
     /// it says nothing new.
     pub(crate) tail: String,
+    /// Whether a `monitor` call naming this id could collect a result from it:
+    /// [`JobPhase::is_collectable`] plus the spelling. A settled liveness
+    /// record reads done but no id reaches it, so its row says false whatever
+    /// its phase.
+    pub(crate) collectable: bool,
 }
 
 /// Every stored job as a row, live ones first and each band newest-mattering
@@ -122,6 +127,7 @@ fn row(job: &StoredJob, now: u64) -> JobRow {
             JobPhase::Done => String::new(),
             _ => record.tail.clone(),
         },
+        collectable: phase.is_collectable() && job.kind == RecordKind::Collectable,
     }
 }
 
@@ -149,8 +155,13 @@ fn render_table(rows: &[JobRow]) -> String {
 
     // KILL is the last column, so it is never padded and needs no width.
     let mut out = format!(
-        "{:<w_state$}  {:<w_id$}  {:<w_profile$}  {:>w_age$}  {:>w_elapsed$}  {:>w_output$}  KILL IN\n",
-        "STATE", "JOB ID", "PROFILE", "AGE", "ELAPSED", "LAST OUTPUT",
+        "{}  {}  {}  {}  {}  {}  KILL IN\n",
+        pad_cells("STATE", w_state, false),
+        pad_cells("JOB ID", w_id, false),
+        pad_cells("PROFILE", w_profile, false),
+        pad_cells("AGE", w_age, true),
+        pad_cells("ELAPSED", w_elapsed, true),
+        pad_cells("LAST OUTPUT", w_output, true),
     );
     for ((r, age), (elapsed, output)) in rows
         .iter()
@@ -158,13 +169,13 @@ fn render_table(rows: &[JobRow]) -> String {
         .zip(elapsed.iter().zip(outputs.iter()))
     {
         out.push_str(&format!(
-            "{:<w_state$}  {:<w_id$}  {:<w_profile$}  {:>w_age$}  {:>w_elapsed$}  {:>w_output$}  {}\n",
-            r.phase.label(),
-            r.job_id,
-            r.profile,
-            age,
-            elapsed,
-            output,
+            "{}  {}  {}  {}  {}  {}  {}\n",
+            pad_cells(r.phase.label(), w_state, false),
+            pad_cells(&r.job_id, w_id, false),
+            pad_cells(&r.profile, w_profile, false),
+            pad_cells(age, w_age, true),
+            pad_cells(elapsed, w_elapsed, true),
+            pad_cells(output, w_output, true),
             kill_cell(r),
         ));
         if !r.tail.is_empty() {
@@ -225,15 +236,6 @@ fn render_table(rows: &[JobRow]) -> String {
 /// it needs this filter too.
 fn tail_cell(tail: &str) -> String {
     truncate(&terminal_safe(tail), TAIL_W)
-}
-
-/// Width of one column: its header, or the widest cell under it.
-fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
-    cells
-        .map(|c| c.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(header.chars().count())
 }
 
 /// How long since this record last mattered. Always answerable — every record
@@ -318,7 +320,7 @@ fn row_json(row: &JobRow) -> serde_json::Value {
         "job_id": row.job_id,
         "profile": row.profile,
         "state": row.phase.label(),
-        "collectable": row.phase.is_collectable(),
+        "collectable": row.collectable,
         "session_id": row.session_id,
         "isolated": row.isolated,
         "age_secs": row.age_secs,

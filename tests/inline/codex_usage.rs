@@ -139,7 +139,9 @@ fn the_absolute_reset_wins_over_the_relative_one() {
 }
 
 /// Banked reset credits ride this same body, so reading them costs no extra
-/// request. The poll only reads the count; spending one is `clauth limit-reset`.
+/// request. The poll only reads the count, into the one reset reading claude
+/// accounts share; codex names no windows and no end. Spending one is
+/// `clauth limit-reset`.
 #[test]
 fn banked_reset_credits_ride_the_same_body() {
     let info = map_usage(
@@ -147,7 +149,19 @@ fn banked_reset_credits_ride_the_same_body() {
         1_600_000_000,
     )
     .expect("parses");
-    assert_eq!(info.codex_reset_credits, Some(3));
+    let resets = info.limit_resets.expect("a reset reading");
+    assert_eq!(resets.usable, 3);
+    assert!(resets.grants.is_empty(), "{:?}", resets.grants);
+    assert!(resets.credits.is_empty(), "{:?}", resets.credits);
+    assert_eq!(resets.banked, None);
+    assert_eq!(
+        serde_json::to_string(&resets).expect("serializes"),
+        r#"{"usable":3}"#,
+        "a codex poll's reading carries its count alone, so its cache bytes do not change"
+    );
+
+    let none = map_usage(r#"{"plan_type": "plus"}"#, 1_600_000_000).expect("parses");
+    assert!(none.limit_resets.is_none(), "no count read is no reading");
 }
 
 /// An empty or unknown-shaped body parses to "no reading", never an error the

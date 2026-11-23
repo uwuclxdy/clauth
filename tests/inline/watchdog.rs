@@ -687,8 +687,9 @@ fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
 /// it came from a watch we armed. inotify leaves `name` empty for those and
 /// notify then reports the watch root, with `WatchMask::OPEN` armed — so every
 /// `opendir` of a watched directory produces one, and clauth's own config leg
-/// does two per reconcile (`runtime::shared_runtime_dirs` reads the profile
-/// store directory). Reading them as unaccountable crosses the orphan floor in
+/// does at least two per reconcile (`runtime::live_shared_runtime_dirs` reads the
+/// profile store directory). Reading them as unaccountable crosses the orphan
+/// floor in
 /// under two minutes on a healthy install, which trains the operator to ignore
 /// the one line this whole signal exists to emit.
 #[test]
@@ -765,6 +766,41 @@ fn a_rescan_wakes_the_loop_but_never_counts_as_a_match() {
         verdict.orphan.is_none(),
         "an event with no paths cannot accuse a spelling either"
     );
+}
+
+/// An open changes nothing (a write also raises a modify or close-write), so it
+/// never wakes the loop: waking on one lets any reader of a watched child —
+/// clauth's own job-store walk over `~/.claude/jobs` included — schedule the
+/// next reconcile forever. It still counts as a match, so the dead-filter
+/// check keeps reading a healthy watcher.
+#[test]
+fn an_open_matches_but_never_wakes_the_loop() {
+    let specs = vec![WatchSpec::new("/home/u/.claude", Interest::AnyChild)];
+    let jobs = PathBuf::from("/home/u/.claude/jobs");
+
+    let open = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Open(
+        notify::event::AccessMode::Any,
+    )))
+    .add_path(jobs.clone());
+    let verdict = classify(&specs, &open);
+    assert!(
+        verdict.matched,
+        "an open of a watched child is still a match"
+    );
+    assert!(!verdict.wake, "an open must not wake the loop");
+
+    for kind in [
+        notify::EventKind::Access(notify::event::AccessKind::Close(
+            notify::event::AccessMode::Write,
+        )),
+        notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )),
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    ] {
+        let event = notify::Event::new(kind).add_path(jobs.clone());
+        assert!(classify(&specs, &event).wake, "{kind:?} must wake the loop");
+    }
 }
 
 /// One spec whose spelling is wrong while its siblings match is the shape a

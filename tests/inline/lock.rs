@@ -833,3 +833,19 @@ fn a_keychain_budget_scope_opened_inside_a_state_flock_hold_refuses() {
     })
     .expect("the scope inside the hold");
 }
+
+/// `state_lock_held` reads this thread's hold, at any depth.
+#[test]
+fn state_lock_held_follows_this_threads_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert!(!state_lock_held());
+    with_state_lock(|_held| {
+        assert!(state_lock_held());
+        with_state_lock(|_inner| {
+            assert!(state_lock_held());
+            Ok(())
+        })
+    })
+    .expect("hold");
+    assert!(!state_lock_held());
+}

@@ -67,6 +67,79 @@ pub(crate) fn rescue_teardown(
     (transcripts.moved, sidecars.moved)
 }
 
+/// A typed start refusal: the one sentence `admit` and its gates answer, so the
+/// sessions route classifies by variant, never by string. `Display` is exactly
+/// the sentence every CLI caller prints.
+#[derive(Debug)]
+pub(crate) enum StartRefusal {
+    /// `'{name}': account is disabled`
+    Disabled { name: ProfileName },
+    /// A `--with-fallback` refusal. The anyhow carries the sentence and, for
+    /// the "could not be checked" arm, the daemon-lock cause.
+    WithFallback(anyhow::Error),
+    /// The copy-host background refusal (`background_unavailable`).
+    CopyHostBackground { reason: String },
+    /// `--with-fallback` on a codex profile, refused the way `clauth start`
+    /// refuses it; codex reads its auth once at start, so a chain lands at the
+    /// NEXT start.
+    CodexWithFallback,
+    /// A quarantined codex login, refused the way `clauth start` refuses it.
+    CodexQuarantined {
+        name: String,
+        kind: String,
+        at: String,
+    },
+    /// Any other background-start refusal (the `--isolated` arm), which the
+    /// sessions route never reaches.
+    Background { reason: String },
+}
+
+impl StartRefusal {
+    /// The sessions-route error code, `None` for a refusal the route never
+    /// reaches (the isolated background arm).
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            StartRefusal::Disabled { .. } => Some("profile_disabled"),
+            StartRefusal::WithFallback(_) => Some("with_fallback_unavailable"),
+            StartRefusal::CopyHostBackground { .. } => Some("background_unavailable"),
+            StartRefusal::CodexWithFallback => Some("with_fallback_unavailable"),
+            StartRefusal::CodexQuarantined { .. } => Some("login_quarantined"),
+            StartRefusal::Background { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartRefusal::Disabled { name } => f.write_str(&crate::disabled_account_refusal(name)),
+            StartRefusal::WithFallback(e) => std::fmt::Display::fmt(e, f),
+            StartRefusal::CopyHostBackground { reason } | StartRefusal::Background { reason } => {
+                f.write_str(reason)
+            }
+            StartRefusal::CodexWithFallback => f.write_str(
+                "--with-fallback is not available on a codex profile: codex reads \
+                 auth.json once at start, so a chain lands at the NEXT start, not \
+                 mid-session. Start without the flag",
+            ),
+            StartRefusal::CodexQuarantined { name, kind, at } => write!(
+                f,
+                "'{name}': codex chain is broken ({kind} since {at}), run `clauth login {name} \
+                 --codex --browser`",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StartRefusal::WithFallback(e) => e.source(),
+            _ => None,
+        }
+    }
+}
+
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot
 /// execute a per-session credential swap. Split from the gate so the render is
 /// exercisable from any run: [`LinkMode::Fake`] is unreachable on a real-symlink
@@ -75,6 +148,151 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
     format!(
         "'{name}': --with-fallback needs a per-session credential swap, but {why}; start without it"
     )
+}
+
+/// Why `clauth start --with-fallback` refuses; [`refusal_message`] renders each
+/// cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainIneligible {
+    /// clap already refuses the flag pair; this arm is for a caller that
+    /// bypasses it, where `chain_opt_in_survives` would drop the opt-in
+    /// silently.
+    Isolated,
+    /// A third-party account gets a chain the walk cannot move it off, so an
+    /// opted-in one would follow nothing, in silence.
+    NotOauth,
+    /// `snapshot_session_chain` returns `None` for a member outside the chain,
+    /// so the row is skipped every tick with nothing said.
+    NotMember,
+    /// A chain holding only this profile gives `next_auto_switch_target`
+    /// nowhere to point. Same silence as a non-member.
+    NoSecondMember,
+    /// The daemon singleton's lock exists but cannot be tested.
+    DaemonUnchecked,
+    /// Only the daemon's decision leg moves a session along the chain, so
+    /// with no daemon the flag is inert.
+    NoDaemon,
+    /// The host structurally cannot execute a per-session credential swap.
+    Transport(crate::runtime::SwapUnsupported),
+}
+
+/// The `clauth start` refusal for `refusal`, each text pinned by
+/// `tests/inline/start.rs`.
+fn refusal_message(name: &ProfileName, refusal: &ChainIneligible) -> String {
+    match refusal {
+        ChainIneligible::Isolated => {
+            format!(
+                "'{name}': --with-fallback cannot be combined with --isolated, since an isolated session follows no chain"
+            )
+        }
+        ChainIneligible::NotOauth => {
+            format!(
+                "'{name}': --with-fallback needs an OAuth account, but this one has a custom base url"
+            )
+        }
+        ChainIneligible::NotMember => {
+            format!(
+                "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on the fallback tab of the `clauth` TUI, or start without it"
+            )
+        }
+        ChainIneligible::NoSecondMember => {
+            format!(
+                "'{name}': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab of the `clauth` TUI, or start without it"
+            )
+        }
+        ChainIneligible::DaemonUnchecked => {
+            format!(
+                "'{name}': --with-fallback needs a running daemon and this host could not be checked for one"
+            )
+        }
+        ChainIneligible::NoDaemon => {
+            format!(
+                "'{name}': --with-fallback needs a running daemon to decide switches, run `clauth daemon`"
+            )
+        }
+        ChainIneligible::Transport(why) => unsupported_host_refusal(name, *why),
+    }
+}
+
+/// The chain-membership gates, in the order both surfaces ask them. Narrower
+/// than [`ChainIneligible`] because these three are exactly what a restore can
+/// degrade on, and its own isolation is always `Shared`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipRefusal {
+    NotOauth,
+    NotMember,
+    NoSecondMember,
+}
+
+impl From<MembershipRefusal> for ChainIneligible {
+    fn from(refusal: MembershipRefusal) -> Self {
+        match refusal {
+            MembershipRefusal::NotOauth => Self::NotOauth,
+            MembershipRefusal::NotMember => Self::NotMember,
+            MembershipRefusal::NoSecondMember => Self::NoSecondMember,
+        }
+    }
+}
+
+/// The chain gates that answer WITHOUT touching the disk, in refusal order.
+/// Shared by `clauth start`'s refusal and the restore's degrade: both must ask
+/// the same questions or the two surfaces drift apart.
+pub(crate) fn chain_membership_refusal(
+    config: &AppConfig,
+    profile: &Profile,
+) -> Option<MembershipRefusal> {
+    let name = &profile.name;
+    if !profile.is_oauth() {
+        return Some(MembershipRefusal::NotOauth);
+    }
+    if !config.state.fallback_chain.iter().any(|n| n == name) {
+        return Some(MembershipRefusal::NotMember);
+    }
+    if !config.state.fallback_chain.iter().any(|n| n != name) {
+        return Some(MembershipRefusal::NoSecondMember);
+    }
+    None
+}
+
+/// How a start follows the fallback chain, if at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainStart {
+    /// No `--with-fallback`: the session stays on its launch account.
+    Off,
+    /// The flag is inert without a daemon, so a start refuses then.
+    Strict,
+    /// The daemon gate is soft: the row follows the chain even while no daemon
+    /// runs, and the daemon adopts it once it does. Every chain-on resume uses
+    /// this, so a daemon dying between the restore's own check and this one
+    /// never turns a restore into a refusal; the caller prints the wait for it
+    /// when it decided the daemon was not up.
+    SoftDaemon,
+}
+
+impl From<bool> for ChainStart {
+    fn from(follows_chain: bool) -> Self {
+        if follows_chain {
+            Self::Strict
+        } else {
+            Self::Off
+        }
+    }
+}
+
+impl ChainStart {
+    fn follows_chain(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// The strict gate the `--with-fallback` refusal tests drive.
+#[cfg(test)]
+fn refuse_unless_chain_eligible(
+    config: &AppConfig,
+    profile: &crate::profile::Profile,
+    isolation: Isolation,
+) -> Result<()> {
+    refuse_unless_chain_eligible_with(config, profile, isolation, ChainStart::Strict)
 }
 
 /// Every reason `--with-fallback` cannot be honored for `name`, refused before
@@ -86,65 +304,49 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
 /// order, and the transport probe runs last. That ordering is load-bearing: a
 /// start refused for a cause the user can act on never materializes a profile
 /// dir for an account that never launched.
-fn refuse_unless_chain_eligible(
+fn refuse_unless_chain_eligible_with(
     config: &AppConfig,
     profile: &crate::profile::Profile,
     isolation: Isolation,
+    chain: ChainStart,
 ) -> Result<()> {
     let name = &profile.name;
-    // clap already refuses the flag pair, so this is for a caller that bypasses
-    // it: `chain_opt_in_survives` drops an isolated opt-in silently, which is the
-    // one outcome every gate here exists to prevent.
     if isolation == Isolation::Isolated {
-        anyhow::bail!(
-            "'{name}': --with-fallback cannot be combined with --isolated, since an \
-             isolated session follows no chain"
-        );
+        return Err(chain_refusal(name, &ChainIneligible::Isolated));
     }
-    // The decision leg's freshness gate reads only the OAuth status store. That
-    // is sound because a third-party-launched session gets a chain the walk
-    // cannot move it off — so an opted-in one would follow nothing, in silence.
-    if !profile.is_oauth() {
-        anyhow::bail!(
-            "'{name}': --with-fallback needs an OAuth account, but this one carries \
-             a custom endpoint; start without it"
-        );
+    if let Some(refusal) = chain_membership_refusal(config, profile) {
+        return Err(chain_refusal(name, &refusal.into()));
     }
-    // `snapshot_session_chain` returns `None` for a member outside the chain, so
-    // the row is skipped every tick with nothing said.
-    if !config.state.fallback_chain.iter().any(|n| n == name) {
-        anyhow::bail!(
-            "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on \
-             the fallback tab, or start without it"
-        );
+    // `singleton_held` is the decision-side reader: it separates "nobody
+    // there" from "can't tell", and a host that cannot be checked cannot run
+    // the decider on it either, so both refuse a start. A restore keeps the
+    // chain through both: the row follows it once the daemon runs.
+    match crate::daemon::singleton_held() {
+        Ok(true) => {}
+        Ok(false) if chain == ChainStart::Strict => {
+            return Err(chain_refusal(name, &ChainIneligible::NoDaemon));
+        }
+        Err(e) if chain == ChainStart::Strict => {
+            return Err(StartRefusal::WithFallback(
+                e.context(refusal_message(name, &ChainIneligible::DaemonUnchecked)),
+            )
+            .into());
+        }
+        Ok(false) | Err(_) => {}
     }
-    // Membership alone is not enough: a chain holding only this profile gives
-    // `next_auto_switch_target` nowhere to point, and both `Off` and a stay-put
-    // `None` write nothing on the session path. Same silence as a non-member.
-    if !config.state.fallback_chain.iter().any(|n| n != name) {
-        anyhow::bail!(
-            "'{name}': --with-fallback needs a second account in the fallback chain to \
-             move to; add one on the fallback tab, or start without it"
-        );
-    }
-    // Only the daemon's decision leg writes `intended_member`, so with no daemon
-    // the flag is inert. `singleton_held` is the decision-side reader: it
-    // separates "nobody there" from "can't tell", and a host that cannot be
-    // checked cannot run the decider on it either, so both refuse.
-    let held = crate::daemon::singleton_held().with_context(|| {
-        format!("'{name}': --with-fallback needs a running daemon and this host could not be checked for one")
-    })?;
-    if !held {
-        anyhow::bail!(
-            "'{name}': --with-fallback needs a running daemon to decide switches, \
-             run `clauth daemon`"
-        );
-    }
-    // Last, because it is the only gate that touches disk.
+    // Last, because it is the only gate that touches disk. A restore runs it
+    // even with no daemon: an unsupported transport outranks the soft daemon
+    // gate, so the restore degrades with the transport clause.
     if let Some(why) = crate::runtime::unsupported_swap_transport(name)? {
-        anyhow::bail!("{}", unsupported_host_refusal(name, why));
+        return Err(chain_refusal(name, &ChainIneligible::Transport(why)));
     }
     Ok(())
+}
+
+/// A `--with-fallback` refusal as the typed [`StartRefusal::WithFallback`]
+/// every surface maps to its error code.
+fn chain_refusal(name: &ProfileName, refusal: &ChainIneligible) -> anyhow::Error {
+    StartRefusal::WithFallback(anyhow::anyhow!("{}", refusal_message(name, refusal))).into()
 }
 
 /// The refusals every start runs before any side effect, shared by [`run`] and
@@ -160,43 +362,66 @@ pub(crate) fn admit<'a>(
     follows_chain: bool,
     claude_args: &[String],
 ) -> Result<&'a Profile> {
+    admit_with(
+        config,
+        name,
+        isolation,
+        ChainStart::from(follows_chain),
+        claude_args,
+    )
+}
+
+fn admit_with<'a>(
+    config: &'a AppConfig,
+    name: &ProfileName,
+    isolation: Isolation,
+    chain: ChainStart,
+    claude_args: &[String],
+) -> Result<&'a Profile> {
     crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
-    if follows_chain {
-        refuse_unless_chain_eligible(config, profile, isolation)?;
+    if chain.follows_chain() {
+        refuse_unless_chain_eligible_with(config, profile, isolation, chain)?;
     }
-    refuse_background_start(name, isolation, follows_chain, claude_args)?;
+    refuse_background_start(name, isolation, chain.follows_chain(), claude_args)?;
     Ok(profile)
 }
 
-/// The process-env model overrides a launcher can inherit, in pair order: the
-/// headline model, then the subagent model. The pair order is the contract
-/// between [`process_model_env`] and [`member_launch_demand`]'s scrub filter, so
-/// reading and filtering cannot drift.
-const PROCESS_MODEL_ENV_KEYS: [&str; 2] = ["ANTHROPIC_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"];
+/// The process-env launch keys a launcher can inherit, in slot order: the
+/// headline model, the subagent model, then the advisor kill switch (not a
+/// model, but read through the same scrub filter and tier precedence). The slot
+/// order is the contract between [`process_model_env`] and
+/// [`member_launch_demand`]'s scrub filter, so reading and filtering cannot
+/// drift.
+const PROCESS_MODEL_ENV_KEYS: [&str; 3] = [
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
+];
 
-/// The process-env model pair, read once per `cmd_start`.
-/// [`crate::fallback::start_walk`] takes the pair as an argument rather than
-/// reading the process environment itself, so its tests pass an explicit empty
-/// pair and stay hermetic.
-pub(crate) fn process_model_env() -> [Option<String>; 2] {
+/// The process-env launch triple, read once per `cmd_start`.
+/// [`crate::fallback::start_walk`] takes it as an argument rather than reading
+/// the process environment itself, so its tests pass an explicit empty triple
+/// and stay hermetic.
+pub(crate) fn process_model_env() -> [Option<String>; 3] {
     PROCESS_MODEL_ENV_KEYS.map(|key| std::env::var(key).ok())
 }
 
 /// The `env_of` reader for [`member_launch_demand`]: maps a model env key to
-/// its slot in the process-env pair, so the start and fallback paths pass one
+/// its slot in the process-env triple, so the start and fallback paths pass one
 /// closure instead of each writing the match.
 pub(crate) fn process_model_env_of(
-    env_models: &[Option<String>; 2],
+    env_models: &[Option<String>; 3],
 ) -> impl Fn(&str) -> Option<String> + '_ {
     move |key| match key {
         "ANTHROPIC_MODEL" => env_models[0].clone(),
         "CLAUDE_CODE_SUBAGENT_MODEL" => env_models[1].clone(),
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" => env_models[2].clone(),
         _ => None,
     }
 }
 
-/// Where the `env_models` pair came from. The start path's inherited process
+/// Where the `env_models` triple came from. The start path's inherited process
 /// env is scrubbed before the child sees it, so a key reaches the child only
 /// where [`crate::runtime::env_survives_scrub`] keeps it; the delegate's caller
 /// env is layered AFTER the scrub ([`crate::mcp::apply_delegate_env`]), so it
@@ -206,6 +431,15 @@ pub(crate) fn process_model_env_of(
 pub(crate) enum EnvLeg {
     Process,
     Caller,
+}
+
+/// The slice of `claude_args` claude reads as options: everything before the
+/// `--` that ends claude's option parsing (one a flag takes as its value is
+/// that flag's value). What follows the separator is prompt text, which no
+/// passthrough reader may scan (a `--model=` in a prompt is a prompt, not a
+/// model). The one cut every passthrough reader shares.
+pub(crate) fn claude_option_args(claude_args: &[String]) -> &[String] {
+    &claude_args[..crate::cc_exempt::options_end(claude_args)]
 }
 
 /// The last `--model` value, the last RAW `--model` value, and the last
@@ -227,7 +461,7 @@ pub(crate) fn parsed_model_args(
     let mut headline = None;
     let mut last_raw_model = None;
     let mut fallback = None;
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--model=") {
             headline = (!v.trim().is_empty()).then(|| v.to_owned());
@@ -328,6 +562,15 @@ pub(crate) struct LaunchDemand {
 ///   `fallbackModel` (`--settings` passthrough > project > overlay), plus
 ///   `CLAUDE_CODE_SUBAGENT_MODEL` as the child sees it (passthrough env, else
 ///   project env, else overlay env, else inherited/caller where it survives);
+/// - the server-side ADVISOR model joins that same fallback side: it runs on
+///   the session's own account, so an account that cannot serve it strands the
+///   advisor turn like a subagent. Its source is the last non-blank `--advisor`
+///   value, else the highest settings source's `advisorModel` (`--settings`
+///   passthrough > project > overlay, the overlay being the profile's
+///   `[models] advisor` row), and it is dropped when
+///   `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` is truthy ([`cc_env_truthy`]) as the
+///   child sees it. A `--fallback-model` equal to the headline drops the
+///   settings fallback list, never the advisor;
 /// - then a `[models]` alias (`opus`/`sonnet`/`haiku`/`fable`, bare or with a
 ///   `[1m]`-style context suffix) remaps onto the `ANTHROPIC_DEFAULT_*_MODEL`
 ///   env value the child sees; a composite (`opusplan`/`best`) expands to its
@@ -443,6 +686,14 @@ fn member_launch_demand_with(
             .or_else(|| overlay.env_value(key))
             .or_else(|| survives(key).then(|| env_of(key)).flatten())
     };
+    // The advisor model by Claude Code's source precedence, off unless the
+    // kill switch the child sees is falsy. A blank flag value was ignored by
+    // `last_advisor_arg`, so it cannot shadow a settings tier.
+    let advisor = crate::cc_exempt::last_advisor_arg(claude_args)
+        .or_else(|| passthrough.advisor.clone())
+        .or_else(|| project.advisor.clone())
+        .or_else(|| overlay.advisor.clone())
+        .filter(|_| !child_env(PROCESS_MODEL_ENV_KEYS[2]).is_some_and(|v| cc_env_truthy(&v)));
     let settings_model = passthrough
         .model
         .clone()
@@ -457,13 +708,19 @@ fn member_launch_demand_with(
     if let Some(named) = named_model {
         // A named model decides the headline; the agent (named or not) is
         // irrelevant.
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         models.insert(0, named);
         remap_model_aliases(&mut models, &child_env);
     } else if unknown_headline {
         // The transcript clauth could not pin names the headline, so only the
         // fallback side is known — the shape a model-less agent launch resolves.
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         remap_model_aliases(&mut models, &child_env);
     } else if let Some(agent) = parsed_agent_arg(claude_args).or_else(|| {
         passthrough
@@ -477,10 +734,16 @@ fn member_launch_demand_with(
         // delegate pre-flight refuses a credit-billed fallback family first, and
         // `launch_families` still records those families.
         agent_without_model = Some(agent);
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         remap_model_aliases(&mut models, &child_env);
     } else {
-        models = launch_models_from(fallbacks, [None, child_env(PROCESS_MODEL_ENV_KEYS[1])]);
+        models = launch_models_from(
+            fallbacks,
+            [advisor.clone(), child_env(PROCESS_MODEL_ENV_KEYS[1])],
+        );
         if let Some(session) = session_model {
             models.insert(0, session);
         }
@@ -502,11 +765,23 @@ fn member_launch_demand_with(
     }
 }
 
+/// Whether Claude Code reads an env value as true: its own boolean parse
+/// (`De` in the 2.1.314 bundle) lowercases and trims, then accepts `1`,
+/// `true`, `yes` and `on`. Anything else, an empty value included, is false.
+/// The one reading `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` gets here, so the demand
+/// drops the advisor exactly when the child does.
+pub(crate) fn cc_env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// The last `--agent` value in the args, both spellings. A blank value is
 /// absent: it never clears an earlier flag.
 pub(crate) fn parsed_agent_arg(claude_args: &[String]) -> Option<String> {
     let mut agent = None;
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         if let Some(v) = a.strip_prefix("--agent=")
             && !v.trim().is_empty()
@@ -563,15 +838,48 @@ pub(crate) fn resumed_agent(claude_args: &[String]) -> ResumedAgent {
     }
 }
 
-/// Every resume form in the args: the exact-id values given (`--resume <v>`,
-/// `--resume=<v>`, `-r <v>`, `-r<v>`), and whether any form clauth cannot pin
-/// is present (`--continue`/`-c`, `--from-pr`, `--teleport`, `--cloud`, a bare
-/// `--resume` with no value or a `-`-prefixed token beside it, `-r=<v>`, whose
-/// `=` the short-option spelling hands Claude Code as part of the value). A
-/// value-taking `-r` in a short-flag cluster consumes the rest of its own token,
-/// else the next token; a `c` in the same cluster is `--continue` with getopt
-/// semantics.
+/// The exact-id resume values in the args and whether any unpinnable resume
+/// form is present; [`scan_resume_forms`] is the walk that finds them.
 fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
+    let scan = scan_resume_forms(claude_option_args(claude_args));
+    (scan.values, scan.unpinnable)
+}
+
+/// What one argv token is, as far as the resume forms go.
+#[derive(Debug)]
+pub(crate) enum ResumeWord {
+    /// No resume form here: the token says how the process runs.
+    Kept,
+    /// A resume spelling, or the value one consumed: the token goes.
+    Dropped,
+    /// A short cluster that resumed and still carries other flags: those
+    /// flags, the `c` of `--continue` removed, for a caller to re-spell as
+    /// `-<rest>`. Never empty.
+    Remainder(String),
+}
+
+/// One walk over the args for every resume form Claude Code's parser accepts,
+/// so the transcripts clauth can pin and the restore argv a bare pane is
+/// compared against ([`crate::hook_resume`]) read them one way.
+///
+/// The forms: an exact-id value (`--resume <v>`, `--resume=<v>`, `-r <v>`,
+/// `-r<v>`) and whether any form clauth cannot pin is present (`--continue`/`-c`,
+/// `--from-pr`, `--teleport`, `--cloud`, a bare `--resume` with no value or a
+/// `-`-prefixed token beside it, `-r=<v>`, whose `=` the short-option spelling
+/// hands Claude Code as part of the value). A value-taking `-r` in a short-flag
+/// cluster consumes the rest of its own token, else the next token; a `c` in the
+/// same cluster is `--continue` with getopt semantics.
+pub(crate) struct ResumeScan<'a> {
+    /// One entry per input token, in order.
+    pub(crate) words: Vec<ResumeWord>,
+    /// The exact-id values the resume spellings gave.
+    pub(crate) values: Vec<&'a str>,
+    /// Whether any form clauth cannot pin to a transcript is present.
+    pub(crate) unpinnable: bool,
+}
+
+pub(crate) fn scan_resume_forms(claude_args: &[String]) -> ResumeScan<'_> {
+    let mut words = Vec::with_capacity(claude_args.len());
     let mut values = Vec::new();
     let mut unpinnable = false;
     let mut i = 0;
@@ -579,25 +887,56 @@ fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
         let arg = claude_args[i].as_str();
         if let Some(value) = arg.strip_prefix("--resume=") {
             values.push(value);
+            words.push(ResumeWord::Dropped);
         } else if arg == "--resume" {
             // A token starting with `-` is a flag, never a resume value
             // (`--resume --verbose` is a bare `--resume`).
             match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
                 Some(value) => {
                     values.push(value.as_str());
+                    words.push(ResumeWord::Dropped);
+                    words.push(ResumeWord::Dropped);
                     i += 1;
                 }
-                None => unpinnable = true,
+                None => {
+                    unpinnable = true;
+                    words.push(ResumeWord::Dropped);
+                }
             }
-        } else if arg == "--continue"
-            || arg == "--from-pr"
+        } else if arg == "--continue" {
+            // It resumes here, but names no transcript clauth can pin.
+            unpinnable = true;
+            words.push(ResumeWord::Dropped);
+        } else if arg == "--from-pr"
             || arg.starts_with("--from-pr=")
             || arg == "--teleport"
             || arg.starts_with("--teleport=")
             || arg == "--cloud"
             || arg.starts_with("--cloud=")
         {
+            // These start another conversation rather than resuming this one,
+            // so they are no resume spelling and the token stands.
             unpinnable = true;
+            words.push(ResumeWord::Kept);
+        } else if arg.starts_with("--session-id=") {
+            // Names the conversation the restore resumes, never an option a
+            // restore could drop: a conversation spelling the hook's strip
+            // removes, and no resume value (a pinned id is not a resume form).
+            words.push(ResumeWord::Dropped);
+        } else if arg == "--session-id" {
+            // The spaced spelling consumes its value like `--resume`, still a
+            // conversation spelling and still no resume value.
+            if claude_args.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
+                words.push(ResumeWord::Dropped);
+                words.push(ResumeWord::Dropped);
+                i += 1;
+            } else {
+                words.push(ResumeWord::Dropped);
+            }
+        } else if arg == "--fork-session" {
+            // A fork starts a new conversation id; the flag names the
+            // conversation, never an option a restore could drop.
+            words.push(ResumeWord::Dropped);
         } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.starts_with('-')) {
             match shorts.char_indices().find(|&(_, c)| c == 'r') {
                 Some((at, _)) => {
@@ -606,26 +945,53 @@ fn resume_forms(claude_args: &[String]) -> (Vec<&str>, bool) {
                     let rest = &shorts[at + 1..];
                     if !rest.is_empty() {
                         values.push(rest);
+                        words.push(leftover_word(&shorts[..at]));
                     } else {
                         match claude_args.get(i + 1).filter(|v| !v.starts_with('-')) {
                             Some(value) => {
                                 values.push(value.as_str());
+                                words.push(leftover_word(&shorts[..at]));
+                                words.push(ResumeWord::Dropped);
                                 i += 1;
                             }
-                            None => unpinnable = true,
+                            None => {
+                                unpinnable = true;
+                                words.push(leftover_word(&shorts[..at]));
+                            }
                         }
                     }
                     if shorts[..at].contains('c') {
                         unpinnable = true;
                     }
                 }
-                None if shorts.contains('c') => unpinnable = true,
-                None => {}
+                None if shorts.contains('c') => {
+                    unpinnable = true;
+                    words.push(leftover_word(shorts));
+                }
+                None => words.push(ResumeWord::Kept),
             }
+        } else {
+            words.push(ResumeWord::Kept);
         }
         i += 1;
     }
-    (values, unpinnable)
+    ResumeScan {
+        words,
+        values,
+        unpinnable,
+    }
+}
+
+/// A resumed short cluster's surviving flags: its prefix carries no `r`, so
+/// only the `c` of `--continue` comes out. A cluster that was all resume
+/// letters is [`ResumeWord::Dropped`].
+fn leftover_word(shorts: &str) -> ResumeWord {
+    let rest: String = shorts.chars().filter(|&c| c != 'c').collect();
+    if rest.is_empty() {
+        ResumeWord::Dropped
+    } else {
+        ResumeWord::Remainder(rest)
+    }
 }
 
 /// The model strings alone of [`member_launch_demand`]: what a call site that
@@ -671,7 +1037,7 @@ pub(crate) fn launch_families_for(
     resumed: &ResumedAgent,
     named_model: bool,
     spawn_cwd: Option<&Path>,
-    env_models: &[Option<String>; 2],
+    env_models: &[Option<String>; 3],
 ) -> Vec<String> {
     let env_of = process_model_env_of(env_models);
     if matches!(resumed, ResumedAgent::Unknown) && !named_model {
@@ -762,8 +1128,9 @@ fn remap_model_aliases(models: &mut Vec<String>, child_env: &impl Fn(&str) -> Op
     *models = expanded;
 }
 
-/// The model slots a passthrough `--settings <file|json>` sets, the top
-/// settings tier: above project-local. Parsed through the same helpers the
+/// The model slots a passthrough `--settings <file|json>` sets: the flag
+/// tier, above user, project and local, below managed policy (measured
+/// 2026-11-12, Claude Code 2.1.322). Parsed through the same helpers the
 /// spawn-side settings fold uses, so one value is read one way. Empty when the
 /// args carry no `--settings` or the value fails to parse (the spawn path warns;
 /// the demand just reads nothing from it). Inline JSON is self-contained and
@@ -777,7 +1144,12 @@ fn passthrough_settings_sources(
     };
     let inline = crate::cc_exempt::is_inline_settings(&value);
     let parsed = if inline {
-        crate::cc_exempt::parse_settings_value(&value, std::path::Path::new("."), true)
+        crate::cc_exempt::parse_settings_value(
+            &value,
+            std::path::Path::new("."),
+            true,
+            crate::cc_exempt::TAIL,
+        )
     } else {
         // An absolute path resolves without the spawn cwd; `parse_settings_value`
         // joins the base only for a relative one.
@@ -786,7 +1158,7 @@ fn passthrough_settings_sources(
             None if std::path::Path::new(value.trim()).is_absolute() => std::path::Path::new("."),
             None => return crate::claude::RuntimeModelSources::default(),
         };
-        crate::cc_exempt::parse_settings_value(&value, dir, false)
+        crate::cc_exempt::parse_settings_value(&value, dir, false, crate::cc_exempt::TAIL)
     };
     let Ok(map) = parsed else {
         return crate::claude::RuntimeModelSources::default();
@@ -802,7 +1174,7 @@ fn passthrough_settings_sources(
 /// already skips, so the `user` tier is not judged here.
 fn project_setting_sources(claude_args: &[String]) -> (bool, bool) {
     let mut enabled = (true, true);
-    let mut args = claude_args.iter();
+    let mut args = claude_option_args(claude_args).iter();
     while let Some(a) = args.next() {
         let value = if let Some(v) = a.strip_prefix("--setting-sources=") {
             Some(v)
@@ -871,11 +1243,17 @@ fn project_model_sources(
         if out.fallbacks.is_none() {
             out.fallbacks = src.fallbacks;
         }
+        if out.advisor.is_none() {
+            out.advisor = src.advisor;
+        }
         if out.env_anthropic.is_none() {
             out.env_anthropic = src.env_anthropic;
         }
         if out.env_subagent.is_none() {
             out.env_subagent = src.env_subagent;
+        }
+        if out.env_disable_advisor.is_none() {
+            out.env_disable_advisor = src.env_disable_advisor;
         }
         if out.env_opus.is_none() {
             out.env_opus = src.env_opus;
@@ -893,9 +1271,10 @@ fn project_model_sources(
     out
 }
 
-/// The one fallback list a launch resolved, beside the subagent env string,
-/// held here so the fold is testable without a home or a process environment.
-/// An empty env value is dropped, never a family.
+/// The one fallback list a launch resolved, beside the advisor model and the
+/// subagent env string (in that slot order), held here so the fold is testable
+/// without a home or a process environment. An empty value is dropped, never a
+/// family.
 pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]) -> Vec<String> {
     let mut out = settings;
     out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));
@@ -906,7 +1285,7 @@ pub(crate) fn launch_models_from(settings: Vec<String>, env: [Option<String>; 2]
 /// as a WHOLE argv word: its value is the flag itself, never a prefix of a
 /// model name or a prompt.
 fn background_flag(claude_args: &[String]) -> Option<&str> {
-    claude_args
+    claude_option_args(claude_args)
         .iter()
         .map(String::as_str)
         .find(|arg| *arg == "--bg" || *arg == "--background")
@@ -930,10 +1309,13 @@ fn refuse_background_start(
     if isolation == Isolation::Isolated
         && let Some(flag) = background_flag(claude_args)
     {
-        anyhow::bail!(
-            "'{name}': {flag} cannot be combined with --isolated, since background sessions \
-             run in the account's shared background tree"
-        );
+        return Err(StartRefusal::Background {
+            reason: format!(
+                "'{name}': {flag} cannot be combined with --isolated, since background sessions \
+                 run in the account's shared background tree"
+            ),
+        }
+        .into());
     }
 
     // The fixed background pair is a COPY on a host that cannot symlink, and a
@@ -948,12 +1330,44 @@ fn refuse_background_start(
         && let Some(flag) = background_flag(claude_args)
         && crate::runtime::background_copy_host(name)?
     {
-        anyhow::bail!(
-            "{}",
-            crate::runtime::copy_host_background_refusal(name.as_str(), flag)
-        );
+        return Err(StartRefusal::CopyHostBackground {
+            reason: crate::runtime::copy_host_background_refusal(name.as_str(), flag),
+        }
+        .into());
     }
     Ok(())
+}
+
+/// What a launch prints and hands to the spawned claude beyond the runtime's
+/// own env: the announce line, and the degrade notice env pair a degraded
+/// `clauth resume --with-fallback` passes on. A plain `Option<&str>` converts
+/// to the announce-only shape, so callers that never degrade keep passing the
+/// announce line alone; [`LaunchExtras::with_degrade`] sets the pair whole,
+/// so no caller can build one with a lone half.
+pub(crate) struct LaunchExtras {
+    pub(crate) announce: Option<String>,
+    pub(crate) degrade: Option<(String, String)>,
+}
+
+impl LaunchExtras {
+    /// The degraded-resume shape: the launch line to announce and the notice
+    /// env pair — the notice text and the `<conversation>:<launcher pid>`
+    /// marker — which a degraded resume always carries together.
+    pub(crate) fn with_degrade(announce: Option<String>, notice: String, marker: String) -> Self {
+        Self {
+            announce,
+            degrade: Some((notice, marker)),
+        }
+    }
+}
+
+impl From<Option<&str>> for LaunchExtras {
+    fn from(announce: Option<&str>) -> Self {
+        Self {
+            announce: announce.map(str::to_owned),
+            degrade: None,
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -962,16 +1376,39 @@ pub(crate) fn run(
     claude_args: &[String],
     isolation: Isolation,
     workspace: Option<&Path>,
-    follows_chain: bool,
-    announce: Option<&str>,
+    chain: impl Into<ChainStart>,
+    extras: impl Into<LaunchExtras>,
 ) -> Result<()> {
-    let profile = admit(config, name, isolation, follows_chain, claude_args)?;
-
-    // Announced after the refusals, so a start that `admit` refuses never
-    // announces first.
-    if let Some(line) = announce {
-        errln!("{line}");
+    let code = run_for_code(
+        config,
+        name,
+        claude_args,
+        isolation,
+        workspace,
+        chain,
+        extras,
+    )?;
+    if code != 0 {
+        std::process::exit(code);
     }
+    Ok(())
+}
+
+/// A session launch's exit code, with the process-exit decision left to the
+/// caller: a caller that must run something after the session ends cannot go
+/// through [`run`].
+pub(crate) fn run_for_code(
+    config: &AppConfig,
+    name: &ProfileName,
+    claude_args: &[String],
+    isolation: Isolation,
+    workspace: Option<&Path>,
+    chain: impl Into<ChainStart>,
+    extras: impl Into<LaunchExtras>,
+) -> Result<i32> {
+    let chain = chain.into();
+    let extras = extras.into();
+    let profile = admit_with(config, name, isolation, chain, claude_args)?;
 
     // The plugin-migration pre-flight: heal a broken or divergent clauth
     // marketplace registration before the session launches, so the session loads
@@ -987,18 +1424,20 @@ pub(crate) fn run(
     // `clauth start <other>` session doesn't inherit it. The live
     // `settings.json` is owned by whoever is active; starting that same profile
     // passes its own keys, which the merge re-inserts (no-op). With no active
-    // marker to read (`switch_off` clears it without touching the file) the
+    // marker to read (a `switch_off` by a clauth that predates
+    // `~/.clauth/base-env.json` cleared it without touching the file) the
     // helper answers every configured profile's keys, so a departed account's
     // entries are stripped too rather than landing in front of the started
-    // account's endpoint.
-    let stale_env_keys = crate::actions::outgoing_env_keys(config);
+    // account's endpoint. The outgoing account is read off disk too: a peer's
+    // switch since this config was read stamped that account's keys.
+    let stale_env_keys = crate::actions::outgoing_env_keys_now(config)?;
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
         // A background launch lands on the account's one fixed tree, which the
         // daemon adopts on its next tick. `--with-fallback` keeps its own
         // per-launch tree: the fixed tree never follows the chain.
-        if background_flag(claude_args).is_some() && !follows_chain {
+        if background_flag(claude_args).is_some() && !chain.follows_chain() {
             ProfileRuntime::acquire_background(
                 &profile.name,
                 BackgroundHold::Launcher,
@@ -1010,7 +1449,7 @@ pub(crate) fn run(
                 profile,
                 isolation,
                 &stale_env_keys,
-                follows_chain,
+                chain.follows_chain(),
                 crate::live_sessions::Launcher::Own,
             )?
         }
@@ -1034,6 +1473,15 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     engine.scrub_env(&mut command, &stale_env_keys);
+    // The degrade notice env pair, layered after the scrub so the scrub
+    // cannot drop it: it belongs to the one claude this degraded resume
+    // launches. Every other claude session clauth launches — a start, a
+    // delegate, a bare `__restore` — drops an inherited pair instead of
+    // passing it on.
+    if let Some((notice, marker)) = &extras.degrade {
+        command.env(crate::hook_resume::DEGRADE_NOTICE_ENV, notice);
+        command.env(crate::hook_resume::DEGRADE_MARKER_ENV, marker);
+    }
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings
@@ -1060,15 +1508,20 @@ pub(crate) fn run(
     if let Some(cwd) = spawn_cwd.as_deref() {
         let settings_file =
             crate::runtime::spawn_settings_file(runtime.config_dir(), runtime.session_id());
-        if let Some(warning) = crate::cc_exempt::apply_spawn_settings(
+        match crate::cc_exempt::apply_spawn_settings(
             &mut command,
             runtime.config_dir(),
             cwd,
             claude_args,
-            &crate::cc_exempt::hook_command(),
+            crate::cc_exempt::Operator,
+            &crate::cc_exempt::hook_command(crate::cc_exempt::READ_HOOK_SUBCOMMAND),
+            // `clauth start` keeps a session's own turn lifecycle; the
+            // foreground-spawn guard is a delegate-only repair.
+            None,
             &settings_file,
         ) {
-            errln!("{warning}");
+            Ok(Some(warning)) => errln!("{warning}"),
+            Ok(None) => {}
         }
     } else {
         command.args(claude_args);
@@ -1090,6 +1543,11 @@ pub(crate) fn run(
         spawn_cwd.as_deref(),
         &env_models,
     );
+    // Announced only after every startup step that can still refuse has
+    // passed: only the spawn's own failure can follow it.
+    if let Some(line) = &extras.announce {
+        errln!("{line}");
+    }
     let mut child = command.spawn().context("failed to spawn claude")?;
     // Record the child's pid and the launch demand's resolved families on the
     // row once the child exists: the daemon's spend-cap decision leg joins a
@@ -1140,14 +1598,11 @@ pub(crate) fn run(
         rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
 
-    // Drop runtime before process::exit so final sync + refcount cleanup runs.
+    // Drop runtime before the code reaches the caller's exit, so final sync +
+    // refcount cleanup runs.
     drop(runtime);
 
-    let code = status_code(outcome.status, outcome.signal);
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    Ok(status_code(outcome.status, outcome.signal))
 }
 
 /// Resolve the directory the spawned `claude` runs in and pin `command` to it.
@@ -1361,6 +1816,21 @@ fn codex_spawn_command(
     let mut command = engine.command();
     engine.scrub_env(&mut command, active_env_keys);
     command.env(engine.home_env_key(), home);
+    // CODEX_HOME names this session home, so a reader inside the session that
+    // must reach the OPERATOR's own login (a switch or delete following the
+    // operator's auth.json slot) resolves the carried key instead. The key
+    // rides into every process started under this session tree — a nested
+    // `clauth start`, a claude session, a daemon started from inside it — and a
+    // child gets no key when no non-session home resolves, so no child inherits
+    // one session home as its operator home.
+    match crate::runtime::explicit_operator_codex_home() {
+        Some(operator_home) => {
+            command.env("CLAUTH_OPERATOR_CODEX_HOME", &operator_home);
+        }
+        None => {
+            command.env_remove("CLAUTH_OPERATOR_CODEX_HOME");
+        }
+    }
     command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
     command
         .arg("-c")

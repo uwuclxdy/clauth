@@ -18,7 +18,7 @@ Run it a second time and it adds nothing. `--key` picks the keybinding, and a re
 |------|--------|
 | `--key <spec>` | the key that opens the dashboard, in herdr's own binding syntax; default `prefix+a` |
 | `--no-config` | install the plugin, leave `config.toml` alone, and print the blocks to paste |
-| `--yes` | skip both prompts, herdr's install preview included; required on a non-TTY stdin |
+| `--yes` | skip every prompt: the key prompt (the key falls back to `prefix+a` unless `--key` names one) and both confirms, herdr's install preview included; required on a non-TTY stdin or stdout |
 
 `HERDR_CONFIG_PATH` overrides which config file gets written, matching how herdr itself reads that variable.
 
@@ -93,7 +93,7 @@ A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the head
 
 ## Herdr options
 
-Seven knobs tune the plugin. Six live in the dashboard's Services tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. The seventh, `home tab`, sits in the Config tab's appearance band and picks the tab every launch opens on; the first herdr launch lands on the Services tab with the herdr row open instead. The six form knobs persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`; `home tab` persists as the top-level `home_tab` key. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
+These knobs tune the plugin. All but `home tab` live in the dashboard's Services tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. `home tab` sits in the Config tab's appearance band and picks the tab every launch opens on; the first herdr launch lands on the Services tab with the herdr row open instead. The form knobs persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`; `home tab` persists as the top-level `home_tab` key. The plugin scripts read them through `clauth herdr config get <key>` (`restore notice` is read by the Claude Code plugin's hook instead), which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
 
 | Knob | Default | What it does |
 |------|---------|--------------|
@@ -103,6 +103,7 @@ Seven knobs tune the plugin. Six live in the dashboard's Services tab: select `h
 | `border label` | off | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `delegate dot` | on | the `clauth mcp` server reports `clauth_delegate=working\|idle` during delegate runs; off disables the reporting entirely |
 | `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote (a block you edited by hand is kept whole), behind a confirm that defaults to cancel |
+| `restore notice` | on | after a herdr restore of a bare `claude` pane that lost launch options, its first prompt is refused once with a notice naming them ([Claude Code plugin](Claude-Code-Plugin)); off stops new notices arming |
 | `home tab` | `overview` | the tab every launch opens on (`overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services`); a saved `plugin` loads as `services`. the first herdr launch lands on the Services tab with the herdr row open instead. edited from the Config tab's appearance band, not the herdr detail |
 
 The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing described above.

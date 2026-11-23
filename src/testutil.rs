@@ -71,8 +71,8 @@ pub(crate) fn node_path(path: &Path) -> PathBuf {
 /// A `RecvBody` bound or one of ureq's other phases is a different, unruled
 /// budget even when it errors inside the window.
 ///
-/// ureq 3.4.2's `BodyReader` surfaces its timeout as `io::Error::other`, so the
-/// ureq error is the io error's inner source.
+/// ureq's `BodyReader` (3.4.2; unchanged through 3.5.1) surfaces its timeout as
+/// `io::Error::other`, so the ureq error is the io error's inner source.
 pub(crate) fn assert_one_budget_timeout<T: std::fmt::Debug>(result: &anyhow::Result<T>) {
     let err = result.as_ref().expect_err("a stalled body is an error");
     let io = err
@@ -201,30 +201,48 @@ pub(crate) fn assert_prompt_body_reads(agent: ureq::Agent) {
 /// session dirs, pid files, or rotation locks — otherwise those paths land in
 /// the real `~/.clauth`.
 pub(crate) struct HomeSandbox {
-    // Drop order: tempdir first, then the shared lock.
+    // Drop order: tempdir first, then the shared lock when this sandbox owns it.
     _tmp: tempfile::TempDir,
-    _guard: crate::lockorder::RankedGuard<'static, ()>,
+    _guard: Option<crate::lockorder::RankedGuard<'static, ()>>,
     home: PathBuf,
     prev_config_dir: Option<std::ffi::OsString>,
     prev_session_id: Option<std::ffi::OsString>,
     prev_claude_pid: Option<std::ffi::OsString>,
+    prev_codex_home: Option<std::ffi::OsString>,
+    prev_operator_codex_home: Option<std::ffi::OsString>,
+    prev_appdata: Option<std::ffi::OsString>,
+    prev_ssl_cert_file: Option<std::ffi::OsString>,
+    prev_ssl_cert_dir: Option<std::ffi::OsString>,
+    prev_no_api: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, acquired above"
-    )]
     pub(crate) fn new() -> Self {
         // Untracked HOME_TEST_LOCK acquired first; no RankedMutex/flock is held.
         let guard = crate::profile::HOME_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        Self::open(Some(guard))
+    }
+
+    /// The same sandbox for a caller that already holds `HOME_TEST_LOCK`: the
+    /// guard stays with that caller, so the env its test sets around the
+    /// sandbox is never visible to another test between the set and the drop.
+    fn open_under(_held: &crate::lockorder::RankedGuard<'static, ()>) -> Self {
+        Self::open(None)
+    }
+
+    fn open(guard: Option<crate::lockorder::RankedGuard<'static, ()>>) -> Self {
         // A prior test that panicked mid-override leaks it into this one: clear
         // it here (and on drop) so a parallel test never inherits a shortened
         // lock deadline it did not set. The callback/feed bounds and the
         // marker-registration pose are the same class of process-global state.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::usage::set_tick_fetch_deadline_override(None);
+        // A fetch's tick deadline counts from its request slot, so a host slot
+        // the previous test booked would queue this test's first request behind
+        // the 5 s spacing before its deadline starts.
+        crate::usage::reset_request_slots();
         set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);
@@ -235,7 +253,7 @@ impl HomeSandbox {
         crate::claude_json::set_json_sync_lock_timeout_override(None);
         crate::claude_json::reset_last_synced();
         crate::claude_json::reset_pending_strip_state();
-        crate::profile::reset_torn_store_notice_for_test();
+        crate::profile::reset_load_notices_for_test();
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
@@ -247,19 +265,32 @@ impl HomeSandbox {
         // the only answer, the rule `profile::home_dir` already states for the
         // home. A test that WANTS one pins it with [`ConfigDirSandbox`], which
         // borrows this guard and so always sets it after this clear.
-        let prev_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let prev_config_dir = take_env("CLAUDE_CONFIG_DIR");
         // Same for the live Claude Code session the suite may run under: its
         // session id and process would stamp a minted delegate's host and decide
         // a hook's own process, passing or failing by where the suite ran.
-        let prev_session_id = std::env::var_os("CLAUDE_CODE_SESSION_ID");
-        let prev_claude_pid = std::env::var_os("CLAUDE_PID");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
-            std::env::remove_var("CLAUDE_PID");
-        }
+        let prev_session_id = take_env("CLAUDE_CODE_SESSION_ID");
+        let prev_claude_pid = take_env("CLAUDE_PID");
+        // A Windows browser manifest's dir reads this before the home, so it
+        // would name the real profile.
+        let prev_appdata = take_env("APPDATA");
+        // The two codex homes this process reads, cleared for the same reason:
+        // a suite run from inside a `clauth start` codex session inherits a
+        // session `CODEX_HOME` and a carried operator home, and both outrank
+        // the sandbox for `build_codex_home`, the switch and the delete. A
+        // test that WANTS one pins it with [`CodexHomeSandbox`] or [`EnvPin`],
+        // which borrow this guard and so always set it after this clear.
+        let prev_codex_home = take_env("CODEX_HOME");
+        let prev_operator_codex_home = take_env("CLAUTH_OPERATOR_CODEX_HOME");
+        // The TLS root decision reads these on every agent build: a runner's
+        // own bundle would otherwise decide every test's trust store (and the
+        // root decision logs a warning inside whichever test builds first). A
+        // test that WANTS one pins it with [`EnvPin`].
+        let prev_ssl_cert_file = take_env("SSL_CERT_FILE");
+        let prev_ssl_cert_dir = take_env("SSL_CERT_DIR");
+        // The REST kill switch: a runner exporting it would turn every
+        // listener decision under test into the no-API arm.
+        let prev_no_api = take_env("CLAUTH_NO_API");
         Self {
             _tmp: tmp,
             _guard: guard,
@@ -267,6 +298,12 @@ impl HomeSandbox {
             prev_config_dir,
             prev_session_id,
             prev_claude_pid,
+            prev_codex_home,
+            prev_operator_codex_home,
+            prev_appdata,
+            prev_ssl_cert_file,
+            prev_ssl_cert_dir,
+            prev_no_api,
         }
     }
 
@@ -276,11 +313,35 @@ impl HomeSandbox {
     }
 }
 
+/// Read `key` and remove it from the process env, for [`HomeSandbox`] to hand
+/// back on drop through [`set_env`].
+#[expect(
+    unsafe_code,
+    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the sandbox or its caller"
+)]
+fn take_env(key: &str) -> Option<std::ffi::OsString> {
+    let prev = std::env::var_os(key);
+    // SAFETY: test-only, called with `HOME_TEST_LOCK` held, restored on drop.
+    unsafe { std::env::remove_var(key) };
+    prev
+}
+
+/// Set `key` to `value`, or remove it for `None`: the one env write behind
+/// every [`HomeSandbox`] restore and [`EnvPin`].
+#[expect(
+    unsafe_code,
+    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by a sandbox or a caller's guard, which every pin borrows"
+)]
+fn set_env(key: &str, value: Option<impl AsRef<std::ffi::OsStr>>) {
+    match value {
+        // SAFETY: test-only, called with `HOME_TEST_LOCK` held.
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        // SAFETY: test-only, called with `HOME_TEST_LOCK` held.
+        None => unsafe { std::env::remove_var(key) },
+    }
+}
+
 impl Drop for HomeSandbox {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, still held here"
-    )]
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // worker still running past the join bound is detached, so its next
@@ -302,6 +363,7 @@ impl Drop for HomeSandbox {
         crate::usage::reset_pending_forgets_for_test();
         crate::usage::reset_profile_fetched_for_test();
         crate::usage::clear_seed_hooks_for_test();
+        crate::usage::clear_claude_resets_seed_apply_hooks_for_test();
         crate::usage::clear_codex_compare_hooks_for_test();
         crate::profile::clear_home_override();
         // Clear the process-wide lock-timeout override after the joins above
@@ -310,6 +372,7 @@ impl Drop for HomeSandbox {
         // the next one. The callback/feed bounds and the marker-registration
         // pose leak the same way, so they clear together.
         crate::lock::set_state_lock_timeout_override(None);
+        crate::usage::set_tick_fetch_deadline_override(None);
         set_tui_worker_join_timeout_override(None);
         crate::oauth_login::set_callback_read_timeout_override(None);
         crate::oauth_login::set_callback_reader_cap_override(None);
@@ -323,19 +386,18 @@ impl Drop for HomeSandbox {
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, still held.
-        match self.prev_config_dir.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-        match self.prev_session_id.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") },
-        }
-        match self.prev_claude_pid.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_PID") },
-        }
+        set_env("CLAUDE_CONFIG_DIR", self.prev_config_dir.take());
+        set_env("CLAUDE_CODE_SESSION_ID", self.prev_session_id.take());
+        set_env("CLAUDE_PID", self.prev_claude_pid.take());
+        set_env("CODEX_HOME", self.prev_codex_home.take());
+        set_env("SSL_CERT_FILE", self.prev_ssl_cert_file.take());
+        set_env("SSL_CERT_DIR", self.prev_ssl_cert_dir.take());
+        set_env(
+            "CLAUTH_OPERATOR_CODEX_HOME",
+            self.prev_operator_codex_home.take(),
+        );
+        set_env("APPDATA", self.prev_appdata.take());
+        set_env("CLAUTH_NO_API", self.prev_no_api.take());
         // A non-panicking miss ran the whole teardown above; panic LAST naming
         // the count and the bound. The unwind then drops the guard (poisoning
         // `HOME_TEST_LOCK`, which the next sandbox recovers) and the tempdir.
@@ -343,6 +405,101 @@ impl Drop for HomeSandbox {
             panic!("{msg}");
         }
     }
+}
+
+/// The fake values the codex-key pins below use. `HomeSandbox::open` reads them
+/// and leaves neither behind for its whole life.
+const KNOWN_CODEX_KEYS: [(&str, &str); 2] = [
+    ("CODEX_HOME", "/known/codex-home"),
+    ("CLAUTH_OPERATOR_CODEX_HOME", "/known/operator-codex-home"),
+];
+
+/// Run `check` over a sandbox built under [`KNOWN_CODEX_KEYS`], with the run's
+/// own values restored before `HOME_TEST_LOCK` is released. One lock is held
+/// across the set, the sandbox and the restore, so the fake values are never
+/// live outside it — not even for an unsandboxed reader — and the pin puts
+/// them back even when `check` panics.
+fn with_known_codex_keys<T>(check: impl FnOnce(HomeSandbox) -> T) -> T {
+    let lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let pins: Vec<(&str, Option<&std::ffi::OsStr>)> = KNOWN_CODEX_KEYS
+        .iter()
+        .map(|&(key, value)| (key, Some(std::ffi::OsStr::new(value))))
+        .collect();
+    let pin = EnvPin::under_lock(&lock, &pins);
+    let seen = check(HomeSandbox::open_under(&lock));
+    drop(pin);
+    drop(lock);
+    seen
+}
+
+/// Both codex keys `open` clears are absent for the sandbox's whole life: a
+/// suite run from inside a codex session must not build homes or move links
+/// under the real carried home.
+#[test]
+fn the_home_sandbox_clears_both_codex_home_keys() {
+    let inside = with_known_codex_keys(|sandbox| {
+        let inside: Vec<Option<std::ffi::OsString>> = KNOWN_CODEX_KEYS
+            .iter()
+            .map(|&(key, _)| std::env::var_os(key))
+            .collect();
+        drop(sandbox);
+        inside
+    });
+
+    for ((key, _), value) in KNOWN_CODEX_KEYS.iter().zip(&inside) {
+        assert_eq!(
+            value, &None,
+            "{key} is cleared for the sandbox's whole life"
+        );
+    }
+}
+
+/// Both codex keys come back on drop at the value the run found: a restore that
+/// dropped either leaves every later test in this process reading no operator
+/// home.
+#[test]
+fn the_home_sandbox_restores_both_codex_home_keys() {
+    let seen = with_known_codex_keys(|sandbox| {
+        drop(sandbox);
+        KNOWN_CODEX_KEYS
+            .iter()
+            .map(|&(key, _)| std::env::var_os(key))
+            .collect::<Vec<Option<std::ffi::OsString>>>()
+    });
+
+    for ((key, value), seen) in KNOWN_CODEX_KEYS.iter().zip(&seen) {
+        assert_eq!(
+            seen.as_deref(),
+            Some(std::ffi::OsStr::new(value)),
+            "{key} comes back with the value the sandbox found"
+        );
+    }
+}
+
+/// The REST kill switch is unset for the sandbox's whole life and comes back on
+/// drop: a runner exporting `CLAUTH_NO_API=1` must not turn a listener test's
+/// answer into the no-API arm, nor lose its own value to a later test.
+#[test]
+fn the_home_sandbox_clears_and_restores_the_rest_kill_switch() {
+    let lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pin = EnvPin::under_lock(&lock, &[("CLAUTH_NO_API", Some(std::ffi::OsStr::new("1")))]);
+    let sandbox = HomeSandbox::open_under(&lock);
+    let inside = std::env::var_os("CLAUTH_NO_API");
+    drop(sandbox);
+    let after = std::env::var_os("CLAUTH_NO_API");
+    drop(pin);
+    drop(lock);
+
+    assert_eq!(inside, None, "the kill switch is unset inside the sandbox");
+    assert_eq!(
+        after.as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "the kill switch comes back with the value the sandbox found"
+    );
 }
 
 /// Run a switch fn (`switch_profile`/`switch_off`/`auto_switch_if_needed`, all
@@ -767,6 +924,16 @@ pub(crate) fn serve_endpoints_raw_with_headers(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, Vec<(String, String)>, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    serve_endpoints_by_request(max, move |raw, i| reply(&request_path(raw), i))
+}
+
+/// [`serve_endpoints_raw_with_headers`] whose reply reads the whole raw
+/// request, for a stub that answers by a request header (an account id) rather
+/// than by path or arrival index. Same listener, same deadlines.
+pub(crate) fn serve_endpoints_by_request(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, Vec<(String, String)>, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -832,7 +999,7 @@ pub(crate) fn serve_endpoints_raw_with_headers(
                 }
             }
             let text = String::from_utf8_lossy(&req).into_owned();
-            let (status, headers, body) = reply(&request_path(&text), i);
+            let (status, headers, body) = reply(&text, i);
             let extra: String = headers
                 .iter()
                 .map(|(k, v)| format!("{k}: {v}\r\n"))
@@ -931,14 +1098,18 @@ pub(crate) fn rotation_fixture_config(
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    crate::profile::save_profile(&profile).expect("save profile");
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
-        profiles: vec![profile],
+        profiles: vec![],
     };
     config.state.profiles.push(name.clone());
     config.state.active_profile = Some(name.clone());
+    // The roster first: it names this profile alone, so an earlier fixture's
+    // profile in the same sandbox holds no store this one's chain is checked
+    // against.
     crate::profile::save_app_state(&config.state).expect("save app state");
+    crate::profile::save_profile(&profile).expect("save profile");
+    config.profiles.push(profile);
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
 
@@ -966,12 +1137,14 @@ pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     std::fs::create_dir(&path).expect("block the credentials path with a directory");
 }
 
-/// Make `dir` refuse to create or write files for the guard's lifetime, so a
-/// test can drive a save failure without root: on Unix the dir's mode drops to
-/// 0o500 (no write bit), on Windows a deny ACE for Everyone removes add-file /
-/// add-subdir (`(WD,AD)`). The constructor probes a real write so a fault that
-/// never bites fails by name instead of greening the test; `Drop` restores
-/// best-effort and never asserts.
+/// Make `dir` refuse to create files for the guard's lifetime, so a test can
+/// drive a save failure without root: on Unix the dir's mode drops to 0o500
+/// (no write bit), on Windows a deny ACE for Everyone (`(WD,AD)`) refuses a
+/// new file. Windows still lets a new subdirectory through it (CI's
+/// `windows-latest`, 2026-10-21), so a fault a test poses is a new FILE. The
+/// constructor probes a real file write so a fault that never bites fails by
+/// name instead of greening the test; `Drop` restores best-effort and never
+/// asserts.
 #[cfg(test)]
 pub(crate) struct UnwritableDir {
     path: PathBuf,
@@ -1157,31 +1330,37 @@ impl<'a> ConfigDirSandbox<'a> {
 /// One or more process env pins, restored to their previous values on drop
 /// (even on panic), in reverse order. Same contract as every pin here: the env
 /// is process-global, serialized by `HOME_TEST_LOCK`, so the pin BORROWS the
-/// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
-/// time instead of a race nothing checks.
+/// [`HomeSandbox`] that holds it (or, through `under_lock`, the lock guard
+/// itself); dropping the holder first is E0505 at compile time instead of a
+/// race nothing checks.
 pub(crate) struct EnvPin<'a> {
     prevs: Vec<(String, Option<std::ffi::OsString>)>,
     _home: std::marker::PhantomData<&'a HomeSandbox>,
 }
 
 impl<'a> EnvPin<'a> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
     pub(crate) fn new(_home: &'a HomeSandbox, pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
-        let mut prevs = Vec::with_capacity(pins.len());
-        for &(key, value) in pins {
-            let prev = std::env::var_os(key);
-            // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-            prevs.push((key.to_string(), prev));
-        }
+        Self::pin(pins)
+    }
+
+    /// The same pin for a caller holding `HOME_TEST_LOCK` with no sandbox
+    /// open yet: a value the sandbox must find at open is set here first.
+    fn under_lock(
+        _held: &'a crate::lockorder::RankedGuard<'static, ()>,
+        pins: &[(&str, Option<&std::ffi::OsStr>)],
+    ) -> Self {
+        Self::pin(pins)
+    }
+
+    fn pin(pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
+        let prevs = pins
+            .iter()
+            .map(|&(key, value)| {
+                let prev = std::env::var_os(key);
+                set_env(key, value);
+                (key.to_string(), prev)
+            })
+            .collect();
         Self {
             prevs,
             _home: std::marker::PhantomData,
@@ -1190,19 +1369,9 @@ impl<'a> EnvPin<'a> {
 }
 
 impl Drop for EnvPin<'_> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
     fn drop(&mut self) {
-        // SAFETY: same as `new` — restore the prior values under the same lock.
-        for (key, prev) in self.prevs.iter().rev() {
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
+        for (key, prev) in self.prevs.drain(..).rev() {
+            set_env(&key, prev);
         }
     }
 }
@@ -1217,6 +1386,79 @@ impl Drop for EnvPin<'_> {
 const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
 printf '%s\t%s\n' "${CLAUDE_CONFIG_DIR-}" "$*" >> "$CLAUDE_SHIM_LOG.spawns"
+# The file behind every `--settings <file>` argument, one line each: the
+# runtime that wrote it removes it when it drops, before a test can read it.
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "--settings" ] && [ -f "$arg" ]; then
+    { tr -d '\n' < "$arg"; printf '\n'; } >> "$CLAUDE_SHIM_LOG.settings"
+  fi
+  prev=$arg
+done
+# Opt-in: dump this child's environment, so a test can pin what the spawn
+# exports (the per-run job id tag included). Lands before every exit branch.
+if [ -n "${CLAUDE_SHIM_ENV_DUMP-}" ]; then
+  env > "$CLAUDE_SHIM_ENV_DUMP"
+fi
+# Opt-in: a process in its own session, the shape a delegate's Bash call
+# leaves behind — the Bash runs in its own session, so a `&` child it starts
+# sits outside this delegate's process group and inherits this child's
+# environment, the per-run stop tag included. Records its own pid (the exec
+# keeps it) into the named file, then runs the named binary for 600 s: the
+# real Bash tool refuses a bare `sleep`, so tests pass a renamed copy.
+if [ -n "${CLAUDE_SHIM_ESCAPED_HOLD-}" ]; then
+  setsid sh -c 'printf "%s\n" "$$" > "$1"; exec "$2" 600' sh "$CLAUDE_SHIM_ESCAPED_HOLD" "$CLAUDE_SHIM_ESCAPED_BIN" &
+fi
+# Opt-in: a process outside both sweeps — its own session, so the group stop
+# misses it, and a scrubbed environment, so the tag sweep cannot see it — that
+# inherits this child's stdout and stderr and holds them open long after the
+# child exits. The shape a stop cannot end, and the one that makes the run's
+# post-exit pipe wait spend its whole grace. Records its pid, then runs the
+# named binary for 600 s.
+if [ -n "${CLAUDE_SHIM_UNSEEN_HOLD-}" ]; then
+  setsid sh -c 'printf "%s\n" "$$" > "$1"; exec env -i "$2" 600' sh "$CLAUDE_SHIM_UNSEEN_HOLD" "$CLAUDE_SHIM_UNSEEN_BIN" &
+fi
+# Opt-in: a grandchild subshell inherits this child's stderr (the pipe clauth
+# reads) and stays alive for the named seconds while the child exits at once,
+# so a test can pin that the run finalizes on the child's exit without waiting
+# on the grandchild's pipe.
+if [ -n "${CLAUDE_SHIM_GRANDCHILD_HOLD-}" ]; then
+  ( sleep "$CLAUDE_SHIM_GRANDCHILD_HOLD" ) &
+  exit 0
+fi
+# Opt-in: write a fake transcript record keyed by the pinned delegate session
+# id, so a test can pin that an isolated stop's rescue lifted it into the
+# global store.
+if [ -n "${CLAUDE_SHIM_TRANSCRIPT-}" ]; then
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-cwd"
+  printf '{"sessionId":"%s","type":"user"}\n' "$CLAUTH_DELEGATE_SESSION_ID" > "$CLAUDE_CONFIG_DIR/projects/-fake-cwd/$CLAUTH_DELEGATE_SESSION_ID.jsonl"
+fi
+# Opt-in: a delegate kept alive until signalled, for the stop tests: record
+# this shim's pid and a same-group grandchild's pid (one per line), then wait
+# on SIGTERM/SIGINT, appending which arrived before exiting 0. The grandchild
+# dies with the group signal, which is what unblocks the wait for the trap.
+# With CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD the grandchild ignores SIGTERM
+# instead, so only the group SIGKILL after the grace can end it: a descendant
+# that ignores the SIGTERM (a backgrounded shell job's shape) is what the
+# grace exists for.
+if [ -n "${CLAUDE_SHIM_SIGNAL_HOLD-}" ]; then
+  if [ -n "${CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD-}" ]; then
+    ( trap '' TERM; sleep 600 ) &
+  else
+    ( sleep 600 ) &
+  fi
+  printf '%s\n' "$$" > "$CLAUDE_SHIM_SIGNAL_HOLD"
+  printf '%s\n' "$!" >> "$CLAUDE_SHIM_SIGNAL_HOLD"
+  trap 'trap "" TERM; sleep "${CLAUDE_SHIM_TERM_DELAY:-0}"; printf "%s\n" TERM >> "$CLAUDE_SHIM_SIGNAL_HOLD"; exit 0' TERM
+  trap 'printf "%s\n" INT >> "$CLAUDE_SHIM_SIGNAL_HOLD"; exit 0' INT
+  while :; do sleep 1; done
+fi
+# Opt-in scripted failure: print the named stderr text and exit with the named
+# code, so a test drives a delegate's non-zero-exit path through a real spawn.
+if [ -n "${CLAUDE_SHIM_STDERR-}" ]; then
+  printf '%s\n' "$CLAUDE_SHIM_STDERR" >&2
+  exit "${CLAUDE_SHIM_EXIT-1}"
+fi
 # Opt-in: a delegate's row is registered by the mcp that spawns us and re-keyed
 # onto our pid once we exist. When this var names a file, wait for that re-key
 # (a row under the live-sessions registry whose pid is ours) and copy the row
@@ -1301,6 +1543,12 @@ case "$1" in
         ;;
     esac
     ;;
+  *)
+    # Opt-in: a foreground session spawn (never `--version`, `plugin`, or a
+    # `--bg` launch, which exits above) exits with the named code, so a test
+    # drives a launch whose child exits non-zero.
+    exit "${CLAUDE_SHIM_SESSION_EXIT-0}"
+    ;;
 esac
 exit 0
 "#;
@@ -1329,6 +1577,19 @@ pub(crate) struct FakeClaude<'a> {
     prev_log: Option<std::ffi::OsString>,
     prev_fail_install: Option<std::ffi::OsString>,
     prev_row_dump: Option<std::ffi::OsString>,
+    prev_stderr: Option<std::ffi::OsString>,
+    prev_exit: Option<std::ffi::OsString>,
+    prev_grandchild_hold: Option<std::ffi::OsString>,
+    prev_session_exit: Option<std::ffi::OsString>,
+    prev_signal_hold: Option<std::ffi::OsString>,
+    prev_term_ignoring: Option<std::ffi::OsString>,
+    prev_transcript: Option<std::ffi::OsString>,
+    prev_escaped_hold: Option<std::ffi::OsString>,
+    prev_escaped_bin: Option<std::ffi::OsString>,
+    prev_unseen_hold: Option<std::ffi::OsString>,
+    prev_unseen_bin: Option<std::ffi::OsString>,
+    prev_term_delay: Option<std::ffi::OsString>,
+    prev_env_dump: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
@@ -1426,6 +1687,78 @@ impl<'a> FakeClaude<'a> {
         unsafe {
             std::env::remove_var("CLAUDE_SHIM_ROW_DUMP");
         }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the failure branch.
+        let prev_stderr = std::env::var_os("CLAUDE_SHIM_STDERR");
+        let prev_exit = std::env::var_os("CLAUDE_SHIM_EXIT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_STDERR");
+            std::env::remove_var("CLAUDE_SHIM_EXIT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the grandchild branch.
+        let prev_grandchild_hold = std::env::var_os("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_GRANDCHILD_HOLD");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would make every session spawn exit non-zero.
+        let prev_session_exit = std::env::var_os("CLAUDE_SHIM_SESSION_EXIT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_SESSION_EXIT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the signal-hold
+        // branch.
+        let prev_signal_hold = std::env::var_os("CLAUDE_SHIM_SIGNAL_HOLD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_SIGNAL_HOLD");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the transcript
+        // branch.
+        let prev_transcript = std::env::var_os("CLAUDE_SHIM_TRANSCRIPT");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TRANSCRIPT");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would turn every signal-hold grandchild
+        // TERM-ignoring.
+        let prev_term_ignoring = std::env::var_os("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the escaped
+        // branch.
+        let prev_escaped_hold = std::env::var_os("CLAUDE_SHIM_ESCAPED_HOLD");
+        let prev_escaped_bin = std::env::var_os("CLAUDE_SHIM_ESCAPED_BIN");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ESCAPED_HOLD");
+            std::env::remove_var("CLAUDE_SHIM_ESCAPED_BIN");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the unseen-hold
+        // branch.
+        let prev_unseen_hold = std::env::var_os("CLAUDE_SHIM_UNSEEN_HOLD");
+        let prev_unseen_bin = std::env::var_os("CLAUDE_SHIM_UNSEEN_BIN");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_UNSEEN_HOLD");
+            std::env::remove_var("CLAUDE_SHIM_UNSEEN_BIN");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop. An
+        // inherited value would slow every signal-hold shim's TERM exit.
+        let prev_term_delay = std::env::var_os("CLAUDE_SHIM_TERM_DELAY");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_TERM_DELAY");
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        // An inherited value would send every shim call down the env-dump
+        // branch.
+        let prev_env_dump = std::env::var_os("CLAUDE_SHIM_ENV_DUMP");
+        unsafe {
+            std::env::remove_var("CLAUDE_SHIM_ENV_DUMP");
+        }
         Self {
             _home: std::marker::PhantomData,
             _tmp: tmp,
@@ -1440,6 +1773,19 @@ impl<'a> FakeClaude<'a> {
             prev_log,
             prev_fail_install,
             prev_row_dump,
+            prev_stderr,
+            prev_exit,
+            prev_grandchild_hold,
+            prev_session_exit,
+            prev_signal_hold,
+            prev_term_ignoring,
+            prev_transcript,
+            prev_escaped_hold,
+            prev_escaped_bin,
+            prev_unseen_hold,
+            prev_unseen_bin,
+            prev_term_delay,
+            prev_env_dump,
         }
     }
 
@@ -1460,6 +1806,18 @@ impl<'a> FakeClaude<'a> {
             .collect()
     }
 
+    /// The settings file behind every `--settings <file>` argument the shim
+    /// was handed, parsed, in call order.
+    pub(crate) fn settings_files(&self) -> Vec<serde_json::Value> {
+        let mut path = self.log.clone().into_os_string();
+        path.push(".settings");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a captured settings file parses"))
+            .collect()
+    }
+
     /// Point the shim's opt-in live-row dump at `path`: the shim waits for its
     /// own row to be re-keyed and copies the row there. Restored on drop like
     /// every other pin.
@@ -1470,6 +1828,148 @@ impl<'a> FakeClaude<'a> {
     pub(crate) fn set_row_dump(&mut self, path: &std::path::Path) {
         // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
         unsafe { std::env::set_var("CLAUDE_SHIM_ROW_DUMP", path) };
+    }
+
+    /// Script the shim's failure: the named text printed to stderr and the
+    /// named exit code, so a test drives a delegate's non-zero-exit path
+    /// through a real spawn. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_scripted_failure(&mut self, stderr: &str, exit: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_STDERR", stderr);
+            std::env::set_var("CLAUDE_SHIM_EXIT", exit);
+        }
+    }
+
+    /// Make the shim exit at once while a grandchild subshell inherits stderr
+    /// and stays alive for the named seconds, so a test pins that the run
+    /// finalizes on the child's exit without waiting on the grandchild's pipe.
+    /// Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_grandchild_hold(&mut self, secs: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_GRANDCHILD_HOLD", secs) };
+    }
+
+    /// Make the session spawn exit with `code` while `--version` and `plugin`
+    /// calls still succeed, so a launch reaches its child and sees it fail.
+    /// Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_session_exit(&mut self, code: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_SESSION_EXIT", code) };
+    }
+
+    /// Point the shim's signal-hold opt-in at `path`: the shim records its own
+    /// pid and a grandchild's pid there (one per line), waits until signalled,
+    /// and appends the signal name it got before exiting 0. Restored on drop
+    /// like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_signal_hold(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_SIGNAL_HOLD", path) };
+    }
+
+    /// Make the shim write a fake transcript keyed by the pinned delegate
+    /// session id before whatever it does next, so a test can pin that an
+    /// isolated stop's rescue lifted it. Restored on drop like every other
+    /// pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_transcript(&mut self) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TRANSCRIPT", "1") };
+    }
+
+    /// Make the signal-hold grandchild ignore SIGTERM, so a stop test can pin
+    /// that the group SIGKILL after the grace ends a TERM-surviving
+    /// descendant. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_term_ignoring_grandchild(&mut self) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD", "1") };
+    }
+
+    /// Point the shim's escaped-process opt-in at `record` and the long-lived
+    /// binary it runs: the shim backgrounds that binary in its own session —
+    /// outside the delegate's process group, the measured shape of a Bash
+    /// call's `&` child — and records its pid in `record`. Restored on drop
+    /// like every other pin. The fixture backgrounds it with `setsid`, so the
+    /// helper takes its callers' platform gate.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_escaped_hold(&mut self, bin: &std::path::Path, record: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_ESCAPED_BIN", bin);
+            std::env::set_var("CLAUDE_SHIM_ESCAPED_HOLD", record);
+        }
+    }
+
+    /// Point the shim's unseen-hold opt-in at `record` and the long-lived
+    /// binary it runs: a process in its own session with a scrubbed
+    /// environment — outside both the group stop and the tag sweep — that
+    /// inherits the shim's stdout and stderr and holds them open after the
+    /// shim exits. Records its own pid. The fixture backgrounds it with
+    /// `setsid` and `env -i`, so the helper takes its callers' platform gate.
+    /// Restored on drop like every other pin.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_unseen_hold(&mut self, bin: &std::path::Path, record: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("CLAUDE_SHIM_UNSEEN_BIN", bin);
+            std::env::set_var("CLAUDE_SHIM_UNSEEN_HOLD", record);
+        }
+    }
+
+    /// Make the shim's TERM trap sleep the named seconds before it records
+    /// the signal and exits, so a stop test can pose a delegate's measured
+    /// SIGTERM-to-exit time. Restored on drop like every other pin.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_term_delay(&mut self, secs: &str) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_TERM_DELAY", secs) }
+    }
+
+    /// Point the shim's env-dump opt-in at `path`: the shim writes its own
+    /// environment there at startup, so a test can pin what the spawn
+    /// exports. Restored on drop like every other pin.
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn set_env_dump(&mut self, path: &std::path::Path) {
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_SHIM_ENV_DUMP", path) };
     }
 }
 
@@ -1493,6 +1993,22 @@ impl Drop for FakeClaude<'_> {
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
                 ("CLAUDE_SHIM_FAIL_INSTALL", &self.prev_fail_install),
                 ("CLAUDE_SHIM_ROW_DUMP", &self.prev_row_dump),
+                ("CLAUDE_SHIM_STDERR", &self.prev_stderr),
+                ("CLAUDE_SHIM_EXIT", &self.prev_exit),
+                ("CLAUDE_SHIM_GRANDCHILD_HOLD", &self.prev_grandchild_hold),
+                ("CLAUDE_SHIM_SESSION_EXIT", &self.prev_session_exit),
+                ("CLAUDE_SHIM_SIGNAL_HOLD", &self.prev_signal_hold),
+                (
+                    "CLAUDE_SHIM_TERM_IGNORING_GRANDCHILD",
+                    &self.prev_term_ignoring,
+                ),
+                ("CLAUDE_SHIM_TRANSCRIPT", &self.prev_transcript),
+                ("CLAUDE_SHIM_ESCAPED_HOLD", &self.prev_escaped_hold),
+                ("CLAUDE_SHIM_ESCAPED_BIN", &self.prev_escaped_bin),
+                ("CLAUDE_SHIM_UNSEEN_HOLD", &self.prev_unseen_hold),
+                ("CLAUDE_SHIM_UNSEEN_BIN", &self.prev_unseen_bin),
+                ("CLAUDE_SHIM_TERM_DELAY", &self.prev_term_delay),
+                ("CLAUDE_SHIM_ENV_DUMP", &self.prev_env_dump),
             ] {
                 match value {
                     Some(v) => std::env::set_var(key, v),
@@ -1736,6 +2252,19 @@ pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::
 /// `subtext0`, `#a6adc8`).
 pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
 
+/// Runs `f` on the local calendar day, again whenever the day turned while it
+/// ran, so a pin seeded off `today` and a render reading its own clock always
+/// agree on the day, a run straddling local midnight included.
+pub(crate) fn on_one_local_day<T>(mut f: impl FnMut(chrono::NaiveDate) -> T) -> T {
+    loop {
+        let today = chrono::Local::now().date_naive();
+        let out = f(today);
+        if chrono::Local::now().date_naive() == today {
+            return out;
+        }
+    }
+}
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
@@ -1748,11 +2277,14 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: Default::default(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -1766,6 +2298,9 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -1782,6 +2317,63 @@ pub(crate) fn oauth_pair(access: &str) -> crate::profile::ClaudeCredentials {
             ..crate::profile::OAuthToken::default_extra()
         }),
     }
+}
+
+/// An OAuth profile whose captured credential is `refresh`, so the shared
+/// `~/.claude/.credentials.json` link a bare `claude` reads resolves to it.
+pub(crate) fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
+    let mut profile = blank_profile(&crate::profile::ProfileName::from(name));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    profile
+}
+
+/// What the credential link a bare `claude` reads holds: the shared
+/// `~/.claude/.credentials.json` carrying `refresh`, under the caller's pinned
+/// HOME.
+pub(crate) fn write_linked_credentials(refresh: &str) {
+    let dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}"}}}}"#),
+    )
+    .expect("write linked credentials");
+}
+
+/// Pad the linked `~/.claude/.credentials.json` with an `mcpOAuth` block of 70
+/// one-KiB entries, past [`crate::runtime::RECORD_READ_CAP`], the way a fleet of
+/// OAuth MCP servers grows the real file.
+pub(crate) fn pad_linked_credentials_past_record_cap() {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    let mut blob: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read the link")).expect("parse");
+    let mcp: serde_json::Map<String, serde_json::Value> = (0..70)
+        .map(|i| {
+            (
+                format!("server-{i:02}"),
+                serde_json::json!({"accessToken": "x".repeat(1024)}),
+            )
+        })
+        .collect();
+    blob["mcpOAuth"] = serde_json::Value::Object(mcp);
+    let bytes = serde_json::to_vec(&blob).expect("serialize the padded blob");
+    assert!(
+        bytes.len() as u64 > crate::runtime::RECORD_READ_CAP,
+        "fixture control: the file is past the record cap ({} bytes)",
+        bytes.len()
+    );
+    std::fs::write(&path, &bytes).expect("write the padded credentials");
 }
 
 /// Write a long-lived `session-token.json` sidecar (no refresh token, so
@@ -1977,6 +2569,56 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
     holder
 }
 
+/// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
+/// scheduler's hourly side read or the CLI's post-spend refresh) with no banked
+/// total and no grant, as an older clauth stored it: the usable count, the
+/// next grant's raw window names and end it kept then, and the read's own
+/// epoch-ms stamp.
+pub(crate) fn write_claude_limit_resets(
+    name: &str,
+    usable: u32,
+    clears: &[&str],
+    ends_at: Option<&str>,
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "clears": clears,
+        "ends_at": ends_at,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
+}
+
+/// [`write_claude_limit_resets`] for a reading that carries the banked total.
+pub(crate) fn write_claude_limit_resets_banked(
+    name: &str,
+    usable: u32,
+    banked: u32,
+    clears: &[&str],
+    fetched_at: u64,
+) {
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    let body = serde_json::json!({
+        "usable": usable,
+        "banked": banked,
+        "clears": clears,
+        "fetched_at": fetched_at,
+    });
+    std::fs::write(&path, body.to_string()).expect("write limit_resets.json");
+}
+
 /// An empty scheduler activity store: the per-profile spend counts a test
 /// drives its own claims through.
 pub(crate) fn fresh_activity() -> crate::usage::ActivityStore {
@@ -2054,6 +2696,36 @@ pub(crate) fn register_names(names: &[&str]) {
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
+/// Leave `name`'s `config.toml` unloadable as a profile: valid TOML holding a
+/// value the profile schema rejects, the hand-edit typo a real config can
+/// carry. [`crate::profile::read_profile`] and a whole-config load fail on it
+/// while the credential store, the roster and the proxy claim still read.
+pub(crate) fn break_profile_config(name: &str) {
+    let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&path, "fallback_threshold = \"x\"\n").expect("break the profile's config");
+}
+
+/// A peer's write: `profiles.toml`'s active marker moves to `name` (or to
+/// none) while the process's config copy still names the account it loaded.
+pub(crate) fn peer_switches_active_to(name: Option<&str>) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.active_profile = name.map(Into::into);
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Hold `profiles` the way a loaded config does: each one's files on disk and
+/// its name on the roster, so a settings writer re-reading the account off
+/// disk finds what the in-memory fixture holds.
+pub(crate) fn persist_profiles(profiles: &[crate::profile::Profile]) {
+    for profile in profiles {
+        crate::profile::save_profile(profile).expect("save the fixture profile");
+    }
+    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+    register_names(&names);
+}
+
 /// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
 pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
     let path = crate::profile::claude_dir()
@@ -2061,6 +2733,40 @@ pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
         .join(".credentials.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
     std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
+}
+
+/// A test-only seam a race test plants: a closure the switch entry points run
+/// between their gate decision and the state hold, posing a peer write. The
+/// closure runs once and is cleared, so the next switch on the thread is clean.
+pub(crate) mod switch_race_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PLANTED: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Plant the peer write to run at the next seam point. One at a time.
+    pub(crate) fn plant(f: impl FnOnce() + 'static) {
+        PLANTED.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "a seam closure is already planted");
+            *slot = Some(Box::new(f));
+        });
+    }
+
+    /// Run (and clear) the planted closure, if any.
+    pub(crate) fn run() {
+        PLANTED.with(|slot| {
+            if let Some(f) = slot.borrow_mut().take() {
+                f();
+            }
+        });
+    }
+
+    /// Test hygiene: nothing left planted after a run.
+    pub(crate) fn assert_empty() {
+        PLANTED.with(|slot| assert!(slot.borrow().is_none(), "seam closure left planted"));
+    }
 }
 
 // ── provider-cache fixtures ──────────────────────────────────────────────────
@@ -2249,7 +2955,13 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
         .to_string()
 }
 
-/// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+/// Overwrite a file's or a directory's modification time — for cache-staleness,
+/// tie-break and age tests.
+///
+/// A file opens for writing. A directory opens differently per platform: unix
+/// cannot open one for writing and sets its mtime through a read-only handle;
+/// Windows needs write access to change any timestamp, plus
+/// `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle at all.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
 /// inside another thread's `MoveFileEx` replace over the same path fails with
@@ -2259,9 +2971,23 @@ pub(crate) fn directory_read_error(dir: &Path) -> String {
 /// one attempt. Bounded, so a genuinely absent file still panics with its own
 /// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
+    let mut options = std::fs::OpenOptions::new();
+    // `metadata` follows a symlink, as the open does.
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+    } else {
+        options.write(true);
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let file = loop {
-        match std::fs::OpenOptions::new().write(true).open(path) {
+        match options.open(path) {
             Ok(file) => break file,
             Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2509,14 +3235,18 @@ pub(crate) fn lines_buffer(
 }
 
 /// Asserts how `phrase` renders where its `part` is a key or a typed command
-/// in prose: every non-space
-/// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
-/// other non-space cell of `phrase` is `ACCENT`.
+/// in prose: every non-space cell of `part` is `ACCENT`, bold for a key and
+/// not for a command, and every other non-space cell of `phrase` is the prose
+/// tier `prose` — its fg, its bg when it sets one, and its net modifiers — and
+/// never `ACCENT` alone. The modifier comparison pins `add_modifier` only, so
+/// a tier that expresses itself by removing a modifier is indistinguishable
+/// from an unstyled cell here.
 pub(crate) fn assert_prose_part(
     buf: &ratatui::buffer::Buffer,
     phrase: &str,
     part: &str,
     is_key: bool,
+    prose: ratatui::style::Style,
 ) {
     let cells = needle_cells(buf, phrase)
         .unwrap_or_else(|| panic!("`{phrase}` missing:\n{}", buffer_rows(buf).join("\n")));
@@ -2536,6 +3266,21 @@ pub(crate) fn assert_prose_part(
             assert_eq!(bold, is_key, "`{part}` in `{phrase}`: cell {i} bold");
         } else {
             assert_ne!(cell.fg, accent, "`{phrase}` outside `{part}`: cell {i} fg");
+            assert_eq!(
+                Some(cell.fg),
+                prose.fg,
+                "`{phrase}` outside `{part}`: cell {i} fg is not the prose tier {prose:?}"
+            );
+            if let Some(bg) = prose.bg {
+                assert_eq!(
+                    cell.bg, bg,
+                    "`{phrase}` outside `{part}`: cell {i} bg is not the prose tier's {prose:?}"
+                );
+            }
+            assert_eq!(
+                cell.modifier, prose.add_modifier,
+                "`{phrase}` outside `{part}`: cell {i} modifiers are not the prose tier's {prose:?}"
+            );
         }
     }
 }
@@ -2628,6 +3373,107 @@ pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
 pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
     crate::runtime::proc_bsdinfo(pid)
         .map(|info| crate::runtime::format_proc_start(info.pbi_start_tvsec))
+}
+
+/// `N` pids that name no running process: each is a child spawned and reaped
+/// here, never one this process handed out before, so the fixture pids of one
+/// test stay distinct however the OS reissues a freed pid. A made-up literal
+/// can name any process or thread the box runs once the kernel has issued
+/// that number.
+pub(crate) fn dead_pids<const N: usize>() -> [u32; N] {
+    // A leaf: nothing is acquired while it is held, so it never orders
+    // against `HOME_TEST_LOCK`.
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut handed_out = HANDED_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Every child stays unreaped until the last pid is picked, so a pid
+    // refused as handed out cannot come straight back to the next spawn.
+    let mut children = Vec::new();
+    let pids = std::array::from_fn(|_| {
+        loop {
+            #[cfg(unix)]
+            let child = Command::new("true").spawn();
+            #[cfg(windows)]
+            let child = Command::new("cmd").args(["/D", "/C", "exit 0"]).spawn();
+            let child = child.expect("spawn a child to reap");
+            let pid = child.id();
+            children.push(child);
+            if handed_out.insert(pid) {
+                break pid;
+            }
+        }
+    });
+    for mut child in children {
+        child.wait().expect("reap the child");
+    }
+    pids
+}
+
+/// A live thread of the test process that is not its thread-group leader,
+/// parked until drop: linux answers `kill(tid, 0)` and every `/proc/<tid>/…`
+/// file for it as for a process, the shape a recorded pid takes once the
+/// kernel reissues it as another program's thread id.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ParkedThread {
+    pub(crate) tid: u32,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl ParkedThread {
+    pub(crate) fn spawn() -> Self {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|link| link.file_name()?.to_str()?.parse::<u32>().ok());
+            let _ = tid_tx.send(tid);
+            // Returns once the owner releases it or drops the sender.
+            let _ = parked.recv();
+        });
+        let tid = tid_rx
+            .recv()
+            .ok()
+            .flatten()
+            .expect("the parked thread reads its tid off /proc/thread-self");
+        assert_ne!(
+            tid,
+            std::process::id(),
+            "the parked thread is no thread-group leader"
+        );
+        Self {
+            tid,
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ParkedThread {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            // A panic the parked thread raised is dropped: `Drop` never asserts.
+            drop(thread.join());
+        }
+    }
+}
+
+/// A thread of the live process `pid` other than its leader, off
+/// `/proc/<pid>/task`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn a_thread_of(pid: u32) -> u32 {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("list the process's threads")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|tid| *tid != pid)
+        .expect("the process runs a thread besides its leader")
 }
 
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
@@ -3155,11 +4001,15 @@ mod route_harness {
             path: path.to_string(),
             query: query.to_string(),
             bearer: bearer.map(str::to_string),
+            authorization_seen: bearer.is_some(),
             if_none_match: None,
             body: body.as_bytes().to_vec(),
             // Routing does not depend on this; the connection loop owns it.
             keep_alive: true,
             ws: Default::default(),
+            cross_origin: Default::default(),
+            // What every client of these routes declares for its body.
+            content_type: crate::daemon::api::http::SoloHeader::One("application/json".to_string()),
         }
     }
 
@@ -3282,10 +4132,93 @@ impl Drop for Owned {
     }
 }
 
+/// Kill the process a shim recorded in `path` when the test unwinds, a red
+/// before the test's own cleanup included: a fixture-spawned holder sits in
+/// its own session, so nothing else reaps it. Reads the file at drop, so a
+/// guard armed before the shim wrote it still holds. Best-effort, never
+/// asserts — a fixture's `Drop` must not panic into an unwinding test.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct KillOnDrop(std::option::Option<PathBuf>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl KillOnDrop {
+    pub(crate) fn for_record(path: &Path) -> Self {
+        Self(Some(path.to_path_buf()))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let Some(path) = self.0.take() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Some(pid) = text.lines().next().and_then(|l| l.parse::<u32>().ok()) else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+    }
+}
+
+/// How long a re-entered fixture child sleeps between polls of its parent.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many poll intervals a parent-death test allows a fixture child before it
+/// is stuck: 200, because a loaded box can delay one poll by far more than an
+/// interval.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_EXIT_POLLS: u32 = 200;
+
+/// The wait before a parent-death test calls a fixture child stuck: 10 s, clear
+/// of a loaded box's scheduling delay and short enough that a real leak reds.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const PARENT_EXIT_BOUND: std::time::Duration =
+    match PARENT_POLL_INTERVAL.checked_mul(PARENT_EXIT_POLLS) {
+        Some(bound) => bound,
+        None => panic!("PARENT_EXIT_POLLS overflows the poll interval"),
+    };
+
+/// Exit this process once its parent pid changes. A SIGKILLed parent runs no
+/// `Drop`, so a re-entered fixture child has to notice the death itself: the
+/// reparent moves `parent_id()` off the pid the child started under. Never
+/// returns.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn exit_when_reparented(parent: u32) -> ! {
+    loop {
+        std::thread::sleep(PARENT_POLL_INTERVAL);
+        if std::os::unix::process::parent_id() != parent {
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Wait out a fixture child whose parent was SIGKILLed, and kill it before
+/// reporting if it is still there: a red must leave nothing parked behind it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn assert_child_exits(pid: u32, start: &str, what: &str) {
+    let deadline = std::time::Instant::now() + PARENT_EXIT_BOUND;
+    while proc_start_of(pid).as_deref() == Some(start) {
+        if std::time::Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+            panic!("{what} outlived its SIGKILLed parent");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The libtest path [`FakeSupervisor`] and [`spawn_parked`] re-enter: a
-/// `#[test]` that parks until SIGTERM when the fixture's marker env is present
-/// and returns at once otherwise (the normal suite run). Re-entering the test
-/// binary itself — a linker-signed executable — keeps its environment readable
+/// `#[test]` that parks until SIGTERM, or exits once its parent dies, when the
+/// fixture's marker env is present and returns at once otherwise (the normal
+/// suite run). Re-entering the test binary itself — a linker-signed
+/// executable — keeps its environment readable
 /// on macOS, where an Apple platform binary like `/bin/sh` would have it
 /// withheld from the verify read.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -3298,9 +4231,11 @@ const READY_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_READY";
 const IGNORE_TERM_ENV: &str = "CLAUTH_TEST_FAKE_SUPERVISOR_IGNORE_TERM";
 
 /// The re-entry target: with the marker env absent this passes instantly (the
-/// normal suite run); with it present the test writes the ready file, then
-/// parks until SIGTERM — installing a no-op SIGTERM handler first when told to
-/// ignore the signal.
+/// normal suite run); with it present the test installs a no-op SIGTERM handler
+/// when told to ignore the signal, captures its parent pid, writes the ready
+/// file, then exits once that parent dies. The capture precedes the ready
+/// write, so whoever kills this child's parent has seen a child already
+/// polling it.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn fake_supervisor_parks_until_sigterm() {
@@ -3314,17 +4249,18 @@ fn fake_supervisor_parks_until_sigterm() {
         let _ignored = signal_hook::flag::register(SIGTERM, Arc::new(AtomicBool::new(false)))
             .expect("register the ignore-SIGTERM handler");
     }
+    // Armed before the ready file: the fixture's owner kills this child's
+    // parent only after reading that file.
+    let parent = std::os::unix::process::parent_id();
     std::fs::write(Path::new(&ready), b"").expect("signal readiness");
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    exit_when_reparented(parent);
 }
 
 /// Spawn a re-entered copy of the test binary that runs only `test`, with
 /// `leading` as the argv words before the `--exact` filter (so argv can pose a
 /// supervisor shape, a daemon shape or a foreign shape) and null stdio.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-fn reentry_command(test: &str, leading: &[&str]) -> Command {
+pub(crate) fn reentry_command(test: &str, leading: &[&str]) -> Command {
     // Linux spawns through `/proc/self/exe`, which execs the running inode even
     // after the test binary is unlinked or rebuilt mid-run (`current_exe()`
     // then reads `<path> (deleted)` and every later spawn fails ENOENT); macOS
@@ -3355,23 +4291,176 @@ fn reenter_parked(config_dir: &Path, leading: &[&str], ready: &Path) -> Command 
     cmd
 }
 
-/// A live re-entered test binary that parks until SIGTERM, with `leading` as
-/// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
-/// while its environment (readable on macOS only for non-platform binaries)
-/// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
-/// owns its reap; the reaped `Owned` kills and waits on drop.
+/// Spawn a re-entered copy of the test binary that runs only [`PARK_TEST`],
+/// tagged with a `CLAUTH_DELEGATE_JOB_ID` the caller picks, writing `ready`
+/// once parked: the escaped-process sweep's fixture. The tag's environment
+/// must stay readable by the sweep on macOS, where an Apple platform binary
+/// (a copied `/bin/sleep`) would have it withheld — a re-entered,
+/// linker-signed test binary exposes it. The caller reaps the child.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
+pub(crate) fn spawn_tagged_park(tag: &str, ready: &Path) -> std::process::Child {
+    let mut cmd = reentry_command(PARK_TEST, &[]);
+    cmd.env(READY_ENV, ready).env("CLAUTH_DELEGATE_JOB_ID", tag);
+    cmd.spawn().expect("spawn tagged parked process")
+}
+
+// ── fixture parent-death harness ─────────────────────────────────────────────
+//
+// A test cannot SIGKILL its own process to prove a fixture child dies with its
+// parent, so a re-entered copy of the test binary stands in as the parent: the
+// proxy spawns the fixture child, records its pid once that child is up, then
+// parks until the test kills it. The child is orphaned exactly as a SIGKILLed
+// parent leaves it.
+
+/// The env-gated re-entry target that proxies for a SIGKILLed fixture parent.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_PARENT_TEST: &str = "testutil::fixture_proxy_parent_parks";
+
+/// The fixture the proxy spawns: `serve` or `park`.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_CHILD_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_CHILD";
+
+/// The path the proxy writes its child's pid to.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_PID_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_PID";
+
+/// The file the proxy waits for before it records the pid: the child's own
+/// readiness signal, so the parent dies only after the child watches it.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_READY_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_READY";
+
+/// The daemon-log file the proxy hands the `serve` child's stderr.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) const PROXY_LOG_ENV: &str = "CLAUTH_TEST_FIXTURE_PROXY_LOG";
+
+/// Spawn a proxy parent whose own child is the named fixture (`serve` or
+/// `park`), so the caller can SIGKILL the child's parent without dying itself.
+/// `ready` is the file the child writes once it runs, and `log` the daemon log
+/// a `serve` child writes to. Returns the proxy and the child's pid; the caller
+/// kills the proxy and waits with [`assert_child_exits`].
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_fixture_under_proxy(
+    kind: &str,
+    ready: &Path,
+    child_home: &Path,
+    base: &str,
+    log: Option<&Path>,
+) -> (Owned, u32) {
+    let dir = tempfile::tempdir().expect("proxy pid dir");
+    let pid_out = dir.path().join("child.pid");
+    let mut cmd = reentry_command(PROXY_PARENT_TEST, &[]);
+    cmd.env(PROXY_CHILD_ENV, kind)
+        .env(PROXY_PID_ENV, &pid_out)
+        .env(PROXY_READY_ENV, ready)
+        .env(SERVE_STOP_CHILD_HOME_ENV, child_home)
+        .env(SERVE_STOP_TOKEN_BASE_ENV, base);
+    if let Some(log) = log {
+        cmd.env(PROXY_LOG_ENV, log);
+    }
+    let proxy = Owned(cmd.spawn().expect("spawn the fixture proxy parent"));
+    // The proxy records the pid only after the child's readiness file exists,
+    // so the caller's SIGKILL always lands on a child that is already watching
+    // its parent.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !pid_out.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture proxy never recorded its child"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pid = std::fs::read_to_string(&pid_out)
+        .expect("the proxy's pid record")
+        .trim()
+        .parse::<u32>()
+        .expect("a child pid");
+    (proxy, pid)
+}
+
+/// The env-gated target [`spawn_fixture_under_proxy`] re-enters: it spawns the
+/// named fixture child, waits for that child's readiness file, records the
+/// child's pid, then parks until the test SIGKILLs it. With the marker env
+/// absent (the normal suite run) it passes at once.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn fixture_proxy_parent_parks() {
+    let Some(kind) = std::env::var_os(PROXY_CHILD_ENV) else {
+        return;
+    };
+    // The proxy is a re-entered child of the test too: it must not outlive a
+    // SIGKILLed test process either. Its exit reparents the fixture child,
+    // whose own poll then exits it.
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || exit_when_reparented(parent));
+    let ready = std::path::PathBuf::from(
+        std::env::var_os(PROXY_READY_ENV).expect("the proxy parent named the ready path"),
+    );
+    let pid_out = std::path::PathBuf::from(
+        std::env::var_os(PROXY_PID_ENV).expect("the proxy parent named the pid-out path"),
+    );
+    let child_home = std::path::PathBuf::from(
+        std::env::var_os(SERVE_STOP_CHILD_HOME_ENV).expect("the proxy parent named the child home"),
+    );
+    let child = match kind.to_str() {
+        Some("serve") => {
+            let base = std::env::var(SERVE_STOP_TOKEN_BASE_ENV)
+                .expect("the proxy parent stubbed the token endpoint");
+            let log = std::path::PathBuf::from(
+                std::env::var_os(PROXY_LOG_ENV).expect("the proxy parent named the daemon log"),
+            );
+            let stderr = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .expect("the proxy's daemon log");
+            serve_stop_child_command(&child_home, &base, stderr).spawn()
+        }
+        Some("park") => reenter_parked(&child_home, &[], &ready).spawn(),
+        other => panic!("unknown fixture child {other:?}"),
+    }
+    .expect("spawn the fixture child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fixture child never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Published whole: the reader parses the pid as soon as the path exists, so
+    // a plain write's create-then-write window would let it read an empty file.
+    let staging = crate::profile::tmp_sibling(&pid_out);
+    std::fs::write(&staging, child.id().to_string()).expect("stage the fixture child's pid");
+    std::fs::rename(&staging, &pid_out).expect("record the fixture child's pid");
+    // Park without waiting on the child: only the test's SIGKILL ends this
+    // proxy, which is what orphans the child. The binding keeps clippy's
+    // `zombie_processes` lint from reading the never-waited child as a leak.
+    let _child = child;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// A live re-entered test binary that parks until SIGTERM or its parent's
+/// death, with `arg0` (the binary's path when `None`) and `leading` as its
+/// argv: a live pid whose argv does NOT hold `daemon run` while its
+/// environment (readable on macOS only for non-platform binaries) carries the
+/// tree's `CLAUDE_CONFIG_DIR`, or one posing as a `clauth` subcommand. The
+/// caller records its start and owns its reap; the reaped `Owned` kills and
+/// waits on drop.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn spawn_parked(config_dir: &Path, arg0: Option<&str>, leading: &[&str]) -> Owned {
+    use std::os::unix::process::CommandExt as _;
     let dir = tempfile::tempdir().expect("parked re-entry dir");
     let ready = dir.path().join("ready");
+    let mut cmd = reenter_parked(config_dir, leading, &ready);
+    if let Some(arg0) = arg0 {
+        cmd.arg0(arg0);
+    }
     // The child is owned from the spawn, so a panic during the readiness wait
     // below still kills and reaps it (the `Owned` Drop) instead of leaking a
     // forever-parked process.
-    let child = Owned(
-        reenter_parked(config_dir, leading, &ready)
-            .spawn()
-            .expect("spawn the re-entered test binary"),
-    );
+    let child = Owned(cmd.spawn().expect("spawn the re-entered test binary"));
     // Wait for the park test to write the ready file before returning, so the
     // caller records a pid that is already parked (and the tempdir can drop:
     // the ready path is no longer needed).
@@ -3388,7 +4477,7 @@ pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
 
 /// A fake supervisor for the pid-stop tests: a re-entered copy of the test
 /// binary run with argv `daemon run` under the chosen `CLAUDE_CONFIG_DIR`,
-/// parked until SIGTERM. The test writes `<tree>/daemon.lock` from the
+/// parked until SIGTERM or its parent's death. The test writes `<tree>/daemon.lock` from the
 /// recorded `pid` + `proc_start` (the live pid's real start, via
 /// [`proc_start_of`]). Killed and reaped on drop, best-effort, never asserts;
 /// the test reaps it first to read its exit status.
@@ -3400,14 +4489,14 @@ pub(crate) struct FakeSupervisor {
     pub(crate) proc_start: String,
 }
 
-/// Reaps the child it owns when [`FakeSupervisor::spawn`] panics between the
-/// spawn and the `FakeSupervisor` hand-back (the readiness assert or the
-/// start-time read). Drop never asserts — the reaping is best-effort, exactly
-/// like [`FakeSupervisor`]'s own.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-struct ReapChild(Option<std::process::Child>);
+/// Kills and reaps the child it owns on drop, so a test or helper that
+/// panics between the spawn and its own cleanup (a readiness assert, a
+/// later check) leaves no process looping. Drop never asserts — the reaping
+/// is best-effort, exactly like [`FakeSupervisor`]'s own.
+#[cfg(all(test, unix))]
+pub(crate) struct ReapChild(pub(crate) Option<std::process::Child>);
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, unix))]
 impl Drop for ReapChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -3462,14 +4551,43 @@ impl Drop for FakeSupervisor {
     }
 }
 
-/// Write `<tree>/daemon.lock` in the supervisor's content-file shape.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+/// Write `<tree>/daemon.lock` in the supervisor's content-file shape. Ungated
+/// like the file it writes: [`write_live_supervisor`] poses a live supervisor
+/// on every platform, and a real one writes this same pair everywhere.
 pub(crate) fn write_daemon_lock(tree: &Path, pid: u32, start: &str) {
     std::fs::write(
         tree.join("daemon.lock"),
         format!("{{\"pid\":{pid},\"procStart\":\"{start}\"}}"),
     )
     .expect("write daemon.lock");
+}
+
+/// Create a FIFO at `path` for the non-regular-file guards: `std` has no
+/// stable `mkfifo` and the crate forbids `unsafe`, so the test shells out to
+/// the coreutils one.
+#[cfg(all(test, unix))]
+pub(crate) fn mkfifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo {} failed", path.display());
+}
+
+/// Record a LIVE supervisor in `tree`'s `daemon.lock`: the test process's own
+/// pid with its real start time, so the record names a live process. The pid
+/// is not a `daemon run` process, so the verify reads it `Unverifiable` — the
+/// arm the live-session count treats as alive — and no test signals it.
+pub(crate) fn write_live_supervisor(tree: &Path) {
+    std::fs::create_dir_all(tree).expect("mkdir the supervised tree");
+    let pid = std::process::id();
+    // Windows: the supervisor's identity form is unmeasured, so any well-formed
+    // record reads `Unverifiable` there and the start string is not compared.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let start = proc_start_of(pid).expect("the test process's start time");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let start = String::from("Thu Oct 22 20:59:19 2026");
+    write_daemon_lock(tree, pid, &start);
 }
 
 /// Write `<tree>/daemon.status.json` in the supervisor's fallback shape.
@@ -3482,13 +4600,24 @@ pub(crate) fn write_daemon_status(tree: &Path, pid: u32, start: &str) {
     .expect("write daemon.status.json");
 }
 
+/// The hang bound `reap_bounded` gives a stop-test child to die of the
+/// SIGTERM its stop sent: the daemon's drain can wait up to
+/// [`crate::daemon::SPEND_DRAIN_BOUND`] in all, its token spend and the tick
+/// thread's exit save sharing that window, plus a margin for the loopback
+/// saves and the process's own exit. A hang detector, not a race bound:
+/// raising it weakens nothing.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+const SERVE_STOP_REAP_BOUND: std::time::Duration =
+    crate::daemon::SPEND_DRAIN_BOUND.saturating_add(std::time::Duration::from_secs(10));
+
 /// Wait for a fake supervisor the code under test should have SIGTERMed to
-/// exit, BOUNDED: a red (no SIGTERM came) kills + reaps the child and panics
-/// with an assertion, never hangs the suite on an unbounded `wait`. Returns
-/// the exit status on success, which the caller asserts is SIGTERM.
+/// exit, BOUNDED by [`SERVE_STOP_REAP_BOUND`]: a red (no SIGTERM came) kills +
+/// reaps the child and panics with an assertion, never hangs the suite on an
+/// unbounded `wait`. Returns the exit status on success, which the caller
+/// asserts is SIGTERM.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + SERVE_STOP_REAP_BOUND;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status,
@@ -3505,10 +4634,10 @@ pub(crate) fn reap_bounded(child: &mut std::process::Child) -> std::process::Exi
 
 // ── E2E `serve` stop harness ─────────────────────────────────────────────────
 //
-// Both stop tests re-enter the test binary to run the real `daemon::serve` in a
-// separate process (`SERVE_STOP_CHILD_TEST`), and both hold that child's token
-// spend in a loopback stub until the test signals. The command builder and the
-// stub live here so the two legs share them.
+// The stop tests and the parent-death test re-enter the test binary to run the
+// real `daemon::serve` in a separate process (`SERVE_STOP_CHILD_TEST`); the stop
+// tests hold that child's token spend in a loopback stub until the test signals.
+// The command builder and the stub live here so every caller shares them.
 
 /// The env-gated re-entry target: the child test fn in `daemon_mod.rs` that
 /// runs `daemon::serve`. With the marker env absent (the normal suite run) it
@@ -4073,4 +5202,23 @@ pub(crate) fn seq_of(line: &str) -> u64 {
         }
     }
     panic!("no --seq in report line: {line}");
+}
+
+/// A fetch-lease ticket the watchdog already spent: `lease` is taken (the lock
+/// file lives under the sandboxed home, so the caller holds a `HomeSandbox`),
+/// then released the way the watchdog releases a holder whose last tick is
+/// older than its bound. A later `acquire_ticket` on `lease` takes it again,
+/// under a new generation.
+pub(crate) fn spent_lease_ticket(
+    lease: &crate::daemon::FetchLease,
+) -> crate::daemon::LeaseTicket<'_> {
+    let bound = std::time::Duration::from_secs(5 * 60);
+    let ticket = lease.acquire_ticket().expect("take the fetch lease");
+    assert!(ticket.is_current(), "a fresh ticket is current");
+    assert!(
+        lease.release_if_stale(crate::usage::now_ms() + 2 * bound.as_millis() as u64, bound),
+        "the watchdog releases the holder"
+    );
+    assert!(!ticket.is_current(), "the release spends the ticket");
+    ticket
 }

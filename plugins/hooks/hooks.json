@@ -40,18 +40,37 @@
             "type": "command",
             "command": "clauth mcp-await-job",
             "asyncRewake": true,
-            "timeout": 4260,
+            "timeout": 86460,
             "rewakeMessage": "A clauth delegate result or status update follows.",
             "rewakeSummary": "clauth delegate update"
           }
         ]
-      },
+      }
+    ],
+    "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "clauth hook-profile-changed-note",
-            "timeout": 10
+            "command": "clauth mcp-await-job",
+            "asyncRewake": true,
+            "timeout": 86460,
+            "rewakeMessage": "A clauth delegate result or status update follows.",
+            "rewakeSummary": "clauth delegate update"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clauth mcp-await-job",
+            "asyncRewake": true,
+            "timeout": 86460,
+            "rewakeMessage": "A clauth delegate result or status update follows.",
+            "rewakeSummary": "clauth delegate update"
           }
         ]
       }

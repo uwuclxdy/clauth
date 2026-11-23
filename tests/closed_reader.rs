@@ -26,6 +26,8 @@ fn failing_command(stderr: Stdio) -> (TempDir, Child) {
     let child = Command::new(env!("CARGO_BIN_EXE_clauth"))
         .args(["info", "no-such-session-id"])
         .env("HOME", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)

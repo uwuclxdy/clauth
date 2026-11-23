@@ -381,6 +381,39 @@ fn a_daemon_stop_sends_each_proxy_exactly_one_sigterm() {
     assert_eq!(stub::terms(&rig.dir), [pid], "exactly one SIGTERM");
 }
 
+/// A refused per-proxy stop spawn runs the stop inline on the coordinator's
+/// stop path, never a panic: the seam refuses the spawn (the one real spawn
+/// failure the box cannot pose), the failure counter proves the degraded
+/// path ran, and the inline stop still sends the proxy its one SIGTERM.
+#[cfg(unix)]
+#[test]
+fn a_refused_per_proxy_stop_spawn_stops_the_proxy_inline() {
+    let rig = Rig::new("zcode");
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+    };
+    manage_round(&mut coordinator, &rig.slots, crate::usage::now_ms());
+    stub::wait_until("the stub records its spawn", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = stub::invocations(&rig.dir)[0].pid;
+
+    let _refused = crate::daemon::gateway::probe_seam::fail_stop_spawns();
+    shutdown_threads(coordinator.threads, coordinator.reaping);
+    assert_eq!(
+        crate::daemon::gateway::probe_seam::stop_spawn_failures(),
+        1,
+        "the one per-proxy stop spawn failed through the seam, and the stop ran inline"
+    );
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [pid],
+        "the inline stop sent the proxy its one SIGTERM"
+    );
+    assert!(!stub::alive(pid), "the proxy stopped");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
@@ -1792,12 +1825,14 @@ fn a_cancelled_manifest_read_publishes_nothing() {
     );
 }
 
-/// A service re-enabled and removed again while its first reaper is still
-/// stopping keeps both reapers' handles: the second removal never drops the
-/// older live reaper's `JoinHandle`, so a stop joins every stop.
+/// A service removed, re-enabled and removed again while its first reaper
+/// still owns the stop reaps nothing on the second removal: the re-enabled
+/// row starts no supervisor beside the reaper, so no second stop exists to
+/// drop, and the one live reaper's handle stays recorded for the daemon
+/// stop to join.
 #[cfg(unix)]
 #[test]
-fn a_second_removal_keeps_the_older_reapers_handle() {
+fn a_second_removal_while_the_reaper_owns_the_stop_adds_no_reaper() {
     let _home = HomeSandbox::new();
     crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
     let slots = new_slots();
@@ -1830,24 +1865,112 @@ fn a_second_removal_keeps_the_older_reapers_handle() {
         "the first reaper is recorded"
     );
 
+    // Re-enabled then removed again while the reaper is still parked: the
+    // re-enabled row starts nothing, so the second removal records no
+    // second reaper and the one live handle is never dropped.
     std::fs::write(&path, row).expect("re-enable");
     manage_round(&mut coordinator, &slots, crate::usage::now_ms());
     std::fs::write(&path, "").expect("remove again");
-    let (go2_tx, go2_rx) = std::sync::mpsc::channel();
-    REAPER_PARKS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(alpha.clone(), go2_rx);
     manage_round(&mut coordinator, &slots, crate::usage::now_ms());
 
     assert_eq!(
         coordinator.reaping.get(&alpha).map(Vec::len),
-        Some(2),
-        "the older reaper's handle is never dropped"
+        Some(1),
+        "the second removal records no reaper and the one live handle stays"
     );
 
     let _ = go1_tx.send(());
-    let _ = go2_tx.send(());
+    shutdown_threads(coordinator.threads, coordinator.reaping);
+}
+
+/// A proxy row removed and re-enabled while its child drains starts no
+/// second supervisor until its reaper finishes the stop: a supervisor
+/// starting beside the reaper would read the same child marker, and its
+/// reclaim could reap the still-draining child out from under the reaper's
+/// `try_wait`. Once the reaper is done, the re-enabled row starts.
+#[cfg(unix)]
+#[test]
+fn a_reenabled_row_starts_no_supervisor_until_its_reaper_finishes() {
+    let home = HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
+    let slots = new_slots();
+    let dir = home.home().join("stub");
+    stub::write_proxy_stub(&dir, "alpha");
+    std::fs::write(dir.join("ignore-term"), "").expect("ignore-term");
+    let port = stub::free_port();
+    crate::proxy::enable("alpha", Some(port), Some(dir.as_os_str())).expect("enable");
+    let alpha = Service::parse("alpha").expect("alpha");
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+    };
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    let marker_path = child_marker_path(&alpha).expect("marker path");
+    stub::wait_until(
+        "alpha's child marker is written",
+        Duration::from_secs(10),
+        || marker_path.exists(),
+    );
+    // The answerer binds only once the child is spawned: the supervisor's
+    // pre-spawn foreign probe refuses to start a child beside an answerer.
+    let _health = stub::HttpAnswer::bind(port, 200, PROXY_HEALTH);
+    stub::wait_until("alpha reads healthy before its removal", secs(15), || {
+        super::slots(&slots)
+            .iter()
+            .any(|slot| slot.service == alpha.as_str() && slot.state == ProxyState::Healthy)
+    });
+
+    // The removal: the next round hands alpha's supervisor to a reaper that
+    // parks until released, as if its stop had not yet sent the SIGTERM, so
+    // the reaper provably owns the stop through the rounds that follow.
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    REAPER_PARKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(alpha.clone(), go_rx);
+    std::fs::write(crate::proxy::registry_path().expect("registry path"), "")
+        .expect("remove alpha's row");
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert_eq!(
+        coordinator.reaping.get(&alpha).map(Vec::len),
+        Some(1),
+        "the removal records alpha's reaper"
+    );
+
+    // Re-enabled while the reaper owns the stop: no second supervisor may
+    // start beside it. The row is written back directly: `proxy::enable`
+    // re-probes the port, which the answerer the test bound now answers.
+    let row = format!(
+        "[alpha]\nport = {port}\nenabled = true\nbinary = \"{}\"\n",
+        dir.join("clauth-alpha-proxy").display()
+    );
+    std::fs::write(crate::proxy::registry_path().expect("registry path"), &row)
+        .expect("re-enable alpha's row");
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert!(
+        !coordinator.threads.contains_key(&alpha),
+        "a re-enabled row starts no second supervisor while its reaper owns the stop"
+    );
+
+    // Once the reaper finishes — the child drains past the stop budget — the
+    // re-enabled row starts its supervisor. Drop the ignore-term marker
+    // first: any later child dies of its SIGTERM, so the teardown never
+    // waits out a second drain.
+    std::fs::remove_file(dir.join("ignore-term")).expect("stop ignoring");
+    let _ = go_tx.send(());
+    stub::wait_until("the reaper finishes its stop", secs(10), || {
+        manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+        !coordinator.reaping.contains_key(&alpha)
+    });
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert!(
+        coordinator.threads.contains_key(&alpha),
+        "the re-enabled row starts a supervisor once its reaper finishes"
+    );
+
+    for call in stub::invocations(&dir) {
+        stub::signal_best_effort(call.pid, "KILL");
+    }
     shutdown_threads(coordinator.threads, coordinator.reaping);
 }
 

@@ -79,6 +79,9 @@ fn build_status_top_level_shape_and_active() {
             "credit_billed_families",
             "gateway",
             "generated_at",
+            // Additive: the address a `--listen` daemon serves on, for the
+            // pairing link.
+            "listen",
             "pending_switch",
             "profiles",
             "proxies",
@@ -88,6 +91,8 @@ fn build_status_top_level_shape_and_active() {
             "wrap_off",
         ],
     );
+    // A body built with no live daemon signals vouches for no listener.
+    assert_eq!(v["listen"], serde_json::Value::Null);
     let profiles = v["profiles"].as_array().unwrap();
     let mut per: Vec<&str> = profiles[0]
         .as_object()
@@ -110,14 +115,23 @@ fn build_status_top_level_shape_and_active() {
             "bell_threshold",
             // Additive (#93): the usage-credit cap, no dollar amounts.
             "credit_capped",
+            // Additive: the account's disabled flag, on every body.
+            "disabled",
             "extra_usage",
             "fallback",
             "fetch_status",
             "fetched_at",
             "harness",
             "has_live_session",
+            // Additive: the banked usage-limit reset count clauth last read,
+            // `null` with no reading.
+            "limit_resets",
+            // Additive: when that count was read, `null` with no reading.
+            "limit_resets_read_at",
             "name",
             "next_refresh_at",
+            // Additive: when the plan ends or renews, `null` when unknown.
+            "plan_end",
             "provider",
             "rolling_token",
             "spend",
@@ -306,6 +320,92 @@ fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles(
     );
 }
 
+/// Each entry says whether its account is disabled, on the default body too:
+/// the disabled ACTIVE account is the one absence cannot reveal there.
+#[test]
+fn every_entry_says_whether_its_account_is_disabled() {
+    let _home = HomeSandbox::new();
+    let mut active_off = oauth_profile("active-off");
+    active_off.disabled = true;
+    let mut other_off = oauth_profile("other-off");
+    other_off.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![active_off, oauth_profile("on"), other_off],
+    };
+    config.state.active_profile = Some("active-off".into());
+
+    let flags = |include_disabled: bool| -> Vec<(String, serde_json::Value)> {
+        status_value(&config, 300_000, None, include_disabled)["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap().to_owned(),
+                    p["disabled"].clone(),
+                )
+            })
+            .collect()
+    };
+    let entry = |name: &str, disabled: bool| (name.to_owned(), serde_json::json!(disabled));
+    assert_eq!(
+        flags(false),
+        [entry("active-off", true), entry("on", false)],
+        "the default body marks the disabled active account"
+    );
+    assert_eq!(
+        flags(true),
+        [
+            entry("active-off", true),
+            entry("on", false),
+            entry("other-off", true),
+        ],
+        "the whole-roster body marks every disabled account"
+    );
+
+    // Being active says nothing about being disabled.
+    let mut enabled_active = config.clone();
+    enabled_active.state.active_profile = Some("on".into());
+    let body = status_value(&enabled_active, 300_000, None, false);
+    let on = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "on")
+        .expect("the active entry");
+    assert_eq!(on["active"], serde_json::json!(true));
+    assert_eq!(on["disabled"], serde_json::json!(false));
+}
+
+/// A codex entry carries the field too, so a reader needs no harness check;
+/// the codex roster has no disabled state, so it always reads `false`.
+#[test]
+fn a_codex_entry_reads_as_enabled() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\"]\n",
+    )
+    .unwrap();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("on")],
+    };
+
+    let v = status_value(&config, 300_000, None, false);
+    let codex = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "cx1")
+        .expect("the codex entry");
+    assert_eq!(codex["active"], serde_json::json!(true));
+    assert_eq!(codex["disabled"], serde_json::json!(false));
+}
+
 // ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
 
 fn set_expiry(p: &mut Profile, expires_at: i64) {
@@ -406,6 +506,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     assert!(none["pending_switch"].is_null());
 
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -417,6 +518,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -453,6 +555,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     let empty_streaks = std::collections::HashMap::new();
     let anchor = 1_780_000_000i64;
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -464,6 +567,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
         v["profiles"]
@@ -514,6 +618,116 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
     }
 }
 
+/// A plan with no 5h limit holds no published queue slot on EITHER arm, and
+/// the members that can open a window size the gap: the daemonless arm reads
+/// the disk usage cache, the live arm the daemon's in-memory usage store. A
+/// call site handing the roster a constant closure would publish the marked
+/// member's slot and size every other member's `next_open_at` off an inflated
+/// `N`.
+#[test]
+fn a_plan_with_no_five_hour_limit_holds_no_published_queue_slot_on_either_arm() {
+    use crate::usage::UsageInfo;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    crate::testutil::register_names(&["a", "b", "m"]);
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "m".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("m")],
+    };
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &"m".into(),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &marked,
+    );
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Daemonless arm: the disk usage cache is the marked source.
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the disk arm publishes no slot for a plan with no 5h limit"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+
+    // Live arm: the daemon's in-memory usage store is the marked source.
+    let anchor = 1_780_000_000i64;
+    let usage: HashMap<String, UsageInfo> = HashMap::from([("m".to_string(), marked.clone())]);
+    let empty_status = HashMap::new();
+    let empty_next = HashMap::new();
+    let empty_streaks = HashMap::new();
+    let live = LiveSignals {
+        fetches_here: true,
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+        listen: None,
+    };
+    let v = status_value(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "m").is_null(),
+        "the live arm publishes no slot for a plan with no 5h limit"
+    );
+    let published = queue_of(&v, "b")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap comes from the two members that can open a window"
+    );
+
+    // Control: the same roster with nothing marked keeps N = 3.
+    let unmarked = LiveSignals {
+        usage: &Default::default(),
+        ..live
+    };
+    let v = status_value(&config, 300_000, Some(&unmarked), false);
+    assert_eq!(
+        queue_of(&v, "m")["position"],
+        3,
+        "unmarked control: m takes the third slot"
+    );
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(3, 300_000)),
+        "unmarked control: the gap is sized by three"
+    );
+}
+
 /// An api-key profile's freshness derives from ITS cache
 /// (`THIRD_PARTY_CACHE_FILE`), and a name the live stores don't carry falls
 /// back to the same derivation — pre-fix both keyed on the OAuth
@@ -561,6 +775,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -572,6 +787,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -846,6 +1062,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
     let empty_status = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -857,6 +1074,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -918,6 +1136,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     ]);
     let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -929,6 +1148,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -947,6 +1167,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
     let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -958,6 +1179,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1133,6 +1355,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     config.state.refresh_spent_accounts = true;
     write(42.0, threshold_secs + 60);
     let live = LiveSignals {
+        fetches_here: true,
         status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1144,6 +1367,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
@@ -1180,6 +1404,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // derivation has nothing — the live third-party store is the only source.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1191,6 +1416,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1205,6 +1431,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
     // cache mtime said, which is a freshness claim about a rejected poll.
     let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1216,6 +1443,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -1238,6 +1466,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &tp,
         third_party_streaks: &Default::default(),
@@ -1249,6 +1478,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -1271,6 +1501,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
     let next = HashMap::new();
     let streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1282,6 +1513,7 @@ fn fetch_status_over_a_fresh_live_status(profile: Profile, fingerprint: u64) -> 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     status_value(&config, 300_000, Some(&live), false)["profiles"][0]["fetch_status"].clone()
 }
@@ -1737,7 +1969,7 @@ fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
     );
 
     let codex = crate::codex_profiles::CodexState::load().expect("load");
-    let entries = build_codex_entries(&codex, 300_000);
+    let entries = build_codex_entries(&codex, 300_000, true);
     let by_name = |name: &str| {
         entries
             .iter()
@@ -1801,6 +2033,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
     let anchor = 1_780_000_000i64;
     let blocked = [crate::profile::ProfileName::from("b")];
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -1812,6 +2045,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -2048,6 +2282,10 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: vec!["fable".to_string(), "mythos".to_string()],
         binary_replaced: true,
         binary_removed: true,
+        listen: Some(ListenSlot {
+            host: "box.example.net".to_string(),
+            port: 8443,
+        }),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2061,6 +2299,7 @@ fn status_body_matches_legacy_json_bytes() {
                 auth_status: "ok".to_string(),
                 fetch_status: Some("Fresh".to_string()),
                 stale: true,
+                alert_stale: true,
                 fetched_at: Some("2026-09-13T00:00:00Z".to_string()),
                 next_refresh_at: Some("2026-09-13T00:05:00Z".to_string()),
                 auto_start: true,
@@ -2097,6 +2336,13 @@ fn status_body_matches_legacy_json_bytes() {
                     percent: Some(12.428),
                 }),
                 credit_capped: false,
+                limit_resets: Some(3),
+                limit_resets_read_at: Some("2026-09-12T23:40:00+00:00".to_string()),
+                disabled: false,
+                plan_end: Some(PlanEndEntry {
+                    kind: "renews".to_string(),
+                    date: "2026-10-15".to_string(),
+                }),
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2110,6 +2356,7 @@ fn status_body_matches_legacy_json_bytes() {
                 auth_status: "ok".to_string(),
                 fetch_status: None,
                 stale: false,
+                alert_stale: false,
                 fetched_at: None,
                 next_refresh_at: None,
                 auto_start: false,
@@ -2122,6 +2369,10 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: None,
+                limit_resets_read_at: None,
+                disabled: false,
+                plan_end: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2135,6 +2386,7 @@ fn status_body_matches_legacy_json_bytes() {
                 auth_status: "ok".to_string(),
                 fetch_status: None,
                 stale: false,
+                alert_stale: false,
                 fetched_at: None,
                 next_refresh_at: None,
                 auto_start: true,
@@ -2150,6 +2402,10 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                limit_resets: None,
+                limit_resets_read_at: None,
+                disabled: false,
+                plan_end: None,
             },
         ],
     };
@@ -2158,7 +2414,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"profiles":["#,
+        r#""credit_billed_families":["fable","mythos"],"binary_replaced":true,"binary_removed":true,"listen":{"host":"box.example.net","port":8443},"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2168,18 +2424,22 @@ fn status_body_matches_legacy_json_bytes() {
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"spend":{"enabled":true,"percent":62.0},"#,
-        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false},"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3,"#,
+        r#""limit_resets_read_at":"2026-09-12T23:40:00+00:00","disabled":false,"#,
+        r#""plan_end":{"kind":"renews","date":"2026-10-15"}},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false},"#,
+        r#""windows":[],"third_party":null,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""limit_resets_read_at":null,"disabled":false,"plan_end":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"spend":null,"#,
-        r#""extra_usage":null,"credit_capped":false}]}"#,
+        r#""extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""limit_resets_read_at":null,"disabled":false,"plan_end":null}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -2200,6 +2460,7 @@ fn status_body_matches_legacy_json_bytes() {
         credit_billed_families: Vec::new(),
         binary_replaced: false,
         binary_removed: false,
+        listen: None,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2207,7 +2468,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
         r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"tps":null,"#,
-        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"profiles":[]}"#,
+        r#""credit_billed_families":[],"binary_replaced":false,"binary_removed":false,"listen":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2262,9 +2523,16 @@ fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
 
     let config = crate::profile::load_config().unwrap();
     let interval_ms = 300_000u64;
-    let members = crate::usage::auto_start_queue_members(&config, &[], |n| {
-        crate::profile_json::is_canceled_cached(n)
-    });
+    let members = crate::usage::auto_start_queue_members(
+        &config,
+        &[],
+        |n| {
+            config
+                .find(n)
+                .is_some_and(crate::profile_json::is_canceled_cached)
+        },
+        crate::usage::no_five_hour_limit_cached,
+    );
     let anchor = crate::usage::history_anchor(
         &config
             .profiles
@@ -2421,6 +2689,7 @@ fn status_body_never_leaks_a_credential() {
     let reading = |utilization: f64| crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,
@@ -2515,6 +2784,7 @@ fn status_body_never_leaks_a_credential() {
     let streaks_map = HashMap::from([("canary-oauth".to_string(), u32::MAX)]);
     let blocked: Vec<ProfileName> = vec!["canary-api".into()];
     let live = LiveSignals {
+        fetches_here: true,
         status: &status_map,
         third_party_status: &third_party_map,
         third_party_streaks: &Default::default(),
@@ -2526,6 +2796,7 @@ fn status_body_never_leaks_a_credential() {
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let body_live = build_status(&config, 300_000, Some(&live), true);
     let body_live_str =
@@ -2757,9 +3028,11 @@ fn status_schema_agrees_with_the_serialized_body() {
 
     // One OAuth profile in the fallback chain and the auto-start queue, a
     // second chain member, and a third-party profile, with caches written
-    // through the crate's real writers so `windows` is non-empty.
+    // through the crate's real writers so `windows` is non-empty. The first
+    // carries a billing day, so the walk reaches `PlanEndEntry`.
     let mut oauth = oauth_profile("schema-oauth");
     oauth.auto_start = true;
+    oauth.plan_renews = chrono::NaiveDate::from_ymd_opt(2099, 12, 15);
     save_profile(&oauth).unwrap();
 
     let mut chain = oauth_profile("schema-chain");
@@ -2790,6 +3063,7 @@ fn status_schema_agrees_with_the_serialized_body() {
     let oauth_reading = crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
             email: None,
@@ -2861,6 +3135,10 @@ fn status_schema_agrees_with_the_serialized_body() {
         body.profiles.iter().any(|e| !e.windows.is_empty()),
         "fixture never populates a window"
     );
+    assert!(
+        body.profiles.iter().any(|e| e.plan_end.is_some()),
+        "fixture never populates a plan end"
+    );
     let value = serde_json::to_value(&body).unwrap();
     assert!(
         value["profiles"]
@@ -2886,9 +3164,9 @@ fn status_schema_agrees_with_the_serialized_body() {
 /// their schemas (`SwitchOk.previous`, `PaneEntry.title`/`agent`/`tag`/
 /// `foreground_process_group_id`/`cwd`/`agent_session_id`, `PaneSession.cwd`,
 /// `SessionsBody.next_before`, `SessionRow.last_ran_profile`/`first_message`/
-/// `last_message` and `HistoryBody.next_before` answer `null`, never a dropped
-/// key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
-/// `HerdrState.reason`) stay optional.
+/// `last_message`/`title`/`git_branch` and `HistoryBody.next_before` answer
+/// `null`, never a dropped key), and the skip-when-absent `Option`s
+/// (`ErrorBody.reason`, `HerdrState.reason`) stay optional.
 #[test]
 fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     use crate::daemon::api::panes::{HerdrState, PaneEntry, PaneSession};
@@ -2939,7 +3217,13 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
         "SessionsBody.next_before is serialized on every answer, so its schema requires it"
     );
     let session_row_required = required(&SessionRow::schema(), "SessionRow");
-    for field in ["last_ran_profile", "first_message", "last_message"] {
+    for field in [
+        "last_ran_profile",
+        "first_message",
+        "last_message",
+        "title",
+        "git_branch",
+    ] {
         assert!(
             session_row_required.iter().any(|name| name == field),
             "SessionRow.{field} is serialized on every answer, so its schema requires it"
@@ -3086,6 +3370,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let empty_status = HashMap::new();
     let empty_streaks = HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3097,6 +3382,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3108,6 +3394,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     // Exactly the cap → not yet distrusted.
     let tp_streaks = HashMap::from([("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3119,6 +3406,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3132,6 +3420,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
     let oauth_status = HashMap::from([("zai".to_string(), FetchStatus::Cached)]);
     let tp_streaks = HashMap::from([("zai".to_string(), deep)]);
     let live = LiveSignals {
+        fetches_here: true,
         status: &oauth_status,
         third_party_status: &tp_status,
         third_party_streaks: &tp_streaks,
@@ -3143,6 +3432,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         usage: &Default::default(),
         gateway: None,
         proxies: None,
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -3227,6 +3517,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
+        fetches_here: true,
         status: &empty_status,
         third_party_status: &Default::default(),
         third_party_streaks: &Default::default(),
@@ -3238,6 +3529,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
         usage: &Default::default(),
         gateway: None,
         proxies: Some(&proxies),
+        listen: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let proxies = v["proxies"].as_array().expect("a proxies array");
@@ -3751,4 +4043,785 @@ fn build_status_ages_a_probed_account_at_its_probe_interval() {
     let v = status_value(&config, 90_000, None, false);
     assert_eq!(entry(&v, "probed")["stale"], false);
     assert_eq!(entry(&v, "polled")["stale"], true);
+}
+
+/// Every published entry's `(name, plan_end)`, in body order.
+fn plan_ends_of(body: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["plan_end"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn plan_day(y: i32, m: u32, d: u32) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::from_ymd_opt(y, m, d)
+}
+
+/// `profiles[].plan_end`: a coming `plan_ends` wins over `plan_renews`; a past
+/// one still publishes `ends` with its own date, unless a `plan_renews` later
+/// than it is set, which publishes that renewal; a billing day already past
+/// carries forward to its next monthly anniversary; neither date publishes
+/// `null`. Every date is hand-written, or for the carry hand-derived from the
+/// 1st of a month, which no month clamps.
+#[test]
+fn build_status_publishes_the_plan_end() {
+    use chrono::Datelike;
+
+    let _home = HomeSandbox::new();
+    let (body, next_first) = crate::testutil::on_one_local_day(|today| {
+        let mut marked = oauth_profile("marked");
+        marked.plan_ends = plan_day(2099, 11, 20);
+        marked.plan_renews = plan_day(2099, 4, 10);
+        let mut ended = oauth_profile("ended");
+        ended.plan_ends = plan_day(2020, 3, 2);
+        let mut lapsed = oauth_profile("lapsed");
+        lapsed.plan_ends = plan_day(2020, 3, 2);
+        lapsed.plan_renews = plan_day(2020, 1, 15);
+        let mut resubscribed = oauth_profile("resubscribed");
+        resubscribed.plan_ends = plan_day(2020, 3, 2);
+        resubscribed.plan_renews = plan_day(2099, 12, 15);
+        // The 1st of the month before last: its next anniversary on or after
+        // today is today itself on a 1st, else the 1st of next month.
+        let this_first = today.with_day(1).unwrap();
+        let mut renewing = oauth_profile("renewing");
+        renewing.plan_renews = Some(this_first - chrono::Months::new(2));
+        let next_first = if today.day() == 1 {
+            today
+        } else {
+            this_first + chrono::Months::new(1)
+        };
+        let names = [
+            "marked",
+            "ended",
+            "lapsed",
+            "resubscribed",
+            "renewing",
+            "bare",
+        ];
+        let config = AppConfig {
+            state: AppState::default(),
+            profiles: vec![
+                marked,
+                ended,
+                lapsed,
+                resubscribed,
+                renewing,
+                oauth_profile("bare"),
+            ],
+        };
+        crate::testutil::register_names(&names);
+        (status_value(&config, 60_000, None, false), next_first)
+    });
+    let entry = |name: &str, plan_end: serde_json::Value| (name.to_string(), plan_end);
+    assert_eq!(
+        plan_ends_of(&body),
+        vec![
+            entry(
+                "marked",
+                serde_json::json!({ "kind": "ends", "date": "2099-11-20" })
+            ),
+            entry(
+                "ended",
+                serde_json::json!({ "kind": "ends", "date": "2020-03-02" })
+            ),
+            entry(
+                "lapsed",
+                serde_json::json!({ "kind": "ends", "date": "2020-03-02" })
+            ),
+            entry(
+                "resubscribed",
+                serde_json::json!({ "kind": "renews", "date": "2099-12-15" })
+            ),
+            entry(
+                "renewing",
+                serde_json::json!({
+                    "kind": "renews",
+                    "date": format!("{}-{:02}-01", next_first.year(), next_first.month()),
+                })
+            ),
+            entry("bare", serde_json::Value::Null),
+        ]
+    );
+}
+
+/// A plan whose cached `/profile` reading says it cannot serve, canceled or
+/// refused by its organization, publishes no renewal: the billing day it
+/// would roll is a guess that reading overrules. A marked end still
+/// publishes, and an active reading keeps the renewal.
+#[test]
+fn build_status_publishes_no_renewal_for_a_plan_that_cannot_serve() {
+    let _home = HomeSandbox::new();
+    let reading = |status: &str| crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Pro,
+            plan_display_name: None,
+            subscription_status: Some(status.to_string()),
+            codex_plan: None,
+            email: None,
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    let renewing = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.plan_renews = plan_day(2099, 12, 15);
+        p
+    };
+    let mut canceled_ending = renewing("canceled-ending");
+    canceled_ending.plan_ends = plan_day(2099, 11, 20);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            renewing("canceled"),
+            renewing("refused"),
+            canceled_ending,
+            renewing("active"),
+        ],
+    };
+    crate::testutil::register_names(&["canceled", "refused", "canceled-ending", "active"]);
+    for (name, status) in [
+        ("canceled", "canceled"),
+        ("refused", crate::usage::ORG_REFUSED_STATUS),
+        ("canceled-ending", "canceled"),
+        ("active", "active"),
+    ] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &reading(status),
+        );
+    }
+    let body = status_value(&config, 60_000, None, false);
+    let entry = |name: &str, plan_end: serde_json::Value| (name.to_string(), plan_end);
+    assert_eq!(
+        plan_ends_of(&body),
+        vec![
+            entry("canceled", serde_json::Value::Null),
+            entry("refused", serde_json::Value::Null),
+            entry(
+                "canceled-ending",
+                serde_json::json!({ "kind": "ends", "date": "2099-11-20" })
+            ),
+            entry(
+                "active",
+                serde_json::json!({ "kind": "renews", "date": "2099-12-15" })
+            ),
+        ]
+    );
+}
+
+/// A claude entry publishes the count its `limit_resets.json` holds: a reading
+/// of zero is `0`, and an account with no reading is `null`, never a zero
+/// clauth did not read.
+#[test]
+fn a_claude_entry_publishes_the_banked_resets_it_read() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("banked"),
+            oauth_profile("spent"),
+            oauth_profile("unread"),
+            Profile::new(
+                "keyed".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                Some("key".to_string()),
+            ),
+        ],
+    };
+    crate::testutil::register_names(&["banked", "spent", "unread", "keyed"]);
+    crate::testutil::write_claude_limit_resets("banked", 3, &["five_hour"], None, 1);
+    crate::testutil::write_claude_limit_resets("spent", 0, &[], None, 1);
+    crate::testutil::write_claude_limit_resets("keyed", 1, &[], None, 1);
+
+    let v = status_value(&config, 300_000, None, false);
+    let count = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))["limit_resets"]
+            .clone()
+    };
+    assert_eq!(count("banked"), 3);
+    assert_eq!(count("spent"), 0);
+    assert!(count("unread").is_null(), "nothing read publishes null");
+    assert_eq!(
+        count("keyed"),
+        1,
+        "the file decides, as on the Overview chip"
+    );
+}
+
+/// A codex entry publishes the count its usage cache carries, the one the poll
+/// read off `wham/usage`; a cache with no count is `null`.
+#[test]
+fn a_codex_entry_publishes_the_banked_resets_its_poll_read() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["held", "spent", "plain", "cold"]);
+    let cache = |usable: Option<u32>| crate::usage::UsageInfo {
+        limit_resets: usable.map(|usable| crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(2)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("spent"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(0)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("plain"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(None),
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000, true);
+    let count = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .limit_resets
+    };
+    assert_eq!(count("held"), Some(2));
+    assert_eq!(count("spent"), Some(0), "a read zero stays a zero");
+    assert_eq!(count("plain"), None, "a cache with no count publishes null");
+    assert_eq!(count("cold"), None, "no cache publishes null");
+}
+
+/// This reader takes a body from a daemon older than the field: a missing key
+/// reads as no count.
+#[test]
+fn an_entry_from_an_older_daemon_reads_with_no_banked_resets() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let mut v = status_value(&config, 300_000, None, false);
+    let profiles = v["profiles"].as_array_mut().unwrap();
+    let entry = profiles[0].as_object_mut().unwrap();
+    entry.remove("limit_resets");
+    entry.remove("limit_resets_read_at");
+
+    let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
+    assert_eq!(entries[0].limit_resets, None);
+    assert_eq!(entries[0].limit_resets_read_at, None);
+    assert_eq!(entries[0].name.as_str(), "work");
+}
+
+/// A claude count is dated by its own read, never the entry's `fetched_at`,
+/// which dates the usage cache: `limit_resets_read_at` is the reading's stamp
+/// in the feed's `+00:00` form, a zero count dated like any other. No reading,
+/// or a reading with no stamp or one past the clock, publishes `null`.
+#[test]
+fn a_claude_entry_dates_its_banked_resets_by_their_own_read() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("banked"),
+            oauth_profile("spent"),
+            oauth_profile("unread"),
+            oauth_profile("unstamped"),
+            oauth_profile("ahead"),
+        ],
+    };
+    crate::testutil::register_names(&["banked", "spent", "unread", "unstamped", "ahead"]);
+    let ahead_of_the_clock = crate::usage::now_ms() + 3 * 3_600_000;
+    crate::testutil::write_claude_limit_resets("ahead", 1, &[], None, ahead_of_the_clock);
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    crate::testutil::write_claude_limit_resets(
+        "banked",
+        3,
+        &["five_hour"],
+        None,
+        1_790_000_000_500,
+    );
+    crate::testutil::write_claude_limit_resets("spent", 0, &[], None, 1_790_000_060_000);
+    let unstamped = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("unstamped"),
+        "limit_resets.json",
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(unstamped.parent().expect("profile dir")).expect("mkdir");
+    std::fs::write(&unstamped, r#"{"usable":2}"#).expect("write limit_resets.json");
+
+    let v = status_value(&config, 300_000, None, false);
+    let row = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    assert_eq!(
+        row("banked")["limit_resets_read_at"],
+        "2026-09-21T14:13:20+00:00"
+    );
+    assert_eq!(
+        row("spent")["limit_resets_read_at"],
+        "2026-09-21T14:14:20+00:00"
+    );
+    assert_eq!(
+        row("unread").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "nothing read publishes a present null"
+    );
+    assert_eq!(row("unstamped")["limit_resets"], 2);
+    assert_eq!(
+        row("unstamped").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "a reading with no stamp keeps its count and dates nothing"
+    );
+    assert_eq!(row("ahead")["limit_resets"], 1);
+    assert_eq!(
+        row("ahead").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "a stamp past the clock keeps its count and dates nothing"
+    );
+}
+
+/// A codex count rides the usage cache, so its read is the entry's own
+/// `fetched_at`; a read zero is dated too, and a cache with no count dates
+/// nothing. The caches are dated in the past, so a stamp taken at build time
+/// cannot pass for the poll's.
+#[test]
+fn a_codex_entry_dates_its_banked_resets_by_its_poll() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["held", "spent", "plain"]);
+    let cache = |usable: Option<u32>| crate::usage::UsageInfo {
+        limit_resets: usable.map(|usable| crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(2)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("spent"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(Some(0)),
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("plain"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cache(None),
+    );
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    let polled = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    for name in ["held", "spent"] {
+        let path = crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .expect("usage cache path");
+        crate::testutil::set_mtime(&path, polled);
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    assert!(row("held")["fetched_at"].is_string(), "the poll dated it");
+    let dated = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("held")["limit_resets_read_at"], dated);
+    assert_eq!(row("held")["fetched_at"], dated);
+    assert_eq!(
+        row("spent")["limit_resets_read_at"],
+        dated,
+        "a read zero is dated like any other"
+    );
+    assert_eq!(
+        row("plain").get("limit_resets_read_at"),
+        Some(&serde_json::Value::Null),
+        "no count dates nothing"
+    );
+}
+
+/// The state a poll landing between a stat and a load leaves such a reader
+/// with: the body is the new poll's while the mtime is the older poll's. The
+/// body's own stamp rides the bytes the count rides, so a count and its age
+/// taken from it come from one read of one file, whatever else lands around it.
+#[test]
+fn a_codex_count_and_its_age_come_from_one_read_of_one_file() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["landed", "spent"]);
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC, 1_789_000_000 s is
+    // 2026-09-10T00:26:40 UTC (`date -u -d @<secs>`).
+    let new_poll_ms = 1_790_000_000_000;
+    let old_poll = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_000_000);
+    for (name, usable) in [("landed", 3), ("spent", 0)] {
+        let profile = crate::profile::ProfileName::from(name);
+        crate::profile_cache::write_profile_cache(
+            &profile,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(new_poll_ms),
+                limit_resets: Some(crate::usage::LimitResets {
+                    usable,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let path =
+            crate::profile::profile_subpath(&profile, crate::profile_cache::USAGE_CACHE_FILE)
+                .expect("usage cache path");
+        crate::testutil::set_mtime(&path, old_poll);
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    let new_poll = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("landed")["limit_resets"], 3);
+    assert_eq!(row("landed")["limit_resets_read_at"], new_poll);
+    assert_eq!(row("landed")["fetched_at"], new_poll);
+    assert_eq!(
+        row("landed")["next_refresh_at"],
+        "2026-09-21T14:18:20+00:00"
+    );
+    assert_eq!(row("spent")["limit_resets"], 0);
+    assert_eq!(row("spent")["limit_resets_read_at"], new_poll);
+}
+
+/// A poll landing right after the entry's one load leaves the whole entry on
+/// the body that load returned: the count, its age, every date and the windows.
+#[test]
+fn a_poll_landing_during_a_codex_entrys_build_changes_nothing_in_that_entry() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["mid-build"]);
+    let profile = crate::profile::ProfileName::from("mid-build");
+    // A reset far enough ahead that the published filter keeps the window.
+    let body = |usable: u32, stamp_ms: u64, used: f64| crate::usage::UsageInfo {
+        fetched_at: Some(stamp_ms),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: used,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        limit_resets: Some(crate::usage::LimitResets {
+            usable,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &profile,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+        &body(3, 1_790_000_000_000, 10.0),
+    );
+    super::set_codex_entry_load_hook(
+        "mid-build",
+        Box::new(move |name| {
+            crate::profile_cache::write_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &body(1, 1_790_000_600_000, 90.0),
+            );
+        }),
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
+    let row = &entries.as_array().unwrap()[0];
+    assert_eq!(row["limit_resets"], 3);
+    assert_eq!(row["limit_resets_read_at"], "2026-09-21T14:13:20+00:00");
+    assert_eq!(row["fetched_at"], "2026-09-21T14:13:20+00:00");
+    assert_eq!(row["next_refresh_at"], "2026-09-21T14:18:20+00:00");
+    assert_eq!(row["windows"][0]["utilization_pct"], 10.0);
+}
+
+/// `fetch_status` reads the clock the dates read: a usable stamp outranks the
+/// file's mtime, in both directions the two can disagree.
+#[test]
+fn a_codex_entrys_freshness_reads_the_polls_stamp_over_the_mtime() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["polled-now", "polled-long-ago"]);
+    let now = crate::usage::now_ms();
+    let long_ago_ms = 1_790_000_000_000;
+    let at = |ms: u64| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    for (name, stamp_ms, mtime_ms) in [
+        ("polled-now", now - 1_000, long_ago_ms),
+        ("polled-long-ago", long_ago_ms, now - 1_000),
+    ] {
+        let profile = crate::profile::ProfileName::from(name);
+        crate::profile_cache::write_profile_cache(
+            &profile,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(stamp_ms),
+                ..Default::default()
+            },
+        );
+        let path =
+            crate::profile::profile_subpath(&profile, crate::profile_cache::USAGE_CACHE_FILE)
+                .expect("usage cache path");
+        crate::testutil::set_mtime(&path, at(mtime_ms));
+    }
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000, true);
+    let status = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .fetch_status
+            .clone()
+    };
+    assert_eq!(status("polled-now").as_deref(), Some("Fresh"));
+    assert_eq!(status("polled-long-ago").as_deref(), Some("Cached"));
+}
+
+/// The Usage tab's codex row rule, on the feed: a stamp past the clock proves
+/// the clock moved, so the file's mtime dates the entry and its count; a file
+/// that does not parse holds no reading, so nothing dates it.
+#[test]
+fn a_codex_entry_falls_back_to_the_mtime_for_a_stamp_past_the_clock() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["ahead", "garbled"]);
+    let ahead = crate::profile::ProfileName::from("ahead");
+    crate::profile_cache::write_profile_cache(
+        &ahead,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(crate::usage::now_ms() + 86_400_000),
+            limit_resets: Some(crate::usage::LimitResets {
+                usable: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    // 1_790_000_000 s is 2026-09-21T14:13:20 UTC (`date -u -d @1790000000`).
+    let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    let ahead_path =
+        crate::profile::profile_subpath(&ahead, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("usage cache path");
+    crate::testutil::set_mtime(&ahead_path, written);
+    let garbled_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("garbled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("usage cache path");
+    std::fs::create_dir_all(garbled_path.parent().expect("profile dir")).expect("profile dir");
+    std::fs::write(&garbled_path, "not json").expect("garbled cache");
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = serde_json::to_value(build_codex_entries(&codex, 300_000, true)).unwrap();
+    let row = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+            .clone()
+    };
+    let dated = "2026-09-21T14:13:20+00:00";
+    assert_eq!(row("ahead")["fetched_at"], dated);
+    assert_eq!(row("ahead")["limit_resets_read_at"], dated);
+    assert_eq!(row("ahead")["fetch_status"], "Cached");
+    assert_eq!(row("ahead")["next_refresh_at"], "2026-09-21T14:18:20+00:00");
+    for key in [
+        "fetched_at",
+        "fetch_status",
+        "next_refresh_at",
+        "limit_resets",
+        "limit_resets_read_at",
+    ] {
+        assert_eq!(
+            row("garbled").get(key),
+            Some(&serde_json::Value::Null),
+            "garbled's {key} dates nothing"
+        );
+    }
+}
+
+/// A live snapshot whose daemon stood down from the fetch lease publishes
+/// `next_refresh_at: null` even when its live countdown map carries an armed
+/// stamp: the stamp is a mirror's cache-clock estimate, not a countdown this
+/// daemon runs. The holder's arm (the flag true) keeps publishing its live
+/// stamp verbatim — the split the tick's writer and the API republish share.
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_live_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let mut next = std::collections::HashMap::new();
+    next.insert(
+        crate::usage::FetchLeg::OAuth.key(crate::profile::ProfileName::from("work")),
+        crate::usage::now_ms() + interval_ms,
+    );
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+        listen: None,
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    let p = &held["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_string(),
+        "control: the holder publishes its armed stamp, got {p}"
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    let p = &stood["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no countdown it does not run, got {p}"
+    );
+}
+
+/// The codex half of `profiles[]` follows the claude half's null rule: a
+/// stood-down daemon runs no codex poll, so its cache-derived stamp
+/// publishes as `null`, and a holder keeps its own — the split the
+/// single-shot and daemonless writers never join (they keep the derived
+/// stamp).
+#[test]
+fn build_status_nulls_next_refresh_for_a_stood_down_daemons_codex_stamp() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    crate::testutil::write_codex_roster(&["polled"]);
+    crate::testutil::write_codex_store(
+        "polled",
+        r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+    );
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("polled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::map_codex_usage(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps"),
+    );
+    let interval_ms = 300_000u64;
+    let empty_status = std::collections::HashMap::new();
+    let third_party_status = std::collections::HashMap::new();
+    let third_party_streaks = std::collections::HashMap::new();
+    let usage = std::collections::HashMap::new();
+    let next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let signals = |fetches_here| LiveSignals {
+        fetches_here,
+        status: &empty_status,
+        third_party_status: &third_party_status,
+        third_party_streaks: &third_party_streaks,
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        usage: &usage,
+        gateway: None,
+        proxies: None,
+        listen: None,
+    };
+    let codex_entry = |v: &serde_json::Value| {
+        v["profiles"]
+            .as_array()
+            .expect("profiles publish")
+            .iter()
+            .find(|e| e["harness"] == "codex")
+            .expect("the codex entry publishes")
+            .clone()
+    };
+
+    let held = status_value(&config, interval_ms, Some(&signals(true)), false);
+    assert!(
+        codex_entry(&held)["next_refresh_at"].is_string(),
+        "control: the holder publishes its derived stamp, got {}",
+        codex_entry(&held)
+    );
+
+    let stood = status_value(&config, interval_ms, Some(&signals(false)), false);
+    assert!(
+        codex_entry(&stood)["next_refresh_at"].is_null(),
+        "a stood-down daemon publishes no codex countdown it does not run, got {}",
+        codex_entry(&stood)
+    );
+
+    // No live feed at all: the single-shot writer runs no poll either way, so
+    // it keeps the cache-derived stamp instead of publishing a null no daemon
+    // asked for.
+    let single = status_value(&config, interval_ms, None, false);
+    assert!(
+        codex_entry(&single)["next_refresh_at"].is_string(),
+        "a single-shot body keeps the codex entry's derived stamp, got {}",
+        codex_entry(&single)
+    );
 }

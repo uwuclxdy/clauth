@@ -10,26 +10,33 @@ use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, BareItemChoice, BareItemForm, BareItemOwnerForm, ConfirmAction,
-    ConfirmState, DivergenceAction, DivergenceForm, DivergenceTargetForm, EnvCollisionChoice,
-    EnvCollisionForm, InputState, LoginMethod, LoginStage, LossWarningButton, LossWarningState,
-    Modal, NamePromptForm, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
-    RebindForm, ScrollStamp, StatusFocus, Tab, TokenPickerForm, TokenView, pane_state,
-    token_model_count,
+    ActionMenuState, App, BareItemChoice, BareItemForm, BareItemOwnerForm, CaptureOwnerChoice,
+    CaptureOwnerForm, ConfigFocus, ConfigRow, ConfirmAction, ConfirmState, DivergenceAction,
+    DivergenceForm, DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, FALLBACK_ROWS,
+    FallbackFocus, FallbackHint, FallbackRow, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState,
+    LoginMethod, LoginStage, LossWarningButton, LossWarningState, MainItemKind, Modal,
+    NamePromptForm, PageAction, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
+    RebindForm, ScrollStamp, ServicesFocus, SetupSelection, StatusFocus, Tab, TokenPickerForm,
+    TokenView, TranscriptCleanupForm, action_menu_opens, chain_candidates, chain_enter_acts,
+    chain_items, chain_reorder_moves, config_rows, config_step_lands, dash_walks, detail_scrolls,
+    fallback_hint, fallback_row_acts, fallback_row_steps, global_config_row_live, herdr_space_acts,
+    main_reorder_moves, minted_key_row, overview_edit_acts, overview_enter_switches, page_keys_act,
+    pane_state, services_fix_keys_act, setup_card_row_count, shunt_esc_folds, token_model_count,
+    walk_moves,
 };
 use super::super::theme;
 use super::chain::reason_marker;
-use super::format::{grapheme_cells, spinner_frame, truncate};
+use super::format::{grapheme_cell_width, spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_CREDIT_CAP_LEGEND, DIAG_DISABLED,
     DIAG_KEY_REJECTED, DIAG_KICK, DIAG_LOGGED_OUT, DIAG_NO_USAGE, DIAG_ORG_REFUSED,
     DIAG_SCOPED_SPENT_LEGEND, DIAG_STALE, DIAG_TOKEN_REJECTED, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
     META_RULE_MIN, bold_when, draw_scrollbar, draw_scrolled_lines, field_window,
-    follow_scroll_offset, follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret,
-    right_meta_fits, title_label, with_bg,
+    follow_scroll_offset, follow_scroll_offset_tail, head_cols, key_cell, line_cells, meta_line,
+    meta_placeable, place_caret, right_meta_fits, title_label, with_bg,
 };
-use super::prose::{self, cmd_lit, key_lit};
+use super::prose::{self, key_lit};
 use crate::fallback::BlockedReason;
 
 /// The stamp a published scroll bound carries: the frame area it was computed
@@ -59,6 +66,10 @@ pub(super) fn draw(
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input, toast_rects),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form, toast_rects),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
+        Modal::LimitReset(form) => {
+            draw_limit_reset(frame, area, form, app.tick_count);
+            form.scroll_stamp.set(stamp(area, app));
+        }
         Modal::PresetApply(form) => {
             draw_preset_apply(frame, area, form);
             form.scroll.stamp.set(stamp(area, app));
@@ -89,6 +100,17 @@ pub(super) fn draw(
         Modal::LossWarning(state) => draw_loss_warning(frame, area, state),
         Modal::BareItem(form) => draw_bare_item(frame, area, form),
         Modal::BareItemOwner(form) => draw_bare_item_owner(frame, area, form),
+        Modal::CaptureOwner(form) => draw_capture_owner(frame, area, form),
+        Modal::TranscriptCleanup(form) => {
+            // What this frame shows, published for the frame loop's record:
+            // the liveness by the clock this draw reads, so a draw that runs
+            // past the window's end is not the frame that shows the keys act.
+            let live = app
+                .transcript_cleanup
+                .buttons_live(app.anim_ms(), app.focus_held);
+            app.transcript_cleanup.set_drawn_live(live);
+            draw_transcript_cleanup(frame, area, form, live);
+        }
     }
 }
 
@@ -428,8 +450,8 @@ struct ModalGeometry<'a> {
 
 /// Which end of a focus range stays visible when it is taller than the
 /// viewport: every option list keeps its head (the row's start); the re-bind
-/// confirm keeps its tail (the cursor's toggle line), so `space` always flips
-/// a visible account.
+/// confirm keeps its tail (the cursor's account row), so `space` always
+/// toggles a visible account's box.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusEnd {
     Head,
@@ -511,7 +533,7 @@ fn draw_modal_scrolled(
 ) -> ModalDraw {
     let content_w = lines
         .iter()
-        .map(|body| normalize_tabs(&body.line).width())
+        .map(|body| line_cells(&normalize_tabs(&body.line)))
         .max()
         .unwrap_or(0) as u16;
     let button_w = match &tail.extra {
@@ -570,7 +592,7 @@ fn draw_modal_scrolled(
                 .iter()
                 .any(|s| s.style.bg == Some(theme::bg_hover()));
             if tinted {
-                let fill = inner_w.saturating_sub(line.width());
+                let fill = inner_w.saturating_sub(line_cells(&line));
                 if fill > 0 {
                     line.push_span(Span::styled(
                         " ".repeat(fill),
@@ -582,16 +604,22 @@ fn draw_modal_scrolled(
         })
         .collect();
     let total = lines.len();
-    // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
-    // line (an `Acknowledge` confirm's ` close `) renders as one row — reserve
-    // only what the branch below actually draws.
-    let button_rows = match &tail.extra {
-        Some(ModalExtra::Buttons(buttons))
-            if buttons.width() > inner_w && buttons.spans.len() >= 3 =>
-        {
-            3
+    // A button row wider than the modal's inner width stacks one button per
+    // row: a `Span`-joined line has no widget that wraps at its gaps, and a
+    // clipped row loses a whole button. A one-button line (an `Acknowledge`
+    // confirm's ` close `) has nothing to stack and still renders as one row.
+    // Reserve the rows the branch below actually draws: one per button plus
+    // the spacer row every modal keeps above its buttons.
+    let button_groups = match &tail.extra {
+        Some(ModalExtra::Buttons(buttons)) if buttons.width() > inner_w => {
+            let groups = button_stack_lines(buttons);
+            (groups.len() > 1).then_some(groups)
         }
-        Some(ModalExtra::Buttons(_)) => 2,
+        _ => None,
+    };
+    let button_rows = match (&tail.extra, &button_groups) {
+        (Some(ModalExtra::Buttons(_)), Some(groups)) => groups.len() as u16 + 1,
+        (Some(ModalExtra::Buttons(_)), None) => 2,
         _ => 0,
     };
     let h = (lines.len() as u16 + 4 + button_rows).min(area.height.saturating_sub(4));
@@ -628,39 +656,42 @@ fn draw_modal_scrolled(
     };
     draw_scrolled_lines(frame, body, lines, (scroll, scroll + viewport), None);
     if let Some(ModalExtra::Buttons(buttons)) = &tail.extra {
+        // Rows the buttons may fill: the rect minus its top border, its top
+        // padding row and its bottom border, so the bottom padding row is the
+        // last row the border encloses. A terminal too short for the reserved
+        // rows keeps only those, pinned to the modal's bottom, so a tighter
+        // terminal cuts the rows above instead of drawing over the border.
+        let last_inside = rect.height.saturating_sub(3);
         let button_area = Rect {
             y: inner.y + inner.height.saturating_sub(button_rows.saturating_sub(1)),
             height: button_rows.saturating_sub(1),
             ..inner
         };
-        if buttons.width() > inner_w {
-            match &buttons.spans[..] {
-                // No button widget can stack the choice while keeping each
-                // complete on a narrow screen: the cancel/affirmative pair
-                // stacks into two rows.
-                [cancel, _, add] => {
+        match &button_groups {
+            Some(groups) => {
+                let first = groups.len().saturating_sub(last_inside as usize);
+                for (i, group) in groups.iter().enumerate().skip(first) {
                     frame.render_widget(
-                        Paragraph::new(Line::from(cancel.clone()).alignment(Alignment::Right)),
+                        Paragraph::new(group.clone()),
                         Rect {
-                            height: 1,
-                            ..button_area
-                        },
-                    );
-                    frame.render_widget(
-                        Paragraph::new(Line::from(add.clone()).alignment(Alignment::Right)),
-                        Rect {
-                            y: button_area.y + 1,
+                            y: button_area.y + (i - first) as u16,
                             height: 1,
                             ..button_area
                         },
                     );
                 }
-                // A one-span line (an `Acknowledge` confirm's ` close `) has no
-                // pair to stack; render it as a plain right-aligned paragraph.
-                _ => frame.render_widget(Paragraph::new(buttons.clone()), button_area),
             }
-        } else {
-            frame.render_widget(Paragraph::new(buttons.clone()), button_area);
+            None => {
+                let height = button_area.height.min(last_inside);
+                frame.render_widget(
+                    Paragraph::new(buttons.clone()),
+                    Rect {
+                        y: inner.y + inner.height.saturating_sub(height),
+                        height,
+                        ..button_area
+                    },
+                );
+            }
         }
     }
     if let Some((row, cell)) = caret_row
@@ -681,6 +712,34 @@ fn draw_modal_scrolled(
         line_starts,
         total,
     }
+}
+
+/// One line per button in a row: a span of spaces alone is the gap a stacked
+/// layout drops, and each button keeps the row's alignment so it pins to the
+/// same edge the single-row form does.
+fn button_stack_lines<'a>(buttons: &Line<'a>) -> Vec<Line<'a>> {
+    let mut groups: Vec<Vec<Span<'a>>> = Vec::new();
+    let mut current: Vec<Span<'a>> = Vec::new();
+    for span in &buttons.spans {
+        if !span.content.is_empty() && span.content.chars().all(|c| c == ' ') {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(span.clone());
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+        .into_iter()
+        .map(|spans| {
+            let mut line = Line::from(spans);
+            line.alignment = buttons.alignment;
+            line
+        })
+        .collect()
 }
 
 /// A tab in a modal body is one break space: ratatui drops control characters
@@ -717,16 +776,6 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 /// unit it belongs to.
 type Flat = (String, usize, Style, Option<usize>);
 
-/// The cells a line draws, summed per grapheme: a whole-string measure folds a
-/// lam-alef cluster to one cell and the buffer draws it as two, so a line that
-/// only looks like it fits would overrun its row.
-fn line_cells(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|span| grapheme_cells(span.content.as_ref()))
-        .sum()
-}
-
 /// [`chunk_line`] over a line carrying marked units ([`prose::marked`]): a
 /// grapheme inside a unit range only breaks where the unit does, so a key or
 /// command that fits a row stays on one, and units joined by punctuation wrap
@@ -743,12 +792,7 @@ fn chunk_line_units(
     units: &[std::ops::Range<usize>],
 ) -> Vec<Line<'static>> {
     let line = normalize_tabs(&line);
-    let fits = if units.is_empty() {
-        line.width() <= w
-    } else {
-        line_cells(&line) <= w
-    };
-    if w == 0 || fits {
+    if line_cells(&line) <= w {
         return vec![line];
     }
 
@@ -769,7 +813,7 @@ fn chunk_line_units(
                 .map(|_| unit);
             flat.push((
                 grapheme.symbol.to_string(),
-                Span::raw(grapheme.symbol).width(),
+                grapheme_cell_width(grapheme.symbol),
                 span.style,
                 held,
             ));
@@ -1243,7 +1287,7 @@ fn modal_block(title: &str, width: u16) -> Block<'static> {
 /// The narrowest modal that draws `title` whole: the corners, the
 /// corner-adjacent dash and the ` TITLE ` break.
 fn modal_title_w(title: &str) -> u16 {
-    Line::from(title_label(title, true, u16::MAX)).width() as u16 + 3
+    line_cells(&Line::from(title_label(title, true, u16::MAX))) as u16 + 3
 }
 
 /// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
@@ -1292,7 +1336,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::RemoveEntry { .. }
             | ConfirmAction::RemoveToken { .. }
             | ConfirmAction::AddToken { .. }
-            | ConfirmAction::RequireClientTokens { .. }
+            | ConfirmAction::RequireClientTokens
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -1311,7 +1355,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             "remove".to_string()
         }
         ConfirmAction::AddToken { .. } => "overwrite".to_string(),
-        ConfirmAction::RequireClientTokens { .. } => "require".to_string(),
+        ConfirmAction::RequireClientTokens => "require".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -1328,47 +1372,6 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         for line in detail.lines() {
             lines.push(prose::marked(line, theme::dim()).into());
         }
-    }
-    // The daemon-start confirm carries its two lines here rather than in
-    // `detail`, which its caller leaves `None`.
-    if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
-        lines.push(
-            prose::marked(
-                concat!(
-                    "spawns the clauth daemon detached: ",
-                    cmd_lit!("clauth daemon")
-                ),
-                theme::dim(),
-            )
-            .into(),
-        );
-        lines.push(
-            Line::from(Span::styled(
-                "logfile at ~/.clauth/daemon.log.",
-                theme::dim(),
-            ))
-            .into(),
-        );
-    }
-    // The token-add confirm's third line names only what the overwrite
-    // replaces, `None` when the profile had neither a base url nor a key.
-    if let ConfirmAction::AddToken { replace, .. } = &state.on_confirm
-        && let Some(replace) = replace
-    {
-        lines.push(prose::marked(replace, theme::dim()).into());
-    }
-    // The require confirm's third line names the profiles whose `base_url`
-    // names the gateway; empty = none to name, no line.
-    if let ConfirmAction::RequireClientTokens { profiles } = &state.on_confirm
-        && !profiles.is_empty()
-    {
-        lines.push(
-            prose::marked(
-                &format!("profiles using the gateway: {profiles}."),
-                theme::dim(),
-            )
-            .into(),
-        );
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `close`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
@@ -1445,9 +1448,61 @@ fn loss_warning_buttons(state: &LossWarningState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The startup re-bind confirm: grouped account moves, one toggle line per
+/// The `TRANSCRIPT CLEANUP` question: what went missing, the number clauth
+/// put back, and what letting it go costs, over `keep <n>` (the default) and
+/// the destructive `remove it`. Its body never scrolls, the loss warning's
+/// shape. Until a drawn frame has shown this answer for half a second, with
+/// the queue seen empty past that and the terminal focused, both buttons draw
+/// faint, the limit-reset modal's unpressable-button shape; the first frame
+/// drawn live still refuses a key read before the loop next finds the queue
+/// empty.
+fn draw_transcript_cleanup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &TranscriptCleanupForm,
+    live: bool,
+) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "cleanupPeriodDays is gone from ~/.claude/settings.json",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            format!("clauth put {} back", form.days),
+            theme::dim(),
+        )),
+        Line::from(Span::styled(
+            "was removing it intentional? without it claude code deletes every transcript older than 30 days",
+            theme::dim(),
+        )),
+    ];
+    let keep = format!("keep {}", form.days);
+    let buttons = if live {
+        choice_buttons(form.on_remove, &keep, true, "remove it")
+    } else {
+        Line::from(vec![
+            Span::styled(format!(" {keep} "), theme::faint()),
+            Span::raw(" "),
+            Span::styled(" remove it ", theme::faint()),
+        ])
+    };
+    draw_modal_scrolled(
+        frame,
+        area,
+        "TRANSCRIPT CLEANUP",
+        BodyLine::all(lines),
+        0,
+        None,
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
+}
+
+/// The startup re-bind confirm: grouped account moves, one checkbox row per
 /// account, and a `not now` / `apply` button pair. The view follows the cursor
-/// and the render publishes each account toggle's line geometry for the page
+/// and the render publishes each account row's line geometry for the page
 /// keys, the same follow/paging shape the other choice menus use.
 fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     let row_w = form
@@ -1477,11 +1532,11 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
         Line::from(""),
     ];
 
-    // The pre-chunk line index of each account toggle, in flat order, plus each
+    // The pre-chunk line index of each account row, in flat order, plus each
     // block's first line: the first account's focus reaches back to it so the
     // block's change set (and, for block 0, the confirm's message) stays on
     // screen when the cursor returns to it.
-    let mut toggle_lines: Vec<usize> = Vec::new();
+    let mut account_row_lines: Vec<usize> = Vec::new();
     let mut block_starts: Vec<usize> = Vec::new();
     let mut flat = 0usize;
     for (bi, block) in form.blocks.iter().enumerate() {
@@ -1498,27 +1553,33 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
             )));
         }
         for (ai, account) in block.accounts.iter().enumerate() {
-            toggle_lines.push(lines.len());
+            account_row_lines.push(lines.len());
             let selected = flat == form.cursor;
+            // Every span carries the tint, so the scroller pads the row to the
+            // padding boundary.
+            let tint = selected.then(theme::bg_hover);
             let arrow = if selected {
-                Span::styled("\u{276f} ", theme::accent())
+                Span::styled(
+                    format!("{} ", theme::CARET),
+                    with_bg(theme::accent().bold(), tint),
+                )
             } else {
                 Span::raw("  ")
             };
-            let toggle = if form.checked[bi][ai] {
-                Span::styled(theme::toggle_on().to_string(), theme::accent())
+            let checkbox = if form.checked[bi][ai] {
+                Span::styled(theme::CHECKBOX_ON, with_bg(theme::accent(), tint))
             } else {
-                Span::styled(theme::toggle_off().to_string(), theme::faint())
+                Span::styled(theme::CHECKBOX_OFF, with_bg(theme::dim(), tint))
             };
             let name_style = if selected {
-                theme::accent()
+                with_bg(theme::body().bold(), tint)
             } else {
                 theme::dim()
             };
             lines.push(Line::from(vec![
                 arrow,
-                toggle,
-                Span::raw(" "),
+                checkbox,
+                Span::styled(" ", with_bg(Style::default(), tint)),
                 Span::styled(account.clone(), name_style),
             ]));
             flat += 1;
@@ -1534,7 +1595,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     .alignment(Alignment::Right);
 
     let focus = form.account_at(form.cursor).and_then(|(bi, ai)| {
-        toggle_lines.get(form.cursor).map(|&line| {
+        account_row_lines.get(form.cursor).map(|&line| {
             let start = if ai == 0 { block_starts[bi] } else { line };
             (start..line + 1, &form.scroll, FocusEnd::Tail)
         })
@@ -1553,7 +1614,7 @@ fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
     );
     form.viewport.set(d.viewport as usize);
     form.total.set(d.total);
-    let starts: Vec<usize> = toggle_lines
+    let starts: Vec<usize> = account_row_lines
         .iter()
         .map(|&line| d.line_starts[line])
         .collect();
@@ -1802,6 +1863,72 @@ fn draw_bare_item_owner(frame: &mut Frame<'_>, area: Rect, form: &BareItemOwnerF
     );
 }
 
+/// A capture whose login looks like `owner`'s account: the question, why it
+/// is asked, then one pick row per choice. The owner's name is colored, never
+/// quoted.
+fn draw_capture_owner(frame: &mut Frame<'_>, area: Rect, form: &CaptureOwnerForm) {
+    let choices = CaptureOwnerChoice::ALL;
+    let cursor = form.cursor.min(choices.len() - 1);
+    let owner = form.owner.as_str();
+    let name = |base: Style| Span::styled(owner.to_string(), base.fg(theme::accent_color()));
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("this login looks like ", theme::body()),
+            name(theme::body()),
+            Span::styled("'s account", theme::body()),
+        ]),
+        Line::from(vec![
+            Span::styled("claude code last signed in as ", theme::dim()),
+            name(theme::dim()),
+            Span::styled(", and this token is newer than the one ", theme::dim()),
+            name(theme::dim()),
+            Span::styled(" holds", theme::dim()),
+        ]),
+        Line::from(""),
+    ];
+    let first = lines.len();
+    for (i, choice) in choices.iter().enumerate() {
+        let selected = i == cursor;
+        let mut row = option_line(
+            selected,
+            match choice {
+                CaptureOwnerChoice::SaveInto => "save into ",
+                CaptureOwnerChoice::CaptureNew => "capture as a new account",
+                CaptureOwnerChoice::Cancel => "cancel",
+            }
+            .to_string(),
+        );
+        if *choice == CaptureOwnerChoice::SaveInto {
+            row.spans.push(Span::styled(
+                owner.to_string(),
+                with_bg(
+                    bold_when(theme::body().fg(theme::accent_color()), selected),
+                    selected.then(theme::bg_hover),
+                ),
+            ));
+        }
+        lines.push(row);
+    }
+    draw_modal_focused(
+        frame,
+        area,
+        "SAVE LOGIN",
+        BodyLine::all(lines),
+        first + cursor..first + cursor + 1,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: choices.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
 fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
     match action {
         DivergenceAction::SwitchToOwner(owner) => {
@@ -1989,9 +2116,11 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         ]));
     }
 
+    // Drawn cells: `lines[0]` carries the user-typed key, so a fold-class
+    // key sizes the modal by what it draws.
     let content_w = lines
         .iter()
-        .map(|line| normalize_tabs(line).width())
+        .map(|line| line_cells(&normalize_tabs(line)))
         .max()
         .unwrap_or(0) as u16;
     let width = (content_w + 6)
@@ -2107,6 +2236,86 @@ fn draw_name_field(
     );
 }
 
+/// The widest reset label the pick list shows before it cuts with `…`.
+const RESET_LABEL_CELLS: usize = 44;
+
+/// `USE A LIMIT RESET`: the account and its count, one pick row per reset,
+/// the focused reset's static key/value rows, then the spend's state — a
+/// spinner while it runs, its refusal (or a fresh record's pin on another
+/// reset) in the error colour — over `cancel` and `use reset`, the latter
+/// faint while it cannot be pressed.
+fn draw_limit_reset(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &super::super::app::LimitResetForm,
+    tick: u64,
+) {
+    use super::super::app::LimitResetPhase;
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("{} · {}", form.name, form.available),
+            theme::body(),
+        )),
+        Line::from(""),
+    ];
+    let cursor = form.cursor.min(form.resets.len().saturating_sub(1));
+    for (i, reset) in form.resets.iter().enumerate() {
+        lines.push(option_line(
+            i == cursor,
+            truncate(&reset.label, RESET_LABEL_CELLS),
+        ));
+    }
+    if let Some(reset) = form.focused() {
+        lines.push(Line::from(""));
+        for (key, value) in &reset.rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<10}"), theme::label()),
+                Span::styled(value.clone(), theme::body()),
+            ]));
+        }
+    }
+    let state = match &form.phase {
+        LimitResetPhase::Spending => Some(Line::from(Span::styled(
+            format!("{} using the reset", spinner_frame(tick)),
+            theme::accent(),
+        ))),
+        LimitResetPhase::Refused(line) => {
+            Some(Line::from(Span::styled(line.clone(), theme::danger())))
+        }
+        LimitResetPhase::Idle => form
+            .pinned_refusal()
+            .map(|line| Line::from(Span::styled(line.to_string(), theme::danger()))),
+    };
+    if let Some(state) = state {
+        lines.push(Line::from(""));
+        lines.push(state);
+    }
+    let use_label = " use reset ";
+    let use_button = if form.can_use() {
+        modal_button(use_label, form.on_use)
+    } else {
+        Span::styled(use_label, theme::faint())
+    };
+    let buttons = Line::from(vec![
+        modal_button(" cancel ", !form.on_use),
+        Span::raw(" "),
+        use_button,
+    ]);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "USE A LIMIT RESET",
+        BodyLine::all(lines),
+        0,
+        Some((2 + cursor..3 + cursor, &form.scroll, FocusEnd::Head)),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
+    form.max_scroll.set(d.max_scroll);
+}
+
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
 /// tail so the two groups read apart without a second rule.
 fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm) {
@@ -2159,255 +2368,391 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 /// The Usage help-modal rows, derived from the same per-row predicate set the
 /// footer's hints use ([`super::footer::usage_key_facts`]), so the help never
 /// promises a key the shown row ignores: `n` on claude rows only, `r` where a
-/// re-read exists, `↵` on any item row.
-fn usage_help_rows(app: &App) -> &'static [(&'static str, &'static str)] {
+/// re-read exists, `↵` on any item row, `↑ ↓` while the detail has somewhere
+/// to scroll or the list a second row to walk to.
+fn usage_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
     use super::footer::{UsageRefresh, usage_key_facts};
     let facts = usage_key_facts(app);
+    let mut rows = Vec::new();
+    if facts.arrows {
+        rows.push((
+            "\u{2191} \u{2193}",
+            if facts.detail {
+                "scroll account detail"
+            } else {
+                "pick account to inspect"
+            },
+        ));
+    }
     if facts.detail {
-        return match facts.r {
-            Some(UsageRefresh::RefreshAccount) => &[
-                ("\u{2191} \u{2193}", "scroll account detail"),
-                ("esc", "return to account selector"),
-                ("\u{2190}", "return to account selector"),
-                ("r", "refresh account"),
-                ("n", "edit the account's note"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ],
-            Some(UsageRefresh::ReReadPool) => &[
-                ("\u{2191} \u{2193}", "scroll account detail"),
-                ("esc", "return to account selector"),
-                ("\u{2190}", "return to account selector"),
-                ("r", "re-read the pool listing"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ],
-            None => &[
-                ("\u{2191} \u{2193}", "scroll account detail"),
-                ("esc", "return to account selector"),
-                ("\u{2190}", "return to account selector"),
-                ("e", "toggle estimates"),
-                ("p", "toggle pace marker"),
-            ],
-        };
+        rows.extend([
+            ("esc", "return to account selector"),
+            ("\u{2190}", "return to account selector"),
+        ]);
+    }
+    if facts.enter {
+        rows.push(("\u{21b5}", "open account detail"));
     }
     match facts.r {
-        Some(UsageRefresh::RefreshAccount) => &[
-            ("\u{2191} \u{2193}", "pick account to inspect"),
-            ("\u{21b5}", "open account detail"),
-            ("r", "refresh account"),
-            ("n", "edit the account's note"),
-            ("e", "toggle estimates"),
-            ("p", "toggle pace marker"),
-        ],
-        Some(UsageRefresh::ReReadPool) => &[
-            ("\u{2191} \u{2193}", "pick account to inspect"),
-            ("\u{21b5}", "open account detail"),
-            ("r", "re-read the pool listing"),
-            ("e", "toggle estimates"),
-            ("p", "toggle pace marker"),
-        ],
-        None if facts.enter => &[
-            ("\u{2191} \u{2193}", "pick account to inspect"),
-            ("\u{21b5}", "open account detail"),
-            ("e", "toggle estimates"),
-            ("p", "toggle pace marker"),
-        ],
-        None => &[
-            ("\u{2191} \u{2193}", "pick account to inspect"),
-            ("e", "toggle estimates"),
-            ("p", "toggle pace marker"),
-        ],
+        Some(UsageRefresh::RefreshAccount) => rows.push(("r", "refresh account")),
+        Some(UsageRefresh::ReReadPool) => rows.push(("r", "re-read the pool listing")),
+        None => {}
     }
+    if facts.n {
+        rows.push(("n", "edit the account's note"));
+    }
+    rows.extend([("e", "toggle estimates"), ("p", "toggle pace marker")]);
+    rows
 }
 
-/// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
-/// sections. A standalone builder (not inlined into `draw_help`) so tests can
-/// enumerate every tab's real content without rendering a frame — see
-/// `every_sub_focus_tab_documents_esc_in_help`.
-fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
-    match app.tab {
-        Tab::Overview => vec![(
-            "accounts",
-            &[
-                ("\u{2191} \u{2193}", "move cursor"),
-                ("\u{21b5}", "switch to selected account (confirm)"),
-                ("shift \u{2191} \u{2193}", "reorder account up / down"),
-                ("e", "edit selected account in setup"),
-            ][..],
-        )],
-        // Derived from the same per-row predicate set as the footer's hints
-        // (`usage_key_facts`), so the help never promises a key the shown row
-        // ignores; on an empty roster the section omits `n`, keeping the
-        // global `n new account` row (matching the empty state's `n to create
-        // one`).
-        Tab::Usage => vec![("usage", usage_help_rows(app))],
-        Tab::Tokens if app.token_view == TokenView::Dashboard && token_model_count(app) == 0 => {
-            vec![(
-                "tokens",
-                &[
+/// The Tokens rows: the dashboard lists its card walk only while it has laid
+/// out its cards, and its `↵` names what it does there (the cause of a failed
+/// read, else the breakdown while a model exists), a model detail
+/// offers `↑ ↓` only while it has somewhere to scroll, and the model list
+/// past one model.
+fn token_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut rows = Vec::new();
+    match app.token_view {
+        TokenView::Dashboard => {
+            if dash_walks(app) {
+                rows.extend([
                     ("\u{2191} \u{2193}", "move between cards"),
                     ("pgup/pgdn", "move a page of cards"),
-                    ("c", "count cache in token figures"),
-                    (
-                        "t",
-                        "cycle period \u{b7} lifetime / daily / weekly / monthly",
-                    ),
-                    ("r", "reload on-disk stats"),
-                ][..],
-            )]
+                ]);
+            }
+            if app.tokens_failed {
+                rows.push(("\u{21b5}", "show why"));
+            } else if token_model_count(app) > 0 {
+                rows.push(("\u{21b5}", "open per-model breakdown"));
+            }
         }
-        Tab::Tokens if app.token_view == TokenView::Dashboard => vec![(
-            "tokens",
-            &[
-                ("\u{2191} \u{2193}", "move between cards"),
-                ("pgup/pgdn", "move a page of cards"),
-                ("\u{21b5}", "open per-model breakdown"),
-                ("c", "count cache in token figures"),
-                (
-                    "t",
-                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
-                ),
-                ("r", "reload on-disk stats"),
-            ][..],
-        )],
-        Tab::Tokens if app.model_detail_focus == StatusFocus::Detail => vec![(
-            "tokens",
-            &[
-                ("\u{2191} \u{2193}", "scroll model detail"),
+        TokenView::Models if app.model_detail_focus == StatusFocus::Detail => {
+            if detail_scrolls(app) {
+                rows.push(("\u{2191} \u{2193}", "scroll model detail"));
+            }
+            rows.extend([
                 ("esc", "return to model selector"),
                 ("\u{2190}", "return to model selector"),
-                ("c", "count cache in token figures"),
-                (
-                    "t",
-                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
-                ),
-                ("r", "reload on-disk stats"),
-            ][..],
-        )],
-        Tab::Tokens if token_model_count(app) == 0 => vec![(
-            "tokens",
-            &[
-                ("\u{2191} \u{2193}", "pick model"),
-                ("esc", "back to dashboard"),
-                ("c", "count cache in token figures"),
-                (
-                    "t",
-                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
-                ),
-                ("r", "reload on-disk stats"),
-            ][..],
-        )],
-        Tab::Tokens => vec![(
-            "tokens",
-            &[
-                ("\u{2191} \u{2193}", "pick model"),
-                ("\u{21b5}", "open model detail"),
-                ("esc", "back to dashboard"),
-                ("c", "count cache in token figures"),
-                (
-                    "t",
-                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
-                ),
-                ("r", "reload on-disk stats"),
-            ][..],
-        )],
-        Tab::Setup => vec![(
-            "setup",
-            &[
-                ("\u{2191} \u{2193}", "pick account / + new, then a row"),
-                ("\u{21b5}", "open settings · edit field · flip toggle"),
-                (
-                    "\u{21b5} on a field",
-                    concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
-                ),
-                // Two rows, so the help keeps its width.
-                (
-                    "space",
-                    "cycle model preset · flip auto-start, usage probe ·",
-                ),
-                ("", "open alert at, probe every"),
-                ("+ / -", "step alert at by 5 · probe every by 30s"),
-                (
-                    "env",
-                    concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
-                ),
-                (
-                    "a",
-                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
-                ),
-                (
-                    "disable / enable",
-                    concat!(
-                        key_lit!("\u{21b5}"),
-                        " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
-                    ),
-                ),
-                (
-                    "delete",
-                    concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
-                ),
-                ("esc", "stop editing / back to account list"),
-            ][..],
-        )],
-        Tab::Config => vec![(
-            "config",
-            &[
-                ("\u{2191} \u{2193}", "move between settings"),
-                ("space", "cycle the focused setting"),
-                (
-                    "\u{21b5}",
-                    concat!(
-                        "same as ",
-                        key_lit!("space"),
-                        " · type a value on refresh or weekly limit",
-                    ),
-                ),
-            ][..],
-        )],
-        Tab::Status => vec![(
-            "status",
-            &[
-                ("\u{2191} \u{2193}", "pick incident / scroll detail"),
-                ("\u{21b5}", "open incident timeline"),
-                ("r", "refresh the feed"),
-                ("esc", "back to the list"),
-            ][..],
-        )],
-        Tab::Services => vec![(
-            "services",
-            &[
-                (
-                    "\u{2191} \u{2193}",
-                    "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
-                ),
-                (
-                    "pgup/pgdn",
-                    "scroll a page · read plugin / herdr diagnostics · page delegates",
-                ),
-                ("\u{21b5}", "open detail · activate · open fix"),
-                ("space", "activate the focused herdr option"),
-                ("+ / -", "step the tag refresh"),
-                ("f", "next fix"),
-                ("r", "re-run all checks"),
-                ("esc", "back to the list · close the editor"),
-            ][..],
-        )],
-        Tab::Fallback => vec![(
-            "fallback chain",
-            &[
-                ("\u{2191} \u{2193}", "move cursor / detail row"),
-                ("shift \u{2191} \u{2193}", "reorder to set priority"),
-                (
-                    "\u{21b5}",
-                    "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
-                ),
-                ("+ / -", "step rotate at / weekly at by 5"),
-                (
-                    "\u{21b5} on rotate at",
-                    concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
-                ),
-                ("\u{21b5} on weekly at", "type a %, empty clears"),
+            ]);
+        }
+        TokenView::Models => {
+            let len = token_model_count(app);
+            if walk_moves(len) {
+                rows.push(("\u{2191} \u{2193}", "pick model"));
+            }
+            if len > 0 {
+                rows.push(("\u{21b5}", "open model detail"));
+            }
+            rows.push(("esc", "back to dashboard"));
+        }
+    }
+    rows.extend([
+        ("c", "count cache in token figures"),
+        (
+            "t",
+            "cycle period \u{b7} lifetime / daily / weekly / monthly",
+        ),
+        ("r", "reload on-disk stats"),
+    ]);
+    rows
+}
+
+/// The Setup rows for the focused pane. The account list lists its own keys;
+/// a card names the focused row's `↵` in the footer's own word, lists `space`
+/// and `+ / -` only while the focused row takes them, and lists the other
+/// row-scoped keys while the card holds a row they act on.
+fn setup_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    const WALK: (&str, &str) = ("\u{2191} \u{2193}", "move between rows");
+    const MENU: (&str, &str) = (
+        "a",
+        "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+    );
+    let mut rows = Vec::new();
+    if app.config_focus == ConfigFocus::Profiles {
+        if walk_moves(app.setup_items().len() + 1) {
+            rows.push(WALK);
+        }
+        rows.push(("\u{21b5}", "open the focused account"));
+        if action_menu_opens(app) {
+            rows.push(MENU);
+        }
+        return rows;
+    }
+    let selection = app.setup_selection();
+    let card: Vec<ConfigRow> = match selection {
+        SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => config_rows(app),
+        SetupSelection::Item(MainItemKind::Codex(_) | MainItemKind::Shunt(..)) => Vec::new(),
+    };
+    if walk_moves(setup_card_row_count(app)) {
+        rows.push(WALK);
+    }
+    if let Some((_, verb)) = super::footer::setup_card_hints(app)
+        .into_iter()
+        .find(|(key, _)| matches!(*key, "↵" | "space/↵"))
+    {
+        rows.push(("\u{21b5}", verb));
+    }
+    if card
+        .iter()
+        .any(|&row| row.is_text() && !minted_key_row(app, row))
+    {
+        rows.push((
+            "\u{21b5} on a field",
+            concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+        ));
+    }
+    // `space` and `+` / `-` act on the focused row alone, through the same
+    // guards the card's key handler and its step functions check; the joined
+    // `+ / -` stays while either direction moves the value.
+    let focused = card.get(app.config_action_cursor).copied();
+    if focused.is_some_and(ConfigRow::is_state_control) {
+        rows.push(("space", "change the focused setting"));
+    }
+    if focused
+        .is_some_and(|row| config_step_lands(app, row, true) || config_step_lands(app, row, false))
+    {
+        rows.push(("+ / -", "step the focused number"));
+    }
+    if card
+        .iter()
+        .any(|row| matches!(row, ConfigRow::EnvAdd | ConfigRow::EnvEntry(_)))
+    {
+        rows.push((
+            "env",
+            concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+        ));
+    }
+    if action_menu_opens(app) {
+        rows.push(MENU);
+    }
+    if card.contains(&ConfigRow::Disabled) && super::footer::setup_disable_verb(app).is_some() {
+        rows.push((
+            "disable / enable",
+            concat!(
+                key_lit!("\u{21b5}"),
+                " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+            ),
+        ));
+    }
+    if card.contains(&ConfigRow::Delete)
+        || matches!(selection, SetupSelection::Item(MainItemKind::Codex(_)))
+    {
+        rows.push((
+            "delete",
+            concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+        ));
+    }
+    rows.push(("esc", "stop editing / back to account list"));
+    rows
+}
+
+/// The Config rows for the focused row: `↵` types a value on the three typed
+/// rows and mirrors `space` elsewhere, and a row another setting makes inert
+/// takes neither.
+fn config_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    const SPACE: (&str, &str) = ("space", "cycle the focused setting");
+    let mut rows = Vec::new();
+    if walk_moves(GLOBAL_CONFIG_ROWS.len()) {
+        rows.push(("\u{2191} \u{2193}", "move between settings"));
+    }
+    match GLOBAL_CONFIG_ROWS.get(app.global_config_cursor).copied() {
+        Some(
+            GlobalConfigRow::RefreshInterval
+            | GlobalConfigRow::ContextNudge
+            | GlobalConfigRow::WeeklyThreshold,
+        ) => rows.extend([SPACE, ("\u{21b5}", "type a value")]),
+        Some(row) if global_config_row_live(app, row) => {
+            rows.extend([SPACE, ("\u{21b5}", concat!("same as ", key_lit!("space")))]);
+        }
+        Some(_) | None => {}
+    }
+    rows
+}
+
+/// The Status rows for the focused pane: the list names its walk and its
+/// open while it holds incidents; a timeline offers `↑ ↓` only while it has
+/// somewhere to scroll.
+fn status_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    const REFRESH: (&str, &str) = ("r", "refresh the feed");
+    let len = app.status.incidents.len();
+    let mut rows = Vec::new();
+    match app.status.focus {
+        StatusFocus::List => {
+            if walk_moves(len) {
+                rows.push(("\u{2191} \u{2193}", "pick incident"));
+            }
+            if len > 0 {
+                rows.push(("\u{21b5}", "open incident timeline"));
+            }
+            rows.push(REFRESH);
+        }
+        StatusFocus::Detail => {
+            if detail_scrolls(app) {
+                rows.push(("\u{2191} \u{2193}", "scroll the timeline"));
+            }
+            rows.extend([REFRESH, ("esc", "back to the list")]);
+        }
+    }
+    rows
+}
+
+/// The Services rows for the focused pane. The list lists its walk, its
+/// descend and `f` on the row under the cursor; a detail lists the keys its
+/// footer offers there, which each derive from their handler's own gate, in
+/// the sense the footer gives them (`↑ ↓` scrolls a detail that only
+/// scrolls), plus the page row its scroll bound gates, which a scroll-only
+/// detail's footer leaves out, and names an `esc` that folds a shunt row
+/// `go back`.
+fn services_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    const ARROWS: (&str, &str) = ("\u{2191} \u{2193}", "move between rows");
+    const ENTER: (&str, &str) = ("\u{21b5}", "open or act on the focused row");
+    let mut rows = Vec::new();
+    match app.services.focus {
+        ServicesFocus::List => {
+            let len = app.services.row_count();
+            if walk_moves(len) {
+                rows.extend([ARROWS, ("pgup/pgdn", "move a page")]);
+            }
+            if len > 0 && app.services.enter_descends() {
+                rows.push(ENTER);
+            }
+        }
+        ServicesFocus::Detail => {
+            let hints = super::footer::services_hints(app);
+            let offers = |key: &str| hints.iter().any(|(k, _)| *k == key);
+            let label = app.services.selected_check().map(|c| c.label);
+            // The arrows row takes the footer's own `↑↓` sense: a detail that
+            // only scrolls names the scroll, a walk names the row move.
+            if let Some((_, word)) = hints.iter().find(|(k, _)| *k == "↑↓") {
+                rows.push(if *word == "scroll" {
+                    ("\u{2191} \u{2193}", "scroll")
+                } else {
+                    ARROWS
+                });
+            }
+            if label == Some("delegates") {
+                if app.services.delegates_selection_moves() {
+                    rows.push(("pgup/pgdn", "move a page"));
+                }
+            } else if detail_scrolls(app) {
+                rows.push(("pgup/pgdn", "scroll a page"));
+            }
+            if offers("↵") || offers("space/↵") {
+                rows.push(ENTER);
+            }
+            if label == Some("shunt") {
+                // The footer's own predicate, in the help's words: `space`
+                // acts on the `enabled` toggle, an entry, or a cycle field,
+                // and nowhere else on the card.
+                let row = match super::footer::shunt_space(app) {
+                    Some(super::footer::ShuntSpaceAction::ToggleEnabled) => {
+                        Some(("space", "toggle enabled"))
+                    }
+                    Some(super::footer::ShuntSpaceAction::ExpandEntry) => {
+                        Some(("space", "expand the entry"))
+                    }
+                    Some(super::footer::ShuntSpaceAction::CollapseEntry) => {
+                        Some(("space", "collapse the entry"))
+                    }
+                    Some(super::footer::ShuntSpaceAction::CycleField) => {
+                        Some(("space", "cycle the field"))
+                    }
+                    None => None,
+                };
+                if let Some(row) = row {
+                    rows.push(row);
+                }
+            }
+            if label == Some("herdr") && herdr_space_acts(app) {
+                rows.push(("space", "activate the focused herdr option"));
+            }
+            if offers("+") || offers("-") {
+                rows.push(("+ / -", "step the tag refresh"));
+            }
+        }
+    }
+    if app.services.f_moves() && services_fix_keys_act(app) {
+        rows.push(("f", "next fix"));
+    }
+    rows.push(("r", "re-run all checks"));
+    if app.services.focus == ServicesFocus::Detail {
+        rows.push(if shunt_esc_folds(app) {
+            ("esc", "go back")
+        } else {
+            ("esc", "back to the list · close the editor")
+        });
+    }
+    rows
+}
+
+/// The Fallback rows for the focused pane. The chain lists its walk, its
+/// reorder and its descend while each acts; a member card lists `↵`, `space`
+/// and `+ / -` only while the focused row takes them, and its other
+/// row-scoped keys while [`fallback_row_acts`] holds for their row.
+fn fallback_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    const WALK: (&str, &str) = ("\u{2191} \u{2193}", "move between rows");
+    const ENTER: (&str, &str) = ("\u{21b5}", "open or change the focused row");
+    let mut rows = Vec::new();
+    if app.fallback_focus == FallbackFocus::Chain {
+        if walk_moves(chain_items(app).len()) {
+            rows.push(WALK);
+        }
+        if chain_reorder_moves(app) {
+            rows.push(("shift \u{2191} \u{2193}", "reorder to set priority"));
+        }
+        if chain_enter_acts(app) {
+            rows.push(ENTER);
+        }
+        return rows;
+    }
+    if matches!(
+        fallback_hint(app),
+        FallbackHint::Empty | FallbackHint::DetailAdd
+    ) {
+        // The `+ add` picker walks the accounts that can still join.
+        let candidates = chain_candidates(app).len();
+        if walk_moves(candidates) {
+            rows.push(WALK);
+        }
+        // `↵` adds the focused candidate: the footer's own word there.
+        if candidates > 0 {
+            rows.push(("\u{21b5}", "add"));
+        }
+    } else {
+        let acts = |row| fallback_row_acts(app, row);
+        if walk_moves(FALLBACK_ROWS.len()) {
+            rows.push(WALK);
+        }
+        // `↵`, `space` and `+` / `-` act on the focused row alone, through
+        // the predicates the card's key handler reads (its cursor clamped
+        // alike). `space` on a state control runs the row as `↵` does, bar
+        // `preferred days`, whose `space` steps its presets (its own row
+        // below).
+        let focused = FALLBACK_ROWS
+            .get(app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1))
+            .copied();
+        if focused.is_some_and(acts) {
+            rows.push(ENTER);
+        }
+        if focused.is_some_and(|row| {
+            row.is_state_control() && row != FallbackRow::PreferredDays && acts(row)
+        }) {
+            rows.push(("space", "change the focused setting"));
+        }
+        if focused.is_some_and(|row| fallback_row_steps(app, row)) {
+            rows.push(("+ / -", "step the focused number"));
+        }
+        if acts(FallbackRow::Threshold) {
+            rows.push((
+                "\u{21b5} on rotate at",
+                concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+            ));
+        }
+        if acts(FallbackRow::WeeklyAt) {
+            rows.push(("\u{21b5} on weekly at", "type a %, empty clears"));
+        }
+        if acts(FallbackRow::PreferredDays) {
+            rows.extend([
                 (
                     "space on preferred days",
                     "step never / weekdays / weekends / every day",
@@ -2426,10 +2771,53 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                         " leave and move",
                     ),
                 ),
-                ("esc", "back / cancel edit"),
-            ][..],
-        )],
+            ]);
+        }
     }
+    rows.push(("esc", "back / cancel edit"));
+    rows
+}
+
+/// The Overview rows: each row key while it acts on the row under the cursor,
+/// and the harness filter, which acts on any roster.
+fn overview_help_rows(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut rows = Vec::new();
+    if walk_moves(app.main_items().len()) {
+        rows.push(("\u{2191} \u{2193}", "move cursor"));
+    }
+    if overview_enter_switches(app) {
+        rows.push(("\u{21b5}", "switch to selected account (confirm)"));
+    }
+    if main_reorder_moves(app) {
+        rows.push(("shift \u{2191} \u{2193}", "reorder account up / down"));
+    }
+    if overview_edit_acts(app) {
+        rows.push(("e", "edit selected account in setup"));
+    }
+    rows.push(("c", "cycle the harness filter"));
+    rows
+}
+
+/// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
+/// sections. A standalone builder (not inlined into `draw_help`) so tests can
+/// enumerate every tab's real content without rendering a frame — see
+/// `every_sub_focus_tab_documents_esc_in_help`.
+fn tab_specific_rows(app: &App) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    vec![match app.tab {
+        Tab::Overview => ("accounts", overview_help_rows(app)),
+        // Derived from the same per-row predicate set as the footer's hints
+        // (`usage_key_facts`), so the help never promises a key the shown row
+        // ignores; on an empty roster the section omits `n`, keeping the
+        // global `n new account` row (matching the empty state's `n to create
+        // one`).
+        Tab::Usage => ("usage", usage_help_rows(app)),
+        Tab::Tokens => ("tokens", token_help_rows(app)),
+        Tab::Setup => ("setup", setup_help_rows(app)),
+        Tab::Config => ("config", config_help_rows(app)),
+        Tab::Status => ("status", status_help_rows(app)),
+        Tab::Services => ("services", services_help_rows(app)),
+        Tab::Fallback => ("fallback chain", fallback_help_rows(app)),
+    }]
 }
 
 /// The shunt card's `check output` modal: the masked failed-check stderr,
@@ -2487,9 +2875,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // The modal's own keys, in their own section. Not folded into `global`
-    // below: every tab binds ↑↓ for its own list, so the shadow filter there
-    // would drop this row on all eight — and hanging it off another section
-    // would put two ↑↓ rows with different senses a few lines apart, the exact
+    // below: the shadow filter there would drop this row wherever the tab's
+    // section lists its own ↑↓ — and hanging it off another section would put
+    // two ↑↓ rows with different senses a few lines apart, the exact
     // contradiction that filter exists to prevent.
     // The close keys were documented only at app level, where `q` reads
     // "back / quit" and `esc` reads "back within a sub-view" — neither tells a
@@ -2499,7 +2887,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("esc \u{00b7} q \u{00b7} ?", "close"),
     ];
 
-    let global_all: &[(&str, &str)] = &[
+    // The page keys' row says what they do on this frame, read off the same
+    // routing the key handler uses, and is listed only while the press moves
+    // something — where the tab's own section already names the key, the
+    // shadow filter below drops this row instead.
+    let mut global_all: Vec<(&str, &str)> = vec![
         ("n", "new account"),
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
@@ -2513,9 +2905,15 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("\u{21e7}tab", "previous screen"),
         ("\u{2325}1-9", "jump to tab"),
         ("esc", "back within a sub-view (no-op at the top level)"),
-        ("pgup/pgdn", "scroll a page"),
         ("\u{2303}c", "quit from anywhere"),
     ];
+    let page_row = page_keys_act(app).map(|action| match action {
+        PageAction::Move => ("pgup/pgdn", "move a page"),
+        PageAction::Scroll => ("pgup/pgdn", "scroll a page"),
+    });
+    if let Some(row) = page_row {
+        global_all.insert(global_all.len() - 1, row);
+    }
     // A key the current tab redefines is documented in its own section above;
     // keeping the global sense too would contradict it (`t` cycles the period
     // and `r` reloads stats on Tokens, `r` refreshes one account on Usage).
@@ -2533,6 +2931,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             shadowed.push("n");
         }
     }
+    // `a` opens nothing while the menu would list nothing: the footer's own
+    // `a actions` predicate.
+    if !action_menu_opens(app) {
+        shadowed.push("a");
+    }
     let global: Vec<(&str, &str)> = global_all
         .iter()
         .copied()
@@ -2544,7 +2947,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.extend(key_section("tabs", nav));
     }
     lines.extend(key_section("this modal", modal_keys));
-    for (section, entries) in &tab_specific {
+    for (section, entries) in tab_specific.iter().filter(|(_, rows)| !rows.is_empty()) {
         lines.extend(key_section(section, entries));
     }
     lines.extend(key_section("global", &global));
@@ -2716,7 +3119,7 @@ fn labelled_value(label: &str, value: String, focused: bool) -> Line<'static> {
     let value_style = if focused {
         Style::default()
             .fg(theme::text_color())
-            .bg(theme::bg_sunken())
+            .bg(theme::sunken_fill())
     } else {
         Style::default().fg(theme::text_color())
     };
@@ -2768,9 +3171,15 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
     // Grow to fit both border breaks, ` ACTIONS ` and ` <account> ─` with the
-    // meta rule between them; a terminal too narrow for that drops the name.
+    // meta rule between them; a terminal too narrow for that drops the name,
+    // and a name ratatui cannot place reserves nothing.
     let meta_w = state.context.as_ref().map_or(0, |c| {
-        META_RULE_MIN + meta_line(c, Style::default()).width()
+        let slot = meta_line(c, Style::default());
+        if meta_placeable(&slot) {
+            META_RULE_MIN + line_cells(&slot)
+        } else {
+            0
+        }
     });
     let w = (content_w + 6)
         .max(modal_title_w(title) + meta_w as u16)
@@ -2844,7 +3253,10 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
             theme::base()
         };
         let glyph = if focused {
-            Span::styled("❯ ", Style::default().fg(theme::accent_color()).bold())
+            Span::styled(
+                format!("{} ", theme::CARET),
+                Style::default().fg(theme::accent_color()).bold(),
+            )
         } else {
             Span::styled("  ", Style::default())
         };
@@ -2875,4 +3287,4 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
 
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_modals.rs"]
-mod tests;
+pub(super) mod tests;

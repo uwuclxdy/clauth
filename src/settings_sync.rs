@@ -24,16 +24,20 @@
 //!   would be undone on every start.
 //! - `~/.claude/settings.json` is NOT a pristine operator base.
 //!   `claude::apply_profile_to_claude_settings` rewrites the ACTIVE profile's
-//!   managed env keys, `apiKeyHelper`, and `model` into that very file on every
-//!   switch. It is a member carrying its own per-profile fields, so those must
-//!   neither propagate outward nor be overwritten by a sibling's — which the
-//!   symmetric [`key_role`] rule gives for free.
+//!   managed env keys, `apiKeyHelper`, `model`, and `advisorModel` into that
+//!   very file on every switch. It is a member carrying its own per-profile
+//!   fields, so those must neither propagate outward nor be overwritten by a
+//!   sibling's — which the symmetric [`key_role`] rule gives for free.
 //!
-//! With no live `clauth start` session there is nothing to reconcile and nothing
-//! to lose: teardown discards each session's runtime tree, so the base is the
-//! only surviving member and the engine's `members.len() < 2` short-circuit makes
-//! a sync a no-op. That is why this runs on the session watchdog and needs no
-//! daemon tick — a headless box has no runtime copy that could diverge.
+//! With no live `clauth start` session there is no copy to merge: teardown
+//! discards each session's runtime tree, so the base is the only surviving
+//! member and the engine's `members.len() < 2` short-circuit makes the merge a
+//! no-op. That is why the merge runs on the session watchdog alone. The
+//! remembered transcript retention ([`crate::retention`]) is the exception: a
+//! bare `claude` sweeps the operator's store off the operator file alone, so
+//! every pass here puts a lost `cleanupPeriodDays` back first, inside the same
+//! hold and before the merge, and the daemon runs that same check on its own
+//! with no session live.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -78,9 +82,10 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "forceLoginGatewayUrl",
     "forceLoginOrgUUID",
     "model",
+    "advisorModel",
 ];
 
-/// The stat snapshot from the last [`sync_once`] that did work; the key for
+/// The stat snapshot from the last [`sync_once`] pass that settled; the key for
 /// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<Vec<crate::jsonsync::MemberSnapshot>>> = Mutex::new(None);
 
@@ -108,11 +113,14 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// The set has two halves:
 /// - top level ([`PER_PROFILE_TOP_FIELDS`]): `apiKeyHelper` names the profile
 ///   whose `config.toml` holds the raw key, so propagating that one string hands
-///   one account's key to another without any `env` entry moving; `model` is
-///   routing.
+///   one account's key to another without any `env` entry moving; `model` and
+///   `advisorModel` are routing. `effortLevel` stays shared — it is Claude
+///   Code's own key; clauth's effort carrier is the managed
+///   `CLAUDE_CODE_EFFORT_LEVEL` env key below.
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
-///   every key any profile declares in its own `config.toml` `[env]`.
+///   every key any profile declares in its own `config.toml` `[env]` and every
+///   key `~/.clauth/base-env.json` records as covered.
 ///
 /// `custom_env` is the union across ALL profiles, not just the member's own
 /// owner, and that is REQUIRED — not merely the conservative choice.
@@ -139,11 +147,11 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
     }
 }
 
-/// Every `settings.json` clauth reconciles: the operator's own
-/// `~/.claude/settings.json` plus each SHARED per-session runtime copy, via
-/// [`crate::jsonsync::runtime_files_under`].
-fn known_paths() -> Result<Vec<PathBuf>> {
-    Ok(crate::jsonsync::runtime_files_under(
+/// Every `settings.json` a reconcile pass may join: the operator's own
+/// `~/.claude/settings.json` plus each LIVE shared per-session runtime copy,
+/// via [`crate::jsonsync::live_runtime_files_under`].
+pub(crate) fn known_paths() -> Result<Vec<PathBuf>> {
+    Ok(crate::jsonsync::live_runtime_files_under(
         &claude_dir()?,
         "settings.json",
     ))
@@ -159,11 +167,14 @@ struct EnvOnlyConfig {
     env: BTreeMap<String, String>,
 }
 
-/// Union of every profile's custom `[env]` keys. A missing `config.toml` is a
-/// profile with no overrides and contributes nothing.
+/// Union of every profile's custom `[env]` keys and every key
+/// `~/.clauth/base-env.json` records as covered: a hand edit can drop a key
+/// from the active account's `config.toml` while its value is still live. A
+/// missing `config.toml` is a profile with no overrides and contributes
+/// nothing.
 ///
-/// `None` when a `config.toml` cannot be read or parsed: the affected
-/// profiles' env sets are then unknown, and [`sync_members`] skips the merge
+/// `None` when a `config.toml` or the record cannot be read or parsed: the
+/// affected env sets are then unknown, and [`sync_members`] skips the merge
 /// rather than treat their keys as shared and leak them into a sibling.
 /// Fail-closed, and self-healing — a file caught mid-edit reads cleanly on the
 /// next tick. Because that pauses settings sync entirely, the first failure is
@@ -181,10 +192,10 @@ struct EnvOnlyConfig {
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     // The union must cover every profile the MEMBER SET can contain, and the
-    // members (`known_paths` → `shared_runtime_dirs`) are DIRECTORY-derived —
+    // members (`known_paths` → `live_shared_runtime_dirs`) are DIRECTORY-derived —
     // so the union walks the same directory listing. A roster-driven union
-    // would let an off-roster dir (the partial-save drift
-    // `sync_state_profiles` exists to repair) keep merging its runtime
+    // would let an off-roster dir (a profile dir written but its roster entry
+    // never saved) keep merging its runtime
     // settings while its `[env]` keys read as shared: the exact leak this fn
     // fails closed against. What the codex split changes is only WHOSE dirs
     // belong to this subsystem: a dir the codex roster claims is skipped — it
@@ -230,10 +241,8 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         .map(|n| n.to_string())
         .collect();
     let profiles = clauth_dir().ok()?.join("profiles");
-    let Ok(entries) = std::fs::read_dir(&profiles) else {
-        return Some(keys);
-    };
-    for entry in entries.flatten() {
+    // No profiles dir is no profile overrides; the record below still counts.
+    for entry in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
@@ -268,6 +277,15 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
             }
         }
     }
+    // A key the active account covers stays per-profile while its record
+    // entry lives, though a hand edit dropped it from that `config.toml`.
+    match crate::claude::saved_base_env_keys() {
+        Ok(covered) => keys.extend(covered),
+        Err(_) => {
+            let path = crate::claude::saved_base_env_path().ok()?;
+            return warn_paused(&path, "does not parse");
+        }
+    }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
     Some(keys)
 }
@@ -287,10 +305,17 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
 }
 
 /// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` stat
-/// fast path in [`crate::jsonsync::run_with_cache`].
+/// fast path in [`crate::jsonsync::run_with_cache`]. The member list is the
+/// fast path's stat key only: the merge re-reads it inside the lock. The key
+/// also holds the retention record the settle reads, which another process (a
+/// build, the daemon) can change while every member holds still. Only a
+/// [`SyncPass::cacheable`] pass keys it.
 pub(crate) fn sync_once() -> Result<()> {
-    let paths = known_paths()?;
-    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || sync_members(&paths))
+    let mut paths = known_paths()?;
+    paths.push(crate::retention::record_path()?);
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || {
+        sync_members().map(SyncPass::cacheable)
+    })
 }
 
 /// The written-copy record for `settings.json`, persisted under the same state
@@ -298,8 +323,38 @@ pub(crate) fn sync_once() -> Result<()> {
 /// outrank a real Claude Code write.
 const SETTINGS_SYNC_WRITTEN_FILENAME: &str = ".settings-sync-written.json";
 
-/// Merge the members under the cross-process state flock. Returns whether the
-/// merge ran (`false` = paused on an unreadable `config.toml`).
+/// The written-copy record path for `settings.json` — one derivation shared by
+/// the merge and the runtime build, so a copy clauth builds is a copy the merge
+/// knows clauth wrote.
+pub(crate) fn written_record_path() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join(SETTINGS_SYNC_WRITTEN_FILENAME))
+}
+
+/// What one [`sync_members`] pass did.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SyncPass {
+    /// Whether the merge ran: `false` when a failed operator put-back skipped
+    /// it, or an unreadable `config.toml` paused it.
+    pub(crate) merged: bool,
+    /// Whether the pass wrote a file, failed to, or could not read or parse a
+    /// registered spawn file it had a number for: a retention put-back or
+    /// record write, a spawn-file keep-current rewrite, a merge write.
+    pub(crate) attempted_write: bool,
+}
+
+impl SyncPass {
+    /// Whether the fast path may key this pass: the merge ran, the pass wrote
+    /// no file and failed to write none, and it could read and parse every
+    /// spawn file it had a number for. A stat key taken before a pass that
+    /// wrote describes bytes the pass replaced, so the same bytes restored at
+    /// the same stat would read as settled; one taken before a pass that owes
+    /// a retry would skip the retry.
+    pub(crate) fn cacheable(self) -> bool {
+        self.merged && !self.attempted_write
+    }
+}
+
+/// Merge the members under the cross-process state flock.
 ///
 /// The lock is what makes this safe against the switch writer.
 /// `claude::apply_profile_to_claude_settings` rewrites the ACTIVE profile's
@@ -319,20 +374,83 @@ const SETTINGS_SYNC_WRITTEN_FILENAME: &str = ".settings-sync-written.json";
 /// that predates the edit rules the key `Shared` and copies it into every
 /// sibling runtime. That leak does not self-heal: from the next tick the key IS
 /// per-profile, so each sibling keeps the copy it should never have received.
-/// The added cost is N small TOML parses inside a hold that already does N
+/// The added cost is N small TOML parses plus the member-list walk — a read of
+/// every profile dir, and of each shared runtime tree's sessions dir with one
+/// open per marker until a held one, and a job-store read when some candidate's
+/// marker probe found nothing — inside a hold that already does N
 /// `settings.json` reads, parses, and writes.
-fn sync_members(paths: &[PathBuf]) -> Result<bool> {
+fn sync_members() -> Result<SyncPass> {
     let operator_file = claude_dir()?.join("settings.json");
-    let record = clauth_dir()?.join(SETTINGS_SYNC_WRITTEN_FILENAME);
-    with_state_lock(|_held| {
-        let Some(custom_env) = per_profile_env_keys() else {
-            return Ok(false);
+    let record = written_record_path()?;
+    #[cfg(test)]
+    run_pre_lock_hook();
+    with_state_lock(|held| {
+        // The member list is read INSIDE the hold: a pass that listed it before
+        // a just-started session's marker was held would run with that session
+        // missing, prune its record entry, and let its first in-session edit be
+        // reverted. The list and `per_profile_env_keys` are read inside the
+        // same hold, so neither predates the merge.
+        let paths = known_paths()?;
+        // Before the env-key pause and whatever the member count: a paused
+        // sync or a lone operator file must still get the number back, and the
+        // merge below must read the members the put-back left.
+        let retention = crate::retention::settle(held, &operator_file, &paths, &record)?;
+        let skipped = SyncPass {
+            merged: false,
+            attempted_write: retention.attempted_write,
         };
-        crate::jsonsync::sync_paths(paths, Some(&operator_file), Some(&record), |path| {
-            key_role(path, &custom_env)
-        })?;
-        Ok(true)
+        // A failed operator put-back skips this pass's merge while it stands:
+        // a merge after it could strip the key from the copies that already
+        // got it back. The skipped pass never keys the `sync_once` fast path,
+        // so the next wake retries the put-back.
+        if !retention.merge_ok {
+            return Ok(skipped);
+        }
+        let Some(custom_env) = per_profile_env_keys() else {
+            return Ok(skipped);
+        };
+        let merge_attempted_write = crate::jsonsync::sync_paths_reporting_writes(
+            &paths,
+            Some(&operator_file),
+            Some(&record),
+            crate::jsonsync::SETTINGS_PROTECTED_KEYS,
+            |path| key_role(path, &custom_env),
+        )?;
+        Ok(SyncPass {
+            merged: true,
+            attempted_write: retention.attempted_write || merge_attempted_write,
+        })
     })
+}
+
+/// Test-only interleave point at the top of [`sync_members`], before the state
+/// flock is taken: the span a session starting between the fast path's member
+/// list and the lock occupies. A test arms it to start a session there and pin
+/// that the merge re-reads the list inside the lock rather than pruning the
+/// fresh session's record entry. `None` is inert; armed and disarmed only while
+/// the arming test holds a `HomeSandbox`.
+#[cfg(test)]
+static PRE_LOCK_HOOK: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// Arm or clear the [`PRE_LOCK_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_pre_lock_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook.map(std::sync::Arc::from);
+}
+
+/// Invoke the armed [`PRE_LOCK_HOOK`], if any. Clones the `Arc` so the hook
+/// runs outside the slot lock.
+#[cfg(test)]
+fn run_pre_lock_hook() {
+    let hook = PRE_LOCK_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]

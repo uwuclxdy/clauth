@@ -47,6 +47,7 @@ fn seed_profiles(names: &[&str], disabled: bool) {
             None,
             None,
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -73,6 +74,7 @@ fn seed_third_party_profiles(names: &[&str]) {
             Some("https://api.deepseek.com".to_string()),
             Some("sk-test-unfunded".to_string()),
             Default::default(),
+            None,
         )
         .expect("create profile");
     }
@@ -377,6 +379,33 @@ fn a_resolved_prompt_path_reads_the_file() {
     );
 }
 
+/// A prompt file whose text starts with `-` would reach claude right after
+/// `-p`, where claude reads it as an option: refused, relative and absolute
+/// alike.
+#[test]
+fn a_prompt_file_whose_text_starts_with_a_dash_is_refused() {
+    let home = HomeSandbox::new();
+    let cwd = work_dir(home.home());
+    std::fs::write(
+        cwd.join("task.md"),
+        "--managed-settings={\"cleanupPeriodDays\":1}",
+    )
+    .expect("fixture file");
+    let cwd = cwd.to_str().unwrap();
+    let refusal = "`prompt` cannot start with `-`: claude would read it as an option".to_string();
+    assert_eq!(
+        super::read_prompt_path(Some(cwd), "task.md"),
+        Err(refusal.clone())
+    );
+    let abs = std::path::absolute(cwd)
+        .expect("absolute cwd")
+        .join("task.md");
+    assert_eq!(
+        super::read_prompt_path(None, abs.to_str().expect("utf8")),
+        Err(refusal)
+    );
+}
+
 /// A FIFO blocks a read-only open until a writer appears, and the MCP server
 /// runs on the only thread of its current-thread runtime, so reading one as a
 /// prompt path would freeze every tool until the process dies. The type check
@@ -551,9 +580,8 @@ fn args_carry_flag_matches_both_spellings() {
 }
 
 /// The wiring the shadow rule protects: `subagent_type` reaches the child as
-/// `--agent <name>`. `run_delegate` cannot run without a real `claude` child,
-/// so the pin is a source scan, the same mechanism the heartbeat wiring pins
-/// use.
+/// `--agent <name>`. The argv test below runs `run_delegate` under
+/// `FakeClaude`; this source scan stays as the cheap pin on the arm itself.
 #[test]
 fn subagent_type_is_passed_as_the_agent_flag() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -572,6 +600,39 @@ fn subagent_type_is_passed_as_the_agent_flag() {
         flag.contains(r#"["--agent", agent]"#),
         "the arm passes the long-form flag AND the caller's value: {flag}",
     );
+}
+
+/// `subagent_type` reaches the spawn as the caller spelled it: clauth neither
+/// strips nor refuses a prefix — the child resolves the name and clauth holds
+/// no roster to map against — so the argv the child receives carries the
+/// call's value verbatim.
+#[cfg(unix)]
+#[test]
+fn a_prefixed_subagent_type_reaches_the_spawn_unchanged() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let fake = FakeClaude::new(&home);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        subagent_type: Some("agents:rev".to_string()),
+        ..base()
+    });
+    // The shim prints no stream-json, so the envelope may be an error: the run
+    // under test is the argv, not the result.
+    let _ = result;
+    let spawns = fake.spawns();
+    assert!(!spawns.is_empty(), "the delegate spawned claude");
+    for (dir, argv) in &spawns {
+        assert!(
+            argv.contains("--agent agents:rev"),
+            "the prefixed spelling reaches the child exactly as the call spelled it ({dir}): {argv}"
+        );
+    }
 }
 
 /// The session-identity flags are clauth-owned, not a typed-vs-raw duplicate:
@@ -596,38 +657,93 @@ fn raw_session_flags_in_args_are_refused() {
     }
 }
 
-/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: one binding
-/// feeds both the env var and the `--session-id`/`--resume` flag, so the
-/// exported id is always the id the child runs under. `run_delegate` cannot
-/// run without a real `claude` child, so the pin is a source scan, the same
-/// mechanism the agent-flag wiring pin uses.
+/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: the id the
+/// spawn exports is the id the child runs under, pinned by `--session-id` on
+/// a fresh run and continued by `--resume=<id>` on a resume. The resumed id
+/// rides one word, so claude never reads an id as an option of its own.
+#[cfg(unix)]
 #[test]
 fn the_exported_session_id_is_the_id_the_child_runs_under() {
-    let src = include_str!("../../src/mcp/mod.rs");
-    let body = src
-        .split_once("fn run_delegate(")
-        .expect("run_delegate is defined")
-        .1;
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let mut fake = FakeClaude::new(&home);
+    let dump = home.home().join("env-dump");
+    fake.set_env_dump(&dump);
+    let exported = || {
+        std::fs::read_to_string(&dump)
+            .expect("the shim dumped its env")
+            .lines()
+            .find_map(|line| line.strip_prefix("CLAUTH_DELEGATE_SESSION_ID="))
+            .map(str::to_owned)
+            .expect("the spawn exports its session id")
+    };
+    let last_argv = || {
+        fake.spawns()
+            .last()
+            .map(|(_, argv)| argv.split(' ').map(str::to_owned).collect::<Vec<_>>())
+            .expect("the delegate spawned claude")
+    };
+
+    // The shim prints no stream-json, so each envelope may be an error: the
+    // run under test is the argv and env, not the result.
+    drop(call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        ..base()
+    }));
+    let fresh = exported();
+    let argv = last_argv();
+    let pin = argv
+        .iter()
+        .position(|word| word == "--session-id")
+        .expect("a fresh run pins its id");
     assert_eq!(
-        body.match_indices("delegate_session_id(").count(),
-        1,
-        "exactly one place mints the delegate's session id",
+        argv.get(pin + 1),
+        Some(&fresh),
+        "a fresh run pins the id it exports: {argv:?}"
+    );
+
+    // The transcript a resume resolves: the id under a workspace slug in the
+    // sandbox's global store.
+    let id = "sess-resume-1";
+    let workspace = home.home().join("w-resume");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let slug = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects")
+        .join("-w-resume");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    std::fs::write(
+        slug.join(format!("{id}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+        ),
+    )
+    .expect("transcript fixture");
+    drop(call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        session_id: Some(id.to_string()),
+        ..base()
+    }));
+    assert_eq!(exported(), id, "a resume exports the id it continues");
+    let argv = last_argv();
+    assert!(
+        argv.contains(&format!("--resume={id}")),
+        "a resume continues its id as one word: {argv:?}"
     );
     assert!(
-        body.contains("let session_id = delegate_session_id(opts.resume)?;"),
-        "the mint binds the name the env stamp and the flag both read",
-    );
-    let tail = body
-        .split_once("if let Some(id) = opts.resume {")
-        .expect("the resume arm exists")
-        .1;
-    assert!(
-        tail.contains(r#"["--resume", id]"#),
-        "a resume keeps the id it continues",
+        !argv.iter().any(|word| word == "--resume" || word == "-r"),
+        "no word of its own carries the resumed id: {argv:?}"
     );
     assert!(
-        tail.contains(r#"["--session-id", &session_id]"#),
-        "a fresh run pins the very binding the env var names",
+        !argv.iter().any(|word| word == "--session-id"),
+        "a resume pins no fresh id: {argv:?}"
     );
 }
 
@@ -742,6 +858,10 @@ fn result_file_writes_the_envelope_and_returns_path_and_sha256() {
     assert!(
         text.starts_with("result written to ") && text.contains("sha256 "),
         "the reply carries path and sha256, not the inline body: {text}",
+    );
+    assert!(
+        text.contains("first line: cwd does not exist"),
+        "the reply names the result's first line beside the path: {text}",
     );
     let path = text
         .split_once("result written to ")
@@ -1163,7 +1283,7 @@ fn a_resume_without_profiles_resolves_the_account_from_the_conversation_record()
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: solo"]);
+    assert_refusal(&result, &["'solo': account is disabled"]);
 }
 
 /// An id no record exists for cannot be attributed: the refusal names the fix,
@@ -1224,7 +1344,7 @@ fn an_explicit_profiles_wins_over_the_record_for_a_resume() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: other"]);
+    assert_refusal(&result, &["'other': account is disabled"]);
     assert!(
         !first_text(&result).contains("solo"),
         "the record's account is not consulted: {}",
@@ -1332,6 +1452,7 @@ fn seed_keyless_third_party(name: &str) {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 }
@@ -1399,10 +1520,7 @@ fn background_single_disabled_target_refuses_before_reserving_a_job() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
-    );
+    assert_refusal(&result, &["'zzbg-off': account is disabled"]);
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -1425,6 +1543,7 @@ fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     assert!(
@@ -1472,6 +1591,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("zzbg-off"))
@@ -1482,6 +1602,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1493,10 +1614,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
-    );
+    assert_refusal(&result, &["'zzbg-off': account is disabled"]);
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -2079,8 +2197,7 @@ fn an_unfunded_target_is_refused_at_routing_time() {
         first_text(&result),
         "delegate to `broke` failed: cannot fund a run: broke — api balance: \
          0.00 CNY (balance too low) (cached 1h 30m ago); name another account; \
-         target `broke`: no 5h/7d limits; api balance: 0.00 CNY (balance too \
-         low) (cached 1h 30m ago)",
+         target `broke`: api balance: 0.00 CNY (balance too low) (cached 1h 30m ago)",
         "the refusal names the account, the provider's figure, the verdict, \
          the cache age and the fix, and the headroom clause dates the same \
          cache"
@@ -2193,6 +2310,7 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
         Some("https://api.deepseek.com".to_string()),
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
     drop(config);
@@ -2226,12 +2344,169 @@ fn the_disabled_sentence_outranks_the_unfunded_one() {
         prompt: Some("hi".to_string()),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled", "clauth enable"]);
+    assert_refusal(&result, &["'broke': account is disabled"]);
     let text = first_text(&result);
     assert!(
         !text.contains("failed: cannot fund a run"),
         "the disabled sentence is the refusal; the headroom footer may still \
          name the verdict beside its figure, but the reason is not the \
          unfunded one: {text}"
+    );
+}
+
+/// `args_carry_flag` stops at the first `--`: a flag after it is the child's
+/// prompt text, never an option the typed-arg shadow rule must see.
+#[test]
+fn args_carry_flag_stops_at_the_separator() {
+    let svec = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert!(args_carry_flag(&svec(&["--agent", "x"]), "--agent"));
+    assert!(args_carry_flag(&svec(&["--agent=x"]), "--agent"));
+    assert!(args_carry_flag(
+        &svec(&["--agent", "x", "--", "prompt"]),
+        "--agent"
+    ));
+    assert!(!args_carry_flag(&svec(&["--", "--agent", "x"]), "--agent"));
+    assert!(!args_carry_flag(&svec(&["--", "--agent=x"]), "--agent"));
+}
+
+/// A quarantined proxy account holding no key and no bind (a stored pair the
+/// load read as an OAuth login) is told the login through its proxy, the only
+/// login clauth takes for it; the same account with no proxy record keeps the
+/// browser-login sentence, byte for byte.
+#[test]
+fn a_quarantined_proxy_target_is_told_the_login_through_its_proxy() {
+    let _home = HomeSandbox::new();
+    let mut px = crate::profile::Profile::new("px".to_string(), None, None);
+    px.proxy = Some(crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let plain = crate::profile::Profile::new("pn".to_string(), None, None);
+    let config = AppConfig {
+        state: AppState {
+            auth_broken: vec!["px".into(), "pn".into()],
+            ..AppState::default()
+        },
+        profiles: vec![px, plain],
+    };
+    let refusal = |name: &str| {
+        let pn = crate::profile::ProfileName::from(name);
+        let profile = config.find(&pn).unwrap();
+        super::preflight_target(profile, &config, &pn, &[], &[], None, false, &[])
+    };
+    assert_eq!(
+        (refusal("px"), refusal("pn")),
+        (
+            Err("profile has no api key: px (run `clauth login px --proxy stub`)".to_string()),
+            Err(
+                "login for 'pn' has expired: refresh token revoked or invalid: run \
+                 `clauth login pn`"
+                    .to_string()
+            ),
+        ),
+        "(the proxy account's refusal, the plain account's)"
+    );
+}
+
+/// Ends the held delegate if the test leaves before its own signal: the shim
+/// records its pid before it waits, so a drop after a panic past that read
+/// still finds the pid, and a second signal to a group already gone does
+/// nothing. Without it, a panic between the spawn and the signal leaves the
+/// run thread blocked on a child only a signal ends, and the scoped join hangs.
+/// Residual: a shim that records nothing inside the pid wait's ten seconds
+/// leaves no pid to find, so a panic there waits on the child; a shim that
+/// starts at all records before it waits.
+#[cfg(target_os = "linux")]
+struct HeldDelegate<'a> {
+    hold: &'a std::path::Path,
+    pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldDelegate<'_> {
+    /// Record the pid the test read, so the drop signals even if the file it
+    /// was read from is unreadable by then.
+    fn record(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldDelegate<'_> {
+    fn drop(&mut self) {
+        let recorded = std::fs::read_to_string(self.hold)
+            .ok()
+            .and_then(|text| text.lines().next()?.parse::<u32>().ok());
+        if let Some(pid) = self.pid.or(recorded) {
+            jobs::signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// A delegate's child reads stdin from `/dev/null`: claude 2.1.327 takes
+/// settings and managed settings from a piped stdin's initialize line, and no
+/// scan of `args` sees them, so a piped stdin would open a settings channel
+/// clauth never judged.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_delegate_spawns_claude_with_a_null_stdin() {
+    use crate::testutil::FakeClaude;
+
+    let home = HomeSandbox::new();
+    // `ProfileRuntime::acquire` refuses a start when `~/.claude` is absent.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("~/.claude");
+    seed_profiles(&["solo"], false);
+    let mut fake = FakeClaude::new(&home);
+    let hold = home.home().join("stdin-hold.log");
+    fake.set_signal_hold(&hold);
+    let stdin = std::thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            call_delegate(DelegateArgs {
+                profiles: Some(vec!["solo".to_string()]),
+                prompt: Some("hi".to_string()),
+                ..base()
+            })
+        });
+        let mut held = HeldDelegate {
+            hold: &hold,
+            pid: None,
+        };
+        let pid = super::tests::wait_for_recorded_pid(&hold);
+        held.record(pid);
+        let stdin = std::fs::read_link(format!("/proc/{pid}/fd/0"));
+        // The group signal ends the held child and the grandchild holding its
+        // pipes; a group already gone signals nothing.
+        jobs::signal_group(pid, libc::SIGTERM);
+        run.join().expect("the delegate returns a tool result");
+        stdin
+    });
+    assert_eq!(
+        stdin.expect("the held child still has its stdin"),
+        std::path::Path::new("/dev/null"),
+        "the delegate's claude reads stdin from /dev/null, never a settings channel"
+    );
+}
+
+/// The delegate spawn names its stdin exactly once: an inherited one is the MCP
+/// server's own JSON-RPC pipe, and a later `.stdin(..)` on the same builder
+/// overrides the null. The runtime test above cannot tell an inherited stdin
+/// from `/dev/null` when the runner itself hands the test `/dev/null`.
+#[test]
+fn run_delegate_names_a_null_stdin() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let rest = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let body = rest.split_once("\nfn ").map_or(rest, |(body, _)| body);
+    assert!(
+        body.contains(".stdin(Stdio::null())"),
+        "run_delegate must spawn claude with a null stdin"
+    );
+    assert_eq!(
+        body.matches(".stdin(").count(),
+        1,
+        "run_delegate sets claude's stdin once, so nothing overrides the null"
     );
 }

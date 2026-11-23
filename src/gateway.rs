@@ -75,7 +75,7 @@ pub(crate) const HEALTH_RESPONSE_SECS: u64 = 2;
 /// The probe's end-to-end ceiling, the two phase bounds added:
 /// [`direct_config`] also sets `timeout_global` to this sum, which is what
 /// enforces it as one end-to-end bound (the header deadline alone stops at the
-/// headers; see `oauth::TOKEN_HTTP_DEADLINES` for the 3.4.2 measurement).
+/// headers; see `oauth::TOKEN_HTTP_DEADLINES` for the measurement).
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration =
     Duration::from_secs(HEALTH_CONNECT_SECS + HEALTH_RESPONSE_SECS);
 
@@ -288,9 +288,11 @@ fn current_holder_identity() -> Result<DaemonIdentity, NoHolder> {
 
 /// Write a hold naming the daemon that holds the singleton now. The TUI's
 /// transient "stop the gateway" writes it; that daemon honours it and any
-/// later daemon ignores and removes it, so a restart clears it by
-/// construction. Errors when no daemon holds the singleton, its pid sidecar is
-/// unreadable, or its start time cannot be read.
+/// later daemon ignores and removes it, so a start as a new process clears it
+/// by construction. A self-update re-exec keeps the pid and its start time, so
+/// the hold survives it, as it survived an update before the re-exec. Errors
+/// when no daemon holds the singleton, its pid sidecar is unreadable, or its
+/// start time cannot be read.
 pub(crate) fn write_hold() -> Result<()> {
     let identity = current_holder_identity()?;
     let path = hold_path()?;
@@ -2551,7 +2553,7 @@ pub(crate) fn health_agent() -> ureq::Agent {
 /// `response` for the response headers and the body, and their sum as one
 /// end-to-end `timeout_global` bound (which is what makes the sum hold even
 /// though the header deadline stops applying at the headers — see
-/// `oauth::TOKEN_HTTP_DEADLINES` for the 3.4.2 measurement). No redirect is
+/// `oauth::TOKEN_HTTP_DEADLINES` for the measurement). No redirect is
 /// followed and no proxy is used, whatever `builder` carried: through an
 /// env-configured proxy a loopback target resolves on the proxy's own host, any
 /// other target's delays and errors would be the proxy's, and the admin key
@@ -2570,6 +2572,11 @@ fn direct_config(
         .max_redirects(0)
         .max_redirects_will_error(false)
         .proxy(None)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 #[derive(Deserialize)]
@@ -4081,6 +4088,9 @@ pub(crate) struct Exited {
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
     deadline: Instant,
+    /// When the child's exit was observed; the drain windows are measured from
+    /// here, not from whenever a caller happens to collect.
+    exit_at: Instant,
 }
 
 impl Exited {
@@ -4100,6 +4110,30 @@ impl Exited {
             .as_ref()
             .map(|chunks| collect_output(chunks, self.deadline))
             .unwrap_or_default()
+    }
+
+    /// The stdout that arrived within `drain` of the child's exit (or the
+    /// run's deadline, whichever is sooner), up to the limit the run was
+    /// given. A descendant holding the pipe open past the child's exit can
+    /// hold the answer only until this shorter deadline, not to the run's
+    /// bound.
+    pub(crate) fn stdout_within(&self, drain: Duration) -> Vec<u8> {
+        self.stdout
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    /// [`stdout_within`] for stderr.
+    pub(crate) fn stderr_within(&self, drain: Duration) -> Vec<u8> {
+        self.stderr
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    fn drain_deadline(&self, drain: Duration) -> Instant {
+        std::cmp::min(self.deadline, self.exit_at + drain)
     }
 }
 
@@ -4197,6 +4231,7 @@ fn run_bounded_impl(
         stdout,
         stderr,
         deadline,
+        exit_at: Instant::now(),
     }))
 }
 

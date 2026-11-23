@@ -37,6 +37,33 @@ fn acknowledge_confirm_renders_on_narrow_terminals() {
     }
 }
 
+/// A confirm sizes its box by the cells its body draws: a detail of 20
+/// lam-alef pairs (20 cells to a whole-string measure, 40 drawn, under the
+/// box cap) gets a box wide enough to hold it on one row, as the same-width
+/// ASCII detail does.
+#[test]
+fn a_lam_alef_confirm_detail_sizes_the_box_by_its_drawn_cells() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState, Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let detail = "لا".repeat(20);
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "go?".into(),
+        detail: Some(detail.clone()),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RotateAll,
+    }));
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains(&detail)),
+        "the 40-cell detail renders on one row: {rows:?}"
+    );
+}
+
 /// An overflowing confirm body scrolls one line with ↓ and one page with
 /// PageDown while the buttons stay pinned; ←/→ still pick the button and Enter
 /// on the default `cancel` closes without running the action.
@@ -279,22 +306,33 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
     let mut tokens = empty_app(Tab::Tokens);
     let empty_usage = empty_app(Tab::Usage);
 
+    // A second account and a second model give each selector somewhere to
+    // walk: a lone row wraps onto itself and its help lists no `↑ ↓`.
     let usage_at_rest = app_on(
         Tab::Usage,
-        vec![crate::testutil::blank_profile(
-            &crate::profile::ProfileName::from("acct"),
-        )],
+        vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct")),
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("acct2")),
+        ],
     );
     usage.usage_detail_focus = StatusFocus::Detail;
     let dashboard = empty_app(Tab::Tokens);
     let mut model_selector = empty_app(Tab::Tokens);
     model_selector.token_stats = Some(crate::tokens::TokenStats {
-        models: vec![crate::tokens::ModelTokens {
-            model: "claude-opus-4-8".into(),
-            input: 12,
-            output: 8,
-            ..Default::default()
-        }],
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4-8".into(),
+                input: 12,
+                output: 8,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4-8".into(),
+                input: 3,
+                output: 2,
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     });
     model_selector.token_view = TokenView::Models;
@@ -305,6 +343,31 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
     tokens.token_stats = model_selector.token_stats.clone();
     tokens.token_view = TokenView::Models;
     tokens.model_detail_focus = StatusFocus::Detail;
+    // Each detail draws at a height it overflows, so it has somewhere to
+    // scroll: the bound its body publishes is the one the help reads.
+    for detail in [&usage, &tokens] {
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, detail)).unwrap();
+        assert!(
+            crate::tui::app::detail_scrolls(detail),
+            "the {:?} detail overflows",
+            detail.tab
+        );
+    }
+    // The populated dashboard lays out its cards, which its card walk needs;
+    // the empty one has none to lay out.
+    for dash in [&populated_dashboard, &dashboard] {
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, dash)).unwrap();
+    }
+    assert_eq!(
+        (
+            populated_dashboard.token_dash_rows.borrow().len(),
+            dashboard.token_dash_rows.borrow().len()
+        ),
+        (7, 0),
+        "(populated, empty) laid-out cards"
+    );
 
     let cases: [(&str, &App, &str, &[&str]); 8] = [
         (
@@ -325,7 +388,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &empty_usage,
             "USAGE",
             &[
-                "│    ↑ ↓                 pick account to inspect",
                 "│    e                   toggle estimates",
                 "│    p                   toggle pace marker",
             ],
@@ -349,8 +411,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &dashboard,
             "TOKENS",
             &[
-                "│    ↑ ↓                 move between cards",
-                "│    pgup/pgdn           move a page of cards",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
                 "│    r                   reload on-disk stats",
@@ -374,7 +434,6 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &empty_model_selector,
             "TOKENS",
             &[
-                "│    ↑ ↓                 pick model",
                 "│    esc                 back to dashboard",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
@@ -463,6 +522,17 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
     });
     models.token_view = TokenView::Models;
     models.model_detail_focus = StatusFocus::Detail;
+    // Each detail draws at a height it overflows, so it has somewhere to
+    // scroll: the bound its body publishes is the one the help reads.
+    for detail in [&usage, &models] {
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, detail)).unwrap();
+        assert!(
+            crate::tui::app::detail_scrolls(detail),
+            "the {:?} detail overflows",
+            detail.tab
+        );
+    }
 
     let cases: [(&str, &App, &[&str]); 2] = [
         (
@@ -588,12 +658,20 @@ fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
     let mut empty = empty_app(Tab::Tokens);
     let mut populated = empty_app(Tab::Tokens);
     populated.token_stats = Some(crate::tokens::TokenStats {
-        models: vec![crate::tokens::ModelTokens {
-            model: "claude-opus-4-8".into(),
-            input: 12,
-            output: 8,
-            ..Default::default()
-        }],
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4-8".into(),
+                input: 12,
+                output: 8,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4-8".into(),
+                input: 3,
+                output: 2,
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     });
     for (name, app, expected) in [
@@ -622,7 +700,7 @@ fn empty_tokens_hides_enter_in_dashboard_and_model_selector_footer() {
         (
             "empty model selector",
             &empty,
-            " ←→ tabs   ↑↓ model   c count cache   t period   a actions   ? help   q back ",
+            " ←→ tabs   c count cache   t period   a actions   ? help   q back ",
         ),
         (
             "populated model selector",
@@ -683,44 +761,60 @@ fn every_sub_focus_tab_documents_esc_in_help() {
 /// reordering the rows reds here instead of drifting unnoticed. Flattening
 /// drops section titles: every current tab documents exactly one, so nothing
 /// is lost. Add another tab's row list to this loop by extending the call.
-fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
+/// The rows follow the focus and the row under the cursor, so `build` sets up
+/// the state whose rows the caller pins.
+fn assert_tab_rows(build: impl FnOnce() -> App, expected: &[(&str, &str)]) {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = empty_app(tab);
-    if tab == Tab::Usage {
-        app = app_on(
-            tab,
-            vec![crate::testutil::blank_profile(
-                &crate::profile::ProfileName::from("acct"),
-            )],
-        );
-    }
-    if tab == Tab::Tokens {
-        app.token_view = TokenView::Models;
-    }
+    let app = build();
     let rows: Vec<(&str, &str)> = tab_specific_rows(&app)
         .iter()
         .flat_map(|(_, entries)| entries.iter().copied())
         .collect();
-    assert_eq!(rows, expected, "{tab:?} help-modal row list drifted");
+    assert_eq!(rows, expected, "{:?} help-modal row list drifted", app.tab);
 }
 
 #[test]
 fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
+    use crate::tui::app::{Check, Health};
+    // A descended herdr detail whose diagnostics overflow: the bound its body
+    // publishes, stood in here, is what the page keys read through.
+    let herdr_detail = |option: usize| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: vec![],
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.herdr_options_cursor = option;
+        app.services.detail_max_scroll.set(4);
+        app
+    };
+    let arrows = ("↑ ↓", "move between rows");
+    let pages = ("pgup/pgdn", "scroll a page");
     assert_tab_rows(
-        Tab::Services,
+        || herdr_detail(0),
         &[
-            (
-                "↑ ↓",
-                "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
-            ),
-            (
-                "pgup/pgdn",
-                "scroll a page · read plugin / herdr diagnostics · page delegates",
-            ),
-            ("↵", "open detail · activate · open fix"),
+            arrows,
+            pages,
+            ("↵", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+    );
+    assert_tab_rows(
+        || herdr_detail(2),
+        &[
+            arrows,
+            pages,
+            ("↵", "open or act on the focused row"),
             ("space", "activate the focused herdr option"),
             ("+ / -", "step the tag refresh"),
-            ("f", "next fix"),
             ("r", "re-run all checks"),
             ("esc", "back to the list · close the editor"),
         ],
@@ -729,16 +823,29 @@ fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
 
 #[test]
 fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    let enter = ("↵", "open or change the focused row");
+    // The chain list's own keys.
     assert_tab_rows(
-        Tab::Fallback,
+        two_member_chain_app,
         &[
-            ("↑ ↓", "move cursor / detail row"),
+            ("↑ ↓", "move between rows"),
             ("shift ↑ ↓", "reorder to set priority"),
-            (
-                "↵",
-                "open · edit threshold · edit weekly at · edit max spend · toggle gates / last resort · remove · add",
-            ),
-            ("+ / -", "step rotate at / weekly at by 5"),
+            enter,
+        ],
+    );
+    // A member card whose every row acts: its account is on the roster and its
+    // weekly gate is on.
+    assert_tab_rows(
+        || {
+            let mut app = two_member_chain_app();
+            app.fallback_focus = FallbackFocus::Detail;
+            app
+        },
+        &[
+            ("↑ ↓", "move between rows"),
+            enter,
+            ("space", "change the focused setting"),
+            ("+ / -", "step the focused number"),
             (
                 "↵ on rotate at",
                 concat!("type a value, ", key_lit!("↵"), " saves"),
@@ -870,8 +977,8 @@ fn a_modal_with_no_room_to_draw_publishes_no_scroll_range() {
 ///
 /// It also pins the THIS MODAL section that documents the scroll itself, whole:
 /// the row cannot go in `global`, since `draw_help` drops any global row whose
-/// key the current tab redefines and all eight tabs bind ↑↓ — and hanging it
-/// off another section would put two ↑↓ rows with different senses a few lines
+/// key the current tab redefines, so every tab binding ↑↓ would lose it — and
+/// hanging it off another section would put two ↑↓ rows with different senses a few lines
 /// apart, which is what that filter exists to prevent.
 #[test]
 fn a_help_modal_that_fits_renders_without_a_scrollbar() {
@@ -954,21 +1061,18 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
 /// `has a live session`, one screen apart, with no test on either wording.
 #[test]
 fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    // The card holds focus, on its `disable` row: the account is neither
+    // active nor holding a live session, so the row acts and its help row
+    // lists with its gate copy.
     assert_tab_rows(
-        Tab::Setup,
+        || setup_row_app(crate::tui::app::ConfigRow::Disabled),
         &[
-            ("↑ ↓", "pick account / + new, then a row"),
-            ("↵", "open settings · edit field · flip toggle"),
+            ("↑ ↓", "move between rows"),
+            ("↵", "disable"),
             (
                 "↵ on a field",
                 concat!("edit inline; ", key_lit!("↵"), " again saves"),
             ),
-            (
-                "space",
-                "cycle model preset · flip auto-start, usage probe ·",
-            ),
-            ("", "open alert at, probe every"),
-            ("+ / -", "step alert at by 5 · probe every by 30s"),
             (
                 "env",
                 concat!("+ add env · ", key_lit!("↵"), " edits a value"),
@@ -1548,6 +1652,10 @@ fn the_usage_help_rows_derive_per_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     let mut app = app_on(
         Tab::Usage,
@@ -1636,6 +1744,10 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
 
     let global_section = |app: &App| -> Vec<String> {
@@ -1675,7 +1787,7 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         "    ⇧tab                previous screen",
         "    ⌥1-9                jump to tab",
         "    esc                 back within a sub-view (no-op at the top level)",
-        "    pgup/pgdn           scroll a page",
+        "    pgup/pgdn           move a page",
         "    ⌃c                  quit from anywhere",
         "",
     ];
@@ -1694,7 +1806,6 @@ fn the_usage_help_global_section_shadows_r_and_n_per_row() {
         "    ⇧tab                previous screen",
         "    ⌥1-9                jump to tab",
         "    esc                 back within a sub-view (no-op at the top level)",
-        "    pgup/pgdn           scroll a page",
         "    ⌃c                  quit from anywhere",
         "",
     ];
@@ -1930,9 +2041,7 @@ fn the_require_confirm_button_is_dangerous() {
         detail: None,
         choice: false,
         scroll: ConfirmScroll::default(),
-        on_confirm: ConfirmAction::RequireClientTokens {
-            profiles: String::new(),
-        },
+        on_confirm: ConfirmAction::RequireClientTokens,
     };
     let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
@@ -2016,7 +2125,14 @@ fn the_daemon_start_confirm_renders_its_rows_and_spans() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let state = ConfirmState {
         message: "start daemon?".into(),
-        detail: None,
+        detail: Some(
+            concat!(
+                "spawns the clauth daemon detached: ",
+                super::prose::cmd_lit!("clauth daemon"),
+                "\nlogfile at ~/.clauth/daemon.log."
+            )
+            .into(),
+        ),
         choice: false,
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StartDaemon,
@@ -2195,6 +2311,8 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
     };
     let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
     let target = DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 24,
         scroll: std::cell::Cell::new(0),
@@ -2523,6 +2641,8 @@ fn long_choice_modals_keep_the_selected_option_and_thumb_visible() {
     let divergence = crate::tui::app::DivergenceForm {
         active: "work".into(),
         sibling: Some("other".into()),
+        long_lived: false,
+        seen: None,
         cursor: 3,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2560,6 +2680,7 @@ fn the_preset_picker_styles_its_delete_key() {
         "d deletes a saved preset",
         "d",
         true,
+        crate::tui::theme::dim(),
     );
 }
 
@@ -2577,6 +2698,8 @@ fn divergence_target_pages_lines_without_skipping_an_option() {
         .map(|i| format!("wrap{i:02} {}", "x".repeat(50)))
         .collect();
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
@@ -2795,6 +2918,8 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
     app.open_modal(Modal::Divergence(DivergenceForm {
         active: "work".into(),
         sibling: Some("other".into()),
+        long_lived: false,
+        seen: None,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
         viewport: std::cell::Cell::new(0),
@@ -2814,6 +2939,8 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
     let mut app = empty_app(Tab::Overview);
     let targets = (0..24).map(|i| format!("account-{i:02}")).collect();
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "work".into(),
+        seen: None,
         targets,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
@@ -2995,6 +3122,151 @@ fn the_action_menu_drops_a_name_that_leaves_no_rule() {
     }
 }
 
+/// The action menu reserves width for its scope name (`meta_w`) and re-checks
+/// it through [`right_meta_fits`], and both measure by drawn cells: a lam-alef
+/// name (`لالالا`, three pairs) folds to half its cells a whole-string
+/// `Line::width` reads, so a modal sized on that measure left the name clipped
+/// into the corner behind a too-narrow rule.
+///
+/// Hand derivation of the three pins. One blank profile named `لالالا` (each
+/// letter its own one-cell grapheme, so the name draws 6 cells where a
+/// whole-string width reads 3) carries scoped items plus
+/// `refresh all accounts` (the widest label, 20 cells), so
+/// `content_w + 6 = (2 + 20 + 3 + 1) + 6 = 32`. The width terms: ` ACTIONS `
+/// = 9, `modal_title_w` = 12; `meta_line` = ` لالالا ` (8 drawn) + one border
+/// dash = 9, so `meta_w = META_RULE_MIN + 9 = 12`; `right_meta_fits` insets =
+/// 3 + 9 + 0 + 9 = 21 and the name is kept iff `modal − 21 >= 3`, i.e. modal
+/// >= 24. The modal spans `min(max(32, 12 + 12), terminal − 4)` below 80:
+/// - 27 cols → modal 23 → `23 − 21 = 2 < 3` → the name drops whole and the
+///   rule runs `23 − 1 − 10 − 1 = 11` dashes;
+/// - 28 cols → modal 24 → `24 − 21 = 3` → kept on a 3-dash rule,
+///   `1 + 1 + 9 + 3 + 8 + 1 + 1 = 24`;
+/// - 80 cols → cap 48 → modal 32 (content-bound) → `32 − 21 = 11` dashes
+///   between title and name.
+#[test]
+fn the_action_menu_sizes_a_lam_alef_name_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("لالالا"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ─── لالالا ─╮"),
+        (80, "╭─ ACTIONS ─────────── لالالا ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// `ｶﾞｶﾞ` draws 4 cells (two clusters, `CellWidth::cell_width` 2 each: one
+/// per halfwidth sound mark) where a per-grapheme `Span::width` sum reads 2,
+/// so the modal body path must measure and split by `cell_width` like the
+/// buffer: two rows of one cluster each at a 3-cell budget, nothing lost.
+#[test]
+fn chunk_line_wraps_a_katakana_body_line_by_drawn_cells() {
+    use ratatui::text::Line;
+    let rows = chunk_line(Line::from("ｶﾞｶﾞ"), 3);
+    // Hand-derived from the buffer's rule (each cluster draws 2): a 3-cell
+    // fill holds one cluster per row.
+    let texts: Vec<String> = rows.iter().map(line_text).collect();
+    assert_eq!(texts, ["ｶﾞ", "ｶﾞ"], "the exact split");
+    for r in &rows {
+        let drawn: usize = r
+            .spans
+            .iter()
+            .map(|span| super::super::format::grapheme_cells(span.content.as_ref()))
+            .sum();
+        assert!(
+            drawn <= 3,
+            "a row draws {drawn} cells at a 3-cell budget: {rows:?}"
+        );
+    }
+}
+
+/// A scope name carrying halfwidth katakana sound marks (`ｶﾞｶﾞ`, two clusters
+/// drawing 2 cells each) cannot sit in a right-aligned title slot: ratatui
+/// places by the whole-string `Line::width`, and any span holding a mark reads
+/// one cell short per mark — no span layout compensates (the mark's
+/// whole-string width is 0), so the drawn name would clip at the corner and
+/// lose the slot's closing `─`. The meta gives way whole instead, at every
+/// width, leaving the border run whole.
+#[test]
+fn the_action_menu_sizes_a_katakana_name_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("ｶﾞｶﾞ"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ────────────╮"),
+        (80, "╭─ ACTIONS ────────────────────╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// A name ratatui cannot place (`ｶﾞ` x12, halfwidth sound marks) reserves no
+/// width: `meta_w` budgets only a placeable meta, so the menu opens at its
+/// content width (2 + the widest label 20 + 3 + the hotkey 1 + 6 = 32) and the
+/// dropped name leaves no blank border run. Budgeting the unplaceable meta's
+/// full drawn width would open the menu 42 wide.
+#[test]
+fn the_action_menu_loses_no_width_to_an_unplaceable_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = "ｶﾞ".repeat(12);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from(name.as_str()),
+        )],
+    );
+    let (rows, left, right) = render_action_menu(&app, 80, 20);
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the action menu's top border");
+    let title: String = rows[top]
+        .chars()
+        .skip(left)
+        .take(right - left + 1)
+        .collect();
+    assert_eq!(
+        title, "╭─ ACTIONS ────────────────────╮",
+        "the menu opens at its content width, not the dropped name's"
+    );
+}
+
 fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
     let buf = term.backend().buffer();
     let area = *buf.area();
@@ -3004,10 +3276,17 @@ fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend
             row.contains("CHECK OUTPUT")
         })
         .expect("modal top border");
-    let x = (0..area.width)
-        .find(|&xx| buf[(xx, top)].symbol() == "C")
-        .map(|c| c - 3)
-        .expect("modal left corner");
+    let title_len = u16::try_from("CHECK OUTPUT".len()).expect("title fits a u16");
+    let title = (0..area.width)
+        .find(|&xx| {
+            (xx..area.width.min(xx + title_len))
+                .map(|x| buf[(x, top)].symbol())
+                .collect::<String>()
+                == "CHECK OUTPUT"
+        })
+        .expect("modal title");
+    // `╭─ ` sits three cells left of the title's first glyph.
+    let x = title - 3;
     let width = (x..area.width)
         .find(|&xx| buf[(xx, top)].symbol() == "╮")
         .map(|xx| xx - x + 1)
@@ -3110,6 +3389,80 @@ fn the_check_output_modal_ascii_body_renders_unchanged() {
         let got = check_output_body_rows(&term);
         assert_eq!(got, *expected, "check output ascii body at {w} cols");
     }
+}
+
+/// The check-output modal sizes to the cells its body draws: `لالالا` is three
+/// lam-alef pairs drawing two cells each, so the body line draws 20 cells where
+/// a whole-string width sums 11. Measured drawn, the modal is 26 wide (20 + 6
+/// of border and padding) and the line sits on one row; a whole-string measure
+/// sizes it at the 17-cell title and cuts the line into three rows inside a
+/// 17-cell border.
+#[test]
+fn the_check_output_modal_sizes_a_lam_alef_body_by_drawn_cells() {
+    use crate::tui::app::{Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Services);
+    app.open_modal(Modal::CheckOutput("لالالا لالالا لالالا".to_string()));
+    let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert_eq!(
+        modal_rows(term.backend().buffer()),
+        [
+            "╭─ CHECK OUTPUT ─────────╮",
+            "│                        │",
+            "│  لالالا لالالا لالالا  │",
+            "│                        │",
+            "╰────────────────────────╯",
+        ],
+        "the check output modal's drawn rows"
+    );
+}
+
+/// The `KEY IN USE` modal sizes the collision line by the cells it draws: the
+/// typed env key is user text, and `لالالا لالالا لالالا` draws 20 cells where a
+/// whole-string width sums 11, so the line draws 68 and the modal is 74 wide
+/// (68 + 6 of border and padding) rather than 66 under the key's whole-string
+/// width, which would wrap the collision line inside a short border.
+#[test]
+fn the_env_collision_modal_sizes_a_fold_class_key_by_drawn_cells() {
+    use crate::tui::app::{EnvCollisionForm, Modal, ScrollStamp, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::cell::Cell;
+    let _home = crate::testutil::HomeSandbox::new();
+    let key = "لالالا لالالا لالالا";
+    let mut app = empty_app(Tab::Overview);
+    app.open_modal(Modal::EnvCollision(EnvCollisionForm {
+        profile: "work".into(),
+        key: key.into(),
+        reason: "set by the base url field".into(),
+        existing_idx: None,
+        cursor: 0,
+        scroll: Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: Cell::new(0),
+        max_scroll_stamp: Cell::new(ScrollStamp::default()),
+        viewport: Cell::new(0),
+        overwrite_needs_review: Cell::new(false),
+    }));
+    let mut term = Terminal::new(TestBackend::new(140, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    let (_, _, left, right) = modal_bounds(buf);
+    assert_eq!(right - left + 1, 74, "the modal's drawn width");
+    let rows = crate::testutil::buffer_rows(buf);
+    assert!(
+        rows.iter().any(|row| {
+            let cut: String = row
+                .chars()
+                .skip(usize::from(left))
+                .take(usize::from(right - left + 1))
+                .collect();
+            cut.trim_end() == "│  'لالالا لالالا لالالا' is already used by set by the base url field.  │"
+        }),
+        "the collision line draws whole inside the modal"
+    );
 }
 
 /// A scrolled modal fits its title like a panel does: a short body leaves the
@@ -3219,7 +3572,7 @@ fn render_rebind(form: &crate::tui::app::RebindForm, width: u16, height: u16) ->
 }
 
 /// The re-bind confirm renders its grouped body through `draw_rebind` itself:
-/// every row, the toggle glyphs, the cursor mark, and the button pair, pinned
+/// every row, the checkbox marks, the cursor mark, and the button pair, pinned
 /// by equality against the rendered buffer.
 #[test]
 fn the_rebind_confirm_renders_its_grouped_body() {
@@ -3238,15 +3591,15 @@ fn the_rebind_confirm_renders_its_grouped_body() {
             "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
-            "│  ❯ ─● D1                                                                                                                                                              │",
-            "│    ─● D2                                                                                                                                                              │",
+            "│  ❯ [x] D1                                                                                                                                                             │",
+            "│    [x] D2                                                                                                                                                             │",
             "│                                                                                                                                                                       │",
             "│    default  deepseek-chat  → opus                                                                                                                                     │",
             "│    opus     (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
             "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
             "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
-            "│    ─● DS1                                                                                                                                                             │",
+            "│    [x] DS1                                                                                                                                                            │",
             "│                                                                                                                                                                       │",
             "│                                                                                                                                                                       │",
             "│                                                                                                                                                     not now   apply   │",
@@ -3256,9 +3609,155 @@ fn the_rebind_confirm_renders_its_grouped_body() {
     );
 }
 
+/// The re-bind confirm over a bare frame with `D2` unticked, cursor on `D1`.
+fn rebind_pick_buffer() -> ratatui::buffer::Buffer {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut form = rebind_render_form();
+    form.checked[0][1] = false;
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| draw_rebind(f, f.area(), &form)).unwrap();
+    term.backend().buffer().clone()
+}
+
+/// The modal's account row whose content ends in ` name`: `(y, content
+/// left x, content right x, content text)`, the content spanning the cells
+/// inside the border and the 2-cell modal padding.
+fn rebind_account_row(buf: &ratatui::buffer::Buffer, name: &str) -> (u16, u16, u16, String) {
+    let (top, bottom, left, right) = modal_bounds(buf);
+    let (from, to) = (left + 3, right - 3);
+    (top + 1..bottom)
+        .find_map(|y| {
+            let text: String = (from..=to).map(|x| buf[(x, y)].symbol()).collect();
+            let text = text.trim_end().to_string();
+            text.ends_with(&format!(" {name}"))
+                .then_some((y, from, to, text))
+        })
+        .unwrap_or_else(|| panic!("no `{name}` account row in the confirm"))
+}
+
+/// Picking accounts is a multi-select, so each pick reads as a checkbox
+/// (`[x]` / `[ ]`), not an on/off switch, on both tiers alike.
+#[test]
+fn the_rebind_confirm_marks_each_pick_with_a_checkbox_on_both_tiers() {
+    use crate::tui::theme::{self, Tier};
+    /// One tier's account rows, the ticked and unticked box colors, and the
+    /// tier's `ACCENT` / `TEXT_DIM` tokens.
+    type TierFrame = (
+        Tier,
+        Vec<String>,
+        [ratatui::style::Color; 3],
+        [ratatui::style::Color; 3],
+        [ratatui::style::Color; 2],
+    );
+    let tiers = [Tier::Full, Tier::Compatible];
+    // Both tiers render before any assertion, so one red names both. The
+    // modal is located while its tier is held: its border color is per tier.
+    let frames: Vec<TierFrame> = tiers
+        .iter()
+        .map(|&tier| {
+            let _tier = crate::testutil::TierSandbox::new(tier);
+            let buf = rebind_pick_buffer();
+            let rows = ["D1", "D2", "DS1"]
+                .iter()
+                .map(|n| rebind_account_row(&buf, n).3)
+                .collect();
+            let fg = |name: &str, offset: u16| {
+                let (y, from, _, _) = rebind_account_row(&buf, name);
+                buf[(from + offset, y)].fg
+            };
+            (
+                tier,
+                rows,
+                [fg("D1", 2), fg("D1", 3), fg("D1", 4)],
+                [fg("D2", 2), fg("D2", 3), fg("D2", 4)],
+                [theme::accent_color(), theme::text_dim_color()],
+            )
+        })
+        .collect();
+    let want = ["❯ [x] D1", "  [ ] D2", "  [x] DS1"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|(tier, rows, ..)| (*tier, rows.clone()))
+            .collect::<Vec<_>>(),
+        tiers.map(|t| (t, want.clone())).to_vec(),
+        "caret, then the checkbox, then the account, on both tiers"
+    );
+    for (tier, _, ticked, unticked, [accent, dim]) in &frames {
+        assert_eq!(*ticked, [*accent; 3], "{tier:?}: a ticked box is ACCENT");
+        assert_eq!(
+            [unticked[0], unticked[2]],
+            [*dim; 2],
+            "{tier:?}: an unticked box's brackets are TEXT_DIM"
+        );
+    }
+}
+
+/// The confirm's caret is the app's one selection caret: `ACCENT + bold`.
+#[test]
+fn the_rebind_confirm_caret_is_accent_bold() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let buf = rebind_pick_buffer();
+    let (y, from, _, text) = rebind_account_row(&buf, "D1");
+    assert!(text.starts_with('❯'), "the caret sits on D1: {text:?}");
+    let caret = &buf[(from, y)];
+    assert_eq!(
+        (
+            caret.fg,
+            caret.modifier.contains(ratatui::style::Modifier::BOLD)
+        ),
+        (crate::tui::theme::accent_color(), true),
+        "the caret is ACCENT + bold"
+    );
+}
+
+/// The focused account row reads like every other selected row: label
+/// `TEXT + bold` on a `BG_HOVER` tint spanning the content width, while an
+/// unfocused account's label stays `TEXT_DIM`.
+#[test]
+fn the_rebind_confirm_focused_row_takes_the_selected_row_treatment() {
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let buf = rebind_pick_buffer();
+    let (y, from, to, _) = rebind_account_row(&buf, "D1");
+    let untinted: Vec<u16> = (from..=to)
+        .filter(|&x| buf[(x, y)].bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<u16>::new(),
+        "the focused row is tinted to the padding boundary"
+    );
+    let (_, from, _, text) = rebind_account_row(&buf, "D1");
+    let at = (text.chars().count() - 2) as u16;
+    let label = |x: u16| {
+        let c = &buf[(from + x, y)];
+        (c.fg, c.modifier.contains(Modifier::BOLD))
+    };
+    assert_eq!(
+        [label(at), label(at + 1)],
+        [(theme::text_color(), true); 2],
+        "the focused label is TEXT + bold"
+    );
+    let (y2, from2, _, text2) = rebind_account_row(&buf, "D2");
+    let at2 = (text2.chars().count() - 2) as u16;
+    let other = |x: u16| {
+        let c = &buf[(from2 + x, y2)];
+        (c.fg, c.modifier.contains(Modifier::BOLD))
+    };
+    assert_eq!(
+        [other(at2), other(at2 + 1)],
+        [(theme::text_dim_color(), false); 2],
+        "an unfocused label stays TEXT_DIM"
+    );
+}
+
 /// On a terminal shorter than the list, the view follows the cursor: with the
-/// cursor on the last account, its toggle line is on screen while the first
-/// block's toggle has scrolled out.
+/// cursor on the last account, its checkbox row is on screen while the first
+/// block's has scrolled out.
 #[test]
 fn the_rebind_confirm_follows_its_cursor_on_a_short_terminal() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
@@ -3267,19 +3766,18 @@ fn the_rebind_confirm_follows_its_cursor_on_a_short_terminal() {
     let rows = render_rebind(&form, 100, 12);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("─● DS1"),
+        joined.contains("[x] DS1"),
         "the cursor's account is on screen: {joined}"
     );
     assert!(
-        !joined.contains("─● D1 "),
+        !joined.contains("[x] D1 "),
         "the first block scrolled out: {joined}"
     );
 }
 
 /// Returning to a block's first account (Down wraps the cursor back) keeps the
 /// block head on screen: the confirm message and its `default` row, not just
-/// the tail toggles. 20 accounts in one block at 100×24, the reviewer's R2-Q3
-/// shape.
+/// the tail rows. 20 accounts in one block at 100×24.
 #[test]
 fn the_rebind_confirm_wrap_back_shows_the_block_head() {
     use crate::profile::Profile;
@@ -3316,22 +3814,22 @@ fn the_rebind_confirm_wrap_back_shows_the_block_head() {
     );
 }
 
-/// A block taller than the viewport: the cursor's first-account toggle line
+/// A block taller than the viewport: the cursor's first-account checkbox row
 /// stays on screen even though the widened focus reaches back to the block head
-/// (the toggle wins over the head).
+/// (the checkbox row wins over the head).
 #[test]
 fn the_rebind_confirm_first_toggle_stays_visible_when_its_block_outgrows_the_viewport() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let form = rebind_render_form();
     let joined = render_rebind(&form, 100, 12).join("\n");
     assert!(
-        joined.contains("─● D1"),
+        joined.contains("[x] D1"),
         "the first account's toggle is on screen: {joined}"
     );
 }
 
 /// Reach-back into a block after the first: `Up` into block 1's first account
-/// keeps that block's change set on screen, not just its toggle.
+/// keeps that block's change set on screen, not just its checkbox row.
 #[test]
 fn up_into_a_later_blocks_first_account_shows_its_rows() {
     use crate::profile::Profile;
@@ -3735,7 +4233,6 @@ fn the_help_global_section_names_the_switch_keys() {
             "    ⇧tab                previous screen",
             "    ⌥1-9                jump to tab",
             "    esc                 back within a sub-view (no-op at the top level)",
-            "    pgup/pgdn           scroll a page",
             "    ⌃c                  quit from anywhere",
             "",
         ]
@@ -3948,8 +4445,7 @@ fn the_modal_caps_at_sixty_percent_from_eighty_columns() {
 fn the_modal_button_groups_keep_a_one_cell_gap() {
     use crate::tui::app::{
         ConfirmAction, ConfirmScroll, ConfirmState, Dirty, EnvCollisionForm, LossWarningButton,
-        LossWarningDrop, LossWarningState, LossWarningTarget, PresetApplyButton, PresetApplyForm,
-        PresetTarget, Tab,
+        LossWarningDrop, LossWarningState, LossWarningTarget, Tab,
     };
     use ratatui::layout::Rect;
 
@@ -3968,20 +4464,7 @@ fn the_modal_button_groups_keep_a_one_cell_gap() {
         "two-button confirm gap"
     );
 
-    let apply = PresetApplyForm {
-        target: PresetTarget::NewAccount,
-        preset: crate::presets::Preset {
-            name: "p".into(),
-            base_url: None,
-            models: Default::default(),
-            builtin: false,
-        },
-        message: "apply preset p?".into(),
-        replaces: vec!["base url"],
-        leaves: vec!["models"],
-        focus: PresetApplyButton::Cancel,
-        scroll: ConfirmScroll::default(),
-    };
+    let apply = preset_apply_form();
     let rows = slice_modal(&render_rows(
         80,
         24,
@@ -4050,6 +4533,381 @@ fn the_modal_button_groups_keep_a_one_cell_gap() {
     assert_eq!(button_tail(&rows), "not now   apply", "rebind gap");
 }
 
+/// The separator between buttons is any span of spaces alone, not just the
+/// exact single raw space every current builder emits: a wider or styled gap
+/// still stacks one button per row.
+#[test]
+fn button_stack_lines_splits_on_any_space_only_gap() {
+    let row = Line::from(vec![
+        Span::raw(" cancel "),
+        Span::raw("   "),
+        Span::raw(" keep "),
+        Span::styled(" ", Style::default().fg(theme::danger_color())),
+        Span::raw(" clear "),
+    ])
+    .alignment(Alignment::Right);
+    let lines = button_stack_lines(&row);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [" cancel ", " keep ", " clear "],
+        "one button per line"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.alignment == Some(Alignment::Right)),
+        "each stacked line keeps the group's alignment"
+    );
+}
+
+/// The preset-apply confirm's fixture: a message, the keys it replaces and
+/// leaves, and a body that wraps at a phone-width modal.
+fn preset_apply_form() -> PresetApplyForm {
+    use crate::tui::app::{ConfirmScroll, PresetTarget};
+    PresetApplyForm {
+        target: PresetTarget::NewAccount,
+        preset: crate::presets::Preset {
+            name: "p".into(),
+            base_url: None,
+            models: Default::default(),
+            builtin: false,
+        },
+        message: "apply preset p?".into(),
+        replaces: vec!["base url"],
+        leaves: vec!["models"],
+        focus: PresetApplyButton::Cancel,
+        scroll: ConfirmScroll::default(),
+    }
+}
+
+/// At 28 columns the preset-apply confirm's three buttons each take their own
+/// row, whole: the shared button row stacks N buttons when the row overflows
+/// the modal's inner width, the same way it already stacks the two-button pair.
+/// The rows are pinned whole, so a stacked button that drifts off the group's
+/// right edge reds as surely as one that clips.
+#[test]
+fn the_preset_apply_buttons_stack_one_per_row_at_28_columns() {
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let rows = slice_modal(&render_rows(
+        28,
+        20,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_preset_apply(f, a, &apply),
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│  apply preset p?     │".to_string(),
+            "│  replaces base url.  │".to_string(),
+            "│  the preset leaves   │".to_string(),
+            "│  models unset.       │".to_string(),
+            "│                      │".to_string(),
+            "│             cancel   │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "│                      │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "28 columns"
+    );
+}
+
+/// The loss warning's trio stacks one per row at 28 columns too: the shared
+/// layout is pinned on both three-button producers, not only preset apply.
+#[test]
+fn the_loss_warning_buttons_stack_one_per_row_at_28_columns() {
+    use crate::tui::app::{
+        Dirty, LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, Tab,
+    };
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let loss = LossWarningState {
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Overview),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::SetupField],
+        },
+    };
+    let rows = slice_modal(&render_rows(
+        28,
+        20,
+        &|f: &mut ratatui::Frame<'_>, a: Rect| draw_loss_warning(f, a, &loss),
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ WARNING ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│  there are unsaved   │".to_string(),
+            "│  edits on the setup  │".to_string(),
+            "│  tab. save them      │".to_string(),
+            "│  before switching?   │".to_string(),
+            "│                      │".to_string(),
+            "│            go back   │".to_string(),
+            "│            discard   │".to_string(),
+            "│               save   │".to_string(),
+            "│                      │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "28 columns"
+    );
+}
+
+/// A terminal too short for the stacked rows keeps them inside the modal's
+/// border: the rows stay pinned to the modal's bottom, so a tighter terminal
+/// drops rows above the cut and never moves one that still fits, and the border
+/// under them survives. The block fills the last row the border encloses — the
+/// bottom padding row — never the border row itself. Six rows is the shortest
+/// terminal that draws a bordered modal at all: below it the centered rect is
+/// one row, where the two borders merge.
+#[test]
+fn a_stacked_button_row_never_draws_outside_a_short_modal() {
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let frame = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_preset_apply(f, a, &apply)
+        })
+    };
+    let render = |height: u16| slice_modal(&frame(height));
+    // Where the centered rect is a single row (both borders merged into it) no
+    // button draws at all, rather than one beside the modal.
+    for height in 4..=5u16 {
+        let rows = frame(height);
+        for label in ["cancel", "keep", "clear"] {
+            assert!(
+                !rows.join("\n").contains(label),
+                "{label} draws on a {height}-row terminal:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+    // The whole frame, not only the modal's slice: a row drawn below the bottom
+    // border would sit outside a slice that stops at the first `╰`.
+    for height in 6..=12u16 {
+        let rows = frame(height);
+        let top = rows
+            .iter()
+            .position(|row| row.contains('\u{256d}'))
+            .unwrap_or_else(|| panic!("modal top border at height {height}:\n{}", rows.join("\n")));
+        let bottom = rows
+            .iter()
+            .position(|row| row.contains('\u{2570}'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "modal bottom border at height {height}:\n{}",
+                    rows.join("\n")
+                )
+            });
+        assert!(
+            top < bottom,
+            "a bordered modal at height {height}:\n{}",
+            rows.join("\n")
+        );
+        for (i, row) in rows.iter().enumerate() {
+            for label in ["cancel", "keep", "clear"] {
+                assert!(
+                    !row.contains(label) || (top < i && i < bottom),
+                    "{label} at frame row {i} stays between the borders at height {height}:\n{}",
+                    rows.join("\n")
+                );
+            }
+        }
+        assert_eq!(
+            rows[bottom].trim(),
+            format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(22)),
+            "the bottom border under the buttons at height {height}"
+        );
+    }
+    // The shortest heights that still hold a row inside the border: the block is
+    // pinned to the bottom, so only the rows above it are cut.
+    assert_eq!(
+        render(9),
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "9 rows"
+    );
+    assert_eq!(
+        render(10),
+        vec![
+            "╭─ CONFIRM ────────────╮".to_string(),
+            "│                      │".to_string(),
+            "│             cancel   │".to_string(),
+            "│               keep   │".to_string(),
+            "│              clear   │".to_string(),
+            "╰──────────────────────╯".to_string(),
+        ],
+        "10 rows"
+    );
+}
+
+/// A squeezed modal draws its button row on the last row the block's border
+/// encloses — the bottom padding row base filled — and never on or past the
+/// border: the button text stays strictly between the border rows anywhere in
+/// the frame, the bottom border stays whole, and the rows that hold a button
+/// are the ones `want` names, content and all.
+fn check_squeezed_modal(name: &str, needles: &[&str], rows: Vec<String>, want: &[(usize, &str)]) {
+    let top = rows
+        .iter()
+        .position(|row| row.contains('\u{256d}'))
+        .unwrap_or_else(|| panic!("{name}: modal top border:\n{}", rows.join("\n")));
+    let bottom = rows
+        .iter()
+        .position(|row| row.contains('\u{2570}'))
+        .unwrap_or_else(|| panic!("{name}: modal bottom border:\n{}", rows.join("\n")));
+    assert!(
+        top < bottom,
+        "{name}: a bordered modal:\n{}",
+        rows.join("\n")
+    );
+    for (i, row) in rows.iter().enumerate() {
+        for needle in needles {
+            assert!(
+                !row.contains(needle) || (top < i && i < bottom),
+                "{name}: {needle:?} at frame row {i}, outside the border rows {top}..={bottom}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+    let border = rows[bottom].trim();
+    assert!(
+        border.starts_with('\u{2570}') && border.ends_with('\u{256f}'),
+        "{name}: the bottom border stays whole:\n{}",
+        rows.join("\n")
+    );
+    let slice = slice_modal(&rows);
+    let drawn: Vec<usize> = slice
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| needles.iter().any(|needle| row.contains(needle)))
+        .map(|(i, _)| i)
+        .collect();
+    let expected: Vec<usize> = want.iter().map(|(i, _)| *i).collect();
+    assert_eq!(
+        drawn,
+        expected,
+        "{name}: button rows {drawn:?} != {expected:?}:\n{}",
+        rows.join("\n")
+    );
+    for (index, line) in want {
+        assert_eq!(
+            &slice[*index],
+            line,
+            "{name}: button row {index} at 28 columns:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
+/// A terminal squeezed below a modal's reserved button rows still keeps its
+/// button row inside the block's border, for every button shape: the preset
+/// apply trio, the two-button pair and a one-button `close` notice. Where base
+/// drew a button row inside the border, a row is still drawn there; nothing
+/// draws above the top border or below the bottom one.
+#[test]
+fn a_squeezed_modal_keeps_its_button_row_inside_the_border() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::layout::Rect;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let apply = preset_apply_form();
+    let stop = ConfirmState {
+        message: "quit?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    let ack = ConfirmState {
+        message: "account in use".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::Acknowledge,
+    };
+    let trio = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_preset_apply(f, a, &apply)
+        })
+    };
+    let pair = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_confirm(f, a, &stop)
+        })
+    };
+    let notice = |height: u16| {
+        render_rows(28, height, &|f: &mut ratatui::Frame<'_>, a: Rect| {
+            draw_confirm(f, a, &ack)
+        })
+    };
+
+    let cancel = "│             cancel   │";
+    let keep = "│               keep   │";
+    let clear = "│              clear   │";
+    let pair_row = "│   cancel   stop   │";
+    let close = "│          close   │";
+
+    let trio_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, clear)]),
+        (9, &[(2, keep), (3, clear)]),
+        (10, &[(2, cancel), (3, keep), (4, clear)]),
+        (11, &[(2, cancel), (3, keep), (4, clear)]),
+        (12, &[(3, cancel), (4, keep), (5, clear)]),
+    ];
+    for (height, want) in trio_want {
+        check_squeezed_modal(
+            "preset apply",
+            &["cancel", "keep", "clear"],
+            trio(*height),
+            want,
+        );
+    }
+
+    let pair_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, pair_row)]),
+        (9, &[(2, pair_row)]),
+        (10, &[(3, pair_row)]),
+        (11, &[(4, pair_row)]),
+        (12, &[(4, pair_row)]),
+    ];
+    for (height, want) in pair_want {
+        check_squeezed_modal("two-button pair", &["cancel   stop"], pair(*height), want);
+    }
+
+    let notice_want: &[(u16, &[(usize, &str)])] = &[
+        (6, &[]),
+        (7, &[]),
+        (8, &[(2, close)]),
+        (9, &[(2, close)]),
+        (10, &[(3, close)]),
+        (11, &[(4, close)]),
+        (12, &[(4, close)]),
+    ];
+    for (height, want) in notice_want {
+        check_squeezed_modal("one-button notice", &["close"], notice(*height), want);
+    }
+}
+
 /// `chunk_line` wraps at word boundaries, still splits a word
 /// longer than the row by display cell between graphemes, measures wide glyphs
 /// by cells, and keeps each span's style across the break.
@@ -4077,6 +4935,16 @@ fn chunk_line_wraps_between_words_and_splits_long_words_by_cells() {
         "a long word splits by cell and loses nothing"
     );
     assert!(rows.iter().all(|r| r.width() <= 4));
+
+    // Three lam-alef pairs: a whole-string measure folds each pair to one cell
+    // (3), the buffer draws every grapheme on its own cell (6), so at a 4-cell
+    // row the line must break after the second pair.
+    let rows = chunk_line(Line::from("لالالا"), 4);
+    assert_eq!(
+        rows.iter().map(line_text).collect::<Vec<_>>(),
+        ["لالا", "لا"],
+        "an unmarked lam-alef line wraps by the cells the buffer draws"
+    );
 
     let rows = chunk_line(Line::from("日本語"), 4);
     assert_eq!(rows.len(), 2, "a wide glyph is measured by its cells");
@@ -4113,9 +4981,22 @@ fn chunk_line_wraps_between_words_and_splits_long_words_by_cells() {
 /// duplicated), no row is empty, and no whitespace-only row follows a row that
 /// carries content. The named probes and a multi-span probe then pin the exact
 /// rows and each grapheme's span style.
+///
+/// Residual the grid cannot see: the alphabet holds no lam-alef fold and no
+/// halfwidth katakana sound mark (each added char multiplies the whole grid),
+/// so those two classes ride the fixed words swept below, and their exact
+/// splits are pinned by `chunk_line_wraps_between_words_and_splits_long_words_by_cells`
+/// and `chunk_line_wraps_a_katakana_body_line_by_drawn_cells`. Invariant (a)
+/// reads each row through ratatui's `CellWidth` trait directly — the rule the
+/// buffer draws by — not through the product's `format::grapheme_cells`, so a
+/// regression of that helper reds here. The grapheme walk runs only on a case
+/// the per-char measure cannot read exactly (`reads_per_char`), which is none
+/// of the grid's, so the grid costs what the whole-string measure costs and the
+/// fold-class words still take the walk.
 #[test]
 fn chunk_line_wraps_any_input_without_overrun_or_loss() {
     use crate::tui::theme;
+    use ratatui::buffer::CellWidth;
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
 
@@ -4136,20 +5017,72 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         }
         v
     }
-    fn check_wrap_invariants(s: &str, w: usize, rows: &[Line<'static>]) {
+    /// The row's drawn cells: each grapheme's own width through [`CellWidth`],
+    /// summed span by span.
+    fn drawn_cells(row: &Line<'static>) -> usize {
+        row.spans
+            .iter()
+            .map(|span| {
+                Span::raw(span.content.as_ref())
+                    .styled_graphemes(Style::default())
+                    .map(|g| usize::from(g.symbol.cell_width()))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+    /// Whether the per-char measure reads `text` exactly, so every row of the
+    /// case it comes from costs `Line::width` instead of [`drawn_cells`].
+    /// That holds for a text built only from standalone chars, on which no
+    /// ligature, emoji-presentation, ZWJ or halfwidth sound-mark rule fires,
+    /// as every char of the grid's alphabet is. For a text mixing such chars
+    /// one whole-text check proves nothing, since departures can cancel
+    /// (`⚠\u{fe0f}لا` sums equal and draws one cell more), so an alphabet
+    /// char that joins one of those rules needs the per-row walk.
+    fn reads_per_char(text: &str) -> bool {
+        let mut buf = [0u8; 4];
+        let mut per_char = 0usize;
+        for c in text.chars() {
+            let one: &str = c.encode_utf8(&mut buf);
+            let own = Span::raw(one).width();
+            if usize::from(one.cell_width()) != own {
+                return false;
+            }
+            per_char += own;
+        }
+        per_char == Span::raw(text).width()
+    }
+    /// Checks the wrap invariants for one case, whose rows all read through
+    /// either the per-char measure (`cheap`) or the drawn-cell walk; returns
+    /// the rows the cheap measure read, the sweep's control that the walk is
+    /// skipped on the plain rows it is meant to skip.
+    fn check_wrap_invariants(s: &str, w: usize, rows: &[Line<'static>], cheap: bool) -> usize {
+        let mut cheap_rows = 0usize;
+        // Each row's text once; every invariant below reads it.
+        let texts: Vec<String> = rows.iter().map(line_text).collect();
         // (c) no empty row unless the source is empty.
         if !s.is_empty() {
-            for (i, r) in rows.iter().enumerate() {
-                assert!(!line_text(r).is_empty(), "empty row {i} for {s:?} at w={w}");
+            for (i, text) in texts.iter().enumerate() {
+                assert!(!text.is_empty(), "empty row {i} for {s:?} at w={w}");
             }
         }
         // (a) a row may exceed `w` only as a single grapheme wider than `w`.
-        for r in rows {
-            if r.width() > w {
+        // Read through ratatui's `CellWidth` trait directly, independent of the
+        // product's measure, on the rows the per-char measure cannot read
+        // exactly; the grid's plain rows cost the whole-string `Line::width`.
+        for (i, r) in rows.iter().enumerate() {
+            let cells = if cheap {
+                cheap_rows += 1;
+                r.width()
+            } else {
+                drawn_cells(r)
+            };
+            if cells > w {
+                let graphemes = Span::raw(texts[i].as_str())
+                    .styled_graphemes(Style::default())
+                    .count();
                 assert!(
-                    line_text(r).chars().count() == 1,
-                    "{} cells in one row for {s:?} at w={w}: {r:?}",
-                    r.width()
+                    graphemes == 1,
+                    "{cells} cells in one row for {s:?} at w={w}: {r:?}"
                 );
             }
         }
@@ -4158,15 +5091,14 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         // duplicated, and no row loses or gains whitespace mid-row.
         let source: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
         let mut it = source.chars().peekable();
-        for (i, r) in rows.iter().enumerate() {
-            let row_text = line_text(r);
-            let leads_with_ws = row_text.chars().next().is_some_and(is_break_space);
+        for (i, text) in texts.iter().enumerate() {
+            let leads_with_ws = text.chars().next().is_some_and(is_break_space);
             if i > 0 && !leads_with_ws {
                 while it.peek().is_some_and(|&c| is_break_space(c)) {
                     it.next();
                 }
             }
-            for c in row_text.chars() {
+            for c in text.chars() {
                 assert_eq!(
                     it.next(),
                     Some(c),
@@ -4190,27 +5122,29 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
                 .take_while(|&c| is_break_space(c))
                 .map(cell_w)
                 .sum();
-            let first_ws_only = line_text(&rows[0]).chars().all(is_break_space);
+            let first_ws_only = texts[0].chars().all(is_break_space);
             assert!(
                 !first_ws_only || indent + cell_w(first) > w,
                 "whitespace-only first row for {s:?} at w={w}: {rows:?}"
             );
         }
         let mut seen_content = false;
-        for (i, r) in rows.iter().enumerate() {
-            let ws_only = line_text(r).chars().all(is_break_space);
+        for (i, text) in texts.iter().enumerate() {
+            let ws_only = text.chars().all(is_break_space);
             assert!(
                 !(ws_only && seen_content),
                 "whitespace-only row {i} for {s:?} at w={w}: {rows:?}"
             );
             seen_content |= !ws_only;
         }
+        cheap_rows
     }
 
     let alphabet = [
         'a', 'b', ' ', '\t', '漢', '\u{a0}', '\u{202f}', '\u{2007}', '\u{3000}',
     ];
     let mut checked = 0usize;
+    let mut cheap_rows = 0usize;
     for len in 0..=7usize {
         let total = alphabet.len().pow(len as u32);
         let mut buf = vec![' '; len];
@@ -4220,24 +5154,111 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
                 n /= alphabet.len();
             }
             let s: String = buf.iter().collect();
+            let normalized: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+            let cheap = reads_per_char(&normalized);
             for w in 1..=6usize {
-                check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w));
+                cheap_rows +=
+                    check_wrap_invariants(&s, w, &chunk_line(Line::from(s.as_str()), w), cheap);
                 checked += 1;
             }
-            // (f) `w == 0` keeps the early return: the line, whole (tabs as
-            // one space).
+            // (f) `w == 0` tokenizes like every other width: a grapheme wider
+            // than the row takes a row of its own, so every visible grapheme
+            // sits alone on its row, in order, and only break whitespace
+            // drops (a leading indent or an all-whitespace line keeps its
+            // space cells). The counts are graphemes, the unit the row holds,
+            // not chars; the sweep's alphabet carries no combining mark, so a
+            // multi-char grapheme cannot appear and the two counts agree. An
+            // empty source draws its one empty row, as every width does.
             let rows = chunk_line(Line::from(s.as_str()), 0);
-            assert_eq!(rows.len(), 1, "w=0 keeps the line whole for {s:?}");
-            let normalized: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+            assert!(!rows.is_empty(), "w=0 still draws the line for {s:?}");
+            // A source that carries a visible grapheme must never draw a row
+            // with no cell at all. A row may still hold only break whitespace
+            // — a leading indent keeps its space cells at every width, and at
+            // width 0 an indent fits no row with its word — so a row without
+            // a visible cell of its own is the contract's, not a defect.
+            let source_has_content = s.chars().any(|c| !is_break_space(c));
+            let mut visible_before = String::new();
+            let mut visible_before_graphemes: Vec<String> = Vec::new();
+            let mut visible_after = String::new();
+            for (i, r) in rows.iter().enumerate() {
+                let t = line_text(r);
+                let vis: Vec<char> = t.chars().filter(|c| !is_break_space(*c)).collect();
+                assert!(
+                    vis.len() <= 1,
+                    "w=0 leaves two visible characters on row {i} for {s:?}: {t:?}"
+                );
+                let graphemes: Vec<String> = Span::raw(t.as_str())
+                    .styled_graphemes(Style::default())
+                    .map(|g| g.symbol.to_string())
+                    .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                    .collect();
+                assert!(
+                    graphemes.len() <= 1,
+                    "w=0 leaves two visible graphemes on row {i} for {s:?}: {t:?}"
+                );
+                assert!(
+                    !t.is_empty() || !source_has_content,
+                    "w=0 draws a row with no cell at row {i} for {s:?}"
+                );
+                visible_before.extend(vis);
+                visible_before_graphemes.extend(graphemes);
+            }
+            visible_after.extend(s.chars().filter(|c| !is_break_space(*c)));
             assert_eq!(
-                line_text(&rows[0]),
-                normalized,
-                "w=0 keeps the content for {s:?}"
+                visible_before, visible_after,
+                "w=0 keeps the visible content in order for {s:?}"
+            );
+            let visible_after_graphemes: Vec<String> = Span::raw(s.as_str())
+                .styled_graphemes(Style::default())
+                .map(|g| g.symbol.to_string())
+                .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                .collect();
+            assert_eq!(
+                visible_before_graphemes, visible_after_graphemes,
+                "w=0 keeps the visible graphemes in order for {s:?}"
             );
             checked += 1;
         }
     }
     assert!(checked > 2_000_000, "the sweep covered {checked} cases");
+    // The fold classes the Cartesian alphabet cannot hold, as fixed words over
+    // every width: lam-alef folds per letter, a halfwidth katakana sound mark
+    // draws its own cell, and one probe mixes them with a break and a wide
+    // glyph.
+    for s in ["لالالا", "ｶﾞｶﾞ", "aｶﾞ 漢"] {
+        // A fold or a halfwidth sound mark reads one cell off the per-char
+        // measure, so a row carrying both letters or the mark pays the walk.
+        let cheap = reads_per_char(s);
+        assert!(!cheap, "the per-char measure read {s:?} exactly");
+        for w in 1..=6usize {
+            cheap_rows += check_wrap_invariants(s, w, &chunk_line(Line::from(s), w), cheap);
+        }
+        let rows = chunk_line(Line::from(s), 0);
+        assert!(!rows.is_empty(), "w=0 still draws the line for {s:?}");
+        let mut before: Vec<String> = Vec::new();
+        for r in &rows {
+            let t = line_text(r);
+            let graphemes: Vec<String> = Span::raw(t.as_str())
+                .styled_graphemes(Style::default())
+                .map(|g| g.symbol.to_string())
+                .filter(|g| g.chars().any(|c| !is_break_space(c)))
+                .collect();
+            assert!(
+                graphemes.len() <= 1,
+                "w=0 leaves two visible graphemes on one row for {s:?}: {t:?}"
+            );
+            before.extend(graphemes);
+        }
+        let after: Vec<String> = Span::raw(s)
+            .styled_graphemes(Style::default())
+            .map(|g| g.symbol.to_string())
+            .filter(|g| g.chars().any(|c| !is_break_space(c)))
+            .collect();
+        assert_eq!(
+            before, after,
+            "w=0 keeps the visible graphemes in order for {s:?}"
+        );
+    }
 
     // The named probes, pinned row for row.
     let probes: [(&str, usize, &[&str]); 18] = [
@@ -4280,6 +5301,16 @@ fn chunk_line_wraps_any_input_without_overrun_or_loss() {
         out,
         flatten_styled(&split),
         "every grapheme keeps its span style across the split"
+    );
+
+    // Each grid source is checked at six widths and every check holds at least
+    // one row, so the 5,380,840 sources hold at least 32,285,040 grid rows:
+    // below that, grid rows took the grapheme walk the per-char measure exists
+    // to skip.
+    assert!(
+        cheap_rows > 32_000_000,
+        "the per-char measure read {cheap_rows} rows: the grid's rows must take \
+         the cheap path, not the grapheme walk"
     );
 }
 
@@ -4340,6 +5371,31 @@ fn chunk_line_treats_a_tab_as_one_break_space() {
     );
 }
 
+/// At width 0 the modal chunker tokenizes like every other width: a grapheme
+/// wider than the row takes a row of its own, so no row holds two visible
+/// graphemes, only break whitespace drops, and the visible content survives
+/// in order.
+#[test]
+fn chunk_line_at_width_zero_tokenizes_like_any_other_width() {
+    use ratatui::text::Line;
+
+    let rows = |text: &str| -> Vec<String> {
+        chunk_line(Line::from(text), 0)
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+    // A tab is one break space: it separates, then drops like any break.
+    assert_eq!(rows("a \tb"), ["a", "b"]);
+    // A wide grapheme takes a row of its own.
+    assert_eq!(rows("漢字"), ["漢", "字"]);
+    // A grapheme of two chars (a base plus its combining mark) is one row,
+    // not one row per char: the row holds the unit the buffer draws.
+    assert_eq!(rows("e\u{301}e"), ["e\u{301}", "e"]);
+    // An empty line is still one empty row.
+    assert_eq!(rows(""), [""]);
+}
+
 /// A check-output body keeps the tab between stderr fields as one space: the
 /// field names never glue.
 #[test]
@@ -4394,9 +5450,9 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// modal): a long description wraps onto the next row under the key column.
 /// One exact pin here, beside the widened (content-fit) help pins above.
 ///
-/// The thumb's extent is part of that shape, so it moves when the legend does:
-/// the `× logged out` row joins the legend, and the thumb is shorter for it.
-/// The wrapped rows above are what this test is for and none of them changed.
+/// The thumb's extent is part of that shape: it follows the modal's total, so a
+/// row joining or leaving any section moves it. The wrapped rows are what this
+/// test is for.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -4418,13 +5474,8 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│                                            ┃ │",
         "│  ACCOUNTS                                  ┃ │",
         "│                                            ┃ │",
-        "│    ↑ ↓                 move cursor         ┃ │",
-        "│    ↵                   switch to selected  ┃ │",
-        "│  account (confirm)                         ┃ │",
-        "│    shift ↑ ↓           reorder account up /┃ │",
-        "│  down                                      ┃ │",
-        "│    e                   edit selected       ┃ │",
-        "│  account in setup                          ┃ │",
+        "│    c                   cycle the harness   ┃ │",
+        "│  filter                                    ┃ │",
         "│                                            ┃ │",
         "│  GLOBAL                                    ┃ │",
         "│                                            ┃ │",
@@ -4444,25 +5495,30 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⌥1-9                jump to tab         ┃ │",
         "│    esc                 back within a       ┃ │",
         "│  sub-view (no-op at the top level)         ┃ │",
-        "│    pgup/pgdn           scroll a page       ┃ │",
         "│    ⌃c                  quit from anywhere  ┃ │",
         "│                                            ┃ │",
         "│  GLYPHS                                    ┃ │",
         "│                                            ┃ │",
-        "│    ✻                   active claude       ┊ │",
-        "│  account                                   ┊ │",
-        "│    ⏣                   active codex account┊ │",
-        "│    ⥋                   active, via shunt   ┊ │",
-        "│    ⇄                   a live session here ┊ │",
-        "│  follows the fallback chain                ┊ │",
-        "│    ⊘                   before a name: setup┊ │",
-        "│  token expired,                            ┊ │",
-        "│                        mis-filled or       ┊ │",
-        "│  refused                                   ┊ │",
+        "│    ✻                   active claude       ┃ │",
+        "│  account                                   ┃ │",
+        "│    ⏣                   active codex account┃ │",
+        "│    ⥋                   active, via shunt   ┃ │",
+        "│    ⇄                   a live session here ┃ │",
+        "│  follows the fallback chain                ┃ │",
+        "│    ⊘                   before a name: setup┃ │",
+        "│  token expired,                            ┃ │",
+        "│                        mis-filled or       ┃ │",
+        "│  refused                                   ┃ │",
         "│    ↲                   the chain switches  ┊ │",
         "│  to this account next                      ┊ │",
         "│    ⊖                   disabled            ┊ │",
         "│    ⊖                   canceled            ┊ │",
+        "│    ⊖                   org refused         ┊ │",
+        "│    ×                   auth broken         ┊ │",
+        "│    ×                   key rejected        ┊ │",
+        "│    ×                   token rejected      ┊ │",
+        "│    ×                   logged out          ┊ │",
+        "│    ⊘                   weekly spent        ┊ │",
         "│                                              │",
         "╰──────────────────────────────────────────────╯",
     ]
@@ -4577,7 +5633,7 @@ fn a_toast_over_the_modal_caret_hides_the_native_cursor() {
             plan: None,
         }),
         input: InputState::new("a name typed into the field"),
-        from_divergence: false,
+        from_divergence: None,
     }));
 
     // At 80x24 the caret is clear of the stack: it lands on the same cell it
@@ -4757,6 +5813,15 @@ fn modal_bounds(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
     panic!("no open modal in the frame")
 }
 
+/// The open modal's drawn rows cut to its borders: the top row through the
+/// bottom row, each spanning `left..=right`.
+fn modal_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+    let (top, bottom, left, right) = modal_bounds(buf);
+    (top..=bottom)
+        .map(|y| (left..=right).map(|x| buf[(x, y)].symbol()).collect())
+        .collect()
+}
+
 /// The open modal's row holding the `❯` caret: `(y, left border x, right
 /// border x, caret x)`.
 fn modal_caret_row(buf: &ratatui::buffer::Buffer) -> (u16, u16, u16, u16) {
@@ -4893,6 +5958,8 @@ fn pick_one_modals_take_the_action_menu_row_look() {
             Modal::Divergence(DivergenceForm {
                 active: "x".into(),
                 sibling: None,
+                long_lived: false,
+                seen: None,
                 cursor: 0,
                 scroll: Cell::new(0),
                 viewport: Cell::new(0),
@@ -4904,6 +5971,8 @@ fn pick_one_modals_take_the_action_menu_row_look() {
         (
             "divergence target",
             Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 cursor: 1,
                 scroll: Cell::new(0),
@@ -5064,6 +6133,8 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
         (
             "+ new account",
             Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 cursor: 0,
                 scroll: Cell::new(0),
@@ -5122,6 +6193,8 @@ fn the_new_rows_keep_accent_identity_selected_and_unselected() {
     // Unselected: cursor 1 leaves the `+ new` row one row above the caret.
     let mut app = empty_app(Tab::Overview);
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "x".into(),
+        seen: None,
         targets: vec!["b".into()],
         cursor: 1,
         scroll: Cell::new(0),
@@ -5363,6 +6436,8 @@ fn pick_one_suffix_env_and_wrapped_rows_tint_their_whole_block() {
     // row after it is untinted.
     let mut app = empty_app(Tab::Overview);
     app.open_modal(Modal::DivergenceTarget(DivergenceTargetForm {
+        from: "x".into(),
+        seen: None,
         targets: vec![
             "a-very-long-account-name-that-wraps-across-several-rows-in-the-picker".into(),
         ],
@@ -6447,9 +7522,8 @@ fn an_over_wide_word_keeps_its_glue_in_the_overflow_path() {
 }
 
 /// The prose walker settles a marked run's edges the way the modal does: a
-/// run's leading and trailing whitespace drops against a separator, a control
-/// char pressed against a run keeps its trailing space, and a whitespace-only
-/// run collapses to the one separator cell.
+/// run's leading and trailing whitespace drops against a separator, and a
+/// whitespace-only run collapses to the one separator cell.
 #[test]
 fn settled_marked_run_edges_match_the_modal() {
     for (text, w, want) in [
@@ -6460,11 +7534,6 @@ fn settled_marked_run_edges_match_the_modal() {
         ),
         (format!("{}\u{a0}", prose::cmd("QA ")), 40, vec!["QA\u{a0}"]),
         (format!("\u{7} {}", prose::key("QA")), 20, vec!["\u{7} QA"]),
-        (
-            format!("\u{6f22}\u{5b57}{}\u{1b}", prose::cmd("\u{6f22}\u{5b57} ")),
-            8,
-            vec!["\u{6f22}\u{5b57}", "\u{6f22}\u{5b57} "],
-        ),
         (
             format!("b{} \u{301}", prose::cmd(" ")),
             40,
@@ -6518,4 +7587,2641 @@ fn joining_glue_with_one_kept_tab_never_carries_the_next_word() {
         assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
         assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
     }
+}
+
+/// `text` with every control character but the tab removed (a tab draws as a
+/// space): the line a control char changes nothing about.
+fn without_controls(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// A control character draws no cell and is never a break, so on each marked
+/// line below each wrapper draws exactly the rows it draws for the same line
+/// with the control removed: no separator cell for it, no kept edge space
+/// pressed against it, no break at it. A tab is no control here: it draws as
+/// a space.
+#[test]
+fn a_control_char_on_a_marked_line_changes_no_drawn_row() {
+    for (text, w, want) in [
+        (
+            format!("x \u{1b}{}){}y,", prose::key("    ZONE"), prose::cmd("xx")),
+            7,
+            vec!["x", "ZONE)xx", "y,"],
+        ),
+        (
+            format!("\u{7}{}y,;", prose::cmd(" \u{a0} login")),
+            7,
+            vec!["\u{a0} login", "y,;"],
+        ),
+        (
+            format!("\u{6f22}\u{5b57}{}\u{1b}", prose::cmd("\u{6f22}\u{5b57} ")),
+            8,
+            vec!["\u{6f22}\u{5b57}\u{6f22}\u{5b57}"],
+        ),
+        (format!("{}\rb", prose::cmd("x")), 8, vec!["xb"]),
+        (
+            format!("QZ{}\n \u{301}", prose::key("x")),
+            4,
+            vec!["QZx \u{301}"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), w);
+        assert_eq!(drawn(bare_prose), want, "bare prose at {w}: {text:?}");
+        assert_eq!(drawn(bare_modal), want, "bare modal at {w}: {text:?}");
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// The same property where the two wrappers already part on the bare line (a
+/// trailing tab after an over-wide run keeps a blank cell in the modal only):
+/// the control after it still changes neither wrapper's rows.
+#[test]
+fn a_control_after_a_trailing_tab_changes_neither_wrapper() {
+    let text = format!("{}\t\u{7}", prose::cmd("\u{6f22}\u{5b57}"));
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 3);
+    let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), 3);
+    assert_eq!(drawn(prose_rows), drawn(bare_prose), "prose: {text:?}");
+    assert_eq!(drawn(modal_rows), drawn(bare_modal), "modal: {text:?}");
+}
+
+/// Inside an over-wide marked run, a non-ASCII space (U+2003) at a run edge is
+/// data: the prose wrapper keeps that char where the modal does, never a plain
+/// space in its place and never dropped as a trailing break.
+#[test]
+fn an_em_space_at_a_run_edge_keeps_its_own_char() {
+    for (text, w, want) in [
+        (
+            format!(
+                "{}\u{6f22}\u{5b57}{}",
+                prose::key("\t\t\u{2003} "),
+                prose::key("x\u{2003}")
+            ),
+            3,
+            vec!["\u{6f22}", "\u{5b57}", "x\u{2003}"],
+        ),
+        (
+            format!(
+                "{}\t\u{200d}{}a{}",
+                prose::key("QA   \u{2003}"),
+                prose::key("  \u{202f}\u{6f22}\u{5b57}"),
+                prose::cmd("x")
+            ),
+            6,
+            vec!["QA \u{2003} \u{200d}", "\u{202f}\u{6f22}\u{5b57}a", "x"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        assert_eq!(prose_rows, want, "prose at {w}: {text:?}");
+        assert_eq!(modal_rows, want, "modal at {w}: {text:?}");
+    }
+}
+
+/// On each line below, a control character inside, between or beside marked
+/// runs is absent too: it keeps no run's edge space, holds no whitespace-only
+/// run's separator open, splits no two runs that meet across it, starts or
+/// ends no join, bounds no run, forces no split, and takes no row or
+/// separator of its own, so each wrapper draws the rows of the same line with
+/// it removed. A tab is no control here. Not covered: a control-only word
+/// beside prose whitespace on a line that fits, the whitespace runs beside a
+/// dropped one, and a control between a breaking space and the joiner or
+/// combining mark after it.
+#[test]
+fn a_control_char_inside_a_marked_run_changes_no_drawn_row() {
+    for (text, w, want) in [
+        (
+            format!(
+                "{};{}",
+                prose::cmd(" \u{1b} \r;"),
+                prose::key("  )\u{6f22}\u{6f22}b")
+            ),
+            9,
+            vec![";; )\u{6f22}\u{6f22}b"],
+        ),
+        (
+            format!("{}{}", prose::key("\u{7} ("), prose::key("QA\u{a0}\t\t")),
+            2,
+            vec!["(", "QA", "\u{a0}"],
+        ),
+        (
+            format!(
+                "\u{a0}\u{200d})\u{2003}{}\u{7}{}",
+                prose::key("QA \u{1b}"),
+                prose::cmd(" )")
+            ),
+            6,
+            vec!["\u{a0}\u{200d})", "QA )"],
+        ),
+        (
+            format!("{}\u{5b57}", prose::cmd(" \r\n")),
+            1,
+            vec!["\u{5b57}"],
+        ),
+        (prose::key("\n  \u{5b57}"), 1, vec!["\u{5b57}"]),
+        (
+            format!("{}a\r\u{7}\u{6f22}", prose::key("a\r\r  \u{c}")),
+            1,
+            vec!["a", "a", "\u{6f22}"],
+        ),
+        (
+            format!("b{}{}", prose::key("\u{7}QA\n"), prose::cmd(" b")),
+            3,
+            vec!["bQA", "b"],
+        ),
+        (
+            format!(
+                "{}ZONE\u{6f22}{}",
+                prose::cmd("ZONEb"),
+                prose::key("\n  bb")
+            ),
+            8,
+            vec!["ZONEbZON", "E\u{6f22} bb"],
+        ),
+        (
+            format!("{}\n {}QA", prose::key("\nZONE"), prose::key("\n(ZONE")),
+            5,
+            vec!["ZONE", "(ZONE", "QA"],
+        ),
+        (
+            format!(
+                "{};{}\tZONE\t",
+                prose::key("QA\u{6f22} "),
+                prose::key("\u{85}  \u{85}(")
+            ),
+            4,
+            vec!["QA\u{6f22}", ";", "(", "ZONE"],
+        ),
+        (format!("{}\tx", prose::cmd("a ")), 3, vec!["a x"]),
+        (format!("\u{7}{}b", prose::key("  ")), 5, vec!["b"]),
+        (format!("a{}\u{7}", prose::key("  ")), 5, vec!["a"]),
+        (
+            format!("x\u{a0}\u{7}{}y", prose::key("  ")),
+            10,
+            vec!["x\u{a0}y"],
+        ),
+        (format!("x\n{}y", prose::key("  ")), 10, vec!["x y"]),
+        (format!("x{}\u{7} y", prose::key("  ")), 10, vec!["x y"]),
+        (format!("a {} b", prose::key(" \u{7} ")), 10, vec!["a b"]),
+        (format!("({})", prose::cmd("a\nb")), 3, vec!["(ab", ")"]),
+        (
+            format!("ab {} \u{5b57}", prose::cmd("\r\n")),
+            3,
+            vec!["ab", "\u{5b57}"],
+        ),
+        (prose::key("QA\u{2003}\u{7}\u{2003}QB"), 4, vec!["QA", "QB"]),
+        (
+            format!("x {}){}", prose::cmd("ZONE"), prose::key("\u{7}QB")),
+            6,
+            vec!["x ZONE", ")", "QB"],
+        ),
+    ] {
+        let (prose_rows, modal_rows) = prose_and_modal_rows(&text, w);
+        let (bare_prose, bare_modal) = prose_and_modal_rows(&without_controls(&text), w);
+        assert_eq!(drawn(bare_prose), want, "bare prose at {w}: {text:?}");
+        assert_eq!(drawn(bare_modal), want, "bare modal at {w}: {text:?}");
+        assert_eq!(drawn(prose_rows), want, "prose at {w}: {text:?}");
+        assert_eq!(drawn(modal_rows), want, "modal at {w}: {text:?}");
+    }
+}
+
+/// Inside a marked run wider than the row, a breaking non-ASCII space between
+/// two words that share a row draws as written, never as a plain space.
+#[test]
+fn a_break_space_inside_an_over_wide_run_keeps_its_own_char() {
+    let text = prose::key("QA\u{2003}QB ZONEZONE");
+    let want = vec!["QA\u{2003}QB", "ZONEZO", "NE"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 6);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+/// A marked run of breaking non-ASCII spaces alone, wider than the row, is a
+/// line of whitespace: both wrappers split it by cell and draw every char.
+#[test]
+fn a_whitespace_only_run_wider_than_the_row_splits_by_cell() {
+    let text = prose::key("\u{2003}\u{2003}\u{2003}");
+    let want = vec!["\u{2003}\u{2003}", "\u{2003}"];
+    let (prose_rows, modal_rows) = prose_and_modal_rows(&text, 2);
+    assert_eq!(prose_rows, want, "prose: {text:?}");
+    assert_eq!(modal_rows, want, "modal: {text:?}");
+}
+
+// ---- hints follow their handler past the states pinned below ----
+
+/// A member card row whose keys are inert offers none: with the member's
+/// weekly gate off, `weekly at` takes no `+ / -` and no `↵` in the footer or
+/// the help, which keeps only the rows other card rows act on; with spend
+/// budget off, `max spend` offers no `↵`.
+#[test]
+fn an_inert_fallback_card_row_offers_no_keys() {
+    use crate::tui::app::{FALLBACK_ROWS, FallbackRow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let card_on = |row: FallbackRow| {
+        let mut app = one_member_chain_app();
+        app.config().profiles[0].check_weekly = false;
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = FALLBACK_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("a card row");
+        app
+    };
+    let inert = [
+        ("←", "back"),
+        ("↑↓", "row"),
+        ("a", "actions"),
+        ("?", "help"),
+        ("q", "back"),
+    ];
+
+    let app = card_on(FallbackRow::WeeklyAt);
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget is off"
+    );
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &inert),
+        "weekly at, gate off"
+    );
+    let help = help_of(&app);
+    assert!(
+        help.iter().all(|(k, _)| *k != "\u{21b5} on weekly at"),
+        "no typing a weekly line the gate ignores: {help:?}"
+    );
+    assert_eq!(
+        help,
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on rotate at",
+                concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+            ),
+            (
+                "space on preferred days",
+                "step never / weekdays / weekends / every day",
+            ),
+            (
+                "\u{21b5} on preferred days",
+                concat!(
+                    "pick days: ",
+                    key_lit!("\u{2190} \u{2192}"),
+                    " walk \u{00b7} ",
+                    key_lit!("space"),
+                    " toggles and saves \u{00b7} ",
+                    key_lit!("\u{21b5} esc q"),
+                    " leave \u{00b7} ",
+                    key_lit!("\u{2191} \u{2193}"),
+                    " leave and move",
+                ),
+            ),
+            ("esc", "back / cancel edit"),
+        ]
+    );
+
+    let app = card_on(FallbackRow::MaxSpend);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &inert),
+        "max spend, budget off"
+    );
+}
+
+/// The Overview `↵` offers no switch onto the account already active, and the
+/// help says so by leaving its row out.
+#[test]
+fn the_overview_help_offers_no_switch_onto_the_active_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    app.config().state.active_profile = Some(crate::profile::ProfileName::from("alpha"));
+    app.overview_cursor = app
+        .main_items()
+        .iter()
+        .position(|item| *item == crate::tui::app::MainItemKind::Profile(0))
+        .expect("alpha's row");
+    let help = help_of(&app);
+    assert!(
+        help.iter().all(|(k, _)| *k != "\u{21b5}"),
+        "no switch onto the active account: {help:?}"
+    );
+    assert_eq!(
+        help,
+        vec![
+            ("\u{2191} \u{2193}", "move cursor"),
+            ("shift \u{2191} \u{2193}", "reorder account up / down"),
+            ("e", "edit selected account in setup"),
+            ("c", "cycle the harness filter"),
+        ]
+    );
+}
+
+/// The Setup `disable` row on the active account is inert: its footer offers
+/// no `↵`, and the help drops both the row's `↵` and its disable row.
+#[test]
+fn an_inert_setup_disable_row_offers_no_enter() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = setup_row_app(crate::tui::app::ConfigRow::Disabled);
+    app.config().state.active_profile = Some(crate::profile::ProfileName::from("alpha"));
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    let help = help_of(&app);
+    assert!(
+        help.iter()
+            .all(|(k, _)| *k != "\u{21b5}" && *k != "disable / enable"),
+        "no disable key on the active account: {help:?}"
+    );
+}
+
+/// A timeline taller than its pane offers its scroll, in the footer and the
+/// help, named for what it scrolls.
+#[test]
+fn an_overflowing_status_timeline_offers_its_scroll() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = status_detail_fits_app();
+    app.status.incidents[0].updates = (0..40)
+        .map(|i| crate::status::IncidentUpdate {
+            phase: crate::status::UpdatePhase::Monitoring,
+            at_ms: 1_780_740_881_000 + i * 60_000,
+            text: format!("update {i}"),
+            transitions: vec![],
+        })
+        .collect();
+    let footer = wide_footer(&app);
+    assert!(
+        app.status.detail_max_scroll.get() > 0,
+        "the timeline overflows"
+    );
+    assert_eq!(
+        footer,
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "scroll"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "scroll the timeline"),
+            ("r", "refresh the feed"),
+            ("esc", "back to the list"),
+        ]
+    );
+}
+
+// ---- every hint derives from its handler: the tab footers and help rows ----
+
+use ratatui::crossterm::event::KeyCode;
+
+/// The frame every hint pin below draws at: wide enough that the footer sheds
+/// no hint and tall enough for the art header, so a row is the whole row.
+const HINT_W: u16 = 200;
+const HINT_H: u16 = 40;
+
+/// Draw `app` twice at the hint frame and return its rows.
+pub(crate) fn hint_frame(app: &App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(HINT_W, HINT_H)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The settled footer row, trimmed.
+pub(crate) fn wide_footer(app: &App) -> String {
+    hint_frame(app)
+        .last()
+        .expect("the footer row")
+        .trim()
+        .to_string()
+}
+
+/// The footer row `groups` compose to: `key label` groups 3 cells apart. The
+/// `a actions` group follows the action menu's own emptiness, which is not
+/// what these pins are about, so it is dropped where the menu is empty.
+pub(crate) fn footer_of(app: &App, groups: &[(&str, &str)]) -> String {
+    let menu_empty = crate::tui::app::build_action_menu(app).items.is_empty();
+    groups
+        .iter()
+        .filter(|(k, _)| !(menu_empty && *k == "a"))
+        .map(|(k, l)| format!("{k} {l}"))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
+/// The per-tab help rows, flattened across sections.
+pub(crate) fn help_of(app: &App) -> Vec<(&'static str, &'static str)> {
+    tab_specific_rows(app)
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().copied())
+        .collect()
+}
+
+fn hint_profiles(names: &[&str]) -> Vec<crate::profile::Profile> {
+    names
+        .iter()
+        .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)))
+        .collect()
+}
+
+fn chain_app(members: &[&str]) -> App {
+    let app = app_on(Tab::Fallback, hint_profiles(members));
+    app.config().state.fallback_chain = members
+        .iter()
+        .map(|n| crate::profile::ProfileName::from(*n))
+        .collect();
+    app
+}
+
+fn one_member_chain_app() -> App {
+    chain_app(&["alpha"])
+}
+
+fn two_member_chain_app() -> App {
+    chain_app(&["alpha", "beta"])
+}
+
+fn hint_incident(id: &str) -> crate::status::Incident {
+    crate::status::Incident {
+        id: id.into(),
+        title: format!("incident {id}"),
+        link: "https://stspg.io/abc".into(),
+        phase: crate::status::UpdatePhase::Monitoring,
+        impact: crate::status::Impact::Minor,
+        started_ms: 1_780_740_881_000,
+        resolved_ms: None,
+        components: vec![],
+        updates: vec![],
+    }
+}
+
+fn status_list_app(incidents: usize) -> App {
+    let mut app = app_on(Tab::Status, vec![]);
+    app.status.incidents = (0..incidents)
+        .map(|i| hint_incident(&format!("i{i}")))
+        .collect();
+    app
+}
+
+fn status_empty_app() -> App {
+    status_list_app(0)
+}
+
+fn status_two_app() -> App {
+    status_list_app(2)
+}
+
+/// A short incident's timeline fits the hint frame, so its scroll bound is 0.
+fn status_detail_fits_app() -> App {
+    let mut app = status_list_app(1);
+    app.status.focus = StatusFocus::Detail;
+    app
+}
+
+/// One short model's detail fits the hint frame, so its scroll bound is 0.
+fn model_detail_fits_app() -> App {
+    let mut app = app_on(Tab::Tokens, vec![]);
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![crate::tokens::ModelTokens {
+            model: "claude-model-a".into(),
+            input: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::Detail;
+    app
+}
+
+fn setup_empty_app() -> App {
+    app_on(Tab::Setup, vec![])
+}
+
+/// Setup on one account, descended into its card with the cursor on `row`.
+fn setup_row_app(row: crate::tui::app::ConfigRow) -> App {
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| panic!("the card shows {row:?}"));
+    app
+}
+
+/// Setup's `+ new` form, descended, with the cursor on `create account`.
+fn setup_create_app() -> App {
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the form holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == crate::tui::app::ConfigRow::Create)
+        .expect("the form shows create account");
+    app
+}
+
+fn config_row_app(row: crate::tui::app::GlobalConfigRow) -> App {
+    let mut app = app_on(Tab::Config, vec![]);
+    app.global_config_cursor = crate::tui::app::GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("a Config row");
+    app
+}
+
+/// A one-member chain has nothing to walk to and no neighbour to swap with:
+/// its footer offers neither `↑↓` nor `⇧↑↓`, and its help lists only `↵`.
+#[test]
+fn a_one_member_chain_offers_no_walk_or_reorder() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = one_member_chain_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↵", "open"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![("\u{21b5}", "open or change the focused row",)]
+    );
+}
+
+/// A joined key keeps its hint while either direction acts: the top member of
+/// a two-member chain can only move down, and `⇧↑↓` stays. The chain focus
+/// lists no detail-row key and no `esc`, which does nothing at the top level.
+#[test]
+fn the_top_member_of_a_longer_chain_keeps_the_joined_reorder_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = two_member_chain_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↑↓", "move"),
+                ("⇧↑↓", "reorder"),
+                ("↵", "open"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("shift \u{2191} \u{2193}", "reorder to set priority"),
+            ("\u{21b5}", "open or change the focused row",),
+        ]
+    );
+}
+
+/// The Overview help lists a key only while it acts: on an empty roster only
+/// the harness filter, which acts on any roster; with two accounts every row
+/// key plus that filter.
+#[test]
+fn the_overview_help_lists_only_live_keys_and_the_harness_filter() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_on(Tab::Overview, vec![]);
+    assert_eq!(help_of(&app), vec![("c", "cycle the harness filter")]);
+
+    let app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move cursor"),
+            ("\u{21b5}", "switch to selected account (confirm)"),
+            ("shift \u{2191} \u{2193}", "reorder account up / down"),
+            ("e", "edit selected account in setup"),
+            ("c", "cycle the harness filter"),
+        ]
+    );
+}
+
+/// A model detail that fits has nothing to scroll: neither the footer nor the
+/// help offers `↑↓` there, as the help modal's own row does on a fitting body.
+#[test]
+fn a_fitting_model_detail_offers_no_scroll() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = model_detail_fits_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(app.model_detail_max_scroll.get(), 0, "the detail fits");
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("esc", "return to model selector"),
+            ("\u{2190}", "return to model selector"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ]
+    );
+}
+
+/// The Status help follows the focus: the list names its walk and its open,
+/// a fitting timeline offers no scroll and no `↵`, and an empty feed only the
+/// refresh.
+#[test]
+fn the_status_help_follows_the_focus_and_the_feed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = status_two_app();
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "pick incident"),
+            ("\u{21b5}", "open incident timeline"),
+            ("r", "refresh the feed"),
+        ]
+    );
+
+    let app = status_empty_app();
+    assert_eq!(help_of(&app), vec![("r", "refresh the feed")]);
+
+    let app = status_detail_fits_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back")
+            ]
+        )
+    );
+    assert_eq!(app.status.detail_max_scroll.get(), 0, "the timeline fits");
+    assert_eq!(
+        help_of(&app),
+        vec![("r", "refresh the feed"), ("esc", "back to the list")]
+    );
+}
+
+/// An empty roster's Setup list holds only `+ new`: `↑↓` has nowhere to go.
+#[test]
+fn an_empty_setup_roster_offers_no_account_walk() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = setup_empty_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↵", "configure"),
+                ("n", "new"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+}
+
+/// The Setup account list's help lists the list's own keys, never a card
+/// row's: no `space`, `+ / -`, env, disable, delete or `esc` while the list
+/// holds focus.
+#[test]
+fn the_setup_list_help_lists_no_card_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open the focused account"),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+        ]
+    );
+}
+
+/// Each Setup card row's `↵` names what it does there.
+#[test]
+fn the_setup_card_names_each_rows_enter() {
+    use crate::tui::app::ConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let card = |verb: (&'static str, &'static str)| {
+        vec![
+            ("←", "back"),
+            ("↑↓", "row"),
+            verb,
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ]
+    };
+
+    let app = setup_row_app(ConfigRow::Name);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "edit"))),
+        "a text row"
+    );
+    let app = setup_row_app(ConfigRow::AutoStart);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("space/↵", "toggle"))),
+        "an on/off row"
+    );
+    let app = setup_row_app(ConfigRow::Delete);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "delete"))),
+        "the delete row"
+    );
+    let app = setup_create_app();
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(&app, &card(("↵", "create"))),
+        "the create row"
+    );
+}
+
+/// An armed delete on a claude card reads like the codex and pool cards' armed
+/// rows: the confirm, its way out, and help.
+#[test]
+fn an_armed_setup_delete_names_its_confirm_and_cancel() {
+    use crate::tui::app::ConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = setup_row_app(ConfigRow::Delete);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↵", "confirm delete"),
+                ("esc", "cancel"),
+                ("?", "help"),
+            ]
+        )
+    );
+}
+
+/// The Config help follows the focused row: `↵` types a value on the three
+/// typed rows, mirrors `space` elsewhere, and a dimmed row whose keys do
+/// nothing lists only the walk.
+#[test]
+fn the_config_help_follows_the_focused_row() {
+    use crate::tui::app::GlobalConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let walk = ("\u{2191} \u{2193}", "move between settings");
+    let space = ("space", "cycle the focused setting");
+
+    for row in [
+        GlobalConfigRow::RefreshInterval,
+        GlobalConfigRow::ContextNudge,
+        GlobalConfigRow::WeeklyThreshold,
+    ] {
+        let app = config_row_app(row);
+        assert_eq!(
+            help_of(&app),
+            vec![walk, space, ("\u{21b5}", "type a value")],
+            "{row:?}"
+        );
+    }
+
+    let app = config_row_app(GlobalConfigRow::AutoUpdate);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            walk,
+            space,
+            ("\u{21b5}", concat!("same as ", key_lit!("space")))
+        ]
+    );
+
+    let app = config_row_app(GlobalConfigRow::BurnFloor);
+    assert!(
+        !app.config().state.burn_aware_switching,
+        "burn floor is dimmed while burn-aware switching is off"
+    );
+    assert_eq!(help_of(&app), vec![walk]);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←→", "tabs"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        )
+    );
+}
+
+/// A failed token read's `↵` expands the cause: the help names that, never the
+/// per-model breakdown the same key opens on a healthy dashboard.
+#[test]
+fn a_failed_token_dashboard_help_names_the_cause() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = model_detail_fits_app();
+    app.token_view = TokenView::Dashboard;
+    app.model_detail_focus = StatusFocus::List;
+    app.tokens_failed = true;
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{21b5}", "show why"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ]
+    );
+}
+
+/// The Services list names no key its focused row ignores: a delegates row
+/// with no job opens no detail and carries no fix, and `space`, `+ / -` and
+/// `esc` act only inside a detail.
+#[test]
+fn the_services_list_help_names_no_dead_row_key() {
+    use crate::tui::app::{Check, Health};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Services, vec![]);
+    app.services.checks = ["delegates", "plugin"]
+        .into_iter()
+        .map(|label| Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: vec![],
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        })
+        .collect();
+    assert!(app.services.delegates.is_empty(), "no delegate job");
+    let keys: Vec<&str> = help_of(&app).into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec!["\u{2191} \u{2193}", "pgup/pgdn", "r"]);
+}
+
+/// A long incident's timeline overflows the hint frame, so its detail scrolls.
+fn status_detail_overflows_app() -> App {
+    let mut app = status_list_app(1);
+    app.status.incidents[0].updates = (0..200u64)
+        .map(|i| crate::status::IncidentUpdate {
+            phase: crate::status::UpdatePhase::Monitoring,
+            at_ms: 1_780_740_881_000 + i * 60_000,
+            text: format!("update {i}"),
+            transitions: vec![],
+        })
+        .collect();
+    app.status.focus = StatusFocus::Detail;
+    app
+}
+
+/// The help's GLOBAL `pgup/pgdn` row says what the key does on this frame: a
+/// list moves its selection a page, a detail pane that overflows scrolls one,
+/// and a detail pane that fits lists no page row, since the press moves nothing.
+#[test]
+fn the_global_page_row_follows_list_or_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let page_rows = |app: &mut App| -> Vec<String> {
+        app.help_scroll = 0;
+        app.open_modal(Modal::Help);
+        let rows = {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut term = Terminal::new(TestBackend::new(HINT_W, 120)).expect("backend");
+            term.draw(|f| crate::tui::render::draw(f, app))
+                .expect("draw");
+            term.draw(|f| crate::tui::render::draw(f, app))
+                .expect("draw");
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        rows.iter()
+            .filter(|r| r.contains("pgup/pgdn") && r.contains("a page"))
+            .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    };
+
+    let mut app = app_on(Tab::Overview, hint_profiles(&["alpha", "beta"]));
+    let found = page_rows(&mut app);
+    assert_eq!(found.len(), 1, "one global page row: {found:?}");
+    assert!(
+        found[0].contains("pgup/pgdn move a page"),
+        "a list moves its selection: {found:?}"
+    );
+    assert_eq!(
+        help_row_segments(&found, "pgup/pgdn"),
+        ["│ pgup/pgdn move a page │"],
+        "the list's page row whole"
+    );
+    let mut app = status_detail_overflows_app();
+    let found = page_rows(&mut app);
+    assert_eq!(found.len(), 1, "one global page row: {found:?}");
+    assert!(
+        found[0].contains("pgup/pgdn scroll a page"),
+        "an overflowing detail pane scrolls: {found:?}"
+    );
+    assert_eq!(
+        help_row_segments(&found, "pgup/pgdn"),
+        ["│ pgup/pgdn scroll a page │"],
+        "the detail's page row whole"
+    );
+    let mut app = status_detail_fits_app();
+    let found = page_rows(&mut app);
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "a fitting detail pane's page press moves nothing, so the help lists no page row"
+    );
+}
+
+/// Every footer hint acts through the real handler: pressing its key changes
+/// the frame. The control first proves a frame drawn twice with no key between
+/// reads the same, so a changed frame is the key's doing.
+#[test]
+fn every_tab_footer_hint_acts_through_the_handler() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    type Case = (&'static str, fn() -> App);
+    let _home = crate::testutil::HomeSandbox::new();
+    let cases: &[Case] = &[
+        ("one-member chain", one_member_chain_app),
+        ("two-member chain", two_member_chain_app),
+        ("model detail that fits", model_detail_fits_app),
+        ("status detail that fits", status_detail_fits_app),
+        ("status list", status_two_app),
+        ("empty setup roster", setup_empty_app),
+        ("setup create row", setup_create_app),
+        ("config burn floor", || {
+            config_row_app(crate::tui::app::GlobalConfigRow::BurnFloor)
+        }),
+        ("config refresh", || {
+            config_row_app(crate::tui::app::GlobalConfigRow::RefreshInterval)
+        }),
+    ];
+    for (name, build) in cases {
+        let app = build();
+        let footer = wide_footer(&app);
+        assert_eq!(hint_frame(&app), hint_frame(&app), "{name}: control");
+        for group in footer.split("   ") {
+            let key = group.split(' ').next().expect("a key");
+            let event = match key {
+                "←→" => crate::testutil::key(KeyCode::Right),
+                "←" => crate::testutil::key(KeyCode::Left),
+                "↑↓" => crate::testutil::key(KeyCode::Down),
+                "⇧↑↓" => KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                "↵" => crate::testutil::key(KeyCode::Enter),
+                "space" | "space/↵" => crate::testutil::key(KeyCode::Char(' ')),
+                "esc" => crate::testutil::key(KeyCode::Esc),
+                "+" => crate::testutil::key(KeyCode::Char('+')),
+                "-" => crate::testutil::key(KeyCode::Char('-')),
+                k if k.chars().count() == 1 => {
+                    crate::testutil::key(KeyCode::Char(k.chars().next().expect("a char")))
+                }
+                other => panic!("{name}: unmapped hint key {other:?}"),
+            };
+            let mut app = build();
+            let before = hint_frame(&app);
+            let cache_before = app.config().state.count_cache;
+            crate::tui::app::handle_key(&mut app, event);
+            // `c` on the Tokens tab flips a saved setting; on a model detail
+            // that keeps its model selected the frame can stay as it was.
+            if key == "c" && app.tab == Tab::Tokens {
+                assert_ne!(
+                    app.config().state.count_cache,
+                    cache_before,
+                    "{name}: `{group}` changes nothing"
+                );
+                continue;
+            }
+            assert_ne!(
+                hint_frame(&app),
+                before,
+                "{name}: `{group}` changes nothing"
+            );
+        }
+    }
+}
+
+// ---- the token model selection follows its model across a reorder ----
+
+/// Two models whose order flips with the cache count: `claude-model-a` leads
+/// on input + output (200 vs 20), `claude-model-b` once cache reads join the
+/// count (200 vs 5020).
+fn two_model_app() -> App {
+    let mut app = app_on(Tab::Tokens, vec![]);
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-model-a".into(),
+                input: 100,
+                output: 100,
+                ..Default::default()
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-model-b".into(),
+                input: 10,
+                output: 10,
+                cache_read: 5000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app.token_period = crate::tui::app::TokenPeriod::Lifetime;
+    app.token_view = TokenView::Models;
+    app.model_detail_focus = StatusFocus::List;
+    app
+}
+
+/// The model picker's caret row, read off the drawn frame.
+fn selected_model_row(app: &App) -> String {
+    let rows = hint_frame(app);
+    let picked: Vec<&String> = rows.iter().filter(|r| r.contains('❯')).collect();
+    assert_eq!(picked.len(), 1, "one caret row: {picked:?}");
+    picked[0].clone()
+}
+
+fn shows(row: &str, model: &str) -> bool {
+    row.contains(&crate::tokens::model_display_name(model))
+}
+
+/// `c` re-ranks the model list; the selection moves with its model to the
+/// model's new row.
+#[test]
+fn the_model_selection_follows_its_model_across_the_cache_toggle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_model_app();
+    let row = selected_model_row(&app);
+    assert!(shows(&row, "claude-model-a"), "starts on a: {row:?}");
+    // The list's own order, the one the picker draws (the detail pane's title
+    // also names the selected model, so frame rows cannot rank the list).
+    let rank = |app: &App| -> Vec<String> {
+        crate::tui::app::token_period_models(app)
+            .into_iter()
+            .map(|m| m.model)
+            .collect()
+    };
+    assert_eq!(
+        rank(&app),
+        ["claude-model-a", "claude-model-b"],
+        "a ranks first without cache"
+    );
+
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert!(app.config().state.count_cache, "the toggle saved");
+    assert_eq!(
+        rank(&app),
+        ["claude-model-b", "claude-model-a"],
+        "b ranks first with cache"
+    );
+    let row = selected_model_row(&app);
+    assert!(
+        shows(&row, "claude-model-a"),
+        "the caret moved with a: {row:?}"
+    );
+}
+
+/// The same toggle from the detail keeps the detail on its model: back on the
+/// list, the caret still names it.
+#[test]
+fn the_model_detail_keeps_its_model_across_the_cache_toggle() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_model_app();
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.model_detail_focus, StatusFocus::Detail, "descended");
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.model_detail_focus, StatusFocus::List, "ascended");
+    let row = selected_model_row(&app);
+    assert!(
+        shows(&row, "claude-model-a"),
+        "the detail stayed on a: {row:?}"
+    );
+}
+
+// ---- a hidden key changes nothing on the boundary fixtures ----
+
+/// The reverse of the shown-hint loop: on the boundary fixtures (one row,
+/// empty, fitting detail, dimmed row), every key the footer hides that the
+/// loop's mapping knows is pressed, and the frame and the state the press
+/// used to touch stay unchanged. Keys another documented surface covers on
+/// that frame (the help's GLOBAL `n`/`r`/`t` rows, `esc` where the help names
+/// its own sense — a descended pane's back, the models list's back to
+/// dashboard — and a shifted walk where the plain walk is shown) are skipped:
+/// those are the curated omissions, not the hidden-hint class.
+#[test]
+fn a_key_the_footer_hides_changes_nothing_on_the_boundary_fixtures() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::{ConfigRow, handle_key};
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let key = crate::testutil::key;
+    let mapped: &[(&str, KeyEvent)] = &[
+        ("↑↓", key(KeyCode::Down)),
+        ("⇧↑↓", KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
+        ("↵", key(KeyCode::Enter)),
+        ("space", key(KeyCode::Char(' '))),
+        ("esc", key(KeyCode::Esc)),
+        ("+", key(KeyCode::Char('+'))),
+        ("-", key(KeyCode::Char('-'))),
+        ("c", key(KeyCode::Char('c'))),
+        ("r", key(KeyCode::Char('r'))),
+        ("t", key(KeyCode::Char('t'))),
+        ("e", key(KeyCode::Char('e'))),
+        ("p", key(KeyCode::Char('p'))),
+        ("f", key(KeyCode::Char('f'))),
+        ("n", key(KeyCode::Char('n'))),
+    ];
+    let one_model = || {
+        let mut app = model_detail_fits_app();
+        app.model_detail_focus = StatusFocus::List;
+        app.model_detail_scroll = 3;
+        app
+    };
+    let empty_setup = || {
+        let mut app = setup_empty_app();
+        app.pending_pool_landing = Some((crate::gateway_admin::PoolFamily::Claude, "pool".into()));
+        app
+    };
+    let dimmed_disable = || {
+        let app = setup_row_app(ConfigRow::Disabled);
+        app.config().state.active_profile = Some(ProfileName::from("alpha"));
+        app
+    };
+    // (name, build, curated skips, state read)
+    type Fixture = (
+        &'static str,
+        fn() -> App,
+        &'static [&'static str],
+        fn(&App) -> String,
+    );
+    let fixtures: Vec<Fixture> = vec![
+        ("one model", one_model, &["esc", "r", "n"], |a| {
+            a.model_detail_scroll.to_string()
+        }),
+        ("empty setup", empty_setup, &["r", "t"], |a| {
+            a.pending_pool_landing.is_some().to_string()
+        }),
+        (
+            "fitting status detail",
+            status_detail_fits_app,
+            &["esc", "r", "t", "n"],
+            |a| a.status.detail_scroll.to_string(),
+        ),
+        (
+            "dimmed disable row",
+            dimmed_disable,
+            &["esc", "r", "t", "n"],
+            |a| {
+                format!(
+                    "{}:{}",
+                    a.config().profiles[0].disabled,
+                    a.config_draft
+                        .as_ref()
+                        .is_some_and(|d| d.armed_action.is_some())
+                )
+            },
+        ),
+    ];
+    for (name, build, skip, read) in fixtures {
+        let app = build();
+        let _ = hint_frame(&app); // publish the bounds the footer reads
+        let footer = wide_footer(&app);
+        let held = read(&app);
+        let before = hint_frame(&app);
+        assert_eq!(
+            hint_frame(&app),
+            before,
+            "{name}: control frame holds still"
+        );
+        for (mapped_key, event) in mapped {
+            let shown = footer.split("   ").any(|g| {
+                let k = g.split(' ').next().unwrap_or("");
+                k == *mapped_key
+                    || (*mapped_key == "space" && k == "space/↵")
+                    || (*mapped_key == "↵" && k == "space/↵")
+                    || (*mapped_key == "⇧↑↓" && k == "↑↓")
+            });
+            if shown || skip.contains(mapped_key) {
+                continue;
+            }
+            let mut app = build();
+            let _ = hint_frame(&app);
+            handle_key(&mut app, *event);
+            assert_eq!(
+                read(&app),
+                held,
+                "{name}: the hidden {mapped_key} changed state"
+            );
+            assert_eq!(
+                hint_frame(&app),
+                before,
+                "{name}: the hidden {mapped_key} changed the frame"
+            );
+        }
+    }
+}
+
+/// The help's `f next fix` row lists only while the focused check holds a fix
+/// line to walk: a herdr check with a problem, not one without.
+#[test]
+fn the_help_names_the_next_fix_row_only_while_the_check_holds_one() {
+    use crate::tui::app::{Check, Health, Problem, ServiceFix};
+    let _home = crate::testutil::HomeSandbox::new();
+    let herdr = |problems: Vec<Problem>| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label: "herdr",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems,
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_max_scroll.set(4);
+        app
+    };
+    let with_fix = herdr(vec![Problem {
+        line: 0,
+        fix: ServiceFix::MoveStoresIn,
+    }]);
+    assert_eq!(
+        help_of(&with_fix),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("pgup/pgdn", "scroll a page",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("f", "next fix"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "a herdr check with a fix lists the walk"
+    );
+    let without_fix = herdr(Vec::new());
+    assert_eq!(
+        help_of(&without_fix),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("pgup/pgdn", "scroll a page",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "no fix line, no f row"
+    );
+}
+
+/// A fallback card row for a chain member whose profile left the roster takes
+/// no key: the five toggle rows drop their `space/↵ toggle` from the footer,
+/// the same gate the handler refuses at.
+#[test]
+fn a_fallback_card_row_for_a_gone_member_offers_no_toggle() {
+    use crate::tui::app::FallbackFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = one_member_chain_app();
+    app.config().profiles.pop();
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::CheckWeekly)
+        .expect("a card row");
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        ),
+        "a gone member's toggle row offers no toggle"
+    );
+}
+
+// ---- a descended walk lists its page row only while it has a row to move to ----
+
+/// The help modal's page-key rows on `app`'s frame, whitespace-collapsed.
+fn help_page_rows(app: &mut App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    app.help_scroll = 0;
+    app.open_modal(Modal::Help);
+    let mut term = Terminal::new(TestBackend::new(HINT_W, 120)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    term.draw(|f| crate::tui::render::draw(f, app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let _ = app.pop_modal();
+    rows.iter()
+        .filter(|r| r.contains("pgup/pgdn"))
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// A descended Setup pool detail for a pool account whose provider runs `auth`.
+fn pool_detail_app(auth: crate::gateway_admin::PoolAuth) -> App {
+    use crate::gateway_admin::{PoolAccount, PoolProvider};
+    use crate::tui::app::handle_key;
+    let mut app = app_on(Tab::Setup, hint_profiles(&["alpha"]));
+    app.shunt_pool = crate::tui::app::ShuntPool::Read(vec![PoolProvider {
+        name: "pool-main".to_string(),
+        auth,
+        accounts: vec![PoolAccount {
+            name: "pool-a".to_string(),
+            available: true,
+            near_quota: false,
+            cooldown_secs_remaining: None,
+            needs_relogin: false,
+            paused: false,
+            disabled: false,
+            utilization_5h: None,
+            reset_5h: None,
+            utilization_7d: None,
+            reset_7d: None,
+            utilization_7d_oi: None,
+            reset_7d_oi: None,
+            plan: None,
+            status: None,
+            requests_attempted: None,
+            requests_failed: None,
+            requests_cancelled: None,
+            mean_latency_ms: None,
+        }],
+    }]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.setup_selection(),
+            SetupSelection::Item(MainItemKind::Shunt(..))
+        ),
+        "the pool account is selected"
+    );
+    assert_eq!(app.config_focus, ConfigFocus::Actions, "↵ descends");
+    app
+}
+
+/// A pool detail with one action row (a codex-family account: `remove` only)
+/// has nowhere to walk, so the help lists no page row; two rows list
+/// `move a page`.
+#[test]
+fn a_pool_detail_lists_its_page_row_only_with_a_second_row() {
+    use crate::gateway_admin::PoolAuth;
+    use crate::tui::app::PoolDetailRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_detail_app(PoolAuth::Codex);
+    assert_eq!(app.pool_detail_rows(), vec![PoolDetailRow::Remove]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        Vec::<String>::new(),
+        "a lone row lists no page row"
+    );
+    let mut app = pool_detail_app(PoolAuth::Claude);
+    assert_eq!(
+        app.pool_detail_rows(),
+        vec![PoolDetailRow::Refresh, PoolDetailRow::Remove]
+    );
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two rows list the page row"
+    );
+}
+
+/// On a one-row pool detail with the remove armed, each walk and page key the
+/// surfaces hide leaves the cursor, the arm and the frame unchanged. With two
+/// rows the joined page key is listed, and a page press that lands on the row
+/// it left still acts: it disarms the remove, while its other direction moves
+/// the cursor.
+#[test]
+fn a_lone_row_pool_detail_keeps_its_armed_remove_under_the_hidden_walk_keys() {
+    use crate::gateway_admin::PoolAuth;
+    use crate::tui::app::{PoolDetailRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = pool_detail_app(PoolAuth::Codex);
+    assert_eq!(app.pool_detail_rows(), vec![PoolDetailRow::Remove]);
+    app.pool_detail_armed = true;
+    let before = hint_frame(&app);
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.config_action_cursor, app.pool_detail_armed),
+            (0, true),
+            "{code:?} on a lone row keeps the cursor and the arm"
+        );
+        assert_eq!(hint_frame(&app), before, "{code:?} changes no frame");
+    }
+
+    let mut app = pool_detail_app(PoolAuth::Claude);
+    assert_eq!(
+        app.pool_detail_rows(),
+        vec![PoolDetailRow::Refresh, PoolDetailRow::Remove]
+    );
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two rows list the page row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let _ = hint_frame(&app);
+    app.pool_detail_armed = true;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        (app.config_action_cursor, app.pool_detail_armed),
+        (1, false),
+        "pgdn on the last row stays there and disarms the remove"
+    );
+}
+
+/// A Fallback `+ add` picker with one candidate has nowhere to walk: the help
+/// lists no page row and each walk and page key leaves the picker and the
+/// frame unchanged. Two candidates list `move a page`.
+#[test]
+fn the_add_picker_pages_only_while_it_has_a_second_candidate() {
+    use crate::tui::app::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let picker = |names: &[&str]| {
+        let mut app = app_on(Tab::Fallback, hint_profiles(names));
+        app.config().state.fallback_chain = vec![crate::profile::ProfileName::from(names[0])];
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            crate::tui::app::fallback_hint(&app),
+            FallbackHint::DetailAdd,
+            "↵ on `+ add` opens the picker"
+        );
+        app
+    };
+
+    let mut app = picker(&["alpha", "beta"]);
+    assert_eq!(chain_candidates(&app), vec!["beta".to_string()]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        Vec::<String>::new(),
+        "one candidate lists no page row"
+    );
+    let before = hint_frame(&app);
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.fallback_focus, app.fallback_detail_cursor),
+            (FallbackFocus::Detail, 0),
+            "{code:?} keeps the picker on its one candidate"
+        );
+        assert_eq!(hint_frame(&app), before, "{code:?} changes no frame");
+    }
+
+    let mut app = picker(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        help_page_rows(&mut app),
+        vec!["│ ││ │ pgup/pgdn move a page │ │".to_string()],
+        "two candidates list the page row"
+    );
+}
+
+/// A re-check that clears the herdr problem while the heal line held focus
+/// leaves the stored focus flag behind; the handler drops it at entry, so
+/// `space` acts on the focused option, and the help lists `space`.
+#[test]
+fn a_cleared_herdr_fix_line_hands_space_back_to_the_option() {
+    use crate::profile::PopupWidth;
+    use crate::tui::app::{Check, Health, Problem, ServiceFix, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let herdr = |problems: Vec<Problem>| Check {
+        label: "herdr",
+        health: Health::Ok,
+        detail: vec![],
+        fix: None,
+        problems,
+        shunt_focus: vec![],
+        shunt_action_start: None,
+    };
+    let mut app = empty_app(Tab::Services);
+    app.services.checks = vec![herdr(vec![Problem {
+        line: 0,
+        fix: ServiceFix::MoveStoresIn,
+    }])];
+    app.services.focus = ServicesFocus::Detail;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        app.services.herdr_fix_focus,
+        "↑ from the first option focuses the heal line"
+    );
+    // The recompute replaces the checks and leaves the focus flag alone.
+    app.services.checks = vec![herdr(Vec::new())];
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows",),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("space", "activate the focused herdr option"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "the cleared heal line lists the option's space"
+    );
+    assert_eq!(
+        app.config().state.herdr.popup_width,
+        PopupWidth::Fit,
+        "the popup width starts at fit"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.herdr.popup_width,
+        PopupWidth::Half,
+        "space cycles the focused popup-width option"
+    );
+}
+
+// ---- a key whose only effect is a refusal shows no hint ----
+
+/// A proxy account logs in only through its proxy: on its Setup card's
+/// `Login` row the footer and the help offer no `↵`, and a press only toasts
+/// the refusal, opening no login.
+#[test]
+fn a_proxy_accounts_login_row_offers_no_enter_and_its_press_only_refuses() {
+    use crate::tui::app::{ConfigRow, config_rows, handle_key};
+    use crate::tui::render::prose::cmd;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        Some("clp_key".to_string()),
+    );
+    crate::profile::save_profile(&px).expect("save px");
+    let record = crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").expect("the stub service"),
+        account: "acct-px".to_string(),
+    };
+    crate::profile::write_proxy_record(&px.name, &record).expect("write the proxy record");
+    px.proxy = Some(record);
+    let mut app = app_on(Tab::Setup, vec![px]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("the card holds a login row");
+
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+            (
+                "env",
+                concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+            ),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+            (
+                "disable / enable",
+                concat!(
+                    key_lit!("\u{21b5}"),
+                    " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                ),
+            ),
+            (
+                "delete",
+                concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+            ),
+            ("esc", "stop editing / back to account list"),
+        ]
+    );
+
+    let cursor = app.config_action_cursor;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>(),
+        vec![format!(
+            "login failed\n'px' is an account on proxy \"stub\": log in to it again with {}, \
+             or delete it with {} first",
+            cmd("clauth login px --proxy stub"),
+            cmd("clauth delete px")
+        )],
+        "the press toasts the refusal"
+    );
+    assert_eq!(
+        (
+            app.modals.len(),
+            app.login.is_some(),
+            app.config_action_cursor
+        ),
+        (0, false, cursor),
+        "(modals, a login in flight, the card row): the press opens nothing"
+    );
+}
+
+// ---- the Tokens dashboard walks only laid-out cards ----
+
+/// A failed token read lays out no cards, so the card walk has nothing to
+/// move: the help lists neither `↑ ↓` nor `pgup/pgdn`, no global page row
+/// shows, and the arrows and page keys change nothing. Once stats load and
+/// the cards are laid out, the walk and its rows return.
+#[test]
+fn a_failed_token_dashboard_lists_no_card_walk_and_its_keys_change_nothing() {
+    use crate::tui::app::{PageAction, handle_key, page_keys_act};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = empty_app(Tab::Tokens);
+    app.tokens_failed = true;
+    let _ = hint_frame(&app);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{21b5}", "show why"),
+            ("c", "count cache in token figures"),
+            (
+                "t",
+                "cycle period \u{b7} lifetime / daily / weekly / monthly",
+            ),
+            ("r", "reload on-disk stats"),
+        ],
+        "the failed dashboard's rows"
+    );
+    assert_eq!(page_keys_act(&app), None, "no global page row");
+    let held = (app.token_dash_focus, app.token_dash_first.get());
+    let held_frame = hint_frame(&app);
+    for code in [
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::PageDown,
+        KeyCode::PageUp,
+    ] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            (app.token_dash_focus, app.token_dash_first.get()),
+            held,
+            "{code:?} moves no card focus"
+        );
+        assert_eq!(hint_frame(&app), held_frame, "{code:?} changes no frame");
+    }
+
+    // Stats land: the cards are laid out and the walk acts.
+    let mut app = model_detail_fits_app();
+    app.token_view = TokenView::Dashboard;
+    app.model_detail_focus = StatusFocus::List;
+    let _ = hint_frame(&app);
+    assert_eq!(
+        help_of(&app)[..2],
+        [
+            ("\u{2191} \u{2193}", "move between cards"),
+            ("pgup/pgdn", "move a page of cards"),
+        ],
+        "laid-out cards list their walk"
+    );
+    assert_eq!(page_keys_act(&app), Some(PageAction::Move));
+    let before = app.token_dash_focus;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_ne!(app.token_dash_focus, before, "↓ moves card focus");
+}
+
+/// Each whitespace-joined row's help-modal segment, from the `│` before `key`
+/// to the `│` after its label: the modal's own row whole, without the panes
+/// it overlays.
+pub(crate) fn help_row_segments(rows: &[String], key: &str) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let at = row.find(key).expect("the row holds the key");
+            let left = row[..at].rfind('│').expect("the modal's left border");
+            let right = at + row[at..].find('│').expect("the modal's right border");
+            row[left..right + '│'.len_utf8()].to_string()
+        })
+        .collect()
+}
+
+// ---- a help row says what its key does on the focused thing ----
+
+/// The Fallback `+ add` picker's `↵` adds the focused candidate: the help
+/// names it in the footer's own word, beside the walk while there is a
+/// second candidate.
+#[test]
+fn the_add_picker_help_names_its_enter_add() {
+    use crate::tui::app::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let picker = |names: &[&str]| {
+        let mut app = app_on(Tab::Fallback, hint_profiles(names));
+        app.config().state.fallback_chain = vec![crate::profile::ProfileName::from(names[0])];
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            crate::tui::app::fallback_hint(&app),
+            FallbackHint::DetailAdd,
+            "↵ on `+ add` opens the picker"
+        );
+        app
+    };
+    let app = picker(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("↑↓", "pick"),
+                ("↵", "add"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back"),
+            ]
+        )
+    );
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "add"),
+            ("esc", "back / cancel edit"),
+        ],
+        "two candidates"
+    );
+    let app = picker(&["alpha", "beta"]);
+    assert_eq!(
+        help_of(&app),
+        vec![("\u{21b5}", "add"), ("esc", "back / cancel edit")],
+        "one candidate"
+    );
+}
+
+/// The Setup card's `space` and `+ / -` rows follow the focused row, as the
+/// card's key handler does: on `name` neither lists and both keys change
+/// nothing; on `auto-start` only `space`; on `alert at` both.
+#[test]
+fn the_setup_card_space_and_step_rows_follow_the_focused_row() {
+    use crate::tui::app::{ConfigRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let head = |verb: &'static str| {
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", verb),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+        ]
+    };
+    let tail = [
+        (
+            "env",
+            concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+        ),
+        (
+            "a",
+            "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+        ),
+        (
+            "disable / enable",
+            concat!(
+                key_lit!("\u{21b5}"),
+                " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+            ),
+        ),
+        (
+            "delete",
+            concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+        ),
+        ("esc", "stop editing / back to account list"),
+    ];
+    let space = ("space", "change the focused setting");
+    let step = ("+ / -", "step the focused number");
+
+    let mut app = setup_row_app(ConfigRow::Name);
+    let mut expected = head("edit");
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "name: neither row");
+    let held = |app: &App| {
+        (
+            app.config_action_cursor,
+            app.config_draft
+                .as_ref()
+                .map(|d| (d.active, d.bell_threshold.value.clone())),
+            app.config().profiles[0].auto_start,
+            app.toasts.len(),
+        )
+    };
+    let before = held(&app);
+    let before_frame = hint_frame(&app);
+    for c in [' ', '+', '-'] {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+        assert_eq!(held(&app), before, "{c:?} on name changes no state");
+        assert_eq!(
+            hint_frame(&app),
+            before_frame,
+            "{c:?} on name changes no frame"
+        );
+    }
+
+    let app = setup_row_app(ConfigRow::AutoStart);
+    let mut expected = head("toggle");
+    expected.push(space);
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "auto-start: space only");
+
+    let app = setup_row_app(ConfigRow::BellThreshold);
+    let mut expected = head("type");
+    expected.extend([space, step]);
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "alert at: space and + / -");
+}
+
+/// A Services detail that only scrolls names its arrows `scroll`, the
+/// footer's own word there; a detail that walks rows keeps
+/// `move between rows`. The plugin card's lone option row keeps its toggle
+/// pair while the arrows scroll, so its list joins the one `↵ open or act`
+/// row the footer's `space/↵` offers.
+#[test]
+fn the_services_detail_arrows_row_follows_the_footers_sense() {
+    use crate::tui::app::{Check, Health, Problem, ServiceFix};
+    let _home = crate::testutil::HomeSandbox::new();
+    let detail = |label: &'static str, problems: Vec<Problem>, bound: u16| {
+        let mut app = empty_app(Tab::Services);
+        app.services.checks = vec![Check {
+            label,
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems,
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_max_scroll.set(bound);
+        app
+    };
+    let scroll_only = vec![
+        ("\u{2191} \u{2193}", "scroll"),
+        ("pgup/pgdn", "scroll a page"),
+        ("r", "re-run all checks"),
+        ("esc", "back to the list · close the editor"),
+    ];
+    for label in ["rex", "shunt"] {
+        assert_eq!(
+            help_of(&detail(label, Vec::new(), 4)),
+            scroll_only,
+            "{label}: a detail that only scrolls"
+        );
+    }
+    let plugin_scroll = vec![
+        ("\u{2191} \u{2193}", "scroll"),
+        ("pgup/pgdn", "scroll a page"),
+        ("\u{21b5}", "open or act on the focused row"),
+        ("r", "re-run all checks"),
+        ("esc", "back to the list · close the editor"),
+    ];
+    assert_eq!(
+        help_of(&detail("plugin", Vec::new(), 4)),
+        plugin_scroll,
+        "plugin: scrolls, plus the lone option row's toggle pair"
+    );
+    let problem = |line| Problem {
+        line,
+        fix: ServiceFix::MoveStoresIn,
+    };
+    let app = detail("plugin", vec![problem(0), problem(1)], 0);
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open or act on the focused row"),
+            ("f", "next fix"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+        "plugin problems: a walk"
+    );
+}
+
+/// A Fallback member card lists `↵`, `space` and `+ / -` only while the
+/// focused row takes them, as its key handler does: the gate-off `weekly at`
+/// lists none and `↵` / `+` / `-` change nothing there; `rotate at` lists all
+/// three; a toggle row lists `↵` and `space`, no `+ / -`.
+#[test]
+fn the_member_card_enter_and_step_rows_follow_the_focused_row() {
+    use crate::tui::app::{FALLBACK_ROWS, FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let card_on = |row: FallbackRow| {
+        let mut app = one_member_chain_app();
+        app.config().profiles[0].check_weekly = false;
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = FALLBACK_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("a card row");
+        app
+    };
+    let enter = ("\u{21b5}", "open or change the focused row");
+    let space = ("space", "change the focused setting");
+    let step = ("+ / -", "step the focused number");
+    let tail = [
+        (
+            "\u{21b5} on rotate at",
+            concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+        ),
+        (
+            "space on preferred days",
+            "step never / weekdays / weekends / every day",
+        ),
+        (
+            "\u{21b5} on preferred days",
+            concat!(
+                "pick days: ",
+                key_lit!("\u{2190} \u{2192}"),
+                " walk \u{00b7} ",
+                key_lit!("space"),
+                " toggles and saves \u{00b7} ",
+                key_lit!("\u{21b5} esc q"),
+                " leave \u{00b7} ",
+                key_lit!("\u{2191} \u{2193}"),
+                " leave and move",
+            ),
+        ),
+        ("esc", "back / cancel edit"),
+    ];
+    let walk = ("\u{2191} \u{2193}", "move between rows");
+
+    let mut app = card_on(FallbackRow::WeeklyAt);
+    let mut expected = vec![walk];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "weekly at, gate off: neither row");
+    let held = |app: &App| {
+        (
+            format!("{:?}", app.config().profiles[0]),
+            app.fallback_edit.is_some(),
+            app.fallback_detail_cursor,
+            app.toasts.len(),
+            app.modals.len(),
+        )
+    };
+    let before = held(&app);
+    let before_frame = hint_frame(&app);
+    for code in [KeyCode::Enter, KeyCode::Char('+'), KeyCode::Char('-')] {
+        handle_key(&mut app, crate::testutil::key(code));
+        assert_eq!(
+            held(&app),
+            before,
+            "{code:?} on the inert row changes no state"
+        );
+        assert_eq!(
+            hint_frame(&app),
+            before_frame,
+            "{code:?} on the inert row changes no frame"
+        );
+    }
+
+    let app = card_on(FallbackRow::Threshold);
+    let mut expected = vec![walk, enter, space, step];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "rotate at: all three rows");
+
+    let app = card_on(FallbackRow::CheckWeekly);
+    let mut expected = vec![walk, enter, space];
+    expected.extend(tail);
+    assert_eq!(help_of(&app), expected, "a toggle row: ↵ and space");
+}
+
+// ---- a stepper's `+` and `-` each follow their own direction ----
+
+/// One persisted claude account `acct` shaped by `edit`, its Setup card open
+/// on `row`: the on-disk shape the steppers write through. A probe-on account
+/// stores a setup token, the shape that lists `probe every`.
+fn persisted_setup_card(
+    row: crate::tui::app::ConfigRow,
+    edit: impl FnOnce(&mut crate::profile::Profile),
+) -> App {
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    edit(&mut profile);
+    crate::profile::save_profile(&profile).expect("persist acct");
+    if profile.usage_probe {
+        crate::testutil::write_long_lived_sidecar(&name);
+        profile.has_long_lived_sidecar = true;
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![name],
+        ..AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_on(Tab::Setup, vec![profile]);
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
+    app.config_action_cursor = crate::tui::app::config_rows(&app)
+        .iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| panic!("the card shows {row:?}"));
+    app
+}
+
+/// One persisted chain member `alpha` shaped by `edit` under a state shaped by
+/// `state_edit`, its member card open on `row`.
+fn persisted_member_card(
+    row: crate::tui::app::FallbackRow,
+    edit: impl FnOnce(&mut crate::profile::Profile),
+    state_edit: impl FnOnce(&mut AppState),
+) -> App {
+    let name = crate::profile::ProfileName::from("alpha");
+    let mut profile = crate::testutil::blank_profile(&name);
+    edit(&mut profile);
+    crate::profile::save_profile(&profile).expect("persist alpha");
+    let mut state = AppState {
+        profiles: vec![name.clone()],
+        fallback_chain: vec![name],
+        ..AppState::default()
+    };
+    state_edit(&mut state);
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Fallback;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = crate::tui::app::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("a card row");
+    app
+}
+
+/// Pins one stepper frame: the footer lists exactly `steps` between `↑↓ row`
+/// and `↵ type`, and each key in `dead` leaves `value`, the toasts and the
+/// drawn frame as they were.
+fn assert_stepper_frame(
+    app: &mut App,
+    steps: &[(&str, &str)],
+    dead: &[char],
+    value: &dyn Fn(&App) -> String,
+    case: &str,
+) {
+    let mut groups = vec![("←", "back"), ("↑↓", "row")];
+    groups.extend_from_slice(steps);
+    groups.extend([
+        ("↵", "type"),
+        ("a", "actions"),
+        ("?", "help"),
+        ("q", "back"),
+    ]);
+    assert_eq!(wide_footer(app), footer_of(app, &groups), "{case}: footer");
+    for &c in dead {
+        let before = (value(app), app.toasts.len());
+        let frame = hint_frame(app);
+        crate::tui::app::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+        assert_eq!(
+            (value(app), app.toasts.len()),
+            before,
+            "{case}: {c:?} changes no state"
+        );
+        assert_eq!(hint_frame(app), frame, "{case}: {c:?} changes no frame");
+    }
+}
+
+/// The Setup card's `alert at` and `probe every` offer `+` and `-` each only
+/// while that direction moves the value: at a bound the footer drops the dead
+/// key and its press writes nothing, while the help's joined `+ / -` stays.
+/// An unset alert starts both directions on 95, and a hundredths value steps
+/// onto the bound first.
+#[test]
+fn a_setup_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{ConfigRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let raise = ("+", "raise");
+    let lower = ("-", "lower");
+    let joined = ("+ / -", "step the focused number");
+    let bell = |app: &App| {
+        let name = crate::profile::ProfileName::from("acct");
+        format!(
+            "{:?}",
+            (
+                app.config().find(&name).and_then(|p| p.bell_threshold),
+                crate::profile::load_profile(&name)
+                    .expect("reload acct")
+                    .bell_threshold,
+            )
+        )
+    };
+    let alert =
+        |v: Option<f64>| persisted_setup_card(ConfigRow::BellThreshold, |p| p.bell_threshold = v);
+
+    let mut mid = alert(Some(50.0));
+    let mid_help = help_of(&mid);
+    assert!(mid_help.contains(&joined), "alert at 50: {mid_help:?}");
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &bell, "alert at 50");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        bell(&mid),
+        "(Some(55.0), Some(55.0))",
+        "alert at 50: + lands"
+    );
+
+    let mut top = alert(Some(100.0));
+    assert_eq!(
+        help_of(&top),
+        mid_help,
+        "alert at 100: the joined row stays"
+    );
+    assert_stepper_frame(&mut top, &[lower], &['+', '='], &bell, "alert at 100");
+
+    let mut bottom = alert(Some(0.0));
+    assert_eq!(
+        help_of(&bottom),
+        mid_help,
+        "alert at 0: the joined row stays"
+    );
+    assert_stepper_frame(&mut bottom, &[raise], &['-', '_'], &bell, "alert at 0");
+
+    let mut off = alert(None);
+    assert_stepper_frame(&mut off, &[raise, lower], &[], &bell, "alert off");
+    handle_key(&mut off, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        bell(&off),
+        "(Some(95.0), Some(95.0))",
+        "alert off: - starts on 95"
+    );
+
+    let mut near = alert(Some(0.004));
+    assert_stepper_frame(&mut near, &[raise, lower], &[], &bell, "alert at 0.004");
+    handle_key(&mut near, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        bell(&near),
+        "(Some(0.0), Some(0.0))",
+        "alert at 0.004: - lands on 0"
+    );
+    assert_stepper_frame(&mut near, &[raise], &['-'], &bell, "alert stepped to 0");
+
+    let probe = |app: &App| {
+        let name = crate::profile::ProfileName::from("acct");
+        format!(
+            "{:?}",
+            (
+                app.config().find(&name).map(|p| p.usage_probe_interval_ms),
+                crate::profile::load_profile(&name)
+                    .expect("reload acct")
+                    .usage_probe_interval_ms,
+            )
+        )
+    };
+    let every = |ms: u64| {
+        persisted_setup_card(ConfigRow::UsageProbeInterval, |p| {
+            p.usage_probe = true;
+            p.usage_probe_interval_ms = ms;
+        })
+    };
+    let less = ("+", "less often");
+    let more = ("-", "more often");
+
+    let mut mid = every(300_000);
+    let mid_help = help_of(&mid);
+    assert!(
+        mid_help.contains(&joined),
+        "probe every 300 s: {mid_help:?}"
+    );
+    assert_stepper_frame(&mut mid, &[less, more], &[], &probe, "probe every 300 s");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(
+        probe(&mid),
+        "(Some(270000), 270000)",
+        "probe every 300 s: - lands"
+    );
+
+    let mut top = every(450_000);
+    assert_eq!(
+        help_of(&top),
+        mid_help,
+        "probe every 450 s: the joined row stays"
+    );
+    assert_stepper_frame(&mut top, &[more], &['+'], &probe, "probe every 450 s");
+
+    let mut bottom = every(60_000);
+    assert_eq!(
+        help_of(&bottom),
+        mid_help,
+        "probe every 60 s: the joined row stays"
+    );
+    assert_stepper_frame(&mut bottom, &[less], &['-'], &probe, "probe every 60 s");
+}
+
+/// The member card's `rotate at` and `weekly at` offer `+` and `-` each only
+/// while that direction moves the value, the help's joined `+ / -` staying. An
+/// unset `weekly at` steps off the chain default, so a default already at
+/// 100 % takes no `+` and its press leaves the override unset.
+#[test]
+fn a_member_card_stepper_offers_each_step_key_only_while_its_direction_moves() {
+    use crate::tui::app::{FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let raise = ("+", "raise");
+    let lower = ("-", "lower");
+    let joined = ("+ / -", "step the focused number");
+    let saved = |field: fn(&crate::profile::Profile) -> Option<f64>| {
+        move |app: &App| {
+            let name = crate::profile::ProfileName::from("alpha");
+            format!(
+                "{:?}",
+                (
+                    app.config().find(&name).map(field),
+                    field(&crate::profile::load_profile(&name).expect("reload alpha")),
+                )
+            )
+        }
+    };
+    let threshold = saved(|p| p.fallback_threshold);
+    let weekly = saved(|p| p.weekly_threshold);
+    let rotate = |v: f64| {
+        persisted_member_card(
+            FallbackRow::Threshold,
+            |p| p.fallback_threshold = Some(v),
+            |_| {},
+        )
+    };
+
+    // The footer and the dead presses first, then the help's joined row,
+    // which reads the same predicates either way round.
+    let mut helps = Vec::new();
+
+    let mut mid = rotate(50.0);
+    helps.push(("rotate at 50", help_of(&mid)));
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &threshold, "rotate at 50");
+    handle_key(&mut mid, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        threshold(&mid),
+        "(Some(Some(55.0)), Some(55.0))",
+        "rotate at 50: + lands"
+    );
+
+    let mut top = rotate(100.0);
+    helps.push(("rotate at 100", help_of(&top)));
+    assert_stepper_frame(&mut top, &[lower], &['+', '='], &threshold, "rotate at 100");
+
+    let mut bottom = rotate(0.0);
+    helps.push(("rotate at 0", help_of(&bottom)));
+    assert_stepper_frame(
+        &mut bottom,
+        &[raise],
+        &['-', '_'],
+        &threshold,
+        "rotate at 0",
+    );
+
+    let weekly_at = |v: Option<f64>, chain_default: Option<f64>| {
+        persisted_member_card(
+            FallbackRow::WeeklyAt,
+            |p| {
+                p.check_weekly = true;
+                p.weekly_threshold = v;
+            },
+            |s| s.weekly_switch_threshold = chain_default,
+        )
+    };
+
+    let mut mid = weekly_at(Some(75.0), None);
+    helps.push(("weekly at 75", help_of(&mid)));
+    assert_stepper_frame(&mut mid, &[raise, lower], &[], &weekly, "weekly at 75");
+
+    let mut top = weekly_at(Some(100.0), None);
+    helps.push(("weekly at 100", help_of(&top)));
+    assert_stepper_frame(&mut top, &[lower], &['+'], &weekly, "weekly at 100");
+
+    let mut bottom = weekly_at(Some(50.0), None);
+    helps.push(("weekly at 50", help_of(&bottom)));
+    assert_stepper_frame(&mut bottom, &[raise], &['-'], &weekly, "weekly at 50");
+
+    let mut unset_top = weekly_at(None, Some(100.0));
+    helps.push(("weekly at unset, chain default 100", help_of(&unset_top)));
+    assert_stepper_frame(
+        &mut unset_top,
+        &[lower],
+        &['+'],
+        &weekly,
+        "weekly at unset, chain default 100",
+    );
+
+    let mut unset = weekly_at(None, None);
+    assert_stepper_frame(&mut unset, &[raise, lower], &[], &weekly, "weekly at unset");
+    handle_key(&mut unset, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(
+        weekly(&unset),
+        "(Some(Some(100.0)), Some(100.0))",
+        "weekly at unset: + steps off the 98 default"
+    );
+
+    // Each bound lists the rows of its row's mid-range control, the joined
+    // `+ / -` among them.
+    let (rotate_helps, weekly_helps) = helps.split_at(3);
+    for group in [rotate_helps, weekly_helps] {
+        let (base_case, base) = &group[0];
+        assert!(base.contains(&joined), "{base_case}: {base:?}");
+        for (case, help) in group {
+            assert_eq!(help, base, "{case}: the joined row stays");
+        }
+    }
+}
+
+/// The `+ add` picker whose last candidate went (a peer disabled it while the
+/// tick reload kept the picker open) offers no `↵ add` in the footer or the
+/// help, the count its handler reads; the press adds nothing.
+#[test]
+fn an_add_picker_with_no_candidates_offers_no_enter() {
+    use crate::tui::app::{FallbackHint, chain_candidates, fallback_hint, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_on(Tab::Fallback, hint_profiles(&["alpha", "beta"]));
+    app.config().state.fallback_chain = vec![crate::profile::ProfileName::from("alpha")];
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        fallback_hint(&app),
+        FallbackHint::DetailAdd,
+        "the picker is open"
+    );
+    app.config().profiles[1].disabled = true;
+    assert!(chain_candidates(&app).is_empty(), "no account can join");
+    assert_eq!(
+        fallback_hint(&app),
+        FallbackHint::DetailAdd,
+        "the picker stays open"
+    );
+    assert_eq!(
+        wide_footer(&app),
+        footer_of(
+            &app,
+            &[
+                ("←", "back"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back")
+            ]
+        )
+    );
+    assert_eq!(help_of(&app), vec![("esc", "back / cancel edit")]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config().state.fallback_chain,
+        vec![crate::profile::ProfileName::from("alpha")],
+        "↵ adds nothing"
+    );
+    assert_eq!(
+        app.fallback_focus,
+        FallbackFocus::Chain,
+        "the empty picker folds back to the chain on any key"
+    );
+}
+
+/// The member card's help lists `space  change the focused setting` while the
+/// focused row is a state control `space` acts on: a toggle row lists it and
+/// `space` flips it; the gate-off `weekly at`, `remove` and `preferred days`
+/// (whose `space` keeps its own row) do not, and the inert row's `space`
+/// changes nothing.
+#[test]
+fn the_member_card_space_row_follows_the_focused_row() {
+    use crate::tui::app::{FallbackRow, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let space = ("space", "change the focused setting");
+    let mut toggle = persisted_member_card(FallbackRow::CheckWeekly, |_| {}, |_| {});
+    assert_eq!(
+        help_of(&toggle),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            ("\u{21b5}", "open or change the focused row"),
+            space,
+            (
+                "\u{21b5} on rotate at",
+                concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+            ),
+            ("\u{21b5} on weekly at", "type a %, empty clears"),
+            (
+                "space on preferred days",
+                "step never / weekdays / weekends / every day",
+            ),
+            (
+                "\u{21b5} on preferred days",
+                concat!(
+                    "pick days: ",
+                    key_lit!("\u{2190} \u{2192}"),
+                    " walk \u{00b7} ",
+                    key_lit!("space"),
+                    " toggles and saves \u{00b7} ",
+                    key_lit!("\u{21b5} esc q"),
+                    " leave \u{00b7} ",
+                    key_lit!("\u{2191} \u{2193}"),
+                    " leave and move",
+                ),
+            ),
+            ("esc", "back / cancel edit"),
+        ],
+        "check weekly"
+    );
+    let name = crate::profile::ProfileName::from("alpha");
+    handle_key(&mut toggle, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        (
+            toggle.config().find(&name).map(|p| p.check_weekly),
+            crate::profile::load_profile(&name)
+                .expect("reload alpha")
+                .check_weekly,
+        ),
+        (Some(false), false),
+        "space flips check weekly"
+    );
+
+    for row in [FallbackRow::Remove, FallbackRow::PreferredDays] {
+        let app = persisted_member_card(row, |_| {}, |_| {});
+        let help = help_of(&app);
+        assert!(!help.contains(&space), "{row:?}: {help:?}");
+    }
+
+    let mut inert =
+        persisted_member_card(FallbackRow::WeeklyAt, |p| p.check_weekly = false, |_| {});
+    let help = help_of(&inert);
+    assert!(!help.contains(&space), "weekly at, gate off: {help:?}");
+    let before = (
+        format!("{:?}", inert.config().find(&name)),
+        inert.fallback_edit.is_some(),
+        inert.toasts.len(),
+    );
+    let frame = hint_frame(&inert);
+    handle_key(&mut inert, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        (
+            format!("{:?}", inert.config().find(&name)),
+            inert.fallback_edit.is_some(),
+            inert.toasts.len(),
+        ),
+        before,
+        "space on the inert row changes no state"
+    );
+    assert_eq!(
+        hint_frame(&inert),
+        frame,
+        "space on the inert row changes no frame"
+    );
+}
+
+/// On a `+ new` form that mints its client token, the focused api key field
+/// is inert: no `↵` in the footer, and its press changes nothing. The help's
+/// `↵ on a field` legend still lists, read off the form's other fields, whose
+/// `↵` edits.
+#[test]
+fn the_minted_key_field_takes_no_enter_and_the_field_legend_reads_the_others() {
+    use crate::tui::app::{ConfigRow, config_rows, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let toml = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let config = home.home().join("shunt.toml");
+    std::fs::write(&config, toml).expect("write shunt.toml");
+    let bind = crate::gateway::resolve_bind(toml, None).expect("bind");
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new(&format!("http://{}", bind.probe));
+    draft.mint_for = Some(crate::tui::app::TokenMint {
+        record: crate::gateway::GatewayRecord::new(config).expect("record"),
+        bind,
+        require: false,
+    });
+    let mut app = app_on(Tab::Setup, vec![]);
+    app.profile_cursor.set(app.profile_count());
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    assert!(
+        app.config_draft.as_ref().is_some_and(|d| d.mint_armed()),
+        "the form mints"
+    );
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::ApiKey)
+        .expect("the form shows api key");
+    assert_eq!(
+        help_of(&app),
+        vec![
+            ("\u{2191} \u{2193}", "move between rows"),
+            (
+                "\u{21b5} on a field",
+                concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+            ),
+            (
+                "a",
+                "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+            ),
+            ("esc", "stop editing / back to account list"),
+        ],
+        "minted api key focus"
+    );
+    let before = (
+        app.config_draft.as_ref().map(|d| d.active),
+        app.toasts.len(),
+        app.modals.len(),
+    );
+    let frame = hint_frame(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        (
+            app.config_draft.as_ref().map(|d| d.active),
+            app.toasts.len(),
+            app.modals.len(),
+        ),
+        before,
+        "↵ on the minted key changes no state"
+    );
+    assert_eq!(
+        hint_frame(&app),
+        frame,
+        "↵ on the minted key changes no frame"
+    );
 }

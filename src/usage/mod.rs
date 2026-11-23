@@ -7,11 +7,21 @@ mod codex_headers;
 // `clauth limit-reset`: the list/consume pair, its selection rule and its text.
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
+// `clauth limit-reset` on a claude account: Claude Code's own reset read and
+// spend. One caller (`main.rs`), reached by path like its codex sibling.
+pub(crate) mod claude_reset;
+// The per-profile record of a limit-reset spend whose reply was lost, shared
+// by both reset arms.
 mod fetch;
 mod forget;
+pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
+// When a plan ends or renews, off the two dates the user copies from
+// claude.ai's billing page.
+mod plan_end;
+pub(crate) use plan_end::{PlanDates, PlanEnd, parse_plan_date, render_plan_date};
 // The auto-start kick sends the probe's request, so the two cannot drift apart.
 pub(crate) use inference::anthropic::send as anthropic_send;
 mod scheduler;
@@ -21,7 +31,10 @@ mod scheduler;
 // it (S5) — the same `pub(crate)` + private-mod + cfg(test) re-export pattern
 // `scan_auto_switch` already uses.
 #[cfg(test)]
-pub(crate) use scheduler::{SchedulerState, tick};
+pub(crate) use scheduler::{
+    SchedulerState, codex_resets_tick_at, publish_blanked_countdowns,
+    set_tick_fetch_deadline_override, tick,
+};
 // Gated like its one caller, the re-entered daemon child.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use scheduler::CLAUTH_TEST_RUN_SCHEDULER;
@@ -30,9 +43,9 @@ pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
     compute_burn_rates_from_history, funded_wallet_rate, project_utilization,
 };
-pub(crate) use codex::fetch_codex_usage;
 #[cfg(test)]
 pub(crate) use codex::{clear_codex_usage_url_override, set_codex_usage_url_override};
+pub(crate) use codex::{codex_usage_url_owned, fetch_codex_usage_at};
 // The mapping is exercised directly by the codex chain tests, which drive a real
 // wham/usage body through the walk rather than hand-building a UsageInfo.
 #[cfg(test)]
@@ -40,38 +53,41 @@ pub(crate) use codex::map_usage as map_codex_usage;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, AccountEmail, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LABEL_30D,
-    LoginProfile, ORG_REFUSED_STATUS, PlanInfo, PlanTier, ProfileFetchDecision,
+    LimitResets, LoginProfile, ORG_REFUSED_STATUS, PlanInfo, PlanTier, ProfileFetchDecision,
     ProfileUnauthorized, ScopedWindow, SpendInfo, USAGE_HTTP_DEADLINES, UsageInfo, UsageWindow,
-    WindowDollars, await_request_slot, cli_user_agent, decide_profile_fetch, epoch_secs_to_iso,
-    expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
+    WindowDollars, await_request_slot, cli_user_agent, correct_cached_plan, decide_profile_fetch,
+    epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, fetch_profile_plan, five_hour_live,
     forget_profile_memo, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
-    long_window_live, mark_profile_read_stale, ms_to_iso, note_profile_memo, now_epoch_secs,
-    now_ms, parse_retry_after, parse_retry_after_at, probe_account_uuid, probe_login_profile,
-    reconcile_identity_anchor_to_held, seed_login_anchor, seed_plan_cache, spent_resume_in_secs,
-    stamp_profile_fetch, window_avg_pace_per_day, window_duration_secs, windows_maxed,
+    long_window_live, mark_profile_read_stale, ms_to_iso, no_five_hour_limit_cached,
+    note_profile_memo, now_epoch_secs, now_ms, parse_retry_after, parse_retry_after_at,
+    probe_account_uuid, probe_login_profile, reconcile_identity_anchor_to_held, seed_login_anchor,
+    seed_plan_cache, spent_resume_in_secs, stamp_profile_fetch, window_avg_pace_per_day,
+    window_duration_secs, windows_maxed,
 };
 pub(crate) use scheduler::{
-    ActivityStore, DeadLoginStats, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt,
-    LegKey, NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
-    PendingSwitchOff, PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, RotateDone,
-    SkippedUnreadable, SpendMarker, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    StreakCounts, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
-    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore,
-    WeeklyResetKicks, any_busy, any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch,
-    bootstrap_third_party, build_token_entries, claim_marked_spend,
-    claim_scheduler_spend_unless_shutting_down, clear_activity, collect_oauth_seed_names,
-    collect_probe_seeds, collect_third_party_entries, collect_third_party_seed_names,
-    collect_token_seeds, collect_tokens, current_key_rejected_names, dead_login_fingerprint,
-    dead_login_is_setup_token, decision_fresh_any, display_activity, end_rotation,
-    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    kick_block_switch_grade, mark_activity, mark_fetch_activity, note_isolated_credit_refusal,
-    oauth_without_pair, polled_third_party_names, probes_switched_off,
-    profile_credential_fingerprint, queued_switch_away_is_stale,
-    raise_refreshing_unless_shutting_down, read_skipped_unreadable, reading_is_polled,
-    reseed_keeping_cadence, seed_dead_logins, selected_activity, selected_next_refresh,
-    spawn_refresher, spending_account, switch_gate_in_flight, switch_grade_kick_blocked_from_cache,
-    switch_grade_kick_lifts, sync_dead_logins, third_party_credentialed, token_spend_in_flight,
-    usage_cache_clock_of, usage_interval_ms, usage_poll_pair, usage_probe_admits,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, DeadLoginStats, FetchLeg,
+    FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PendingSwitchTarget,
+    PollStreaks, ProfileActivity, RefetchQueue, RotateDone, SkippedUnreadable, SpendGate,
+    SpendMarker, StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
+    any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
+    build_token_entries, claim_marked_spend, claim_scheduler_spend_unless_shutting_down,
+    clear_activity, collect_oauth_seed_names, collect_probe_seeds, collect_third_party_entries,
+    collect_third_party_seed_names, collect_token_seeds, collect_tokens, countdown_blanked,
+    current_key_rejected_names, dead_login_fingerprint, dead_login_is_setup_token,
+    decision_fresh_any, display_activity, end_rotation, fill_chain_snapshot_stores, is_idle,
+    is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
+    mark_fetch_activity, new_claude_resets_memo, new_codex_resets_memo,
+    note_isolated_credit_refusal, oauth_cache_leg_admits, oauth_without_pair,
+    polled_third_party_names, probes_switched_off, profile_credential_fingerprint,
+    queued_switch_away_is_stale, raise_refreshing_unless_shutting_down, read_skipped_unreadable,
+    reading_is_polled, reseed_keeping_cadence, seed_dead_logins, selected_activity,
+    selected_next_refresh, spawn_refresher, spending_account, switch_gate_in_flight,
+    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, sync_dead_logins,
+    third_party_credentialed, tick_fetch_deadline, token_spend_in_flight, usage_cache_clock_of,
+    usage_interval_ms, usage_poll_pair, usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
@@ -96,7 +112,11 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 #[cfg(test)]
 pub(crate) use scheduler::LAST_REFRESHER_SKIP_STORE;
+#[cfg(test)]
+pub(crate) use scheduler::LAST_REFRESHER_START;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
+#[cfg(test)]
+pub(crate) use scheduler::clear_claude_resets_seed_apply_hooks_for_test;
 #[cfg(test)]
 pub(crate) use scheduler::clear_codex_compare_hooks_for_test;
 #[cfg(test)]
@@ -109,9 +129,13 @@ pub(crate) use scheduler::{SeedPhase, set_seed_hook};
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.
+// The spacing and response-header constants ride along: the wire tests bound
+// their elapsed asserts off them, and no shipped path reads either outside
+// `fetch` itself.
 #[cfg(test)]
 pub(crate) use fetch::{
-    reserved_request_slot, reset_profile_fetched_for_test, reset_request_slots, set_compare_hook,
+    REQUEST_SPACING_MS, USAGE_HTTP_RECV_HEADERS_SECS, reserved_request_slot,
+    reset_profile_fetched_for_test, reset_request_slots, set_compare_hook,
 };
 // Test-only: the adopt's token → uuid memo outlives a call now, so it also
 // outlives a test. Cleared with the endpoint overrides that make it reachable.

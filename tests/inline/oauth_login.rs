@@ -140,7 +140,11 @@ fn callback_accepts_matching_state_and_extracts_the_code() {
         verdict.expect("valid callback").as_deref(),
         Some("authcode-1")
     );
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
@@ -153,7 +157,11 @@ fn callback_aborts_on_a_state_mismatch() {
         .expect_err("a state mismatch must abort the login")
         .to_string();
     assert!(err.contains("state mismatch"), "err was: {err}");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 /// Bytes only the browser redirect could have supplied.
@@ -176,10 +184,15 @@ fn callback_aborts_on_an_oauth_error_param_without_echoing_it() {
         .expect_err("an OAuth error param is fatal")
         .to_string();
     assert_eq!(err, "you declined the authorization request");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
     assert!(
         !response.contains(CALLBACK_CANARY),
-        "the page must not reflect it either: {response}"
+        "the page must not reflect it either: {}",
+        response.lines().next().unwrap_or("")
     );
 
     // An `error` code outside RFC 6749's set is where the bytes are least
@@ -272,11 +285,11 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     let rejected = LoginError::Exchange(TokenFailure::Status(400));
     assert_eq!(
         rejected.cli_message(),
-        "anthropic rejected the request (HTTP 400): run `clauth login` again for a fresh code"
+        "anthropic rejected the request (HTTP 400): start the login again for a fresh code"
     );
     assert_eq!(
         rejected.user_message(),
-        "anthropic rejected the request: run `clauth login` again for a fresh code"
+        "anthropic rejected the request: start the login again for a fresh code"
     );
     assert!(
         !rejected.user_message().contains("400"),
@@ -293,7 +306,7 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     for status in [400, 429, 503] {
         let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
         assert!(
-            m.ends_with(": run `clauth login` again for a fresh code"),
+            m.ends_with(": start the login again for a fresh code"),
             "a spent authorization code is only fixed by a new login, got: {m}"
         );
         assert!(
@@ -354,19 +367,31 @@ fn callback_ignores_unrelated_requests_and_keeps_waiting() {
     // A favicon probe is answered 404 and is NOT fatal — the login keeps waiting.
     let (verdict, response) = callback_roundtrip("GET /favicon.ico HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("non-callback path is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 
     // /callback with no code at all → 400, still not fatal.
     let (verdict, response) = callback_roundtrip("GET /callback?state=STATE HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("missing code is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
 fn callback_pages_are_distinct_and_never_reflect_query_values() {
     // Success: styled page that attempts a tab auto-close.
     let (_, ok) = callback_roundtrip("GET /callback?code=c&state=STATE HTTP/1.1\r\n", "STATE");
-    assert!(ok.contains("You're logged in"), "got: {ok}");
+    assert!(
+        ok.contains("You're logged in"),
+        "got: {}",
+        ok.lines().next().unwrap_or("")
+    );
     assert!(
         ok.contains("window.close"),
         "the success page attempts a tab auto-close"
@@ -378,7 +403,11 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
         "GET /callback?error=access_denied&error_description=evil-marker HTTP/1.1\r\n",
         "STATE",
     );
-    assert!(denied.contains("Login canceled"), "got: {denied}");
+    assert!(
+        denied.contains("Login canceled"),
+        "got: {}",
+        denied.lines().next().unwrap_or("")
+    );
     assert!(
         !denied.contains("evil-marker"),
         "untrusted query values must never be reflected into the page"
@@ -386,10 +415,33 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
 
     // Any other OAuth error keeps the generic failure page, with no auto-close.
     let (_, failed) = callback_roundtrip("GET /callback?error=server_error HTTP/1.1\r\n", "STATE");
-    assert!(failed.contains("Login failed"), "got: {failed}");
+    assert!(
+        failed.contains("Login failed"),
+        "got: {}",
+        failed.lines().next().unwrap_or("")
+    );
     assert!(
         !failed.contains("window.close"),
         "only the success page auto-closes"
+    );
+}
+
+/// The page a callback writes needs no follow-up request, so a stray request
+/// on the same listener is answered as the not-found page and never taken for
+/// the callback.
+#[test]
+fn a_stray_request_is_answered_as_not_found_and_never_takes_a_code() {
+    let (verdict, response) = callback_roundtrip("GET /assets/login.css HTTP/1.1\r\n", "STATE");
+    assert!(verdict.expect("a non-callback is not a callback").is_none());
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("Nothing at this address"),
+        "the not-found page: {}",
+        response.lines().next().unwrap_or("")
     );
 }
 
@@ -425,10 +477,74 @@ fn login_summary_names_the_plan_a_free_login_stored() {
         }),
     };
     assert!(
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
             .contains("  plan: Claude Free (token verified against the API)"),
         "got: {}",
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
+    );
+}
+
+fn token_stamped(sub: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: sub.map(str::to_string),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The login's own `/profile` probe knows the plan better than the bare token
+/// stamp: a 20x Max login stamps `max` but reads as Ultra.
+#[test]
+fn login_summary_names_the_plan_the_probe_read_over_the_token_stamp() {
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(20)),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&plan));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// An Ultra organization mints no token stamp, yet its probe still named the
+/// plan, and the server's own name wins there too.
+#[test]
+fn login_summary_names_a_probed_plan_when_the_token_has_no_stamp() {
+    let ultra = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Ultra,
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(None), Some(&ultra));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+    let named = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        plan_display_name: Some("Ultra Lite".to_string()),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&named));
+    assert!(
+        summary.contains("  plan: Claude Ultra Lite (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// A probe that classified nothing is no plan: the token stamp still speaks.
+#[test]
+fn login_summary_falls_back_to_the_token_stamp_over_an_unclassified_probe() {
+    let unknown = crate::usage::PlanInfo::default();
+    let summary = super::login_summary(&token_stamped(Some("pro")), Some(&unknown));
+    assert!(
+        summary.contains("  plan: Claude Pro (token verified against the API)"),
+        "got: {summary}"
     );
 }
 
@@ -447,7 +563,7 @@ fn login_summary_defers_when_the_token_claims_no_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     };
-    let summary = super::login_summary(&creds);
+    let summary = super::login_summary(&creds, None);
     assert!(
         summary.contains("  plan: will populate on the first usage refresh"),
         "got: {summary}"
@@ -758,6 +874,7 @@ fn a_failed_probe_carries_no_plan_and_seeds_nothing() {
         &mut config,
         "fresh".to_string(),
         Default::default(),
+        None,
         snapshot,
     )
     .expect("capture");

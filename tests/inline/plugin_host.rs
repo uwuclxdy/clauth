@@ -131,6 +131,19 @@ fn the_await_job_hook_matches_delegate_under_both_server_names() {
     }
 }
 
+/// Every command a hooks.json event runs, across its matcher groups.
+fn event_commands(hooks: &serde_json::Value, event: &str) -> Vec<String> {
+    hooks["hooks"][event]
+        .as_array()
+        .unwrap_or_else(|| panic!("{event} is an array"))
+        .iter()
+        .filter_map(|group| group["hooks"].as_array())
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The SessionStart wiring the self-heal rides on: the committed hooks.json
 /// must carry BOTH hooks — the profile-change note keeps working, and the new
 /// self-heal entry points at the hidden `clauth self-heal` subcommand. A drift
@@ -141,15 +154,7 @@ fn session_start_hook_wires_self_heal_beside_the_note() {
     let hooks: serde_json::Value =
         serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
             .expect("plugins/hooks/hooks.json parses");
-    let commands: Vec<String> = hooks["hooks"]["SessionStart"]
-        .as_array()
-        .expect("SessionStart is an array")
-        .iter()
-        .filter_map(|group| group["hooks"].as_array())
-        .flatten()
-        .filter_map(|hook| hook["command"].as_str())
-        .map(str::to_string)
-        .collect();
+    let commands = event_commands(&hooks, "SessionStart");
     assert!(
         commands
             .iter()
@@ -159,6 +164,137 @@ fn session_start_hook_wires_self_heal_beside_the_note() {
     assert!(
         commands.iter().any(|c| c == "clauth self-heal"),
         "the self-heal hook is not wired into SessionStart: {commands:?}"
+    );
+}
+
+/// A prompt is the main scope's backstop for the note: a turn whose tool
+/// calls all fall inside a cadence window the previous turn opened would
+/// otherwise go unchecked. The UserPromptSubmit leg must keep its entry.
+#[test]
+fn prompt_submit_keeps_the_note_command() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let commands = event_commands(&hooks, "UserPromptSubmit");
+    assert!(
+        commands
+            .iter()
+            .any(|c| c == "clauth hook-profile-changed-note"),
+        "the profile-change note must keep its UserPromptSubmit slot: {commands:?}"
+    );
+}
+
+/// The mid-turn note is one process spawn per cadence window in the hooks
+/// module. A `PostToolUse` entry whose matcher takes every tool spawns a
+/// command on each call, so none may exist: an absent, empty, `*` or `.*`
+/// matcher all run for any tool. Each matcher is read as a regex and checked
+/// against ordinary tool names; one the `regex` crate cannot read fails here
+/// rather than passing unseen. `Agent` is left out: a matcher naming only the
+/// agent-spawn tools is a legitimate shape.
+#[test]
+fn no_post_tool_use_entry_runs_on_every_tool_call() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let groups = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse is an array");
+    for entry in groups {
+        let matcher = entry
+            .get("matcher")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !matcher.is_empty(),
+            "a PostToolUse entry without a matcher runs on every tool call: {entry}"
+        );
+        let matcher =
+            regex::Regex::new(matcher).expect("a PostToolUse matcher compiles as a regex");
+        for tool in ["Bash", "Read", "Write"] {
+            assert!(
+                !matcher.is_match(tool),
+                "{tool:?} is an ordinary call, so the matcher runs on every tool call: {entry}"
+            );
+        }
+    }
+}
+
+/// The note window map's sweep is its only bound on growth besides a
+/// subagent's run ending. `claude plugin test` loads the module in its own
+/// graph, so a plugin test cannot read the map size (measured 2026-10-30: an
+/// exported counter read 0 and a global read -1); the sweep is pinned at the
+/// source instead. What that cannot see: whether the sweep runs at all, and
+/// whether a `return`, an uncalled function or a `/* */` block comment inside
+/// the handler span leaves it dead code.
+#[test]
+fn the_note_window_sweep_bounds_the_map() {
+    let source = include_str!("../../plugins/hooks/register.ts");
+    assert!(
+        source.contains("for (const [stale, at] of lastNoteAt)"),
+        "register.ts must keep the note window sweep: it is the map's only \
+         bound besides a subagent's run ending"
+    );
+    assert!(
+        source.contains("lastNoteAt.delete(stale)"),
+        "the sweep must drop the entry it found stale, not just walk the map"
+    );
+    let handler = source
+        .find("on('tool.call', async")
+        .expect("register.ts registers the note's tool.call handler");
+    let stamp = handler
+        + source[handler..]
+            .find("lastNoteAt.set(key, now)")
+            .expect("the handler stamps the window before it runs the note");
+    // Comment lines are dropped first: an out-commented sweep still carries
+    // both substrings, so a raw `contains` reads it as present.
+    let body = source[handler..stamp]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        body.contains(
+            "for (const [stale, at] of lastNoteAt) { if (now - at >= NOTE_CADENCE_MS) \
+             lastNoteAt.delete(stale) }"
+        ),
+        "the window stamp must be preceded, inside the note's tool.call handler, \
+         by the sweep loop and its bare NOTE_CADENCE_MS threshold: {body}"
+    );
+}
+
+/// The hooks module skips the note cadence on a main-scope agent-spawn call
+/// so the headroom nudge still fires there, from a list of tool names it
+/// mirrors from clauth. Both sides must name the same tools: a name only one
+/// side knows silently drops that spawn's nudge.
+#[test]
+fn module_and_clauth_name_the_same_agent_spawn_tools() {
+    let source = include_str!("../../plugins/hooks/register.ts");
+    let decl = source
+        .find("const AGENT_SPAWN_TOOLS")
+        .expect("register.ts names its agent-spawn tool list");
+    // Bound the parse to the declaration's own line, so a respelling with no
+    // `= [` reds here instead of parsing a later declaration's list.
+    let line = source[decl..]
+        .lines()
+        .next()
+        .expect("the declaration line is not empty");
+    let open = line
+        .find("= [")
+        .expect("the list follows the declaration on its own line")
+        + 3;
+    let close = open + line[open..].find(']').expect("the list closes on its line");
+    let module: Vec<&str> = line[open..close]
+        .split(',')
+        .map(|name| name.trim().trim_matches('\''))
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(!module.is_empty(), "the parsed list must not be empty");
+    assert_eq!(
+        module,
+        crate::hook_note::AGENT_SPAWN_TOOLS.to_vec(),
+        "register.ts's agent-spawn list drifted from clauth's predicate"
     );
 }
 
@@ -1091,6 +1227,21 @@ fn committed_root_marketplace_matches_agentgear_rules() {
 
 // ── the installPath convergence leg ────────────────────────────────────────
 
+/// Encode a native path spelling into the JSON string interior a registry
+/// stores (a windows profiles dir carries single backslashes; serde_json
+/// escapes every `\` and `"`). Independent of the product's `json_encode` so
+/// a bug there cannot mask one here.
+fn encode_interior(decoded: &str) -> String {
+    let quoted = serde_json::to_string(decoded).expect("a &str encodes");
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Decode a raw JSON string interior back into the value it spells.
+/// Independent of the product's `json_decode`.
+fn decode_interior(raw: &str) -> String {
+    serde_json::from_str(&format!("\"{raw}\"")).expect("a JSON string interior")
+}
+
 /// The auto-fix's acceptance shape, pinned: plant two runtime-prefixed
 /// installPaths, one with a `~/.claude/plugins/cache/` twin and one without;
 /// the pass reads the first as its twin, names the second, leaves a
@@ -1116,20 +1267,20 @@ fn repoint_registry_reroots_a_dead_path_and_names_a_missing_twin() {
         .join("a6261ea74c14");
     std::fs::create_dir_all(&twin).expect("twin dir");
 
-    let dead = format!(
+    let dead = encode_interior(&format!(
         "{}/D0/runtime-700698-0/plugins/cache/agenticat/agents/a6261ea74c14",
         clauth.join("profiles").display()
-    );
-    let missing = format!(
+    ));
+    let missing = encode_interior(&format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
         clauth.join("profiles").display()
-    );
+    ));
     // A live tree still resolves its recorded path: left alone today, it
     // converges the day the tree dies.
-    let live = format!(
+    let live = encode_interior(&format!(
         "{}/D0/runtime-9-0/plugins/cache/live/1",
         clauth.join("profiles").display()
-    );
+    ));
     std::fs::create_dir_all(clauth.join("profiles/D0/runtime-9-0/plugins/cache/live/1"))
         .expect("live tree");
 
@@ -1157,7 +1308,7 @@ fn repoint_registry_reroots_a_dead_path_and_names_a_missing_twin() {
         !line.contains("live/1"),
         "a still-resolving path is neither rewritten nor named: {line}"
     );
-    let expected = original.replace(&dead, &twin_str);
+    let expected = original.replace(&dead, &encode_interior(&twin_str));
     assert_eq!(
         std::fs::read_to_string(&registry).unwrap(),
         expected,
@@ -1176,10 +1327,10 @@ fn repoint_registry_names_a_skip_only_pass() {
     let claude = home.home().join(".claude");
     let clauth = home.home().join(".clauth");
 
-    let missing = format!(
+    let missing = encode_interior(&format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
         clauth.join("profiles").display()
-    );
+    ));
     let original = format!(
         "{{\n  \"version\": 2,\n  \"plugins\": {{\n    \"security-guidance@claude-plugins-official\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{missing}\" }}\n    ]\n  }}\n}}\n"
     );
@@ -1210,11 +1361,95 @@ fn repoint_registry_names_a_skip_only_pass() {
     );
 }
 
+/// The skip line names the path a user would type, not the registry's JSON
+/// spelling of it: a recorded path holding a character JSON escapes (a `"`
+/// here; every `\` of a windows path alike) reads decoded in the line, the
+/// same as a rewrite's two paths do.
+#[test]
+fn repoint_registry_names_a_skipped_path_decoded() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let profiles = home.home().join(".clauth").join("profiles");
+
+    let dead = format!(
+        "{}/D0/runtime-1-0/plugins/cache/mk/we\"ird/1",
+        profiles.display()
+    );
+    let stored = serde_json::to_string(&dead).expect("a &str encodes");
+    let original = format!(
+        "{{\n  \"plugins\": {{\n    \"we@mk\": [\n      {{ \"installPath\": {stored} }}\n    ]\n  }}\n}}\n"
+    );
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+
+    let twin = claude
+        .join("plugins")
+        .join("cache")
+        .join("mk")
+        .join("we\"ird")
+        .join("1");
+    let expected = format!(
+        "clauth self-heal: left {dead} (no twin at {})",
+        twin.display()
+    );
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(!outcome.changed, "a skip moves no bytes");
+    assert_eq!(outcome.line.as_deref(), Some(expected.as_str()));
+    assert_eq!(std::fs::read_to_string(&registry).unwrap(), original);
+}
+
+/// A control character the registry spells as a JSON escape decodes into the
+/// path but prints escaped: the line reaches a terminal, and the registry is
+/// another program's file.
+#[test]
+fn repoint_registry_escapes_a_decoded_control_character() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let profiles = home.home().join(".clauth").join("profiles");
+
+    let dead = format!(
+        "{}/D0/runtime-1-0/plugins/cache/mk/a\u{1b}[31m/1",
+        profiles.display()
+    );
+    let stored = serde_json::to_string(&dead).expect("a &str encodes");
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(
+        &registry,
+        format!("{{\"plugins\":{{\"a@mk\":[{{\"installPath\":{stored}}}]}}}}"),
+    )
+    .expect("registry");
+
+    let twin = claude
+        .join("plugins")
+        .join("cache")
+        .join("mk")
+        .join("a\\u{1b}[31m")
+        .join("1");
+    let shown = dead.replace('\u{1b}', "\\u{1b}");
+    let expected = format!(
+        "clauth self-heal: left {shown} (no twin at {})",
+        twin.display()
+    );
+    let line = super::repoint_registry()
+        .expect("repoint")
+        .line
+        .expect("the skip names itself");
+    assert_eq!(line, expected);
+    assert!(!line.contains('\u{1b}'), "no live escape byte: {line:?}");
+}
+
 /// The separator half of the windows contract: CC records `\`-spelled paths
 /// on windows, and the remap must converge them exactly like `/`-spelled
-/// ones. Both spellings converge to the one canonical twin the product's
-/// component-wise join builds, asserted by exact display equality on every
-/// platform.
+/// ones. Both spellings arrive as the raw JSON interior agentgear's scanner
+/// hands over (every `\` doubled) and converge to the one canonical twin the
+/// product's component-wise join builds, asserted by exact display equality on
+/// every platform.
 #[test]
 fn registry_remap_matches_both_separator_spellings() {
     use crate::testutil::HomeSandbox;
@@ -1234,13 +1469,13 @@ fn registry_remap_matches_both_separator_spellings() {
         .join("1");
     std::fs::create_dir_all(&canonical).expect("twin dir");
 
-    let back_path = format!(
+    let back_path = encode_interior(&format!(
         "{}\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
         profiles.display()
-    );
+    ));
     match super::registry_remap(&back_path, &prefix_fwd, &prefix_back, &claude) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
-            to,
+            decode_interior(&to),
             canonical.display().to_string(),
             "the backslash-spelled path rewrites to the canonical twin"
         ),
@@ -1252,13 +1487,13 @@ fn registry_remap_matches_both_separator_spellings() {
         }
     }
 
-    let fwd_path = format!(
+    let fwd_path = encode_interior(&format!(
         "{}/D0/runtime-9-0/plugins/cache/mkt/plugin/1",
         profiles.display()
-    );
+    ));
     match super::registry_remap(&fwd_path, &prefix_fwd, &prefix_back, &claude) {
         agentgear::Remap::Rewrite(to) => assert_eq!(
-            to,
+            decode_interior(&to),
             canonical.display().to_string(),
             "the forward-spelled path rewrites to the canonical twin"
         ),
@@ -1280,6 +1515,246 @@ fn registry_remap_matches_both_separator_spellings() {
     );
 }
 
+/// The windows half of the remap contract: agentgear's scanner hands the remap
+/// the registry string's raw JSON interior, so on windows every `\` arrives
+/// doubled, and the rewrite must go back JSON-escaped — agentgear writes it
+/// verbatim between the quotes, and a raw `\` spelling would corrupt the JSON.
+/// The remap therefore decodes, matches and builds the twin on the decoded
+/// value, then encodes the rewrite. The windows spellings are stand-ins rooted
+/// under the sandbox home: on linux `\` is an ordinary filename byte, so the
+/// twin the product joins really exists and the assertions are exact (pure
+/// string/JSON, no cfg(windows)).
+#[cfg(unix)]
+#[test]
+fn registry_remap_decodes_the_raw_text_and_json_encodes_the_rewrite() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let profiles_back = format!(r"{}/C:\Users\u\.clauth\profiles", home.home().display());
+    let claude_back =
+        std::path::PathBuf::from(format!(r"{}/C:\Users\u\.claude", home.home().display()));
+    let prefix_fwd = format!("{profiles_back}/");
+    let prefix_back = format!("{profiles_back}\\");
+
+    let canonical = claude_back
+        .join("plugins")
+        .join("cache")
+        .join("mkt")
+        .join("plugin")
+        .join("1");
+    std::fs::create_dir_all(&canonical).expect("twin dir");
+
+    // The raw interior a windows registry stores: every `\` doubled.
+    let raw = format!(
+        r"{}/C:\\Users\\u\\.clauth\\profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
+        home.home().display()
+    );
+    match super::registry_remap(&raw, &prefix_fwd, &prefix_back, &claude_back) {
+        agentgear::Remap::Rewrite(to) => {
+            let decoded = serde_json::from_str::<String>(&format!("\"{to}\""))
+                .expect("the rewrite is valid JSON string content");
+            assert_eq!(
+                decoded,
+                canonical.display().to_string(),
+                "the rewrite decodes to the canonical twin"
+            );
+            assert!(
+                to.contains(r"\\Users"),
+                "the rewrite is JSON-escaped, not a raw backslash spelling: {to}"
+            );
+        }
+        agentgear::Remap::Keep => {
+            panic!("the raw-escaped windows path must decode into a rewrite, got Keep")
+        }
+        agentgear::Remap::Skip(reason) => {
+            panic!("the raw-escaped windows path must decode into a rewrite, got Skip({reason})")
+        }
+    }
+}
+
+/// A registry whose `installPath` holds the raw
+/// JSON-escaped windows spelling (`\\` per `\`) converges to the new prefix
+/// through the exact call [`super::repoint_registry`] makes, and the rewritten
+/// bytes still parse as JSON with the decoded `installPath` at the twin.
+// The windows stand-in paths (`\` as a filename byte, an embedded `C:`) are
+// invalid paths on windows itself, where the shape runs for real.
+#[cfg(unix)]
+#[test]
+fn repoint_converges_a_json_escaped_windows_registry_and_the_bytes_still_parse() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let profiles_back = format!(r"{}/C:\Users\u\.clauth\profiles", home.home().display());
+    let claude_back =
+        std::path::PathBuf::from(format!(r"{}/C:\Users\u\.claude", home.home().display()));
+    let prefix_fwd = format!("{profiles_back}/");
+    let prefix_back = format!("{profiles_back}\\");
+
+    let twin = claude_back
+        .join("plugins")
+        .join("cache")
+        .join("mkt")
+        .join("plugin")
+        .join("1");
+    std::fs::create_dir_all(&twin).expect("twin dir");
+
+    let dead = format!(
+        r"{}/C:\\Users\\u\\.clauth\\profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
+        home.home().display()
+    );
+    let original =
+        format!(r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{dead}"}}]}}}}"#);
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+
+    let report = agentgear::repoint_install_paths(&registry, |path| {
+        super::registry_remap(path, &prefix_fwd, &prefix_back, &claude_back)
+    })
+    .expect("repoint");
+    assert_eq!(
+        report.rewritten.len(),
+        1,
+        "the JSON-escaped windows path converges: {report:?}"
+    );
+    let written = std::fs::read_to_string(&registry).expect("registry");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&written).expect("the rewritten bytes parse as JSON");
+    assert_eq!(
+        parsed["plugins"]["agents@mkt"][0]["installPath"]
+            .as_str()
+            .expect("installPath is a string"),
+        twin.display().to_string(),
+        "the decoded installPath is the canonical twin"
+    );
+}
+
+/// The re-point line names the paths a human recognizes: agentgear reports the
+/// rewrite with the raw interior as `from` and the JSON-escaped spelling as
+/// `to` (on windows both carry doubled backslashes), so the line decodes both
+/// and falls back to the raw text when a decode fails. Pinned by equality on
+/// the whole line — any raw/decoded mix breaks it.
+#[cfg(unix)]
+#[test]
+fn repoint_line_names_decoded_spellings() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+
+    let twin = claude
+        .join("plugins")
+        .join("cache")
+        .join("mkt")
+        .join("plugin")
+        .join("1");
+    std::fs::create_dir_all(&twin).expect("twin dir");
+
+    // The escaped interior agentgear hands back as `Repointed.from`: every `\`
+    // doubled. The sandbox's profile prefix is forward-spelled, so the doubled
+    // run starts after it — the same "escaped interior" shape the remap sees
+    // on windows, and the backslash tail keeps the decoded path dangling.
+    let raw_from = format!(
+        r"{}/.clauth/profiles\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
+        home.home().display()
+    );
+    let decoded_from = format!(
+        r"{}/.clauth/profiles\D0\runtime-9-0\plugins\cache\mkt\plugin\1",
+        home.home().display()
+    );
+    let original = format!(
+        r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{raw_from}"}}]}}}}"#
+    );
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(outcome.changed, "the rewrite counts as a change");
+    let expected = format!(
+        "clauth self-heal: re-pointed {decoded_from} -> {}",
+        twin.display()
+    );
+    assert_eq!(
+        outcome.line.expect("a rewrite reports"),
+        expected,
+        "the line names the decoded spellings, not the JSON-escaped raw interior"
+    );
+}
+
+/// The decode-failure guard: a raw interior the JSON string grammar cannot
+/// read (an invalid escape like `\D`, or a raw control byte) is text the remap
+/// must not act on — it Keeps, and the pass moves no bytes, even though the
+/// raw text itself matches the backslash prefix a corrupt registry can carry.
+#[test]
+fn registry_remap_keeps_an_unreadable_interior() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let profiles = home.home().join(".clauth").join("profiles");
+    let prefix_fwd = format!("{}/", profiles.display());
+    let prefix_back = format!("{}\\", profiles.display());
+
+    // A raw single-`\` interior: invalid JSON string content (`\D`), yet the
+    // raw text matches the backslash prefix on every platform, so only the
+    // decode guard stands between the matcher and the unreadable value.
+    let bad_escape = format!(
+        r"{}\D0\runtime-9-0\plugins\cache\mkt\plugin\1",
+        profiles.display()
+    );
+    assert!(
+        bad_escape.starts_with(&prefix_back),
+        "the fixture reaches the matcher"
+    );
+    assert!(
+        matches!(
+            super::registry_remap(&bad_escape, &prefix_fwd, &prefix_back, &claude),
+            agentgear::Remap::Keep
+        ),
+        "an interior with an invalid JSON escape is unreadable: Keep"
+    );
+
+    // A raw control byte inside the interior is equally unreadable.
+    let control_byte = format!(
+        "{}/\u{1}D0/runtime-9-0/plugins/cache/mkt/plugin/1",
+        profiles.display()
+    );
+    assert!(
+        control_byte.starts_with(&prefix_fwd),
+        "the fixture reaches the matcher"
+    );
+    assert!(
+        matches!(
+            super::registry_remap(&control_byte, &prefix_fwd, &prefix_back, &claude),
+            agentgear::Remap::Keep
+        ),
+        "an interior with a raw control byte is unreadable: Keep"
+    );
+
+    // And the pass moves no bytes on the unreadable interior.
+    let original = format!(
+        r#"{{"plugins":{{"agents@mkt":[{{"scope":"user","installPath":"{bad_escape}"}}]}}}}"#
+    );
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().expect("plugins dir")).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+    let report = agentgear::repoint_install_paths(&registry, |path| {
+        super::registry_remap(path, &prefix_fwd, &prefix_back, &claude)
+    })
+    .expect("repoint");
+    assert!(
+        report.rewritten.is_empty() && report.skipped.is_empty(),
+        "the unreadable interior is neither rewritten nor named: {report:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&registry).expect("registry"),
+        original,
+        "the pass moves no bytes on an unreadable interior"
+    );
+}
+
 /// The detached leg reports a skip-only line once per process: the daemon
 /// tick would otherwise repeat the same line every tick until a re-login
 /// lands the twin.
@@ -1291,10 +1766,10 @@ fn detached_repoint_reports_skips_once_per_process() {
     let claude = home.home().join(".claude");
     let clauth = home.home().join(".clauth");
 
-    let missing = format!(
+    let missing = encode_interior(&format!(
         "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
         clauth.join("profiles").display()
-    );
+    ));
     let registry = claude.join("plugins/installed_plugins.json");
     std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
     std::fs::write(
@@ -1360,10 +1835,12 @@ fn repoint_registry_says_nothing_when_clean() {
 "#
     .replace(
         "CLAUDE_TWIN_PLACEHOLDER",
-        &claude
-            .join("plugins/cache/widget/widget/0.5.1")
-            .display()
-            .to_string(),
+        &encode_interior(
+            &claude
+                .join("plugins/cache/widget/widget/0.5.1")
+                .display()
+                .to_string(),
+        ),
     );
     std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
     std::fs::write(&registry, &bytes).expect("registry");
@@ -1444,5 +1921,28 @@ fn the_replaced_query_reports_nothing() {
         lines.snapshot(),
         Vec::<String>::new(),
         "the query logs nothing"
+    );
+}
+
+/// The re-exec path's exec source: the path recorded at start. After a
+/// replacement `current_exe()` reads `<path> (deleted)` on linux, so the
+/// recorded path is the only one that can be exec'd.
+#[cfg(unix)]
+#[test]
+fn the_recorded_path_is_the_record_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let recorded = crate::testutil::write_shim(home.home(), "self-exe-recorded", "exit 0");
+    {
+        let _self = super::SelfExeOverride::pin(Some(recorded.as_path()));
+        assert_eq!(
+            super::recorded_self_exe_path().as_deref(),
+            Some(recorded.as_path()),
+            "a pinned record yields its path"
+        );
+    }
+    assert_eq!(
+        super::recorded_self_exe_path(),
+        None,
+        "an unpinned caller has no record to exec"
     );
 }

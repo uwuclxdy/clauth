@@ -1019,9 +1019,10 @@ fn short_commit(commit: &str) -> &str {
 }
 
 /// The one kill-on-deadline reap loop: [`bounded_output`] spawns and hands
-/// its child here, and the heal's install and remote probe spawn their own so
-/// a failed spawn is named at the call site rather than read as a timeout.
-fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
+/// its child here, and the heal's install and remote probe, and `clauth rex`'s
+/// config reload, spawn their own so a failed spawn is named at the call site
+/// rather than read as a timeout.
+pub(crate) fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -1105,8 +1106,8 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines.
-fn confirm(question: &str, yes: bool) -> Result<bool> {
+/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines. `clauth rex` shares it.
+pub(crate) fn confirm(question: &str, yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }
@@ -1788,9 +1789,10 @@ fn herdr_value(herdr: &crate::profile::HerdrSettings, key: &str) -> Result<Strin
         "border_label" => Ok(on_off(herdr.border_label).to_string()),
         "delegate_dot" => Ok(on_off(herdr.delegate_dot).to_string()),
         "delegate_row_text" => Ok(on_off(herdr.delegate_row_text).to_string()),
+        "restore_notice" => Ok(on_off(herdr.restore_notice).to_string()),
         _ => Err(crate::UsageError(format!(
             "unknown herdr config key '{key}'; valid keys: popup_width, pane_tag, \
-             tag_watch_secs, border_label, delegate_dot, delegate_row_text"
+             tag_watch_secs, border_label, delegate_dot, delegate_row_text, restore_notice"
         ))
         .into()),
     }

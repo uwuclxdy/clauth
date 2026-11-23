@@ -1,35 +1,37 @@
-//! Clawd: the 9×3 block mascot the header draws.
+//! Clawd: the 9×3 block mascot the header draws, and the one
+//! [`super::mascot::Mascot`] today.
 //!
-//! The sprite, its pose tables and its fifteen animations are extracted from
+//! The sprite, its pose tables and its thirteen animations are extracted from
 //! Claude Code 2.1.309 (its embedded build `1ce7e4ff2da8d4b0…`), where the
-//! same component paints the wordmark's left column. Frames advance on the
-//! TUI's own 80 ms tick rather than the source's 60 ms redraw: the frame index
-//! is `elapsed / 80 ms`, so a frame whose tick runs late is skipped rather
-//! than queued, and an extra draw repeats the current frame.
+//! same component paints the wordmark's left column.
 //!
 //! Claude Code withholds the full sprite on Apple's Terminal.app and paints a
 //! simplified one there instead; the verdict is read once from `TERM_PROGRAM`
 //! at TUI startup and carried in as a bool. Both arms are ported: the
 //! simplified sprite, and the source's filter that drops facing sequences and
 //! animations whose first frame reads as the rest pose, when the simplified
-//! arm is in use. Not ported: the source's `prefersReducedMotion` check, which
-//! turns the animation off entirely, since clauth has no such setting.
+//! arm is in use. Poof and shadow marks paint in the source's `inactive`
+//! colour.
 //!
-//! Idle motion is the short idle set — look, wink, boop, tap, sneeze — one
-//! every ten seconds. The longer set — jump, celebrate, skip, spin, peekaboo,
-//! drop, waddle, peek, turn, coin-hop — plays on launch and every thirty
-//! minutes; `celebrate` is clauth's addition to Claude Code's pool. Poof and
-//! shadow marks paint in the source's `inactive` colour.
+//! The playback rules — the launch, the one waiting slot, the repeat and
+//! quiet clocks, hiding and `reduce_motion` — live in
+//! [`super::mascot::Stage`], which knows a mascot only through the trait:
+//! [`Clawd`] holds its poses, frames and the sprite arm, nothing that ticks.
 
 use std::sync::LazyLock;
+
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use super::mascot::{Cue, Mascot};
+use super::theme;
+
+#[cfg(test)]
+use super::mascot::{FRAME_MS, Playing, Rank, Stage};
 
 /// Sprite width in cells; the header gives it one more column of padding.
 pub(crate) const COLS: usize = 9;
 pub(crate) const ROWS: usize = 3;
-
-const FRAME_MS: u64 = 80;
-const SUBTLE_PERIOD_MS: u64 = 10_000;
-const BIG_PERIOD_MS: u64 = 30 * 60 * 1000;
 
 /// The startup gate: `false` selects the simplified sprite arm, the one
 /// Claude Code paints on Apple's Terminal.app (see the module doc). Only
@@ -101,8 +103,6 @@ const LOOK_RIGHT: Pose = face(Eyes::Right, Arms::Down, Feet::Both);
 const CLOSED: Pose = face(Eyes::Closed, Arms::Down, Feet::Both);
 const CLOSED_UP: Pose = face(Eyes::Closed, Arms::Up, Feet::Both);
 const WINK: Pose = face(Eyes::Wink, Arms::Down, Feet::Both);
-const TAP_LEFT: Pose = face(Eyes::Open, Arms::Down, Feet::Left);
-const TAP_RIGHT: Pose = face(Eyes::Open, Arms::Down, Feet::Right);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Poof {
@@ -145,7 +145,7 @@ const REST: Frame = Frame {
     shadow: Shadow::None,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Anim {
     Jump,
     Look,
@@ -157,8 +157,6 @@ pub(crate) enum Anim {
     Waddle,
     Peek,
     Wink,
-    Boop,
-    Tap,
     Sneeze,
     Turn,
     CoinHop,
@@ -178,8 +176,6 @@ impl Anim {
             Self::Waddle => "waddle",
             Self::Peek => "peek",
             Self::Wink => "wink",
-            Self::Boop => "boop",
-            Self::Tap => "tap",
             Self::Sneeze => "sneeze",
             Self::Turn => "turn",
             Self::CoinHop => "coin-hop",
@@ -201,8 +197,6 @@ impl Anim {
             Self::Waddle => &anims.waddle,
             Self::Peek => &anims.peek,
             Self::Wink => &anims.wink,
-            Self::Boop => &anims.boop,
-            Self::Tap => &anims.tap,
             Self::Sneeze => &anims.sneeze,
             Self::Turn => &anims.turn,
             Self::CoinHop => &anims.coin_hop,
@@ -210,11 +204,7 @@ impl Anim {
     }
 }
 
-/// In-place animations: the subtle idle set, one per ten-second slot.
-const SUBTLE: [Anim; 5] = [Anim::Look, Anim::Wink, Anim::Boop, Anim::Tap, Anim::Sneeze];
-
-/// Travelling or turning animations: the bigger moments, on launch and every
-/// thirty minutes.
+/// Travelling or turning animations: the launch picks one.
 const BIG: [Anim; 10] = [
     Anim::Jump,
     Anim::Celebrate,
@@ -228,6 +218,10 @@ const BIG: [Anim; 10] = [
     Anim::CoinHop,
 ];
 
+/// The small hello a key plays after five quiet minutes, picked like the
+/// launch. Both read as motion on the simplified sprite too.
+const HELLO: [Anim; 2] = [Anim::Look, Anim::Wink];
+
 /// The frame table, one named field per animation.
 struct Anims {
     jump: Vec<Frame>,
@@ -240,8 +234,6 @@ struct Anims {
     waddle: Vec<Frame>,
     peek: Vec<Frame>,
     wink: Vec<Frame>,
-    boop: Vec<Frame>,
-    tap: Vec<Frame>,
     sneeze: Vec<Frame>,
     turn: Vec<Frame>,
     coin_hop: Vec<Frame>,
@@ -578,41 +570,6 @@ fn build_anims() -> Anims {
     push(&mut wink, WINK, 5, Opts::default());
     push(&mut wink, DEFAULT, 1, Opts::default());
 
-    let mut boop = Vec::new();
-    push(
-        &mut boop,
-        CLOSED,
-        1,
-        Opts {
-            offset: 1,
-            poof: Poof::Dot,
-            ..Opts::default()
-        },
-    );
-    push(
-        &mut boop,
-        CLOSED,
-        2,
-        Opts {
-            offset: 1,
-            poof: Poof::Wave,
-            ..Opts::default()
-        },
-    );
-    push(&mut boop, LOOK_LEFT, 4, Opts::default());
-    push(&mut boop, DEFAULT, 2, Opts::default());
-    push_blink(&mut boop);
-
-    let mut tap = Vec::new();
-    push(&mut tap, TAP_LEFT, 2, Opts::default());
-    push(&mut tap, TAP_RIGHT, 2, Opts::default());
-    push(&mut tap, TAP_LEFT, 2, Opts::default());
-    push(&mut tap, TAP_RIGHT, 2, Opts::default());
-    push(&mut tap, TAP_LEFT, 1, Opts::default());
-    push(&mut tap, TAP_RIGHT, 1, Opts::default());
-    push(&mut tap, ARMS_UP, 3, Opts::default());
-    push(&mut tap, DEFAULT, 1, Opts::default());
-
     let mut sneeze = Vec::new();
     push(&mut sneeze, CLOSED_UP, 4, Opts::default());
     push(
@@ -726,8 +683,6 @@ fn build_anims() -> Anims {
         waddle,
         peek,
         wink,
-        boop,
-        tap,
         sneeze,
         turn,
         coin_hop,
@@ -755,10 +710,6 @@ pub(crate) enum CellKind {
 }
 
 pub(crate) type Art = [[(char, CellKind); COLS]; ROWS];
-
-pub(crate) fn rest_art(full_sprite: bool) -> Art {
-    render(&REST, full_sprite)
-}
 
 /// Draw one frame. `full_sprite` is the startup verdict: `false` paints the
 /// simplified sprite instead (see the module doc).
@@ -1048,9 +999,8 @@ fn facing_rows(facing: Facing) -> &'static [&'static str] {
     }
 }
 
-/// The pools the simplified sprite can animate: Claude Code keeps only the
-/// animations that read as motion without a facing or a rest-pose opening.
-static SUBTLE_SIMPLIFIED: LazyLock<Vec<Anim>> = LazyLock::new(|| simplified_pool(&SUBTLE));
+/// The launch pool the simplified sprite can animate: Claude Code keeps only
+/// the animations that read as motion without a facing or a rest-pose opening.
 static BIG_SIMPLIFIED: LazyLock<Vec<Anim>> = LazyLock::new(|| simplified_pool(&BIG));
 
 fn simplified_pool(pool: &[Anim]) -> Vec<Anim> {
@@ -1080,14 +1030,6 @@ fn reads_as_motion(anim: Anim) -> bool {
     }
 }
 
-fn subtle_pool(full_sprite: bool) -> &'static [Anim] {
-    if full_sprite {
-        &SUBTLE
-    } else {
-        SUBTLE_SIMPLIFIED.as_slice()
-    }
-}
-
 fn big_pool(full_sprite: bool) -> &'static [Anim] {
     if full_sprite {
         &BIG
@@ -1096,113 +1038,111 @@ fn big_pool(full_sprite: bool) -> &'static [Anim] {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Playing {
-    anim: Anim,
-    start_ms: u64,
-}
-
-/// The header mascot's playback state: which animation runs, and when the
-/// next idle or big moment is due. The render path reads [`Clawd::frame`] and
-/// never mutates it; [`Clawd::tick`] moves the schedule.
+/// Clawd's own state: the sprite arm the startup verdict selected. Everything
+/// that plays — what runs, what waits, the repeat and quiet clocks — lives in
+/// [`super::mascot::Stage`].
 pub(crate) struct Clawd {
-    playing: Option<Playing>,
-    next_subtle_ms: u64,
-    next_big_ms: u64,
-    seed: u64,
-    /// The startup verdict on `TERM_PROGRAM`. False paints the simplified arm
-    /// and restricts the animation pools to what still reads there.
-    pub(crate) full_sprite: bool,
+    full_sprite: bool,
 }
 
 impl Clawd {
     pub(crate) fn new() -> Self {
-        Self {
-            playing: None,
-            next_subtle_ms: SUBTLE_PERIOD_MS,
-            // Zero, so the first tick (always after the first paint) opens the
-            // launch animation; startup work before it cannot clip it.
-            next_big_ms: 0,
-            seed: random_seed(),
-            full_sprite: true,
-        }
+        Self { full_sprite: true }
+    }
+}
+
+impl Mascot for Clawd {
+    type Anim = Anim;
+
+    const SIZE: (usize, usize) = (COLS, ROWS);
+
+    fn launch(&self) -> &'static [Anim] {
+        big_pool(self.full_sprite)
     }
 
-    pub(crate) fn tick(&mut self, now_ms: u64) {
-        if let Some(playing) = self.playing {
-            let elapsed = now_ms.saturating_sub(playing.start_ms);
-            if elapsed < frames_ms(playing.anim) {
-                return;
+    fn hello(&self) -> &'static [Anim] {
+        &HELLO
+    }
+
+    fn react(&self, cue: Cue) -> Option<Anim> {
+        let anim = match cue {
+            Cue::Switch => Anim::Jump,
+            Cue::SessionMoved => Anim::Skip,
+            Cue::SessionStarted => Anim::Waddle,
+            Cue::LoginGained | Cue::UpdateInstalled => Anim::Celebrate,
+            Cue::WindowReset => Anim::Spin,
+            Cue::DelegateDone => Anim::Wink,
+            Cue::BellCrossed | Cue::NewIncident | Cue::DaemonReplaced => Anim::Peek,
+            Cue::Quarantined | Cue::RefreshFailed | Cue::DelegateFailed | Cue::DaemonDown => {
+                Anim::Sneeze
             }
-            self.playing = None;
-        }
-        if now_ms >= self.next_big_ms {
-            let pool = big_pool(self.full_sprite);
-            let anim = pool[self.pick(pool.len())];
-            self.playing = Some(Playing {
-                anim,
-                start_ms: now_ms,
-            });
-            self.next_big_ms = now_ms.saturating_add(BIG_PERIOD_MS);
-            // A big moment restarts the subtle rhythm, so the next small one
-            // lands a full period after it rather than in its shadow.
-            self.next_subtle_ms = now_ms.saturating_add(SUBTLE_PERIOD_MS);
-        } else if now_ms >= self.next_subtle_ms {
-            let pool = subtle_pool(self.full_sprite);
-            let anim = pool[self.pick(pool.len())];
-            self.playing = Some(Playing {
-                anim,
-                start_ms: now_ms,
-            });
-            self.next_subtle_ms = now_ms.saturating_add(SUBTLE_PERIOD_MS);
-        }
+        };
+        Some(anim)
     }
 
+    fn frame_count(&self, anim: Anim) -> usize {
+        anim.frames().len()
+    }
+
+    fn draw(&self, anim: Option<Anim>, index: usize) -> Vec<Line<'static>> {
+        let art = match anim.and_then(|anim| anim.frames().get(index)) {
+            Some(frame) => render(frame, self.full_sprite),
+            None => render(&REST, self.full_sprite),
+        };
+        art.iter().map(|row| Line::from(row_spans(row))).collect()
+    }
+
+    fn set_full_sprite(&mut self, full_sprite: bool) {
+        self.full_sprite = full_sprite;
+    }
+}
+
+/// The running animation's frame at `now_ms`, `None` once it has run out.
+/// The header draws through [`Stage::draw`], never this.
+#[cfg(test)]
+impl Stage<Clawd> {
     pub(crate) fn frame(&self, now_ms: u64) -> Option<&'static Frame> {
         let playing = self.playing?;
-        let index = now_ms.saturating_sub(playing.start_ms) / FRAME_MS;
-        playing.anim.frames().get(usize::try_from(index).ok()?)
-    }
-
-    /// Render tests pin one animation instead of sampling the random launch
-    /// choice. Never compiled into the binary.
-    #[cfg(test)]
-    pub(crate) fn play(&mut self, anim: Anim, start_ms: u64) {
-        self.playing = Some(Playing { anim, start_ms });
-    }
-
-    fn pick(&mut self, len: usize) -> usize {
-        (self.next_random() % len as u64) as usize
-    }
-
-    fn next_random(&mut self) -> u64 {
-        self.seed ^= self.seed << 13;
-        self.seed ^= self.seed >> 7;
-        self.seed ^= self.seed << 17;
-        self.seed
+        let index = usize::try_from(now_ms.saturating_sub(playing.start_ms) / FRAME_MS).ok()?;
+        playing.anim.frames().get(index)
     }
 }
 
-fn frames_ms(anim: Anim) -> u64 {
-    anim.frames().len() as u64 * FRAME_MS
+/// The source's style mapping, one span per run of equal [`CellKind`]. The
+/// header renders the mascot's lines as they come, so every colour stays here.
+fn row_spans(row: &[(char, CellKind); COLS]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut glyphs = String::new();
+    let mut run_kind = row[0].1;
+    for &(glyph, kind) in row {
+        if kind != run_kind {
+            spans.push(Span::styled(
+                std::mem::take(&mut glyphs),
+                cell_style(run_kind),
+            ));
+            run_kind = kind;
+        }
+        glyphs.push(glyph);
+    }
+    spans.push(Span::styled(glyphs, cell_style(run_kind)));
+    spans
 }
 
-#[cfg(not(test))]
-fn random_seed() -> u64 {
-    let mut bytes = [0u8; 8];
-    match getrandom::fill(&mut bytes) {
-        Ok(()) => u64::from_le_bytes(bytes) | 1,
-        // Cosmetic choice only: a fixed pick is a fine fallback for a failed
-        // entropy read, and the seed must stay non-zero for the xorshift.
-        Err(_) => 1,
+fn cell_style(kind: CellKind) -> Style {
+    let body = theme::accent_2_color();
+    match kind {
+        CellKind::Empty => Style::default(),
+        CellKind::Body => Style::default().fg(body),
+        CellKind::CutOut => Style::default().fg(body).bg(theme::clawd_cutout_color()),
+        CellKind::Lid => Style::default().fg(theme::clawd_cutout_color()).bg(body),
+        CellKind::Inactive => Style::default().fg(theme::text_faint_color()),
     }
 }
 
-/// Render tests sample specific animations; a fixed seed keeps every run on
-/// the same choice.
+/// How long `anim` runs, for the render tests that pin collision boundaries.
 #[cfg(test)]
-fn random_seed() -> u64 {
-    0x9E37_79B9_7F4A_7C15
+pub(crate) fn frames_ms(anim: Anim) -> u64 {
+    anim.frames().len() as u64 * FRAME_MS
 }
 
 #[cfg(test)]

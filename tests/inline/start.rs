@@ -113,10 +113,9 @@ fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     assert!(!snap.exists(), "the sidecar moved too");
 }
 
-/// `run`'s rescue leg cannot be driven without a real `claude` child, which this
-/// crate never fakes, so it is pinned over the source: the teardown tests own
-/// whether the move works, and this owns what stands between the stamp leg and
-/// the end of the teardown region.
+/// `run`'s rescue leg is pinned over the source: the teardown tests own whether
+/// the move works, and this owns what stands between the stamp leg and the end
+/// of the teardown region.
 ///
 /// An EQUALITY rather than a `contains`, because a needle that only looks for the
 /// condition is blind to every spelling that leaves the condition's own bytes
@@ -158,6 +157,51 @@ fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
          rescue_teardown(runtime.config_dir(),runtime.sessions_dir(),&claude_home);}",
         "between the stamp leg and the end of the teardown region there must be \
          the rescue leg and nothing else, gated on the isolation alone"
+    );
+}
+
+/// The launch's announce line (a degraded resume's "resumed pinned", the
+/// no-daemon chain line, `start --auto`'s launch line) prints only once every
+/// startup step that can still refuse has passed: the `extras.announce` print
+/// is the statement right before claude's spawn, and `run_for_code` names
+/// `extras.announce` once. Read off the comment- and whitespace-stripped text,
+/// for the reason the teardown pin above gives.
+///
+/// What it cannot decide: a failure of the spawn itself still follows the
+/// line; an early print reached through another binding of `extras`; and a
+/// caller printing the line itself before `run_for_code` (the degraded
+/// resume's own launch-line tests cover that caller, the other two have
+/// none).
+#[test]
+fn the_announce_line_is_the_last_step_before_the_spawn() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run_for_code(")
+        .expect("run_for_code is defined")
+        .1;
+    let body = body
+        .split_once("\n}\n")
+        .expect("run_for_code ends at a top-level brace")
+        .0;
+    let dense: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let announce = "ifletSome(line)=&extras.announce{errln!(\"{line}\");}";
+    assert_eq!(
+        dense.matches("extras.announce").count(),
+        1,
+        "the announce line is printed from one place"
+    );
+    let before_spawn = dense
+        .split_once("letmutchild=command.spawn()")
+        .expect("run_for_code spawns claude")
+        .0;
+    assert!(
+        before_spawn.ends_with(announce),
+        "the announce line must be the statement right before the spawn"
     );
 }
 
@@ -367,8 +411,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .expect_err("a custom endpoint must refuse");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     let oauth = chain_ready_config("thirdparty");
@@ -399,7 +442,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     assert_eq!(
         err.to_string(),
         "'loner': --with-fallback needs a fallback-chain member; add 'loner' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let member = chain_ready_config("loner");
@@ -492,7 +535,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     assert_eq!(
         err.to_string(),
         "'onlyone': --with-fallback needs a second account in the fallback chain to \
-         move to; add one on the fallback tab, or start without it"
+         move to; add one on the fallback tab of the `clauth` TUI, or start without it"
     );
 
     let paired = chain_ready_config("onlyone");
@@ -609,7 +652,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     assert_eq!(
         err.to_string(),
         "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let err = run(
@@ -627,6 +670,72 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         "~/.claude not found; install Claude Code first",
         "a bare start must skip the gate entirely"
     );
+}
+
+/// The subagent-shell hook is for a headless delegate alone: a `clauth start`
+/// session's settings file carries the symlink repairs and nothing else.
+/// Driven through the real `run`, read off the settings file the fake `claude`
+/// was handed.
+#[cfg(unix)]
+#[test]
+fn a_started_session_carries_no_foreground_spawn_hook() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+    crate::testutil::healthy_install(&claude);
+
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("a shared start");
+
+    let settings = fake.settings_files();
+    assert_eq!(
+        settings.len(),
+        1,
+        "the shared start's linked projects get the repair settings file"
+    );
+    let pre = settings[0]["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("a PreToolUse array");
+    assert!(
+        pre.iter().any(|entry| entry["matcher"] == "Read"),
+        "the Read exemption hook is there, so the file under test is the start's own"
+    );
+    for entry in pre {
+        let commands: Vec<&str> = entry["hooks"]
+            .as_array()
+            .map(|hooks| hooks.iter().filter_map(|h| h["command"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            commands
+                .iter()
+                .all(|c| !c.contains(crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND)),
+            "a started session runs no foreground-spawn hook: {entry}"
+        );
+        assert_eq!(
+            entry["matcher"], "Read",
+            "a started session's file holds the Read exemption alone: {entry}"
+        );
+    }
 }
 
 // ── the plugin pre-flight ─────────────────────────────────────────────────
@@ -769,8 +878,14 @@ fn start_prints_one_line_per_store_it_cannot_create() {
             ),
             format!(
                 "clauth: could not create {}: {refused}; this session's transcripts \
-                 stay in its own tree and are lost when it ends\n",
+                 stay in its own tree until ~/.claude can take them and no job still holds \
+                 that tree\n",
                 claude.join("projects").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's background sessions \
+                 stay in its own tree, where the clauth app cannot reach them\n",
+                claude.join("sessions").display()
             ),
         ];
         assert_eq!(
@@ -780,12 +895,13 @@ fn start_prints_one_line_per_store_it_cannot_create() {
         );
     }
 
-    // Only `jobs` fails: `projects` pre-exists as a real dir before arming, so
-    // the run names only the store whose records stay in the tree.
+    // Only `jobs` fails: `projects` and `sessions` pre-exist as real dirs before
+    // arming, so the run names only the store whose records stay in the tree.
     {
         let sb = HomeSandbox::new();
         let claude = sb.home().join(".claude");
         std::fs::create_dir_all(claude.join("projects")).expect("~/.claude/projects");
+        std::fs::create_dir_all(claude.join("sessions")).expect("~/.claude/sessions");
         let _config = ConfigDirSandbox::new(&sb, &claude);
         let fake = FakeClaude::new(&sb);
         let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
@@ -904,6 +1020,124 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     assert!(
         !args.iter().any(|a| a.contains("/tmp/one-shared-dir")),
         "the operator's path is never what the spawn names"
+    );
+}
+
+/// The spawn carries the operator's own codex home beside the session pin:
+/// inside the session `CODEX_HOME` names the session home, and the operator's
+/// explicit home rides `CLAUTH_OPERATOR_CODEX_HOME` instead. Carried only when
+/// the caller's environment names one; the session-home pin itself is never
+/// displaced.
+#[test]
+fn the_codex_spawn_carries_the_operators_explicit_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom.as_os_str()))]);
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the caller's custom CODEX_HOME is what the spawn carries"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home pin is unchanged"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[("CODEX_HOME", None), ("CLAUTH_OPERATOR_CODEX_HOME", None)],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "no explicit operator home named, nothing carried: {env:?}"
+        );
+    }
+}
+
+/// A nested `clauth start`: the caller's `CODEX_HOME` is a clauth session
+/// home, so it is no operator home and the inherited carry value wins; a
+/// carry value that is itself a session home is no operator home either, and
+/// the spawn REMOVES the key so the child cannot inherit it — its own
+/// resolution then falls to the default home.
+#[test]
+fn the_codex_spawn_carries_the_operator_home_past_a_session_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let caller_session = home.home().join(".clauth/profiles/cy/codex-home-777-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the inherited operator home is carried, not the caller's session home"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home is pinned AFTER the scrub, whatever the scrub carried"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                (
+                    "CLAUTH_OPERATOR_CODEX_HOME",
+                    Some(caller_session.as_os_str()),
+                ),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "a carried session home is dropped from the child, not inherited: {env:?}"
+        );
+    }
+}
+
+/// A relative `CODEX_HOME` is carried as the DIRECTORY it names, resolved
+/// against this shell's cwd: the child runs under its own cwd, so the
+/// spelling alone would name another directory inside the session.
+#[test]
+fn the_codex_spawn_carries_a_relative_operator_home_as_a_directory() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some("my-codex".as_ref()))]);
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let env = crate::testutil::env_overrides(&cmd);
+
+    let expected = std::env::current_dir().expect("cwd").join("my-codex");
+    assert_eq!(
+        env.get("CLAUTH_OPERATOR_CODEX_HOME")
+            .and_then(|v| v.as_deref()),
+        expected.to_str(),
+        "the carried value is the directory, not the spelling"
     );
 }
 
@@ -1147,6 +1381,99 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
         json["env"].get("ANTHROPIC_API_KEY").is_none(),
         "a departed account's env key must not survive in front of the started \
          account's endpoint: {settings}"
+    );
+}
+
+/// A peer's switch after the start's config read stamps the account it made
+/// active into the live settings: the runtime the start builds strips that
+/// account's custom env too, read off disk, so the started account's runtime
+/// never inherits it.
+#[cfg(unix)]
+#[test]
+fn a_start_strips_the_env_a_peer_switch_stamped_after_its_config_read() {
+    use crate::testutil::HomeSandbox;
+
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let pair = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.credentials = Some(pair("departing"));
+    let mut peer = Profile::new("peer".to_string(), None, None);
+    peer.credentials = Some(pair("peer"));
+    peer.env
+        .insert("PEER_ONLY_KEY".to_string(), "peer-secret".to_string());
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    for profile in [&departing, &peer, &target] {
+        crate::profile::save_profile(profile).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["departing".into(), "peer".into(), "target".into()],
+        active_profile: Some("departing".into()),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("departing"))
+        .expect("link departing");
+    let config = crate::profile::load_config().expect("the start's read");
+
+    let mut peer_config = crate::profile::load_config().expect("peer read");
+    assert!(
+        crate::actions::switch_profile_locked(
+            &mut peer_config,
+            &crate::profile::ProfileName::from("peer")
+        )
+        .expect("peer switch"),
+        "fixture: the peer switched"
+    );
+    assert!(
+        crate::claude::claude_settings_env_keys()
+            .expect("live settings")
+            .contains(&"PEER_ONLY_KEY".to_string()),
+        "fixture: the peer's switch stamped its key live"
+    );
+
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let target_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("target"))
+        .expect("profile dir");
+    let observer = std::thread::spawn(move || crate::testutil::runtime_settings_until(&target_dir));
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("start");
+    let settings = observer
+        .join()
+        .expect("observer thread")
+        .expect("the runtime settings never appeared");
+    drop(shim);
+
+    let json: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    assert_eq!(
+        json["env"]["ANTHROPIC_BASE_URL"],
+        serde_json::json!("https://api.deepseek.com/anthropic"),
+        "fixture: the merge ran, pointing the runtime at the started endpoint"
+    );
+    assert!(
+        json["env"].get("PEER_ONLY_KEY").is_none(),
+        "the peer-switched account's env must not ride into the started runtime: {settings}"
     );
 }
 
@@ -1456,8 +1783,7 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
     .expect_err("a custom endpoint must refuse under --with-fallback");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     admit(
@@ -1477,7 +1803,10 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
 /// tree without a `jobs` link would keep the record where no clauth reader
 /// looks and lose the tree under the running session. The transcript store is
 /// the same case: with no `~/.claude/projects`, a transcript written through
-/// the tree is unindexed and dies with it.
+/// the tree stays unindexed until the tree's rescue. The live session record
+/// matters for the mod bridge, which reads a peer no `live_sessions` row joins
+/// from `~/.claude/sessions`: with no link, the record stays in the tree and
+/// the bridge cannot find it while the session runs.
 ///
 /// The red-first pin: on the base it places no store link.
 #[cfg(unix)]
@@ -1535,6 +1864,20 @@ fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
         transcripts.len(),
         1,
         "the transcript is in the global store the session index reads"
+    );
+    // The mod bridge reads a peer no `live_sessions` row joins from
+    // `~/.claude/sessions`, so a background session's record must land there.
+    assert_eq!(
+        fs::read_link(tree.join("sessions")).expect("the tree links its sessions store"),
+        claude.join("sessions"),
+        "the tree's live records land in the global store the bridge reads"
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &fs::metadata(claude.join("sessions")).expect("the global sessions store exists")
+        ) & 0o777,
+        0o700,
+        "the created store is owner-only"
     );
 }
 
@@ -2093,7 +2436,7 @@ fn an_unpinnable_resume_records_its_union_families_not_the_headline() {
         &ResumedAgent::Unknown,
         false,
         None,
-        &[Some("opus".to_owned()), None],
+        &[Some("opus".to_owned()), None, None],
     );
     assert_eq!(
         families,
@@ -2117,7 +2460,7 @@ fn an_agent_launch_records_its_fallback_not_the_env_headline() {
         &ResumedAgent::Agent("pa".to_owned()),
         false,
         None,
-        &[Some("opus".to_owned()), None],
+        &[Some("opus".to_owned()), None, None],
     );
     assert_eq!(
         families,
@@ -3172,7 +3515,7 @@ fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
     let tree = background_tree(&shim);
     // A live process with the right config dir and the recorded (real) start,
     // but argv that is NOT `daemon run`.
-    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let mut foreign = crate::testutil::spawn_parked(&tree, None, &["not", "a", "supervisor"]);
     let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
     crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
     for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
@@ -3331,4 +3674,630 @@ fn a_default_without_member_default_stays_literal() {
         ),
         ["haiku", "default"]
     );
+}
+
+/// Every passthrough reader stops at claude's `--` separator: what follows it is
+/// claude's prompt text, never an option (a background create sends its prompt
+/// as `--bg -- <prompt>`), while the same option before the `--` still reads.
+#[test]
+fn passthrough_readers_stop_at_the_separator() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model", "opus"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model=claude-opus-4-1"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--model", "haiku", "--", "--model=opus"])).0,
+        Some("haiku".to_string())
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--bg", "--", "--agent", "x"])),
+        None
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--agent", "y", "--", "--agent=x"])),
+        Some("y".to_string())
+    );
+    assert_eq!(
+        resume_forms(&args(&["--bg", "--", "-c", "--resume", "abc"])),
+        (Vec::<&str>::new(), false)
+    );
+    assert_eq!(background_flag(&args(&["--", "--bg"])), None);
+    assert_eq!(background_flag(&args(&["--bg", "--", "x"])), Some("--bg"));
+    assert_eq!(
+        project_setting_sources(&args(&["--bg", "--", "--setting-sources", "user"])),
+        project_setting_sources(&args(&["--bg"]))
+    );
+    assert_eq!(
+        parsed_model_args(&args(&[
+            "--model",
+            "haiku",
+            "--fallback-model",
+            "sonnet",
+            "--",
+            "--model=opus",
+            "--fallback-model=x",
+        ])),
+        (
+            Some("haiku".to_string()),
+            Some("haiku".to_string()),
+            Some("sonnet".to_string())
+        )
+    );
+}
+
+/// A `--` that a value-taking flag takes as its value is that flag's value,
+/// never the separator, so the readers keep reading options past it; only a
+/// `--` in a flag position ends them. The same walk decides where
+/// `fold_settings_args` stops.
+#[test]
+fn a_separator_taken_as_a_flag_value_ends_no_reader() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        claude_option_args(&args(&["--name", "--", "--bg"])),
+        args(&["--name", "--", "--bg"]).as_slice()
+    );
+    assert_eq!(
+        background_flag(&args(&["--name", "--", "--bg"])),
+        Some("--bg")
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--name", "--", "--model", "opus"])),
+        (Some("opus".to_string()), Some("opus".to_string()), None)
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["-pn", "--", "--agent", "x"])),
+        Some("x".to_string())
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--name", "x", "--", "--bg"])),
+        args(&["--name", "x"]).as_slice()
+    );
+    assert_eq!(
+        claude_option_args(&args(&["-r", "--", "--bg"])),
+        args(&["-r"]).as_slice(),
+        "an optional value never takes a `-`-led word, so this `--` is the separator"
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--bg", "--", "--model", "opus"])),
+        args(&["--bg"]).as_slice()
+    );
+}
+
+// ── advisor model in the launch demand ───────────────────────────────────────
+
+/// A launch's demand models for the advisor tests: `args` as the passthrough,
+/// `env` as the inherited or caller env (`leg`), `stale` as the outgoing
+/// profile's stale env keys, under `~/.claude/settings.json` as the shared
+/// base.
+fn advisor_demand(
+    profile: &Profile,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    leg: EnvLeg,
+    stale: &[&str],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let stale: Vec<String> = stale.iter().map(|k| (*k).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    member_launch_models(
+        profile,
+        Isolation::Shared,
+        &stale,
+        &args,
+        None,
+        leg,
+        cwd,
+        |key| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+    )
+}
+
+/// A launch with no env, no stale keys and no project dir.
+fn plain_advisor_demand(profile: &Profile, args: &[&str]) -> Vec<String> {
+    advisor_demand(profile, args, None, EnvLeg::Caller, &[], &[])
+}
+
+/// A project dir under the sandbox home holding `.claude/settings.json` and
+/// `.claude/settings.local.json` bodies (`None` writes no file).
+fn project_with(
+    home: &HomeSandbox,
+    name: &str,
+    shared: Option<&str>,
+    local: Option<&str>,
+) -> std::path::PathBuf {
+    let dir = home.home().join(name);
+    fs::create_dir_all(dir.join(".claude")).unwrap();
+    if let Some(body) = shared {
+        fs::write(dir.join(".claude").join("settings.json"), body).unwrap();
+    }
+    if let Some(body) = local {
+        fs::write(dir.join(".claude").join("settings.local.json"), body).unwrap();
+    }
+    dir
+}
+
+fn profile_with_advisor(advisor: Option<&str>) -> Profile {
+    let mut p = Profile::new("adv".to_string(), None, None);
+    p.models.advisor = advisor.map(str::to_owned);
+    p
+}
+
+/// The advisor joins the demand beside the headline, from the last non-blank
+/// `--advisor` in either spelling, and only where claude would read the flag
+/// as the advisor flag.
+#[test]
+fn the_advisor_flag_joins_the_demand() {
+    let _home = HomeSandbox::new();
+    let p = profile_with_advisor(None);
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor=opus"]),
+        ["sonnet", "opus"],
+        "the equals spelling reads the same"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "haiku", "--advisor=opus"]
+        ),
+        ["sonnet", "opus"],
+        "the last flag wins, across spellings"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", ""]),
+        ["sonnet"],
+        "a blank value names no model"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "opus", "--advisor", ""]
+        ),
+        ["sonnet", "opus"],
+        "a blank later flag does not clear an earlier one"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "--advisor", "opus"]),
+        ["--advisor"],
+        "`--model` takes `--advisor` as its value, so no advisor flag was given"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--name", "--advisor", "opus"]),
+        ["sonnet"],
+        "`--name` takes `--advisor` as its value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor"]),
+        ["sonnet"],
+        "a trailing `--advisor` has no value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--", "--advisor", "opus"]),
+        ["sonnet"],
+        "nothing past the separator is a flag"
+    );
+}
+
+/// A blank `--advisor` shadows nothing: the settings tiers still apply.
+#[test]
+fn a_blank_advisor_flag_leaves_the_settings_tiers_in_force() {
+    let home = HomeSandbox::new();
+    let project = project_with(&home, "proj", Some(r#"{"advisorModel":"haiku"}"#), None);
+    let p = profile_with_advisor(None);
+    let demand = |args: &[&str]| advisor_demand(&p, args, Some(&project), EnvLeg::Caller, &[], &[]);
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", ""]),
+        ["sonnet", "haiku"]
+    );
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"],
+        "a non-blank flag outranks the project tier"
+    );
+}
+
+/// Each settings tier supplies the advisor in Claude Code's order: the
+/// `--settings` passthrough, then the project's local file, its shared file,
+/// then the overlay (the profile's `[models] advisor` row), with the flag over
+/// all of them.
+#[test]
+fn the_advisor_model_is_read_from_each_settings_tier_in_precedence_order() {
+    let home = HomeSandbox::new();
+    let inline = r#"{"advisorModel":"fable"}"#;
+    let file = home.home().join("pass.json");
+    fs::write(&file, r#"{"advisorModel":"fable"}"#).unwrap();
+    let both = project_with(
+        &home,
+        "both",
+        Some(r#"{"advisorModel":"sonnet"}"#),
+        Some(r#"{"advisorModel":"haiku"}"#),
+    );
+    let shared_only = project_with(&home, "shared", Some(r#"{"advisorModel":"sonnet"}"#), None);
+    let row = profile_with_advisor(Some("opus"));
+    let blank = profile_with_advisor(None);
+    let demand = |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>| {
+        let mut full = vec!["--model", "m"];
+        full.extend_from_slice(args);
+        advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], &[])
+    };
+
+    assert_eq!(demand(&row, &[], None), ["m", "opus"], "the overlay row");
+    assert_eq!(
+        demand(&blank, &["--settings", inline], None),
+        ["m", "fable"],
+        "inline --settings JSON"
+    );
+    assert_eq!(
+        demand(&blank, &["--settings", file.to_str().unwrap()], None),
+        ["m", "fable"],
+        "a --settings file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&shared_only)),
+        ["m", "sonnet"],
+        "the project's shared file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&both)),
+        ["m", "haiku"],
+        "the project's local file outranks its shared file"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&both)),
+        ["m", "haiku"],
+        "a project tier outranks the overlay"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", inline], Some(&both)),
+        ["m", "fable"],
+        "the --settings passthrough outranks the project tiers"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--settings", inline, "--advisor", "opus"],
+            Some(&both)
+        ),
+        ["m", "opus"],
+        "the flag outranks every settings tier"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "user"], Some(&both)),
+        ["m"],
+        "`--setting-sources user` leaves the project tiers unread"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "project"], Some(&both)),
+        ["m", "sonnet"],
+        "only the enabled tier counts"
+    );
+}
+
+/// The overlay strips a global `advisorModel` when the profile has no row (the
+/// writer is clauth-owned, like `model`), so the global key never reaches the
+/// demand; an isolated runtime has no base at all, and only the row applies.
+#[test]
+fn a_global_advisor_model_never_counts_without_a_profile_row() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(claude.join("settings.json"), r#"{"advisorModel":"opus"}"#).unwrap();
+    let args = ["--model".to_owned(), "m".to_owned()];
+    let demand = |p: &Profile, isolation: Isolation| {
+        member_launch_models(p, isolation, &[], &args, None, EnvLeg::Caller, None, |_| {
+            None
+        })
+    };
+
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Shared),
+        ["m"],
+        "no row: the shared base's advisorModel is removed by the overlay"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Shared),
+        ["m", "haiku"],
+        "a row replaces the base value"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Isolated),
+        ["m", "haiku"],
+        "an isolated runtime reads the row alone"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Isolated),
+        ["m"]
+    );
+}
+
+/// The advisor resolves through the child's `ANTHROPIC_DEFAULT_*_MODEL` alias
+/// remap like any other demand string, composites expanded first.
+#[test]
+fn the_advisor_alias_remaps_through_the_childs_default_model_env() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.opus = Some("claude-opus-5-5".to_owned());
+    p.models.fable = Some("claude-fable-5".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m"]),
+        ["m", "claude-opus-5-5"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "best"]),
+        ["m", "claude-fable-5", "claude-opus-5-5"],
+        "a composite expands to its member aliases, each remapped"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "opus[1m]"]),
+        ["m", "claude-opus-5-5[1m]"],
+        "a context suffix is kept"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "claude-sonnet-5"]),
+        ["m", "claude-sonnet-5"],
+        "a full id is demanded as typed"
+    );
+}
+
+#[test]
+fn the_advisor_is_a_fallback_side_model_beside_the_subagent_and_the_fallback_list() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.subagent = Some("haiku".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--fallback-model", "fable"]),
+        ["sonnet", "fable", "opus", "haiku"],
+        "headline, the fallback list, the advisor, then the subagent"
+    );
+    assert_eq!(
+        crate::fallback::demand_from(plain_advisor_demand(&p, &["--model", "opus"])),
+        ["opus", "haiku"],
+        "an advisor equal to the headline is one family once the walk dedups"
+    );
+}
+
+/// `cc_env_truthy` is Claude Code's own boolean parse of an env value.
+#[test]
+fn cc_env_truthy_matches_claude_codes_boolean_parse() {
+    for yes in ["1", "true", "TRUE", "True", " yes ", "on", "ON", "\tOn\n"] {
+        assert!(cc_env_truthy(yes), "{yes:?}");
+    }
+    for no in [
+        "", " ", "0", "false", "no", "off", "2", "y", "enabled", "truee",
+    ] {
+        assert!(!cc_env_truthy(no), "{no:?}");
+    }
+}
+
+/// A truthy `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` the child sees drops the
+/// advisor, whichever source carries the flag and the model; a falsy one keeps
+/// it.
+#[test]
+fn a_truthy_disable_flag_drops_the_advisor() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let kept = |p: &Profile, args: &[&str], env: &[(&str, &str)]| {
+        advisor_demand(p, args, None, EnvLeg::Caller, &[], env) == ["m", "opus"]
+    };
+    let args = ["--model", "m", "--advisor", "opus"];
+
+    for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+        assert!(
+            !kept(&row, &args, &[(key, truthy)]),
+            "caller env {truthy:?} drops the advisor"
+        );
+        let inline = format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#);
+        let mut with_settings = args.to_vec();
+        with_settings.extend(["--settings", inline.as_str()]);
+        assert!(
+            !kept(&row, &with_settings, &[]),
+            "--settings env {truthy:?} drops the advisor"
+        );
+        let project = project_with(
+            &home,
+            "killed",
+            Some(&format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#)),
+            None,
+        );
+        assert_eq!(
+            advisor_demand(&row, &args, Some(&project), EnvLeg::Caller, &[], &[]),
+            ["m"],
+            "project env {truthy:?} drops the advisor"
+        );
+        let mut profile_env = row.clone();
+        profile_env.env.insert(key.to_owned(), truthy.to_owned());
+        assert!(
+            !kept(&profile_env, &args, &[]),
+            "profile [env] {truthy:?} drops the advisor"
+        );
+    }
+    for falsy in ["0", "false", "no", "off", ""] {
+        assert!(
+            kept(&row, &args, &[(key, falsy)]),
+            "caller env {falsy:?} keeps the advisor"
+        );
+    }
+    assert!(kept(&row, &args, &[]), "an unset flag keeps the advisor");
+}
+
+/// The kill switch and the model resolve through separate tiers: the highest
+/// tier that sets the switch decides, wherever the model came from.
+#[test]
+fn the_disable_flag_and_the_advisor_model_resolve_through_separate_tiers() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let off = format!(r#"{{"env":{{"{key}":"1"}}}}"#);
+    let on = format!(r#"{{"env":{{"{key}":"0"}}}}"#);
+    let project_off = project_with(&home, "off", Some(&off), None);
+    let project_on = project_with(&home, "on", Some(&on), None);
+    let mut row = profile_with_advisor(Some("opus"));
+    let demand =
+        |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>, env: &[(&str, &str)]| {
+            let mut full = vec!["--model", "m"];
+            full.extend_from_slice(args);
+            advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], env)
+        };
+
+    assert_eq!(
+        demand(&row, &[], Some(&project_off), &[]),
+        ["m"],
+        "the model from the overlay, the switch from the project tier"
+    );
+    assert_eq!(
+        demand(&row, &["--advisor", "haiku"], Some(&project_off), &[]),
+        ["m"],
+        "the flag names a model but the project switch still turns the tool off"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", &on], Some(&project_off), &[]),
+        ["m", "opus"],
+        "a higher tier's falsy switch beats a lower tier's truthy one"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[(key, "1")]),
+        ["m", "opus"],
+        "a project env value beats the caller env"
+    );
+    row.env.insert(key.to_owned(), "1".to_owned());
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[]),
+        ["m", "opus"],
+        "the project env beats the overlay env"
+    );
+    assert_eq!(
+        demand(&row, &[], None, &[(key, "0")]),
+        ["m"],
+        "the overlay env beats the caller env"
+    );
+
+    // `--setting-sources` narrows the project tiers for the switch as it does
+    // for the model: a project switch in a tier Claude Code never reads is no
+    // switch at all.
+    let row = profile_with_advisor(Some("opus"));
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "user"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "`--setting-sources user` leaves the project switch unread, so the advisor stays"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "local"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "the shared project file is not in a `local`-only list"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "project"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m"],
+        "an enabled project tier's switch still turns the advisor off"
+    );
+}
+
+/// On the start path the kill switch rides the process env and reaches the
+/// child only where the scrub keeps it: a key the outgoing profile's `[env]`
+/// carried is stale, so the child never sees it and the advisor stays.
+#[test]
+fn a_stale_process_env_kill_switch_does_not_drop_the_advisor() {
+    let _home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let args = ["--model", "m"];
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[], &[(key, "1")]),
+        ["m"],
+        "an inherited truthy switch survives the scrub and turns the advisor off"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[key], &[(key, "1")]),
+        ["m", "opus"],
+        "a stale key is scrubbed, so the advisor stays"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Caller, &[key], &[(key, "1")]),
+        ["m"],
+        "the delegate's caller env is layered after the scrub, so it always reaches the child"
+    );
+}
+
+/// A launch whose headline is unknown still demands the advisor beside the
+/// fallback side: an agent with no model, and an unpinnable resume.
+#[test]
+fn an_agent_launch_keeps_the_advisor_on_the_fallback_side() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let args: Vec<String> = ["--agent", "reviewer"].map(str::to_owned).to_vec();
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &args,
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("reviewer"));
+    assert_eq!(
+        demand.models,
+        ["opus"],
+        "the advisor is known whatever the agent runs"
+    );
+
+    let unknown = member_launch_unknown_headline_models(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(unknown, ["opus"]);
+}
+
+/// The advisor never changes whether the headline is unknown: a launch naming
+/// no model with no member default stays unknown with an advisor set.
+#[test]
+fn the_advisor_does_not_resolve_an_unknown_headline() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert!(demand.unknown);
+    assert_eq!(demand.models, ["opus"]);
 }

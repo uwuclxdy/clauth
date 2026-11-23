@@ -7,6 +7,12 @@
 /// The per-profile file name under the profile dir (`profiles/<name>/note.txt`).
 pub(crate) const NOTE_FILE: &str = "note.txt";
 
+/// Why a task on a name its roster (the claude profiles, or the codex roster for
+/// a codex row) no longer carries is refused: the note editor's save and the
+/// TUI's held-`e` landing both say it, so the explanation cannot drift between
+/// them.
+pub(crate) const ACCOUNT_GONE: &str = "account is no longer in the roster";
+
 use crate::profile::ProfileName;
 
 /// The account's stored note, `None` when it has none. An empty file reads as
@@ -42,7 +48,7 @@ pub(crate) fn save_note(name: &ProfileName, text: &str) -> std::io::Result<()> {
     if !crate::profile::is_configured(name).unwrap_or(false) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "account is no longer in the roster",
+            ACCOUNT_GONE,
         ));
     }
     let Some(path) = crate::profile_cache::profile_cache_path(name, NOTE_FILE) else {

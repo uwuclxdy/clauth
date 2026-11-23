@@ -20,9 +20,15 @@ pub(crate) mod log_rotate;
 mod probe;
 pub(crate) mod proxies;
 mod status_json;
+
+#[cfg(test)]
+#[path = "../../tests/inline/proxy_p6_feed.rs"]
+pub(crate) mod proxy_p6_feed_tests;
 mod tick;
 mod types;
 
+#[cfg(test)]
+pub(crate) use probe::LEASE_STALE_BOUND;
 /// The running daemon's pid sidecar reader, shared by the gateway hold writer
 /// in `crate::gateway`.
 pub(crate) use probe::holder_pid;
@@ -30,13 +36,13 @@ use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{
-    DaemonHealth, FetchLease, daemon_binary_change, daemon_health, gateway_slot, proxy_slots,
-    singleton_held,
+    DaemonHealth, FetchLease, LeaseTicket, daemon_health, gateway_slot, probe_daemon, proxy_slots,
+    singleton_held, spawn_lease_watchdog,
 };
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};
 #[cfg(test)]
-pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
+pub(crate) use probe::{daemon_lock_path, feed_reads, hold_daemon_lock, reset_feed_reads};
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
 /// referencing them as `super::…` after the extraction.
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
@@ -44,8 +50,8 @@ pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -55,22 +61,23 @@ use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{
-    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, clauth_dir,
+    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600_fast, clauth_dir,
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
-    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, SkippedUnreadable, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
-    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    ActivityStore, ClaudeResetsMemoLock, CodexResetsMemoLock, FetchStatus, KickBlocks,
+    LastFetchedAt, LegKey, NextRefreshPerProfile, PendingSwitch, PendingSwitchOff, PollStreaks,
+    RefetchQueue, SkippedUnreadable, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
+    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, WeeklyResetKicks, bootstrap_fetch, bootstrap_third_party,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, new_claude_resets_memo,
+    new_codex_resets_memo, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::{
-    ProfileEntry, build_codex_entries, build_profile_entries, build_status,
+    PlanEndEntry, ProfileEntry, build_codex_entries, build_profile_entries, build_status,
 };
 // The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
@@ -89,6 +96,13 @@ const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 /// every tick would spend one per second.
 #[cfg(target_os = "macos")]
 const BARE_ITEM_SCAN_EVERY_TICKS: u64 = 30;
+/// How often (in `TICK`s) the tick sweeps live sessions' per-session Keychain
+/// items for a stale copy of a rolling bearer that no stamp will re-point
+/// (`runtime::sweep_stale_copied_bearers_detached`): at boot, then every
+/// ~5 min. Each sweep reads only the items of sessions that lost their
+/// `.credentials.json`, one `security` read each.
+#[cfg(target_os = "macos")]
+const STALE_COPY_SWEEP_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
@@ -101,12 +115,91 @@ const PID_FILE: &str = "clauthd.pid";
 /// instance allowed to park on the singleton lock. See [`probe::Claim`].
 const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
-/// held for life by whichever instance (daemon or a TUI) is the current usage
-/// fetcher. See [`FetchLease`](probe::FetchLease).
+/// held by whichever instance (daemon or a TUI) is the current usage fetcher
+/// while its ticks keep completing. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// The daemon's log beside `status.json`: its stderr and stdout when the TUI
 /// starts it. The run loop caps it by this name.
 const LOG_FILE: &str = "daemon.log";
+
+/// Latch for the retention leg's check-failed line, so a standing failure is
+/// reported once per failure run rather than on every tick. Cleared by the
+/// next clean check, so a recurrence is reported again.
+static RETENTION_CHECK_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The retention leg's cadence: a change event under `~/.claude` drives the
+/// check, and the 30 s fallback (the polling cadence too, when no watch arms)
+/// covers an event the watcher never delivered.
+const RETENTION_TIMINGS: crate::watchdog::Timings = crate::watchdog::Timings {
+    debounce: Duration::from_millis(200),
+    cooldown: Duration::from_millis(500),
+    fallback: Duration::from_secs(30),
+    config_poll: Duration::from_secs(30),
+    credential_poll: Duration::from_secs(30),
+    swap_poll: Duration::from_secs(30),
+};
+
+/// One retention check for the leg: run [`crate::retention::reconcile`] and
+/// latch its failure line, so a standing failure is reported once per failure
+/// run. Cleared by the next clean check, so a recurrence is reported again.
+/// Extracted from the `serve` wiring so the latch has a test.
+fn retention_check() {
+    if let Err(e) = crate::retention::reconcile() {
+        if !RETENTION_CHECK_FAILED.swap(true, Ordering::Relaxed) {
+            logline!("clauth daemon: cleanupPeriodDays check failed: {e:#}");
+        }
+    } else {
+        RETENTION_CHECK_FAILED.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The retention leg as a watchdog reconcile: `check` is its config leg, and
+/// it has no credential or swap leg.
+struct RetentionCheck<F>(F);
+
+impl<F: Fn()> crate::watchdog::Reconcile for RetentionCheck<F> {
+    fn config(&self) {
+        (self.0)();
+    }
+    fn credentials(&self) {}
+    fn swap_poll(&self) {}
+}
+
+/// Run `check` once now, then on every change under `claude_home`, on the
+/// watchdog's event loop with its polling fallback, until `shutdown` fires or
+/// disconnects. The session watchdogs put a lost `cleanupPeriodDays` back only
+/// while a `clauth start` session runs; this leg covers a bare `claude` with
+/// no session live. The watch arms before the thread spawns, so a write
+/// landing right after the spawn still raises its event.
+///
+/// Every child counts as a match rather than just `settings.json`: the file is
+/// legitimately absent, and a name-only interest would read every other
+/// `~/.claude` write as an unmatched event, so the dead-filter check would
+/// report a healthy watcher. An open of a child wakes nothing.
+fn spawn_retention_watch(
+    claude_home: &std::path::Path,
+    timings: crate::watchdog::Timings,
+    shutdown: crossbeam_channel::Receiver<()>,
+    check: impl Fn() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let specs = [crate::watchdog::WatchSpec::new(
+        claude_home,
+        crate::watchdog::Interest::AnyChild,
+    )];
+    let watcher = crate::watchdog::try_start(&specs, timings.debounce);
+    std::thread::Builder::new()
+        .name("clauth-retention".into())
+        .spawn(move || {
+            check();
+            crate::watchdog::run_with_watcher(
+                watcher,
+                specs.len(),
+                &shutdown,
+                &timings,
+                &RetentionCheck(check),
+            );
+        })
+}
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
 /// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
@@ -116,11 +209,13 @@ const LOG_FILE: &str = "daemon.log";
 /// `KeepAlive{SuccessfulExit=false}` restart the daemon (boot()'s relink +
 /// atomic writes make restart safe).
 ///
-/// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
-/// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
-/// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
-/// did. TENSION: a legit switch's keychain shell-outs can block inside the
-/// `StateLock`, leaving only ~10s of slack. Twice now the count of those
+/// Tightened 60s→30s for the single-fetcher lease (#27): a main loop wedged alive
+/// would otherwise delay every other instance's fetch for as long as the process
+/// lives — the scheduler thread may still be completing ticks, so its lease
+/// watchdog cannot see this wedge — 30s frees the lease about as fast as the
+/// retired TUI freshness re-arm did. A wedged SCHEDULER thread is that watchdog's
+/// to break (SCOPE below). TENSION: a legit switch's keychain shell-outs can block
+/// inside the `StateLock`, leaving only ~10s of slack. Twice now the count of those
 /// shell-outs grew under this deadline (a read-modify-write made one mirror two
 /// calls; a first-login adopt makes one switch two mirrors), so the bound is no
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
@@ -135,10 +230,11 @@ const LOG_FILE: &str = "daemon.log";
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
-/// keeps the main loop ticking and the feed fresh, so it trips nothing and the
-/// lease is never freed — pre-existing (the retired probe keyed on the same
-/// main-loop freshness). Do not read this deadline as
-/// covering the fetch path itself.
+/// keeps the main loop ticking and the feed fresh, so it trips nothing here; the
+/// scheduler's own lease watchdog ([`probe::spawn_lease_watchdog`]) releases
+/// the lease once its tick has completed nothing for
+/// [`probe::LEASE_STALE_BOUND`]. Do not read this deadline as covering the
+/// fetch path itself.
 ///
 /// A SUSPENDED process (Modern Standby/S0ix, S3, a VM pause, SIGSTOP) freezes
 /// the loop but not the wall clock, so a freeze reads as a wedge on wall time
@@ -217,6 +313,1148 @@ fn drains_exhausted(remaining: Option<Duration>, now: Instant, deadline: Instant
     remaining.is_some_and(|r| r.is_zero()) || now >= deadline
 }
 
+/// The descriptors the re-exec passes to the next image of this process: the
+/// open file description holding the singleton's flock (`clauthd.lock`) and,
+/// when `--listen` runs, the bound REST listener. std opens every descriptor
+/// close-on-exec, so without a handover the exec would drop both between the
+/// old image's exec and the new image's claim: a parked `--standby` could
+/// take the singleton there, and any process could take the port. The old
+/// image clears close-on-exec on each registered fd right before the exec
+/// and names its number in the exec command's env — never this process's,
+/// which has live threads at the exec; the new image reads the vars first
+/// thing, re-marks the adopted fds close-on-exec so no child inherits them,
+/// validates each number while borrowing it (the lock file by device and
+/// inode plus the flock itself, a stream socket by its type and bound
+/// address), and adopts the validated descriptors instead of claiming and
+/// binding afresh. A number that fails validation is left open (never
+/// closed) and logged per descriptor; a parsed number at or above the stdio
+/// floor that is still open is re-marked close-on-exec, so no later child
+/// inherits it, and the start falls back to the fresh claim and bind.
+#[cfg(unix)]
+pub(crate) mod exec_handover {
+    use std::fs::File;
+    use std::net::{SocketAddr, TcpListener};
+    use std::os::fd::{FromRawFd, RawFd};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use crate::logline::logline;
+
+    /// The env var naming the lock descriptor's fd to the next image.
+    pub(crate) const LOCK_FD_ENV: &str = "CLAUTH_EXEC_LOCK_FD";
+    /// The env var naming the REST listener's fd to the next image.
+    pub(crate) const LISTEN_FD_ENV: &str = "CLAUTH_EXEC_LISTEN_FD";
+
+    /// The fd of the open file description holding the singleton's flock,
+    /// once this image holds the lock.
+    static LOCK_FD: Mutex<Option<RawFd>> = Mutex::new(None);
+    /// The bound REST listener's fd, once this image serves the API.
+    static LISTEN_FD: Mutex<Option<RawFd>> = Mutex::new(None);
+    /// The listener [`take_at_start`] validated and stored, for
+    /// [`take_listener`].
+    static ADOPTED_LISTENER: Mutex<Option<TcpListener>> = Mutex::new(None);
+
+    /// The descriptors [`prepare_for_exec`] cleared close-on-exec on, for
+    /// the exec command to name in the next image's env.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct Handover {
+        lock: Option<RawFd>,
+        listen: Option<RawFd>,
+    }
+
+    /// Record the singleton lock's descriptor once this image holds it, so
+    /// the next re-exec hands it over.
+    pub(crate) fn register_lock(fd: RawFd) {
+        *LOCK_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fd);
+    }
+
+    /// Record the bound REST listener's descriptor once it is bound, so the
+    /// next re-exec hands it over.
+    pub(crate) fn register_listener(fd: RawFd) {
+        *LISTEN_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fd);
+    }
+
+    /// Hand the registered descriptors to the next image, right before the
+    /// exec: clear close-on-exec on each and return the pair for
+    /// [`apply_handover`] to name on the exec command. The process
+    /// environment is never mutated: the daemon has live threads at the
+    /// exec (on macOS the detached keychain worker reads the env), and
+    /// edition 2024 forbids calling an env function while another thread
+    /// may. No rollback is needed — a successful exec replaces the image,
+    /// and an exec that returned reaches the abort.
+    pub(crate) fn prepare_for_exec() -> Handover {
+        let lock = *LOCK_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fd) = lock {
+            set_cloexec(fd, false);
+        }
+        let listen = *LISTEN_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fd) = listen {
+            set_cloexec(fd, false);
+        }
+        Handover { lock, listen }
+    }
+
+    /// Name the prepared descriptors on the exec command, so the next image
+    /// inherits them through the exec: `Command::env` builds the child's
+    /// environment from this process's without mutating it, which is what
+    /// keeps the live threads racing no env write. The new image's first
+    /// act removes both vars before it spawns anything.
+    pub(crate) fn apply_handover(command: &mut std::process::Command, handover: Handover) {
+        if let Some(fd) = handover.lock {
+            command.env(LOCK_FD_ENV, fd.to_string());
+        }
+        if let Some(fd) = handover.listen {
+            command.env(LISTEN_FD_ENV, fd.to_string());
+        }
+    }
+
+    /// Clear every registration and adopted descriptor, for a test that
+    /// registered scratch descriptors it then drops before the process
+    /// ends: a later production handover must never touch a recycled fd
+    /// number.
+    #[cfg(all(test, unix))]
+    pub(crate) fn reset() {
+        *LOCK_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *LISTEN_FD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *ADOPTED_LISTENER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Whether a refused number was open when its own probe ran: a closed
+    /// number has no close-on-exec flag to restore.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refused {
+        Open,
+        Closed,
+    }
+
+    /// Classify a failed libc probe on a raw number: `EBADF` means the
+    /// number is closed; any other failure means it answered and is open.
+    fn probe_refused() -> Refused {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            Refused::Closed
+        } else {
+            Refused::Open
+        }
+    }
+
+    // Counts this thread's refusal-arm close-on-exec re-marks, so a test
+    // can pin that a closed number is never re-marked and an open one is.
+    #[cfg(test)]
+    thread_local! {
+        static REFUSED_REMARKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The re-marks counted on this thread so far.
+    #[cfg(test)]
+    pub(crate) fn refused_remarks() -> usize {
+        REFUSED_REMARKS.with(std::cell::Cell::get)
+    }
+
+    /// Undo the handover's close-on-exec clear on a refused number whose
+    /// probe found it open, so no later child inherits it.
+    fn remark_refused(fd: RawFd) {
+        set_cloexec(fd, true);
+        #[cfg(test)]
+        REFUSED_REMARKS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// The new image's first act: read the handover env (removing both vars
+    /// at once, so no child of this image inherits them), and validate each
+    /// number while borrowing it: the lock fd must be an open handle to
+    /// `dir/clauthd.lock` (same device and inode) whose flock this process
+    /// holds, and the listener fd, when `listen` is configured, must be a
+    /// stream socket bound to that address. A number that fails validation
+    /// (an unparsable value, one below 3, a closed or foreign descriptor)
+    /// is left open — it may be one this process does not own — and, when it
+    /// parsed to a number at or above the stdio floor and is still open,
+    /// re-marked close-on-exec, undoing the handover's clear so no later
+    /// child inherits it; its refusal is logged with the fallback that runs
+    /// for it. Returns the adopted lock (the caller then skips the claim),
+    /// or `None` for a fresh claim.
+    #[expect(
+        unsafe_code,
+        reason = "Rust 2024 makes env removal unsafe; this runs as the new image's first act, before any thread or child exists"
+    )]
+    pub(crate) fn take_at_start(dir: &Path, listen: Option<SocketAddr>) -> Option<File> {
+        let lock_env = std::env::var_os(LOCK_FD_ENV);
+        let listen_env = std::env::var_os(LISTEN_FD_ENV);
+        // SAFETY: `LOCK_FD_ENV` is this handover's own var, and this runs as
+        // the new image's first act — before any thread is spawned and
+        // before anything can spawn (the boot capture spawns `ps` on macOS) —
+        // so no other thread may be inside an env function and no child of
+        // this image ever inherits it.
+        unsafe { std::env::remove_var(LOCK_FD_ENV) };
+        // SAFETY: `LISTEN_FD_ENV` is private to the same handover and is
+        // removed in that same pre-thread window, so no child inherits it and
+        // no other thread reads the environment here.
+        unsafe { std::env::remove_var(LISTEN_FD_ENV) };
+        let mut refused_lock = false;
+        let lock = match lock_env.as_deref().and_then(handover_fd) {
+            Some(fd) => match adopt_lock(fd, dir) {
+                Ok(file) => Some(file),
+                Err(refused) => {
+                    refused_lock = true;
+                    // The previous image cleared close-on-exec on this
+                    // number right before the exec; a refusal over an open
+                    // descriptor leaves it that way, so restore the flag —
+                    // an inheritable fd would ride every child of this
+                    // image too. A closed number has no flag to restore.
+                    if refused == Refused::Open {
+                        remark_refused(fd);
+                    }
+                    None
+                }
+            },
+            None => {
+                refused_lock = lock_env.is_some();
+                None
+            }
+        };
+        if refused_lock {
+            logline!(
+                "clauth daemon: the lock descriptor handed over across the re-exec failed validation; claiming the singleton afresh"
+            );
+        }
+        let mut refused_listen = false;
+        match listen_env.as_deref().and_then(handover_fd) {
+            Some(fd) => {
+                let lock_fd = lock.as_ref().map(|file| {
+                    use std::os::fd::AsRawFd as _;
+                    file.as_raw_fd()
+                });
+                // The adopted lock's own number is refused before the
+                // listener arm runs, so the listener arm can never take
+                // ownership of the lock's descriptor — today's validation
+                // already refuses the lock's regular file at `SO_TYPE`, but
+                // the order keeps a future ownership-taking listener
+                // validation from double-owning it.
+                let adopted: Result<TcpListener, Refused> = match (listen, lock_fd) {
+                    // The adopted lock's own number, open by construction.
+                    (Some(_), Some(lock_fd)) if fd == lock_fd => Err(Refused::Open),
+                    (Some(addr), _) => adopt_listener(fd, addr),
+                    // No listener is configured (unreachable across the
+                    // exec, which keeps the argv): a number that was never
+                    // validated is not owned, so it stays open.
+                    (None, _) => Err(Refused::Open),
+                };
+                match adopted {
+                    Ok(listener) => {
+                        *ADOPTED_LISTENER
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
+                    }
+                    Err(refused) => {
+                        refused_listen = true;
+                        // As for the lock arm: the previous image cleared
+                        // close-on-exec on this number, and a refusal over
+                        // an open descriptor leaves it that way, so restore
+                        // the flag — a refused listener keeps its bound
+                        // socket open, and without the re-mark it would
+                        // also stay inheritable into every later child.
+                        if refused == Refused::Open {
+                            remark_refused(fd);
+                        }
+                    }
+                }
+            }
+            None => refused_listen = listen_env.is_some(),
+        }
+        if refused_listen {
+            match listen {
+                Some(_) => logline!(
+                    "clauth daemon: the listener descriptor handed over across the re-exec failed validation; binding the REST listener afresh"
+                ),
+                None => logline!(
+                    "clauth daemon: the listener descriptor handed over across the re-exec failed validation; no REST listener is configured for this start"
+                ),
+            }
+        }
+        lock
+    }
+
+    /// Take the listener [`take_at_start`] validated and stored, when it is
+    /// the one bound to `listen`; `None` when no listener was handed over
+    /// (or it failed validation), so the caller binds afresh. A configured
+    /// port 0 matches the bound ephemeral port: the address means "any
+    /// port on this ip", never a literal port.
+    pub(crate) fn take_listener(listen: SocketAddr) -> Option<TcpListener> {
+        let adopted = ADOPTED_LISTENER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        let bound = adopted.local_addr().ok()?;
+        (bound.ip() == listen.ip() && (listen.port() == 0 || bound.port() == listen.port()))
+            .then_some(adopted)
+    }
+
+    /// Validate one handed-over lock descriptor while borrowing it, then
+    /// adopt: an open handle to `dir/clauthd.lock` — same device and inode
+    /// — whose flock this process holds. Every check runs through `libc` on
+    /// the raw number first, so a refused number (a closed fd, a foreign
+    /// descriptor) is left open: it may be one this process does not own,
+    /// and closing it (stderr, a supervisor-passed fd) would be worse than
+    /// leaving it. Ownership moves in only once validated.
+    #[expect(
+        unsafe_code,
+        reason = "validating a handed-over descriptor needs libc fstat and flock on a raw number, and adopting it needs from_raw_fd"
+    )]
+    fn adopt_lock(fd: RawFd, dir: &Path) -> Result<File, Refused> {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `libc::stat` is all integers, so the zeroed value is
+        // valid, and no field is read before `fstat` fills the struct.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: `fd` is a number read from the handover env; fstat is
+        // defined for any fd number (EBADF for a closed one) and writes only
+        // to our own `stat` local.
+        if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
+            return Err(probe_refused());
+        }
+        let expected = std::fs::metadata(dir.join(super::LOCK_FILE)).map_err(|_| Refused::Open)?;
+        if (stat.st_dev as u64, stat.st_ino as u64) != (expected.dev(), expected.ino()) {
+            return Err(Refused::Open);
+        }
+        // The flock itself: re-locking the same open file description
+        // succeeds only while this process holds it (or takes it, which is
+        // the same end state); a refusal means another process holds it and
+        // the handover lied.
+        // SAFETY: `flock` is defined for any fd number and touches no memory
+        // of ours; a closed number fails with EBADF.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(Refused::Open);
+        }
+        // Only now is the number owned: validated as an open handle to the
+        // lock file whose flock this process holds.
+        // SAFETY: `from_raw_fd` takes ownership of the validated descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        // Re-marked close-on-exec at once: only this image's own next
+        // handover clears it, so no child of this image inherits it.
+        set_cloexec(fd, true);
+        Ok(file)
+    }
+
+    /// Validate one handed-over listener descriptor while borrowing it, then
+    /// adopt: a stream socket (`SO_TYPE`) bound to the configured address
+    /// (`getsockname`), never merely any open descriptor — a configured
+    /// port 0 matches the bound ephemeral port, the address meaning "any
+    /// port on this ip". The listening flag is checked where the kernel
+    /// answers it: linux answers `SO_ACCEPTCONN`, macOS 27 answers every
+    /// socket with `ENOPROTOOPT`, so there the type and the bound address
+    /// are the validation. A refused number is left open (see
+    /// [`adopt_lock`]), so `TcpListener::from_raw_fd` — whose contract is
+    /// an open socket — runs only on a validated one.
+    #[expect(
+        unsafe_code,
+        reason = "validating a handed-over listener needs getsockopt on a raw descriptor number, and adopting it needs from_raw_fd"
+    )]
+    fn adopt_listener(fd: RawFd, listen: SocketAddr) -> Result<TcpListener, Refused> {
+        let mut sock_type: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: as in [`adopt_lock`], getsockopt is defined for any fd
+        // number and writes only to our own locals.
+        let type_probe = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut sock_type).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        if type_probe != 0 {
+            return Err(probe_refused());
+        }
+        if sock_type != libc::SOCK_STREAM {
+            return Err(Refused::Open);
+        }
+        let bound = socket_address(fd);
+        let same_address = bound.as_ref().is_some_and(|bound| {
+            bound.ip() == listen.ip() && (listen.port() == 0 || bound.port() == listen.port())
+        });
+        if !same_address {
+            return Err(Refused::Open);
+        }
+        // And a LISTENING socket where the kernel answers the question, so
+        // a bound-but-unconnected socket planted in the env never reads as
+        // the daemon's listener. A kernel that refuses the read (macOS)
+        // leaves the checks above as the validation.
+        let mut accepting: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: as in [`adopt_lock`], getsockopt is defined for any fd
+        // number and writes only to our own locals.
+        let ok = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&raw mut accepting).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        if ok == 0 && accepting == 0 {
+            return Err(Refused::Open);
+        }
+        // Only now is the number owned: validated as a stream socket bound
+        // to the configured address.
+        // SAFETY: `from_raw_fd` takes ownership of the validated socket.
+        let listener = unsafe { TcpListener::from_raw_fd(fd) };
+        set_cloexec(fd, true);
+        Ok(listener)
+    }
+
+    /// The address the socket behind `fd` is bound to (`getsockname`), or
+    /// `None` when the call fails or the family is not one the daemon
+    /// serves.
+    #[expect(
+        unsafe_code,
+        reason = "reading a socket's bound address needs getsockname and a sockaddr_storage reinterpretation no safe std API exposes"
+    )]
+    fn socket_address(fd: RawFd) -> Option<SocketAddr> {
+        // SAFETY: `sockaddr_storage` is plain-integer storage, so the zeroed
+        // value is valid and every field read afterwards is one the call
+        // wrote.
+        let mut storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `fd` is an open socket (validated by the caller) and the
+        // pointers address our own locals; getsockname writes at most `len`
+        // bytes into `storage`.
+        if unsafe {
+            libc::getsockname(
+                fd,
+                (&raw mut storage).cast::<libc::sockaddr>(),
+                &raw mut len,
+            )
+        } != 0
+        {
+            return None;
+        }
+        match libc::c_int::from(storage.ss_family) {
+            libc::AF_INET => {
+                // SAFETY: the family tags the storage as a sockaddr_in.
+                let addr = unsafe { *(&raw const storage).cast::<libc::sockaddr_in>() };
+                Some(SocketAddr::from((
+                    std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(addr.sin_port),
+                )))
+            }
+            libc::AF_INET6 => {
+                // SAFETY: the family tags the storage as a sockaddr_in6.
+                let addr = unsafe { *(&raw const storage).cast::<libc::sockaddr_in6>() };
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                    u16::from_be(addr.sin6_port),
+                    addr.sin6_flowinfo,
+                    addr.sin6_scope_id,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse one handover env value into a descriptor number worth probing:
+    /// a number below 3 is refused — the daemon's stdio (stderr IS
+    /// daemon.log) must never be closed through an adoption — and an
+    /// unparsable value is refused too.
+    fn handover_fd(value: &std::ffi::OsStr) -> Option<RawFd> {
+        value.to_str()?.parse::<RawFd>().ok().filter(|fd| *fd >= 3)
+    }
+
+    /// Set (or clear) close-on-exec on `fd`. Explicit on both sides: a raw
+    /// descriptor keeps whatever flag it inherited, so adoption sets it and
+    /// the handover clears it.
+    #[expect(
+        unsafe_code,
+        reason = "close-on-exec is a raw descriptor flag only fcntl reaches; no safe std API sets it on a number this process may not own"
+    )]
+    fn set_cloexec(fd: RawFd, on: bool) {
+        // SAFETY: `fd` is a descriptor number, not necessarily an open one
+        // or one this process owns: fcntl is defined for any number (EBADF
+        // for a closed one), and F_GETFD only reads that number's own
+        // descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags != -1 {
+            let flags = if on {
+                flags | libc::FD_CLOEXEC
+            } else {
+                flags & !libc::FD_CLOEXEC
+            };
+            // SAFETY: F_SETFD runs only after F_GETFD found the number open,
+            // and it only rewrites that number's own descriptor flags.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+        }
+    }
+}
+
+/// Platforms that never re-exec have no descriptors to hand over: the
+/// listener slot is always empty, so every start binds afresh.
+#[cfg(not(unix))]
+pub(crate) mod exec_handover {
+    use std::net::{SocketAddr, TcpListener};
+
+    pub(crate) fn take_listener(_listen: SocketAddr) -> Option<TcpListener> {
+        None
+    }
+}
+
+/// The fixed token a handover-capable build answers on stdout, exit 0, to
+/// the daemon's hidden capability argument (`EXEC_HANDOVER_FLAG`): the
+/// re-exec probe spawns the replacement and compares these exact bytes, so
+/// a build that predates the handover (which exits on the unknown
+/// argument) or any other program at the path reads as not capable. A
+/// build that will serve the API reads its certificate first and answers
+/// [`EXEC_HANDOVER_CERT_REFUSED`] with the reason instead.
+pub(crate) const EXEC_HANDOVER_TOKEN: &str = "clauth-exec-handover";
+/// The marker a replacement that cannot load the API certificate answers
+/// instead of the token: the first line of the probe's cert-refused answer,
+/// written by the answer arm in `main.rs` and matched by the probe here, so
+/// the two never drift apart.
+pub(crate) const EXEC_HANDOVER_CERT_REFUSED: &str = "clauth-exec-handover-cert-refused";
+/// The probe's argv spelling of the hidden argument, dashes included (the
+/// value a spawn receives). `cli.rs` declares the same flag on the
+/// `daemon` command without them (`hide = true` keeps it out of --help and
+/// the hand-written completions); the parse test drives the real CLI with
+/// this string, so a drift between the two reds.
+#[cfg(unix)]
+pub(crate) const EXEC_HANDOVER_FLAG: &str = "--__exec-handover";
+
+/// Two consecutive reads of the daemon's own executable as replaced make the
+/// re-exec due. A rename-replaced file reads whole from its first read (a
+/// rename is atomic); the second read gives an install that creates the new
+/// file at the path one more tick, and an exec that still fails aborts for
+/// the supervisor's restart. Due reports once per streak: a replacement that
+/// never clears must not re-log and re-run the check every tick. `None` and
+/// `Removed` restart the count — a removed binary has nothing to exec, and
+/// the exec failure would abort the daemon. On non-unix it never returns
+/// true: Windows keeps the status-feed toast and never restarts itself.
+#[derive(Debug, Default)]
+pub(crate) struct ReexecWatch {
+    #[cfg(unix)]
+    replaced_in_a_row: u8,
+    /// The identity of the replacement the last not-capable probe stood
+    /// down on: while that identity still sits at the recorded path the
+    /// watch stays dead (the binary was judged, and re-probing it per
+    /// check would spawn once a second forever), and a new identity
+    /// re-arms it from two consecutive reads.
+    #[cfg(unix)]
+    stood_down_identity: Option<BinaryIdentity>,
+    /// Whether the last verdict was a stand-down: an unkeyable path (no
+    /// identity to compare) then keeps that verdict standing, so the probe
+    /// never runs once per due cycle on a file it cannot read.
+    #[cfg(unix)]
+    stood_down: bool,
+}
+
+impl ReexecWatch {
+    #[cfg(unix)]
+    pub(crate) fn observe(&mut self, change: Option<crate::plugin_host::ExeChange>) -> bool {
+        if change == Some(crate::plugin_host::ExeChange::Replaced) {
+            // Saturating: a replacement that never clears (an empty stop kit,
+            // an old daemon) must neither overflow nor re-report due.
+            self.replaced_in_a_row = self.replaced_in_a_row.saturating_add(1);
+            return self.replaced_in_a_row == 2;
+        }
+        self.replaced_in_a_row = 0;
+        false
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn observe(&mut self, _change: Option<crate::plugin_host::ExeChange>) -> bool {
+        false
+    }
+
+    /// Record a not-capable verdict for the replacement at the recorded
+    /// path: the streak resets, and the identity is remembered so the same
+    /// binary is never re-probed while it still sits there.
+    #[cfg(unix)]
+    pub(crate) fn stand_down(&mut self, identity: Option<BinaryIdentity>) {
+        self.replaced_in_a_row = 0;
+        self.stood_down_identity = identity;
+        self.stood_down = true;
+    }
+
+    /// The identity of the replacement the last stand-down recorded.
+    #[cfg(unix)]
+    pub(crate) fn stood_down_on(&self) -> Option<BinaryIdentity> {
+        self.stood_down_identity
+    }
+
+    /// Whether a not-capable verdict stands recorded. A readable file at
+    /// the path still re-arms the probe; only an unkeyable one keeps it.
+    #[cfg(unix)]
+    pub(crate) fn stood_down(&self) -> bool {
+        self.stood_down
+    }
+
+    /// Reset the streak without a stand-down: the same stood-down binary
+    /// still sits at the path, so a NEW replacement (a different identity)
+    /// must re-arm from two consecutive reads.
+    #[cfg(unix)]
+    pub(crate) fn reset_streak(&mut self) {
+        self.replaced_in_a_row = 0;
+    }
+}
+
+/// The watch's own notion of a replacement binary's identity: device,
+/// inode, length, mtime at full precision and the mode bits, so an in-place
+/// rewrite that keeps the inode and lands in the recorded mtime's own second
+/// still reads as a new binary. The mode is part of it because an installer
+/// can land the file without its exec bit and chmod it after the probe's
+/// spawn was refused: the watch's own replacement reading is mode-blind, so
+/// only this identity can re-arm the probe. `None` when the file cannot be
+/// vouched for (gone, unreadable, not a regular file): before any
+/// stand-down the watch treats the replacement as new, and after one the
+/// verdict stands until a keyable file returns.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BinaryIdentity {
+    dev_ino: (u64, u64),
+    len: u64,
+    mtime_nanos: u128,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl BinaryIdentity {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let mtime_nanos = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since_epoch| since_epoch.as_nanos());
+        Some(Self {
+            dev_ino: (meta.dev(), meta.ino()),
+            len: meta.len(),
+            mtime_nanos,
+            mode: meta.mode(),
+        })
+    }
+}
+
+/// How long the capability probe may run before the replacement reads as
+/// not capable: the probe's signal is the answer itself (the token, or the
+/// cert-refused marker), the wall clock is the backstop for a binary that
+/// hangs. The heartbeat is restamped between the probe and the stop, so
+/// this bound shares no watchdog window with the stop's serial legs
+/// (`the_capability_probe_fits_the_watchdog_deadline`).
+#[cfg(unix)]
+const EXEC_PROBE_BOUND: Duration = Duration::from_secs(5);
+
+/// The cert-refused answer's first line — [`EXEC_HANDOVER_CERT_REFUSED`]
+/// plus the newline — matched whole, so any other non-token answer stays
+/// the no-handover verdict.
+#[cfg(unix)]
+const EXEC_HANDOVER_CERT_REFUSED_LINE: &str = "clauth-exec-handover-cert-refused\n";
+
+/// The probe's stdout cap: the bare token, or the cert-refused marker line
+/// plus the reason the verdict logs (the sanitizer keeps 200 chars of it).
+/// 4 KiB after the marker leaves every real reason whole while a run-away
+/// writer stays bounded; the token comparison stays exact on the bytes the
+/// cap let through.
+#[cfg(unix)]
+const EXEC_PROBE_OUTPUT_CAP: usize = EXEC_HANDOVER_CERT_REFUSED_LINE.len() + 4096;
+
+/// What the capability probe answered.
+#[cfg(unix)]
+enum ReplacementVerdict {
+    /// The exact token, exit 0: the replacement takes the handover.
+    Capable,
+    /// Anything else that is not a cert refusal — a build that predates the
+    /// handover (it exits on the unknown argument), a hang, a spawn failure,
+    /// another program at the path.
+    NoHandover,
+    /// The cert-refused marker line plus the reason: the replacement ran the
+    /// same certificate read the exec'd start would, and it failed.
+    CertRefused(String),
+}
+
+/// Probe the replacement at the recorded path for the restart-handover
+/// capability, before the stop: spawn it with the re-exec's own command (the
+/// path with this process's argv kept) plus the hidden flag, so it judges
+/// the exact start the exec would run, in this process's env and cwd. Stdin
+/// null, stdout read up to [`EXEC_PROBE_OUTPUT_CAP`], stderr drained and
+/// dropped; [`crate::gateway::run_bounded`] kills and reaps a child that
+/// outruns [`EXEC_PROBE_BOUND`]. A build that predates the handover exits on
+/// the unknown argument and reads as no handover.
+#[cfg(unix)]
+fn probe_replacement(path: &std::path::Path) -> ReplacementVerdict {
+    let mut command = reexec_command(path);
+    command.arg(EXEC_HANDOVER_FLAG);
+    match crate::gateway::run_bounded(
+        &mut command,
+        path,
+        EXEC_PROBE_BOUND,
+        Some(EXEC_PROBE_OUTPUT_CAP),
+    ) {
+        Ok(crate::gateway::Bounded::Exited(exited)) => {
+            let answer = exited.stdout();
+            if let Some(reason) = answer.strip_prefix(EXEC_HANDOVER_CERT_REFUSED_LINE.as_bytes()) {
+                // The bytes come from whatever program sits at the path, so
+                // the reason is sanitized where the line is rendered.
+                ReplacementVerdict::CertRefused(String::from_utf8_lossy(reason).into_owned())
+            } else if exited.status.success() && answer == EXEC_HANDOVER_TOKEN.as_bytes() {
+                ReplacementVerdict::Capable
+            } else {
+                ReplacementVerdict::NoHandover
+            }
+        }
+        _ => ReplacementVerdict::NoHandover,
+    }
+}
+
+/// One re-exec evaluation: when due, run the stop (children + spend drain),
+/// then, unless a stop signal was parked while the stop ran, the exec; an
+/// exec that returned reaches the abort. A parked stop signal ends the run by
+/// the signal-exit step instead: die of that signal, never exec. Each side
+/// effect is injected so the order, the lost-race arm, the parked-signal arm
+/// and the failure arm pin without stopping children, exec-ing, dying or
+/// aborting the test process. The stop reports whether it ran: a stop that
+/// found the kit already taken lost the race to the signal path, which then
+/// owns this process's exit.
+#[cfg(unix)]
+fn reexec_step(
+    due: bool,
+    on_stop: impl FnOnce() -> bool,
+    pending_signal: impl FnOnce() -> Option<libc::c_int>,
+    on_exec: impl FnOnce() -> bool,
+    on_signal_exit: impl FnOnce(libc::c_int),
+    on_abort: impl FnOnce(),
+) {
+    if !due {
+        return;
+    }
+    if !on_stop() {
+        return;
+    }
+    if let Some(signal) = pending_signal() {
+        on_signal_exit(signal);
+        return;
+    }
+    if !on_exec() {
+        on_abort();
+    }
+}
+
+/// The production re-exec command: the recorded path with this process's own
+/// argv kept (see [`reexec_command_with_argv`]) and the inherited env and cwd
+/// the `Command` defaults carry.
+#[cfg(unix)]
+fn reexec_command(path: &std::path::Path) -> std::process::Command {
+    reexec_command_with_argv(path, std::env::args_os())
+}
+
+/// The re-exec command built from the argv source it is given: argv[0]
+/// included, because the daemon's identity guard reads argv[0]'s basename and
+/// a symlinked start must survive the re-exec, the rest as the args. The
+/// source is a seam — production passes the process's own argv, the test one
+/// it controls, so a re-entered child runs a single `--exact` test instead of
+/// re-running the harness's whole filter.
+#[cfg(unix)]
+fn reexec_command_with_argv(
+    path: &std::path::Path,
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut argv = argv.into_iter();
+    // argv[0] is taken before the args: `args` consumes the rest, so a later
+    // `next` would read past the end and the override would never fire.
+    let argv0 = argv.next();
+    let mut command = std::process::Command::new(path);
+    command.args(argv);
+    if let Some(argv0) = argv0 {
+        command.arg0(argv0);
+    }
+    command
+}
+
+/// The re-exec wiring's test hooks: the exec attempt and the signal exit run
+/// for real by default, but a test can arm a replacement (the real ones exec
+/// or exit the test process) and count the production stop runs. Per-thread,
+/// so parallel tests never see each other's arms; every wiring test resets
+/// the slots first, because a test that arms a hook and never takes it (a red
+/// one) would otherwise hand its arm to the next test on the same thread —
+/// which only the threaded harness's `WouldBlock` fallback makes possible
+/// (libtest spawns a thread per test, nextest a process per test).
+#[cfg(all(test, unix))]
+mod reexec_wiring_test {
+    use std::cell::{Cell, RefCell};
+
+    /// The armed exec attempt: runs in place of the real exec; `true` =
+    /// success. It receives what the real exec would run: the recorded
+    /// path and the command the production step built, the handover
+    /// already applied to it.
+    type ExecHook = Box<dyn FnOnce(&std::path::Path, std::process::Command) -> bool>;
+    /// The armed signal exit: runs in place of the real re-raise + `exit`.
+    type SignalExitHook = Box<dyn FnOnce(libc::c_int)>;
+    /// The armed abort: runs in place of the real `std::process::abort`, so a
+    /// test observes the abort arm without ending its process.
+    type AbortHook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static EXEC: RefCell<Option<ExecHook>> = const { RefCell::new(None) };
+        static SIGNAL_EXIT: RefCell<Option<SignalExitHook>> = const { RefCell::new(None) };
+        static ABORT: RefCell<Option<AbortHook>> = const { RefCell::new(None) };
+        static STOPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        EXEC.with(|slot| *slot.borrow_mut() = None);
+        SIGNAL_EXIT.with(|slot| *slot.borrow_mut() = None);
+        ABORT.with(|slot| *slot.borrow_mut() = None);
+        STOPS.with(|stops| stops.set(0));
+    }
+
+    /// Run in place of the real exec attempt while armed; `true` = success.
+    pub(super) fn arm_exec(
+        exec: impl FnOnce(&std::path::Path, std::process::Command) -> bool + 'static,
+    ) {
+        EXEC.with(|slot| *slot.borrow_mut() = Some(Box::new(exec)));
+    }
+
+    pub(super) fn take_exec() -> Option<ExecHook> {
+        EXEC.with(|slot| slot.borrow_mut().take())
+    }
+
+    /// Run in place of the real signal exit (the re-raise + `exit`) while armed.
+    pub(super) fn arm_signal_exit(exit: impl FnOnce(libc::c_int) + 'static) {
+        SIGNAL_EXIT.with(|slot| *slot.borrow_mut() = Some(Box::new(exit)));
+    }
+
+    pub(super) fn take_signal_exit() -> Option<SignalExitHook> {
+        SIGNAL_EXIT.with(|slot| slot.borrow_mut().take())
+    }
+
+    /// Run in place of the real abort while armed.
+    pub(super) fn arm_abort(abort: impl FnOnce() + 'static) {
+        ABORT.with(|slot| *slot.borrow_mut() = Some(Box::new(abort)));
+    }
+
+    pub(super) fn take_abort() -> Option<AbortHook> {
+        ABORT.with(|slot| slot.borrow_mut().take())
+    }
+
+    /// Count the production stop runs the wiring observed.
+    pub(super) fn observe_stop() {
+        STOPS.with(|stops| stops.set(stops.get() + 1));
+    }
+
+    pub(super) fn stops() -> usize {
+        STOPS.with(std::cell::Cell::get)
+    }
+}
+
+/// Log the exec leg's failure and answer false, so [`reexec_step`] takes its
+/// abort: a supervisor restarts the daemon fresh, the only safe end once the
+/// stop has run and no image is serving.
+#[cfg(unix)]
+fn reexec_failed(path: &std::path::Path, error: impl std::fmt::Display) -> bool {
+    logline!(
+        "clauth daemon: re-exec of {} failed ({error}); aborting for a clean restart",
+        path.display()
+    );
+    false
+}
+
+/// The daemon's own listener start, recorded for the cert-refused verdict's
+/// manual-restart advice: the address and the explicit certificate pair it
+/// was started with, so the advised `--replace` reloads the same certificate
+/// source (the bare `--listen` form would fall back to the lego source).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct RestartAdvice {
+    listen: Option<SocketAddr>,
+    /// `--cert`/`--key` when the start carried them.
+    explicit: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+#[cfg(unix)]
+impl RestartAdvice {
+    /// The advice for this daemon, read off its own start: the `--listen`
+    /// address and, under an explicit `--cert`/`--key` pair, those paths.
+    fn from_source(listen: Option<SocketAddr>, certs: &api::tls::CertSource) -> Self {
+        let explicit = match certs {
+            api::tls::CertSource::Lego => None,
+            api::tls::CertSource::Explicit(paths) => Some((paths.cert.clone(), paths.key.clone())),
+        };
+        Self { listen, explicit }
+    }
+}
+
+/// How many chars of a cert-refused reason the log line keeps, after
+/// sanitizing: the bytes come from whatever program sits at the path, so the
+/// line stays one line of bounded length. Unicode format characters (a bidi
+/// override among them) still pass through: `char` exposes no general-category
+/// check, and none is added as a dependency for a cosmetic gap.
+#[cfg(unix)]
+const REASON_MAX_CHARS: usize = 200;
+
+/// One argument of the advised command, shell-quoted where it needs to be, so
+/// an address or certificate path with a space or a shell metacharacter pastes
+/// as the one argument it was. A plain one keeps the approved line's unquoted
+/// rendering.
+///
+/// `shlex` refuses only a NUL byte, which cannot appear in a Unix path or
+/// argument at all; such text is left as it is.
+#[cfg(unix)]
+fn shell_arg(text: &str) -> String {
+    match shlex::try_quote(text) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => text.to_owned(),
+    }
+}
+
+/// One `--cert`/`--key` member of the advised command: a path starting with
+/// `-` takes clap's `--flag=value` form, because the space-separated form
+/// reads it as the next flag and shell quoting cannot change that. Every other
+/// path keeps the space-separated form the approved line already had.
+#[cfg(unix)]
+fn cert_path_arg(flag: &str, path: &std::path::Path) -> String {
+    let rendered = path.display().to_string();
+    if rendered.starts_with('-') {
+        format!(" {flag}={}", shell_arg(&rendered))
+    } else {
+        format!(" {flag} {}", shell_arg(&rendered))
+    }
+}
+
+/// The manual-restart command the cert-refused verdict advises: the daemon's
+/// own `--listen` address and, when it started with an explicit pair, the
+/// `--cert`/`--key` paths, each shell-quoted so it pastes whole; a path
+/// starting with `-` takes the `--flag=value` form so clap reads it as the
+/// value. A daemon that serves no API gets the command without a listener —
+/// the only start that reproduces its own.
+#[cfg(unix)]
+fn restart_command(advice: &RestartAdvice) -> String {
+    let mut command = String::from("clauth daemon --replace");
+    if let Some(addr) = advice.listen {
+        command.push_str(" --listen ");
+        command.push_str(&shell_arg(&addr.to_string()));
+    }
+    if let Some((cert, key)) = &advice.explicit {
+        command.push_str(&cert_path_arg("--cert", cert));
+        command.push_str(&cert_path_arg("--key", key));
+    }
+    command
+}
+
+/// The cert-refused verdict's log line: the approved wording, the reason
+/// sanitized to one line of at most [`REASON_MAX_CHARS`] chars (control
+/// characters become spaces), and the manual-restart command from
+/// [`restart_command`].
+#[cfg(unix)]
+fn cert_refused_line(path: &std::path::Path, reason: &str, advice: &RestartAdvice) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(REASON_MAX_CHARS)
+        .collect();
+    format!(
+        "clauth daemon: {} cannot load the API certificate ({reason}); keeping this image \
+         running until a manual restart: `{}` after fixing the certificate",
+        path.display(),
+        restart_command(advice),
+    )
+}
+
+/// The run loop's per-tick re-exec check: feed the watch, and once it is due,
+/// probe the replacement at the recorded path for the restart-handover
+/// capability BEFORE anything stops — a build that cannot take the handover
+/// must never be exec'd into, because its fresh claim would collide with the
+/// inherited lock and the daemon would die as "already running". A
+/// not-capable verdict and a cert refusal each log once and stand down: no
+/// stop, no drain, no exec, and the watch remembers the binary's identity,
+/// so the same file is never re-probed on later checks while a new
+/// replacement re-arms it. A cert refusal is its own line — the replacement
+/// cannot load the API certificate its start would serve — carrying the
+/// manual-restart command `advice` names (this daemon's own `--listen`
+/// address and explicit certificate pair, so the advised restart loads the
+/// same source). A capable verdict restamps the heartbeat (the probe and
+/// the stop's serial legs each get their own watchdog window), logs, stops
+/// the children and drains the spend in flight through the signal path's
+/// own [`gateway::stop_for_exit`], then execs the path recorded at start —
+/// never `current_exe()`, which reads `<path> (deleted)` after a
+/// replacement. A stop signal the watcher parked while the stop ran ends
+/// the process by that signal instead, exactly as the signal path would.
+/// An exec that returned failed — and a recorded path whose bytes changed
+/// after the probe, so the exec would run an unprobed image — logs and
+/// aborts so the unit restarts the daemon.
+#[cfg(unix)]
+#[expect(
+    clippy::exit,
+    reason = "a stop signal parked while the re-exec's stop ran ends the process by that signal instead of the exec, as the signal path does"
+)]
+fn reexec_if_due(
+    watch: &mut ReexecWatch,
+    kit: &gateway::StopKit,
+    heartbeat: &AtomicU64,
+    advice: &RestartAdvice,
+) {
+    use std::os::unix::process::CommandExt as _;
+    if !watch.observe(crate::plugin_host::self_exe_change()) {
+        return;
+    }
+    let Some(path) = crate::plugin_host::recorded_self_exe_path() else {
+        return;
+    };
+    let identity = BinaryIdentity::of(&path);
+    // A stood-down verdict on a path the watch cannot key stays standing: no
+    // identity can tell that replacement from a later one, so probing every
+    // due cycle would spawn and log once per cycle on a file it can never
+    // vouch for. A keyable file at the path moves on to the comparison.
+    if watch.stood_down() && identity.is_none() {
+        watch.reset_streak();
+        return;
+    }
+    // The replacement the last probe stood down on still sits at the path:
+    // nothing re-checks, and the streak resets so a NEW replacement (a
+    // different identity) re-arms from two consecutive reads.
+    if watch
+        .stood_down_on()
+        .zip(identity)
+        .is_some_and(|(stood, now)| stood == now)
+    {
+        watch.reset_streak();
+        return;
+    }
+    match probe_replacement(&path) {
+        ReplacementVerdict::NoHandover => {
+            watch.stand_down(identity);
+            logline!(
+                "clauth daemon: {} does not understand the restart handover; keeping this image running until a manual restart",
+                path.display()
+            );
+            return;
+        }
+        ReplacementVerdict::CertRefused(reason) => {
+            watch.stand_down(identity);
+            logline!("{}", cert_refused_line(&path, &reason, advice));
+            return;
+        }
+        ReplacementVerdict::Capable => {}
+    }
+    // The probe and the stop's serial legs cannot share one watchdog window
+    // (EXEC_PROBE_BOUND + TICK + SPEND_DRAIN_BOUND + DAEMON_STOP_BUDGET +
+    // STOP_ANSWER_GRACE exceeds WATCHDOG_DEADLINE): restamp the heartbeat
+    // here, so each bounded leg gets its own window and a legal drain is
+    // never cut mid-save.
+    heartbeat.store(crate::usage::now_ms(), Ordering::Relaxed);
+    logline!(
+        "clauth daemon: its binary was replaced; re-executing {}",
+        path.display()
+    );
+    reexec_step(
+        true,
+        || {
+            let Some((spends, gateway, proxies)) = kit.take() else {
+                // The kit is empty: the signal path took it first and owns
+                // the end of this process, and re-exec-ing now would cut its
+                // drain short. Unless the watcher never started (its spawn
+                // failed at boot): then no stop owner exists, the children
+                // were already stopped by that arm's drop, and the due
+                // re-exec waits the token spend in flight out through the
+                // spare drain the kit kept before it execs.
+                if !kit.watcher_lost() {
+                    return false;
+                }
+                let Some(spends) = kit.take_spare_drain() else {
+                    return false;
+                };
+                #[cfg(all(test, unix))]
+                reexec_wiring_test::observe_stop();
+                // No child is left to stop, so the drain runs alone: a stop
+                // thread for an idle supervision is a needless spawn through
+                // a thread limit that already lost the watcher once.
+                spends.drain(SPEND_DRAIN_BOUND);
+                return true;
+            };
+            #[cfg(all(test, unix))]
+            reexec_wiring_test::observe_stop();
+            gateway::stop_for_exit(&spends, gateway, proxies);
+            true
+        },
+        || kit.take_pending_stop_signal(),
+        || {
+            // The capable verdict is bound to the bytes the probe spawned: a
+            // second replacement can land while the stop runs (up to the
+            // whole drain bound), and exec'ing it unprobed is the death the
+            // probe exists to prevent. The stop already ran, so a stand-down
+            // can no longer leave a serving daemon: the exec-failure abort
+            // restarts the unit fresh.
+            if BinaryIdentity::of(&path) != identity {
+                return reexec_failed(&path, "the replacement changed after the probe");
+            }
+            // Hand the singleton's descriptors over first: the exec closes
+            // every close-on-exec fd std opens, so without this the flock
+            // and the listener would drop here and reopen the gap to a
+            // parked standby. The pair is named on the exec command's env,
+            // never this process's (which the live threads must not race).
+            // The command is built and the handover applied before the test
+            // hook below, so a test observes exactly the command the real
+            // exec runs.
+            let handover = exec_handover::prepare_for_exec();
+            let mut command = reexec_command(&path);
+            exec_handover::apply_handover(&mut command, handover);
+            #[cfg(all(test, unix))]
+            if let Some(exec) = reexec_wiring_test::take_exec() {
+                return exec(&path, command);
+            }
+            // `exec` returns only its error: on success the image is replaced
+            // and this process never comes back.
+            let e = command.exec();
+            reexec_failed(&path, e)
+        },
+        |signal| {
+            #[cfg(all(test, unix))]
+            if let Some(signal_exit) = reexec_wiring_test::take_signal_exit() {
+                signal_exit(signal);
+                return;
+            }
+            // Die of the parked stop signal exactly as the signal path does:
+            // the default disposition, then the conventional exit code.
+            if let Err(e) = signal_hook::low_level::emulate_default_handler(signal) {
+                logline!("clauth daemon: cannot re-raise signal {signal}: {e}");
+            }
+            std::process::exit(128 + signal);
+        },
+        || {
+            #[cfg(all(test, unix))]
+            if let Some(abort) = reexec_wiring_test::take_abort() {
+                abort();
+                return;
+            }
+            std::process::abort()
+        },
+    );
+}
+
+/// The per-tick check on platforms that never re-exec: the watch is fed like
+/// the unix side so the loop keeps one shape, and it never returns true here
+/// (a console daemon has no exec and no stop signal).
+#[cfg(not(unix))]
+fn reexec_if_due(watch: &mut ReexecWatch, _kit: &gateway::StopKit, _heartbeat: &AtomicU64) {
+    watch.observe(crate::plugin_host::self_exe_change());
+}
+
 /// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its
 /// own walk. `mkdir_700` only sets the mode on dirs it CREATES; a tree from an
 /// older build or created under a permissive umask can be 0o755
@@ -260,11 +1498,15 @@ fn api_enabled() -> bool {
     std::env::var(NO_API_ENV).as_deref() != Ok("1")
 }
 
-/// `serve`'s listener decision, extracted because it is the REST kill switch's
-/// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
-/// prepared listener. The prepare arm reads the certificate; the legacy import and
-/// the bind itself run later, below the claim, in `api::serve_prepared`.
-fn listener_setup(
+/// The listener decision `serve` runs at start, and the handover probe's
+/// answer runs identically (`main.rs`), so the probe can never judge a
+/// different start than the exec runs. Extracted because it is the REST kill
+/// switch's call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield
+/// `no_api`, never a prepared listener. The prepare arm only reads the
+/// certificate — the first-use `tls.json` is `serve`'s write above it — and
+/// the legacy import and the bind itself run later, below the claim, in
+/// `api::serve_prepared`.
+pub(crate) fn listener_setup(
     listen: Option<SocketAddr>,
     certs: &api::tls::CertSource,
 ) -> Result<(Option<api::Prepared>, Option<SocketAddr>)> {
@@ -286,8 +1528,9 @@ fn listener_setup(
 /// instead of each opening a window, and it leaves the caller's job object
 /// where that job allows it, so a host closing the job (sshd ending a
 /// session) does not end it either. A clauth session home the caller inherited
-/// is scrubbed ([`crate::runtime::scrub_clauth_homes`]): the daemon outlives
-/// that session and its tree.
+/// is scrubbed, with the operator's own codex home put back in a session
+/// `CODEX_HOME`'s place ([`crate::runtime::scrub_clauth_homes`]): the daemon
+/// outlives that session and its tree.
 pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Child> {
     let dir = clauth_dir()?;
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
@@ -373,22 +1616,109 @@ pub(crate) fn await_start(
 /// [`TOKEN_HTTP_DEADLINES`](crate::oauth::TOKEN_HTTP_DEADLINES), plus a second
 /// for the stage write that makes the minted pair durable after the endpoint
 /// answers. Derived from that bound, never a literal, so retuning the client
-/// moves the exit wait with it.
+/// moves the exit wait with it. The re-exec path runs this wait on the main
+/// loop, so it must stay inside [`WATCHDOG_DEADLINE`] with a [`TICK`] of
+/// budget — the watchdog's own slow-tick allowance — or a long drain aborts
+/// the daemon mid-save.
 pub(crate) const SPEND_DRAIN_BOUND: Duration =
     crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(Duration::from_secs(1));
 
+/// The scheduler's tick thread as a clean stop sees it: what
+/// `usage::spawn_refresher` returns. The thread saves the tps producer's
+/// unsaved attribution (applied proxy token records included) as its last act,
+/// and the producer lives on that thread alone, so a stop wakes it and waits
+/// for it to end.
+#[derive(Clone, Debug)]
+pub(crate) struct TickThread {
+    /// `None` where no thread was spawned (a test build's skip). The join
+    /// handle sits in a shared slot so a finished thread can be taken out and
+    /// joined: the join is the only reader of a panic, which ends the thread
+    /// without running its exit save.
+    thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl TickThread {
+    pub(crate) fn new(
+        thread: Option<std::thread::JoinHandle<()>>,
+        shutting_down: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            thread: thread.map(|handle| Arc::new(Mutex::new(Some(handle)))),
+            shutting_down,
+        }
+    }
+
+    /// Raise the stop flag and cut the thread's sleep short. Returns at once:
+    /// a tick in flight finishes first, then the thread saves and ends.
+    pub(crate) fn stop(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(thread) = &self.thread
+            && let Ok(guard) = thread.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.thread().unpark();
+        }
+    }
+
+    /// Wait until the thread ended, or `bound` past `started` — `true` when
+    /// it ended. A tick still running then is abandoned with its unsaved
+    /// records, as a crash would lose them, and says so once. A panic ends
+    /// the thread but skips the exit save; the join reads it and says so
+    /// once.
+    pub(crate) fn wait_stopped(&self, started: Instant, bound: Duration) -> bool {
+        let Some(thread) = &self.thread else {
+            return true;
+        };
+        while !thread
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(std::thread::JoinHandle::is_finished))
+            .unwrap_or(true)
+        {
+            let remaining = bound.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                logline!(
+                    "clauth: the usage tick was still running after {} s; exiting without its last tps save",
+                    bound.as_secs()
+                );
+                return false;
+            }
+            std::thread::sleep(gateway::stop_sleep(remaining));
+        }
+        if let Ok(mut guard) = thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            drop(guard);
+            if handle.join().is_err() {
+                logline!(
+                    "clauth: the usage tick thread panicked; exiting without its last tps save"
+                );
+            }
+        }
+        true
+    }
+}
+
 /// The daemon's stop gate for a token spend: the store the scheduler claims
-/// spends in and the flag that refuses new ones. [`serve`] builds it once and
-/// every signal watcher carries it, the `(Err, Err)` start arm included, so a
-/// stop signal waits the spend in flight out before the process exits. What it
-/// does not cover: a stop that lands before that watcher is installed (the
-/// scheduler starts in `boot()`), and a process left with no watcher at all
-/// because signal registration failed.
+/// spends in and the flag that refuses new ones, plus the tick thread whose
+/// exit save the stop waits for. [`serve`] builds it once and every signal
+/// watcher carries it, the `(Err, Err)` start arm included, so a stop signal
+/// waits the spend in flight out before the process exits. What it does not
+/// cover: a stop that lands before that watcher is installed — the scheduler
+/// starts in `boot()`, and until the watcher exists a SIGTERM keeps the
+/// default action, so the process dies and the span is lost like a crash —
+/// and a process left with no watcher at all because signal registration
+/// failed. Clone is a second handle to the same gate: the stop kit keeps one
+/// as its spare for the watcher-lost re-exec.
+#[derive(Clone)]
 pub(crate) struct SpendDrain {
     #[cfg(unix)]
     activity: ActivityStore,
     #[cfg(unix)]
     shutting_down: Arc<AtomicBool>,
+    #[cfg(unix)]
+    scheduler: Option<TickThread>,
 }
 
 impl SpendDrain {
@@ -400,18 +1730,57 @@ impl SpendDrain {
             activity,
             #[cfg(unix)]
             shutting_down,
+            #[cfg(unix)]
+            scheduler: None,
         }
     }
 
-    /// Refuse every scheduler token spend that has not started, then wait until
-    /// the one already in flight saves, or `bound` elapses — `true` when it
-    /// cleared. The flag goes up FIRST: a spend claiming the gap before a
-    /// check could otherwise run past the drain and die unsaved, so the claim
-    /// re-tests the flag under the store's lock. One log line when it actually
-    /// waited, one when it gives up, none when nothing ran.
+    /// The same gate, also stopping `scheduler` and waiting for its exit save.
+    pub(crate) fn with_scheduler(self, scheduler: TickThread) -> Self {
+        #[cfg(not(unix))]
+        let _ = scheduler;
+        Self {
+            #[cfg(unix)]
+            activity: self.activity,
+            #[cfg(unix)]
+            shutting_down: self.shutting_down,
+            #[cfg(unix)]
+            scheduler: Some(scheduler),
+        }
+    }
+
+    /// Refuse every scheduler token spend that has not started and wake the
+    /// tick thread, then wait until the spend already in flight saves or
+    /// `bound` elapses — `true` when it cleared — and then for the tick
+    /// thread's exit save. The flag goes up FIRST: a spend claiming the gap
+    /// before a check could otherwise run past the drain and die unsaved, so
+    /// the claim re-tests the flag under the store's lock. One log line when
+    /// the spend wait actually waited, one when it gives up, none when nothing
+    /// ran.
+    ///
+    /// The tick thread gets until `bound` past the drain's start — the same
+    /// window as the spend wait, so the two waits never add. The drain ends
+    /// within `SPEND_DRAIN_BOUND` (20 s) whatever the tick does, and
+    /// `REPLACE_WAIT` (that plus 5 s) still lets the stop finish before
+    /// `--replace` force-kills it. A clean stop loses the unsaved records
+    /// only when the last tick outruns that window.
     #[cfg(unix)]
     pub(crate) fn drain(&self, bound: Duration) -> bool {
         self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.stop();
+        }
+        let started = Instant::now();
+        let cleared = self.wait_spend(started, bound);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.wait_stopped(started, bound);
+        }
+        cleared
+    }
+
+    /// The spend half of [`Self::drain`], its flag already raised.
+    #[cfg(unix)]
+    fn wait_spend(&self, started: Instant, bound: Duration) -> bool {
         if !crate::usage::token_spend_in_flight(&self.activity) {
             return true;
         }
@@ -425,7 +1794,6 @@ impl SpendDrain {
                 bound.as_secs()
             ),
         }
-        let started = Instant::now();
         while crate::usage::token_spend_in_flight(&self.activity) {
             let remaining = bound.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -441,6 +1809,28 @@ impl SpendDrain {
     }
 }
 
+/// The singleton claim for a start that adopted nothing across the exec
+/// (which is every start on platforms that never re-exec): `--replace`
+/// terminates the incumbent and takes over, `--standby` parks a lone
+/// waiter, and the default yields as redundant — the outcomes [`serve`]
+/// matches on.
+fn fresh_claim(dir: &std::path::Path, mode: StartMode) -> Result<Claim> {
+    Ok(match mode {
+        // A start whose pid sidecar names this process must never signal
+        // it: after a refused handover the inherited lock descriptor stays
+        // open (and its flock held), and the sidecar the replaced image
+        // stamped still names this pid (the exec keeps it), so
+        // `claim_by_replacing` would terminate its own pid. A plain claim
+        // instead reads the singleton as held — or takes it, if the
+        // descriptor is gone — and never signals itself.
+        StartMode::Replace if probe::holder_pid() == Some(std::process::id()) => {
+            claim_singleton(dir, false)?
+        }
+        StartMode::Replace => probe::claim_by_replacing(dir)?,
+        _ => claim_singleton(dir, mode == StartMode::Standby)?,
+    })
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
@@ -454,11 +1844,28 @@ pub(crate) fn serve(
 ) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
-    // (2026-07-09 — see `logline`).
+    // (2026-07-09 — see `logline`). First also so the capture's failure line
+    // below is stamped like every other.
     crate::logline::enable_timestamps();
     crate::platform::init();
 
     let dir = clauth_dir()?;
+    // Adopt the descriptors the replaced image handed over across the exec
+    // before anything can spawn (the capture below spawns `ps` on macOS):
+    // the handover env is removed here, so no child of this image inherits
+    // it, and each fd is validated while borrowed. An adopted fd, and a
+    // refused number its probe found open, is re-marked close-on-exec. A
+    // refused descriptor is left open, logged with its fallback, and the
+    // start falls back to the fresh claim and bind below.
+    #[cfg(unix)]
+    let handed_over_lock = exec_handover::take_at_start(&dir, listen);
+    // The boot capture runs before anything can spawn: the children this
+    // process inherited across a re-exec (the exec keeps the pid, so the
+    // children the replaced image spawned are this image's too) are listed
+    // while none of this image's own exist yet, so the run loop's per-tick
+    // reap can never take a `Child` this image owns. A fresh start captures
+    // an empty set.
+    gateway::capture_inherited_children();
     // Create ~/.clauth at 0o700 (was create_dir_all → umask 0o755). Above the
     // singleton claim because the lock files live in the dir; it no-ops for
     // every instance after the first.
@@ -473,6 +1880,16 @@ pub(crate) fn serve(
     // promotion), where the incumbent's port is free, a redundant instance
     // never reaches them, and a start that dies cannot have written
     // `devices.json` or deleted `auth_token.json`.
+    //
+    // The first-use `tls.json` is this start's write, never the handover
+    // probe's answer: the probe runs the same listener decision below and must
+    // leave the home alone. `listener_setup` branches on a listener and the
+    // REST kill switch; the lego source below is this write's own condition,
+    // since only the lego read inside `api::prepare` consults the file — an
+    // explicit `--cert`/`--key` pair never does.
+    if listen.is_some() && api_enabled() && matches!(certs, api::tls::CertSource::Lego) {
+        api::tls::create_default_tls_config()?;
+    }
     let (mut prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
@@ -482,11 +1899,19 @@ pub(crate) fn serve(
     // manually run one (a clean exit is never restarted under launchd
     // `KeepAlive{SuccessfulExit=false}`); `--replace` terminates the holder and
     // takes over (#57). A dead holder's advisory flock auto-releases, so neither
-    // a standby nor a replace is ever orphaned.
-    let claim = match mode {
-        StartMode::Replace => probe::claim_by_replacing(&dir)?,
-        _ => claim_singleton(&dir, mode == StartMode::Standby)?,
+    // a standby nor a replace is ever orphaned. A re-exec'd image that adopted
+    // the handed-over lock skips the claim entirely: it already holds the
+    // singleton, and there must be no instant of the restart where a parked
+    // `--standby` could take it.
+    #[cfg(unix)]
+    let claim = match handed_over_lock {
+        // The replaced image's lock, adopted: a fresh claim would only lose
+        // to its own flock, and `--replace` must not terminate its own pid.
+        Some(file) => Claim::Active(probe::DaemonLock::adopt_handed_over(file)),
+        None => fresh_claim(&dir, mode)?,
     };
+    #[cfg(not(unix))]
+    let claim = fresh_claim(&dir, mode)?;
     let (lock, promoted) = match claim {
         Claim::Active(lock) => (lock, false),
         Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
@@ -531,6 +1956,10 @@ pub(crate) fn serve(
     warn_if_spend_is_uncapped(&config);
     warn_if_chain_has_no_usage_source(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
+    #[cfg(unix)]
+    {
+        daemon.restart_advice = RestartAdvice::from_source(listen, certs);
+    }
     daemon.boot();
 
     // After `boot` (the stores are seeded and the scheduler is up, so a request
@@ -547,27 +1976,41 @@ pub(crate) fn serve(
         logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
     }
     if let Some(prepared) = prepared {
-        let ctx = api::serve_prepared(
+        let ctx = match api::serve_prepared(
             prepared,
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
             daemon.memory_stores(),
-        )?;
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // `boot` started the tick thread before this last start step
+                // that can fail; stop it and wait for its exit save, as the
+                // signal path would, or the records applied since the last
+                // save are lost like a crash.
+                if let Some(scheduler) = daemon.scheduler.get() {
+                    scheduler.stop();
+                    let _ = scheduler.wait_stopped(Instant::now(), SPEND_DRAIN_BOUND);
+                }
+                return Err(e);
+            }
+        };
         daemon.push = api::start_push(&ctx);
     }
 
     // After the listener, the last start step that can fail, so a start that
     // dies leaves no child behind; before `run`, which never returns, so the
-    // supervisors (or the signal watcher holding them) live as long as the
-    // process. A standby reaches this only once promoted: the gateway and the
-    // proxies run under the singleton's holder alone.
+    // supervisors, held by the stop kit the signal watcher and the re-exec
+    // path share, live as long as the process. A standby reaches this only
+    // once promoted: the gateway and the proxies run under the singleton's
+    // holder alone.
     let gateway = gateway::start(Arc::clone(&daemon.gateway), &lock);
     let proxies = proxies::start(Arc::clone(&daemon.proxies), &lock);
     // Every arm installs the watcher, the both-failed one included: with no
     // child to stop the daemon still owes the token spend in flight its save.
     let spends = daemon.spend_drain();
-    let _supervisor = match (gateway, proxies) {
+    let stop_kit = match (gateway, proxies) {
         (Ok(gateway), Ok(proxies)) => gateway::stop_on_signal(spends, Some(gateway), proxies),
         (Ok(gateway), Err(e)) => {
             logline!("clauth daemon: {e:#}; proxies are not supervised");
@@ -584,11 +2027,28 @@ pub(crate) fn serve(
         }
     };
 
+    // Under the singleton's holder alone, like the supervisors above. Detached:
+    // it lives as long as the process, and every write it makes is one atomic
+    // rename under the state flock.
+    let retention = crate::profile::claude_dir().and_then(|claude_home| {
+        spawn_retention_watch(
+            &claude_home,
+            RETENTION_TIMINGS,
+            crossbeam_channel::never(),
+            retention_check,
+        )
+        .context("failed to start the cleanupPeriodDays check")
+    });
+    if let Err(e) = retention {
+        logline!("clauth daemon: {e:#}");
+    }
+    crate::update::spawn_for_daemon();
+
     logline!(
         "clauth daemon: running (status → {})",
         daemon.status_path.display()
     );
-    daemon.run();
+    daemon.run(&stop_kit);
     Ok(())
 }
 
@@ -640,10 +2100,10 @@ fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
                 // third-party-classified sink's picked reading is its provider
                 // stats, which carry no plan, so its OAuth plan never cancels it.
                 |n| {
-                    config
-                        .find(n)
-                        .is_some_and(|p| !p.usage_cache_is_third_party())
-                        && crate::profile_json::refuses_service_cached(n)
+                    config.find(n).is_some_and(|p| {
+                        !p.usage_cache_is_third_party()
+                            && crate::profile_json::refuses_service_cached(p)
+                    })
                 },
             )
         })
@@ -779,8 +2239,8 @@ pub(crate) fn status_probe() -> Result<()> {
 
 /// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads
 /// the on-disk caches and prints the same shape the daemon writes, then
-/// exits. No scheduler; freshness and next-refresh are derived from cache
-/// mtimes. `include_disabled` mirrors `build_status`'s flag of the same name
+/// exits. No scheduler; freshness and next-refresh are derived from each
+/// account's cache. `include_disabled` mirrors `build_status`'s flag of the same name
 /// (hidden by default; `dispatch`'s `--all`/`--disabled` flips it).
 pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
@@ -879,6 +2339,19 @@ fn prior_generated_at() -> Option<String> {
         .get("generated_at")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The `listen` slot the running daemon last published in `status.json`, for
+/// `clauth devices pair`'s link. `None` when no feed is on disk, it does not
+/// parse, or its writer serves no `--listen` API.
+pub(crate) fn published_listen() -> Option<status_json::ListenSlot> {
+    #[derive(serde::Deserialize)]
+    struct Feed {
+        #[serde(default)]
+        listen: Option<status_json::ListenSlot>,
+    }
+    let body = std::fs::read(clauth_dir().ok()?.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice::<Feed>(&body).ok()?.listen
 }
 
 /// Rewrite `status.json` from `config`, unconditionally.
@@ -1004,7 +2477,7 @@ fn write_status_json(json: &[u8]) {
         );
         return;
     }
-    if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), json) {
+    if let Err(e) = atomic_write_600_fast(&dir.join(STATUS_FILE), json) {
         logline!("clauth: failed to publish status.json after a switch: {e}");
     }
 }
@@ -1059,7 +2532,18 @@ pub(crate) struct LiveStores {
     /// The daemon's shutdown flag, which the same claim refuses once a stop
     /// signal has raised it.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The usage-fetch lease, so every feed writer's snapshot carries whether
+    /// THIS daemon runs the fetches: a stood-down daemon publishes
+    /// `next_refresh_at: null` rather than the mirror's derived stamps.
+    pub(crate) fetch_lease: Arc<FetchLease>,
+    /// Where the `--listen` API serves, set once by its bind and read by every
+    /// status write as the `listen` slot. Unset without `--listen`.
+    pub(crate) listen: ListenHandle,
 }
+
+/// The `listen` slot's one writer is the API's bind, once per daemon, so a
+/// set-once cell needs no lock rank.
+pub(crate) type ListenHandle = Arc<OnceLock<status_json::ListenSlot>>;
 
 #[cfg(test)]
 impl Default for LiveStores {
@@ -1080,6 +2564,8 @@ impl Default for LiveStores {
             proxies: proxies::new_slots(),
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
+            listen: ListenHandle::default(),
         }
     }
 }
@@ -1098,6 +2584,11 @@ pub(crate) struct LiveSnapshot {
     usage: HashMap<String, UsageInfo>,
     gateway: Option<gateway::GatewaySlot>,
     proxies: Vec<proxies::ProxySlot>,
+    /// Whether this daemon held the usage-fetch lease when the snapshot was
+    /// taken — the flag every feed writer reads to null a stood-down
+    /// daemon's countdowns.
+    fetches_here: bool,
+    listen: Option<status_json::ListenSlot>,
 }
 
 impl LiveStores {
@@ -1172,6 +2663,8 @@ impl LiveStores {
             usage,
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
+            fetches_here: self.fetch_lease.fetches_here(),
+            listen: self.listen.get().cloned(),
         }
     }
 }
@@ -1179,6 +2672,7 @@ impl LiveStores {
 impl LiveSnapshot {
     pub(crate) fn signals(&self) -> LiveSignals<'_> {
         LiveSignals {
+            fetches_here: self.fetches_here,
             status: &self.status,
             third_party_status: &self.third_party_status,
             third_party_streaks: &self.third_party_streaks,
@@ -1190,6 +2684,7 @@ impl LiveSnapshot {
             usage: &self.usage,
             gateway: self.gateway.as_ref(),
             proxies: Some(&self.proxies),
+            listen: self.listen.as_ref(),
         }
     }
 }
@@ -1199,6 +2694,13 @@ impl LiveSnapshot {
 fn entry_fresh(entry: &status_json::ProfileEntry) -> bool {
     let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
     !entry.stale && entry.fetch_status.as_deref() == Some(fresh)
+}
+
+/// [`entry_fresh`] as the 5h bell and the window push judge it: a proxy
+/// member's freshness is its chain windows' (`alert_stale`).
+fn entry_alert_fresh(entry: &status_json::ProfileEntry) -> bool {
+    let fresh = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+    !entry.alert_stale && entry.fetch_status.as_deref() == Some(fresh)
 }
 
 /// What a background hold keys on: the account's fixed pair, or one handed-off
@@ -1449,8 +2951,13 @@ impl BackgroundHolds {
         }
         // An unreadable store names every tree, so it cannot say which holds to
         // adopt; leaving the holds as they are is the fail-closed direction
-        // (nothing was released above either).
-        if matches!(jobs, crate::claude_jobs::JobTrees::Unreadable { .. }) {
+        // (nothing was released above either). A store caught mid-create names
+        // no tree either — its record-less dir can name any tree the next
+        // instant — so it adopts nothing new the same way; the release loop
+        // above has already kept every hold.
+        if matches!(jobs, crate::claude_jobs::JobTrees::Unreadable { .. })
+            || jobs.global_mid_create_store().is_some()
+        {
             return;
         }
         // A streak whose job has gone says nothing about the next one: clearing
@@ -1735,8 +3242,21 @@ struct Daemon {
     /// Scheduler-only stores held on `self` so `forget_memory` can reach the
     /// whole process's name-keyed state.
     weekly_reset_kicks: WeeklyResetKicks,
+    /// The claude banked-reset side read's cadence memo, shared with the
+    /// scheduler the same way [`Self::weekly_reset_kicks`] is.
+    claude_resets_memo: ClaudeResetsMemoLock,
+    /// The codex banked-reset side read's cadence memo, shared the same way.
+    codex_resets_memo: CodexResetsMemoLock,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
+    /// The fetch lease the scheduler tick holds: the main-loop drains read it
+    /// to tell whether this instance still fetches, so a queued switch or
+    /// switch-off does not execute once the watchdog released the lease (the
+    /// holder that took over decides).
+    fetch_lease: Arc<FetchLease>,
+    /// The scheduler's tick thread once `boot` started it: the stop gate
+    /// ([`Self::spend_drain`]) carries it, so a stop waits for its exit save.
+    scheduler: std::sync::OnceLock<TickThread>,
     /// Last-seen reload fingerprint — drives external-change reload. Set only
     /// by a successful reload (which re-read disk); a self-initiated write
     /// never moves it, so the next tick re-reads, rebuilds and logs.
@@ -1774,6 +3294,13 @@ struct Daemon {
     /// changes at the midnight rollover and on a config edit, and is
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
+    /// The unaddressable-name notices last logged, the same set-gate as
+    /// `day_claim_notices` (`AppConfig::name_notices`).
+    name_notices: Vec<crate::profile::NameNotice>,
+    /// The kind of the last background-hold strip-list read that failed and
+    /// was logged, `None` once one reads: the read runs every tick, so a
+    /// failure logs once per kind rather than once per tick.
+    strip_list_failure: Option<String>,
     /// The headless bell's latch over the published `profiles[]` figures.
     bells: crate::bell::BellLatch,
     /// The push sender's inbox, while the REST API serves; `None` otherwise.
@@ -1782,8 +3309,8 @@ struct Daemon {
     push_latches: crate::push::StatusLatches,
     /// The last codex roster this daemon read successfully, in memory only;
     /// empty until the first successful read. On a failed read it stands in
-    /// for the roster `queue_pushes` forgets against, so a failed read forgets
-    /// no codex names on a guess.
+    /// for the roster `queue_pushes` forgets against and `log_name_notices`
+    /// judges, so a failed read forgets or re-raises no codex names on a guess.
     last_codex_roster: Vec<ProfileName>,
     /// Runs `bell_command`; a seam so tests record the ring instead.
     ring_bell: fn(&str, &str) -> anyhow::Result<()>,
@@ -1793,12 +3320,19 @@ struct Daemon {
     /// The per-proxy slots every proxy supervisor publishes into, read by
     /// every status write as the `proxies` array.
     proxies: proxies::ProxySlots,
+    /// Where the `--listen` API serves once bound, read by every status write.
+    listen: ListenHandle,
     /// The daemon's holds on the per-account background trees.
     background: BackgroundHolds,
     /// Ticks since boot, for the bare-item leg's cadence
-    /// ([`BARE_ITEM_SCAN_EVERY_TICKS`]).
+    /// ([`BARE_ITEM_SCAN_EVERY_TICKS`]) and the stale-copy sweep's
+    /// ([`STALE_COPY_SWEEP_EVERY_TICKS`]).
     #[cfg(target_os = "macos")]
     bare_item_scan_ticks: u64,
+    /// The listener start this daemon booted with, named by the cert-refused
+    /// verdict's manual-restart advice (the re-exec check reads it).
+    #[cfg(unix)]
+    restart_advice: RestartAdvice,
 }
 
 impl Daemon {
@@ -1849,13 +3383,18 @@ impl Daemon {
             third_party_broken,
             skipped_unreadable: Arc::new(RankedMutex::new(HashSet::new())),
             weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+            claude_resets_memo: new_claude_resets_memo(),
+            codex_resets_memo: new_codex_resets_memo(),
             suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
-            // Raised by [`SpendDrain::drain`] when a stop signal arrives: from
-            // then on the scheduler refuses every new token spend
+            // Raised by [`SpendDrain::drain`] when a stop signal arrives, and
+            // by `serve` when its API fails to start after `boot`: from then
+            // on the scheduler refuses every new token spend
             // (`spawn_refresher` and the rotation gate read it), while the
             // spend already in flight saves. The TUI's quit path is the flag's
             // other writer.
             shutting_down: Arc::new(AtomicBool::new(false)),
+            fetch_lease: Arc::new(FetchLease::new()),
+            scheduler: std::sync::OnceLock::new(),
             last_reload_fp,
             last_reload_error: None,
             snapshot,
@@ -1863,6 +3402,8 @@ impl Daemon {
             switch_backoff: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            name_notices: Vec::new(),
+            strip_list_failure: None,
             credit_capped: HashSet::new(),
             credit_refusals: crate::profile_cache::CreditRefusalWatch::default(),
             dead_login_stats: crate::usage::DeadLoginStats::new(),
@@ -1874,9 +3415,12 @@ impl Daemon {
             status_path,
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
+            listen: ListenHandle::default(),
             background: BackgroundHolds::new(),
             #[cfg(target_os = "macos")]
             bare_item_scan_ticks: 0,
+            #[cfg(unix)]
+            restart_advice: RestartAdvice::default(),
         };
         crate::usage::seed_dead_logins(&daemon.config, &daemon.third_party_broken);
         daemon
@@ -1922,7 +3466,9 @@ impl Daemon {
                     }
                 }
             };
-            let _ = link_profile_credentials(&active);
+            if let Err(e) = link_profile_credentials(&active) {
+                logline!("clauth daemon: {e:#}; .credentials.json was not relinked to '{active}'");
+            }
         }
 
         let interval = self.refresh_interval.load(Ordering::Relaxed);
@@ -1968,13 +3514,17 @@ impl Daemon {
     /// what a signal watcher carries, so the drain sees exactly the token
     /// spends claimed in this store and refuses the ones that have not started.
     fn spend_drain(&self) -> SpendDrain {
-        SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down))
+        let drain = SpendDrain::new(Arc::clone(&self.activity), Arc::clone(&self.shutting_down));
+        match self.scheduler.get() {
+            Some(scheduler) => drain.with_scheduler(scheduler.clone()),
+            None => drain,
+        }
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
-        spawn_refresher(
+        let scheduler = spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
@@ -1987,6 +3537,8 @@ impl Daemon {
             Arc::clone(&self.kick_blocks),
             Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.weekly_reset_kicks),
+            Arc::clone(&self.claude_resets_memo),
+            Arc::clone(&self.codex_resets_memo),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -2000,12 +3552,13 @@ impl Daemon {
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
-            // lease for life, but if a TUI is already fetching, the daemon stands
-            // its refresher down and hydrates instead — the main loop still writes
-            // `status.json` every tick regardless of who fetches. A fresh lease per
-            // scheduler; the tick thread's clone keeps the flock held for the
-            // process lifetime.
-            Arc::new(FetchLease::new()),
+            // lease, but if a TUI is already fetching, the daemon stands its
+            // refresher down and hydrates instead — the main loop still writes
+            // `status.json` every tick regardless of who fetches. The daemon's
+            // own clone feeds the main-loop drains' stand-down check; the tick
+            // thread's clone keeps the flock held while its ticks complete, and
+            // its lease watchdog releases it when they stop.
+            Arc::clone(&self.fetch_lease),
             // The daemon has no display reader of its provider store
             // (`status.json` reads provider figures off disk), so its stand-down
             // hydration seeds the work list, never the display superset.
@@ -2015,13 +3568,15 @@ impl Daemon {
             false,
             Arc::clone(&self.snapshot),
         );
+        // `boot` runs once per daemon, so the cell is empty here.
+        let _ = self.scheduler.set(scheduler);
     }
 
     /// Main loop. Writes an initial `status.json` immediately (so a reader that
     /// attaches before the first fetch has something to read), then each tick
     /// reloads external config changes, executes queued switches, and rewrites
     /// `status.json`. Runs until the process is killed.
-    fn run(&mut self) {
+    fn run(&mut self, stop_kit: &gateway::StopKit) {
         self.write_status();
         // Stamp the first heartbeat before the watchdog starts so it never trips
         // on the zero-heartbeat boot window, then spawn it.
@@ -2034,6 +3589,7 @@ impl Daemon {
         // under the cap.
         let log_path = self.status_path.with_file_name(LOG_FILE);
         let mut ticks: u64 = 0;
+        let mut reexec_watch = ReexecWatch::default();
         loop {
             if ticks.is_multiple_of(LOG_ROTATE_EVERY_TICKS) {
                 let _ = log_rotate::rotate_log_if_large(
@@ -2046,6 +3602,27 @@ impl Daemon {
             self.tick();
             self.heartbeat
                 .store(crate::usage::now_ms(), Ordering::Relaxed);
+            // Reap the children the previous image left (the boot-captured
+            // set) once their exits land, so none of them sits defunct for
+            // the daemon's life; the set only ever holds pids this process
+            // inherited across the exec.
+            gateway::reap_inherited_tick();
+            // The re-exec check sits between ticks, after the heartbeat store:
+            // the scheduler thread may be mid-rotation at this instant, so the
+            // stop path drains the spend in flight before the exec.
+            #[cfg(unix)]
+            reexec_if_due(
+                &mut reexec_watch,
+                stop_kit,
+                &self.heartbeat,
+                &self.restart_advice,
+            );
+            #[cfg(not(unix))]
+            reexec_if_due(&mut reexec_watch, stop_kit, &self.heartbeat);
+            // Copied bearers a stamp queued while a tick's budget was armed,
+            // re-pointed off this loop so its Keychain legs never spend the
+            // watchdog's window.
+            crate::runtime::repoint_copied_bearers_detached();
             ticks = ticks.wrapping_add(1);
         }
     }
@@ -2119,6 +3696,8 @@ impl Daemon {
             proxies: Arc::clone(&self.proxies),
             activity: Arc::clone(&self.activity),
             shutting_down: Arc::clone(&self.shutting_down),
+            fetch_lease: Arc::clone(&self.fetch_lease),
+            listen: Arc::clone(&self.listen),
         }
     }
 
@@ -2132,6 +3711,8 @@ impl Daemon {
             poll_streaks: Arc::clone(&self.poll_streaks),
             kick_blocks: Arc::clone(&self.kick_blocks),
             weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            claude_resets_memo: Arc::clone(&self.claude_resets_memo),
+            codex_resets_memo: Arc::clone(&self.codex_resets_memo),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             third_party_usage: Arc::clone(&self.third_party_usage_store),
             third_party_status: Arc::clone(&self.third_party_status),
@@ -2158,7 +3739,10 @@ impl Daemon {
     /// profile's cache files and sweeps the session flocks, and holding CONFIG
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
-    fn write_status(&mut self) {
+    ///
+    /// Hands back the codex roster the body was built from, so the tick's name
+    /// notices read it from this one load rather than a second.
+    fn write_status(&mut self) -> Option<crate::codex_profiles::CodexState> {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
         let snapshot = self.live_stores().snapshot();
         let live = snapshot.signals();
@@ -2175,7 +3759,7 @@ impl Daemon {
             status_json::build_status_with_codex(&cfg_snap, interval, Some(&live), false);
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
-                if let Err(e) = atomic_write_600(&self.status_path, &json) {
+                if let Err(e) = atomic_write_600_fast(&self.status_path, &json) {
                     logline!("clauth daemon: failed to write status.json: {e}");
                 }
             }
@@ -2189,6 +3773,7 @@ impl Daemon {
             cfg_snap.state.bell_command.as_deref(),
         );
         self.queue_pushes(&cfg_snap, &body.profiles, codex.as_ref());
+        codex
     }
 
     /// Say a spent usage-credit cap out loud, once per account per edge, on
@@ -2347,7 +3932,7 @@ impl Daemon {
                 // follows that line too").
                 util: long_util(entry),
             },
-            fresh: entry_fresh(entry),
+            fresh: entry_alert_fresh(entry),
         });
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its latches must
@@ -2370,16 +3955,17 @@ impl Daemon {
     }
 
     /// The headless half of the 5h bell, judged on the figures this tick just
-    /// published so the bell and the feed never disagree. With no
-    /// `bell_command` the latch is left as it is,
-    /// so setting one mid-crossing does not re-announce a bell already rung.
+    /// published so the bell and the feed never disagree about a figure; a
+    /// proxy member's freshness is its chain windows' (`alert_stale`). With no
+    /// `bell_command` a present account keeps its latch as it is, so setting
+    /// one mid-crossing does not re-announce a bell already rung; a deleted
+    /// account is forgotten either way.
     fn ring_bells(
         &mut self,
         roster: &[crate::profile::Profile],
         entries: &[status_json::ProfileEntry],
         command: Option<&str>,
     ) {
-        let Some(command) = command else { return };
         // Forget against the ROSTER, not the published body: a disabled account
         // is hidden from the body but is still an account, so its standing bell
         // must not re-arm when it comes back into view. Only a deleted account
@@ -2387,8 +3973,9 @@ impl Daemon {
         // whole bell population.
         let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
         self.bells.forget_absent(&present);
+        let Some(command) = command else { return };
         for entry in entries {
-            let fresh = entry_fresh(entry);
+            let fresh = entry_alert_fresh(entry);
             let util = entry
                 .windows
                 .iter()
@@ -2414,3 +4001,15 @@ mod watchdog_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_reexec.rs"]
+mod reexec_tests;
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/inline/daemon_reexec_steps.rs"]
+mod reexec_steps_tests;
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/inline/daemon_handover.rs"]
+mod handover_tests;

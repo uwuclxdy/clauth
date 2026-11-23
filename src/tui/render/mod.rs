@@ -15,6 +15,7 @@ mod footer;
 mod format;
 mod global_config;
 mod header;
+pub(crate) use header::art_fits;
 mod modals;
 mod overview;
 mod panes;
@@ -24,7 +25,7 @@ pub(super) mod prose;
 mod services;
 mod status;
 mod tabs;
-mod toasts;
+pub(crate) mod toasts;
 mod tokens;
 mod usage;
 
@@ -61,16 +62,17 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     // renders a reading reads this snapshot alone.
     let readings = app.readings_snapshot();
 
-    // Content frame's top border doubles as the header/content separator; the
-    // header is always 3 rows (brand / count+status / tabs+gauge).
-    let [header_area, content_area, footer_area] = Layout::vertical([
-        Constraint::Length(header::header_height(app)),
+    // Content frame's top border doubles as the header/content separator; with
+    // the art the header is the mascot's own rows (brand / live+gauge+status /
+    // any blank rows / tabs), without it 2 (brand+tabs / live+gauge+status).
+    let [_, content_area, footer_area] = Layout::vertical([
+        Constraint::Length(header::header_height(area)),
         Constraint::Min(5),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    header::draw(frame, header_area, app, &readings);
+    header::draw(frame, area, app, &readings);
 
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {

@@ -15,7 +15,11 @@
 //!   * **A device always.** Every route but the pairing redemption needs
 //!     `Authorization: Bearer <token>` from a paired device, and the switch
 //!     needs one paired with control; see [`devices`], [`pairing`], and the
-//!     table in [`routes`].
+//!     table in [`routes`]. The terminal stream's upgrade also takes a
+//!     [`ticket`] that device minted, since a page can set no header on a
+//!     WebSocket. A CORS preflight from an origin in `[serve] app_origins` is
+//!     the one answer before authentication on any path: one fixed head, the
+//!     same for every path and method.
 //!   * **Operations.** The health check, the status feed, the OpenAPI document,
 //!     the account switch and the fallback-chain edits (order, per-member
 //!     threshold, wrap-off; control devices only), and the pairing redemption.
@@ -39,6 +43,7 @@ pub(crate) mod push;
 pub(crate) mod routes;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
+pub(crate) mod ticket;
 pub(crate) mod tls;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -238,6 +243,8 @@ fn claim_slot() -> Option<ConnectionSlot> {
 pub(crate) struct Prepared {
     listen: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+    /// The name the certificate serves ([`tls::Identity::name`]).
+    served_name: Option<String>,
 }
 
 impl Prepared {
@@ -251,8 +258,10 @@ impl Prepared {
     /// while every client's trust in it expired. Nothing else calls this — a
     /// start that did not park read the certificate moments before serving.
     pub(crate) fn reload_certificate(&mut self, certs: &tls::CertSource) -> Result<()> {
-        self.tls_config = tls::server_config(certs, self.listen.ip())
+        let identity = tls::server_config(certs, self.listen.ip())
             .context("failed to reload the TLS certificate after the standby promotion")?;
+        self.tls_config = identity.config;
+        self.served_name = identity.name;
         Ok(())
     }
 }
@@ -265,7 +274,7 @@ impl Prepared {
 /// running daemon, so a certificate that had just been renewed badly used to
 /// take the incumbent down and then abort — leaving the host with no daemon at
 /// all, and with it no refresh and no auto-switch, not merely no listener.
-/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
+/// `wiki/REST-API.md` recommends `clauth daemon --replace --listen` as the
 /// post-`lego renew` hook, which makes the documented automation the trigger.
 /// Settled first, a bad renewal is a no-op: the incumbent keeps running.
 /// The `--standby` park the result can be carried through is unbounded, so
@@ -275,9 +284,17 @@ impl Prepared {
 /// The legacy import runs in [`serve_prepared`] too, below the claim and below
 /// a standby's promotion, so a start that dies on this certificate or yields
 /// as redundant imports nothing.
+///
+/// The handover probe's answer runs the same read (via
+/// `daemon::listener_setup`), so the probe judges the exact start the exec
+/// would run.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
-    let tls_config = tls::server_config(certs, listen.ip())?;
-    Ok(Prepared { listen, tls_config })
+    let identity = tls::server_config(certs, listen.ip())?;
+    Ok(Prepared {
+        listen,
+        tls_config: identity.config,
+        served_name: identity.name,
+    })
 }
 
 /// Build the mod bridge and the API context together (unix): a bridge bind or
@@ -300,6 +317,7 @@ pub(crate) fn build_context(
         panes::real_probe(),
         events::production_herdr_resolver(),
         terminal::real_terminal_spawn(),
+        create::real_session_spawn(),
         bridge,
     )
 }
@@ -314,10 +332,12 @@ pub(crate) fn build_context(
 /// the claim died `--replace --listen` on the port its dying incumbent still
 /// held, exited a plain second instance non-zero on a boot race its contract
 /// says it wins by yielding, and had a parked standby holding a listening
-/// socket nothing accepted on for the whole park. Every failure here is fatal
-/// to the daemon by design (the caller propagates it): the operator asked for
-/// a listener, and a daemon that silently ran without one would look healthy
-/// while the remote client stayed dark.
+/// socket nothing accepted on for the whole park. A re-exec'd image whose
+/// handed-over listener validated adopts that socket instead of binding: it
+/// never closed, so the port never dropped between the images. Every failure
+/// here is fatal to the daemon by design (the caller propagates it): the
+/// operator asked for a listener, and a daemon that silently ran without one
+/// would look healthy while the remote client stayed dark.
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     config: ConfigHandle,
@@ -325,9 +345,42 @@ pub(crate) fn serve_prepared(
     live: super::LiveStores,
     memory_stores: crate::usage::MemoryStores,
 ) -> Result<Arc<ApiContext>> {
-    let Prepared { listen, tls_config } = prepared;
-    let listener = TcpListener::bind(listen)
-        .with_context(|| format!("failed to bind the REST API to {listen}"))?;
+    let Prepared {
+        listen,
+        tls_config,
+        served_name,
+    } = prepared;
+    let listener = match super::exec_handover::take_listener(listen) {
+        Some(listener) => listener,
+        None => TcpListener::bind(listen)
+            .with_context(|| format!("failed to bind the REST API to {listen}"))?,
+    };
+    // Registered so THIS image's own re-exec hands the socket over in turn.
+    #[cfg(unix)]
+    super::exec_handover::register_listener({
+        use std::os::fd::AsRawFd as _;
+        listener.as_raw_fd()
+    });
+    // The port the kernel picked when `:0` was asked, not the asked-for one.
+    let bound = listener
+        .local_addr()
+        .context("failed to read the REST API's bound address")?;
+    match served_name {
+        Some(host) => {
+            let slot = crate::daemon::status_json::ListenSlot {
+                host,
+                port: bound.port(),
+            };
+            if live.listen.set(slot).is_err() {
+                logline!("clauth daemon: a listen address was already published; keeping it");
+            }
+        }
+        None => logline!(
+            "clauth daemon: the REST API's certificate does not cover the name its file is \
+             named for and carries no non-wildcard DNS name, so status.json publishes no listen \
+             address; pairing links need [serve] public_address"
+        ),
+    }
     devices::import_legacy()?;
     devices::note_at_start();
     let ctx = {
@@ -345,6 +398,7 @@ pub(crate) fn serve_prepared(
                 panes::real_probe(),
                 events::production_herdr_resolver(),
                 terminal::real_terminal_spawn(),
+                create::real_session_spawn(),
             )
         }
     };
@@ -355,7 +409,7 @@ pub(crate) fn serve_prepared(
         .spawn(move || accept_loop(&listener, &tls_config, &accept_ctx));
     spawned.context("failed to spawn the REST API accept thread")?;
 
-    logline!("clauth daemon: REST API listening on https://{listen}");
+    logline!("clauth daemon: REST API listening on https://{bound}");
     Ok(ctx)
 }
 
@@ -454,7 +508,7 @@ fn serve_connection(
         // The TLS handshake runs lazily inside the first read here, so a
         // plaintext client or a bad SNI surfaces as an IO error and gets no
         // response: there is no secure channel to answer over.
-        let request = match reader.next_request() {
+        let mut request = match reader.next_request() {
             // Clean close, or an idled-out budget, between requests. Either is
             // how a kept-alive connection normally ends.
             Ok(None) => break,
@@ -483,7 +537,21 @@ fn serve_connection(
 
         served = served.saturating_add(1);
         let summary = http::request_summary(&request.method, &request.path);
-        let handled = routes::handle(ctx, &request, peer);
+        // Judged here, ahead of authentication and of any route lookup: a
+        // preflight carries no bearer, and its one fixed answer names no path.
+        let cors = http::Cors::judge(&routes::listed_origins(ctx), &request.cross_origin)
+            .settle_preflight(&request);
+        let origin_field = cors.log_field(&request.cross_origin);
+        request.cross_origin.refused = cors.refuses(&request.cross_origin);
+        let handled = if cors.is_preflight() {
+            routes::Handled {
+                response: http::Response::raw_json(200, Vec::new()),
+                device: None,
+                hijack: None,
+            }
+        } else {
+            routes::handle(ctx, &request, peer)
+        };
 
         // A validated WebSocket upgrade takes the connection over: write the
         // 101 head, then run the terminal bridge to the socket's end. The
@@ -494,8 +562,15 @@ fn serve_connection(
                 .device
                 .as_deref()
                 .map_or_else(|| "-".to_string(), http::sanitize_for_log);
-            logline!("clauth api: {peer} {device} {summary} -> 101");
-            if let Err(e) = http::write_upgrade_head(reader.stream_mut(), &hijack.accept) {
+            logline!(
+                "clauth api: {peer} {device} {summary} -> 101{origin_field}{}",
+                hijack.auth_field()
+            );
+            if let Err(e) = http::write_upgrade_head(
+                reader.stream_mut(),
+                &hijack.accept,
+                hijack.selected_protocol(),
+            ) {
                 logline!("clauth api: {peer}: failed to write the upgrade head: {e}");
                 break;
             }
@@ -511,26 +586,36 @@ fn serve_connection(
             return;
         }
 
-        let response = if request.method == "HEAD" {
+        let mut response = if request.method == "HEAD" {
             handled.response.into_head()
         } else {
             handled.response
         };
+        response.cors = cors;
 
         // Both sides have to agree, and the budget is ours alone to enforce.
         // What is advertised is the budget genuinely left, so a client is never
         // told it has time it does not have.
         //
-        // An answer no device earned (a 401, a failed pairing) never keeps the
-        // connection. Otherwise anyone able to reach the port could hold a slot
-        // for the whole budget by sending one bogus request and going quiet,
-        // and at 32 slots that is a lockout for the price of a TCP connection;
-        // and every wrong pairing code costs its sender a new connection rather
-        // than one more request on an open one. Before connections persisted,
-        // one socket timeout capped the hold; now the budget would. A real
-        // client presents its token, and a pairing that succeeds may carry on,
-        // so this costs nothing legitimate.
-        let earned = handled.device.is_some() || (200..300).contains(&response.status);
+        // An answer keeps the connection when a success answered it or when a
+        // device earned a non-401 answer; nothing else does. A preflight earns
+        // nothing whatever its status: its 200 needs only an origin, and an
+        // origin is no secret. A 401 closes the connection even when a handler
+        // wrote it after the router stamped the device on the request — a
+        // device revoked while a long poll or a push subscription re-checked
+        // its row is owed the close its next request would get; the line still
+        // names it, so the refusal reads as one from that device. Otherwise
+        // anyone able to reach the port could hold a slot for the whole budget
+        // by sending one bogus request and going quiet, and at 32 slots that is
+        // a lockout for the price of a TCP connection; and every wrong pairing
+        // code costs its sender a new connection rather than one more request
+        // on an open one. Before connections persisted, one socket timeout
+        // capped the hold; now the budget would. A real client presents its
+        // token, and a pairing that succeeds may carry on, so this costs
+        // nothing legitimate.
+        let earned = !response.cors.is_preflight()
+            && ((handled.device.is_some() && response.status != 401)
+                || (200..300).contains(&response.status));
         let remaining = expires.saturating_duration_since(std::time::Instant::now());
         let disposition =
             if request.keep_alive && earned && served < limits.max_requests && !remaining.is_zero()
@@ -556,7 +641,7 @@ fn serve_connection(
             .as_deref()
             .map_or_else(|| "-".to_string(), http::sanitize_for_log);
         logline!(
-            "clauth api: {peer} {device} {summary} -> {}",
+            "clauth api: {peer} {device} {summary} -> {}{origin_field}",
             response.status
         );
         if let Err(e) = http::write_response(reader.stream_mut(), response, &disposition, expires) {

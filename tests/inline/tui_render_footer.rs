@@ -47,11 +47,14 @@ fn the_usage_hints_advertise_the_note_key() {
         usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -65,6 +68,9 @@ fn the_usage_hints_advertise_the_note_key() {
         unreadable_credentials_store: None,
         setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     let with_account = App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
@@ -113,6 +119,10 @@ fn the_usage_r_hint_derives_from_the_row() {
         reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     };
     let with_claude = || {
         App::new(AppConfig {
@@ -160,8 +170,15 @@ fn the_setup_alert_row_advertises_its_stepper_keys() {
         profiles: vec![crate::profile::Profile::new("a".to_string(), None, None)],
     });
     app.tab = Tab::Setup;
-    app.config_focus = ConfigFocus::Actions;
     app.profile_cursor.set(0);
+    // Descend the way a user does, so the card holds the draft its steppers
+    // write through.
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
     app.config_action_cursor = config_rows(&app)
         .iter()
         .position(|r| *r == ConfigRow::BellThreshold)
@@ -277,6 +294,131 @@ fn the_rebind_confirm_footer_row_is_pinned() {
     }
 }
 
+/// With a login in flight and the re-bind confirm open, the login line derives
+/// `? help` the same way the plain footer does: `?` falls through the confirm
+/// (`KeyOwner::claims`), so the key still opens help above the modal — pressed
+/// for real, with the confirm staying open beneath.
+#[test]
+fn the_login_footer_shows_help_beside_the_rebind_confirm() {
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use crate::tui::app::{LoginMethod, LoginStage, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![
+        Profile::new(
+            "D1".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        Profile::new(
+            "D2".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+    ];
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open"
+    );
+    app.login = Some(LoginSession {
+        name: "fresh".into(),
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
+        generation: 0,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'fresh'   ↑↓ row   space toggle   ↵ choose   ? help   q not now",
+        "the rebind confirm's help key rides the login line"
+    );
+    handle_key(&mut app, key(KeyCode::Char('?')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Help)),
+        "`?` opens help above the re-bind confirm"
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm stays open beneath the help modal"
+    );
+    app.modals.pop();
+    assert!(app.login.is_some(), "the login stays live");
+
+    app.login = None;
+    app.codex_login = Some(CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'cdx-one'   ↑↓ row   space toggle   ↵ choose   ? help   q not now",
+        "the rebind confirm's help key rides the codex login line"
+    );
+}
+
+/// With a login in flight and nothing owning the keyboard, `?` falls through to
+/// the global help arm (`handle_key` takes only esc/q for a live login), so the
+/// collapsed login row derives `? help` the same way an owned row does — and
+/// the hint is honest: the key opens help above the login.
+#[test]
+fn the_collapsed_login_row_derives_help_from_the_global_key() {
+    use crate::testutil::key;
+    use crate::tui::app::{LoginMethod, LoginStage, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.login = Some(LoginSession {
+        name: "fresh".into(),
+        account: Some(crate::profile::ProfileId::mint().expect("mint an id")),
+        generation: 0,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
+    });
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "⠋ logging in 'fresh'   esc cancel   ? help",
+        "the collapsed claude login row derives ? help"
+    );
+    handle_key(&mut app, key(KeyCode::Char('?')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Help)),
+        "`?` opens help above the live login"
+    );
+    assert!(app.login.is_some(), "the login stays live");
+
+    let mut codex = bare_app();
+    codex.codex_login = Some(CodexLoginSession {
+        name: "cdx-one".into(),
+        generation: 0,
+        url: None,
+        cancel: crate::codex_login::LoginCancel::new(),
+        is_new: false,
+    });
+    assert_eq!(
+        settled_footer(&codex, 80, 24),
+        "⠋ logging in 'cdx-one'   esc cancel   ? help",
+        "the collapsed codex login row derives ? help"
+    );
+}
+
 // ── modal footer derivation ──────────────────────────────────────────────────
 
 /// The hint pairs one modal's footer derives from.
@@ -287,6 +429,57 @@ type HintRow = &'static [(&'static str, &'static str)];
 /// cannot produce it at the two pinned sizes); `row_45` the 45-col row when it
 /// sheds. `prep` sets the frame state the `hints` describe — the scroll bound,
 /// a built-in pick — so the derivation drive is deterministic without a draw.
+/// A limit-reset modal on two usable resets, `cancel` focused.
+fn two_reset_form() -> crate::tui::app::LimitResetForm {
+    let choice = |id: &str| crate::tui::app::ResetChoice {
+        id: id.to_string(),
+        label: format!("reset {id}"),
+        rows: vec![("id", id.to_string())],
+        usable: true,
+        held: true,
+    };
+    crate::tui::app::LimitResetForm {
+        name: crate::profile::ProfileName::from("cl1"),
+        harness: crate::harness::Harness::Claude,
+        available: "2 available".to_string(),
+        resets: vec![choice("g-1"), choice("g-2")],
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: crate::tui::app::LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(crate::tui::app::ScrollStamp::default()),
+    }
+}
+
+/// A limit-reset modal whose list overflows an 80x24 frame: thirteen one-row
+/// resets fill 17 body lines against the 14 the modal's body holds.
+fn scrolled_reset_form() -> crate::tui::app::LimitResetForm {
+    let choice = |id: &str| crate::tui::app::ResetChoice {
+        id: id.to_string(),
+        label: format!("reset {id}"),
+        rows: vec![("id", id.to_string())],
+        usable: true,
+        held: true,
+    };
+    crate::tui::app::LimitResetForm {
+        name: crate::profile::ProfileName::from("cl1"),
+        harness: crate::harness::Harness::Claude,
+        available: "13 available".to_string(),
+        resets: (0..13).map(|i| choice(&format!("g-{i}"))).collect(),
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: crate::tui::app::LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(crate::tui::app::ScrollStamp::default()),
+    }
+}
+
 struct ModalCase {
     name: &'static str,
     modal: Modal,
@@ -321,10 +514,11 @@ fn modal_cases() -> Vec<ModalCase> {
     use crate::presets::{Preset, RebindBlock, RowMove};
     use crate::tui::app::{
         ActionMenuAction, ActionMenuState, BareItemForm, BareItemOwnerForm, BareItemWrite,
-        CaptureNameForm, ConfirmAction, ConfirmScroll, ConfirmState, Dirty, DivergenceForm,
-        DivergenceTargetForm, EnvCollisionForm, InputState, LossWarningButton, LossWarningDrop,
-        LossWarningState, LossWarningTarget, NamePromptAction, NamePromptForm, PresetApplyButton,
-        PresetApplyForm, PresetPickerForm, PresetTarget, RebindForm, TokenPickerForm,
+        CaptureNameForm, CaptureOrigin, CaptureOwnerForm, ConfirmAction, ConfirmScroll,
+        ConfirmState, Dirty, DivergenceForm, DivergenceTargetForm, EnvCollisionForm, InputState,
+        LossWarningButton, LossWarningDrop, LossWarningState, LossWarningTarget, NamePromptAction,
+        NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm, PresetTarget,
+        RebindForm, TokenPickerForm,
     };
     use std::cell::{Cell, RefCell};
 
@@ -486,6 +680,8 @@ fn modal_cases() -> Vec<ModalCase> {
             modal: Modal::Divergence(DivergenceForm {
                 active: "x".into(),
                 sibling: None,
+                long_lived: false,
+                seen: None,
                 // `discard` sits last so ↵ only opens its confirm, never the
                 // overwrite path's credential work, inside a test.
                 cursor: 2,
@@ -503,6 +699,8 @@ fn modal_cases() -> Vec<ModalCase> {
         ModalCase {
             name: "divergence target",
             modal: Modal::DivergenceTarget(DivergenceTargetForm {
+                from: "x".into(),
+                seen: None,
                 targets: vec!["b".into()],
                 // A profile row, so ↵ takes the pick's toast path, never the
                 // `+ new` capture flow.
@@ -558,6 +756,40 @@ fn modal_cases() -> Vec<ModalCase> {
                 ("q", "back"),
             ],
             prep: |_| {},
+        },
+        ModalCase {
+            name: "limit reset",
+            modal: Modal::LimitReset(two_reset_form()),
+            row: Some("↑↓ reset   ←→ button   ↵ choose   q back"),
+            row_45: None,
+            hints: &[
+                ("↑↓", "reset"),
+                ("←→", "button"),
+                ("↵", "choose"),
+                ("q", "back"),
+            ],
+            prep: |_| {},
+        },
+        ModalCase {
+            name: "limit reset scroll",
+            modal: Modal::LimitReset(scrolled_reset_form()),
+            // The overflowing list's ↑↓ scrolls the body and is the same ↑↓
+            // that walks it: one row, as every list modal whose body follows
+            // its cursor shows.
+            row: Some("↑↓ reset   ←→ button   ↵ choose   q back"),
+            row_45: None,
+            hints: &[
+                ("↑↓", "reset"),
+                ("←→", "button"),
+                ("↵", "choose"),
+                ("q", "back"),
+            ],
+            prep: |a| {
+                if let Some(Modal::LimitReset(f)) = a.modals.last_mut() {
+                    f.max_scroll.set(1);
+                    f.scroll_stamp.set(fresh_stamp());
+                }
+            },
         },
         ModalCase {
             name: "preset picker builtin",
@@ -617,6 +849,32 @@ fn modal_cases() -> Vec<ModalCase> {
             prep: |_| {},
         },
         ModalCase {
+            name: "capture owner",
+            modal: Modal::CaptureOwner(CaptureOwnerForm {
+                // `cancel`, so ↵ only closes it, never a credential write.
+                cursor: 2,
+                ..CaptureOwnerForm::new(
+                    crate::actions::AccountIdMatch {
+                        owner: "beta".into(),
+                        account: crate::profile::AccountId::from("uuid-beta".to_string()),
+                    },
+                    crate::profile::ProfileId::mint().expect("id"),
+                    CaptureSnapshot {
+                        credentials: None,
+                        base_url: None,
+                        api_key: None,
+                        anchor: AnchorAction::Unproven,
+                        plan: None,
+                    },
+                    CaptureOrigin::NewForm,
+                )
+            }),
+            row: Some("↑↓ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("↑↓", "pick"), ("↵", "choose"), ("q", "back")],
+            prep: |_| {},
+        },
+        ModalCase {
             name: "env collision",
             modal: collision(false),
             row: Some("↑↓ pick   ↵ choose   q back"),
@@ -661,7 +919,7 @@ fn modal_cases() -> Vec<ModalCase> {
                     plan: None,
                 }),
                 input: InputState::new(""),
-                from_divergence: false,
+                from_divergence: None,
             }),
             row: Some("↵ save   ←→ caret   q back"),
             row_45: None,
@@ -712,6 +970,27 @@ fn modal_cases() -> Vec<ModalCase> {
             ],
             prep: |_| {},
         },
+        ModalCase {
+            name: "transcript cleanup",
+            modal: Modal::TranscriptCleanup(crate::tui::app::TranscriptCleanupForm {
+                days: 3650,
+                on_remove: false,
+            }),
+            row: Some("←→ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("←→", "pick"), ("↵", "choose"), ("q", "back")],
+            // Its keys act once a drawn frame showed the question for half a
+            // second, an empty poll followed, and a frame drew it live.
+            prep: |app| {
+                app.anim_phase_ms = Some(0);
+                let _ = app.frame_drawn();
+                app.anim_phase_ms = Some(500);
+                app.queue_seen_empty();
+                app.transcript_cleanup.set_drawn_live(true);
+                let _ = app.frame_drawn();
+                app.queue_seen_empty();
+            },
+        },
     ]
 }
 
@@ -740,6 +1019,9 @@ fn modal_index(modal: &Modal) -> usize {
         Modal::CodexLogin => 15,
         Modal::BareItem(_) => 16,
         Modal::BareItemOwner(_) => 17,
+        Modal::CaptureOwner(_) => 18,
+        Modal::LimitReset(_) => 19,
+        Modal::TranscriptCleanup(_) => 20,
     }
 }
 
@@ -747,7 +1029,7 @@ fn modal_index(modal: &Modal) -> usize {
 /// Bumped with `modal_index` — the coverage test reds when an index has no
 /// case. That guard fires only once `MODAL_COUNT` is bumped past the new arm's
 /// index.
-const MODAL_COUNT: usize = 18;
+const MODAL_COUNT: usize = 21;
 
 /// Every `Modal` variant has a case driving its row; the two login modals are
 /// the variants a case cannot cover (their login-in-flight lines own the
@@ -791,6 +1073,8 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::ActionMenu(f)) => format!("{}", f.cursor),
         Some(Modal::BareItem(f)) => format!("{}", f.cursor),
         Some(Modal::BareItemOwner(f)) => format!("{}", f.cursor),
+        Some(Modal::CaptureOwner(f)) => format!("{}", f.cursor),
+        Some(Modal::LimitReset(f)) => format!("{}:{}:{:?}", f.cursor, f.on_use, f.phase),
         Some(Modal::EnvCollision(f)) => format!(
             "{}:{}:{}:{}",
             f.cursor,
@@ -801,6 +1085,7 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::CaptureName(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::NamePrompt(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::Rebind(f)) => format!("{}:{}:{:?}", f.choice, f.cursor, f.checked),
+        Some(Modal::TranscriptCleanup(f)) => format!("{}:{}", f.days, f.on_remove),
         Some(Modal::Help) => format!("{}", app.help_scroll),
         Some(Modal::CheckOutput(_)) => format!("{}", app.check_output_scroll),
         Some(Modal::Login) => String::new(),
@@ -1570,7 +1855,8 @@ fn the_login_footer_shows_the_open_modals_row() {
 
 /// A codex re-login in flight keeps its lead line and reads `q back` while its
 /// modal is open (the collapse key; `r`/`c` live in the modal body) and `esc
-/// cancel` once collapsed — the [`draw_login`] shape without the paste door.
+/// cancel` plus the derived `? help` once collapsed — the [`draw_login`] shape
+/// without the paste door.
 #[test]
 fn the_codex_login_footer_names_only_its_modal_keys() {
     use crate::tui::app::CodexLoginSession;
@@ -1597,7 +1883,7 @@ fn the_codex_login_footer_names_only_its_modal_keys() {
     collapsed.codex_login = Some(session());
     assert_eq!(
         settled_footer(&collapsed, 80, 24),
-        "⠋ logging in 'cdx-one'   esc cancel",
+        "⠋ logging in 'cdx-one'   esc cancel   ? help",
         "the collapsed codex login's footer"
     );
 }
@@ -2002,7 +2288,11 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
         )
     }
 
-    fn check(app: &App, name: &str, w: u16) {
+    fn check(app: &App, name: &str, w: u16, tier: crate::tui::theme::Tier) {
+        let fill = match tier {
+            crate::tui::theme::Tier::Full => ratatui::style::Color::Rgb(30, 30, 46),
+            crate::tui::theme::Tier::Compatible => ratatui::style::Color::Reset,
+        };
         let (row, cells) = footer_at(app, w, 24);
         let expected = format!(" i saving {name}\u{2026} · \u{2303}c \u{2303}c quit now");
         assert_eq!(row.trim_end(), expected, "whole row at {w}, got {row:?}");
@@ -2023,7 +2313,7 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
                 bold,
                 "cell {i} bold at {w}"
             );
-            assert_eq!(cell.bg, crate::tui::theme::bg(), "cell {i} bg at {w}");
+            assert_eq!(cell.bg, fill, "cell {i} bg at {w}");
         }
     }
 
@@ -2039,15 +2329,15 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
             app.tab = tab;
             app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
             app.exit_wait = true;
-            check(&app, "bind", 80);
-            check(&app, "bind", 34);
+            check(&app, "bind", 80, tier);
+            check(&app, "bind", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
             app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
             app.exit_wait = true;
-            check(&app, "upstream", 80);
-            check(&app, "upstr", 34);
+            check(&app, "upstream", 80, tier);
+            check(&app, "upstr", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
@@ -2056,8 +2346,8 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
                 occurrence: 0,
             })));
             app.exit_wait = true;
-            check(&app, "a", 80);
-            check(&app, "a", 34);
+            check(&app, "a", 80, tier);
+            check(&app, "a", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
@@ -2067,15 +2357,15 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
             ));
             app.pool_mutation_kind = Some(PoolMutationKind::Remove);
             app.exit_wait = true;
-            check(&app, "alpha", 80);
-            check(&app, "alpha", 34);
+            check(&app, "alpha", 80, tier);
+            check(&app, "alpha", 34, tier);
 
             let mut app = bare_app();
             app.tab = tab;
             app.services.shunt_action.running = true;
             app.exit_wait = true;
-            check(&app, "shunt", 80);
-            check(&app, "shunt", 34);
+            check(&app, "shunt", 80, tier);
+            check(&app, "shunt", 34, tier);
         }
     }
 
@@ -2090,16 +2380,18 @@ fn the_save_cue_names_the_row_and_survives_the_floor() {
         app.tab = Tab::Overview;
         app.services.shunt_save = Some(save(ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream)));
         app.loss_pending = Some(LossWarningTarget::Quit);
-        check(&app, "upstream", 80);
+        check(&app, "upstream", 80, tier);
     }
 
     // The hints return once the wait ends.
+    let tier = crate::tui::theme::Tier::Full;
+    let _tier = crate::testutil::TierSandbox::new(tier);
     let mut app = bare_app();
     app.tab = Tab::Services;
     let at_rest = settled_footer(&app, 80, 24);
     app.services.shunt_save = Some(save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
     app.exit_wait = true;
-    check(&app, "bind", 80);
+    check(&app, "bind", 80, tier);
     app.exit_wait = false;
     app.services.shunt_save = None;
     assert_eq!(
@@ -2300,20 +2592,99 @@ fn the_save_cue_names_the_save_before_the_action_before_the_pool() {
     check_cue(&app, "alpha", 80);
 }
 
-/// While the exit wait holds on a running profile delete, the cue names the
-/// profile being deleted, as the cue builder words it for that name.
+/// While the exit wait holds on a running profile delete, the cue says
+/// `deleting` and names the profile, never `saving`: the words are written out
+/// so a cue builder that drops the verb cannot agree with itself. 35 columns is
+/// the narrowest row that still holds this name uncut.
 #[test]
 fn the_save_cue_names_the_profile_a_running_delete_removes() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for w in [80, 35] {
+        let mut app = bare_app();
+        app.tab = Tab::Setup;
+        app.deleting = Some(crate::profile::ProfileName::from("gone"));
+        app.exit_wait = true;
+        assert_eq!(
+            cue_row(&app, w),
+            " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now",
+            "whole row at {w}"
+        );
+    }
+}
+
+/// The verb comes from the arm that named the row: a write ranked above the
+/// delete says `saving` beside it, and the switch ranked below it waits its turn.
+#[test]
+fn the_save_cue_takes_its_verb_from_the_arm_that_named_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.deleting = Some(crate::profile::ProfileName::from("gone"));
+    app.rolling_switch = Some(crate::profile::ProfileName::from("arm"));
+    app.services.shunt_save = Some(cue_save(ShuntSaveKey::Field(ShuntFieldKey::Bind)));
+    app.services.shunt_action.running = true;
+    app.pool_mutation_row = Some((
+        PoolFamily::Claude,
+        ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_kind = Some(PoolMutationKind::Remove);
+    app.exit_wait = true;
+    check_cue(&app, "bind", 80);
+
+    app.services.shunt_save = None;
+    check_cue(&app, "shunt", 80);
+
+    app.services.shunt_action.running = false;
+    check_cue(&app, "alpha", 80);
+
+    app.pool_mutation_row = None;
+    app.pool_mutation_kind = None;
+    assert_eq!(
+        cue_row(&app, 80),
+        " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
+
+    app.deleting = None;
+    check_cue(&app, "arm", 80);
+}
+
+/// `deleting` takes two cells more than `saving`, and the name pays for them:
+/// the inset row's width less the 2-cell leader and the 27 cells of copy leaves
+/// 3 cells at 34 columns and 4 at 35. The copy stays whole either way.
+#[test]
+fn a_running_deletes_cue_cuts_the_name_for_its_longer_verb() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = bare_app();
+    app.tab = Tab::Setup;
+    app.deleting = Some(crate::profile::ProfileName::from("gone"));
+    app.exit_wait = true;
+    assert_eq!(
+        cue_row(&app, 34),
+        " i deleting gon\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
+    assert_eq!(
+        cue_row(&app, 35),
+        " i deleting gone\u{2026} · \u{2303}c \u{2303}c quit now"
+    );
+}
+
+/// While the exit wait holds on a running rolling-token switch, the cue
+/// names the account being armed.
+#[test]
+fn the_save_cue_names_the_account_a_rolling_switch_arms() {
     let _home = crate::testutil::HomeSandbox::new();
 
     for w in [80, 34] {
         let mut app = bare_app();
         app.tab = Tab::Setup;
-        app.deleting = Some(crate::profile::ProfileName::from("gone"));
+        app.rolling_switch = Some(crate::profile::ProfileName::from("arm"));
         app.exit_wait = true;
         let expected = format!(
             " {SAVE_CUE_LEADER}{}",
-            prose::plain(&save_cue("gone", w - 2))
+            prose::plain(&save_cue("saving", "arm", w - 2))
         );
         assert_eq!(cue_row(&app, w), expected, "whole row at {w}");
     }
@@ -2381,7 +2752,7 @@ fn a_claude_new_form_login_row_keeps_enter_despite_a_cached_shunt_reason() {
         tab_hints(&app),
         [
             ("↑↓", "row"),
-            ("↵", "edit / toggle"),
+            ("↵", "log in"),
             ("a", "actions"),
             ("?", "help"),
             ("q", "back"),
@@ -2402,7 +2773,7 @@ fn a_codex_new_form_login_row_keeps_enter_despite_a_cached_shunt_reason() {
         tab_hints(&app),
         [
             ("↑↓", "row"),
-            ("↵", "edit / toggle"),
+            ("↵", "log in"),
             ("a", "actions"),
             ("?", "help"),
             ("q", "back"),
@@ -2422,7 +2793,7 @@ fn an_existing_accounts_login_row_keeps_enter_despite_a_cached_shunt_reason() {
         tab_hints(&app),
         [
             ("↑↓", "row"),
-            ("↵", "edit / toggle"),
+            ("↵", "log in"),
             ("a", "actions"),
             ("?", "help"),
             ("q", "back"),
@@ -2719,8 +3090,8 @@ fn x_over_a_toast_pops_and_disarms_the_quit() {
     assert!(!app.quit, "the quit re-arms after x");
 }
 
-/// With no row under the Overview cursor `e` opens nothing, so the footer drops
-/// its hint; the row's other keys keep their places.
+/// With no row under the Overview cursor `e` opens nothing and `⇧↑↓` moves
+/// nothing, so the footer drops both hints.
 #[test]
 fn the_empty_overview_footer_drops_the_edit_key() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2733,12 +3104,39 @@ fn the_empty_overview_footer_drops_the_edit_key() {
 
     assert_eq!(
         settled_footer(&app, 80, 24),
-        "←→ tabs   ⇧↑↓ reorder   a actions   c harness   ? help   q quit"
+        "←→ tabs   a actions   c harness   ? help   q quit"
+    );
+}
+
+/// `⇧↑↓` swaps the cursor's account with a neighbour, so it is hinted only
+/// while the cursor holds an account and another account exists to swap with.
+#[test]
+fn the_overview_footer_hints_reorder_only_with_a_neighbour_to_swap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("p1")),
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("p2")),
+        ],
+    });
+    app.tab = Tab::Overview;
+    assert!(
+        matches!(
+            app.current_main_item(),
+            Some(crate::tui::app::MainItemKind::Profile(_))
+        ),
+        "precondition: an account under the cursor"
+    );
+    assert_eq!(
+        settled_footer(&app, 80, 24),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
     );
 }
 
 /// With a row under the Overview cursor `e` opens its Setup editor, so the
-/// drawn footer keeps the hint beside the other row keys.
+/// drawn footer keeps the hint; a lone account has no neighbour to swap with,
+/// so `⇧↑↓` drops.
 #[test]
 fn the_overview_footer_with_a_row_names_the_edit_key() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2755,6 +3153,601 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
     );
     assert_eq!(
         settled_footer(&app, 80, 24),
-        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit"
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit"
     );
+}
+
+/// `⇧↑↓` counts the rows the reorder reaches, never the roster: beside a
+/// disabled account, which has no Overview row, one shown account has no
+/// neighbour to swap with and two do.
+#[test]
+fn the_overview_footer_counts_the_rows_the_reorder_reaches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let footer = |names: &[&str]| {
+        let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from("off"));
+        off.disabled = true;
+        let shown = names
+            .iter()
+            .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: std::iter::once(off).chain(shown).collect(),
+        });
+        app.tab = Tab::Overview;
+        settled_footer(&app, 80, 24)
+    };
+    assert_eq!(
+        footer(&["p1"]),
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit",
+        "one shown row beside a disabled account"
+    );
+    assert_eq!(
+        footer(&["p1", "p2"]),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit",
+        "two shown rows beside a disabled account"
+    );
+}
+
+/// An empty Models list advertises no row key: `↑↓` moves nothing there.
+#[test]
+fn an_empty_models_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_view = crate::tui::app::TokenView::Models;
+    app.token_stats = Some(crate::tokens::TokenStats::default());
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("c", "count cache"),
+            ("t", "period"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "back"),
+        ]
+    );
+}
+
+/// An unreadable token cache advertises the keys that act on it: `↵` shows
+/// the cause and `r` reloads.
+#[test]
+fn an_unreadable_token_cache_advertises_its_cause_and_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("↵", "cause"),
+            ("r", "reload"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}
+
+/// `x` leaves an unreadable token cache's failure in place (it is state, not
+/// a notification); `r` turns it back into a load in flight.
+#[test]
+fn r_reloads_an_unreadable_token_cache_and_x_leaves_it() {
+    use crate::testutil::key;
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    app.token_stats = None;
+    app.tokens_failed = true;
+    handle_key(&mut app, key(KeyCode::Char('x')));
+    assert!(app.tokens_failed, "x keeps the failure");
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    assert!(
+        !app.tokens_failed,
+        "r clears the failure while the reload runs"
+    );
+    assert!(app.tokens_topping_up, "r starts the reload");
+}
+
+/// An empty Status list advertises no row key: `↑↓` moves nothing and `↵`
+/// opens nothing there, from the incident count the key handler gates on.
+#[test]
+fn an_empty_status_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Status;
+    app.status.focus = crate::tui::app::StatusFocus::List;
+    assert!(
+        app.status.incidents.is_empty(),
+        "precondition: no incidents"
+    );
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}
+
+/// An empty Services list advertises no row key: `↑↓` moves nothing and `↵`
+/// descends into nothing there, from the same count the key handler gates on.
+#[test]
+fn an_empty_services_list_advertises_no_row_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Services;
+    app.services.focus = crate::tui::app::ServicesFocus::List;
+    assert_eq!(
+        tab_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    );
+}
+
+// ---- the token rows' `↵` hints ----
+
+/// A Setup card focused on `row` of an OAuth account `acct`. `login` stores a
+/// rotating pair (both token rows show, the clear row live); without it only
+/// the long-lived sidecar holds a credential, so the clear row is dimmed.
+/// `broken` quarantines the login, which dims the rolling-switch row.
+fn token_row_app(row: crate::tui::app::ConfigRow, login: bool, broken: bool) -> App {
+    use crate::profile::{ClaudeCredentials, OAuthToken, ProfileName};
+    use crate::tui::app::{ConfigFocus, config_rows};
+    let creds = |refresh: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "access".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let mut acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    if login {
+        acct.credentials = Some(creds(Some("refresh")));
+    }
+    let dir = crate::profile::profile_dir(&ProfileName::from("acct")).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds(None)).expect("serialize sidecar"),
+    )
+    .expect("write sidecar");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("acct")],
+            auth_broken: if broken {
+                vec![ProfileName::from("acct")]
+            } else {
+                vec![]
+            },
+            ..AppState::default()
+        },
+        profiles: vec![acct],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    // Descend the way a user does, so the card holds the draft an arm needs.
+    crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_focus,
+        ConfigFocus::Actions,
+        "the card holds focus"
+    );
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == row)
+        .unwrap_or_else(|| panic!("the card shows {row:?}"));
+    app
+}
+
+/// The two token rows name their action, and once armed their confirm, the way
+/// the delete row does.
+#[test]
+fn the_token_rows_name_their_enter_and_its_confirm() {
+    use crate::tui::app::ConfigRow;
+    for (row, verb, confirm) in [
+        (ConfigRow::ClearSessionToken, "clear", "confirm clear"),
+        (ConfigRow::RollingTokenSwitch, "switch", "confirm switch"),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = token_row_app(row, true, false);
+        let hints = tab_hints(&app);
+        assert!(
+            hints.contains(&("↵", verb)),
+            "{row:?} names its ↵: {hints:?}"
+        );
+        assert!(
+            !hints.contains(&("↵", "edit / toggle")),
+            "{row:?} drops the generic label: {hints:?}"
+        );
+        crate::tui::app::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            tab_hints(&app),
+            vec![("↵", confirm), ("esc", "cancel"), ("?", "help")],
+            "{row:?} armed"
+        );
+    }
+}
+
+/// A dimmed token row's `↵` does nothing, so its footer offers none.
+#[test]
+fn a_dimmed_token_row_offers_no_enter() {
+    use crate::tui::app::ConfigRow;
+    for (row, login, broken) in [
+        (ConfigRow::ClearSessionToken, false, false),
+        (ConfigRow::RollingTokenSwitch, true, true),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = token_row_app(row, login, broken);
+        let hints = tab_hints(&app);
+        assert!(
+            hints.iter().all(|(key, _)| *key != "↵"),
+            "{row:?} dimmed offers no ↵: {hints:?}"
+        );
+    }
+}
+
+// ---- a press that moves no selection changes nothing ----
+
+/// One fixture per walk arm: a one-row list hides its `↑↓` hint, and every
+/// arrow or page press that moves no selection leaves the arm's own state —
+/// the scrolled detail it used to reset — and the drawn frame untouched.
+#[test]
+fn a_lone_row_list_press_changes_nothing_on_any_walk_arm() {
+    use crate::tui::app::{Check, Health, StatusFocus, Tab, TokenView, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let frame = |app: &App| -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(200, 10)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+    let tokens = || {
+        let mut app = bare_app();
+        app.tab = Tab::Tokens;
+        app.token_view = TokenView::Models;
+        app.model_detail_focus = StatusFocus::List;
+        app.token_stats = Some(crate::tokens::TokenStats {
+            models: vec![crate::tokens::ModelTokens {
+                model: "claude-model-a".into(),
+                input: 1,
+                output: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app
+    };
+    let usage = || {
+        let mut app = bare_app();
+        app.config().profiles = vec![crate::profile::Profile::new("acct".to_string(), None, None)];
+        app.tab = Tab::Usage;
+        app
+    };
+    let status = || {
+        let mut app = bare_app();
+        app.tab = Tab::Status;
+        app.status.incidents = vec![crate::status::Incident {
+            id: "i0".into(),
+            title: "incident i0".into(),
+            link: "https://stspg.io/abc".into(),
+            phase: crate::status::UpdatePhase::Monitoring,
+            impact: crate::status::Impact::Minor,
+            started_ms: 1_780_740_881_000,
+            resolved_ms: None,
+            components: vec![],
+            updates: vec![],
+        }];
+        app
+    };
+    let services = || {
+        let mut app = bare_app();
+        app.tab = Tab::Services;
+        app.services.checks = vec![Check {
+            label: "rex",
+            health: Health::Ok,
+            detail: vec![],
+            fix: None,
+            problems: vec![],
+            shunt_focus: vec![],
+            shunt_action_start: None,
+        }];
+        app
+    };
+    // Each arm ends in list focus over one row, its detail scrolled for real,
+    // and its footer hiding `↑↓`. The Setup arm holds no scroll; its state is
+    // the pending pool landing a lone-row press used to clear.
+    type Arm = (&'static str, fn() -> App, fn(&App) -> String);
+    let prepare = |build: fn() -> App, name: &str| -> App {
+        let mut app = build();
+        if name == "setup" {
+            let hints = tab_hints(&app);
+            assert!(
+                hints.iter().all(|(k, _)| *k != "\u{2191}\u{2193}"),
+                "{name}: a lone row hides its walk: {hints:?}"
+            );
+            return app;
+        }
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let _ = frame(&app);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+        // A one-incident timeline can fit even a ten-row frame; the scroll
+        // the arm used to reset is the state this pins, so stand it in where
+        // no real scroll fits.
+        if name == "status" {
+            app.status.detail_scroll = 3;
+        }
+        if name == "services" {
+            app.services.detail_scroll = 2;
+            app.services.shunt_scroll.set(2);
+            app.services.diagnostic_focus = true;
+            app.services.land_on_herdr = true;
+        }
+        let hints = tab_hints(&app);
+        assert!(
+            hints.iter().all(|(k, _)| *k != "\u{2191}\u{2193}"),
+            "{name}: a one-row list hides its walk: {hints:?}"
+        );
+        app
+    };
+    let mut arms: Vec<Arm> = vec![
+        ("tokens models", tokens, |app| {
+            app.model_detail_scroll.to_string()
+        }),
+        ("usage", usage, |app| app.usage_detail_scroll.to_string()),
+        ("status", status, |app| app.status.detail_scroll.to_string()),
+        ("services", services, |app| {
+            format!(
+                "{},{},{},{}",
+                app.services.detail_scroll,
+                app.services.shunt_scroll.get(),
+                app.services.diagnostic_focus,
+                app.services.land_on_herdr
+            )
+        }),
+    ];
+    let mut setup_arm: Vec<Arm> = vec![(
+        "setup",
+        || {
+            let mut app = bare_app();
+            app.tab = Tab::Setup;
+            app.pending_pool_landing =
+                Some((crate::gateway_admin::PoolFamily::Claude, "pool".into()));
+            app
+        },
+        |app| app.pending_pool_landing.is_some().to_string(),
+    )];
+    arms.append(&mut setup_arm);
+
+    for (name, build, read) in arms {
+        let app = prepare(build, name);
+        let held = read(&app);
+        if name != "setup" {
+            // The Setup arm's non-default state is its own fixture's pending
+            // landing; every other arm builds it by scrolling.
+            assert_ne!(held, read(&build()), "{name}: the state is non-default");
+        }
+        let before = frame(&app);
+        assert_eq!(frame(&app), before, "{name}: control frame holds still");
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            let mut app = prepare(build, name);
+            handle_key(&mut app, crate::testutil::key(key));
+            assert_eq!(read(&app), held, "{name}: {key:?} changed state");
+            assert_eq!(frame(&app), before, "{name}: {key:?} changed the frame");
+        }
+    }
+}
+
+/// An armed token row whose gate closes (the daemon's sidecar re-stamp lands,
+/// a login is quarantined) drops its `↵ confirm`, keeping the way out: the
+/// handler refuses at the same gate, so a hidden confirm would be dead.
+#[test]
+fn an_armed_token_row_that_turns_dimmed_drops_its_confirm() {
+    use crate::claude::SessionTokenStatus;
+    use crate::profile::{ClaudeCredentials, OAuthToken, Profile, ProfileName};
+    use crate::tui::app::{ConfigFocus, ConfigRow, config_rows, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+
+    // The clear row: a flag-only account arms, then the sidecar cache entry
+    // the daemon's re-stamp writes closes the gate.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("acct");
+        let dir = crate::profile::profile_dir(&name).expect("profile dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut acct = Profile::new("acct".to_string(), None, None);
+        acct.rolling_token = true;
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![acct],
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(0);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.config_focus,
+            ConfigFocus::Actions,
+            "the card holds focus"
+        );
+        let pos = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::ClearSessionToken)
+            .expect("the clear row shows over the rolling flag");
+        app.config_action_cursor = pos;
+        assert!(tab_hints(&app).contains(&("↵", "clear")), "live row");
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            tab_hints(&app),
+            vec![("↵", "confirm clear"), ("esc", "cancel"), ("?", "help")],
+            "armed"
+        );
+        app.session_tokens
+            .insert("acct".to_string(), SessionTokenStatus::LongLived(None));
+        assert_eq!(
+            tab_hints(&app),
+            vec![("esc", "cancel"), ("?", "help")],
+            "the gate closed: the confirm drops, the way out stays"
+        );
+        let creds = ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "access".to_string(),
+                ..OAuthToken::default_extra()
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&creds).expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.config().profiles[0].rolling_token,
+            "the confirm press was refused at the gate"
+        );
+    }
+    // The switch row: a live login arms, then a quarantined login closes
+    // its gate.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("acct");
+        let mut acct = Profile::new("acct".to_string(), None, None);
+        acct.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        });
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: vec![name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![acct],
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(0);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.config_focus,
+            ConfigFocus::Actions,
+            "the card holds focus"
+        );
+        let pos = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::RollingTokenSwitch)
+            .expect("the switch row shows");
+        app.config_action_cursor = pos;
+        assert!(tab_hints(&app).contains(&("↵", "switch")), "live row");
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            tab_hints(&app),
+            vec![("↵", "confirm switch"), ("esc", "cancel"), ("?", "help")],
+            "armed"
+        );
+        app.config().state.auth_broken.push(name.clone());
+        assert_eq!(
+            tab_hints(&app),
+            vec![("esc", "cancel"), ("?", "help")],
+            "the gate closed: the confirm drops, the way out stays"
+        );
+    }
+}
+
+/// A dimmed, unarmed token row drops only its `↵`: the footer keeps the row
+/// walk and the `a actions` / `? help` / `q back` tail, as every other inert
+/// card row does, and the help lists no `↵` row for it.
+#[test]
+fn a_dimmed_token_row_keeps_the_walk_and_the_tail() {
+    use crate::tui::app::ConfigRow;
+    use crate::tui::render::modals::tests::{footer_of, help_of, wide_footer};
+    use crate::tui::render::prose::key_lit;
+    for (row, login, broken) in [
+        (ConfigRow::ClearSessionToken, false, false),
+        (ConfigRow::RollingTokenSwitch, true, true),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = token_row_app(row, login, broken);
+        assert_eq!(
+            tab_hints(&app),
+            vec![
+                ("↑↓", "row"),
+                ("a", "actions"),
+                ("?", "help"),
+                ("q", "back")
+            ],
+            "{row:?} dimmed"
+        );
+        assert_eq!(
+            wide_footer(&app),
+            footer_of(
+                &app,
+                &[
+                    ("←", "back"),
+                    ("↑↓", "row"),
+                    ("a", "actions"),
+                    ("?", "help"),
+                    ("q", "back"),
+                ]
+            ),
+            "{row:?} dimmed: the drawn footer"
+        );
+        assert_eq!(
+            help_of(&app),
+            vec![
+                ("\u{2191} \u{2193}", "move between rows"),
+                (
+                    "\u{21b5} on a field",
+                    concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+                ),
+                (
+                    "env",
+                    concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+                ),
+                (
+                    "a",
+                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+                ),
+                (
+                    "disable / enable",
+                    concat!(
+                        key_lit!("\u{21b5}"),
+                        " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                    ),
+                ),
+                (
+                    "delete",
+                    concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+                ),
+                ("esc", "stop editing / back to account list"),
+            ],
+            "{row:?} dimmed: the help"
+        );
+    }
 }

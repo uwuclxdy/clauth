@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
@@ -57,6 +59,34 @@ impl Drop for ApiUrlSandbox<'_> {
     }
 }
 
+// Test-only thread-start refusal switch, armed on the calling thread by
+// `fail_update_spawns`: while armed, `start_update_thread` poses the OS's
+// refusal with a stack size no kernel grants, so a test drives `spawn`'s
+// failure arm without exhausting the process's threads.
+#[cfg(all(test, unix))]
+thread_local! {
+    static SPAWN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Refuse the update-thread spawns on this thread, posing the one failure a
+/// test cannot (the box always has threads left). The returned guard disarms
+/// it on drop.
+#[cfg(all(test, unix))]
+pub(crate) fn fail_update_spawns() -> UpdateSpawnFailArm {
+    SPAWN_REFUSED.with(|refused| refused.set(true));
+    UpdateSpawnFailArm
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct UpdateSpawnFailArm;
+
+#[cfg(all(test, unix))]
+impl Drop for UpdateSpawnFailArm {
+    fn drop(&mut self) {
+        SPAWN_REFUSED.with(|refused| refused.set(false));
+    }
+}
+
 /// Env var: set to `1` to disable all background update work.
 const NO_UPDATE_ENV: &str = "CLAUTH_NO_UPDATE";
 
@@ -86,14 +116,250 @@ const METADATA_CALL_BOUND: Duration = Duration::from_secs(35);
 /// into the `MINISIGN_SECRET_KEY` GitHub Actions secret, the public key here.
 const MINISIGN_PUBLIC_KEY: &str = "RWS4HZQQuH8GjgSAz119H+6csSha0uFjoMKt3gx8Ror9Kvh3nObNSmVm";
 
-/// Outcome of the background update check. A failed check writes one
-/// `clauth.log` line and sends no event; only actionable results are reported.
+/// The wait between two checks of one update loop: one listing request an hour
+/// per running process, against GitHub's 60 unauthenticated requests an hour
+/// per address.
+const CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// A release's page, completed by its tag: where the line about a higher major
+/// sends the user to read the release note.
+const RELEASE_PAGE_URL: &str = "https://github.com/uwuclxdy/clauth/releases/tag/";
+
+/// What a check found that the user can act on, sent once per version per
+/// process. A failed check writes one `clauth.log` line and sends no event.
 pub(crate) enum UpdateEvent {
-    /// Newer release downloaded and self-installed; effective next launch.
+    /// Newer release downloaded and self-installed; this process runs it from
+    /// its next start (a unix daemon re-execs into it).
     Installed(String),
     /// Newer release exists but can't be self-applied (cargo install or no
     /// prebuilt asset); user must update manually.
     Available(String),
+    /// A release of a higher major version: never installed automatically, so
+    /// the user reads its release note and updates by hand.
+    MajorAvailable(String),
+}
+
+/// One process's update checker: the version it runs, the key and replace
+/// call its installs go through, and the versions it already told, so each
+/// line and event goes out once per version however many hours it runs.
+pub(crate) struct Updater {
+    current: &'static str,
+    public_key: &'static str,
+    /// A prebuilt asset exists for this platform and the binary is not
+    /// cargo's, so a newer same-major release installs; else it is only told.
+    can_self_install: bool,
+    /// Whether the binary on disk changed since this process started: a
+    /// process running an outdated image never installs over its successor.
+    binary_changed: Box<BinaryChanged>,
+    replace: Box<ReplaceCall>,
+    told: HashSet<String>,
+}
+
+/// The call that puts a verified, staged binary over the running one.
+type ReplaceCall = dyn Fn(&Path) -> io::Result<()> + Send;
+
+/// The check for a binary that changed on disk since this process started.
+type BinaryChanged = dyn Fn() -> bool + Send;
+
+impl Updater {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: CURRENT_VERSION,
+            public_key: MINISIGN_PUBLIC_KEY,
+            can_self_install: asset_name().is_some() && !is_cargo_installed(),
+            binary_changed: Box::new(|| {
+                crate::plugin_host::self_exe_change().is_some() || replaced_by_self_update()
+            }),
+            replace: Box::new(|staged: &Path| {
+                // The sandbox fence: a test build never replaces the test
+                // binary, whatever listing a test serves it.
+                if cfg!(test) {
+                    return Err(io::Error::other(
+                        "a test build never replaces its own binary",
+                    ));
+                }
+                self_replace::self_replace(staged)
+            }),
+            told: HashSet::new(),
+        }
+    }
+
+    /// Run one check against `api_url`, using `agent` for every metadata call
+    /// (listing, `sha256sums.txt`, `.minisig`). A failure writes exactly one
+    /// line; a release with nothing to do writes nothing.
+    fn check(
+        &mut self,
+        tx: &Sender<UpdateEvent>,
+        api_url: &str,
+        agent: &ureq::Agent,
+        gate: &ReplaceGate,
+    ) {
+        if let Err(e) = self.try_check(tx, api_url, agent, gate) {
+            logline!("update check failed: {e:#}");
+        }
+    }
+
+    fn try_check(
+        &mut self,
+        tx: &Sender<UpdateEvent>,
+        api_url: &str,
+        agent: &ureq::Agent,
+        gate: &ReplaceGate,
+    ) -> anyhow::Result<()> {
+        let release = fetch_latest(agent, api_url)?;
+        let tag = release.tag_name.as_str();
+        let version = tag.trim_start_matches('v');
+
+        // First, for every build kind: a major release may break what the user
+        // relies on, so it is only told, never downloaded.
+        if is_higher_major(tag, self.current) {
+            if self.told.insert(version.to_owned()) {
+                logline!(
+                    "v{version} is out and is not installed automatically: read its release \
+                     note, then update by hand ({RELEASE_PAGE_URL}{tag})"
+                );
+                send(tx, UpdateEvent::MajorAvailable(version.to_owned()));
+            }
+            return Ok(());
+        }
+        if !is_newer(tag, self.current) || (self.binary_changed)() {
+            return Ok(());
+        }
+
+        let asset = match asset_name() {
+            Some(asset) if self.can_self_install => asset,
+            _ => {
+                if self.told.insert(version.to_owned()) {
+                    logline!("update available: v{version}");
+                    send(tx, UpdateEvent::Available(version.to_owned()));
+                }
+                return Ok(());
+            }
+        };
+
+        let Some(asset_entry) = release.assets.iter().find(|a| a.name == asset) else {
+            anyhow::bail!("release {version} lists no {asset} asset; refusing update");
+        };
+        let url = asset_entry.browser_download_url.as_str();
+        let size = asset_entry.size;
+
+        // Ceiling, right after the listing parse and before any other request: a
+        // listing past this must not fetch the sums file or the signature.
+        if size > MAX_ASSET_BYTES {
+            anyhow::bail!(
+                "asset of {size} bytes exceeds the {MAX_ASSET_BYTES}-byte ceiling; refusing download"
+            );
+        }
+
+        let sums_url = derive_sums_url(url, asset);
+        if self.download_and_replace(url, &sums_url, asset, size, agent, gate)? {
+            logline!("updated to v{version}");
+            send(tx, UpdateEvent::Installed(version.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn download_and_replace(
+        &self,
+        url: &str,
+        sums_url: &str,
+        asset: &str,
+        size: u64,
+        agent: &ureq::Agent,
+        gate: &ReplaceGate,
+    ) -> anyhow::Result<bool> {
+        // 1. Fetch the sums file; treat any error as fail-closed (no integrity = no update).
+        let sums_text = agent
+            .get(sums_url)
+            .header("User-Agent", "clauth-updater")
+            .call()
+            .map_err(|e| anyhow::anyhow!("sha256sums.txt fetch failed (skipping update): {e}"))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| anyhow::anyhow!("sha256sums.txt read failed (skipping update): {e}"))?;
+
+        // 1b. Authenticate sha256sums.txt with the pinned minisign key BEFORE
+        //     trusting any hash it lists. No-op (no network call) while no key is
+        //     pinned; fail-closed (missing/invalid signature ⇒ no update) once one is.
+        verify_sums_signature(agent, self.public_key, sums_url, &sums_text)?;
+
+        let expected_hex = find_expected_sha(&sums_text, asset).ok_or_else(|| {
+            anyhow::anyhow!("asset {asset} not listed in sha256sums.txt; aborting")
+        })?;
+
+        let bytes = fetch_asset(url, size, download_budget(size))?;
+
+        if !verify_sha256(&bytes, &expected_hex) {
+            anyhow::bail!(
+                "SHA-256 mismatch for {asset}: download corrupted or tampered; aborting update"
+            );
+        }
+
+        // Read again after the download, which can take the whole budget: a
+        // binary replaced meanwhile belongs to a successor this process must
+        // not overwrite.
+        if (self.binary_changed)() {
+            return Ok(false);
+        }
+
+        replace_verified(&bytes, gate, &self.replace)
+    }
+}
+
+/// Deliver one event. The daemon keeps no receiver and a quitting TUI drops
+/// its own, so a closed channel is the expected end of the conversation, and
+/// the log line said beside each event already holds the news.
+fn send(tx: &Sender<UpdateEvent>, event: UpdateEvent) {
+    drop(tx.send(event));
+}
+
+/// The loop every daemon and TUI runs: a check at once, then one after each
+/// [`CHECK_INTERVAL`] that `wait` sits out (it answers `false` to end the
+/// loop). Before each check it asks `enabled`, so a round read off sends no
+/// request and the loop keeps waiting for the next.
+fn run_loop(
+    updater: &mut Updater,
+    tx: &Sender<UpdateEvent>,
+    api_url: &str,
+    agent: &ureq::Agent,
+    gate: &ReplaceGate,
+    mut enabled: impl FnMut() -> bool,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    loop {
+        if enabled() {
+            updater.check(tx, api_url, agent, gate);
+        }
+        if !wait(CHECK_INTERVAL) {
+            return;
+        }
+    }
+}
+
+/// The update toggle as it stands now: the SAVED `[update].auto_update`, read
+/// from disk on each call so a toggle saved in any TUI reaches every running
+/// loop, through [`updates_enabled`].
+fn updates_enabled_now() -> bool {
+    updates_enabled(saved_auto_update())
+}
+
+/// The saved `[update].auto_update`. A state file that fails to read answers
+/// off: it may hold an off the user saved, and an hourly loop loses only the
+/// rounds until the file reads again.
+fn saved_auto_update() -> bool {
+    crate::profile::load_app_state().is_ok_and(|state| state.update.auto_update)
+}
+
+/// One check of a fresh process's updater, the shape the whole-check tests
+/// drive.
+#[cfg(test)]
+fn run_check_with(
+    tx: &Sender<UpdateEvent>,
+    api_url: &str,
+    agent: &ureq::Agent,
+    gate: &ReplaceGate,
+) {
+    Updater::new().check(tx, api_url, agent, gate);
 }
 
 #[derive(Deserialize)]
@@ -117,37 +383,92 @@ pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The one shared update gate: the persisted `[update].auto_update` setting
 /// (default on — an absent table means on) AND `CLAUTH_NO_UPDATE` unset or
-/// not `"1"`. Both consumers — [`spawn`] and `herdr::heal_detached` — route
-/// through this so the env kill-switch and the saved toggle never disagree.
+/// not `"1"`. Every consumer — [`spawn`], each round of [`run_loop`] and
+/// `herdr::heal_detached` — routes through this so the env kill-switch and the
+/// saved toggle never disagree.
 pub(crate) fn updates_enabled(saved_auto_update: bool) -> bool {
     saved_auto_update && env::var(NO_UPDATE_ENV).as_deref() != Ok("1")
 }
 
-/// Spawn a background update check; applies if self-replaceable, toasts result.
-/// Returns the update thread (for a bounded exit wait), or `None` when the
-/// saved `auto_update` setting or `CLAUTH_NO_UPDATE` disables updates.
+/// [`run_loop`] as [`spawn`]'s thread runs it: the saved toggle read fresh
+/// each round, and the replace gate's stop-aware wait.
+fn run_hourly(
+    updater: &mut Updater,
+    tx: &Sender<UpdateEvent>,
+    api_url: &str,
+    agent: &ureq::Agent,
+    gate: &ReplaceGate,
+) {
+    run_loop(
+        updater,
+        tx,
+        api_url,
+        agent,
+        gate,
+        updates_enabled_now,
+        |interval| gate.sleep_unless_stopped(interval),
+    );
+}
+
+/// Start the update thread (`clauth-upd`), or hand back the error the OS
+/// refused it with. A test build on unix may pose that refusal through
+/// [`fail_update_spawns`], so its failure arm is reachable without exhausting
+/// the box's threads.
+fn start_update_thread(body: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle<()>> {
+    #[cfg(all(test, unix))]
+    let builder = if SPAWN_REFUSED.with(std::cell::Cell::get) {
+        // No kernel grants a stack this size, so the real `spawn` refuses.
+        std::thread::Builder::new().stack_size(usize::MAX)
+    } else {
+        std::thread::Builder::new()
+    };
+    #[cfg(not(all(test, unix)))]
+    let builder = std::thread::Builder::new();
+    builder.name("clauth-upd".into()).spawn(body)
+}
+
+/// Spawn the update loop ([`run_hourly`]): a check now and one each hour, each
+/// installing a newer same-major release where this build can self-install
+/// and telling the rest through `tx`. Returns the update thread (for a bounded
+/// exit wait), or `None` when the saved `auto_update` setting or
+/// `CLAUTH_NO_UPDATE` disables updates at the start, or the update thread
+/// cannot start (one line is logged, and the process runs on without update
+/// checks until it restarts).
 pub(crate) fn spawn(tx: Sender<UpdateEvent>, saved_auto_update: bool) -> Option<UpdateThread> {
     if !updates_enabled(saved_auto_update) {
         return None;
     }
     let gate = Arc::new(ReplaceGate::new());
-    let flag = Arc::clone(&gate);
-    #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
-    let handle = std::thread::Builder::new()
-        .name("clauth-upd".into())
-        .spawn(move || {
-            // A test build must never reach `api.github.com` or self-replace the
-            // test binary: end at once and drop the sender, so the receiver reads
-            // disconnected.
-            if cfg!(test) {
-                return;
-            }
-            let url = api_url();
-            let agent = make_agent();
-            run_check_with(&tx, &url, &agent, &flag);
-        })
-        .expect("failed to spawn update thread");
-    Some(UpdateThread { handle, gate })
+    let shared = Arc::clone(&gate);
+    let body = move || {
+        // A test build must never reach `api.github.com` or self-replace the
+        // test binary: end at once and drop the sender, so the receiver reads
+        // disconnected.
+        if cfg!(test) {
+            return;
+        }
+        run_hourly(&mut Updater::new(), &tx, &api_url(), &make_agent(), &shared);
+    };
+    match start_update_thread(body) {
+        Ok(handle) => Some(UpdateThread { handle, gate }),
+        Err(e) => {
+            logline!("update check failed: cannot start the update thread: {e}");
+            None
+        }
+    }
+}
+
+/// The daemon's update loop, gated at its start like the TUI's on the saved
+/// toggle. Nothing reads its events, so its log lines are its whole output;
+/// detached, it lives as long as the daemon.
+pub(crate) fn spawn_for_daemon() {
+    let (tx, _) = std::sync::mpsc::channel();
+    let thread = spawn(tx, saved_auto_update());
+    // A test build's loop returns before any request, so this line is the
+    // daemon start's only trace of the spawn and its start gate's verdict.
+    #[cfg(test)]
+    logline!("the update spawn ran (loop started: {})", thread.is_some());
+    drop(thread);
 }
 
 /// Set while this process's own self-update is replacing, or has replaced, the
@@ -209,28 +530,36 @@ const GATE_IDLE: u8 = 0;
 const GATE_REPLACING: u8 = 1;
 const GATE_ABANDONED: u8 = 2;
 
-/// The gate between the exit wait and the replace step. Once the wait gives up
-/// ([`ReplaceGate::abandon`]), a replace that has not started never starts (an
-/// exit would cut it short); while a replace runs ([`ReplaceGate::begin`] took
-/// the idle state), the wait cannot give up; after the replace ends, it can.
-struct ReplaceGate(AtomicU8);
+/// The gate between the exit wait and the update thread. Once the wait gives
+/// up ([`ReplaceGate::abandon`]), a replace that has not started never starts
+/// (an exit would cut it short); while a replace runs ([`ReplaceGate::begin`]
+/// took the idle state), the wait cannot give up; after the replace ends, it
+/// can. The wait's stop request ([`ReplaceGate::stop`]) ends a loop sleeping
+/// between checks at once, so an idle loop never holds the exit.
+struct ReplaceGate {
+    state: AtomicU8,
+    stopped: AtomicBool,
+}
 
 impl ReplaceGate {
     fn new() -> Self {
-        Self(AtomicU8::new(GATE_IDLE))
+        Self {
+            state: AtomicU8::new(GATE_IDLE),
+            stopped: AtomicBool::new(false),
+        }
     }
 
     /// Move idle -> replacing, returning a guard that restores idle on drop.
     /// `None` once abandoned (or while a replace already runs — which cannot
     /// happen: the guard is the only holder while replacing).
     fn begin(&self) -> Option<ReplaceGuard<'_>> {
-        match self.0.compare_exchange(
+        match self.state.compare_exchange(
             GATE_IDLE,
             GATE_REPLACING,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => Some(ReplaceGuard(&self.0)),
+            Ok(_) => Some(ReplaceGuard(&self.state)),
             Err(_) => None,
         }
     }
@@ -239,7 +568,7 @@ impl ReplaceGate {
     /// already-abandoned gate also answers `true`), `false` while a replace
     /// runs.
     fn abandon(&self) -> bool {
-        match self.0.compare_exchange(
+        match self.state.compare_exchange(
             GATE_IDLE,
             GATE_ABANDONED,
             Ordering::SeqCst,
@@ -250,9 +579,31 @@ impl ReplaceGate {
         }
     }
 
+    /// Ask the loop to end at its next wait; the caller unparks the loop's
+    /// thread so a wait already sleeping ends now.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// The loop's production wait, on the loop's own thread: sleep `interval`,
+    /// `true` once it passed, `false` as soon as a stop is asked. An unpark
+    /// that lands between the flag read and the park leaves its token, so the
+    /// park returns at once and the flag is read again.
+    fn sleep_unless_stopped(&self, interval: Duration) -> bool {
+        let deadline = Instant::now().checked_add(interval);
+        while !self.stopped.load(Ordering::SeqCst) {
+            let left = deadline.map_or(interval, |at| at.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::park_timeout(left);
+        }
+        false
+    }
+
     #[cfg(test)]
     fn is_replacing(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == GATE_REPLACING
+        self.state.load(Ordering::SeqCst) == GATE_REPLACING
     }
 }
 
@@ -269,8 +620,8 @@ impl Drop for ReplaceGuard<'_> {
 }
 
 /// The exit-wait handle for the background update thread: the [`JoinHandle`]
-/// plus the replace gate, so [`wait_on_exit`] can detach a slow download but
-/// never cut short a running self-replace.
+/// plus the replace gate, so [`UpdateThread::wait_on_exit`] can end a sleeping loop and
+/// detach a slow download but never cut short a running self-replace.
 pub(crate) struct UpdateThread {
     handle: JoinHandle<()>,
     gate: Arc<ReplaceGate>,
@@ -282,21 +633,24 @@ pub(crate) struct UpdateThread {
 const REPLACE_WAIT_CAP: Duration = Duration::from_secs(60);
 
 impl UpdateThread {
-    /// Wait for the update thread to finish; if it has not within
-    /// `detach_after`, give up the gate (so no replace can start after this
-    /// returns) — unless a replace is already running, in which case keep
-    /// waiting for it to end (polling at 50 ms), up to [`REPLACE_WAIT_CAP`]
-    /// past `detach_after`.
+    /// Stop the loop and wait for the update thread to finish: a loop sleeping
+    /// between checks ends at once, a check in flight runs on. If the thread
+    /// has not finished within `detach_after`, give up the gate (so no replace
+    /// can start after this returns) — unless a replace is already running, in
+    /// which case keep waiting for it to end (polling at 50 ms), up to
+    /// [`REPLACE_WAIT_CAP`] past `detach_after`.
     pub(crate) fn wait_on_exit(self, detach_after: Duration) {
-        let deadline = Instant::now() + detach_after;
-        while !self.handle.is_finished() && Instant::now() < deadline {
+        self.gate.stop();
+        self.handle.thread().unpark();
+        let started = Instant::now();
+        while !self.handle.is_finished() && started.elapsed() < detach_after {
             std::thread::sleep(Duration::from_millis(50));
         }
         if self.handle.is_finished() {
             return;
         }
-        let cap_deadline = Instant::now() + REPLACE_WAIT_CAP;
-        while Instant::now() < cap_deadline {
+        let detached = Instant::now();
+        while detached.elapsed() < REPLACE_WAIT_CAP {
             if self.handle.is_finished() {
                 return;
             }
@@ -306,66 +660,6 @@ impl UpdateThread {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-}
-
-/// Run one update check against `api_url`, using `agent` for every metadata
-/// call (listing, `sha256sums.txt`, `.minisig`). A failure writes exactly one
-/// `clauth.log` line; the up-to-date and cargo-installed paths are not failures
-/// and write nothing.
-fn run_check_with(
-    tx: &Sender<UpdateEvent>,
-    api_url: &str,
-    agent: &ureq::Agent,
-    gate: &ReplaceGate,
-) {
-    if let Err(e) = try_update(tx, api_url, agent, gate) {
-        logline!("update check failed: {e:#}");
-    }
-}
-
-fn try_update(
-    tx: &Sender<UpdateEvent>,
-    api_url: &str,
-    agent: &ureq::Agent,
-    gate: &ReplaceGate,
-) -> anyhow::Result<()> {
-    let release = fetch_latest(agent, api_url)?;
-
-    if !is_newer(&release.tag_name, CURRENT_VERSION) {
-        return Ok(());
-    }
-    let version = release.tag_name.trim_start_matches('v').to_string();
-
-    // Cargo install or unsupported platform: notify only.
-    let Some(asset) = asset_name() else {
-        let _ = tx.send(UpdateEvent::Available(version));
-        return Ok(());
-    };
-    if is_cargo_installed() {
-        let _ = tx.send(UpdateEvent::Available(version));
-        return Ok(());
-    }
-
-    let Some(asset_entry) = release.assets.iter().find(|a| a.name == asset) else {
-        anyhow::bail!("release {version} lists no {asset} asset; refusing update");
-    };
-    let url = asset_entry.browser_download_url.clone();
-    let size = asset_entry.size;
-
-    // Ceiling, right after the listing parse and before any other request: a
-    // listing past this must not fetch the sums file or the signature.
-    if size > MAX_ASSET_BYTES {
-        anyhow::bail!(
-            "asset of {size} bytes exceeds the {MAX_ASSET_BYTES}-byte ceiling; refusing download"
-        );
-    }
-
-    let sums_url = derive_sums_url(&url, asset);
-
-    if download_and_replace(&url, &sums_url, asset, size, agent, gate)? {
-        let _ = tx.send(UpdateEvent::Installed(version));
-    }
-    Ok(())
 }
 
 /// Build the `sha256sums.txt` URL from `asset_url` by replacing the asset filename.
@@ -437,15 +731,17 @@ fn verify_minisign(
         .map_err(|e| anyhow::anyhow!("minisign signature did not verify; refusing update: {e}"))
 }
 
-/// Fetch `sha256sums.txt.minisig` and verify it against `MINISIGN_PUBLIC_KEY`.
-/// No-op (and no network call) while the key is unset; fail-closed on any fetch
-/// or verification error once it's pinned.
+/// Fetch `sha256sums.txt.minisig` and verify it against `public_key`
+/// ([`MINISIGN_PUBLIC_KEY`] outside tests). No-op (and no network call) while
+/// the key is unset; fail-closed on any fetch or verification error once it's
+/// pinned.
 fn verify_sums_signature(
     agent: &ureq::Agent,
+    public_key: &str,
     sums_url: &str,
     sums_text: &str,
 ) -> anyhow::Result<()> {
-    if MINISIGN_PUBLIC_KEY.trim().is_empty() {
+    if public_key.trim().is_empty() {
         return Ok(());
     }
     let sig_url = format!("{sums_url}.minisig");
@@ -457,7 +753,7 @@ fn verify_sums_signature(
         .body_mut()
         .read_to_string()
         .map_err(|e| anyhow::anyhow!("signature read failed (skipping update): {e}"))?;
-    verify_minisign(MINISIGN_PUBLIC_KEY, sums_text.as_bytes(), &sig_text)
+    verify_minisign(public_key, sums_text.as_bytes(), &sig_text)
 }
 
 /// One agent for the metadata calls (release listing, `sha256sums.txt`,
@@ -468,6 +764,11 @@ fn metadata_agent(bound: Duration) -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_global(Some(bound))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into()
 }
@@ -508,61 +809,34 @@ fn fetch_asset(url: &str, size: u64, budget: Duration) -> anyhow::Result<Vec<u8>
         .map_err(|e| anyhow::anyhow!("asset download failed: {e}"))?
         .body_mut()
         .with_config()
-        // ureq 3.4.2's `limit(n)` errors the moment a read starts with `n` bytes
-        // already consumed, and `read_to_end` probes once more for EOF — so an
-        // exactly-`n`-byte body trips `limit(n)`. Bound at `size + 1`: `size`
-        // bytes read cleanly, anything larger is refused. Saturating so the
-        // bound can never overflow for an extreme listed size.
+        // ureq's `limit(n)` (3.4.2; unchanged through 3.5.1) errors the moment
+        // a read starts with `n` bytes already consumed, and `read_to_end`
+        // probes once more for EOF — so an exactly-`n`-byte body trips
+        // `limit(n)`. Bound at `size + 1`: `size` bytes read cleanly, anything
+        // larger is refused. Saturating so the bound can never overflow for an
+        // extreme listed size.
         .limit(size.saturating_add(1))
         .read_to_vec()
         .map_err(|e| anyhow::anyhow!("asset read failed: {e}"))
 }
 
-fn download_and_replace(
-    url: &str,
-    sums_url: &str,
-    asset: &str,
-    size: u64,
-    agent: &ureq::Agent,
+/// The replace step — staging, self-replace, cleanup — holds the gate so an
+/// exit wait never detaches mid-replace; the download before it is not gated. A
+/// refused begin (the exit wait already gave up) is silent: `Ok(false)`, so no
+/// log line and no `Installed` event — the process is exiting. The replace call
+/// itself is injected, so a test drives the step to failure without replacing
+/// the running binary.
+fn replace_verified(
+    bytes: &[u8],
     gate: &ReplaceGate,
+    replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> anyhow::Result<bool> {
-    // 1. Fetch the sums file; treat any error as fail-closed (no integrity = no update).
-    let sums_text = agent
-        .get(sums_url)
-        .header("User-Agent", "clauth-updater")
-        .call()
-        .map_err(|e| anyhow::anyhow!("sha256sums.txt fetch failed (skipping update): {e}"))?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| anyhow::anyhow!("sha256sums.txt read failed (skipping update): {e}"))?;
-
-    // 1b. Authenticate sha256sums.txt with the pinned minisign key BEFORE
-    //     trusting any hash it lists. No-op (no network call) until a key is
-    //     pinned; fail-closed (missing/invalid signature ⇒ no update) once one is.
-    verify_sums_signature(agent, sums_url, &sums_text)?;
-
-    let expected_hex = find_expected_sha(&sums_text, asset)
-        .ok_or_else(|| anyhow::anyhow!("asset {asset} not listed in sha256sums.txt; aborting"))?;
-
-    let bytes = fetch_asset(url, size, download_budget(size))?;
-
-    if !verify_sha256(&bytes, &expected_hex) {
-        anyhow::bail!(
-            "SHA-256 mismatch for {asset}: download corrupted or tampered; aborting update"
-        );
-    }
-
-    // The replace step — staging, self-replace, cleanup — holds the gate so an
-    // exit wait never detaches mid-replace; the download above is not gated. A
-    // refused begin (the exit wait already gave up) is silent: `Ok(false)`, so
-    // no log line and no `Installed` event — the process is exiting.
     let Some(_replace) = gate.begin() else {
         return Ok(false);
     };
-    let (_staging_dir, staged) = stage_verified(&bytes)?;
-    replace_marked(&staged, |staged| self_replace::self_replace(staged))?;
+    let (_staging_dir, staged) = stage_verified(bytes)?;
+    replace_marked(&staged, replace)?;
     // `_staging_dir` drops here, removing the staged file.
-
     Ok(true)
 }
 
@@ -669,6 +943,27 @@ pub(crate) fn is_newer(tag: &str, current: &str) -> bool {
         (Some(latest), Some(cur)) => latest > cur,
         _ => false,
     }
+}
+
+/// Whether `tag`'s major version is higher than `current`'s, the release the
+/// updater never installs. Only the leading major is read, so a tag whose full
+/// version does not parse (`v1.0.0-rc.1`, `1.0`) still counts; a side whose
+/// major does not parse never is.
+fn is_higher_major(tag: &str, current: &str) -> bool {
+    match (leading_major(tag), leading_major(current)) {
+        (Some(latest), Some(cur)) => latest > cur,
+        _ => false,
+    }
+}
+
+/// The leading major number of a version tag: an optional `v`, then the digits
+/// before the first `.`.
+fn leading_major(version: &str) -> Option<u32> {
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
 }
 
 #[cfg(test)]

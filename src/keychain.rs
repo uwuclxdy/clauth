@@ -385,8 +385,9 @@ const SECURITY_STDIN_LINE_MAX: usize = 4096;
 /// other macOS versions get. A blob past it is refused rather than sent — not
 /// the only non-destructive disposition (E2BIG past the break fails safe too),
 /// but the only one that names the size and the remediation instead of
-/// surfacing as a bare spawn failure.
-const SECURITY_ARGV_VALUE_MAX: usize = 512 * 1024;
+/// surfacing as a bare spawn failure. The value is defined in `runtime` beside
+/// the record cap because the credentials reads share the same bound.
+const SECURITY_ARGV_VALUE_MAX: usize = crate::runtime::CREDENTIALS_READ_CAP as usize;
 
 /// How [`put_blob_at`] hands one write to `security`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,7 +795,16 @@ fn merge_and_put_reporting_at(
     {
         return Ok(false);
     }
-    match merge_write(incoming, existing.as_ref(), keep) {
+    let merged = merge_write(incoming, existing.as_ref(), keep).map(|mut blob| {
+        // A switch's carry keeps the incoming store's own MCP logins while the
+        // MCP login sync is on; a relink keeping everything has nothing to
+        // keep apart.
+        if matches!(keep, Keep::CarriedOnly) {
+            crate::claude::keep_own_mcp_logins(&mut blob, incoming, None, None);
+        }
+        blob
+    });
+    match merged {
         Some(blob) => put_blob_at(service, account, &blob).map(|()| true),
         None => Ok(true),
     }
@@ -1341,7 +1351,7 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
         SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // A locked keychain's read exits 36 with nothing on stderr
-            // (measured 2026-10-29 on mac-6), so the classification's literal
+            // (measured 2026-10-29 on macOS), so the classification's literal
             // names the cause the empty bytes cannot.
             let shown = match (op, stderr.trim(), class.cause()) {
                 (SecurityOp::Read, "", Some(cause)) => cause,
@@ -1686,10 +1696,29 @@ pub(crate) fn keychain_hand_off_for_config_dir(
         Ok(Some(blob)) => blob,
         Err(e) => return sign_out_over_failed_read(&service, &account, &e),
     };
-    let landed = match crate::claude::carried_keys_of(&blob) {
+    let landed = match crate::claude::hand_off_carried_keys(&blob) {
         None => true,
         Some(carried) => match crate::claude::carry_item_keys_into_store(store, &carried) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Every other account's store too: an MCP login belongs to no
+                // Claude account, and the next swap may land the session on
+                // any of them. Best effort, never failing the hand-off, and on
+                // its own thread: it takes the state flock per store, which no
+                // wait inside this Keychain budget scope may. A failed spawn
+                // leaves it to the next MCP login sync: a running daemon's
+                // pass, or the next hand-off.
+                if let Err(e) = std::thread::Builder::new()
+                    .name("clauth-mcp-fan-out".into())
+                    .spawn(move || crate::claude::fan_out_carried_mcp_logins(&carried))
+                {
+                    logline!(
+                        "clauth: could not start copying the handed-off MCP server logins \
+                         into every account's store: {e}. The next MCP login sync copies \
+                         them (a running daemon's pass, or the next hand-off)"
+                    );
+                }
+                true
+            }
             Err(e) => {
                 logline!(
                     "clauth: could not save the per-session Keychain item's MCP server logins \
@@ -1719,6 +1748,88 @@ pub(crate) fn keychain_hand_off_for_config_dir(
         }
     }
     delete_at(&service, &account).map(|_| SignOutOutcome::SignedOut)
+}
+
+/// Re-point a live session's NAMESPACED item at `member`'s current rolling
+/// bearer when it still holds `revoked`, the one the member's last stamp
+/// replaced ([`crate::claude::repoint_copied_bearer`]). The item and the
+/// sidecar are read right before the write and the rule re-checked on what
+/// they hold then, so a save Claude Code made in between is judged as it is.
+/// An absent item is never created; only `claudeAiOauth` changes.
+///
+/// [`crate::runtime::ItemRepoint::NotHeld`] when the item is absent or no
+/// longer holds `revoked`; [`crate::runtime::ItemRepoint::NotYet`] when it
+/// does hold it but the sidecar is unreadable or cannot replace it yet;
+/// otherwise the item now holds the current bearer
+/// ([`crate::runtime::ItemRepoint::Written`]). A read that had its full
+/// [`SECURITY_TIMEOUT`] and failed on anything but the locked-keychain
+/// transient carries [`ItemReadFailed`].
+pub(crate) fn repoint_config_dir_item_bearer(
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+    revoked: &str,
+    sidecar: &Path,
+    member: &crate::profile::ProfileName,
+) -> Result<crate::runtime::ItemRepoint> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    anyhow::ensure!(
+        service == owned.service(),
+        "refusing to write per-session Keychain item `{service}`: the durable ownership row names \
+         `{}`",
+        owned.service()
+    );
+    let account = account()?;
+    // A read the caller's budget clamped below its own timeout can fail on
+    // that clamp alone, which proves nothing about the item.
+    let full_read = crate::lock::clamp_to_hold_budget(SECURITY_TIMEOUT) == SECURITY_TIMEOUT;
+    let read = read_blob_at(&service, &account).map_err(|e| {
+        if !full_read || failed_on_locked_keychain(&e) {
+            e
+        } else {
+            e.context(ItemReadFailed)
+        }
+    });
+    let Some(mut blob) = read? else {
+        return Ok(crate::runtime::ItemRepoint::NotHeld);
+    };
+    if !crate::claude::item_holds_revoked(&blob, revoked) {
+        return Ok(crate::runtime::ItemRepoint::NotHeld);
+    }
+    let Some(current) = std::fs::read(sidecar)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return Ok(crate::runtime::ItemRepoint::NotYet);
+    };
+    let behind = crate::claude::rolling_sidecar_behind_chain(member);
+    let now = crate::usage::now_ms() as i64;
+    if !crate::claude::repoint_copied_bearer(&mut blob, revoked, &current, now, behind) {
+        return Ok(crate::runtime::ItemRepoint::NotYet);
+    }
+    put_blob_at(&service, &account, &blob)?;
+    Ok(crate::runtime::ItemRepoint::Written)
+}
+
+/// Context on a re-point's item read that failed on anything but the
+/// locked-keychain transient: an access dialog denied or left unanswered, a
+/// read that ran out of time, or an item that does not parse. A read of an
+/// item Claude Code created can raise an access dialog, so the re-point gives
+/// such a session up rather than retrying it on the swap item retry's
+/// cadence.
+#[derive(Debug)]
+pub(crate) struct ItemReadFailed;
+
+impl std::fmt::Display for ItemReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not read the item")
+    }
+}
+
+/// Whether a failed Keychain call failed on the classified locked-keychain
+/// transient, which leaves the item untouched: a caller that leaves it for a
+/// later attempt logs nothing.
+pub(crate) fn failed_on_locked_keychain(e: &anyhow::Error) -> bool {
+    !crate::claude::failed_read_degrades_to_delete(classified_exit(e))
 }
 
 /// A sign-out over an item whose read FAILED: skip over the classified
@@ -1831,7 +1942,7 @@ fn sign_out_saving_at(
         crate::claude::SignOut::Delete => {
             logline!(
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login). Run `clauth <name>` to put one back"
+                 stores no Claude login). Run `clauth switch <name>` to put one back"
             );
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
