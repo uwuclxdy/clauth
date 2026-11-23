@@ -10,7 +10,7 @@
 //! mint one-caller abstractions, so the split stands over a single grab-bag
 //! `format.rs`.
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use ratatui::buffer::CellWidth;
 use ratatui::style::Style;
 use ratatui::text::Span;
@@ -1117,6 +1117,25 @@ pub(crate) fn local_day(epoch: i64) -> Option<NaiveDate> {
             .with_timezone(&Local)
             .date_naive(),
     )
+}
+
+/// The epoch second the local calendar day `day` starts: its local midnight,
+/// or, where a clock change skips midnight, midnight read at the offset the
+/// day before still had. `None` outside chrono's range.
+pub(crate) fn local_day_start(day: NaiveDate) -> Option<i64> {
+    let midnight = day.and_time(NaiveTime::MIN);
+    if let Some(start) = midnight.and_local_timezone(Local).earliest() {
+        return Some(start.timestamp());
+    }
+    let eve = day
+        .pred_opt()?
+        .and_time(NaiveTime::from_hms_opt(12, 0, 0)?)
+        .and_local_timezone(Local)
+        .earliest()?;
+    midnight
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(eve.offset().local_minus_utc()))
 }
 
 /// The local wall-clock date as `YYYY-MM-DD` — the contract's absolute-age

@@ -32,8 +32,8 @@ use crate::format::{DIAG_CREDITS_REFUSED, account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRow, StatRowKind, StatRowRaw};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, PlanEnd, ProfileActivity, QueueSlot,
-    StreakCounts, UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
+    ExtraPeriod, FetchStatus, KickBlock, LABEL_5H, ProfileActivity, QueueSlot, StreakCounts,
+    UsageWindow, WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak,
     kick_block_switch_grade, now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh,
     switch_grade_kick_lifts, usage_interval_ms,
 };
@@ -157,7 +157,7 @@ pub(super) fn draw(
 
     match app.usage_selection() {
         SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
-            draw_usage_detail(frame, detail, app, readings, toast_rects);
+            draw_usage_detail(frame, detail, app, readings, toast_rects, now_epoch_secs());
         }
         SetupSelection::Item(MainItemKind::Codex(_)) => draw_codex_usage_detail(frame, detail, app),
         SetupSelection::Item(MainItemKind::Shunt(..)) => {
@@ -205,6 +205,7 @@ fn draw_usage_detail(
     app: &App,
     readings: &ReadingsSnapshot,
     toast_rects: &[Rect],
+    now: i64,
 ) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
@@ -243,6 +244,8 @@ fn draw_usage_detail(
     // rank below it) — the spend-uncapped check under the guard never re-reads
     // the durable verdict per member.
     let key_rejected = app.key_rejected_names();
+    // Read before the Config lock too, which the store ranks below.
+    let dead_logins = super::overview::dead_logins(app);
     let cfg = app.config();
     let profile = cfg.profiles.get(
         app.profile_cursor
@@ -377,10 +380,15 @@ fn draw_usage_detail(
         }
         None => (inner, None),
     };
+    let plan_frame = PlanFrame {
+        now,
+        login_dead: super::overview::login_dead(app, &cfg, profile, &dead_logins, now),
+    };
     let lines = build_usage_lines(
         profile,
         inner.width,
         &header,
+        plan_frame,
         app,
         readings,
         show_estimates,
@@ -683,6 +691,7 @@ fn build_usage_lines(
     profile: &Profile,
     inner_w: u16,
     header: &HeaderState,
+    plan_frame: PlanFrame,
     app: &App,
     readings: &ReadingsSnapshot,
     show_estimates: bool,
@@ -690,7 +699,7 @@ fn build_usage_lines(
     reset_fmt: ResetFmt,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, header, inner_w, readings));
+    lines.extend(header_lines(profile, header, plan_frame, inner_w, readings));
     lines.push(Line::from(""));
     // The banked-reset row sits right under the plan row, ahead of the
     // pricing and status rows: the account's resets read as part of its
@@ -1620,6 +1629,7 @@ fn bar_spans(
 fn header_lines(
     profile: &Profile,
     header: &HeaderState,
+    plan_frame: PlanFrame,
     inner_w: u16,
     readings: &ReadingsSnapshot,
 ) -> Vec<Line<'static>> {
@@ -1659,7 +1669,7 @@ fn header_lines(
     // leaves: the countdown and its gap stay reserved, so the date drops
     // before the countdown shortens.
     let kick_room = kick.as_deref().map_or(0, |k| grapheme_cells(k) + KICK_GAP);
-    if let Some((text, style)) = plan_end_tail(profile, readings) {
+    if let Some((text, style)) = plan_end_tail(profile, plan_frame, readings) {
         let tail = format!(" · {text}");
         let tail_w = grapheme_cells(&tail);
         if left_w + tail_w + kick_room <= row_w {
@@ -1678,18 +1688,36 @@ fn header_lines(
     lines
 }
 
-/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: a plan
-/// marked ending in the warning color, a renewal faint. `None` when no date
+/// The frame facts the `plan` row's date reads beside the profile and its
+/// reading: the wall clock (epoch seconds), read once per frame, and whether
+/// the Overview's marker column draws the account's login dead
+/// ([`super::overview::login_dead`]).
+#[derive(Clone, Copy)]
+struct PlanFrame {
+    now: i64,
+    login_dead: bool,
+}
+
+/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: the
+/// warning color exactly while the Overview flags the date in its plan chip
+/// ([`super::overview::plan_chip`]), faint otherwise. `None` when no date
 /// applies, a renewal included on a plan whose reading says it cannot serve
 /// (the status the Overview's `⊖` marks).
-fn plan_end_tail(profile: &Profile, readings: &ReadingsSnapshot) -> Option<(String, Style)> {
-    let today = crate::format::local_day(now_epoch_secs())?;
+fn plan_end_tail(
+    profile: &Profile,
+    frame: PlanFrame,
+    readings: &ReadingsSnapshot,
+) -> Option<(String, Style)> {
+    let today = crate::format::local_day(frame.now)?;
     let refuses_service =
         crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name));
     let end = profile.plan_dates().end(today, refuses_service)?;
-    let style = match end {
-        PlanEnd::Renews(_) => theme::faint(),
-        PlanEnd::Ends(_) => theme::warning(),
+    let flagged =
+        super::overview::plan_chip(profile, readings, frame.login_dead, frame.now).is_some();
+    let style = if flagged {
+        theme::warning()
+    } else {
+        theme::faint()
     };
     Some((plan_end_text(end, today), style))
 }

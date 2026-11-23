@@ -1301,10 +1301,15 @@ fn header_lines_plan_falls_back_to_account_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     let expected = crate::format::account_tier(&profile, None)
         .and_then(|t| t.display())
         .expect("a 'max' token claims a tier");
@@ -1376,10 +1381,9 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+    let plan_row: String = header_lines(&profile, &header, sound_frame(), 52, &readings)
         .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("Claude Ultra"),
         "hybrid plan row shows its fetched tier, got {plan_row:?}"
@@ -1429,25 +1433,99 @@ fn header_lines_plan_shows_the_server_plan_name() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+    let plan_row: String = header_lines(&profile, &header, sound_frame(), 52, &readings)
         .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("Claude Ultra Lite"),
         "the plan row shows the server's name, got {plan_row:?}"
     );
 }
 
-/// The `plan` row names the next billing day off `plan_renews`, faint, and a
-/// marked `plan_ends` in its place in the warning color, `ended` once past
-/// unless a `plan_renews` later than it is set; a row too narrow for the
-/// phrase keeps the plan name alone. Dates are seeded off the same local day
-/// the render reads.
+/// Noon local on 2020-04-06, the `plan` row fixtures' frame clock: years
+/// before any real run.
+fn plan_now() -> i64 {
+    chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2020, 4, 6, 12, 0, 0)
+        .single()
+        .expect("an hour no clock change skips or repeats")
+        .timestamp()
+}
+
+/// The frame facts at [`plan_now`] for an account whose login is sound.
+fn sound_frame() -> PlanFrame {
+    PlanFrame {
+        now: plan_now(),
+        login_dead: false,
+    }
+}
+
+/// The Usage tab's `plan` tail at [`plan_now`] for a lone account `a` whose
+/// plan ends tomorrow while its 7d week resets two days out, with `adjust`
+/// applied to the built config: returns the `(1d)` tail's row and its last
+/// cell's foreground.
+fn plan_tail_drawn(
+    adjust: impl FnOnce(&mut crate::profile::AppConfig),
+) -> (String, ratatui::style::Color) {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let now = plan_now();
+    let tomorrow = crate::format::local_day(now)
+        .expect("the frame clock's local day")
+        .succ_opt()
+        .expect("a next day");
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.plan_ends = Some(tomorrow);
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 30.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 2 * 86_400)),
+            }),
+            ..Default::default()
+        },
+    );
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    adjust(&mut config);
+    let mut app = App::new(config);
+    app.profile_cursor.set(0);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|row| row.contains("(1d)"))
+        .unwrap_or_else(|| panic!("the plan tail draws: {rows:#?}")) as u16;
+    let row = &rows[usize::from(y)];
+    let at = row.find("(1d)").expect("the tail text");
+    let x = row[..at].chars().count() as u16 + "(1d)".chars().count() as u16 - 1;
+    (row.clone(), buf.cell((x, y)).expect("the tail cell").fg)
+}
+
+/// The `plan` row names the next billing day off `plan_renews` and a marked
+/// `plan_ends` in its place, `ended` once past unless a `plan_renews` later
+/// than it is set, all faint: with no 7d reading the Overview flags none of
+/// them. A row too narrow for the phrase keeps the plan name alone.
 #[test]
 fn header_lines_plan_names_the_renewal_or_the_marked_end() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
     let readings = snap_with_usage(
         ReadingsSnapshot::default(),
         "dated",
@@ -1473,10 +1551,9 @@ fn header_lines_plan_names_the_renewal_or_the_marked_end() {
         peak: None,
     };
     let row = |profile: &crate::profile::Profile, width: u16| -> Vec<Span<'static>> {
-        header_lines(profile, &header, width, &readings)
+        header_lines(profile, &header, sound_frame(), width, &readings)
             .first()
-            .map(|l| l.spans.clone())
-            .unwrap_or_default()
+            .map_or_default(|l| l.spans.clone())
     };
     // Each case: the row's text and its last span's style.
     let shown = |profile: &crate::profile::Profile, width: u16| {
@@ -1489,54 +1566,40 @@ fn header_lines_plan_names_the_renewal_or_the_marked_end() {
     };
     let body = crate::tui::theme::body();
     let faint = crate::tui::theme::faint();
-    let warning = crate::tui::theme::warning();
-    let (cases, expected) = crate::testutil::on_one_local_day(|today| {
-        // `nov 2`: chrono's own month and day, never the render's table.
-        let spoken = |days: i64| {
-            (today + chrono::Duration::days(days))
-                .format("%b %-d")
-                .to_string()
-                .to_lowercase()
-        };
-        let mut profile = profile.clone();
-        let mut cases = vec![shown(&profile, 52)];
-        profile.plan_renews = Some(today + chrono::Duration::days(20));
-        cases.push(shown(&profile, 52));
-        profile.plan_ends = Some(today + chrono::Duration::days(10));
-        cases.push(shown(&profile, 52));
-        cases.push(shown(&profile, 24));
-        profile.plan_ends = Some(today);
-        cases.push(shown(&profile, 52));
-        profile.plan_ends = Some(today - chrono::Duration::days(1));
-        profile.plan_renews = None;
-        cases.push(shown(&profile, 52));
-        // A billing day set after the plan's marked end: the plan came back.
-        profile.plan_ends = Some(today - chrono::Duration::days(30));
-        profile.plan_renews = Some(today + chrono::Duration::days(20));
-        cases.push(shown(&profile, 52));
-        let expected = vec![
-            ("plan      Claude Ultra".to_string(), body),
-            (
-                format!("plan      Claude Ultra · renews {} (20d)", spoken(20)),
-                faint,
-            ),
-            (
-                format!("plan      Claude Ultra · ends {} (10d)", spoken(10)),
-                warning,
-            ),
-            ("plan      Claude Ultra".to_string(), body),
-            ("plan      Claude Ultra · ends today".to_string(), warning),
-            (
-                format!("plan      Claude Ultra · ended {}", spoken(-1)),
-                warning,
-            ),
-            (
-                format!("plan      Claude Ultra · renews {} (20d)", spoken(20)),
-                faint,
-            ),
-        ];
-        (cases, expected)
-    });
+    let today = chrono::NaiveDate::from_ymd_opt(2020, 4, 6).expect("the fixture's day");
+    let mut cases = vec![shown(&profile, 52)];
+    profile.plan_renews = Some(today + chrono::Duration::days(20));
+    cases.push(shown(&profile, 52));
+    profile.plan_ends = Some(today + chrono::Duration::days(10));
+    cases.push(shown(&profile, 52));
+    cases.push(shown(&profile, 24));
+    profile.plan_ends = Some(today);
+    cases.push(shown(&profile, 52));
+    profile.plan_ends = Some(today - chrono::Duration::days(1));
+    profile.plan_renews = None;
+    cases.push(shown(&profile, 52));
+    // A billing day set after the plan's marked end: the plan came back.
+    profile.plan_ends = Some(today - chrono::Duration::days(30));
+    profile.plan_renews = Some(today + chrono::Duration::days(20));
+    cases.push(shown(&profile, 52));
+    let expected = vec![
+        ("plan      Claude Ultra".to_string(), body),
+        (
+            "plan      Claude Ultra · renews apr 26 (20d)".to_string(),
+            faint,
+        ),
+        (
+            "plan      Claude Ultra · ends apr 16 (10d)".to_string(),
+            faint,
+        ),
+        ("plan      Claude Ultra".to_string(), body),
+        ("plan      Claude Ultra · ends today".to_string(), faint),
+        ("plan      Claude Ultra · ended apr 5".to_string(), faint),
+        (
+            "plan      Claude Ultra · renews apr 26 (20d)".to_string(),
+            faint,
+        ),
+    ];
     assert_eq!(
         cases, expected,
         "no date; a renewal; a marked end over it; no room; ending today; \
@@ -1579,7 +1642,7 @@ fn header_lines_plan_shows_no_renewal_for_a_plan_that_cannot_serve() {
             },
         );
         // Wide enough for `· renews dec 15, 2099 (…d)` beside the plan name.
-        header_lines(&profile, &header, 80, &readings)
+        header_lines(&profile, &header, sound_frame(), 80, &readings)
             .first()
             .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect())
     };
@@ -1632,42 +1695,175 @@ fn header_lines_plan_date_takes_only_the_room_the_countdown_leaves() {
         },
     );
     let kick = "usage auto-start in 2h 28m";
-    let (rows, expected) = crate::testutil::on_one_local_day(|today| {
-        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        profile.auto_start = true;
-        profile.plan_renews = Some(today + chrono::Duration::days(20));
-        let rows = [52, 48, 72].map(|width| {
-            header_lines(&profile, &header, width, &readings)
-                .first()
-                .map_or_default(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.clone())
-                        .collect::<String>()
-                })
-        });
-        let tail = format!(
-            " · renews {} (20d)",
-            (today + chrono::Duration::days(20))
-                .format("%b %-d")
-                .to_string()
-                .to_lowercase()
-        );
-        // `plan` + the no-data dash measure 11 cells.
-        let flush = |width: usize, left: &str| {
-            format!(
-                "{left}{}{kick}",
-                " ".repeat(width - left.chars().count() - kick.chars().count())
-            )
-        };
-        let expected = [
-            flush(52, "plan      —"),
-            flush(48, "plan      —"),
-            flush(72, &format!("plan      —{tail}")),
-        ];
-        (rows, expected)
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.auto_start = true;
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2020, 4, 26);
+    let rows = [52, 48, 72].map(|width| {
+        header_lines(&profile, &header, sound_frame(), width, &readings)
+            .first()
+            .map_or_default(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
     });
+    let tail = " · renews apr 26 (20d)";
+    // `plan` + the no-data dash measure 11 cells.
+    let flush = |width: usize, left: &str| {
+        format!(
+            "{left}{}{kick}",
+            " ".repeat(width - left.chars().count() - kick.chars().count())
+        )
+    };
+    let expected = [
+        flush(52, "plan      —"),
+        flush(48, "plan      —"),
+        flush(72, &format!("plan      —{tail}")),
+    ];
     assert_eq!(rows, expected, "(52, 48, 72) cells");
+}
+
+/// The `plan` row's date reads in the warning color exactly while the
+/// Overview's plan chip flags it, faint otherwise, for a renewal and a marked
+/// end alike: a day starting before the 7d window's reset, today's included,
+/// is amber; a day starting past the reset, an end months away, a reading
+/// with no 7d window, an account whose login the Overview marks dead and a
+/// canceled plan's marked end are faint.
+#[test]
+fn header_lines_plan_tail_is_amber_exactly_while_the_overview_flags_it() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let local_at = |d: u32, hour: u32| {
+        chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2020, 4, d, hour, 0, 0)
+            .single()
+            .expect("an hour no clock change skips or repeats")
+            .timestamp()
+    };
+    let day = |m: u32, d: u32| chrono::NaiveDate::from_ymd_opt(2020, m, d);
+    let week = Some(local_at(11, 18));
+    let tail = |status: &str, ends, renews, reset: Option<i64>, login_dead: bool| {
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+        profile.plan_ends = ends;
+        profile.plan_renews = renews;
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "dated",
+            crate::usage::UsageInfo {
+                plan: Some(crate::usage::PlanInfo {
+                    tier: crate::usage::PlanTier::Max(Some(20)),
+                    subscription_status: Some(status.to_string()),
+                    ..Default::default()
+                }),
+                seven_day: reset.map(|reset| crate::usage::UsageWindow {
+                    utilization: 30.0,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(reset)),
+                }),
+                ..Default::default()
+            },
+        );
+        let header = HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        };
+        let frame = PlanFrame {
+            now: plan_now(),
+            login_dead,
+        };
+        let spans = header_lines(&profile, &header, frame, 80, &readings)
+            .first()
+            .map_or_default(|l| l.spans.clone());
+        (
+            spans.last().map_or_default(|s| s.content.to_string()),
+            spans.last().map_or_default(|s| s.style),
+        )
+    };
+    let warning = crate::tui::theme::warning();
+    let faint = crate::tui::theme::faint();
+    assert_eq!(
+        [
+            tail("active", None, day(1, 9), week, false),
+            tail("active", None, day(3, 6), week, false),
+            tail("active", day(4, 10), None, week, false),
+        ],
+        [
+            (" · renews apr 9 (3d)".to_string(), warning),
+            (" · renews today".to_string(), warning),
+            (" · ends apr 10 (4d)".to_string(), warning),
+        ],
+        "(a renewal before the reset, one today, an end before the reset)"
+    );
+    assert_eq!(
+        [
+            tail("active", None, day(1, 9), Some(local_at(7, 18)), false),
+            tail("active", day(7, 5), None, week, false),
+            tail("active", day(4, 10), None, None, false),
+            tail("active", day(4, 10), None, week, true),
+            tail("canceled", day(4, 10), None, week, false),
+        ],
+        [
+            (" · renews apr 9 (3d)".to_string(), faint),
+            (" · ends jul 5 (90d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+        ],
+        "(a renewal past the reset, an end months away, no 7d reading, a dead login, \
+         a canceled plan before the reset)"
+    );
+}
+
+/// A disabled account selected in the Usage tab reads its `plan` tail faint:
+/// the chip predicate refuses the account, so a plan day before the week's
+/// reset never flags amber. The same account enabled reads the tail amber.
+#[test]
+fn draw_usage_detail_disabled_account_reads_a_faint_plan_tail() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["a"]);
+    let (flagged, flagged_fg) = plan_tail_drawn(|_| {});
+    assert_eq!(
+        flagged_fg,
+        theme::warning_color(),
+        "control, enabled: the flagged tail is amber: {flagged}"
+    );
+    let (disabled, disabled_fg) = plan_tail_drawn(|c| c.profiles[0].disabled = true);
+    assert_eq!(
+        disabled_fg,
+        theme::text_faint_color(),
+        "a disabled account's tail is faint: {disabled}"
+    );
+}
+
+/// The `plan` tail's amber comes through `draw_usage_detail`'s own `PlanFrame`
+/// wire-up, not only through `header_lines`: at [`plan_now`] an account whose
+/// plan day is tomorrow and whose 7d week resets two days out draws the tail
+/// amber, and the same account with a broken login draws it faint.
+#[test]
+fn draw_usage_detail_plan_tail_follows_the_overview_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["a"]);
+    let (live, live_fg) = plan_tail_drawn(|_| {});
+    assert_eq!(
+        live_fg,
+        theme::warning_color(),
+        "the flagged tail is amber: {live}"
+    );
+    let (dead, dead_fg) = plan_tail_drawn(|c| c.state.auth_broken.push("a".into()));
+    assert_eq!(
+        dead_fg,
+        theme::text_faint_color(),
+        "a dead login's tail is faint: {dead}"
+    );
 }
 
 /// With no fetched plan AND no tier the token can claim, the `plan` row takes
@@ -1701,7 +1897,13 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let lines = header_lines(&profile, &header, 52, &ReadingsSnapshot::default());
+    let lines = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    );
     let plan_line = lines.first().expect("plan row");
     let value = plan_line.spans.last().expect("plan value span");
     assert_eq!(value.content, "—", "plan value, got {:?}", plan_line.spans);
@@ -1753,7 +1955,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             diag: DiagFlags::default(),
             peak: None,
         };
-        header_lines(&profile, &header, 52, &readings)
+        header_lines(&profile, &header, sound_frame(), 52, &readings)
             .iter()
             .map(|l| {
                 l.spans
@@ -1877,7 +2079,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         peak: None,
     };
     let row = |w: u16| {
-        header_lines(&profile, &header, w, &readings)[0]
+        header_lines(&profile, &header, sound_frame(), w, &readings)[0]
             .spans
             .iter()
             .map(|s| s.content.clone())
@@ -1925,10 +2127,15 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         !plan_row.contains("api"),
         "a key with no endpoint has no third-party arm to head: {plan_row:?}"
@@ -1945,6 +2152,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         &profile,
         52,
         &header,
+        sound_frame(),
         &app,
         &ReadingsSnapshot::default(),
         true,
@@ -1993,10 +2201,15 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("api"),
         "api-key plan row stays 'api', got {plan_row:?}"
@@ -2062,7 +2275,13 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     // names the STATUS. Folding "canceled" into the tier is what made the JSON
     // surfaces disagree about the same account, and this is where a reader
     // would first be tempted to do it again.
-    let header_text = text(header_lines(&profile, &header, 120, &readings));
+    let header_text = text(header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        120,
+        &readings,
+    ));
     let plan_row = header_text.lines().next().expect("plan row");
     assert!(
         plan_row.contains("Claude Free") && !plan_row.contains("canceled"),
@@ -3765,8 +3984,17 @@ fn the_usage_pane_draws_the_failed_fetch_mark_from_the_streak_store() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
         rows.iter().any(|row| row.contains("[ cached ]")),
@@ -4124,7 +4352,7 @@ fn render_usage_buffer(u: crate::usage::UsageInfo, auto_start: bool) -> ratatui:
     );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
         .expect("draw");
     term.backend().buffer().clone()
 }
@@ -4277,7 +4505,7 @@ fn a_plan_with_no_five_hour_limit_takes_no_burn_rate() {
     );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let at = rows
@@ -4335,7 +4563,7 @@ fn the_usage_tab_sizes_the_queue_without_a_plan_that_has_no_five_hour_limit() {
     let rows_of = |readings: &ReadingsSnapshot| -> Vec<String> {
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[]))
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[], now_epoch_secs()))
             .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
@@ -4454,7 +4682,7 @@ fn a_hybrid_plan_with_no_five_hour_limit_is_judged_off_its_oauth_entry() {
         app.profile_cursor.set(cursor);
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
             .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
@@ -5353,10 +5581,16 @@ fn header_lines_pricing_row_only_with_windows() {
             next_flip: Some((false, 60)),
         }),
     };
-    let rows: Vec<String> = header_lines(&profile, &base, 60, &ReadingsSnapshot::default())
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+    let rows: Vec<String> = header_lines(
+        &profile,
+        &base,
+        sound_frame(),
+        60,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    .collect();
     assert!(
         rows.iter().any(|r| r.contains("pricing")),
         "windowed profile gets the row: {rows:?}"
@@ -5366,10 +5600,16 @@ fn header_lines_pricing_row_only_with_windows() {
     assert!(idx == 1, "second header row, under plan: {rows:?}");
 
     let flat = HeaderState { peak: None, ..base };
-    let rows: Vec<String> = header_lines(&profile, &flat, 60, &ReadingsSnapshot::default())
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+    let rows: Vec<String> = header_lines(
+        &profile,
+        &flat,
+        sound_frame(),
+        60,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    .collect();
     assert!(
         !rows.iter().any(|r| r.contains("pricing")),
         "flat pricing renders no row: {rows:?}"
@@ -5696,8 +5936,17 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     let fetch_row = rows
@@ -5750,8 +5999,17 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     assert!(
@@ -5795,8 +6053,17 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     // Border `│` + 1 block-padding cell + the 2-cell indent = 3 leading cells.
@@ -5865,8 +6132,17 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     assert!(
@@ -8102,8 +8378,17 @@ fn a_keyless_proxy_account_holding_a_pair_names_its_login_in_the_empty_body() {
         app.profile_cursor.set(0);
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-            .expect("draw");
+        term.draw(|f| {
+            draw_usage_detail(
+                f,
+                f.area(),
+                &app,
+                &app.readings_snapshot(),
+                &[],
+                now_epoch_secs(),
+            )
+        })
+        .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
     let proxy_row = format!(
@@ -8193,8 +8478,17 @@ fn usage_detail_rows(profile: crate::profile::Profile, width: u16) -> Vec<String
     app.profile_cursor.set(0);
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
