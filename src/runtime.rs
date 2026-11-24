@@ -2065,12 +2065,12 @@ fn gc_codex_homes() {
     if candidates.is_empty() {
         return;
     }
-    let _ = with_state_lock(|_held| {
+    drop(with_state_lock(|_held| {
         for (home, sessions) in candidates {
             // The liveness read and the removal BOTH belong under the state
             // lock, because the acquire's whole critical section runs under it
             // and the marker's flock is taken AFTER the home is built. Read
-            // unlocked, the entire `build_codex_home` window shows a home
+            // unlocked, the entire `build_codex_home_with` window shows a home
             // present beside a marker dir that is empty — indistinguishable
             // from a crash's leftover — and this sweep would reap a session
             // that is starting. Under the lock the only two states left are
@@ -2086,7 +2086,7 @@ fn gc_codex_homes() {
             }
         }
         Ok::<_, anyhow::Error>(())
-    });
+    }));
 }
 
 fn gc_runtime_trees() {
@@ -14786,7 +14786,24 @@ fn codex_config_names(dir: &Path) -> impl Iterator<Item = String> {
 ///   `create_dir_all` cannot pass a dangling dir link). Isolated: a real
 ///   per-session `sessions/`, discarded by design. Fake: the home IS the
 ///   global store.
-fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
+/// - `.credentials.json` and `mcp-oauth-locks` — shared flavor under real
+///   symlinks, with `sync_mcp_logins` on: see [`share_codex_mcp_oauth`].
+///
+/// `opts` are the profile's codex knobs as the caller read them, and
+/// `sync_mcp_logins` the global toggle as it read it, so the teardown acts on
+/// the same decision. Returns, when the home shares the operator's MCP OAuth
+/// logins, the record of the `.credentials.json` the home held when this build
+/// ended, read from the home's own path after the share attempt, whatever that
+/// attempt did (linked the operator's file, found a file already there, placed
+/// nothing, or failed): the one input of [`carry_codex_mcp_oauth_back`].
+fn build_codex_home_with(
+    home: &Path,
+    name: &str,
+    isolation: Isolation,
+    mode: LinkMode,
+    opts: &CodexProfileOpts,
+    sync_mcp_logins: bool,
+) -> Result<Option<McpOauthAtBuild>> {
     let operator = operator_codex_home()?;
     let global = codex_global_home(name)?;
     let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
@@ -14817,7 +14834,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
     }
 
-    let link_hooks = isolation == Isolation::Shared && codex_profile_opts(name).hooks_json;
+    let link_hooks = isolation == Isolation::Shared && opts.hooks_json;
     let (operator_hooks, session_hooks) = (operator.join("hooks.json"), home.join("hooks.json"));
     let session_homes = codex_home_spellings(home)?;
 
@@ -14896,16 +14913,221 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         }
     }
 
+    // Sharing is best-effort: a server that cannot see the logins only loses
+    // its tools, never the session. The record is read whatever the share did,
+    // so no path through it can leave the teardown without one; one that cannot
+    // be read leaves none, and the teardown carries nothing.
+    let mcp_oauth_at_build =
+        if isolation == Isolation::Shared && mode == LinkMode::Real && sync_mcp_logins {
+            if let Err(e) = share_codex_mcp_oauth(&operator, home) {
+                logline!("clauth: sharing codex MCP OAuth logins failed: {e:#}");
+            }
+            #[cfg(test)]
+            run_mcp_oauth_record_hook();
+            McpOauthAtBuild::read(home)
+                .inspect_err(|e| {
+                    logline!("clauth: sharing codex MCP OAuth logins failed: {e:#}");
+                })
+                .ok()
+        } else {
+            None
+        };
+
     let sessions = home.join("sessions");
     if sessions.symlink_metadata().is_err() {
         crate::profile::mkdir_700(&sessions)
             .with_context(|| format!("failed to create {}", sessions.display()))?;
     }
+    Ok(mcp_oauth_at_build)
+}
+
+/// Codex's MCP OAuth file store (`rmcp-client/src/oauth.rs`), used when no OS
+/// keyring answers, and its aggregate-store lock dir (`oauth/store_lock.rs`).
+const CODEX_MCP_OAUTH_FILE: &str = ".credentials.json";
+const CODEX_MCP_OAUTH_LOCKS: &str = "mcp-oauth-locks";
+
+/// While `sync_mcp_logins` is on (the default, the toggle that shares Claude
+/// Code's MCP logins too), a shared session sees the operator's MCP OAuth
+/// logins (`codex mcp login <server>`), which live in the operator codex home's
+/// `.credentials.json` when no OS keyring answers. Without them every OAuth
+/// server answers AuthRequired and codex starts the session without its tools.
+/// Those are bearer credentials for every server the operator signed in to:
+/// every profile's shared sessions can read and use them while the toggle is on.
+///
+/// The file is a HARD link, not a symlink: codex opens it for writing with
+/// `O_NOFOLLOW`, so a symlink would fail every refresh, and its write truncates
+/// in place, so one inode keeps a rotated refresh token visible to the operator
+/// and to every sibling session. A hard link cannot cross filesystems: with the
+/// two homes on different ones the link fails, the caller logs it, and the
+/// session runs without the logins. This decides only what to place; what the
+/// teardown may carry back is the build's record, read after this returns.
+///
+/// Limits: removing a server's login inside a session when it is the store's
+/// last login deletes the file, which unlinks only that home's name, so the
+/// login comes back in the next session. With two or more logins codex rewrites
+/// the shared file in place, so that logout reaches the operator home and every
+/// session. And when the operator has no file yet, only one session's first
+/// login is kept: see [`carry_codex_mcp_oauth_back`].
+fn share_codex_mcp_oauth(operator: &Path, home: &Path) -> Result<()> {
+    if !operator.is_dir() {
+        return Ok(());
+    }
+    // Created even before the first login. codex creates its lock dir on
+    // demand (`rmcp-client/src/oauth/store_lock.rs`), but the session's lock
+    // path is the link below, and it must reach the operator's dir so the
+    // operator and every session serialize on one lock, not one each.
+    let locks = operator.join(CODEX_MCP_OAUTH_LOCKS);
+    crate::profile::mkdir_700(&locks)
+        .with_context(|| format!("failed to create {}", locks.display()))?;
+    let locks_dst = home.join(CODEX_MCP_OAUTH_LOCKS);
+    if locks_dst.symlink_metadata().is_err() {
+        link_entry(&locks, &locks_dst)?;
+    }
+    let src = operator.join(CODEX_MCP_OAUTH_FILE);
+    let dst = home.join(CODEX_MCP_OAUTH_FILE);
+    if src.is_file() && dst.symlink_metadata().is_err() {
+        std::fs::hard_link(&src, &dst).with_context(|| {
+            format!("failed to hard-link {} -> {}", dst.display(), src.display())
+        })?;
+    }
     Ok(())
 }
 
+/// What a file is on disk, to tell the file a session home held at build from
+/// one written since: (dev, ino) on unix, the birth time elsewhere.
+#[cfg(unix)]
+type FileIdent = (u64, u64);
+#[cfg(not(unix))]
+type FileIdent = Option<std::time::SystemTime>;
+
+#[cfg(unix)]
+fn file_ident(meta: &std::fs::Metadata) -> FileIdent {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_ident(meta: &std::fs::Metadata) -> FileIdent {
+    meta.created().ok()
+}
+
+/// The `.credentials.json` a shared session home held when its build ended,
+/// whatever the share did: read from the home's own path, so a logout landing
+/// in the operator's home after the link was placed still finds the link here.
+/// `None` when the home held none, so any file there at teardown is the
+/// session's own login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McpOauthAtBuild(Option<FileIdent>);
+
+impl McpOauthAtBuild {
+    fn read(home: &Path) -> Result<Self> {
+        let path = home.join(CODEX_MCP_OAUTH_FILE);
+        match path.symlink_metadata() {
+            Ok(meta) => Ok(Self(Some(file_ident(&meta)))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            Err(e) => Err(e).with_context(|| format!("failed to stat {}", path.display())),
+        }
+    }
+
+    /// Whether `meta` is the file this record names.
+    fn names(self, meta: &std::fs::Metadata) -> bool {
+        self.0 == Some(file_ident(meta))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MCP_OAUTH_RECORD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam for [`build_codex_home_with`]'s record: a hook run once between
+/// the share attempt and the record, posing a logout in the operator's home
+/// landing in that window. Test-only.
+// Its one caller is a unix-only test; on other targets the test build would flag it as dead code.
+#[cfg(all(test, unix))]
+struct McpOauthRecordHook;
+
+#[cfg(all(test, unix))]
+impl McpOauthRecordHook {
+    fn arm(hook: impl FnMut() + 'static) -> Self {
+        MCP_OAUTH_RECORD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for McpOauthRecordHook {
+    fn drop(&mut self) {
+        MCP_OAUTH_RECORD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_mcp_oauth_record_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&MCP_OAUTH_RECORD_HOOK) {
+        hook();
+    }
+}
+
+/// The teardown half of [`share_codex_mcp_oauth`]: a file the session wrote
+/// into its home after the build, its first MCP login, reaches the operator as
+/// one more hard link before the home is removed, the operator home created
+/// owner-only when it is missing. Only such a file is carried: one `at_build`
+/// names, the file the home held when its build ended whatever the share did
+/// (the operator's own link, or a dead session's leftover), stays where it is,
+/// so a logout made in the operator's home is never undone.
+/// A carried file that is not the operator's while the operator has one of its
+/// own is left alone and logged: neither side is provably newer, and the
+/// operator's stays. So when two sessions both make a first login before either
+/// ends, the first teardown's file becomes the operator's and the second's is
+/// logged and dropped with its home.
+fn carry_codex_mcp_oauth_back(
+    operator: &Path,
+    home: &Path,
+    at_build: McpOauthAtBuild,
+) -> Result<()> {
+    let session = home.join(CODEX_MCP_OAUTH_FILE);
+    let meta = match session.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", session.display())),
+    };
+    if !meta.is_file() || at_build.names(&meta) {
+        return Ok(());
+    }
+    let target = operator.join(CODEX_MCP_OAUTH_FILE);
+    match target.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::profile::mkdir_700(operator)
+                .with_context(|| format!("failed to create {}", operator.display()))?;
+            std::fs::hard_link(&session, &target).with_context(|| {
+                format!(
+                    "failed to hard-link {} -> {}",
+                    target.display(),
+                    session.display()
+                )
+            })
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to stat {}", target.display())),
+        Ok(op_meta) => {
+            #[cfg(unix)]
+            if file_ident(&op_meta) != file_ident(&meta) {
+                logline!(
+                    "clauth: kept {}, this session's copy differs",
+                    target.display()
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = op_meta;
+            Ok(())
+        }
+    }
+}
+
 /// Live codex session guard — the codex [`ProfileRuntime`]. On drop: converges
-/// a fake-mode auth copy back to the store, carries a durable store codex
+/// a fake-mode auth copy back to the store, carries a first MCP OAuth login the
+/// session made to the operator home, carries a durable store codex
 /// healed in place back into the profile-global home, drops the registry row
 /// and marker, and removes the per-session home (its rollout roots are links,
 /// so the rollouts stay in the store); the bare `codex-home` (the durable
@@ -14918,6 +15140,13 @@ pub(crate) struct CodexRuntime {
     profile: String,
     isolation: Isolation,
     mode: LinkMode,
+    /// The `.credentials.json` this home held when its build ended, whatever
+    /// the share did; `None` when the home does not share the operator's MCP
+    /// OAuth logins (`sync_mcp_logins` off at acquire, an isolated or fake
+    /// home) or the record could not be read. The teardown carries back only a
+    /// file this record does not name, and nothing without one, whatever the
+    /// toggle says by then.
+    mcp_oauth_at_build: Option<McpOauthAtBuild>,
     _pid_lock: File,
 }
 
@@ -14931,8 +15160,11 @@ impl CodexRuntime {
         // (phase 4) can decide against this profile, or the rotation gate
         // reads the account as idle while a session is mid-start on it.
         let _rotation_guard = RotationGuard::acquire(&owned)?;
+        // Read once, before the state flock: a plain file read, and the
+        // teardown acts on this value whatever the toggle says by then.
+        let sync_mcp_logins = crate::claude::sync_mcp_logins();
 
-        let (session, home, sessions, pid_file, pid_lock, mode) = with_state_lock(|_held| {
+        let (session, home, sessions, pid_file, pid_lock, mode, rec) = with_state_lock(|_held| {
             crate::profile::mkdir_700(&profile_root)
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
@@ -14986,7 +15218,7 @@ impl CodexRuntime {
             // per-session and was wiped. That home holds a physical auth.json
             // COPY, and a session that died before Drop could converge leaves
             // the rotated chain nowhere else — the wipe destroyed it, and
-            // `build_codex_home` then converged the SPENT store token back out
+            // `build_codex_home_with` then converged the SPENT store token back out
             // for codex to replay into `refresh_token_reused`. The predicate
             // that already answers this correctly demands a session id, so
             // both bare stems keep the state that must outlive a session.
@@ -15002,7 +15234,14 @@ impl CodexRuntime {
             }
             crate::profile::mkdir_700(&home)
                 .with_context(|| format!("failed to create {}", home.display()))?;
-            build_codex_home(&home, name, isolation, mode)?;
+            let rec = build_codex_home_with(
+                &home,
+                name,
+                isolation,
+                mode,
+                &codex_profile_opts(name),
+                sync_mcp_logins,
+            )?;
 
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
@@ -15029,7 +15268,7 @@ impl CodexRuntime {
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live codex session failed: {e}");
             }
-            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode))
+            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode, rec))
         })?;
 
         Ok(Self {
@@ -15040,6 +15279,7 @@ impl CodexRuntime {
             profile: name.to_string(),
             isolation,
             mode,
+            mcp_oauth_at_build: rec,
             _pid_lock: pid_lock,
         })
     }
@@ -15066,6 +15306,14 @@ impl Drop for CodexRuntime {
             )
         {
             logline!("clauth: codex auth converge at teardown failed: {e:#}");
+        }
+        // The operator home resolves as the build resolved it, so a first login
+        // reaches the codex the operator runs, never a `~/.codex` it does not.
+        if let Some(at_build) = self.mcp_oauth_at_build
+            && let Err(e) = operator_codex_home()
+                .and_then(|operator| carry_codex_mcp_oauth_back(&operator, &self.home, at_build))
+        {
+            logline!("clauth: carrying codex MCP OAuth logins at teardown failed: {e:#}");
         }
         // Carry a durable store codex healed in place back into the
         // profile-global home — best-effort, never failing a completed

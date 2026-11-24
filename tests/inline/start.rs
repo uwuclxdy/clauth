@@ -1000,7 +1000,7 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
     std::fs::create_dir_all(&session_home).expect("mkdir home");
     // The operator's own setting, faithfully copied into the session home by
-    // `build_codex_home` — codex would resolve its DBs there, not here.
+    // `build_codex_home_with` — codex would resolve its DBs there, not here.
     std::fs::write(
         session_home.join("config.toml"),
         b"sqlite_home = \"/tmp/one-shared-dir\"\n",

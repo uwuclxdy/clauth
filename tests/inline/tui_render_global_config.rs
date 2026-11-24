@@ -1794,11 +1794,11 @@ fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
     }
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, toggles(), tunables()).expect("hint"),
-        "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch"
+        "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; every shared codex session uses your codex's MCP server logins"
     );
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, off_state, tunables()).expect("hint"),
-        "each account keeps its own MCP server logins"
+        "each account keeps its own MCP server logins, and codex sessions get none of your codex's"
     );
 }
 
