@@ -48,6 +48,7 @@ fn the_usage_hints_advertise_the_note_key() {
         env: BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,

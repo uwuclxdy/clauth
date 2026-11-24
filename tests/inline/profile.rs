@@ -2586,6 +2586,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -3161,6 +3162,41 @@ fn model_settings_round_trip_through_config_toml() {
     );
 }
 
+/// Per-model effort is its own `[model_effort]` table, outside `[models]`
+/// (presets replace `[models]` whole), keyed by a tier or a model id, and
+/// survives a render→parse round-trip; an empty map writes only the commented
+/// example.
+#[test]
+fn model_effort_round_trips_as_its_own_table() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models.default = Some("opus".to_string());
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("# [model_effort]\n# sonnet = \"xhigh\"\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.model_effort.is_empty());
+
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.model_effort, profile.model_effort);
+    assert_eq!(
+        parsed.models, profile.models,
+        "per-model effort never lands in [models]"
+    );
+    assert!(
+        rendered.contains(
+            "[model_effort]\nclaude-opus-4-5-20251101 = \"medium\"\nsonnet = \"xhigh\"\n"
+        ),
+        "{rendered}"
+    );
+}
+
 /// The account's effort is its own top-level `effort` key, outside `[models]`
 /// (presets re-bind and launch demand read `[models]`), and survives a
 /// render→parse round-trip; an unset effort writes no key at all.
@@ -3202,10 +3238,11 @@ fn the_config_comment_names_the_effort_carrier() {
     let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
     assert!(
         rendered.contains(concat!(
-            "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
-            "# (`effortLevel` is Claude Code's own key).\n",
+            "# Reasoning effort for this account. With one model selected, low, medium,\n",
+            "# high and xhigh set that model's level unless [model_effort] sets it.\n",
+            "# Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n",
         )),
-        "the comment names the key and its one carrier: {rendered}"
+        "the comment describes model and account-wide effort: {rendered}"
     );
     assert!(
         rendered.contains("# effort = \"high\"\n"),
@@ -7914,6 +7951,38 @@ fn the_pre_put_back_env_doc_toggles_its_example_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file written before the `effort` doc named the per-model level still
+/// toggles `effort` in place under its own older doc block, and unsetting
+/// gives the file back byte for byte.
+#[test]
+fn the_account_wide_effort_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldeffort".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldeffort")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# Reasoning effort for this account. With one model selected, low, medium,\n\
+                   # high and xhigh set that model's level unless [model_effort] sets it.\n\
+                   # Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n\
+                   # effort = \"high\"\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n\
+                 # (`effortLevel` is Claude Code's own key).\n\
+                 # effort = \"high\"\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldeffort")).unwrap();
+    profile.effort = Some("high".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("# effort = \"high\"\n", "effort = \"high\"\n")
+    );
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
 /// The `advisor` row saves into `[models]` in place beside the other rows and
 /// loads back, and clearing it deletes its line alone.
 #[test]
@@ -8743,6 +8812,7 @@ fn every_profile_config_scalar_is_modelled() {
         env: BTreeMap::new(),
         models: ModelSettings::default(),
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8850,6 +8920,7 @@ fn every_profile_config_table_is_modelled() {
             advisor: Some("v".to_string()),
         },
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
@@ -8878,7 +8949,7 @@ fn every_profile_config_table_is_modelled() {
         .map(|(k, _)| k.as_str())
         .collect();
     tables.sort_unstable();
-    assert_eq!(tables, ["console", "env", "models"]);
+    assert_eq!(tables, ["console", "env", "model_effort", "models"]);
 }
 
 /// Every field the writer's edit step handles is pinned behaviourally: an empty
@@ -8914,6 +8985,10 @@ fn a_save_writes_every_modelled_field_from_an_empty_file() {
         advisor: Some("v".to_string()),
     };
     profile.effort = Some("high".to_string());
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
     profile.fallback_threshold = Some(50.0);
     profile.weekly_threshold = Some(70.0);
     profile.last_resort = true;
@@ -9174,7 +9249,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "effort",
-            "6c78fc0ab64d4df00a2325391b3a9081f006eac6f95b3d835d9869ff139058c3",
+            "a0ca0deab2ea9914f17cff3cd3d401b3fb44c9b5355785a5266ff29ce3c4730e",
         ),
         (
             "console",
@@ -9188,13 +9263,17 @@ fn every_current_doc_block_matches_its_pinned_digest() {
             "env",
             "b1ecf434ca77d914fe3ad1493532e7c46a760ea8b3f6a1d43da92d7375921257",
         ),
+        (
+            "model_effort",
+            "fef5875d92d9db9522d714fcfb654ec75d981c22ee5e415349741bcc3d5403b4",
+        ),
     ]
     .into_iter()
     .collect();
     for key in MODELLED_SCALARS
         .iter()
         .copied()
-        .chain(["console", "models", "env"])
+        .chain(["console", "models", "env", "model_effort"])
     {
         let Some(&digest) = pinned.get(key) else {
             panic!("`{key}` has no pinned doc digest: add its row");

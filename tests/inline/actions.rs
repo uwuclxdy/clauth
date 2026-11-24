@@ -17388,7 +17388,7 @@ fn a_cover_from_before_the_record_is_never_saved_as_the_users_value() {
     );
     assert_eq!(
         base_env_record()["v"],
-        serde_json::json!(1),
+        serde_json::json!(2),
         "the first apply after the upgrade stamps the record"
     );
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
@@ -17573,7 +17573,7 @@ fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
     assert!(switch_profile_locked(&mut config, &a).is_ok());
     assert_eq!(
         base_env_record(),
-        serde_json::json!({ "v": 1, "active": "a", "keys": {} }),
+        serde_json::json!({ "v": 2, "active": "a", "keys": {} }),
         "stamped at the first apply, naming the account it saw active"
     );
     seed_user_endpoint();
@@ -17588,7 +17588,7 @@ fn the_first_settings_apply_stamps_the_record_and_keeps_it_while_empty() {
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
     assert_eq!(
         base_env_record(),
-        serde_json::json!({ "v": 1, "active": "b", "keys": {} }),
+        serde_json::json!({ "v": 2, "active": "b", "keys": {} }),
         "the last entry retired, the stamp stays"
     );
 }

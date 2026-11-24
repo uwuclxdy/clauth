@@ -96,6 +96,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
             env: BTreeMap::new(),
             models: Default::default(),
             effort: None,
+            model_effort: Default::default(),
             fallback_threshold: threshold,
             weekly_threshold: None,
             last_resort: false,
