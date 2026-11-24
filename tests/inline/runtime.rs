@@ -4658,6 +4658,51 @@ fn read_settings_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).expect("read settings")).expect("parse settings")
 }
 
+/// A launch whose per-session effort record cannot be written still lands its
+/// settings and starts, logging the failure once.
+#[test]
+fn a_launch_whose_effort_record_fails_to_write_still_starts_and_logs_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("settings.json"), br#"{}"#).expect("write settings");
+        let runtime = tmp.path().join("runtime");
+        let record = runtime.join(".clauth-model-effort.json");
+        fs::create_dir_all(record.join("held")).expect("a dir where the record goes");
+        let mut profile = make_profile("p");
+        profile
+            .model_effort
+            .insert("sonnet".to_string(), "high".to_string());
+        let logs = crate::logline::LogLines::new();
+        let _capture = logs.capture_here();
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &tmp.path().join("creds.json"),
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("the launch goes on");
+
+        assert_eq!(
+            read_settings_json(&runtime.join("settings.json"))["modelSettings"]["sonnet"]["effortLevel"],
+            "high"
+        );
+        let failed = format!("clauth: failed to write {}: ", record.display());
+        let lines = logs.snapshot();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(&failed))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+    });
+}
+
 /// Build one shared tree from an operator file holding `days`, so the build
 /// remembers it the way production learns it.
 fn remember_through_a_build(root: &Path, claude_home: &Path, days: u64) {
@@ -14481,8 +14526,8 @@ fn a_pre_arming_session_converges_onto_the_armed_sidecar_on_one_poll() {
 /// A convergence that really moves the session (one poll onto the armed
 /// rolling sidecar, same member) writes nothing new, so the session's effort
 /// — whatever `env.CLAUDE_CODE_EFFORT_LEVEL` the file carries — keeps its
-/// bytes: the converge plan mints no effort, and writing one would reset the
-/// session to the model default mid-conversation.
+/// bytes: the converge plan mints no effort, and writing one could change the
+/// session's effort mid-conversation.
 #[test]
 fn a_converge_leaves_the_session_effort_alone() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -23900,6 +23945,34 @@ fn live_session_runtime_dirs_lists_live_claude_trees_only() {
         .expect("background row");
     assert!(bg.background);
     assert_eq!(bg.runtime, bg_tree);
+}
+
+/// A Setup effort edit that cannot reach a live session's settings names the
+/// session that missed it.
+#[test]
+fn a_live_session_that_cannot_take_an_effort_edit_is_named_in_the_log() {
+    let _home = HomeSandbox::new();
+    let acct = crate::profile::ProfileName::from("acct");
+    crate::live_sessions::register(&crate::testutil::live_row("806-0", "acct")).expect("register");
+    let _marker = hold_session_row_marker(&acct, false, "806-0").expect("marker");
+    let [tree, _] = session_runtime_trees(&acct, false, "806-0").expect("trees");
+    fs::create_dir_all(&tree).expect("tree");
+    fs::write(tree.join("settings.json"), "[]").expect("a settings file holding no object");
+    let logs = crate::logline::LogLines::new();
+    let _capture = logs.capture_here();
+    crate::lock::with_state_lock(|_| {
+        update_live_effort(&crate::profile::Profile::new(
+            "acct".to_string(),
+            None,
+            None,
+        ));
+        Ok(())
+    })
+    .expect("state lock");
+    assert_eq!(
+        logs.snapshot(),
+        ["clauth: session 806-0 could not take the updated effort: settings.json is not an object"]
+    );
 }
 
 /// The queue keeps one entry per revoked bearer and member, and a drain that

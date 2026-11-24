@@ -859,6 +859,81 @@ fn only_a_pinned_models_effort_stays_per_profile() {
     );
 }
 
+/// A pinned `[models]` id keeps the level under its model's canonical name per
+/// profile, while another model of its tier and another tier still sync.
+#[test]
+fn a_pinned_id_keeps_its_own_models_level_and_syncs_the_rest_of_its_tier() {
+    let home = HomeSandbox::new();
+    write_config(
+        home.home(),
+        "p",
+        "[models]\nopus = \"claude-opus-4-5-20251101[1m]\"\n\n[model_effort]\nopus = \"high\"\n",
+    );
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "low"},
+            "claude-opus-5-5": {"effortLevel": "low"},
+            "claude-sonnet-4-5": {"effortLevel": "low"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "high"},
+            "claude-opus-5-5": {"effortLevel": "high"},
+            "claude-sonnet-4-5": {"effortLevel": "high"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    assert_eq!(
+        read_json(&runtime),
+        serde_json::json!({
+            "modelSettings": {
+                "claude-opus-4-5": {"effortLevel": "high"},
+                "claude-opus-5-5": {"effortLevel": "low"},
+                "claude-sonnet-4-5": {"effortLevel": "low"}
+            }
+        })
+    );
+}
+
+/// A pinned bare tier alias keeps a legacy family-last model id of its tier
+/// per profile, while an id of another tier still syncs.
+#[test]
+fn an_alias_pin_keeps_a_legacy_family_last_model_per_profile() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p", "[model_effort]\nsonnet = \"high\"\n");
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-3-5-sonnet": {"effortLevel": "low"},
+            "claude-3-opus": {"effortLevel": "low"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-3-5-sonnet": {"effortLevel": "high"},
+            "claude-3-opus": {"effortLevel": "high"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    assert_eq!(
+        read_json(&runtime),
+        serde_json::json!({
+            "modelSettings": {
+                "claude-3-5-sonnet": {"effortLevel": "high"},
+                "claude-3-opus": {"effortLevel": "low"}
+            }
+        })
+    );
+}
+
 /// A model the live record still covers stays per-profile though no config
 /// pins it any more, and a record that does not parse pauses the sync.
 #[test]

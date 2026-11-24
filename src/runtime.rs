@@ -5338,9 +5338,12 @@ struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
     /// The intended member's effort for the running session
-    /// ([`crate::claude::live_effort`]: its `[env]` entry when present,
-    /// else the field, else `""`), carried into the swap's settings.json
-    /// rewrite. The converge branch mints `None`:
+    /// ([`crate::claude::live_effort`]: with one model selected, the value
+    /// that makes the session apply what a fresh launch applies, which is the
+    /// carrier's own value when Claude Code's parser takes it and the
+    /// per-model level or `""` otherwise; with no selected model, the
+    /// account-wide carrier as it stands), carried into the swap's
+    /// settings.json rewrite. The converge branch mints `None`:
     /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
     /// new, so no caller reads the field there.
     effort: Option<String>,
@@ -7683,8 +7686,9 @@ impl ProfileRuntime {
                     // the re-armed legs land: the swap that armed them is gone,
                     // so its plan's value is unrecoverable, and the adoption
                     // reads the member's current one instead — the value a
-                    // running session uses (`live_effort`: its `[env]`
-                    // entry or the field). The read-only form is the under-hold
+                    // running session uses (`live_effort`: the carrier's value
+                    // when Claude Code's parser takes it, else the selected
+                    // model's level). The read-only form is the under-hold
                     // one: `load_profile` may rewrite `config.toml` and adopt a
                     // legacy `.pending` sidecar, both through the state flock
                     // this hold already owns.
@@ -11131,7 +11135,19 @@ fn write_merged_settings(
                 .context("failed to write runtime settings.json")?;
         }
     }
-    crate::model_effort::RuntimeLevels::write(&settings_dst, levels, Default::default())?;
+    // The record only tells a later swap which levels this launch wrote, so
+    // its failure never fails a launch whose settings landed. A swap then
+    // reads whatever record the tree holds: none on a fresh tree, so nothing
+    // goes back; on a reused tree an earlier launch's, through
+    // `RuntimeLevels::read`, which keeps only the levels the session still
+    // holds.
+    if let Err(e) = crate::model_effort::RuntimeLevels::write(
+        &settings_dst,
+        levels,
+        std::collections::BTreeMap::new(),
+    ) {
+        logline!("clauth: {e:#}");
+    }
     Ok(())
 }
 

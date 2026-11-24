@@ -7951,6 +7951,38 @@ fn the_pre_put_back_env_doc_toggles_its_example_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file written before the `effort` doc named the per-model level still
+/// toggles `effort` in place under its own older doc block, and unsetting
+/// gives the file back byte for byte.
+#[test]
+fn the_account_wide_effort_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldeffort".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldeffort")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# Reasoning effort for this account. With one model selected, low, medium,\n\
+                   # high and xhigh set that model's level unless [model_effort] sets it.\n\
+                   # Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n\
+                   # effort = \"high\"\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n\
+                 # (`effortLevel` is Claude Code's own key).\n\
+                 # effort = \"high\"\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldeffort")).unwrap();
+    profile.effort = Some("high".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("# effort = \"high\"\n", "effort = \"high\"\n")
+    );
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
 /// The `advisor` row saves into `[models]` in place beside the other rows and
 /// loads back, and clearing it deletes its line alone.
 #[test]
@@ -9231,13 +9263,17 @@ fn every_current_doc_block_matches_its_pinned_digest() {
             "env",
             "b1ecf434ca77d914fe3ad1493532e7c46a760ea8b3f6a1d43da92d7375921257",
         ),
+        (
+            "model_effort",
+            "fef5875d92d9db9522d714fcfb654ec75d981c22ee5e415349741bcc3d5403b4",
+        ),
     ]
     .into_iter()
     .collect();
     for key in MODELLED_SCALARS
         .iter()
         .copied()
-        .chain(["console", "models", "env"])
+        .chain(["console", "models", "env", "model_effort"])
     {
         let Some(&digest) = pinned.get(key) else {
             panic!("`{key}` has no pinned doc digest: add its row");

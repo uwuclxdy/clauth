@@ -543,9 +543,10 @@ fn every_effort_value_rides_the_env_override_alone() {
     }
 }
 
-/// An empty value reads as no value at startup and returns a running session to
-/// the model default, where removing the key leaves it on the old value, so an
-/// account with no effort writes `""`.
+/// An empty value is no value, so a running session falls back to a level set
+/// with `/effort`, else the per-model level its own settings held for the model
+/// when it started, else the model default; removing the key instead leaves it
+/// on the old value, so an account with no effort writes `""`.
 #[test]
 fn an_unset_effort_writes_an_empty_env_override() {
     let v = built_with_effort(None, None);

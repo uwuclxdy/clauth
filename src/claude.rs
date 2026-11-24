@@ -7264,7 +7264,9 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
 /// model is that model's level instead ([`crate::model_effort::resolved`]) and
 /// the carrier stays `""`: the carrier outranks every per-model level, so
 /// writing it would hand `claude --model <other>` this model's effort. A
-/// `max` or custom `effort` has no per-model form and keeps the carrier.
+/// `max` or custom `effort` has no per-model form and keeps the carrier, where
+/// Claude Code drops a value its parser does not take and the per-model level
+/// applies ([`crate::model_effort::selected_effort`] mirrors that resolver).
 pub(crate) fn effective_effort(profile: &Profile) -> String {
     if let Some(value) = profile.env.get("CLAUDE_CODE_EFFORT_LEVEL") {
         return value.clone();
@@ -7276,14 +7278,17 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
     }
 }
 
-/// A running session rereads the env carrier. Its per-model table was
-/// loaded at startup, so hand over the selected model's configured level here.
+/// A running session rereads the env carrier. Its per-model table was loaded
+/// at startup, so hand over what makes it apply what a fresh launch applies to
+/// the selected model ([`crate::model_effort::selected_effort`]'s `level`): a
+/// carrier value Claude Code's parser takes goes verbatim, and every other
+/// value becomes the per-model level it leaves in force, or nothing. With no
+/// selected model the account-wide carrier stands.
 pub(crate) fn live_effort(profile: &Profile) -> String {
-    let launch = effective_effort(profile);
-    if profile.env.contains_key("CLAUDE_CODE_EFFORT_LEVEL") || !launch.is_empty() {
-        return launch;
+    match crate::model_effort::selected_effort(profile) {
+        Some(selected) => selected.level.unwrap_or_default(),
+        None => effective_effort(profile),
     }
-    crate::model_effort::selected_level(profile).unwrap_or_default()
 }
 
 /// The account's per-model levels for a build, logging (once per account and
@@ -7434,13 +7439,17 @@ fn build_settings(
         }
     }
 
-    // The one effort carrier: every value rides
-    // `CLAUDE_CODE_EFFORT_LEVEL`, `""` when unset — an empty value acts as no
-    // value at startup and returns a running session to the model default,
-    // where removing the key leaves it on the old value (CC 2.1.317 re-reads
-    // only this carrier). `effective_effort` folds the profile's own `[env]`
-    // entry in ahead of "profile env last", so the loop below re-asserts the
-    // same value.
+    // The env carrier, `""` when unset: an empty value is no value, so a
+    // running session falls back to a level set with `/effort`, else the
+    // per-model level its own settings held for the model when it started,
+    // else the model default; removing the key leaves it on the old value (CC
+    // 2.1.317 re-reads only this carrier). An account-wide effort rides it.
+    // Under a selected model a per-model `effort` level keeps it `""` and the
+    // level rides `modelSettings`; a `max` or custom effort has no per-model
+    // form and keeps the carrier. A write into the live file carries the
+    // selected model's level here too, for a session already running.
+    // `effective_effort` folds the profile's own `[env]` entry in ahead of
+    // "profile env last", so the loop below re-asserts the same value.
     env.insert(
         "CLAUDE_CODE_EFFORT_LEVEL".into(),
         if live.is_some() {

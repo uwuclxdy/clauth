@@ -2045,10 +2045,14 @@ pub(crate) fn edit_profile_model(
 /// selected model's new level on their next settings read.
 ///
 /// The slot `edit` sees is the Setup row's ([`crate::model_effort::row_level`]):
-/// while the `model` row names one model, that model's level, which lands in
-/// `[model_effort]`. The scalar is then cleared, since it was either that
-/// model's level already or an account-wide value the per-model edit
-/// replaces. Otherwise the slot is the account-wide `effort`.
+/// while the `model` row names one model, the value
+/// [`crate::model_effort::selected_effort`] reports for it. An edit writes the
+/// report's `entry` and clears the account's `effort`, which was either that
+/// model's level already or a value the per-model edit replaces; a clear
+/// removes the `entry` and the `effort`, except that while the row showed a
+/// carrier value (the account's `effort` or an `[env]` entry) it removes that
+/// `effort` alone, leaving the entry it overrode and the `[env]` entry in
+/// place. Otherwise the slot is the account-wide `effort`.
 pub(crate) fn edit_profile_effort(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2057,19 +2061,21 @@ pub(crate) fn edit_profile_effort(
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
         let (fresh, ()) = update_profile_config(name, |fresh| {
-            match crate::model_effort::selected_model(&fresh.models).map(str::to_string) {
-                Some(model) => {
-                    let mut slot = crate::model_effort::row_level(fresh);
+            match crate::model_effort::selected_effort(fresh) {
+                Some(selected) => {
+                    let mut slot = selected.shown;
                     edit(&mut slot);
-                    // Every spelling that lands on this model goes, so the
-                    // row's value is the one in force.
-                    for key in crate::model_effort::selected_entries(fresh, &model) {
-                        fresh.model_effort.remove(&key);
+                    match slot {
+                        Some(level) => {
+                            fresh.model_effort.insert(selected.entry, level);
+                            fresh.effort = None;
+                        }
+                        None if selected.account_wide => fresh.effort = None,
+                        None => {
+                            fresh.model_effort.remove(&selected.entry);
+                            fresh.effort = None;
+                        }
                     }
-                    if let Some(level) = slot {
-                        fresh.model_effort.insert(model, level);
-                    }
-                    fresh.effort = None;
                 }
                 None => edit(&mut fresh.effort),
             }

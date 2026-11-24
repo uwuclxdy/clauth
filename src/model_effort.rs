@@ -14,9 +14,13 @@
 //!
 //! Claude Code's schema for the key takes `low`, `medium`, `high` and `xhigh`
 //! only and drops any other value without a word, so [`resolved`] skips an
-//! entry outside that set. The env carrier (`CLAUDE_CODE_EFFORT_LEVEL`)
-//! outranks every per-model level, which is why
-//! [`crate::claude::effective_effort`] writes it empty under a selected model.
+//! entry outside that set. The account-wide carrier
+//! (`CLAUDE_CODE_EFFORT_LEVEL`) outranks every per-model level, so
+//! [`crate::claude::effective_effort`] writes it empty while the selected
+//! model's `effort` is a level; a value the carrier's parser takes and the
+//! schema cannot hold (`max`, `med`, a token budget) keeps the carrier, and
+//! the `auto`/`unset` sentinels run the model default, capped by any settings
+//! `maxEffortLevel` ([`selected_effort`] mirrors the resolver).
 //!
 //! Two writes land the levels:
 //!
@@ -53,11 +57,17 @@ pub(crate) fn invalid_row_level(per_model: bool, value: &str) -> bool {
     per_model && !value.is_empty() && !is_level(value)
 }
 
+/// Whether the effort row shows a `[model_effort]` entry Claude Code drops
+/// (never a value the carrier supplies, which applies ahead of the table).
 pub(crate) fn invalid_selected_entry(profile: &Profile) -> bool {
-    selected_model(&profile.models)
-        .and_then(|model| selected_entries(profile, model).into_iter().next())
-        .and_then(|key| profile.model_effort.get(&key))
-        .is_some_and(|level| !is_level(level.trim()))
+    selected_effort(profile).is_some_and(|selected| {
+        profile
+            .model_effort
+            .get(&selected.entry)
+            .is_some_and(|level| {
+                !is_level(level.trim()) && selected.shown.as_deref() == Some(level.as_str())
+            })
+    })
 }
 
 /// The one model an account's `model` row names, or `None` when it names
@@ -75,40 +85,194 @@ pub(crate) fn names_one_model(model: &str) -> bool {
     !model.is_empty() && model != "default" && model != "opusplan"
 }
 
-/// The level the Setup tab's `effort` row shows and edits: the selected
-/// model's (its `[model_effort]` entry, else the scalar) while the `model` row
-/// names one model, the account-wide scalar otherwise.
+/// The level the Setup tab's `effort` row shows: [`selected_effort`]'s while
+/// the `model` row names one model, the account-wide scalar otherwise.
 pub(crate) fn row_level(profile: &Profile) -> Option<String> {
-    let Some(model) = selected_model(&profile.models) else {
-        return profile.effort.clone();
-    };
-    selected_entries(profile, model)
-        .first()
-        .and_then(|key| profile.model_effort.get(key))
-        .cloned()
-        .or_else(|| selected_level(profile))
-        .or_else(|| profile.effort.clone())
+    match selected_effort(profile) {
+        Some(selected) => selected.shown,
+        None => profile.effort.clone(),
+    }
 }
 
-pub(crate) fn selected_level(profile: &Profile) -> Option<String> {
+/// The selected model's effort as a fresh launch applies it, which the Setup
+/// row shows and edits and a moved session's carrier hands over.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SelectedEffort {
+    /// The `[model_effort]` key an edit writes, and a clear removes while the
+    /// row shows it: the entry whose level a launch applies, else the first
+    /// entry for the model Claude Code drops, else the `model` row's own
+    /// spelling. While the row shows a carrier value (the account's `effort` or
+    /// an `[env]` entry), an edit still writes this entry and a clear leaves it.
+    pub(crate) entry: String,
+    /// Whether `shown` is a carrier value (the account's `effort` or an `[env]`
+    /// entry) instead of an entry: it rides the carrier, so a clear removes the
+    /// account's `effort` alone, leaving the entry it overrode and the `[env]`
+    /// entry in place.
+    pub(crate) account_wide: bool,
+    /// The value the row shows: the carrier's value while Claude Code's parser
+    /// takes it (`auto` for the `auto`/`unset` sentinels), else the per-model
+    /// level that applies, else the entry Claude Code drops, else nothing.
+    pub(crate) shown: Option<String>,
+    /// The value a moved session's carrier hands over: `shown` wherever that
+    /// makes the session apply what a fresh launch applies, and the per-model
+    /// level (`None` when nothing does) where the row shows a dropped entry.
+    pub(crate) level: Option<String>,
+}
+
+/// Which of the account's levels a fresh launch applies to the selected
+/// model, read the way Claude Code reads the built file: the carrier's value
+/// while its parser takes it ([`carrier_class`]), else the per-model table's
+/// level, where of the written keys naming that model an exact canonical one
+/// wins, else the first in the account's spelling order ([`resolved`]'s). A
+/// key a member's file already holds keeps that file's position, so an
+/// existing spelling outside this order can take the level instead. A tier
+/// alias with no `[models]` row runs a model clauth cannot see, so only the
+/// alias's own entry is its level. `None` while the `model` row names no one
+/// model.
+pub(crate) fn selected_effort(profile: &Profile) -> Option<SelectedEffort> {
     let model = selected_model(&profile.models)?;
-    let key = settings_key(&profile.models, model);
-    let mut levels = resolved(profile);
-    levels
-        .remove(&key)
-        .or_else(|| tier_of(&key).and_then(|tier| levels.remove(tier)))
+    let lands = lands_on(settings_key(&profile.models, model));
+    let entries = selected_entries(profile, model);
+    let valid = |key: &&String| {
+        profile
+            .model_effort
+            .get(*key)
+            .is_some_and(|level| is_level(level.trim()))
+    };
+    let applied = resolved(profile)
+        .into_iter()
+        .filter(|(written, _)| lands(written))
+        .min_by_key(|(written, _)| *written != canonical_name(written));
+    let applied_entry = applied.as_ref().and_then(|(written, _)| {
+        entries
+            .iter()
+            .filter(valid)
+            .find(|key| settings_key(&profile.models, key) == *written)
+            .cloned()
+    });
+    let applied_level = applied.map(|(_, level)| level);
+    let shown_entry = applied_entry.or_else(|| entries.iter().find(|key| !valid(key)).cloned());
+    let (entry, table_shown) = match shown_entry {
+        Some(entry) => {
+            let shown = profile.model_effort.get(&entry).cloned();
+            (entry, shown)
+        }
+        None => (model.to_owned(), applied_level.clone()),
+    };
+    let carrier = crate::claude::effective_effort(profile);
+    let (account_wide, shown, level) = match carrier_class(&carrier) {
+        Carrier::Taken => (true, Some(carrier.clone()), Some(carrier)),
+        Carrier::Sentinels => (true, Some("auto".to_string()), Some("auto".to_string())),
+        Carrier::Dropped => (false, table_shown, applied_level),
+    };
+    Some(SelectedEffort {
+        entry,
+        account_wide,
+        shown,
+        level,
+    })
 }
 
-/// The `[model_effort]` keys that land on the same `modelSettings` key as
-/// `model` (the alias and its `[models]` id, say), in [`entry_order`]: the
-/// entries the effort row shows and replaces.
+/// How Claude Code's `CLAUDE_CODE_EFFORT_LEVEL` parser reads a carrier value
+/// (bundle 2.1.330, `function hZ` at 315943041, `function nk` at 315943481).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carrier {
+    /// A value it takes as an effort: a level (`max` included), `med`, or a
+    /// token budget.
+    Taken,
+    /// The `auto`/`unset` sentinels: the model default runs, capped by any
+    /// settings `maxEffortLevel`, never a per-model level.
+    Sentinels,
+    /// Anything else, the empty string included: the parser drops it, so the
+    /// per-model level applies.
+    Dropped,
+}
+
+fn carrier_class(value: &str) -> Carrier {
+    let lower = value.to_lowercase();
+    if lower == "auto" || lower == "unset" {
+        Carrier::Sentinels
+    } else if rides_carrier(value) {
+        Carrier::Taken
+    } else {
+        Carrier::Dropped
+    }
+}
+
+/// Whether Claude Code's `CLAUDE_CODE_EFFORT_LEVEL` parser takes `value` as an
+/// effort: a level, `max`, the `med` spelling of `medium`, or a token budget
+/// (a value `parseInt` reads a leading integer from). Any other value leaves
+/// the per-model level in force; the `auto`/`unset` sentinels go to
+/// [`Carrier::Sentinels`].
+fn rides_carrier(value: &str) -> bool {
+    let value = value.to_lowercase();
+    match value.as_str() {
+        "med" => true,
+        value => LEVELS.contains(&value) || value == "max" || numeric_prefix(value),
+    }
+}
+
+/// Whether a leading integer spells `value`: `parseInt`'s leading whitespace,
+/// an optional sign, then a digit, the shape Claude Code parses as a token
+/// budget.
+fn numeric_prefix(value: &str) -> bool {
+    let bytes = value.trim_start_matches(parse_int_space).as_bytes();
+    match bytes.first() {
+        Some(b'+' | b'-') => bytes.get(1).is_some_and(u8::is_ascii_digit),
+        Some(first) => first.is_ascii_digit(),
+        None => false,
+    }
+}
+
+/// The whitespace `parseInt` skips before a number: the ASCII set (vertical
+/// tab included), `U+00A0`, `U+FEFF`, `U+1680`, `U+2000`-`U+200A`, `U+2028`,
+/// `U+2029`, `U+202F`, `U+205F` and `U+3000`. `U+0085` is no whitespace to it,
+/// where `char::is_whitespace` takes it.
+fn parse_int_space(c: char) -> bool {
+    c.is_ascii_whitespace()
+        || c == '\u{b}'
+        || c == '\u{a0}'
+        || c == '\u{feff}'
+        || c == '\u{1680}'
+        || ('\u{2000}'..='\u{200a}').contains(&c)
+        || c == '\u{2028}'
+        || c == '\u{2029}'
+        || c == '\u{202f}'
+        || c == '\u{205f}'
+        || c == '\u{3000}'
+}
+
+/// The `[model_effort]` keys whose level lands on `model`, ranked the way
+/// [`selected_effort`] reads Claude Code's lookup: an exact canonical written
+/// key first, then the account's own key order; a key a member's file already
+/// holds keeps that file's position, so the file's order can differ. Keys
+/// sharing one written key rank by [`entry_order`].
 pub(crate) fn selected_entries(profile: &Profile, model: &str) -> Vec<String> {
-    let target = settings_key(&profile.models, model);
-    entry_order(&profile.models, &profile.model_effort)
+    let lands = lands_on(settings_key(&profile.models, model));
+    let mut entries: Vec<(bool, String, &str)> =
+        entry_order(&profile.models, &profile.model_effort)
+            .into_iter()
+            .filter_map(|key| {
+                let written = settings_key(&profile.models, key);
+                lands(&written).then(|| (written != canonical_name(&written), written, key))
+            })
+            .collect();
+    entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    entries
         .into_iter()
-        .filter(|key| settings_key(&profile.models, key) == target)
-        .map(str::to_string)
+        .map(|(_, _, key)| key.to_owned())
         .collect()
+}
+
+/// Whether a written `modelSettings` key lands on the model `target` (a
+/// [`settings_key`]) runs. A bare tier alias resolves through the reading
+/// session's own alias table, so only that alias lands on it.
+fn lands_on(target: String) -> impl Fn(&str) -> bool {
+    let canonical = (!TIERS.contains(&target.as_str())).then(|| canonical_name(&target));
+    move |written| match &canonical {
+        None => written == target,
+        Some(canonical) => !TIERS.contains(&written) && canonical_name(written) == *canonical,
+    }
 }
 
 /// The order in which `[model_effort]` keys claim their `modelSettings` key:
@@ -147,26 +311,192 @@ fn tier_of(key: &str) -> Option<&str> {
     TIERS.contains(&tier).then_some(tier)
 }
 
-pub(crate) fn is_pinned(pinned: &std::collections::BTreeSet<String>, key: &str) -> bool {
-    pinned.contains(key) || tier_of(key).is_some_and(|tier| pinned.contains(tier))
+/// The tier a canonical Claude id names, in either shape the catalog spells:
+/// `claude-<tier>-...` or the older `claude-<major>[-<minor>]-<tier>`.
+fn tier_of_id(canonical: &str) -> Option<&str> {
+    if let Some(tier) = tier_of(canonical) {
+        return Some(tier);
+    }
+    let name = canonical.strip_prefix("claude-")?;
+    let (major, rest) = name.split_once('-')?;
+    if !(1..=2).contains(&major.len()) || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let family = match rest.split_once('-') {
+        Some((minor, family))
+            if (1..=2).contains(&minor.len()) && minor.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            family
+        }
+        Some(_) => return None,
+        None => rest,
+    };
+    TIERS.contains(&family).then_some(family)
 }
 
-/// A user's exact tier key takes precedence over an alias in Claude Code.
-/// Cover existing tier keys as well, preserving explicit exact-id entries.
+/// The region prefixes Claude Code accepts before `anthropic.` in a model id.
+const REGIONS: [&str; 7] = ["us", "eu", "apac", "jp", "au", "us-gov", "global"];
+
+/// A `.` between a Claude version's numbers, which Claude Code reads as `-`.
+#[expect(clippy::expect_used, reason = "the version-dot pattern is a literal")]
+static VERSION_DOT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(claude-(?:[a-z]+-)?[0-9]{1,2})\.([0-9])")
+        .expect("the version-dot pattern is a literal")
+});
+
+/// What may follow a Claude release's version for the id to still name that
+/// release: a `-fast` or `-latest` suffix, a `-vN` revision, a date
+/// (`-20251101`, `@20251101`).
+#[expect(
+    clippy::expect_used,
+    reason = "the release-suffix pattern is a literal"
+)]
+static RELEASE_SUFFIX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"^(?:-fast|-latest)?(?:-v[0-9]{1,3}@[0-9]{8}|[-@][0-9]{8})?(?:-v[0-9]{1,3}(?::[0-9]{1,3})?)?$",
+    )
+    .expect("the release-suffix pattern is a literal")
+});
+
+/// The name Claude Code keys a model's `modelSettings` entry by: lowercase,
+/// a trailing `[1m]` gone, and a Claude release id (dated, `@date`, `-vN`,
+/// `<region>.anthropic.`, a dotted version) folded to its release name. Any
+/// other id keeps its spelling, less a trailing `-YYYYMMDD`. A tier alias
+/// stays an alias: Claude Code resolves it per session.
+pub(crate) fn canonical_name(id: &str) -> String {
+    let id = VERSION_DOT
+        .replace_all(&id.trim().to_ascii_lowercase(), "${1}-${2}")
+        .into_owned();
+    let folded = claude_release(&id).unwrap_or_else(|| {
+        id.rsplit_once('-')
+            .filter(|(_, date)| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+            .map_or_else(|| id.clone(), |(name, _)| name.to_owned())
+    });
+    match folded.strip_suffix("[1m]") {
+        Some(name) => name.to_owned(),
+        None => folded,
+    }
+}
+
+/// The release name of a Claude id, `None` for an id that is no Claude
+/// release or carries anything past its version but a release suffix.
+fn claude_release(id: &str) -> Option<String> {
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return None;
+    }
+    let id = id
+        .strip_suffix("[1m]")
+        .or_else(|| id.strip_suffix("[2m]"))
+        .unwrap_or(id);
+    let id = id.rsplit('/').next().unwrap_or(id);
+    let id = match id.split_once("anthropic.") {
+        Some(("", rest)) => rest,
+        Some((region, rest)) => match region.strip_suffix('.') {
+            Some(region) if REGIONS.contains(&region) => rest,
+            Some(region) if region.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') => {
+                return None;
+            }
+            _ => id,
+        },
+        None => id,
+    };
+    let (name, suffix) = release_name(id.strip_prefix("claude-")?)?;
+    RELEASE_SUFFIX.is_match(suffix).then_some(name)
+}
+
+/// `claude-<family>-<major>[-<minor>]` or the older
+/// `claude-<major>[-<minor>]-<family>`, from the text after `claude-`, with
+/// what follows it. A `-0` minor names the release with no minor, as Claude
+/// Code's catalog spells it, except `opus-4` and `sonnet-4`, which it spells
+/// `-4-0`.
+fn release_name(rest: &str) -> Option<(String, &str)> {
+    fn version(text: &str) -> Option<(&str, &str)> {
+        let len = text.bytes().take_while(u8::is_ascii_digit).count();
+        (1..=2).contains(&len).then(|| text.split_at(len))
+    }
+    fn minor(text: &str) -> (Option<&str>, &str) {
+        match text.strip_prefix('-').and_then(version) {
+            Some((minor, tail)) => (Some(minor), tail),
+            None => (None, text),
+        }
+    }
+    let letters = |text: &str| text.bytes().take_while(u8::is_ascii_lowercase).count();
+    let family_len = letters(rest);
+    if family_len > 0 {
+        let (family, tail) = rest.split_at(family_len);
+        let (major, tail) = version(tail.strip_prefix('-')?)?;
+        return Some(match minor(tail) {
+            (Some(minor), tail) if minor != "0" => {
+                (format!("claude-{family}-{major}-{minor}"), tail)
+            }
+            (_, tail) if major == "4" && matches!(family, "opus" | "sonnet") => {
+                (format!("claude-{family}-4-0"), tail)
+            }
+            (_, tail) => (format!("claude-{family}-{major}"), tail),
+        });
+    }
+    let (major, tail) = version(rest)?;
+    let (minor, tail) = minor(tail);
+    let tail = tail.strip_prefix('-')?;
+    let family_len = letters(tail);
+    if family_len == 0 {
+        return None;
+    }
+    let (family, tail) = tail.split_at(family_len);
+    let name = match minor {
+        Some(minor) => format!("claude-{major}-{minor}-{family}"),
+        None => format!("claude-{major}-{family}"),
+    };
+    Some((name, tail))
+}
+
+/// Whether the settings sync keeps `modelSettings.<key>` per profile: a key
+/// an account writes, a key naming the same model as a pinned id once both
+/// fold through [`canonical_name`], and every Claude id of a pinned tier
+/// alias's tier, since the alias lands on whichever model each session's own
+/// `[models]` row names.
+pub(crate) fn is_pinned(pinned: &std::collections::BTreeSet<String>, key: &str) -> bool {
+    if pinned.contains(key) {
+        return true;
+    }
+    let canonical = canonical_name(key);
+    pinned.iter().any(|pin| {
+        if TIERS.contains(&pin.as_str()) {
+            tier_of_id(&canonical) == Some(pin.as_str())
+        } else {
+            canonical_name(pin) == canonical
+        }
+    })
+}
+
+/// Cover the keys of the settings that Claude Code would read ahead of the
+/// account's own: an existing key folding to the same model as one of the
+/// account's takes that model's level (the first account key of that model in
+/// [`resolved`]'s order), and any other `claude-<tier>-*` key of a tier the
+/// account sets by its bare alias takes the alias's level. An account's own
+/// key is never covered.
 pub(crate) fn expand_tier_levels(
     settings: &serde_json::Map<String, serde_json::Value>,
     levels: &mut BTreeMap<String, String>,
 ) {
-    if let Some(models) = settings
+    let Some(models) = settings
         .get("modelSettings")
         .and_then(serde_json::Value::as_object)
-    {
-        for key in models.keys() {
-            if let Some(level) = tier_of(key).and_then(|tier| levels.get(tier)).cloned() {
-                levels.entry(key.clone()).or_insert(level);
-            }
+    else {
+        return;
+    };
+    let mut covers = BTreeMap::new();
+    for key in models.keys().filter(|key| !levels.contains_key(*key)) {
+        let canonical = canonical_name(key);
+        let same_model = levels
+            .iter()
+            .find(|(id, _)| !TIERS.contains(&id.as_str()) && canonical_name(id) == canonical)
+            .map(|(_, level)| level);
+        if let Some(level) = same_model.or_else(|| levels.get(tier_of(key)?)) {
+            covers.insert(key.clone(), level.clone());
         }
     }
+    levels.extend(covers);
 }
 
 /// The account's per-model levels, keyed by the `modelSettings` key clauth
