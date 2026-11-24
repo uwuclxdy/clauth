@@ -170,7 +170,7 @@ A saved Claude Code account's rows:
 | `reduce motion` | the header mascot and the Overview's provider names stay still; spinners keep turning | off |
 | `on mismatch` | `ask`, `overwrite` (skipped on a proxy account or an account running on a long-lived token; the launch shows the resolver banner instead), `new`, `discard` | `ask` |
 | `non-login keys` | keep a `/design-login` with the account it was made on | on |
-| `sync MCP logins` | every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; off, each account keeps its own MCP server logins | on |
+| `sync MCP logins` | every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; every shared codex session uses your codex's MCP server logins; off, each account keeps its own MCP server logins, and codex sessions get none of your codex's | on |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
 | `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
