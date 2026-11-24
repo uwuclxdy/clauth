@@ -16115,7 +16115,15 @@ fn a_session_config_loses_the_keys_that_escape_the_home() {
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let copied = fs::read_to_string(session_home.join("config.toml")).expect("read copy");
     let parsed: toml::Value = toml::from_str(&copied).expect("the rewrite is still valid TOML");
@@ -16178,7 +16186,15 @@ fn a_session_config_is_copied_from_the_operators_own_codex_home() {
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
 
     let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom.as_os_str()))]);
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let copied = fs::read_to_string(session_home.join("config.toml")).expect("read the copy");
     let parsed: toml::Value = toml::from_str(&copied).expect("the copy is valid TOML");
@@ -16200,7 +16216,15 @@ fn a_session_config_is_copied_from_the_operators_own_codex_home() {
             ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
         ],
     );
-    build_codex_home(&nested_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &nested_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let copied = fs::read_to_string(nested_home.join("config.toml")).expect("read the copy");
     let parsed: toml::Value = toml::from_str(&copied).expect("the copy is valid TOML");
@@ -16227,7 +16251,15 @@ fn an_unparseable_operator_config_copies_through_verbatim() {
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     assert_eq!(
         fs::read_to_string(session_home.join("config.toml")).expect("read copy"),
@@ -16323,7 +16355,15 @@ fn a_shared_codex_home_links_the_table() {
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
 
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let auth = session_home.join("auth.json");
     assert!(
@@ -16392,7 +16432,15 @@ fn a_shared_codex_home_links_the_table() {
 
     // The opt-in flips exactly the hooks link.
     fs::write(profile.join("config.toml"), b"hooks_json = true\n").expect("write opts");
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("rebuild");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("rebuild");
     assert!(
         session_home.join("hooks.json").symlink_metadata().is_ok(),
         "the per-profile opt-in links hooks.json"
@@ -16437,7 +16485,15 @@ fn a_linked_hooks_json_carries_the_operators_trust_into_each_home() {
     for sid in ["4242-0", "4343-0"] {
         let session_home = profile.join(format!("codex-home-{sid}"));
         crate::profile::mkdir_700(&session_home).expect("mkdir home");
-        build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+        build_codex_home_with(
+            &session_home,
+            "cx",
+            Isolation::Shared,
+            LinkMode::Real,
+            &codex_profile_opts("cx"),
+            false,
+        )
+        .expect("build");
 
         let state = state_of(&session_home);
         let key = format!(
@@ -16466,7 +16522,15 @@ fn a_linked_hooks_json_carries_the_operators_trust_into_each_home() {
     // Isolated links no hooks, so it carries no trust: the copy is verbatim.
     let isolated = profile.join("codex-home-isolated-4444-0");
     crate::profile::mkdir_700(&isolated).expect("mkdir isolated");
-    build_codex_home(&isolated, "cx", Isolation::Isolated, LinkMode::Real).expect("build isolated");
+    build_codex_home_with(
+        &isolated,
+        "cx",
+        Isolation::Isolated,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build isolated");
     assert_eq!(
         fs::read_to_string(isolated.join("config.toml")).expect("read copy"),
         config
@@ -16476,7 +16540,15 @@ fn a_linked_hooks_json_carries_the_operators_trust_into_each_home() {
     fs::write(profile.join("config.toml"), b"harness = \"codex\"\n").expect("drop opt-in");
     let plain = profile.join("codex-home-4545-0");
     crate::profile::mkdir_700(&plain).expect("mkdir plain");
-    build_codex_home(&plain, "cx", Isolation::Shared, LinkMode::Real).expect("build plain");
+    build_codex_home_with(
+        &plain,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build plain");
     assert!(plain.join("hooks.json").symlink_metadata().is_err());
     assert_eq!(
         fs::read_to_string(plain.join("config.toml")).expect("read copy"),
@@ -17188,7 +17260,15 @@ fn an_isolated_codex_home_links_only_the_auth() {
     let session_home = profile.join("codex-home-isolated-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
 
-    build_codex_home(&session_home, "cx", Isolation::Isolated, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Isolated,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     assert!(session_home.join("auth.json").symlink_metadata().is_ok());
     assert!(session_home.join("skills").symlink_metadata().is_err());
@@ -17217,7 +17297,7 @@ fn an_isolated_codex_home_links_only_the_auth() {
     );
 }
 
-/// With the `mcp_oauth` opt-in, shared homes see the operator's MCP OAuth
+/// With `sync_mcp_logins` on, shared homes see the operator's MCP OAuth
 /// logins through ONE inode (a hard link — codex writes it with `O_NOFOLLOW`, so a symlink
 /// would fail every refresh) and lock on the operator's lock dir. A refresh
 /// written through one home is what the operator and the next home read.
@@ -17236,12 +17316,19 @@ fn a_shared_codex_home_shares_the_operators_mcp_oauth_logins() {
 
     let profile = home.home().join(".clauth/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
-    fs::write(profile.join("config.toml"), b"mcp_oauth = true\n").expect("write opts");
     let a = profile.join("codex-home-4242-0");
     let b = profile.join("codex-home-4343-0");
     for h in [&a, &b] {
         crate::profile::mkdir_700(h).expect("mkdir home");
-        build_codex_home(h, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+        build_codex_home_with(
+            h,
+            "cx",
+            Isolation::Shared,
+            LinkMode::Real,
+            &codex_profile_opts("cx"),
+            true,
+        )
+        .expect("build");
     }
 
     let creds = a.join(".credentials.json");
@@ -17293,7 +17380,15 @@ fn a_shared_codex_home_shares_the_operators_mcp_oauth_logins() {
 
     let isolated = profile.join("codex-home-isolated-4444-0");
     crate::profile::mkdir_700(&isolated).expect("mkdir isolated");
-    build_codex_home(&isolated, "cx", Isolation::Isolated, LinkMode::Real).expect("build isolated");
+    build_codex_home_with(
+        &isolated,
+        "cx",
+        Isolation::Isolated,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        true,
+    )
+    .expect("build isolated");
     isolated
         .join(".credentials.json")
         .symlink_metadata()
@@ -17302,9 +17397,106 @@ fn a_shared_codex_home_shares_the_operators_mcp_oauth_logins() {
         .join("mcp-oauth-locks")
         .symlink_metadata()
         .unwrap_err();
+
+    let fake = profile.join("codex-home-4545-0");
+    crate::profile::mkdir_700(&fake).expect("mkdir fake");
+    let at_build = build_codex_home_with(
+        &fake,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Fake,
+        &codex_profile_opts("cx"),
+        true,
+    )
+    .expect("build fake");
+    assert_eq!(at_build, None, "a fake home keeps no record to carry by");
+    fake.join(".credentials.json")
+        .symlink_metadata()
+        .unwrap_err();
+    fake.join("mcp-oauth-locks").symlink_metadata().unwrap_err();
 }
 
-/// Opted in, with no operator logins yet: no credential file is placed, and the first login a session
+/// The session acquire is where the toggle is read: on (its default), a shared
+/// session's home holds the operator's file as one inode and links its lock
+/// dir; an isolated session's home holds neither.
+#[cfg(unix)]
+#[test]
+fn codex_sessions_share_mcp_oauth_logins_while_sync_mcp_logins_is_on() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let op_creds = operator.join(".credentials.json");
+    fs::write(&op_creds, b"{\"hostinger|x\":{}}").expect("write creds");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+
+    let shared = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire shared");
+    let linked = fs::symlink_metadata(shared.home().join(".credentials.json"))
+        .expect("the shared home holds the operator's file");
+    let op_meta = fs::metadata(&op_creds).expect("stat operator");
+    assert_eq!(
+        (linked.dev(), linked.ino()),
+        (op_meta.dev(), op_meta.ino()),
+        "one inode"
+    );
+    assert_eq!(
+        fs::read_link(shared.home().join("mcp-oauth-locks")).expect("lock link"),
+        operator.join("mcp-oauth-locks")
+    );
+
+    let isolated = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire isolated");
+    isolated
+        .home()
+        .join(".credentials.json")
+        .symlink_metadata()
+        .unwrap_err();
+    isolated
+        .home()
+        .join("mcp-oauth-locks")
+        .symlink_metadata()
+        .unwrap_err();
+    drop(isolated);
+    drop(shared);
+    assert_eq!(
+        fs::read_to_string(&op_creds).expect("the operator's file stays"),
+        "{\"hostinger|x\":{}}"
+    );
+}
+
+/// With `sync_mcp_logins` off at acquire, a shared session's home holds neither
+/// the operator's file nor its lock dir, and nothing is created in the
+/// operator's home.
+#[cfg(unix)]
+#[test]
+fn codex_sessions_share_no_mcp_oauth_logins_while_sync_mcp_logins_is_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::write(operator.join(".credentials.json"), b"{\"hostinger|x\":{}}").expect("write creds");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+    crate::profile::update_app_state(|state, _| state.sync_mcp_logins = false)
+        .expect("turn the toggle off");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    runtime
+        .home()
+        .join(".credentials.json")
+        .symlink_metadata()
+        .unwrap_err();
+    runtime
+        .home()
+        .join("mcp-oauth-locks")
+        .symlink_metadata()
+        .unwrap_err();
+    drop(runtime);
+    assert!(
+        operator.join("mcp-oauth-locks").symlink_metadata().is_err(),
+        "nothing is created in the operator's home"
+    );
+}
+
+/// With no operator logins yet: no credential file is placed, and the first login a session
 /// makes reaches the operator at teardown; a home holding a different file
 /// while the operator has its own leaves the operator's untouched.
 #[cfg(unix)]
@@ -17315,11 +17507,19 @@ fn a_first_mcp_oauth_login_in_a_session_reaches_the_operator() {
     fs::create_dir_all(&operator).expect("mkdir operator");
     let profile = home.home().join(".clauth/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
-    fs::write(profile.join("config.toml"), b"mcp_oauth = true\n").expect("write opts");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
 
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    let at_build = build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        true,
+    )
+    .expect("build")
+    .expect("a shared real home keeps a record");
     session_home
         .join(".credentials.json")
         .symlink_metadata()
@@ -17331,7 +17531,7 @@ fn a_first_mcp_oauth_login_in_a_session_reaches_the_operator() {
     );
 
     fs::write(session_home.join(".credentials.json"), b"{\"new\":{}}").expect("login");
-    carry_codex_mcp_oauth_back(&operator, &session_home).expect("carry");
+    carry_codex_mcp_oauth_back(&operator, &session_home, at_build).expect("carry");
     assert_eq!(
         fs::read_to_string(operator.join(".credentials.json")).expect("operator has it"),
         "{\"new\":{}}"
@@ -17345,7 +17545,7 @@ fn a_first_mcp_oauth_login_in_a_session_reaches_the_operator() {
     let other = profile.join("codex-home-4343-0");
     crate::profile::mkdir_700(&other).expect("mkdir other");
     fs::write(other.join(".credentials.json"), b"{\"stray\":{}}").expect("stray");
-    carry_codex_mcp_oauth_back(&operator, &other).expect("carry stray");
+    carry_codex_mcp_oauth_back(&operator, &other, McpOauthAtBuild(None)).expect("carry stray");
     assert_eq!(
         fs::read_to_string(operator.join(".credentials.json")).expect("read"),
         "{\"new\":{}}",
@@ -17353,12 +17553,317 @@ fn a_first_mcp_oauth_login_in_a_session_reaches_the_operator() {
     );
 }
 
-/// Without the opt-in a shared home gets neither the operator's MCP OAuth
+/// The operator gains a different `.credentials.json` while a session makes its
+/// own first login: the teardown keeps the operator's file and names it.
+#[cfg(unix)]
+#[test]
+fn a_teardown_keeps_a_differing_operator_file_and_names_its_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+    let op_creds = operator.join(".credentials.json");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    fs::write(
+        runtime.home().join(".credentials.json"),
+        b"{\"session\":{}}",
+    )
+    .expect("login");
+    fs::write(&op_creds, b"{\"operator\":{}}").expect("operator logs in meanwhile");
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        drop(runtime);
+    }
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: kept {}, this session's copy differs",
+            op_creds.display()
+        )]
+    );
+    assert_eq!(
+        fs::read_to_string(&op_creds).expect("read"),
+        "{\"operator\":{}}"
+    );
+}
+
+/// A logout of the operator's last server in a plain codex shell removes its
+/// file while a session holds the build's link to it: the teardown must not
+/// put the logged-out credentials back.
+#[cfg(unix)]
+#[test]
+fn a_logout_in_the_operator_home_during_a_session_stays_logged_out() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let op_creds = operator.join(".credentials.json");
+    fs::write(&op_creds, b"{\"hostinger|x\":{}}").expect("write creds");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let linked =
+        fs::symlink_metadata(runtime.home().join(".credentials.json")).expect("the build linked");
+    let op_meta = fs::metadata(&op_creds).expect("stat operator");
+    assert_eq!(
+        (linked.dev(), linked.ino()),
+        (op_meta.dev(), op_meta.ino()),
+        "the session holds the operator's file"
+    );
+    fs::remove_file(&op_creds).expect("codex deletes an emptied store");
+    drop(runtime);
+    assert!(
+        op_creds.symlink_metadata().is_err(),
+        "logged-out credentials came back"
+    );
+}
+
+/// The same logout landing after the build linked the file but before it read
+/// its record: the record comes from the session home's own path, which still
+/// holds the link, so the teardown carries nothing.
+#[cfg(unix)]
+#[test]
+fn a_logout_between_the_link_and_the_record_stays_logged_out() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let op_creds = operator.join(".credentials.json");
+    fs::write(&op_creds, b"{\"hostinger|x\":{}}").expect("write creds");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+
+    let logout = op_creds.clone();
+    let hook = McpOauthRecordHook::arm(move || {
+        fs::remove_file(&logout).expect("codex deletes an emptied store");
+    });
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    drop(hook);
+    assert!(
+        runtime.home().join(".credentials.json").is_file(),
+        "the build linked the file before the logout"
+    );
+    op_creds.symlink_metadata().unwrap_err();
+    drop(runtime);
+    assert!(
+        op_creds.symlink_metadata().is_err(),
+        "logged-out credentials came back"
+    );
+}
+
+/// A `.credentials.json` already in a session home before its build (a crashed
+/// session's leftover on a reused tree) is never the session's login, so the
+/// teardown never carries it.
+#[cfg(unix)]
+#[test]
+fn a_credentials_file_left_in_the_session_home_before_the_build_is_never_carried() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    fs::write(session_home.join(".credentials.json"), b"{\"leftover\":{}}").expect("leftover");
+
+    let at_build = build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        true,
+    )
+    .expect("build")
+    .expect("a shared real home keeps a record");
+    carry_codex_mcp_oauth_back(&operator, &session_home, at_build).expect("carry");
+    assert!(
+        operator
+            .join(".credentials.json")
+            .symlink_metadata()
+            .is_err(),
+        "the leftover reached the operator"
+    );
+}
+
+/// The leftover with no operator codex home at build (the share places
+/// nothing): never carried, and no operator home is created for it.
+#[cfg(unix)]
+#[test]
+fn a_leftover_with_no_operator_codex_home_is_never_carried_and_creates_no_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    fs::write(session_home.join(".credentials.json"), b"{\"leftover\":{}}").expect("leftover");
+
+    let at_build = build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        true,
+    )
+    .expect("build")
+    .expect("a shared real home keeps a record");
+    carry_codex_mcp_oauth_back(&operator, &session_home, at_build).expect("carry");
+    assert!(
+        operator.symlink_metadata().is_err(),
+        "an operator home was created for the leftover"
+    );
+}
+
+/// The leftover with the share failing at its lock-dir step: the failure is
+/// logged, and the leftover is still never carried.
+#[cfg(unix)]
+#[test]
+fn a_leftover_is_never_carried_when_the_share_fails_at_the_lock_dir() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let locks = operator.join("mcp-oauth-locks");
+    fs::write(&locks, b"").expect("a file where the lock dir goes");
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    fs::write(session_home.join(".credentials.json"), b"{\"leftover\":{}}").expect("leftover");
+
+    let lines = crate::logline::LogLines::new();
+    let at_build = {
+        let _capture = lines.capture_here();
+        build_codex_home_with(
+            &session_home,
+            "cx",
+            Isolation::Shared,
+            LinkMode::Real,
+            &codex_profile_opts("cx"),
+            true,
+        )
+        .expect("build")
+        .expect("a shared real home keeps a record")
+    };
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: sharing codex MCP OAuth logins failed: failed to create {}: File exists (os \
+             error 17)",
+            locks.display()
+        )]
+    );
+    carry_codex_mcp_oauth_back(&operator, &session_home, at_build).expect("carry");
+    assert!(
+        operator
+            .join(".credentials.json")
+            .symlink_metadata()
+            .is_err(),
+        "the leftover reached the operator"
+    );
+}
+
+/// The teardown resolves the operator home as the build does: a first login
+/// reaches the custom home `CODEX_HOME` or the carried
+/// `CLAUTH_OPERATOR_CODEX_HOME` names, and `~/.codex` gains nothing.
+#[cfg(unix)]
+#[test]
+fn a_first_login_reaches_a_custom_operator_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let default = home.home().join(".codex");
+    fs::create_dir_all(&default).expect("mkdir the default home");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+
+    for (key, dir) in [
+        ("CODEX_HOME", "my-codex"),
+        ("CLAUTH_OPERATOR_CODEX_HOME", "carried-codex"),
+    ] {
+        let custom = home.home().join(dir);
+        fs::create_dir_all(&custom).expect("mkdir the custom operator home");
+        let _env = crate::testutil::EnvPin::new(&home, &[(key, Some(custom.as_os_str()))]);
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+        fs::write(runtime.home().join(".credentials.json"), b"{\"new\":{}}").expect("login");
+        drop(runtime);
+        assert_eq!(
+            fs::read_to_string(custom.join(".credentials.json"))
+                .unwrap_or_else(|e| panic!("{key}: the login reached the custom home: {e}")),
+            "{\"new\":{}}"
+        );
+        assert!(
+            default
+                .join(".credentials.json")
+                .symlink_metadata()
+                .is_err(),
+            "{key}: ~/.codex gained the login"
+        );
+    }
+}
+
+/// No operator codex home at teardown: the first login a session made creates
+/// it owner-only and lands in it, so the login is not dropped with the home.
+#[cfg(unix)]
+#[test]
+fn a_first_login_with_no_operator_codex_home_creates_it_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(home.home().join(".clauth/profiles/cx")).expect("mkdir profile");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    fs::write(runtime.home().join(".credentials.json"), b"{\"new\":{}}").expect("login");
+    drop(runtime);
+    let mode = fs::metadata(&operator)
+        .expect("the operator home was created")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+    assert_eq!(
+        fs::read_to_string(operator.join(".credentials.json")).expect("the login landed"),
+        "{\"new\":{}}"
+    );
+}
+
+/// The build links `hooks.json` by the opts its caller passed, never by a
+/// second read of the profile's config, so the teardown and the build act on
+/// one decision.
+#[cfg(unix)]
+#[test]
+fn the_codex_build_reads_hooks_json_from_the_opts_it_is_passed() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::write(operator.join("hooks.json"), b"{}").expect("write hooks");
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("config.toml"), b"harness = \"codex\"\n").expect("no opt-in on disk");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &CodexProfileOpts { hooks_json: true },
+        false,
+    )
+    .expect("build");
+    assert_eq!(
+        fs::read_link(session_home.join("hooks.json")).expect("hooks.json is linked"),
+        operator.join("hooks.json")
+    );
+}
+
+/// With `sync_mcp_logins` off a shared home gets neither the operator's MCP OAuth
 /// logins nor its lock dir: those are bearer credentials for every server the
 /// operator signed in to, readable by any profile that links them.
 #[cfg(unix)]
 #[test]
-fn a_shared_codex_home_without_the_opt_in_gets_no_mcp_oauth_logins() {
+fn a_shared_codex_home_built_with_sync_mcp_logins_off_gets_no_mcp_oauth_logins() {
     let home = crate::testutil::HomeSandbox::new();
     let operator = home.home().join(".codex");
     fs::create_dir_all(&operator).expect("mkdir operator");
@@ -17368,7 +17873,15 @@ fn a_shared_codex_home_without_the_opt_in_gets_no_mcp_oauth_logins() {
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
 
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
     session_home
         .join(".credentials.json")
         .symlink_metadata()
@@ -17383,34 +17896,41 @@ fn a_shared_codex_home_without_the_opt_in_gets_no_mcp_oauth_logins() {
     );
 }
 
-/// Teardown acts on the opt-in the session STARTED with: enabling `mcp_oauth`
-/// mid-session does not carry that session's login into `~/.codex`, and a
-/// session that started opted in still carries its first login back.
+/// Teardown acts on the `sync_mcp_logins` value the session STARTED with:
+/// turning it on mid-session does not carry that session's login into
+/// `~/.codex`, and turning it off mid-session still carries the first login of
+/// a session that started with it on.
 #[cfg(unix)]
 #[test]
-fn codex_teardown_carries_mcp_oauth_only_for_a_session_that_started_opted_in() {
+fn codex_teardown_carries_by_the_sync_mcp_logins_value_read_at_acquire() {
     let home = crate::testutil::HomeSandbox::new();
     let operator = home.home().join(".codex");
     fs::create_dir_all(&operator).expect("mkdir operator");
     let profile = home.home().join(".clauth/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
     let op_creds = operator.join(".credentials.json");
+    let set_sync = |on: bool| {
+        crate::profile::update_app_state(|state, _| state.sync_mcp_logins = on)
+            .expect("write the toggle");
+    };
 
-    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire unopted");
+    set_sync(false);
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire with it off");
     fs::write(
         runtime.home().join(".credentials.json"),
         b"{\"unopted\":{}}",
     )
     .expect("login");
-    fs::write(profile.join("config.toml"), b"mcp_oauth = true\n").expect("opt in mid-session");
+    set_sync(true);
     drop(runtime);
     assert!(
         op_creds.symlink_metadata().is_err(),
-        "a session that started without the opt-in carries nothing back"
+        "a session that started with the toggle off carries nothing back"
     );
 
-    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire opted");
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire with it on");
     fs::write(runtime.home().join(".credentials.json"), b"{\"opted\":{}}").expect("login");
+    set_sync(false);
     drop(runtime);
     assert_eq!(
         fs::read_to_string(&op_creds).expect("carried"),
@@ -17430,7 +17950,15 @@ fn a_rollout_written_through_the_linked_root_is_in_the_store_before_teardown() {
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let day = session_home.join("sessions/2026/09/16");
     fs::create_dir_all(&day).expect("codex's dated tree through the link");
@@ -17706,7 +18234,15 @@ fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
     fs::create_dir_all(&profile).expect("mkdir profile");
     let session_home = profile.join("codex-home-4242-0");
     crate::profile::mkdir_700(&session_home).expect("mkdir home");
-    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+    build_codex_home_with(
+        &session_home,
+        "cx",
+        Isolation::Shared,
+        LinkMode::Real,
+        &codex_profile_opts("cx"),
+        false,
+    )
+    .expect("build");
 
     let layer = fs::read_to_string(session_home.join("work.config.toml")).expect("read layer");
     let parsed: toml::Value = toml::from_str(&layer).expect("valid TOML");
