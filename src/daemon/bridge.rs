@@ -31,6 +31,7 @@ use serde_json::{Map, Value, json};
 
 use crate::daemon::api::http::sanitize_for_log;
 use crate::logline::logline;
+use crate::oauth_login::{Malformed, percent_decode_bytes};
 
 /// One event body, in bytes. A mod event is small by construction (a row wake
 /// carries its `uuid`, never its content; an ask carries its tool input), so a
@@ -122,6 +123,11 @@ pub(crate) const MAX_WAITS_PER_INSTANCE: usize = 8;
 /// for the snapshot a reconnecting stream opens with; queued prompts are
 /// never evicted.
 const KEPT_PROMPT_OUTCOMES: usize = 16;
+
+/// Cap on the open subagent turns one instance lists and one poll reports:
+/// every such turn rides the poll's query, so this bounds both the query's
+/// share of the 16 KiB bridge head budget and the snapshot one instance grows.
+const MAX_OPEN_AGENT_TURNS: usize = 64;
 
 /// How long the accept loop pauses after an error it cannot attribute to one
 /// connection, so a persistent failure cannot spin a core (mirrors the REST
@@ -300,6 +306,56 @@ fn answer_receipt(value: &Value) -> Option<(&str, Receipt)> {
         _ => return None,
     };
     Some((ask, receipt))
+}
+
+/// Which edge of a subagent's turn an `agent_turn` event reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnEdge {
+    Start,
+    End,
+}
+
+impl TurnEdge {
+    /// The wire name, on the event's and the `session.agent` frame's `state`.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::End => "end",
+        }
+    }
+}
+
+/// One subagent turn edge the mod reports: its own event kind, never
+/// `turn_start`/`turn_end`, so a daemon that predates it refuses it rather
+/// than relaying a subagent's turn as the main loop's.
+struct AgentTurn<'a> {
+    agent_id: &'a str,
+    edge: TurnEdge,
+    turn: &'a str,
+}
+
+/// An `agent_turn` event's fields, or `None` for one the daemon cannot read: a
+/// missing, empty or non-string `agent_id`, a `state` other than `start` or
+/// `end`, or a missing, empty or non-string `turn`.
+fn agent_turn(value: &Value) -> Option<AgentTurn<'_>> {
+    let agent_id = value
+        .get("agent_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    let edge = match value.get("state")?.as_str()? {
+        "start" => TurnEdge::Start,
+        "end" => TurnEdge::End,
+        _ => return None,
+    };
+    let turn = value
+        .get("turn")?
+        .as_str()
+        .filter(|turn| !turn.is_empty())?;
+    Some(AgentTurn {
+        agent_id,
+        edge,
+        turn,
+    })
 }
 
 /// An `answer` command's ask id, or `None` for any other command.
@@ -587,6 +643,18 @@ struct Live {
     /// Which module load of the mod speaks for this instance: only its starts
     /// and polls set `prompt_reports` and `caps` or drain `commands`.
     loads: Loads,
+    /// The open main-loop turn's id: set by `turn_start`, cleared by
+    /// `turn_end`, and replaced as a whole by an accepted poll that reports
+    /// the mod's open turns, for the snapshot's `turn`.
+    main_turn: Option<String>,
+    /// Each subagent with an open turn, as `(agent_id, turn)` in first-start
+    /// order, bounded to [`MAX_OPEN_AGENT_TURNS`], for the snapshot's
+    /// `agents`: a subagent resumed while listed replaces its turn in place,
+    /// its end removes it, and a start past the bound lists nothing. A main
+    /// `turn_end` leaves it: a background subagent's turn runs on past the
+    /// main turn's end. An accepted poll that reports the mod's open turns
+    /// replaces the whole list.
+    agent_turns: Vec<(String, String)>,
     /// The main transcript, located at registration and tailed on each
     /// main-file wake; `None` until the file is found (SB-11).
     main_file: Option<FileTail>,
@@ -665,6 +733,8 @@ impl Live {
             prompt_reports: false,
             caps: BTreeSet::new(),
             loads: Loads::Unheard,
+            main_turn: None,
+            agent_turns: Vec::new(),
             main_file: None,
             subagent_files: HashMap::new(),
             subagent_snapshot: HashMap::new(),
@@ -1351,9 +1421,14 @@ impl Hub {
     /// that same instance order, each instance's asks in open order and its
     /// prompts in mint order. An entry's `caps` are the instance's own, none
     /// once its `end` owns the final read: an ending instance takes no more
-    /// answers. The revalidation closes moved or silent instances and drops
-    /// kept sets whose process is gone or moved first, with the peer resolve
-    /// running off every hub lock (SB-10, SB-13).
+    /// answers. Its `turn` is the open main turn's id (`null` with none) and
+    /// its `agents` each subagent with an open turn, `{agent_id, turn}` in
+    /// first-start order, both read from the instance's own state, so a frame
+    /// a stream missed never pins either; an ending instance reads `null` and
+    /// `[]`, and a removed one takes both with it. The revalidation closes
+    /// moved or silent instances and drops kept sets whose process is gone or
+    /// moved first, with the peer resolve running off every hub lock (SB-10,
+    /// SB-13).
     pub(crate) fn snapshot(&self) -> Value {
         let records: Vec<(u32, String, String)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1384,16 +1459,25 @@ impl Hub {
         let session_entries: Vec<Value> = sessions
             .iter()
             .map(|(_, live)| {
-                let caps = if live.ending {
-                    Vec::new()
+                let (caps, turn, agents): (_, _, Vec<Value>) = if live.ending {
+                    (Vec::new(), None, Vec::new())
                 } else {
-                    Cap::names(&live.caps)
+                    (
+                        Cap::names(&live.caps),
+                        live.main_turn.as_deref(),
+                        live.agent_turns
+                            .iter()
+                            .map(|(agent_id, turn)| json!({"agent_id": agent_id, "turn": turn}))
+                            .collect(),
+                    )
                 };
                 json!({
                     "session": live.session_id,
                     "cwd": live.cwd,
                     "interactive": live.interactive,
                     "caps": caps,
+                    "turn": turn,
+                    "agents": agents,
                 })
             })
             .collect();
@@ -1522,6 +1606,7 @@ impl Hub {
                 "ask_closed"
             }
             Some("answer_receipt") => "answer_receipt",
+            Some("agent_turn") => "agent_turn",
             _ => return (400, error_value("bad_request")),
         };
         let report = if kind == "prompt" {
@@ -1537,6 +1622,14 @@ impl Hub {
                 return (400, error_value("bad_request"));
             };
             Some(receipt)
+        } else {
+            None
+        };
+        let agent = if kind == "agent_turn" {
+            let Some(agent) = agent_turn(&value) else {
+                return (400, error_value("bad_request"));
+            };
+            Some(agent)
         } else {
             None
         };
@@ -1708,6 +1801,10 @@ impl Hub {
             }
             "turn_start" | "turn_end" => {
                 let turn = value.get("turn").cloned().unwrap_or(Value::Null);
+                live.main_turn = match kind {
+                    "turn_start" => turn.as_str().map(str::to_owned),
+                    _ => None,
+                };
                 self.broadcast(
                     "session.status",
                     json!({"session": named, "state": kind, "turn": turn}),
@@ -1829,6 +1926,38 @@ impl Hub {
             "answer_receipt" => {
                 if let Some((ask, receipt)) = receipt {
                     self.settle_receipt(live, named, ask, receipt);
+                }
+                (200, json!({ "ok": true }))
+            }
+            "agent_turn" => {
+                if let Some(AgentTurn {
+                    agent_id,
+                    edge,
+                    turn,
+                }) = agent
+                {
+                    match edge {
+                        TurnEdge::Start => {
+                            // A start past the bound lists nothing; its frame
+                            // still relays, as the engine raised it.
+                            if let Some((_, open)) =
+                                live.agent_turns.iter_mut().find(|(id, _)| id == agent_id)
+                            {
+                                turn.clone_into(open);
+                            } else if live.agent_turns.len() < MAX_OPEN_AGENT_TURNS {
+                                live.agent_turns
+                                    .push((agent_id.to_owned(), turn.to_owned()));
+                            }
+                        }
+                        // An end whose start this instance never saw (a
+                        // reconnect, a reload) finds nothing listed and still
+                        // relays its frame.
+                        TurnEdge::End => live.agent_turns.retain(|(id, _)| id != agent_id),
+                    }
+                    self.broadcast(
+                        "session.agent",
+                        json!({"session": named, "agent_id": agent_id, "state": edge.name(), "turn": turn}),
+                    );
                 }
                 (200, json!({ "ok": true }))
             }
@@ -2256,6 +2385,7 @@ impl Hub {
             prompt_reports: true,
             caps: caps.iter().copied().collect(),
             load: Some(1),
+            turns: None,
         };
         let PollAnswer {
             status,
@@ -2306,6 +2436,7 @@ impl Hub {
             prompt_reports: reports,
             caps: BTreeSet::new(),
             load: None,
+            turns: None,
         };
         self.poll_announced(peer_pid, session, wait, announced)
     }
@@ -2314,10 +2445,12 @@ impl Hub {
     /// requeue them when the answer write fails rather than letting a 200'd
     /// command vanish (A#1). A restarted daemon first meets a live mod by its
     /// poll, so the poll's [`Announced`] lands on the instance it reconciles:
-    /// its `prompt_reports` and `caps` replace the instance's. A poll of an
-    /// older module load than the instance's current one ([`Loads`]) answers
-    /// empty at once and touches nothing: no announcement, no drain, no
-    /// liveness, no park, so the current load's parked poll stays parked.
+    /// its `prompt_reports` and `caps` replace the instance's, and its open
+    /// turns, when it reports them, replace `main_turn` and `agent_turns`. A
+    /// poll of an older module load than the instance's current one
+    /// ([`Loads`]) answers empty at once and touches nothing: no
+    /// announcement, no drain, no liveness, no park, so the current load's
+    /// parked poll stays parked.
     fn poll_announced(
         &self,
         peer_pid: u32,
@@ -2346,6 +2479,14 @@ impl Hub {
             live.last_poll = now;
             live.prompt_reports = announced.prompt_reports;
             live.caps = announced.caps;
+            // The mod's open turns ride the poll like its caps: an accepted
+            // poll replaces them, so a start or end frame the bridge refused
+            // or lost, or a silence close's dropped state, is right again
+            // within one poll.
+            if let Some(turns) = announced.turns {
+                live.main_turn = turns.main;
+                live.agent_turns = turns.agents;
+            }
             let commands: Vec<Value> = live.commands.drain(..).collect();
             live.inflight += commands.len();
             (created, live.generation, commands)
@@ -4095,6 +4236,10 @@ struct Announced {
     /// `load=<n>`: the module load that sent the poll ([`Loads`]); none when
     /// the query carries no `load` or one that is not a decimal `u64`.
     load: Option<u64>,
+    /// `turn=<id>&agents=<agent_id>:<turn>,…`: the mod's open turns, `None`
+    /// for a poll of a mod that does not report them (a query with no `turn`
+    /// key), which changes neither the instance's `turn` nor its `agents`.
+    turns: Option<OpenTurns>,
 }
 
 impl Announced {
@@ -4110,8 +4255,65 @@ impl Announced {
             load: query_param(path, "load")
                 .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|n| n.parse().ok()),
+            turns: OpenTurns::from_poll(path),
         }
     }
+}
+
+/// The open turns a poll reports: the main loop's open turn id, if one runs,
+/// and each subagent with an open turn, in the mod's order.
+#[derive(Debug, Default)]
+struct OpenTurns {
+    main: Option<String>,
+    agents: Vec<(String, String)>,
+}
+
+impl OpenTurns {
+    /// The open turns `path` reports, `None` when its query carries no `turn`
+    /// key (a mod older than the poll's open-turn fields). An empty `turn`
+    /// value is no open main turn, and so is one that does not percent-decode.
+    /// Each `agents` entry is `<agent_id>:<turn>` with both sides
+    /// percent-encoded: an entry with no `:`, an empty side, a side that is
+    /// not a percent-encoded UTF-8 string, or one past
+    /// [`MAX_OPEN_AGENT_TURNS`] is skipped, never a refused poll. A repeated
+    /// agent id replaces its turn where it first listed, as the event path's
+    /// re-start does.
+    fn from_poll(path: &str) -> Option<Self> {
+        let turn = query_param(path, "turn")?;
+        let main = decoded_side(turn);
+        let mut agents: Vec<(String, String)> = Vec::new();
+        for entry in query_param(path, "agents")
+            .into_iter()
+            .flat_map(|list| list.split(','))
+        {
+            let Some((agent_id, turn)) = entry.split_once(':') else {
+                continue;
+            };
+            let (Some(agent_id), Some(turn)) = (decoded_side(agent_id), decoded_side(turn)) else {
+                continue;
+            };
+            if let Some((_, open)) = agents
+                .iter_mut()
+                .find(|(id, _)| id.as_str() == agent_id.as_str())
+            {
+                *open = turn;
+            } else if agents.len() < MAX_OPEN_AGENT_TURNS {
+                agents.push((agent_id, turn));
+            }
+        }
+        Some(Self { main, agents })
+    }
+}
+
+/// One percent-encoded side of an `agents` entry, or `None` for an empty one
+/// or one that is not a percent-encoded UTF-8 string: the mod encodes each
+/// side with `encodeURIComponent`, so anything else is a peer's malformed
+/// entry, skipped rather than stored.
+fn decoded_side(text: &str) -> Option<String> {
+    let bytes = percent_decode_bytes(text, false, Malformed::Refuse)?;
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|side| !side.is_empty())
 }
 
 /// The `session` and `ask` of a `GET /wait` query, both required — a missing
@@ -4382,3 +4584,7 @@ mod kept_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/daemon_bridge_receipts.rs"]
 mod receipts_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/daemon_bridge_agents.rs"]
+mod agents_tests;

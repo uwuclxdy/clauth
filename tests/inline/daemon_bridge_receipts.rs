@@ -179,6 +179,7 @@ impl World {
             prompt_reports: true,
             caps: RECEIPT_CAPS.iter().copied().collect(),
             load: Some(1),
+            turns: None,
         };
         let PollAnswer {
             status,
@@ -435,6 +436,7 @@ fn an_answer_requeued_by_a_failed_write_counts_as_still_queued() {
         prompt_reports: true,
         caps: RECEIPT_CAPS.iter().copied().collect(),
         load: Some(1),
+        turns: None,
     };
     let PollAnswer { body, drained, .. } = world.hub.poll_announced(100, "s-one", WOKEN, announced);
     assert_eq!(body["commands"], json!([allow("a1")]));

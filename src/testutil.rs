@@ -277,7 +277,7 @@ impl HomeSandbox {
         // The two codex homes this process reads, cleared for the same reason:
         // a suite run from inside a `clauth start` codex session inherits a
         // session `CODEX_HOME` and a carried operator home, and both outrank
-        // the sandbox for `build_codex_home`, the switch and the delete. A
+        // the sandbox for `build_codex_home_with`, the switch and the delete. A
         // test that WANTS one pins it with [`CodexHomeSandbox`] or [`EnvPin`],
         // which borrow this guard and so always set it after this clear.
         let prev_codex_home = take_env("CODEX_HOME");

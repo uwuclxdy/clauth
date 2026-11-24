@@ -2378,6 +2378,73 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     );
     driven.insert(("GET".to_string(), "/events".to_string(), 200));
 
+    // The stream's document names the subagent frame with its four fields and
+    // each snapshot entry's open turn and subagent list, and a stream over a
+    // live bridge opens with a snapshot carrying both.
+    {
+        let Some(utoipa::openapi::RefOr::T(streamed)) = doc_operation(&doc, "GET", "/events")
+            .expect("GET /events is in the document")
+            .responses
+            .responses
+            .get("200")
+        else {
+            panic!("GET /events must document an inline 200");
+        };
+        for named in [
+            "`event: session.agent`",
+            r#"`{"session","agent_id","state":"start"|"end","turn"}`"#,
+            r#"{"session","cwd","interactive","caps","turn","agents"}"#,
+            r#"`[{"agent_id","turn"},…]`"#,
+        ] {
+            assert!(
+                streamed.description.contains(named),
+                "GET /events 200 must name {named}"
+            );
+        }
+
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| rows.get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        for body in [
+            serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true}),
+            serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "turn_start", "turn": "m1"}),
+            serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "agent_turn", "agent_id": "a1", "state": "start", "turn": "t1"}),
+        ] {
+            assert_eq!(hub.event(100, body.to_string().as_bytes()).0, 200, "{body}");
+        }
+        let ctx_bridge = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            hub,
+        );
+        let events = call(&ctx_bridge, &req("GET", "/api/v1/events", Some(TOKEN), ""));
+        assert_eq!(events.status, 200);
+        let rendered = render_stream(
+            events,
+            std::time::Instant::now() + std::time::Duration::from_millis(300),
+        );
+        let rendered_text = String::from_utf8_lossy(&rendered);
+        let snapshot = rendered_text
+            .split("event: session.snapshot\ndata: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or_else(|| panic!("the stream opens with a snapshot: {rendered_text:?}"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(snapshot).expect("snapshot json")["sessions"],
+            serde_json::json!([{"session": FIXTURE_ID, "cwd": "/w", "interactive": true, "caps": [], "turn": "m1", "agents": [{"agent_id": "a1", "turn": "t1"}]}])
+        );
+    }
+
     let switched = call(
         &ctx,
         &req(

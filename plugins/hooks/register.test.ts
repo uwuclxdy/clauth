@@ -55,6 +55,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
   const closed = { fail: 0 }
   // The next `fail` `answer_receipt` posts answer 500, the same way.
   const receipt = { fail: 0 }
+  // An `agent_turn` answers 400 `bad_request`, as a daemon that predates the
+  // kind does.
+  const agentTurn = { refuse: false }
   // A device answer: the daemon closes the ask and keeps the answer for its
   // wait. An ask already closed refuses (the device got `ask_closed`).
   const answer = (ask: string, payload: Record<string, unknown>): void => {
@@ -115,6 +118,9 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
       asks.set(body.ask as string, { answer: null, closed: false })
       return res(200, JSON.stringify({ ok: true, remote: true, hold: askHold }))
     }
+    if (body !== undefined && body.kind === 'agent_turn' && agentTurn.refuse) {
+      return res(400, JSON.stringify({ error: 'bad_request' }))
+    }
     if (body !== undefined && body.kind === 'ask_closed' && closed.fail > 0) {
       closed.fail -= 1
       return res(500, 'boom')
@@ -130,7 +136,7 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     }
     return res(200, JSON.stringify({ ok: true }))
   })
-  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, closed, receipt, answer }
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, closed, receipt, agentTurn, answer }
 }
 
 function installBoilerplate(
@@ -705,6 +711,226 @@ test('B2: append wakes carry exactly session, seq, kind, uuid and agent_id', asy
   expect(appends[0]!.uuid).toBe('u1')
   expect(Object.keys(appends[1]!).sort()).toEqual(['agent_id', 'kind', 'seq', 'session', 'uuid'])
   expect(appends[1]!.agent_id).toBe('agent-1')
+})
+
+// The turn events the mod posted, in post order, without their seq.
+function turnPosts(bridge: { events: EventBody[] }) {
+  return bridge.events
+    .filter(e => e.kind === 'turn_start' || e.kind === 'turn_end' || e.kind === 'agent_turn')
+    .map(({ seq: _seq, ...rest }) => rest)
+}
+
+test('AT1: a subagent turn posts agent_turn with its agent_id and turn; the main loop posts turn_start/turn_end as before', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'Reply with exactly OK', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  // Resumed under its first id, with a new turn.
+  await $.turn.start({ text: 'Reply with exactly TWO', turnId: 't2', agentId: 'a1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't2' })
+  await clock.settle()
+
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'turn_start', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't2' },
+    { session: 'sid-1', kind: 'turn_end', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't2' },
+  ])
+})
+
+test('AT2: a daemon refusing agent_turn leaves the main loop posting in order', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  bridge.agentTurn.refuse = true
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.start({ text: 'y', turnId: 'm2' })
+  await clock.settle()
+
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'turn_start', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't1' },
+    { session: 'sid-1', kind: 'turn_end', turn: 'm1' },
+    { session: 'sid-1', kind: 'turn_start', turn: 'm2' },
+  ])
+})
+
+test('AT3: a subagent turn start leaves the idle queue draining as an idle main loop does', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // A SendMessage resume runs a subagent in the background while the main
+  // loop waits: its turn must not make the main loop read as busy.
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual(['idle'])
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+  ])
+})
+
+test('AT4: a subagent turn complete leaves the open main turn holding the queue', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual([])
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  expect(submissions).toEqual(['queued'])
+})
+
+// The value one poll URL's query carries for `key`, or null when it carries
+// none: the same `key=value` scan the daemon's own poll parse does.
+function queryValue(url: string, key: string): string | null {
+  const query = url.split('?')[1] ?? ''
+  for (const pair of query.split('&')) {
+    const at = pair.indexOf('=')
+    if (at >= 0 && pair.slice(0, at) === key) return pair.slice(at + 1)
+  }
+  return null
+}
+
+// The last poll URL the mod fetched, once it has polled at least once.
+function lastPollUrl(bridge: { fetches: FetchRecord[] }): string {
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(0)
+  return polls[polls.length - 1]!.url
+}
+
+// The open subagent turns one poll URL lists, each entry as its encoded
+// `<agent_id>:<turn>` text.
+function pollAgents(url: string): string[] {
+  const agents = queryValue(url, 'agents') ?? ''
+  return agents === '' ? [] : agents.split(',')
+}
+
+test('AT6: every poll carries the open turns as it sends them; none survive the session end', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('m1')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  // Each side is percent-encoded, so an id carrying the separator or a comma
+  // still reaches the daemon as one entry.
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.start({ text: 'look', turnId: 't:2', agentId: 'a:2' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t1', 'a%3A2:t%3A2'])
+
+  // A resumed subagent replaces its entry in place.
+  await $.turn.start({ text: 'again', turnId: 't3', agentId: 'a1' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t3', 'a%3A2:t%3A2'])
+
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't3' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a%3A2:t%3A2'])
+
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.complete({ ...agentEnd('a:2'), turnId: 't:2' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  // An end clears both even with an open main turn and an open subagent: the
+  // conversation they belonged to is gone, so the next poll reports none. The
+  // main turn id is percent-encoded like an `agents` side, so a separator in
+  // it stays part of the value.
+  await $.turn.start({ text: 'x', turnId: 'm2&3' })
+  await $.turn.start({ text: 'look', turnId: 't4', agentId: 'a4' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('m2%263')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a4:t4'])
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 5; i++) await clock.advance(PARK_MS)
+  expect(lastPollUrl(bridge)).toContain('/poll?session=sid-2')
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+})
+
+test('AT7: with 65 subagent turns open a poll lists only the first 64', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 65; i++) {
+    await $.turn.start({ text: 'look', turnId: `t${i}`, agentId: `a${i}` })
+  }
+  await clock.advance(PARK_MS)
+  const listed = pollAgents(lastPollUrl(bridge))
+  expect(listed).toHaveLength(64)
+  expect(listed[0]).toBe('a0:t0')
+  expect(listed[63]).toBe('a63:t63')
+  // A start past the bound lists nothing, yet its own event still posts: the
+  // 65th subagent's start is the last start event the daemon was sent.
+  const starts = turnPosts(bridge).filter(p => p.kind === 'agent_turn' && p.state === 'start')
+  expect(starts[starts.length - 1]).toEqual({
+    session: 'sid-1',
+    kind: 'agent_turn',
+    agent_id: 'a64',
+    state: 'start',
+    turn: 't64',
+  })
+  // At the bound a resumed subagent replaces its listed turn in place.
+  await $.turn.start({ text: 'again', turnId: 't0b', agentId: 'a0' })
+  await clock.advance(PARK_MS)
+  const resumed = pollAgents(lastPollUrl(bridge))
+  expect(resumed).toHaveLength(64)
+  expect(resumed[0]).toBe('a0:t0b')
+  // The module keeps the first 64 subagents: the one the bound left out stays
+  // out when a slot frees, rather than riding in later.
+  await $.turn.complete({ ...agentEnd('a0'), turnId: 't0b' })
+  await clock.advance(PARK_MS)
+  const freed = pollAgents(lastPollUrl(bridge))
+  expect(freed).toHaveLength(63)
+  expect(freed).not.toContain('a64:t64')
+  // A new start then fills the freed slot, last in first-start order.
+  await $.turn.start({ text: 'late', turnId: 't64', agentId: 'a64' })
+  await clock.advance(PARK_MS)
+  const later = pollAgents(lastPollUrl(bridge))
+  expect(later).toHaveLength(64)
+  expect(later).not.toContain('a0:t0')
+  expect(later[63]).toBe('a64:t64')
+})
+
+test('AT8: a session start restores no open turn from $.state', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t1'])
+  await $.session.end({ sessionId: 'sid-1', reason: 'other' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
 })
 
 test('B3: on Windows the mod is inert — no fetch at all', async ($, on) => {
@@ -2915,6 +3141,26 @@ test('R3c: an interrupt landing while ask_opened is in flight still closes that 
   await new Promise(r => setTimeout(() => r(undefined), 50))
   bridge.poll.commands = [{ kind: 'interrupt' }]
   await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 500))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask: bridge.lastAsk(), by: 'interrupt' }])
+})
+
+test('AT5: a background subagent turn complete inside an in-flight interrupt keeps the aborted ask by interrupt', { timeoutMs: 15000, plugins: [engineAbort, slowOpen] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  // The interrupt lands while the ask_opened post is in flight (R3c), and a
+  // background subagent's turn ends before the held ask's close is decided:
+  // a SendMessage resume runs one while the main loop waits.
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await new Promise(r => setTimeout(() => r(undefined), 50))
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete(agentEnd('a1'))
   await p
   await new Promise(r => setTimeout(() => r(undefined), 500))
   const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
