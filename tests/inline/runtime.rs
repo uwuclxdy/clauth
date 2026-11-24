@@ -28052,3 +28052,66 @@ fn a_plugin_dir_inside_a_tree_is_matched_by_prefix_only() {
         tree
     ));
 }
+
+/// A `claude` launched with a `--plugin-dir` into the tree AFTER the sweep's
+/// snapshot must still spare it: the retire re-reads the live plugin dirs.
+#[test]
+fn gc_rereads_plugin_dirs_before_retiring_a_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let late = runtime.join("moshi-plugin");
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![late]));
+        let _ = gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::Named(Vec::new()),
+        );
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a plugin dir that appeared after the snapshot must spare the tree"
+        );
+    });
+}
+
+/// The delete path ignores plugin dirs, so a live `--plugin-dir` never makes a
+/// tree read as unrescued.
+#[test]
+fn the_delete_path_ignores_live_plugin_dirs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        PLUGIN_DIRS_OVERRIDE
+            .with(|slot| *slot.borrow_mut() = Some(vec![runtime.join("moshi-plugin")]));
+        let snapshot = crate::claude_jobs::job_trees();
+        let _ = gc_one_pair(&runtime, &sessions, &snapshot, &LivePluginDirs::Off);
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            !runtime.join(".claude.json").exists(),
+            "Off must retire the tree despite a live --plugin-dir"
+        );
+        assert!(!LivePluginDirs::Off.spares(&runtime));
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_path_owned_by_this_user_reads_as_ours() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert!(path_owned_by_euid(tmp.path()));
+    assert!(!path_owned_by_euid(&tmp.path().join("missing")));
+    assert!(process_is_ours(std::process::id()));
+}
