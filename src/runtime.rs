@@ -4083,6 +4083,7 @@ fn gc_held_marker_set(file: File) {
 /// The removal hold renames the tree to its tombstone ([`retire_tree`]), and
 /// the rescue runs once the lock drops, because nothing but that tree may hold
 /// what its dead session wrote.
+#[cfg(test)]
 fn gc_one_pair_synced(
     runtime: &Path,
     sessions: &Path,
