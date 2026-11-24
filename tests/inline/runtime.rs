@@ -8980,7 +8980,12 @@ fn gc_spares_a_pair_when_the_job_is_written_after_the_sweep_snapshot() {
         let snapshot = crate::claude_jobs::job_trees();
         write_claude_job(tmp.path(), "37560ded", &runtime);
         drop(marker);
-        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        let _ = gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::Named(Vec::new()),
+        );
         assert!(
             runtime.join(".claude.json").is_file(),
             "a job written after the sweep snapshot must still spare the tree"
@@ -9010,7 +9015,12 @@ fn gc_spares_a_dead_isolated_pair_a_job_written_after_the_sweep_snapshot() {
         let snapshot = crate::claude_jobs::job_trees();
         write_claude_job(tmp.path(), "37560ded", &runtime);
         drop(marker);
-        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        let _ = gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::Named(Vec::new()),
+        );
         assert!(
             runtime.join(".claude.json").is_file(),
             "a job written after the sweep snapshot must spare an isolated tree"
@@ -27954,4 +27964,91 @@ fn a_logged_out_shell_in_a_proxy_sessions_file_raises_no_line() {
             "((drain of the login, of the shell), lines, px's store, the session's file kept)"
         );
     });
+}
+
+/// Claude Code binds `--plugin-dir` to the runtime it launched under. After a
+/// mid-run profile switch no process has that runtime as its config dir, but
+/// the plugin is still loaded from it, so the sweep must keep it.
+#[test]
+fn gc_spares_a_runtime_a_live_plugin_dir_still_points_into() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let live = LivePluginDirs::named(vec![runtime.join("moshi-plugin")]);
+        let _ = gc_one_pair(&runtime, &sessions, &snapshot, &live);
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a live --plugin-dir into the runtime must spare it"
+        );
+    });
+}
+
+#[test]
+fn gc_collects_a_dead_runtime_no_plugin_dir_points_into() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        let sibling = profiles.join("a").join("runtime-6411-1");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let live = LivePluginDirs::named(vec![sibling.join("moshi-plugin")]);
+        let _ = gc_one_pair(&runtime, &sessions, &snapshot, &live);
+        assert!(
+            !runtime.join(".claude.json").exists(),
+            "a plugin dir in a sibling runtime must not spare this one"
+        );
+    });
+}
+
+#[test]
+fn an_unreadable_process_table_spares_every_tree() {
+    assert!(LivePluginDirs::Unreadable.spares(Path::new("/p/runtime-1-0")));
+}
+
+#[test]
+fn argv_plugin_dirs_reads_both_spellings() {
+    let argv: Vec<&[u8]> = vec![
+        b"claude",
+        b"--plugin-dir",
+        b"/p/runtime-1-0/moshi-plugin",
+        b"--model=x",
+        b"--plugin-dir=/q/other",
+        b"--plugin-dir-no-mcp",
+        b"/not/this",
+        b"--plugin-dir",
+    ];
+    assert_eq!(
+        argv_plugin_dirs(&argv),
+        vec![
+            PathBuf::from("/p/runtime-1-0/moshi-plugin"),
+            PathBuf::from("/q/other")
+        ]
+    );
+}
+
+#[test]
+fn a_plugin_dir_inside_a_tree_is_matched_by_prefix_only() {
+    let tree = Path::new("/p/runtime-1-0");
+    assert!(plugin_dir_inside_tree(
+        Path::new("/p/runtime-1-0/moshi-plugin"),
+        tree
+    ));
+    assert!(!plugin_dir_inside_tree(
+        Path::new("/p/runtime-1-01/moshi-plugin"),
+        tree
+    ));
+    assert!(!plugin_dir_inside_tree(
+        Path::new("/home/u/.claude/moshi-plugin"),
+        tree
+    ));
 }
