@@ -67,6 +67,7 @@ fn poll(hub: &Hub, pid: u32, session: &str, load: Option<u64>) -> serde_json::Va
         prompt_reports: true,
         caps: std::collections::BTreeSet::new(),
         load,
+        turns: None,
     };
     let PollAnswer {
         status,

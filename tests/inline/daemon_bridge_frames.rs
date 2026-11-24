@@ -1063,7 +1063,7 @@ fn a_start_carries_its_mods_caps_and_a_reload_replaces_them() {
     );
     assert_eq!(
         hub.snapshot()["sessions"],
-        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}])
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"], "turn": null, "agents": []}])
     );
 
     event(
@@ -1080,7 +1080,7 @@ fn a_start_carries_its_mods_caps_and_a_reload_replaces_them() {
     );
     assert_eq!(
         hub.snapshot()["sessions"],
-        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": []}])
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": [], "turn": null, "agents": []}])
     );
 }
 
@@ -1117,8 +1117,8 @@ fn the_snapshot_lists_live_sessions_and_open_asks() {
         hub.snapshot(),
         serde_json::json!({
             "sessions": [
-                {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"]},
-                {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": []}
+                {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"], "turn": null, "agents": []},
+                {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": [], "turn": null, "agents": []}
             ],
             "asks": [
                 {"session": "s-one", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null, "held": false}
@@ -1154,8 +1154,8 @@ fn an_ending_instances_snapshot_entry_carries_no_caps() {
     assert_eq!(
         hub.snapshot()["sessions"],
         serde_json::json!([
-            {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": []},
-            {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": ["notes"]}
+            {"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": [], "turn": null, "agents": []},
+            {"session": "s-two", "cwd": "/w/app", "interactive": true, "caps": ["notes"], "turn": null, "agents": []}
         ])
     );
 

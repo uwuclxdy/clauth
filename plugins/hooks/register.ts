@@ -22,6 +22,9 @@ const BODY_LIMIT = 1024 * 1024
 // at 30 s; one awaited fetch costs no hook budget, so the re-poll stays bounded
 // on both sides.
 const POLL_INTERVAL_MS = 1000
+// The most open subagent turns one poll lists; the daemon keeps the same
+// bound, so the query stays far under its 16 KiB request-head cap.
+const MAX_POLL_AGENT_TURNS = 64
 // A poll error waits this long before the next poll, so a down daemon never
 // spins the loop.
 const POLL_BACKOFF_MS = 5000
@@ -271,6 +274,12 @@ let pollInFlight: Promise<void> | null = null
 let sendChain: Promise<unknown> = Promise.resolve()
 let nextPollAfter = 0
 let turnId: string | null = null
+// Each subagent with an open turn, by agent id, in first-start order: every
+// poll carries them so the daemon's snapshot recovers from a start or end
+// frame the bridge refused or lost. In memory only, never `$.state`: a
+// persisted entry whose end fired during a reload would stick for the session,
+// while this one only undercounts until that subagent's own end.
+let agentTurns = new Map<string, string>()
 // Phone prompts oldest first; only the head is ever tried. The same array is
 // kept in `$.state` (PROMPTS), which `session.start` loads as the authority.
 let promptQueue: QueuedPrompt[] = []
@@ -902,6 +911,20 @@ async function onPollError($: EngineInterface): Promise<void> {
   nextPollAfter = now + POLL_BACKOFF_MS
 }
 
+// The open-turn fields a poll carries: the main loop's open turn (empty when
+// none) and each open subagent turn, both sides percent-encoded. Read as the
+// poll is built, so a turn that opened or closed since the last poll shows now.
+function pollTurns(): string {
+  let agents = ''
+  let listed = 0
+  for (const [agentId, turn] of agentTurns) {
+    if (listed === MAX_POLL_AGENT_TURNS) break
+    agents += `${listed === 0 ? '' : ','}${encodeURIComponent(agentId)}:${encodeURIComponent(turn)}`
+    listed += 1
+  }
+  return `turn=${encodeURIComponent(turnId ?? '')}&agents=${agents}`
+}
+
 // One timer poll: the session's only poll, carrying prompts, interrupts and
 // (redundantly) answers. A held check never pumps this loop — it waits on its
 // own `/wait` — so a poll error or a dropped remote flag here touches no hold.
@@ -916,7 +939,7 @@ async function doPoll($: EngineInterface): Promise<void> {
     try {
       res = await fetchBridge(
         $,
-        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1&caps=${CAPS.join(',')}&load=${loadNumber}`,
+        `/poll?session=${encodeURIComponent(session)}&prompt_reports=1&caps=${CAPS.join(',')}&load=${loadNumber}&${pollTurns()}`,
         'GET',
       )
     } catch {
@@ -2341,6 +2364,10 @@ export const register: Register = on => {
       // saves finds an epoch already past and runs none of its commands.
       promptQueue = []
       promptEpoch += 1
+      // The ended conversation's turns went with it: the next poll reports
+      // none, so the daemon's snapshot drops what no end frame reached.
+      turnId = null
+      agentTurns.clear()
       // The ending id is the engine's, since the poll may already speak for the
       // next one; with none registered there is nothing to end.
       const ended = sessionId === null ? null : e.sessionId
@@ -2396,10 +2423,22 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // A subagent's turn posts its own event kind, never `turn_start`/`turn_end`:
+  // a daemon that predates it refuses the kind, so no daemon relays a
+  // subagent's turn as the main loop's.
   on('turn.start', async ($, e, next) => {
-    if (!inert && e.agentId === undefined) {
-      turnId = e.turnId
-      void postEvent($, 'turn_start', { turn: e.turnId })
+    if (!inert) {
+      if (e.agentId === undefined) {
+        turnId = e.turnId
+        void postEvent($, 'turn_start', { turn: e.turnId })
+      } else {
+        // A start past the bound is not listed; a start for a listed id
+        // replaces its turn. The event itself still posts either way.
+        if (agentTurns.has(e.agentId) || agentTurns.size < MAX_POLL_AGENT_TURNS) {
+          agentTurns.set(e.agentId, e.turnId)
+        }
+        void postEvent($, 'agent_turn', { agent_id: e.agentId, state: 'start', turn: e.turnId })
+      }
     }
     return next(e)
   })
@@ -2409,11 +2448,16 @@ export const register: Register = on => {
     // Nothing else bounds the map but the sweep, and a stale entry could only
     // withhold a run a later fire owes.
     if (e.agentId !== undefined) lastNoteAt.delete(noteWindowKey(e.agentId))
-    if (!inert && e.agentId === undefined) {
-      turnId = null
-      interruptedTurn = null
-      void postEvent($, 'turn_end', { turn: e.turnId })
-      await drainPrompts($)
+    if (!inert) {
+      if (e.agentId === undefined) {
+        turnId = null
+        interruptedTurn = null
+        void postEvent($, 'turn_end', { turn: e.turnId })
+        await drainPrompts($)
+      } else {
+        agentTurns.delete(e.agentId)
+        void postEvent($, 'agent_turn', { agent_id: e.agentId, state: 'end', turn: e.turnId })
+      }
     }
     return next(e)
   })
