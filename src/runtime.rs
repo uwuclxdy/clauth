@@ -2090,7 +2090,8 @@ fn gc_codex_homes() {
 }
 
 /// The `--plugin-dir` values of every live process, read once per sweep, again
-/// before deciding on a tree, and once more just before it is retired.
+/// before deciding unless a live session marker holds the tree, and once more
+/// just before it is retired.
 ///
 /// Claude Code records a plugin by the absolute path it was launched with, and
 /// `--plugin-dir <runtime>/<plugin>` stays bound to that runtime for the life
@@ -2196,6 +2197,16 @@ fn plugin_dir_inside_tree(dir: &Path, tree: &Path) -> bool {
 /// the kernel withholds (another user's) is skipped, and elsewhere nothing is
 /// inspected, so behaviour there is unchanged.
 fn live_plugin_dirs() -> LivePluginDirs {
+    debug_assert!(
+        !crate::lock::state_lock_held(),
+        "the live process-table read must never span the state flock"
+    );
+    #[cfg(test)]
+    PLUGIN_DIR_READS.with(|count| count.set(count.get() + 1));
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if PLUGIN_DIRS_UNREADABLE.with(std::cell::Cell::get) {
+        return LivePluginDirs::Unreadable;
+    }
     #[cfg(test)]
     if let Some(dirs) = PLUGIN_DIRS_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return LivePluginDirs::Named(dirs);
@@ -2222,10 +2233,10 @@ fn live_plugin_dirs() -> LivePluginDirs {
     }
 }
 
-/// Whether `/proc/<pid>` belongs to the user running clauth. Linux serves
-/// `cmdline` of every user's process, so another user's argv must not keep a
-/// tree on disk; macOS compares the pid's uid as well. A pid that vanished
-/// reads as not ours.
+/// Whether the process `pid` runs as this process's effective uid: linux reads
+/// the owner of `/proc/<pid>` (it serves `cmdline` of every user's process, so
+/// another user's argv must not keep a tree on disk), macOS the `pbi_uid` of
+/// `proc_bsdinfo`. A pid that vanished reads as not ours.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_is_ours(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
@@ -2260,6 +2271,25 @@ thread_local! {
     /// Test seam: when set, [`live_plugin_dirs`] returns exactly these dirs.
     static PLUGIN_DIRS_OVERRIDE: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
+    /// Test seam: when set, [`live_plugin_dirs`] reads as
+    /// [`LivePluginDirs::Unreadable`]. Gated to the platforms where the process
+    /// table is read: a construction anywhere else would make the variant live
+    /// and leave its `expect(dead_code)` unfulfilled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static PLUGIN_DIRS_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: how many times [`live_plugin_dirs`] ran on this thread, so a
+    /// test can pin which pairs pay the read and which skip it.
+    static PLUGIN_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn plugin_dir_reads() -> usize {
+    PLUGIN_DIR_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_plugin_dir_reads() {
+    PLUGIN_DIR_READS.with(|count| count.set(0));
 }
 
 fn gc_runtime_trees() {
@@ -4118,7 +4148,8 @@ fn gc_one_pair_synced(
 
 /// [`gc_one_pair_synced`] with the plugin-dir mode: [`LivePluginDirs::Off`]
 /// skips the plugin-dir reads, anything else re-reads the live dirs fresh
-/// before deciding on the tree and again before retiring it.
+/// before deciding unless a live session marker holds the tree, and again
+/// before retiring it.
 fn gc_one_pair_synced_with(
     runtime: &Path,
     sessions: &Path,
@@ -4130,10 +4161,16 @@ fn gc_one_pair_synced_with(
     // it while no supervisor has been stopped yet. Sparing here sends no
     // SIGTERM and stamps no in-flight stop record. The re-read just before
     // the retire hold below stays, for a dir that appears after this one.
-    let refreshed = plugin_dirs.refreshed();
-    if refreshed.spares(runtime) {
-        refreshed.announce_spare(runtime);
-        return Ok(());
+    // A tree a live session marker holds skips this read: the decide hold
+    // spares it already, and the read walks the whole process table on linux
+    // and spawns `ps` on macOS. A marker count the probe could not take reads
+    // as no live marker, keeping this read and the line it logs.
+    if live_sessions_at(sessions).is_none_or(|live| live == 0) {
+        let refreshed = plugin_dirs.refreshed();
+        if refreshed.spares(runtime) {
+            refreshed.announce_spare(runtime);
+            return Ok(());
+        }
     }
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
@@ -4200,11 +4237,16 @@ fn gc_one_pair_synced_with(
     on_gc_recheck_hold(runtime, sessions);
 
     // Re-read the live `--plugin-dir`s: a `claude` launched with one into this
-    // tree after the sweep's snapshot must still spare it. Taken here, just
+    // tree after the sweep's snapshot must still spare it, and the spare is
+    // announced here as the earlier reads announce theirs. Taken here, just
     // before the hold, because on macOS the process listing shells out to
     // `ps` and no subprocess may span the state flock; the hold below then
     // acts on this read the way it acts on the marker and job re-reads.
-    let plugin_spare = plugin_dirs.refreshed().spares(runtime);
+    let late = plugin_dirs.refreshed();
+    let plugin_spare = late.spares(runtime);
+    if plugin_spare {
+        late.announce_spare(runtime);
+    }
 
     // Re-check under a FRESH lock hold, then collect: between the decide above
     // and this hold a concurrently starting session can re-mint this same path,
