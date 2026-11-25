@@ -2089,8 +2089,8 @@ fn gc_codex_homes() {
     }));
 }
 
-/// The `--plugin-dir` values of every live process, read once per sweep and
-/// again just before a tree is retired.
+/// The `--plugin-dir` values of every live process, read once per sweep, again
+/// before deciding on a tree, and once more just before it is retired.
 ///
 /// Claude Code records a plugin by the absolute path it was launched with, and
 /// `--plugin-dir <runtime>/<plugin>` stays bound to that runtime for the life
@@ -2098,11 +2098,18 @@ fn gc_codex_homes() {
 /// keeps running, the marker lock dies with it and the config-dir liveness
 /// reads no longer hold the tree, yet `/reload-plugins` still resolves the
 /// plugin through it. Sparing on the launch-time path keeps that reload working.
-pub(crate) enum LivePluginDirs {
+enum LivePluginDirs {
     /// Every readable live process's `--plugin-dir` values.
     Named(Vec<PathBuf>),
     /// The process table could not be listed: spare every tree this sweep, the
     /// fail-closed direction the job-store snapshot takes.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "constructed only by the linux/macos process-table read"
+        )
+    )]
     Unreadable,
     /// Plugin dirs play no part (the delete path, where the profile dir goes
     /// either way and a spared tree would read as unrescued).
@@ -2110,11 +2117,11 @@ pub(crate) enum LivePluginDirs {
 }
 
 impl LivePluginDirs {
-    /// The snapshot to re-take before retiring a tree: a fresh read, except
+    /// The snapshot to re-take before acting on a tree: a fresh read, except
     /// that [`LivePluginDirs::Off`] stays off.
-    fn refreshed(&self) -> LivePluginDirs {
+    fn refreshed(&self) -> Self {
         match self {
-            LivePluginDirs::Off => LivePluginDirs::Off,
+            Self::Off => Self::Off,
             _ => live_plugin_dirs(),
         }
     }
@@ -2122,22 +2129,37 @@ impl LivePluginDirs {
     /// A snapshot holding exactly `dirs`.
     #[cfg(test)]
     fn named(dirs: Vec<PathBuf>) -> Self {
-        LivePluginDirs::Named(dirs)
+        Self::Named(dirs)
     }
 
     /// Whether a live process's `--plugin-dir` lies inside `tree`, or the
     /// snapshot is unreadable.
     fn spares(&self, tree: &Path) -> bool {
         match self {
-            LivePluginDirs::Unreadable => true,
-            LivePluginDirs::Off => false,
-            LivePluginDirs::Named(dirs) => dirs.iter().any(|dir| plugin_dir_inside_tree(dir, tree)),
+            Self::Unreadable => true,
+            Self::Off => false,
+            Self::Named(dirs) => dirs.iter().any(|dir| plugin_dir_inside_tree(dir, tree)),
+        }
+    }
+
+    /// Announce a per-pair spare for a NAMED hit, and nothing else: `spares`
+    /// is true for every pair under an unreadable process table, and the
+    /// sweep-level line already covered that case once per sweep. Call only
+    /// after [`Self::spares`] returned true.
+    fn announce_spare(&self, tree: &Path) {
+        if matches!(self, Self::Named(_)) {
+            logline!(
+                "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+                 (--plugin-dir)",
+                tree.display()
+            );
         }
     }
 }
 
 /// Every value an argv gives `--plugin-dir`, in both the `--plugin-dir X` and
 /// `--plugin-dir=X` spellings. PURE.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn argv_plugin_dirs(argv: &[&[u8]]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut args = argv.iter();
@@ -2154,15 +2176,10 @@ fn argv_plugin_dirs(argv: &[&[u8]]) -> Vec<PathBuf> {
     dirs
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt as _;
     PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-}
-
-#[cfg(not(unix))]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Whether `dir` lies inside `tree`, by path prefix in the tree's walked or
@@ -2207,7 +2224,7 @@ fn live_plugin_dirs() -> LivePluginDirs {
 
 /// Whether `/proc/<pid>` belongs to the user running clauth. Linux serves
 /// `cmdline` of every user's process, so another user's argv must not keep a
-/// tree on disk; macOS already withholds those argvs. A pid that vanished
+/// tree on disk; macOS compares the pid's uid as well. A pid that vanished
 /// reads as not ours.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_is_ours(pid: u32) -> bool {
@@ -2217,18 +2234,24 @@ fn process_is_ours(pid: u32) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = pid;
-        true
+        proc_bsdinfo(pid).is_some_and(|info| info.pbi_uid == effective_uid())
     }
+}
+
+/// The effective uid of this process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    #[expect(unsafe_code, reason = "geteuid takes no arguments and cannot fail")]
+    let euid = unsafe { libc::geteuid() };
+    euid
 }
 
 /// Whether `path` is owned by the effective uid of this process.
 #[cfg(target_os = "linux")]
 fn path_owned_by_euid(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    // SAFETY: `geteuid` takes no arguments and cannot fail.
-    #[allow(unsafe_code)]
-    let euid = unsafe { libc::geteuid() };
+    let euid = effective_uid();
     std::fs::metadata(path).is_ok_and(|meta| meta.uid() == euid)
 }
 
@@ -2243,7 +2266,7 @@ fn gc_runtime_trees() {
     // One snapshot of Claude Code's job store per sweep, before the pair loop,
     // so the fast path never pays the walk per pair. A dead pair the snapshot
     // did not name pays one more store read, under the state flock (the
-    // `gc_one_pair_synced` re-read). An unreadable store spares every dead pair
+    // `gc_one_pair_synced_with` re-read). An unreadable store spares every dead pair
     // this sweep — the fail-closed direction `is_session_alive` takes — and the
     // log names the offending job dir, never its contents.
     let job_trees = crate::claude_jobs::job_trees();
@@ -2328,12 +2351,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees, plugin_dirs: &LivePlug
         if is_runtime_dir_name(&child_name)
             && let Some(sessions) = paired_sessions_name(&child_name)
         {
-            let _ = gc_one_pair(
+            drop(gc_one_pair(
                 &profile.join(&child_name),
                 &profile.join(sessions),
                 job_trees,
                 plugin_dirs,
-            );
+            ));
         } else if is_sessions_dir_name(&child_name)
             && let Some(runtime) = paired_runtime_name(&child_name)
         {
@@ -2343,7 +2366,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees, plugin_dirs: &LivePlug
             // rather than a reused one.
             let runtime = profile.join(runtime);
             if runtime.symlink_metadata().is_err() {
-                let _ = gc_one_pair(&runtime, &profile.join(&child_name), job_trees, plugin_dirs);
+                drop(gc_one_pair(
+                    &runtime,
+                    &profile.join(&child_name),
+                    job_trees,
+                    plugin_dirs,
+                ));
             }
         }
     }
@@ -4001,10 +4029,10 @@ fn gc_one_pair(
     plugin_dirs: &LivePluginDirs,
 ) -> Result<()> {
     // The job check sits here as a FAST PATH, before the state flock
-    // `gc_one_pair_synced` takes: the store was read once above and the check
+    // `gc_one_pair_synced_with` takes: the store was read once above and the check
     // is a canonicalize + set lookup, not a walk. It is not the decision — a
     // job written after the snapshot but before the marker frees is caught by
-    // the fresh re-read `gc_one_pair_synced` makes under the lock. Spared
+    // the fresh re-read `gc_one_pair_synced_with` makes under the lock. Spared
     // before the flock means a named tree is never renamed to its rescue
     // tombstone — the one order that would rescue-and-delete a tree a live job
     // still reads.
@@ -4025,13 +4053,9 @@ fn gc_one_pair(
     // when nothing else holds the tree: its `clauth start` died (killed, OOM)
     // and took the marker lock with it while `claude` keeps running. This is
     // the fast path off the sweep's snapshot; `gc_one_pair_synced_with`
-    // re-reads before it retires the tree.
+    // re-reads it fresh before deciding and again before it retires the tree.
     if plugin_dirs.spares(runtime) {
-        logline!(
-            "clauth: spared runtime tree {}: a live process still loads a plugin from it \
-             (--plugin-dir)",
-            runtime.display()
-        );
+        plugin_dirs.announce_spare(runtime);
         return Ok(());
     }
     gc_one_pair_synced_with(runtime, sessions, plugin_dirs, || {})
@@ -4093,13 +4117,24 @@ fn gc_one_pair_synced(
 }
 
 /// [`gc_one_pair_synced`] with the plugin-dir mode: [`LivePluginDirs::Off`]
-/// skips the plugin-dir re-read, anything else re-reads it fresh.
+/// skips the plugin-dir reads, anything else re-reads the live dirs fresh
+/// before deciding on the tree and again before retiring it.
 fn gc_one_pair_synced_with(
     runtime: &Path,
     sessions: &Path,
     plugin_dirs: &LivePluginDirs,
     remint_interleave: impl FnOnce(),
 ) -> Result<()> {
+    // Re-read the live `--plugin-dir`s BEFORE the decide hold: a `claude`
+    // launched with one into this tree after the sweep's snapshot must spare
+    // it while no supervisor has been stopped yet. Sparing here sends no
+    // SIGTERM and stamps no in-flight stop record. The re-read just before
+    // the retire hold below stays, for a dir that appears after this one.
+    let refreshed = plugin_dirs.refreshed();
+    if refreshed.spares(runtime) {
+        refreshed.announce_spare(runtime);
+        return Ok(());
+    }
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
     // the tree is removed. Collected after the closures below, where a
