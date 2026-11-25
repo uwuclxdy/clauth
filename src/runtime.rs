@@ -2089,11 +2089,214 @@ fn gc_codex_homes() {
     }));
 }
 
+/// The `--plugin-dir` values of every live process, read once per sweep, again
+/// before deciding unless a live session marker holds the tree, and once more
+/// just before it is retired.
+///
+/// Claude Code records a plugin by the absolute path it was launched with, and
+/// `--plugin-dir <runtime>/<plugin>` stays bound to that runtime for the life
+/// of the process. If its `clauth start` dies (killed, OOM) while the `claude`
+/// keeps running, the marker lock dies with it and the config-dir liveness
+/// reads no longer hold the tree, yet `/reload-plugins` still resolves the
+/// plugin through it. Sparing on the launch-time path keeps that reload working.
+enum LivePluginDirs {
+    /// Every readable live process's `--plugin-dir` values.
+    Named(Vec<PathBuf>),
+    /// The process table could not be listed: spare every tree this sweep, the
+    /// fail-closed direction the job-store snapshot takes.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "constructed only by the linux/macos process-table read"
+        )
+    )]
+    Unreadable,
+    /// Plugin dirs play no part (the delete path, where the profile dir goes
+    /// either way and a spared tree would read as unrescued).
+    Off,
+}
+
+impl LivePluginDirs {
+    /// The snapshot to re-take before acting on a tree: a fresh read, except
+    /// that [`LivePluginDirs::Off`] stays off.
+    fn refreshed(&self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            _ => live_plugin_dirs(),
+        }
+    }
+
+    /// A snapshot holding exactly `dirs`.
+    #[cfg(test)]
+    fn named(dirs: Vec<PathBuf>) -> Self {
+        Self::Named(dirs)
+    }
+
+    /// Whether a live process's `--plugin-dir` lies inside `tree`, or the
+    /// snapshot is unreadable.
+    fn spares(&self, tree: &Path) -> bool {
+        match self {
+            Self::Unreadable => true,
+            Self::Off => false,
+            Self::Named(dirs) => dirs.iter().any(|dir| plugin_dir_inside_tree(dir, tree)),
+        }
+    }
+
+    /// Announce a per-pair spare for a NAMED hit, and nothing else: `spares`
+    /// is true for every pair under an unreadable process table, and the
+    /// sweep-level line already covered that case once per sweep. Call only
+    /// after [`Self::spares`] returned true.
+    fn announce_spare(&self, tree: &Path) {
+        if matches!(self, Self::Named(_)) {
+            logline!(
+                "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+                 (--plugin-dir)",
+                tree.display()
+            );
+        }
+    }
+}
+
+/// Every value an argv gives `--plugin-dir`, in both the `--plugin-dir X` and
+/// `--plugin-dir=X` spellings. PURE.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn argv_plugin_dirs(argv: &[&[u8]]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        let value = if *arg == b"--plugin-dir" {
+            args.next().copied()
+        } else {
+            arg.strip_prefix(b"--plugin-dir=")
+        };
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            dirs.push(bytes_to_path(value));
+        }
+    }
+    dirs
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// Whether `dir` lies inside `tree`, by path prefix in the tree's walked or
+/// canonical spelling. Never canonicalizes `dir`: the plugin entry is a symlink
+/// out of the tree, and following it would hide the very reference this check
+/// exists to see. PURE apart from the tree's own canonicalize.
+fn plugin_dir_inside_tree(dir: &Path, tree: &Path) -> bool {
+    dir.starts_with(tree)
+        || crate::canonical::identity(tree).is_ok_and(|canonical| dir.starts_with(canonical))
+}
+
+/// One snapshot of every live process's `--plugin-dir` values. Linux reads
+/// `/proc/<pid>/cmdline`, macOS the `KERN_PROCARGS2` argv; a process whose argv
+/// the kernel withholds (another user's) is skipped, and elsewhere nothing is
+/// inspected, so behaviour there is unchanged.
+fn live_plugin_dirs() -> LivePluginDirs {
+    debug_assert!(
+        !crate::lock::state_lock_held(),
+        "the live process-table read must never span the state flock"
+    );
+    #[cfg(test)]
+    PLUGIN_DIR_READS.with(|count| count.set(count.get() + 1));
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if PLUGIN_DIRS_UNREADABLE.with(std::cell::Cell::get) {
+        return LivePluginDirs::Unreadable;
+    }
+    #[cfg(test)]
+    if let Some(dirs) = PLUGIN_DIRS_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return LivePluginDirs::Named(dirs);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(pids) = live_process_pids() else {
+            return LivePluginDirs::Unreadable;
+        };
+        LivePluginDirs::Named(
+            pids.into_iter()
+                .filter(|pid| process_is_ours(*pid))
+                .filter_map(process_argv)
+                .flat_map(|argv| {
+                    let argv: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+                    argv_plugin_dirs(&argv)
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        LivePluginDirs::Named(Vec::new())
+    }
+}
+
+/// Whether the process `pid` runs as this process's effective uid: linux reads
+/// the owner of `/proc/<pid>` (it serves `cmdline` of every user's process, so
+/// another user's argv must not keep a tree on disk), macOS the `pbi_uid` of
+/// `proc_bsdinfo`. A pid that vanished reads as not ours.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_ours(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        path_owned_by_euid(&PathBuf::from(format!("/proc/{pid}")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        proc_bsdinfo(pid).is_some_and(|info| info.pbi_uid == effective_uid())
+    }
+}
+
+/// The effective uid of this process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    #[expect(unsafe_code, reason = "geteuid takes no arguments and cannot fail")]
+    let euid = unsafe { libc::geteuid() };
+    euid
+}
+
+/// Whether `path` is owned by the effective uid of this process.
+#[cfg(target_os = "linux")]
+fn path_owned_by_euid(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let euid = effective_uid();
+    std::fs::metadata(path).is_ok_and(|meta| meta.uid() == euid)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`live_plugin_dirs`] returns exactly these dirs.
+    static PLUGIN_DIRS_OVERRIDE: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam: when set, [`live_plugin_dirs`] reads as
+    /// [`LivePluginDirs::Unreadable`]. Gated to the platforms where the process
+    /// table is read: a construction anywhere else would make the variant live
+    /// and leave its `expect(dead_code)` unfulfilled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static PLUGIN_DIRS_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: how many times [`live_plugin_dirs`] ran on this thread, so a
+    /// test can pin which pairs pay the read and which skip it.
+    static PLUGIN_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn plugin_dir_reads() -> usize {
+    PLUGIN_DIR_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_plugin_dir_reads() {
+    PLUGIN_DIR_READS.with(|count| count.set(0));
+}
+
 fn gc_runtime_trees() {
     // One snapshot of Claude Code's job store per sweep, before the pair loop,
     // so the fast path never pays the walk per pair. A dead pair the snapshot
     // did not name pays one more store read, under the state flock (the
-    // `gc_one_pair_synced` re-read). An unreadable store spares every dead pair
+    // `gc_one_pair_synced_with` re-read). An unreadable store spares every dead pair
     // this sweep — the fail-closed direction `is_session_alive` takes — and the
     // log names the offending job dir, never its contents.
     let job_trees = crate::claude_jobs::job_trees();
@@ -2139,8 +2342,15 @@ fn gc_runtime_trees() {
         return;
     };
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
+    let plugin_dirs = live_plugin_dirs();
+    if matches!(plugin_dirs, LivePluginDirs::Unreadable) {
+        logline!(
+            "clauth: spared every dead runtime tree this sweep: the live \
+             process table could not be read for --plugin-dir"
+        );
+    }
     for profile in entries.flatten() {
-        gc_profile_trees(&profile.path(), &job_trees);
+        gc_profile_trees(&profile.path(), &job_trees, &plugin_dirs);
     }
 }
 
@@ -2148,7 +2358,7 @@ fn gc_runtime_trees() {
 /// first, then every dead runtime tree, retired and rescued. Tombstones go
 /// first because a kept `runtime.rescuing` blocks the rename that would retire
 /// a dead `runtime` beside it.
-fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
+fn gc_profile_trees(profile: &Path, job_trees: &JobTrees, plugin_dirs: &LivePluginDirs) {
     // Strict predicates, not the loose pairing split: these walks hand
     // `remove_dir_all` whatever they match, so a future `runtime_state` or
     // `sessions.json` under a profile must fall through untouched.
@@ -2171,11 +2381,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
         if is_runtime_dir_name(&child_name)
             && let Some(sessions) = paired_sessions_name(&child_name)
         {
-            let _ = gc_one_pair(
+            drop(gc_one_pair(
                 &profile.join(&child_name),
                 &profile.join(sessions),
                 job_trees,
-            );
+                plugin_dirs,
+            ));
         } else if is_sessions_dir_name(&child_name)
             && let Some(runtime) = paired_runtime_name(&child_name)
         {
@@ -2185,7 +2396,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
             // rather than a reused one.
             let runtime = profile.join(runtime);
             if runtime.symlink_metadata().is_err() {
-                let _ = gc_one_pair(&runtime, &profile.join(&child_name), job_trees);
+                drop(gc_one_pair(
+                    &runtime,
+                    &profile.join(&child_name),
+                    job_trees,
+                    plugin_dirs,
+                ));
             }
         }
     }
@@ -2218,7 +2434,14 @@ pub(crate) fn rescue_profile_trees(profile: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
-    gc_profile_trees(profile, &crate::claude_jobs::job_trees());
+    gc_profile_trees(
+        profile,
+        &crate::claude_jobs::job_trees(),
+        // The profile dir goes either way: a tree spared here would count as
+        // unrescued, so `delete` would refuse and `delete --force` would drop
+        // its transcripts unrescued.
+        &LivePluginDirs::Off,
+    );
     let children = match std::fs::read_dir(profile) {
         Ok(children) => children,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -3829,12 +4052,17 @@ fn rescue_claimed_tombstone(tombstone: &Path) {
 /// it is renamed to a tombstone under the lock and rescued outside it
 /// ([`retire_tree`]), and the flock is never held across a tree-sized walk; a
 /// runtime path that is itself a link is unlinked alone.
-fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<()> {
+fn gc_one_pair(
+    runtime: &Path,
+    sessions: &Path,
+    job_trees: &JobTrees,
+    plugin_dirs: &LivePluginDirs,
+) -> Result<()> {
     // The job check sits here as a FAST PATH, before the state flock
-    // `gc_one_pair_synced` takes: the store was read once above and the check
+    // `gc_one_pair_synced_with` takes: the store was read once above and the check
     // is a canonicalize + set lookup, not a walk. It is not the decision — a
     // job written after the snapshot but before the marker frees is caught by
-    // the fresh re-read `gc_one_pair_synced` makes under the lock. Spared
+    // the fresh re-read `gc_one_pair_synced_with` makes under the lock. Spared
     // before the flock means a named tree is never renamed to its rescue
     // tombstone — the one order that would rescue-and-delete a tree a live job
     // still reads.
@@ -3851,7 +4079,16 @@ fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<
         }
         return Ok(());
     }
-    gc_one_pair_synced(runtime, sessions, || {})
+    // A live process's launch-time `--plugin-dir` into this tree spares it even
+    // when nothing else holds the tree: its `clauth start` died (killed, OOM)
+    // and took the marker lock with it while `claude` keeps running. This is
+    // the fast path off the sweep's snapshot; `gc_one_pair_synced_with`
+    // re-reads it fresh before deciding and again before it retires the tree.
+    if plugin_dirs.spares(runtime) {
+        plugin_dirs.announce_spare(runtime);
+        return Ok(());
+    }
+    gc_one_pair_synced_with(runtime, sessions, plugin_dirs, || {})
 }
 
 #[cfg(test)]
@@ -3900,11 +4137,41 @@ fn gc_held_marker_set(file: File) {
 /// The removal hold renames the tree to its tombstone ([`retire_tree`]), and
 /// the rescue runs once the lock drops, because nothing but that tree may hold
 /// what its dead session wrote.
+#[cfg(test)]
 fn gc_one_pair_synced(
     runtime: &Path,
     sessions: &Path,
     remint_interleave: impl FnOnce(),
 ) -> Result<()> {
+    gc_one_pair_synced_with(runtime, sessions, &LivePluginDirs::Off, remint_interleave)
+}
+
+/// [`gc_one_pair_synced`] with the plugin-dir mode: [`LivePluginDirs::Off`]
+/// skips the plugin-dir reads, anything else re-reads the live dirs fresh
+/// before deciding unless a live session marker holds the tree, and again
+/// before retiring it.
+fn gc_one_pair_synced_with(
+    runtime: &Path,
+    sessions: &Path,
+    plugin_dirs: &LivePluginDirs,
+    remint_interleave: impl FnOnce(),
+) -> Result<()> {
+    // Re-read the live `--plugin-dir`s BEFORE the decide hold: a `claude`
+    // launched with one into this tree after the sweep's snapshot must spare
+    // it while no supervisor has been stopped yet. Sparing here sends no
+    // SIGTERM and stamps no in-flight stop record. The re-read just before
+    // the retire hold below stays, for a dir that appears after this one.
+    // A tree a live session marker holds skips this read: the decide hold
+    // spares it already, and the read walks the whole process table on linux
+    // and spawns `ps` on macOS. A marker count the probe could not take reads
+    // as no live marker, keeping this read and the line it logs.
+    if live_sessions_at(sessions).is_none_or(|live| live == 0) {
+        let refreshed = plugin_dirs.refreshed();
+        if refreshed.spares(runtime) {
+            refreshed.announce_spare(runtime);
+            return Ok(());
+        }
+    }
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
     // the tree is removed. Collected after the closures below, where a
@@ -3969,6 +4236,18 @@ fn gc_one_pair_synced(
     #[cfg(test)]
     on_gc_recheck_hold(runtime, sessions);
 
+    // Re-read the live `--plugin-dir`s: a `claude` launched with one into this
+    // tree after the sweep's snapshot must still spare it, and the spare is
+    // announced here as the earlier reads announce theirs. Taken here, just
+    // before the hold, because on macOS the process listing shells out to
+    // `ps` and no subprocess may span the state flock; the hold below then
+    // acts on this read the way it acts on the marker and job re-reads.
+    let late = plugin_dirs.refreshed();
+    let plugin_spare = late.spares(runtime);
+    if plugin_spare {
+        late.announce_spare(runtime);
+    }
+
     // Re-check under a FRESH lock hold, then collect: between the decide above
     // and this hold a concurrently starting session can re-mint this same path,
     // so the removal keys on the world it runs in — markers, the job store AND
@@ -3976,6 +4255,7 @@ fn gc_one_pair_synced(
     // delete below takes.
     let renamed = with_state_lock(|_held| {
         let spares = prune_stale_sessions(sessions).unwrap_or(1) != 0
+            || plugin_spare
             || crate::claude_jobs::job_trees().spares(runtime)
             || !matches!(
                 supervisor_state(runtime),

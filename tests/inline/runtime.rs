@@ -9026,7 +9026,12 @@ fn gc_spares_a_pair_when_the_job_is_written_after_the_sweep_snapshot() {
         let snapshot = crate::claude_jobs::job_trees();
         write_claude_job(tmp.path(), "37560ded", &runtime);
         drop(marker);
-        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        drop(gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::Named(Vec::new()),
+        ));
         assert!(
             runtime.join(".claude.json").is_file(),
             "a job written after the sweep snapshot must still spare the tree"
@@ -9056,7 +9061,12 @@ fn gc_spares_a_dead_isolated_pair_a_job_written_after_the_sweep_snapshot() {
         let snapshot = crate::claude_jobs::job_trees();
         write_claude_job(tmp.path(), "37560ded", &runtime);
         drop(marker);
-        let _ = gc_one_pair(&runtime, &sessions, &snapshot);
+        drop(gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::Named(Vec::new()),
+        ));
         assert!(
             runtime.join(".claude.json").is_file(),
             "a job written after the sweep snapshot must spare an isolated tree"
@@ -28768,4 +28778,479 @@ fn a_logged_out_shell_in_a_proxy_sessions_file_raises_no_line() {
             "((drain of the login, of the shell), lines, px's store, the session's file kept)"
         );
     });
+}
+
+/// Claude Code binds `--plugin-dir` to the runtime it launched under. When the
+/// tree's `clauth start` supervisor is gone (killed, OOM) the marker lock dies
+/// with it and nothing else holds the tree, yet the plugin stays loaded from
+/// it, so the sweep must keep it.
+#[test]
+fn gc_spares_a_runtime_a_live_plugin_dir_still_points_into() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let live = LivePluginDirs::named(vec![runtime.join("moshi-plugin")]);
+        drop(gc_one_pair(&runtime, &sessions, &snapshot, &live));
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a live --plugin-dir into the runtime must spare it"
+        );
+    });
+}
+
+#[test]
+fn gc_collects_a_dead_runtime_no_plugin_dir_points_into() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        let sibling = profiles.join("a").join("runtime-6411-1");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let live = LivePluginDirs::named(vec![sibling.join("moshi-plugin")]);
+        drop(gc_one_pair(&runtime, &sessions, &snapshot, &live));
+        assert!(
+            !runtime.join(".claude.json").exists(),
+            "a plugin dir in a sibling runtime must not spare this one"
+        );
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_unreadable_process_table_spares_every_tree() {
+    assert!(LivePluginDirs::Unreadable.spares(Path::new("/p/runtime-1-0")));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn argv_plugin_dirs_reads_both_spellings() {
+    let argv: Vec<&[u8]> = vec![
+        b"claude",
+        b"--plugin-dir",
+        b"/p/runtime-1-0/moshi-plugin",
+        b"--model=x",
+        b"--plugin-dir=/q/other",
+        b"--plugin-dir-no-mcp",
+        b"/not/this",
+        b"--plugin-dir=",
+        b"--plugin-dir",
+        b"",
+        b"--plugin-dir",
+    ];
+    assert_eq!(
+        argv_plugin_dirs(&argv),
+        vec![
+            PathBuf::from("/p/runtime-1-0/moshi-plugin"),
+            PathBuf::from("/q/other")
+        ]
+    );
+}
+
+#[test]
+fn a_plugin_dir_inside_a_tree_is_matched_by_prefix_only() {
+    let tree = Path::new("/p/runtime-1-0");
+    assert!(plugin_dir_inside_tree(
+        Path::new("/p/runtime-1-0/moshi-plugin"),
+        tree
+    ));
+    assert!(!plugin_dir_inside_tree(
+        Path::new("/p/runtime-1-01/moshi-plugin"),
+        tree
+    ));
+    assert!(!plugin_dir_inside_tree(
+        Path::new("/home/u/.claude/moshi-plugin"),
+        tree
+    ));
+}
+
+/// A `claude` launched with a `--plugin-dir` into the tree AFTER the decide
+/// hold must still spare it, with the same spare line the earlier reads log:
+/// the retire re-reads the live plugin dirs and announces the named hit.
+#[test]
+fn gc_rereads_plugin_dirs_before_retiring_a_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        let snapshot = crate::claude_jobs::job_trees();
+        let late = runtime.join("moshi-plugin");
+        set_gc_recheck_hook(Some(Box::new(move |_runtime, _sessions| {
+            PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![late.clone()]));
+        })));
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            drop(gc_one_pair(
+                &runtime,
+                &sessions,
+                &snapshot,
+                &LivePluginDirs::Named(Vec::new()),
+            ));
+        }
+        set_gc_recheck_hook(None);
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "a plugin dir that appeared after the snapshot must spare the tree"
+        );
+        let spare_line = format!(
+            "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+             (--plugin-dir)",
+            runtime.display()
+        );
+        assert!(
+            lines.snapshot().contains(&spare_line),
+            "the retire-hold spare logs the plugin-dir line the earlier reads log"
+        );
+    });
+}
+
+/// A tree a live session marker holds is spared by the decide hold, so the
+/// early live-process read is skipped for it: that read is the whole process
+/// table on linux and a `ps` spawn on macOS, and it cannot change the outcome.
+/// A tree NO live marker holds keeps the read, which is what spares it before
+/// its supervisor is signalled.
+#[test]
+fn gc_skips_the_early_plugin_dir_read_for_a_marked_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "marked", "runtime-4242-41", "4242-41");
+        let marker = open_pid_file(&sessions.join("4242-41")).expect("marker");
+        marker.lock().expect("lock");
+        let snapshot = crate::claude_jobs::job_trees();
+        reset_plugin_dir_reads();
+        drop(gc_one_pair(
+            &runtime,
+            &sessions,
+            &snapshot,
+            &LivePluginDirs::named(Vec::new()),
+        ));
+        assert_eq!(
+            plugin_dir_reads(),
+            0,
+            "a live marker spares the tree at the decide hold; the early process-table read is wasted"
+        );
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "the live marker's tree stays"
+        );
+        drop(marker);
+    });
+}
+
+/// The live plugin-dir read must never run inside the state flock: on macOS it
+/// spawns `ps`, and a stuck spawn inside the flock would hold every clauth
+/// process's state lock. The guard is a debug assertion, so this pins it only
+/// where debug assertions are on.
+#[cfg(debug_assertions)]
+#[test]
+fn the_plugin_dir_read_refuses_under_the_state_flock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        assert!(
+            !crate::lock::state_lock_held(),
+            "the test thread must start outside the state flock"
+        );
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let read = std::panic::catch_unwind(|| {
+            crate::lock::with_state_lock(|_| {
+                live_plugin_dirs();
+                Ok(())
+            })
+        });
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let message = match read {
+            Ok(_) => {
+                panic!("reading the live plugin dirs while holding the state flock must panic")
+            }
+            Err(payload) => payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default(),
+        };
+        assert!(
+            message.contains("must never span the state flock"),
+            "the panic must be the plugin-dir guard, not another fault: {message}"
+        );
+    });
+}
+
+/// A `claude` launched with a `--plugin-dir` into a tree AFTER the sweep's
+/// snapshot must spare it BEFORE its supervisor is signalled: the fast path
+/// read the stale snapshot, and a spare past the decide hold lands after the
+/// SIGTERM.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gc_spares_a_late_plugin_dir_before_stopping_the_supervisor() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _claude_home = fake_claude_home(tmp.path());
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "lateplugin", "runtime-4242-31", "4242-31");
+        let sup = crate::testutil::FakeSupervisor::spawn(&runtime, false);
+        crate::testutil::write_daemon_lock(&runtime, sup.pid, &sup.proc_start);
+        let snapshot = crate::claude_jobs::job_trees();
+        PLUGIN_DIRS_OVERRIDE
+            .with(|slot| *slot.borrow_mut() = Some(vec![runtime.join("moshi-plugin")]));
+        let sent = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let sent = std::rc::Rc::clone(&sent);
+            crate::runtime::set_signal_send_hook(Some(Box::new(move |_| {
+                sent.set(sent.get() + 1);
+            })));
+        }
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            gc_one_pair(
+                &runtime,
+                &sessions,
+                &snapshot,
+                &LivePluginDirs::Named(Vec::new()),
+            )
+            .expect("gc");
+        }
+        crate::runtime::set_signal_send_hook(None);
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            !stop_in_flight(&runtime).expect("read the in-flight stop journal"),
+            "a spared tree must leave no in-flight stop record behind"
+        );
+
+        assert_eq!(
+            sent.get(),
+            0,
+            "a --plugin-dir that appeared after the snapshot must spare the tree before its supervisor is signalled"
+        );
+        assert!(runtime.join(".claude.json").is_file(), "the tree is spared");
+        let spare_line = format!(
+            "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+             (--plugin-dir)",
+            runtime.display()
+        );
+        assert!(
+            lines.snapshot().contains(&spare_line),
+            "the spare logs the plugin-dir line the fast path logs"
+        );
+    });
+}
+
+/// Under an unreadable process table `spares` is true for every pair — no
+/// process was shown to name any tree — and the sweep-level line already
+/// covered it: no per-pair plugin line is logged.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gc_spares_silently_under_an_unreadable_process_table() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) = dead_pair(&profiles, "bgplug", "runtime-4242-32", "4242-32");
+        let snapshot = crate::claude_jobs::job_trees();
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            gc_one_pair(&runtime, &sessions, &snapshot, &LivePluginDirs::Unreadable).expect("gc");
+        }
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "an unreadable process table spares the tree"
+        );
+        assert!(
+            !lines
+                .snapshot()
+                .iter()
+                .any(|line| line.contains("spared runtime tree")),
+            "no per-pair spare line under an unreadable process table"
+        );
+    });
+}
+
+/// An unreadable process table at the retire re-read spares the tree silently,
+/// as an unreadable snapshot does at the fast path: no per-pair line claims a
+/// live process names it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gc_spares_silently_when_the_retire_read_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) =
+            dead_pair(&profiles, "retireunread", "runtime-4242-42", "4242-42");
+        let snapshot = crate::claude_jobs::job_trees();
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        set_gc_recheck_hook(Some(Box::new(|_runtime, _sessions| {
+            PLUGIN_DIRS_UNREADABLE.with(|slot| slot.set(true));
+        })));
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            drop(gc_one_pair(
+                &runtime,
+                &sessions,
+                &snapshot,
+                &LivePluginDirs::named(Vec::new()),
+            ));
+        }
+        set_gc_recheck_hook(None);
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        PLUGIN_DIRS_UNREADABLE.with(|slot| slot.set(false));
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "an unreadable process table spares the tree at the retire re-read"
+        );
+        assert!(
+            !lines
+                .snapshot()
+                .iter()
+                .any(|line| line.contains("spared runtime tree")),
+            "no per-pair spare line under an unreadable process table"
+        );
+    });
+}
+
+/// A sessions path whose marker count cannot be taken keeps the early read and
+/// the spare line it logs: the unknown reads as no live marker, never as a
+/// live one. The path is a file here, so `read_dir` fails as it does on a
+/// sessions dir the OS cannot open.
+#[test]
+fn gc_reads_the_plugin_dirs_when_the_marker_count_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let (runtime, sessions) =
+            dead_pair(&profiles, "unknowncount", "runtime-4242-43", "4242-43");
+        fs::remove_dir_all(&sessions).expect("drop the sessions dir");
+        fs::write(&sessions, b"").expect("a sessions path that cannot be listed");
+        assert!(
+            fs::read_dir(&sessions).is_err(),
+            "the sessions path must be unlistable for this test to mean anything"
+        );
+        let snapshot = crate::claude_jobs::job_trees();
+        PLUGIN_DIRS_OVERRIDE
+            .with(|slot| *slot.borrow_mut() = Some(vec![runtime.join("moshi-plugin")]));
+        reset_plugin_dir_reads();
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            drop(gc_one_pair(
+                &runtime,
+                &sessions,
+                &snapshot,
+                &LivePluginDirs::named(Vec::new()),
+            ));
+        }
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(
+            plugin_dir_reads(),
+            1,
+            "an unknown marker count keeps the early process-table read"
+        );
+        assert!(
+            runtime.join(".claude.json").is_file(),
+            "the early read's spare keeps the tree"
+        );
+        let spare_line = format!(
+            "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+             (--plugin-dir)",
+            runtime.display()
+        );
+        assert!(
+            lines.snapshot().contains(&spare_line),
+            "an unknown marker count keeps the line the early read logs"
+        );
+    });
+}
+
+/// The delete path ignores plugin dirs, so a live `--plugin-dir` never makes a
+/// tree read as unrescued: the delete's own rescue entry point collects the
+/// tree and leaves nothing standing.
+#[test]
+fn the_delete_path_ignores_live_plugin_dirs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("a").join("runtime-6411-0");
+        let sessions = profiles.join("a").join("sessions-6411-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed");
+        PLUGIN_DIRS_OVERRIDE
+            .with(|slot| *slot.borrow_mut() = Some(vec![runtime.join("moshi-plugin")]));
+        let left = rescue_profile_trees(&profiles.join("a"));
+        PLUGIN_DIRS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(
+            left, None,
+            "nothing may be left unrescued: the delete path ignores a live --plugin-dir"
+        );
+        assert!(
+            !runtime.join(".claude.json").exists(),
+            "Off must retire the tree despite a live --plugin-dir"
+        );
+        assert!(!LivePluginDirs::Off.spares(&runtime));
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_path_owned_by_this_user_reads_as_ours() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    assert!(path_owned_by_euid(tmp.path()));
+    assert!(!path_owned_by_euid(&tmp.path().join("missing")));
+    assert!(process_is_ours(std::process::id()));
+}
+
+/// Another user's process is never ours: the pid's uid decides, so a
+/// `process_is_ours` that answers true for every pid reds here. A host where
+/// pid 1 runs as this user fails loudly instead of passing vacuously.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_users_process_does_not_read_as_ours() {
+    use std::os::unix::fs::MetadataExt as _;
+    let pid1 = fs::metadata("/proc/1").expect("/proc/1 metadata");
+    let own = fs::metadata("/proc/self").expect("/proc/self metadata");
+    assert_ne!(
+        pid1.uid(),
+        own.uid(),
+        "/proc/1 must belong to another user for this test to mean anything; run it unprivileged"
+    );
+    assert!(
+        !process_is_ours(1),
+        "another user's pid must not keep a tree on disk"
+    );
+}
+
+/// On macOS our own pid is ours and launchd's (pid 1, root) is not: the uid
+/// compare decides. A root run fails loudly instead of passing vacuously.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_macos_uid_compare_keeps_our_pid_and_drops_launchd() {
+    assert_ne!(
+        effective_uid(),
+        0,
+        "run unprivileged: pid 1 must belong to another user"
+    );
+    assert!(
+        process_is_ours(std::process::id()),
+        "our own pid must read as ours"
+    );
+    assert!(
+        !process_is_ours(1),
+        "launchd's pid must not keep a tree on disk"
+    );
 }
