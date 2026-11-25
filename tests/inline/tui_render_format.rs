@@ -174,6 +174,7 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             env: std::collections::BTreeMap::new(),
             models: Default::default(),
             effort: None,
+            model_effort: Default::default(),
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,

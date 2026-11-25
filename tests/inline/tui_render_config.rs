@@ -37,7 +37,7 @@ fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'stat
 
 /// [`effort_cycle_lines`] in a pane wide enough that the row is one line.
 fn effort_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
-    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE);
+    let mut lines = effort_cycle_lines(arrow, current, selected, WIDE, false);
     assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
     lines.remove(0)
 }
@@ -65,6 +65,30 @@ fn model_cycle_brackets_the_active_option_only_on_focus() {
         focused.chars().count(),
         blurred.chars().count() + 2,
         "the bracket pair is the only width change on focus"
+    );
+}
+
+/// While the `model` row names one model the effort row edits that model's
+/// level, which Claude Code keeps only as low, medium, high or xhigh: the
+/// cycle drops `max`, and an account-wide `max` left on the scalar shows as
+/// the custom value it now is.
+#[test]
+fn a_models_own_effort_cycle_has_no_max() {
+    let per_model = |current| {
+        let mut lines = effort_cycle_lines(Span::raw("  "), current, false, WIDE, true);
+        assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+        line_text(&lines.remove(0))
+    };
+    let options: Vec<String> = per_model("high")
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(options, ["unset", "low", "medium", "high", "xhigh"]);
+    assert!(per_model("max").contains("max"), "{}", per_model("max"));
+    assert!(
+        line_text(&effort_line(Span::raw("  "), "", false)).contains("max"),
+        "the account-wide cycle keeps max"
     );
 }
 
@@ -549,6 +573,61 @@ fn the_effort_hint_says_whether_the_account_holds_an_effort() {
             "{value:?}"
         );
     }
+}
+
+#[test]
+fn the_effort_hint_names_the_table_or_env_override() {
+    let mut snap = Snap::blank("acct");
+    snap.has_model_effort = true;
+    assert_eq!(
+        row_hint(ConfigRow::Effort, &snap, "").as_deref(),
+        Some("[model_effort] supplies levels for its configured models")
+    );
+    snap.per_model_effort = true;
+    snap.env
+        .push(("CLAUDE_CODE_EFFORT_LEVEL".into(), "max".into()));
+    assert_eq!(
+        row_hint(ConfigRow::Effort, &snap, "high").as_deref(),
+        Some("CLAUDE_CODE_EFFORT_LEVEL in [env] overrides the account's effort levels")
+    );
+}
+
+#[test]
+fn invalid_model_effort_renders_a_red_value_and_an_inline_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut snap = Snap::blank("acct");
+    snap.per_model_effort = true;
+    snap.invalid_effort_entry = true;
+    snap.effort = "max".into();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    term.draw(|frame| {
+        draw_settings_rows(
+            frame,
+            Rect::new(0, 0, 80, 8),
+            &app,
+            &[ConfigRow::Effort],
+            0,
+            &snap,
+            SettingsRowsTail {
+                actions_focused: true,
+                toast_rects: &[],
+            },
+        )
+    })
+    .unwrap();
+    let buffer = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buffer);
+    let (y, x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, row)| row.find("max").map(|x| (y, row[..x].chars().count())))
+        .unwrap();
+    assert_eq!(Some(buffer[(x as u16, y as u16)].fg), theme::danger().fg);
+    assert_eq!(rows[y + 1].trim(), "└ low, medium, high or xhigh");
 }
 
 /// The set-effort hint at an 80-column terminal: the detail pane is narrower

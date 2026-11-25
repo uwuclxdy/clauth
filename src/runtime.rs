@@ -76,7 +76,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::claude::{build_claude_settings_json, create_symlink};
+use crate::claude::{build_runtime_settings_json, create_symlink};
 use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
@@ -5575,10 +5575,13 @@ pub(crate) fn swap_target_precondition(
 struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]: its `[env]` entry when present,
-    /// else the field, else `""`), carried into the swap's settings.json
-    /// rewrite. The converge branch mints `None`:
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]: with one model selected, the value
+    /// that makes the session apply what a fresh launch applies, which is the
+    /// carrier's own value when Claude Code's parser takes it and the
+    /// per-model level or `""` otherwise; with no selected model, the
+    /// account-wide carrier as it stands), carried into the swap's
+    /// settings.json rewrite. The converge branch mints `None`:
     /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
     /// new, so no caller reads the field there.
     effort: Option<String>,
@@ -5926,8 +5929,8 @@ struct SwapItemRetry {
     member: ProfileName,
     store: PathBuf,
     previous_store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]), written into the session's
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]), written into the session's
     /// settings.json once the item legs land (on macOS the handover write is
     /// deferred to that point). `None` (the adopting read failed) writes `""`.
     effort: Option<String>,
@@ -6425,7 +6428,7 @@ impl SessionSwap {
         Ok(SwapPlan {
             member: intended,
             store,
-            effort: Some(crate::claude::effective_effort(&profile)),
+            effort: Some(crate::claude::live_effort(&profile)),
         })
     }
 
@@ -6721,15 +6724,33 @@ impl SessionSwap {
 
     /// The swap's effort handover write: the member's effort (`""` when it
     /// holds none) into `env.CLAUDE_CODE_EFFORT_LEVEL` of the session's
-    /// runtime settings.json, recorded through the same owner-only path the
-    /// launch uses. Best-effort — a failure is logged naming the session dir
-    /// and the swap stands, per the handover's contract.
+    /// runtime settings.json, and its per-model levels into `modelSettings`
+    /// ([`crate::claude::set_settings_effort`]), recorded through the same
+    /// owner-only path the launch uses. The levels are read under the hold the
+    /// caller owns (`read_profile`, the under-hold form); an unreadable member
+    /// hands over the carrier alone. Best-effort — a failure is logged naming
+    /// the session dir and the swap stands, per the handover's contract.
     fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
-        if let Err(e) = crate::claude::set_settings_env_key(
+        let levels = match crate::profile::read_profile(member) {
+            Ok(profile) => Some(crate::model_effort::resolved(&profile)),
+            Err(e) => {
+                logline!(
+                    "clauth: session {} swapped onto {} but its per-model effort could not be \
+                     read: {e:#}",
+                    self.session.as_str(),
+                    member,
+                );
+                None
+            }
+        };
+        if let Err(e) = crate::claude::set_settings_effort(
             &self.runtime.join("settings.json"),
             record,
             "CLAUDE_CODE_EFFORT_LEVEL",
             effort.unwrap_or(""),
+            levels
+                .as_ref()
+                .map(|incoming| (incoming, self.isolation == Isolation::Shared)),
         ) {
             logline!(
                 "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",
@@ -7903,14 +7924,15 @@ impl ProfileRuntime {
                     // the re-armed legs land: the swap that armed them is gone,
                     // so its plan's value is unrecoverable, and the adoption
                     // reads the member's current one instead — the value a
-                    // launch on it would carry (`effective_effort`: its `[env]`
-                    // entry or the field). The read-only form is the under-hold
+                    // running session uses (`live_effort`: the carrier's value
+                    // when Claude Code's parser takes it, else the selected
+                    // model's level). The read-only form is the under-hold
                     // one: `load_profile` may rewrite `config.toml` and adopt a
                     // legacy `.pending` sidecar, both through the state flock
                     // this hold already owns.
                     let effort = crate::profile::read_profile(&member)
                         .ok()
-                        .map(|profile| crate::claude::effective_effort(&profile));
+                        .map(|profile| crate::claude::live_effort(&profile));
                     item_retry =
                         adopted_item_retry(launch_store.as_deref(), &canonical, &member, effort);
                 }
@@ -11308,7 +11330,8 @@ fn write_merged_settings(
         }
         _ => None,
     };
-    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    let (mut merged, levels) =
+        build_runtime_settings_json(base.as_deref(), profile, stale_env_keys)?;
     if let Some(days) = carried_days {
         merged = crate::retention::carry_into(merged, days)?;
     }
@@ -11349,6 +11372,19 @@ fn write_merged_settings(
             atomic_write_600(&settings_dst, &merged)
                 .context("failed to write runtime settings.json")?;
         }
+    }
+    // The record only tells a later swap which levels this launch wrote, so
+    // its failure never fails a launch whose settings landed. A swap then
+    // reads whatever record the tree holds: none on a fresh tree, so nothing
+    // goes back; on a reused tree an earlier launch's, through
+    // `RuntimeLevels::read`, which keeps only the levels the session still
+    // holds.
+    if let Err(e) = crate::model_effort::RuntimeLevels::write(
+        &settings_dst,
+        levels,
+        std::collections::BTreeMap::new(),
+    ) {
+        logline!("clauth: {e:#}");
     }
     Ok(())
 }
@@ -11710,6 +11746,34 @@ pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
         }
     }
     out
+}
+
+/// Refresh the effort carrier of managed sessions on the globally active
+/// account after a Setup edit. The caller holds the state lock.
+pub(crate) fn update_live_effort(profile: &Profile) {
+    let effort = crate::claude::live_effort(profile);
+    let levels = crate::model_effort::resolved(profile);
+    let written = crate::settings_sync::written_record_path().ok();
+    for live in sessions_on_member(live_session_runtime_dirs(), &profile.name) {
+        let shared = live
+            .runtime
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_shared_runtime_dir_name);
+        let record = if shared { written.as_deref() } else { None };
+        if let Err(e) = crate::claude::set_settings_effort(
+            &live.runtime.join("settings.json"),
+            record,
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            &effort,
+            Some((&levels, shared)),
+        ) {
+            logline!(
+                "clauth: session {} could not take the updated effort: {e:#}",
+                live.session
+            );
+        }
+    }
 }
 
 /// Whether a daemon-side writer may adopt the unowned per-session item of
