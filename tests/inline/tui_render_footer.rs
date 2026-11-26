@@ -49,11 +49,14 @@ fn the_usage_hints_advertise_the_note_key() {
         env: BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -969,6 +972,27 @@ fn modal_cases() -> Vec<ModalCase> {
             ],
             prep: |_| {},
         },
+        ModalCase {
+            name: "transcript cleanup",
+            modal: Modal::TranscriptCleanup(crate::tui::app::TranscriptCleanupForm {
+                days: 3650,
+                on_remove: false,
+            }),
+            row: Some("←→ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("←→", "pick"), ("↵", "choose"), ("q", "back")],
+            // Its keys act once a drawn frame showed the question for half a
+            // second, an empty poll followed, and a frame drew it live.
+            prep: |app| {
+                app.anim_phase_ms = Some(0);
+                let _ = app.frame_drawn();
+                app.anim_phase_ms = Some(500);
+                app.queue_seen_empty();
+                app.transcript_cleanup.set_drawn_live(true);
+                let _ = app.frame_drawn();
+                app.queue_seen_empty();
+            },
+        },
     ]
 }
 
@@ -999,6 +1023,7 @@ fn modal_index(modal: &Modal) -> usize {
         Modal::BareItemOwner(_) => 17,
         Modal::CaptureOwner(_) => 18,
         Modal::LimitReset(_) => 19,
+        Modal::TranscriptCleanup(_) => 20,
     }
 }
 
@@ -1006,7 +1031,7 @@ fn modal_index(modal: &Modal) -> usize {
 /// Bumped with `modal_index` — the coverage test reds when an index has no
 /// case. That guard fires only once `MODAL_COUNT` is bumped past the new arm's
 /// index.
-const MODAL_COUNT: usize = 20;
+const MODAL_COUNT: usize = 21;
 
 /// Every `Modal` variant has a case driving its row; the two login modals are
 /// the variants a case cannot cover (their login-in-flight lines own the
@@ -1062,6 +1087,7 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::CaptureName(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::NamePrompt(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::Rebind(f)) => format!("{}:{}:{:?}", f.choice, f.cursor, f.checked),
+        Some(Modal::TranscriptCleanup(f)) => format!("{}:{}", f.days, f.on_remove),
         Some(Modal::Help) => format!("{}", app.help_scroll),
         Some(Modal::CheckOutput(_)) => format!("{}", app.check_output_scroll),
         Some(Modal::Login) => String::new(),

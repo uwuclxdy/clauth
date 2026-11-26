@@ -7014,7 +7014,9 @@ fn a_switch_off_drops_the_login_the_adopt_skipped() {
     let tree = profile_tree("px");
     let live = write_live_login("at-r19-off", "rt-r19-off");
 
-    let off = crate::actions::switch_off_locked(&mut config).map_err(|e| e.to_string());
+    let off = crate::actions::switch_off_locked(&mut config)
+        .map(|departed| departed.is_some())
+        .map_err(|e| e.to_string());
 
     assert_eq!(
         (

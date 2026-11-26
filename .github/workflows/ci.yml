@@ -143,6 +143,23 @@ jobs:
       # updated in the runner and thrown away with it.
       - name: clippy (-D warnings)
         run: cargo clippy --locked --all-targets --all-features --release -- -D warnings
+      # The ubuntu coverage run fills the runner's 145G disk: #151's green test
+      # step ended with 64M free, and #173 died mid-step on "No space left on
+      # device" (measured 2026-11-24). Free room before it by deleting the
+      # preinstalled SDKs this workflow never uses: the Android SDK, .NET, GHC
+      # (GHCup's GHC and cabal) and the CodeQL bundle in the tool cache. No
+      # step here and no action it uses reads any of them: none calls dotnet,
+      # ghc, cabal, stack or codeql, and none builds Android. Log the disk
+      # before and after.
+      - name: free runner disk
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android/sdk
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h /
       # `--no-fail-fast` so a red run reports every failure instead of a prefix: nextest
       # cancels at the first one, so you fix what you were shown, push, and are handed
       # more — which reads like a regression your own fix caused, at a build per round.
@@ -161,6 +178,20 @@ jobs:
           else
             cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
           fi
+      # The coverage report reads only lcov.info, and the later legs build under
+      # target/release and target/debug, so the coverage run's own build and
+      # profraw files can go: the linux runner's disk filled at the debug leg's
+      # link (measured 2026-11-20). Clean them before the debug leg and log the
+      # disk it frees. The instrumented dependency builds under
+      # target/llvm-cov-target stay: rust-cache saves them for the next
+      # coverage run.
+      - name: free the coverage build dir
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          [ -d target/llvm-cov-target ] || echo "::warning::target/llvm-cov-target is absent: the coverage build put nothing there to free"
+          cargo llvm-cov clean --workspace
+          df -h /
       # Every leg above is --release, where debug_assertions is off and
       # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
       # gated on it cannot run at all, so the local gate was catching regressions

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
@@ -20,7 +20,7 @@ use super::InputState;
 use super::SeededInput;
 use crate::fallback::parse_threshold;
 use crate::profile::ProfileName;
-use crate::testutil::write_live_creds;
+use crate::testutil::{peer_switches_active_to, write_live_creds};
 
 #[test]
 fn delete_word_removes_run_left_of_caret() {
@@ -3002,6 +3002,283 @@ fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
     );
 }
 
+/// The chain's own move leaves a line in clauth.log: the toast vanishes with
+/// the TUI, so without the line nothing tells when (or whether) the chain
+/// moved off an account whose window still ran out.
+#[test]
+fn on_tick_logs_a_queued_auto_switch_with_the_left_reading() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            seven_day: Some(boot_window(70.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // First tick dispatches (posts the gate); the second completes it.
+        super::on_tick(&mut app);
+        super::on_tick(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'perso' from 'work'; 'work' read 5h 92% (line 90%), 7d 70% (line 98%) 4m ago"),
+        "the landed auto-switch is logged with what the left account read and how long ago: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer switch landing while the queued switch's gate runs must not change
+/// what the line reports: the account left is the one `profiles.toml` names
+/// under the switch's own hold, never the process's copy read before it.
+#[test]
+fn on_tick_logs_the_account_its_hold_left_after_a_peer_switch() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso", "peer"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let mut peer = stored_oauth_profile("peer", far_future());
+    peer.fallback_threshold = Some(90.0);
+    save_profile(&peer).expect("save peer");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![
+            ProfileName::from("work"),
+            ProfileName::from("perso"),
+            ProfileName::from("peer"),
+        ],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso, peer],
+    });
+    app.bootstrap_started = true;
+    for (name, five, seven) in [("work", 91.0, 60.0), ("peer", 92.0, 70.0)] {
+        app.usage_store.lock().expect("usage_store").insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(five)),
+                seven_day: Some(boot_window(seven)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy still names work.
+        super::on_tick(&mut app);
+        // A peer's switch lands while that answer waits.
+        peer_switches_active_to(Some("peer"));
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'perso' from 'peer'; 'peer' read 5h 92% (line 90%), 7d 70% (line 98%) 4m ago"),
+        "the line names the account the switch's own hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after this app loaded
+/// leaves only the disk naming the account the queued switch will leave; the
+/// line still names it, with its reading.
+#[test]
+fn on_tick_names_a_left_account_its_config_copy_lacks() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy has no `delta`.
+        super::on_tick(&mut app);
+        // A peer saves `delta` and switches onto it while that answer waits.
+        stored_oauth_profile("delta", far_future());
+        crate::testutil::register_names(&["delta"]);
+        peer_switches_active_to(Some("delta"));
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: auto-switched to 'perso' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the queued switch's line: the name comes from the switch's own result, and
+/// only the figures need a profile. Its stored reading cannot fill them without
+/// one.
+#[test]
+fn on_tick_names_a_left_account_with_no_loadable_profile() {
+    use crate::profile::{AppConfig, AppState, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["work", "perso"]);
+    let mut work = stored_oauth_profile("work", far_future());
+    work.fallback_threshold = Some(90.0);
+    save_profile(&work).expect("save work");
+    let perso = stored_oauth_profile("perso", far_future());
+    write_live_creds(work.credentials.as_ref().expect("work creds"));
+    let state = AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        fallback_chain: vec![ProfileName::from("work"), ProfileName::from("perso")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![work, perso],
+    });
+    app.bootstrap_started = true;
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "perso".to_string(),
+            key_rejected_cause: None,
+        });
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The tick dispatches the switch: its gate answers, the drain that
+        // finalizes it waits for the next call, and this copy has no `delta`.
+        super::on_tick(&mut app);
+        // A peer saves `delta`, switches onto it, and its config.toml stops
+        // loading while that answer waits.
+        stored_oauth_profile("delta", far_future());
+        crate::testutil::register_names(&["delta"]);
+        peer_switches_active_to(Some("delta"));
+        crate::testutil::break_profile_config("delta");
+        app.usage_store.lock().expect("usage_store").insert(
+            "delta".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(92.0)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+        super::drain_switch_gates(&mut app);
+    }
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("perso"),
+        "precondition: the queued switch lands"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: auto-switched to 'perso' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A queued switch must not execute once the TUI lost the fetch lease: the
 /// decision was queued under a ticket the watchdog then released, and the
 /// holder that took over decides. The record clears with the skip.
@@ -3589,8 +3866,75 @@ fn the_startup_one_shot_passes_over_a_member_with_a_credit_refusal() {
     )
     .expect("the one-shot runs");
 
-    assert_eq!(action, Some(SwitchAction::To("delta".into())));
+    assert_eq!(
+        action.map(|taken| taken.action),
+        Some(SwitchAction::To("delta".into()))
+    );
     assert_eq!(app.config().state.active_profile.as_deref(), Some("delta"));
+}
+
+/// The startup one-shot cannot log another account: its dispatch refuses to
+/// switch once `profiles.toml` names an active account other than the one the
+/// decision was made about, so the account it moves off is the one its hold
+/// read.
+#[test]
+fn the_startup_one_shot_drops_its_decision_once_disk_names_another_active() {
+    use crate::fallback::SwitchAction;
+
+    // Control: memory and disk both name the decided account, so it lands.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (app, gamma_store, readable) = unreadable_middle_member_app();
+        std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+        let action = crate::fallback::auto_switch_if_needed(
+            &app.config,
+            None,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.poll_streaks,
+            &app.third_party_streaks,
+            &app.kick_blocks,
+        )
+        .expect("the one-shot runs");
+        assert_eq!(
+            action.map(|taken| taken.action),
+            Some(SwitchAction::To("gamma".into())),
+            "fixture control: both copies name alpha, so the one-shot decides"
+        );
+    }
+
+    // A peer's switch left `profiles.toml` naming delta.
+    {
+        let _home = crate::testutil::HomeSandbox::new();
+        let (app, gamma_store, readable) = unreadable_middle_member_app();
+        std::fs::write(&gamma_store, &readable).expect("heal gamma's store");
+        peer_switches_active_to(Some("delta"));
+        let action = crate::fallback::auto_switch_if_needed(
+            &app.config,
+            None,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.poll_streaks,
+            &app.third_party_streaks,
+            &app.kick_blocks,
+        )
+        .expect("the one-shot runs");
+        assert_eq!(action, None, "the rendezvous drops the stale decision");
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some("alpha"),
+            "this process's copy still names alpha"
+        );
+        assert_eq!(
+            active_on_disk().as_deref(),
+            Some("delta"),
+            "the peer's switch stands"
+        );
+    }
 }
 
 #[test]
@@ -14018,7 +14362,8 @@ fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
                 &app.third_party_streaks,
                 &app.kick_blocks,
             )
-            .unwrap(),
+            .unwrap()
+            .map(|taken| taken.action),
             Some(SwitchAction::To("kl".into())),
             "{label}: the startup one-shot"
         );
@@ -22985,11 +23330,21 @@ fn boot_window(utilization: f64) -> UsageWindow {
     }
 }
 
-/// Drive one bootstrap tail over the caller-held sandbox with `status` as the
-/// ACTIVE profile's last read. Everything else — chain, windows, credentials,
-/// the spare's own Fresh status — is identical across calls, so `status` is the
-/// only variable between the two directions.
-fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> App {
+/// Where a decided startup one-shot lands: on the idle spare, or off once the
+/// whole chain is spent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootTail {
+    Spare,
+    WrapOff,
+}
+
+/// Drive one bootstrap tail with `status` as the ACTIVE profile's last read.
+/// `tail` names where a decided one-shot lands and picks the member list it
+/// lands over, and `spent_fetched_at` dates the active's stored reading (a
+/// line that has to carry an age passes one). Every other field — the active
+/// account, its windows, its credentials, the live file — is identical across
+/// calls.
+fn bootstrap_app(status: FetchStatus, tail: BootTail, spent_fetched_at: Option<u64>) -> App {
     use super::{StartupSignal, drain_startup_signals};
     use crate::profile::{AppConfig, AppState, Profile, save_profile};
 
@@ -23000,49 +23355,58 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
         p
     };
     let spent = mk(BOOT_SPENT);
-    let spare = mk(BOOT_SPARE);
     // The live file is the ACTIVE account's captured mirror: the relink has no
     // uncaptured login to strand, so a decided switch actually lands.
     write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
+    let mut profiles = vec![spent];
+    let mut chain = vec![BOOT_SPENT.into()];
+    if tail == BootTail::Spare {
+        profiles.push(mk(BOOT_SPARE));
+        chain.push(BOOT_SPARE.into());
+    }
 
     let config = AppConfig {
         state: AppState {
             active_profile: Some(BOOT_SPENT.into()),
-            profiles: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
-            fallback_chain: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            profiles: chain.clone(),
+            fallback_chain: chain,
+            switch_off_when_spent: tail == BootTail::WrapOff,
             ..AppState::default()
         },
-        profiles: vec![spent, spare],
+        profiles,
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
     let mut app = App::new(config);
 
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     {
         let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
         store.insert(
             BOOT_SPENT.to_string(),
             UsageInfo {
                 five_hour: Some(boot_window(100.0)),
+                fetched_at: spent_fetched_at,
                 ..UsageInfo::default()
             },
         );
-        store.insert(
-            BOOT_SPARE.to_string(),
-            UsageInfo {
-                five_hour: Some(boot_window(1.0)),
-                ..UsageInfo::default()
-            },
-        );
+        if tail == BootTail::Spare {
+            store.insert(
+                BOOT_SPARE.to_string(),
+                UsageInfo {
+                    five_hour: Some(boot_window(1.0)),
+                    ..UsageInfo::default()
+                },
+            );
+        }
     }
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     {
         let mut s = app
             .usage_status
             .lock()
             .expect("usage_status mutex poisoned");
         s.insert(BOOT_SPENT.to_string(), status);
-        s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+        if tail == BootTail::Spare {
+            s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+        }
     }
 
     // `finish_bootstrap` starts the real scheduler via `spawn_refresher`, which
@@ -23095,7 +23459,7 @@ fn skips_the_one_shot(status: FetchStatus) -> bool {
 #[test]
 fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    let app = bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None);
 
     assert_eq!(
         app.config().state.active_profile.as_deref(),
@@ -23106,6 +23470,58 @@ fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
         toast_bodies(&app),
         vec!["auto-switched to 'spare'".to_string()],
         "the landed switch announces its target",
+    );
+}
+
+#[test]
+fn bootstrap_one_shot_logs_the_switch_away_from_a_fresh_exhausted_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None)
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPARE),
+        "precondition: the startup switch lands",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: auto-switched to 'spare' from 'spent'; 'spent' read 5h 100% (line 95%) at an unknown time"),
+        "the startup switch is logged with what the left account read, and that nothing dates it: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// The startup one-shot's wrap-off is the chain's own move too, so it leaves
+/// the same reading line the daemon's does.
+#[test]
+fn bootstrap_one_shot_logs_the_wrap_off_with_the_left_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    let app = {
+        let _capture = lines.capture_here();
+        bootstrap_app(
+            FetchStatus::Fresh,
+            BootTail::WrapOff,
+            Some(crate::usage::now_ms() - 240_000),
+        )
+    };
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        None,
+        "precondition: the startup one-shot switched off",
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'spent' read 5h 100% (line 95%) 4m ago"),
+        "the startup wrap-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
     );
 }
 
@@ -23125,7 +23541,7 @@ fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
 
     for status in skipped {
         let _home = crate::testutil::HomeSandbox::new();
-        let app = bootstrap_app(&_home, status);
+        let app = bootstrap_app(status, BootTail::Spare, None);
 
         assert_eq!(
             app.config().state.active_profile.as_deref(),
@@ -23429,11 +23845,14 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -46685,7 +47104,7 @@ fn bootstrap_one_shot_stands_down_when_another_instance_holds_the_fetch_lease() 
     // flock stays held for the rest of the test.
     let other = crate::daemon::FetchLease::new();
     assert!(other.acquire(), "the first instance wins the lease");
-    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    let app = bootstrap_app(FetchStatus::Fresh, BootTail::Spare, None);
     assert_eq!(
         app.config().state.active_profile.as_deref(),
         Some(BOOT_SPENT),
@@ -60930,9 +61349,9 @@ fn plugin_card_carries_daemon_line(app: &App) -> bool {
 
 /// A fresh daemon feed saying `binary_replaced: true` raises one warning toast
 /// per run, tints the Services tab until it is visited, and puts a line on the
-/// plugin card that holds exactly while the feed says so. The daemon probe's
-/// own cadence drives all three: the test never recomputes the card itself
-/// after the first seed.
+/// plugin card that holds exactly while the feed says so — each after the
+/// replaced grace. The daemon probe's own cadence drives all of it: the test
+/// never recomputes the card itself after the first seed.
 #[test]
 fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     use crate::daemon::DaemonHealth;
@@ -60958,12 +61377,25 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
     );
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace the first true reading raises nothing"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     assert_eq!(
         daemon_replaced_toasts(&app),
         vec![super::ToastKind::Warning],
-        "the first true reading toasts once, in the warning tone"
+        "the grace end toasts once, in the warning tone"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61005,8 +61437,14 @@ fn a_daemon_on_a_replaced_binary_toasts_once_and_marks_the_plugin_card() {
         "the toast is once per run, never once per entry"
     );
     assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "a re-rise holds the line until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
+    poll_and_land(&mut app);
+    assert!(
         plugin_card_carries_daemon_line(&app),
-        "the line returns with the flag"
+        "the line returns with the flag once the grace ends"
     );
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61053,6 +61491,8 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     write_binary_feed(&now(), false, false);
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
 
     write_binary_feed(&now(), true, true);
     poll_and_land(&mut app);
@@ -61086,8 +61526,15 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
+        None,
+        "a replaced read after a removal holds until its grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
         Some(super::ToastKind::Warning),
-        "a kind flip re-tints the Services tab"
+        "the kind flip re-tints the Services tab once its grace ends"
     );
     let detail = plugin_card_detail(&app);
     assert!(
@@ -61125,6 +61572,219 @@ fn a_daemon_whose_binary_was_removed_names_the_removal() {
         ),
         (1, 1),
         "each kind toasts at most once per run"
+    );
+}
+
+/// A fresh daemon read as replaced only briefly — a daemon mid-re-exec —
+/// raises nothing: the toast and card line wait out a grace of continuous
+/// replaced reads, so the advice is not shouted over the daemon's own
+/// restart.
+#[test]
+fn a_daemon_read_replaced_briefly_raises_nothing() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "nor a tint"
+    );
+    assert_eq!(
+        app.daemon_health,
+        DaemonHealth::Fresh,
+        "the quiet was not a failed probe: the feed reads live"
+    );
+}
+
+/// A daemon that died while the grace ran — the re-exec failed and nothing
+/// restarts it — raises nothing: a dead daemon already shows as not running,
+/// so no toast, no card line and no Services tint, on the death read and on
+/// the read after it.
+#[test]
+fn a_daemon_that_died_under_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the grace still holds the advice while the daemon lives"
+    );
+
+    drop(lock);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the death under the grace raises no toast"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "no card line for a dead daemon"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "no Services tint for a dead daemon"
+    );
+
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the read after the death stays quiet too"
+    );
+    assert!(
+        !plugin_card_carries_daemon_line(&app),
+        "and no card line appears later"
+    );
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "and no Services tint appears later"
+    );
+}
+
+/// A daemon that flipped the feed back to false within the grace — the
+/// re-exec happened — raises nothing, and a later replaced read restarts the
+/// full grace rather than continuing the old one.
+#[test]
+fn a_daemon_that_flipped_back_within_the_grace_raises_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the re-exec'd daemon raises nothing"
+    );
+
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "a fresh replaced read restarts the full grace"
+    );
+}
+
+/// A flip back to false inside the grace restarts it in full: the old
+/// grace's end raises nothing, and the advice waits a whole grace from the
+/// next replaced read.
+#[test]
+fn a_flip_back_within_the_grace_restarts_it_in_full() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 5_000);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 6_000);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "the old grace's end raises nothing once a flip back restarted it"
+    );
+    app.daemon_now_override = Some(t0 + 16_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the advice raises a whole grace after the next replaced read"
+    );
+}
+
+/// A feed held at `binary_replaced` true continuously for the grace raises
+/// today's exact toast and card line and tints the Services tab. The grace
+/// clock is the TUI's own wall-clock read — the `tps` cache-age precedent's
+/// override — so the test advances it without sleeping; the feed's own
+/// freshness still reads the real clock.
+#[test]
+fn a_daemon_held_on_a_replaced_binary_past_the_grace_raises_the_advice() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let now = || chrono::Utc::now().to_rfc3339();
+
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    super::switch_tab(&mut app, super::Tab::Overview);
+    write_replaced_feed(&now(), false);
+    poll_and_land(&mut app);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "under the grace nothing raises"
+    );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert!(
+        daemon_replaced_toasts(&app).is_empty(),
+        "still nothing one ms before the grace ends"
+    );
+
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        daemon_replaced_toasts(&app),
+        vec![super::ToastKind::Warning],
+        "the grace end raises today's exact toast, in the warning tone"
+    );
+    assert!(plugin_card_carries_daemon_line(&app), "and the card line");
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        Some(super::ToastKind::Warning),
+        "and the Services tab takes the warning tint"
     );
 }
 
@@ -61539,9 +62199,9 @@ fn a_stale_daemons_replaced_flag_raises_nothing() {
     assert!(!plugin_card_carries_daemon_line(&app), "nor a card line");
 }
 
-/// Each rise of the daemon's flag tints the Services tab again, though the
-/// toast stays once per run: a daemon replaced, restarted, then replaced
-/// again is news each time.
+/// Each rise of the daemon's flag tints the Services tab again once its own
+/// grace ends, though the toast stays once per run: a daemon replaced,
+/// restarted, then replaced again is news each time.
 #[test]
 fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -61555,7 +62215,11 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     poll_and_land(&mut app);
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
 
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    app.daemon_now_override = Some(t0 + 10_000);
     poll_and_land(&mut app);
     super::switch_tab(&mut app, super::Tab::Services);
     super::switch_tab(&mut app, super::Tab::Overview);
@@ -61568,6 +62232,13 @@ fn every_rise_of_the_daemons_flag_tints_the_services_tab() {
     );
 
     write_replaced_feed(&now(), true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.tab_activity[super::Tab::Services.index()],
+        None,
+        "the second rise holds its tint until its own grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 20_000);
     poll_and_land(&mut app);
     assert_eq!(
         app.tab_activity[super::Tab::Services.index()],
@@ -61639,6 +62310,41 @@ fn a_self_update_raises_no_second_replaced_binary_toast() {
         app.toasts.back().map(|t| (t.kind, t.body.as_str())),
         Some((super::ToastKind::Warning, OWN_REPLACED_INSTALL_REFUSAL)),
         "naming the restart"
+    );
+}
+
+/// A higher major release the updater found toasts one warning in these two
+/// lines, once per run however many versions arrive.
+#[test]
+fn a_higher_major_release_toasts_the_approved_warning() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.update_results = rx;
+    let before = app.toasts.len();
+    tx.send(crate::update::UpdateEvent::MajorAvailable(
+        "1.0.0".to_string(),
+    ))
+    .expect("send");
+    super::on_tick(&mut app);
+    tx.send(crate::update::UpdateEvent::MajorAvailable(
+        "1.0.1".to_string(),
+    ))
+    .expect("send");
+    super::on_tick(&mut app);
+    let told: Vec<_> = app
+        .toasts
+        .iter()
+        .skip(before)
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        told,
+        vec![(
+            super::ToastKind::Warning,
+            "v1.0.0 is out\nnot installed automatically: read the release note"
+        )],
+        "one toast per run, holding the first version read"
     );
 }
 
@@ -63592,6 +64298,215 @@ fn the_settle_runs_on_a_worker_and_holds_the_write() {
     );
     assert_eq!(active_on_disk(), None, "the settled sign-out ran");
     assert!(app.modals.is_empty(), "nothing to ask");
+}
+
+/// The chain's own switch-off leaves the same reading line in clauth.log that
+/// every other chain move does: its toast is gone with the TUI.
+#[test]
+fn drain_pending_switch_off_logs_the_left_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(97.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *app.pending_switch_off.lock().expect("flag") = true;
+        drain_pending_switch_off(&mut app);
+        // The gate holds the write on its settle; landing the answer resumes
+        // it, and the resumed write is the one that switches off.
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'work' read 5h 97% (line 95%) 4m ago"),
+        "the chain's switch-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer switch landing while the bare item settles must not change what the
+/// wrap-off line reports: the account left is the one `profiles.toml` names
+/// under the switch-off's own hold, never the copy read before it.
+#[test]
+fn perform_switch_off_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    let mut peer = stored_oauth_profile("peer", far_future());
+    peer.fallback_threshold = Some(90.0);
+    crate::testutil::register_names(&["peer"]);
+    app.config().profiles.push(peer);
+    for (name, five) in [("work", 97.0), ("peer", 92.0)] {
+        app.usage_store.lock().expect("usage_store").insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(five)),
+                fetched_at: Some(crate::usage::now_ms() - 240_000),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    // The peer's switch landed while this copy still named work.
+    peer_switches_active_to(Some("peer"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth: switched off: all accounts spent; 'peer' read 5h 92% (line 90%) 4m ago"),
+        "the line names the account the switch-off's own hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after this app loaded
+/// leaves only the disk naming the account the wrap-off will leave; the line
+/// still names it, with its reading.
+#[test]
+fn perform_switch_off_names_a_left_account_its_config_copy_lacks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    // A peer saves `delta` and switches onto it after this app loaded.
+    stored_oauth_profile("delta", far_future());
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
+        "the line names the account the switch-off's own hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the wrap-off line: the name comes from the switch-off's own result, and only
+/// the figures need a profile. Its stored reading cannot fill them without one.
+#[test]
+fn perform_switch_off_names_a_left_account_with_no_loadable_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    // A peer saves `delta`, switches onto it, and its config.toml stops loading
+    // after this app loaded.
+    stored_oauth_profile("delta", far_future());
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+    app.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(92.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        // The write holds on the settle; landing the answer resumes it, and
+        // the resumed write is the one that switches off.
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert_eq!(active_on_disk(), None, "precondition: the wrap-off landed");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent; 'delta' read nothing"),
+        "the line names the account the switch-off's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A wrap-off `profiles.toml` already made writes the bare line, the daemon's
+/// twin shape, and names no reading for an account this process did not turn
+/// off.
+#[test]
+fn perform_switch_off_logs_the_bare_line_when_disk_is_already_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_item_app(
+        vec![FakeSettle::Settled],
+        crate::claude::BareItemSave::Nothing,
+    );
+    app.usage_store.lock().expect("usage_store").insert(
+        "work".to_string(),
+        UsageInfo {
+            five_hour: Some(boot_window(97.0)),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(None);
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        super::perform_switch_off(&mut app);
+        land_bare_item_answers(&mut app);
+    }
+
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth: switched off: all accounts spent"),
+        "a wrap-off the disk already made writes the bare line: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains("'work' read")),
+        "the line reports no reading for an account this process did not turn off: {:?}",
+        lines.snapshot()
+    );
 }
 
 /// `s` with a profile cached with the login's account saves the login into
@@ -69577,6 +70492,8 @@ fn a_hung_rex_plugin_read_leaves_the_first_paint_unblocked() {
             "plugin: not installed".to_string(),
             "watcher: not running".to_string(),
             "experimental: may change in any release".to_string(),
+            String::new(),
+            format!("  {}", crate::tui::render::prose::cmd("clauth rex install")),
         ]
     );
     super::join_test_workers();
@@ -69825,6 +70742,142 @@ mod effort_row {
         }
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(effort_on_disk(), None, "an emptied field unsets the effort");
+    }
+
+    fn acct_on_disk() -> Profile {
+        crate::profile::load_config()
+            .expect("reload")
+            .profiles
+            .into_iter()
+            .find(|p| p.name == "acct")
+            .expect("the account is on disk")
+    }
+
+    fn saved_model_account_app(model: &str, effort: Option<&str>) -> App {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.models.default = Some(model.to_string());
+        profile.effort = effort.map(str::to_string);
+        crate::testutil::persist_profiles(std::slice::from_ref(&profile));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(0);
+        enter_config_detail(&mut app);
+        app
+    }
+
+    /// Under a selected model the effort row is that model's level: the
+    /// account's scalar shows there and moves into `[model_effort]` on the
+    /// first edit, and the cycle skips `max`, which Claude Code does not keep
+    /// per model.
+    #[test]
+    fn under_a_selected_model_the_effort_row_edits_that_models_level() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("sonnet", Some("high"));
+        assert_eq!(
+            app.config_draft.as_ref().expect("draft").effort.value,
+            "high",
+            "the scalar is sonnet's level while sonnet is selected"
+        );
+        cycle_effort(&mut app);
+        let p = acct_on_disk();
+        assert_eq!(p.effort, None, "the scalar moved into the table");
+        assert_eq!(
+            p.model_effort.get("sonnet").map(String::as_str),
+            Some("xhigh")
+        );
+        cycle_effort(&mut app);
+        assert_eq!(
+            acct_on_disk().model_effort.get("sonnet"),
+            None,
+            "xhigh -> unset: no max for a model's own level"
+        );
+        assert_eq!(app.config_draft.as_ref().expect("draft").effort.value, "");
+    }
+
+    #[test]
+    fn a_selected_model_refuses_a_level_claude_code_would_drop() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("opus", None);
+        put_cursor_on_effort(&mut app);
+        handle_key(&mut app, key(KeyCode::Enter));
+        for c in "max".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        let p = acct_on_disk();
+        assert_eq!(p.effort, None);
+        assert!(p.model_effort.is_empty(), "max is refused under a model");
+        assert_eq!(
+            app.config_draft.as_ref().and_then(|d| d.active),
+            Some(ConfigRow::Effort),
+            "the field stays open on the refusal"
+        );
+    }
+
+    #[test]
+    fn the_new_account_model_reseeds_effort_and_refuses_invalid_edits_inline() {
+        use super::super::{CommitResult, commit_config_field, cycle_model};
+
+        let _home = HomeSandbox::new();
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(app.profile_count());
+        enter_config_detail(&mut app);
+
+        let draft = app.config_draft.as_mut().expect("draft");
+        draft.effort = InputState::new("max");
+        draft.model = InputState::new("");
+        cycle_model(&mut app);
+        let draft = app.config_draft.as_mut().expect("draft");
+        assert_eq!(draft.model.value, "fable");
+        assert_eq!(draft.effort.value, "");
+        draft.effort = InputState::new("max");
+        draft.active = Some(ConfigRow::Effort);
+        assert!(matches!(
+            commit_config_field(&mut app, ConfigRow::Effort),
+            CommitResult::Refused
+        ));
+        let draft = app.config_draft.as_ref().expect("draft");
+        assert_eq!(draft.active, Some(ConfigRow::Effort));
+        assert_eq!(draft.effort.value, "max");
+    }
+
+    #[test]
+    fn the_new_account_form_refuses_max_under_a_selected_model() {
+        let _home = HomeSandbox::new();
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Setup;
+        app.profile_cursor.set(app.profile_count());
+        enter_config_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("fresh");
+            d.model = InputState::new("sonnet");
+            d.effort = InputState::new("max");
+        }
+        commit_new_account(&mut app);
+        assert!(
+            app.config().find(&ProfileName::from("fresh")).is_none(),
+            "a typed max under a selected model creates nothing"
+        );
+    }
+
+    #[test]
+    fn opusplan_keeps_the_account_wide_effort_cycle() {
+        let _home = HomeSandbox::new();
+        let mut app = saved_model_account_app("opusplan", Some("xhigh"));
+        cycle_effort(&mut app);
+        let p = acct_on_disk();
+        assert_eq!(p.effort.as_deref(), Some("max"));
+        assert!(p.model_effort.is_empty());
     }
 
     #[test]
@@ -74692,6 +75745,129 @@ fn closed_terminal() -> ratatui::Terminal<ratatui::backend::CrosstermBackend<Clo
     .expect("a fixed viewport needs no terminal")
 }
 
+/// One step of a [`ScriptedEvents`] queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scripted {
+    /// A key press already queued.
+    Key(KeyCode),
+    /// Where the keys queued at this instant end: what follows arrives later.
+    Later,
+    /// A terminal focus report already queued: `true` gained, `false` lost.
+    Focus(bool),
+}
+
+/// The frame loop's input in a test: a zero-timeout poll answers only for the
+/// events ahead of the next [`Scripted::Later`], a poll that waits reads past
+/// it, as a terminal's queue answers a key typed after the poll began. With a
+/// shared clock it moves that clock as a wait begins and as it serves an
+/// event, so a test can put a clock step inside the frame loop's own wake or
+/// its drop.
+#[derive(Debug, Default)]
+struct ScriptedEvents {
+    steps: std::collections::VecDeque<Scripted>,
+    /// The bound every waiting poll asked for, in order: the frame loop's own
+    /// wait, which a zero-timeout drop poll does not ask.
+    waits: Vec<std::time::Duration>,
+    /// The injected clock this source moves, when a test installed the same
+    /// clock on its app.
+    clock: Option<Arc<AtomicU64>>,
+    /// How far a waiting poll moves [`Self::clock`] as it begins.
+    wait_ms: u64,
+    /// How far one read of a queued event moves [`Self::clock`]: the drop's
+    /// own time.
+    read_ms: u64,
+}
+
+impl ScriptedEvents {
+    fn keys(codes: &[KeyCode]) -> Self {
+        let mut events = Self::default();
+        events.push(codes);
+        events
+    }
+
+    /// A source over `clock`: every waiting poll moves it by `wait_ms`, every
+    /// queued event it reads by `read_ms`.
+    fn moving(clock: Arc<AtomicU64>, wait_ms: u64, read_ms: u64) -> Self {
+        Self {
+            clock: Some(clock),
+            wait_ms,
+            read_ms,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, codes: &[KeyCode]) {
+        self.steps
+            .extend(codes.iter().map(|&code| Scripted::Key(code)));
+    }
+
+    fn push_focus(&mut self, gained: bool) {
+        self.steps.push_back(Scripted::Focus(gained));
+    }
+
+    /// The keys still queued, in order.
+    fn queued(&self) -> Vec<KeyCode> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                Scripted::Key(code) => Some(*code),
+                Scripted::Later | Scripted::Focus(_) => None,
+            })
+            .collect()
+    }
+
+    /// Move the shared clock by `ms`, when a test installed one.
+    fn advance(&self, ms: u64) {
+        if let Some(clock) = &self.clock {
+            clock.fetch_add(ms, Ordering::Relaxed);
+        }
+    }
+}
+
+impl crate::tui::EventSource for ScriptedEvents {
+    fn poll(&mut self, timeout: std::time::Duration) -> std::io::Result<bool> {
+        if !timeout.is_zero() {
+            self.waits.push(timeout);
+            let wait_ms = self.wait_ms;
+            self.advance(wait_ms);
+        }
+        loop {
+            match self.steps.front() {
+                Some(Scripted::Key(_) | Scripted::Focus(_)) => return Ok(true),
+                Some(Scripted::Later) if !timeout.is_zero() => {
+                    self.steps.pop_front();
+                }
+                Some(Scripted::Later) | None => return Ok(false),
+            }
+        }
+    }
+
+    fn read(&mut self) -> std::io::Result<ratatui::crossterm::event::Event> {
+        loop {
+            match self.steps.pop_front() {
+                Some(Scripted::Key(code)) => {
+                    let read_ms = self.read_ms;
+                    self.advance(read_ms);
+                    return Ok(ratatui::crossterm::event::Event::Key(crate::testutil::key(
+                        code,
+                    )));
+                }
+                Some(Scripted::Focus(gained)) => {
+                    let read_ms = self.read_ms;
+                    self.advance(read_ms);
+                    return Ok(if gained {
+                        ratatui::crossterm::event::Event::FocusGained
+                    } else {
+                        ratatui::crossterm::event::Event::FocusLost
+                    });
+                }
+                Some(Scripted::Later) => {}
+                None => panic!("the frame loop read past the end of its script"),
+            }
+        }
+    }
+}
+
 /// Output that fails every write and flush with `EIO`.
 #[cfg(unix)]
 struct ClosedOutput;
@@ -74735,8 +75911,12 @@ fn a_pending_stop_signal_ends_the_frame_loop_and_shutdown_still_runs() {
     // check returns that error rather than running on.
     let mut terminal = closed_terminal();
     let stop_signal = std::sync::OnceLock::from(signal_hook::consts::signal::SIGHUP);
-    let frames =
-        super::super::run_frames(&mut terminal, &mut app, &mut || stop_signal.get().is_some());
+    let frames = super::super::run_frames(
+        &mut terminal,
+        &mut app,
+        &mut ScriptedEvents::default(),
+        &mut || stop_signal.get().is_some(),
+    );
     assert!(
         frames.is_ok(),
         "the stop request ends the loop before its first draw: {frames:?}"
@@ -74758,6 +75938,189 @@ fn a_pending_stop_signal_ends_the_frame_loop_and_shutdown_still_runs() {
             None => panic!("the signal path's exit reads as Interrupted: {e:?}"),
         },
         Ok(()) => panic!("a loop ended by a stop signal is not a clean quit"),
+    }
+}
+
+/// The TUI asks for focus reports after it holds the alternate screen, and
+/// every give-back stops them and shows the cursor; a failed write of either
+/// request never stops the TUI and never skips the hand-back's other steps.
+/// The seam is the write itself: `open_terminal` and
+/// `give_back_terminal` add no byte of their own. Unix only: crossterm writes
+/// these bytes to the writer only on its ANSI path, and a Windows test
+/// process with no console and no `TERM` takes the WinAPI path instead, so
+/// there is no byte seam there.
+#[cfg(unix)]
+#[test]
+fn the_terminal_asks_for_focus_reports_and_the_hand_back_stops_them() {
+    let mut setup = Vec::new();
+    crate::tui::enter_screen(&mut setup).expect("the alternate screen and the ask");
+    let setup = String::from_utf8_lossy(&setup);
+    let screen = setup
+        .find("\u{1b}[?1049h")
+        .expect("the alternate screen entered");
+    let focus = setup
+        .find("\u{1b}[?1004h")
+        .expect("focus reports asked for");
+    assert!(
+        screen < focus,
+        "the ask follows the alternate screen: {setup:?}"
+    );
+
+    let back = std::cell::RefCell::new(String::new());
+    crate::tui::give_back_steps(&mut HandBackSteps(&back), || {
+        back.borrow_mut().push_str("\u{0}restore\u{0}");
+        Ok(())
+    })
+    .expect("the hand-back");
+    let back = back.borrow();
+    let stopped = back.find("\u{1b}[?1004l").expect("focus reports stopped");
+    let restored = back.find("\u{0}restore\u{0}").expect("the restore ran");
+    let shown = back.find("\u{1b}[?25h").expect("the cursor shown");
+    assert!(
+        back.starts_with("\u{0}restore\u{0}"),
+        "raw mode comes off before any write to the terminal: {back:?}"
+    );
+    assert!(
+        restored < stopped && stopped < shown,
+        "focus reports stop, then the cursor is shown: {back:?}"
+    );
+
+    let after = std::cell::RefCell::new(String::new());
+    let failed = crate::tui::give_back_steps(&mut HandBackSteps(&after), || {
+        Err(std::io::Error::other("the restore failed"))
+    })
+    .expect_err("a failed restore is reported");
+    assert_eq!(failed.to_string(), "the restore failed");
+    let after = after.borrow();
+    assert_eq!(
+        after.as_str(),
+        "\u{1b}[?1004l\u{1b}[?25h",
+        "the later steps still ran after the failed restore"
+    );
+
+    let mut failing = FailFocusWrite::default();
+    crate::tui::enter_screen(&mut failing).expect("the ask never fails the TUI");
+    assert!(
+        failing.written.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "the alternate screen still entered"
+    );
+    let mut failing = FailFocusWrite::default();
+    let restored = std::cell::Cell::new(false);
+    assert!(
+        crate::tui::give_back_steps(&mut failing, || {
+            restored.set(true);
+            Ok(())
+        })
+        .is_err(),
+        "the failed focus-report write is reported"
+    );
+    assert!(restored.get(), "and the restore still ran");
+    assert!(
+        failing.written.windows(6).any(|w| w == b"\x1b[?25h"),
+        "and the cursor is still shown"
+    );
+
+    let mut failing = FailFocusWrite::default();
+    let both = crate::tui::give_back_steps(&mut failing, || {
+        Err(std::io::Error::other("the restore failed"))
+    })
+    .expect_err("a hand-back with two failed steps is reported");
+    assert_eq!(
+        both.to_string(),
+        "the restore failed",
+        "the first failure is the one returned"
+    );
+}
+
+/// A hand-back over a terminal that stopped reading turns raw mode off before
+/// its first write waits: the writer blocks inside that write, and the restore
+/// has already run. Unix only: a Windows test process with no console and no
+/// `TERM` takes crossterm's WinAPI path, so no write reaches the writer.
+#[cfg(unix)]
+#[test]
+fn a_stalled_hand_back_write_still_turns_raw_mode_off() {
+    struct Stall {
+        reached: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl std::io::Write for Stall {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+                let _ = self.release.recv();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (reached, blocked) = std::sync::mpsc::channel::<()>();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let restored = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&restored);
+    let hand_back = std::thread::spawn(move || {
+        let mut out = Stall {
+            reached: Some(reached),
+            release: held,
+        };
+        crate::tui::give_back_steps(&mut out, || {
+            seen.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("the released hand-back");
+    });
+    blocked
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the hand-back reached its first write");
+    let restored_before_release = restored.load(Ordering::SeqCst);
+    drop(release);
+    hand_back.join().expect("the hand-back thread ends");
+    assert!(
+        restored_before_release,
+        "raw mode came off before the first write waited"
+    );
+}
+
+/// Writes everything but a focus-report sequence, whose write fails: the shape
+/// of an output that cannot take the ask.
+#[cfg(unix)]
+#[derive(Default)]
+struct FailFocusWrite {
+    written: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl std::io::Write for FailFocusWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.windows(7).any(|w| w == b"\x1b[?1004") {
+            return Err(std::io::Error::other("the focus-report write failed"));
+        }
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Appends each write to one stream, so the restore can mark its own step in
+/// it and the hand-back's order is read off that stream.
+#[cfg(unix)]
+struct HandBackSteps<'a>(&'a std::cell::RefCell<String>);
+
+#[cfg(unix)]
+impl std::io::Write for HandBackSteps<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().push_str(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -75553,12 +76916,62 @@ fn a_daemon_on_a_replaced_binary_makes_the_mascot_peek() {
         None,
         "a plain feed moved the mascot"
     );
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
     feed(true);
     poll_and_land(&mut app);
     assert_eq!(
         app.mascot.playing_anim(),
-        Some(crate::tui::clawd::Anim::Peek)
+        None,
+        "the first replaced read moved the mascot inside the grace"
     );
+    app.daemon_now_override = Some(t0 + 9_999);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the mascot moved one ms before the grace ends"
+    );
+    app.daemon_now_override = Some(t0 + 10_000);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        Some(crate::tui::clawd::Anim::Peek),
+        "a daemon held on a replaced binary for the whole grace never made the mascot peek"
+    );
+}
+
+#[test]
+fn a_daemon_that_re_execs_inside_the_grace_never_makes_the_mascot_peek() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _lock = crate::daemon::hold_daemon_lock();
+    let feed = |replaced: bool| write_replaced_feed(&chrono::Utc::now().to_rfc3339(), replaced);
+    let mut app = bare_app();
+    stub_left_behind(&mut app, false);
+    mascot_idle_at(&mut app, 30_000);
+    feed(false);
+    poll_and_land(&mut app);
+
+    let t0 = crate::usage::now_ms();
+    app.daemon_now_override = Some(t0);
+    feed(true);
+    poll_and_land(&mut app);
+    assert_eq!(
+        app.mascot.playing_anim(),
+        None,
+        "the replaced read before the re-exec moved the mascot"
+    );
+    app.daemon_now_override = Some(t0 + 2_000);
+    feed(false);
+    for at in [2_000, 9_999, 10_000, 12_000, 20_000] {
+        app.daemon_now_override = Some(t0 + at);
+        poll_and_land(&mut app);
+        assert_eq!(
+            app.mascot.playing_anim(),
+            None,
+            "the mascot moved {at} ms after a replaced read its daemon re-exec cleared"
+        );
+    }
 }
 
 #[test]
@@ -78446,5 +79859,2896 @@ mod limit_reset_modal {
         assert_eq!(form.available, "2 available");
         assert_eq!(form.focused().map(|reset| reset.id.as_str()), Some("later"));
         handle_key(&mut app, key(KeyCode::Esc));
+    }
+}
+
+// ── TRANSCRIPT CLEANUP ───────────────────────────────────────────────────
+
+mod transcript_cleanup {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    use ratatui::crossterm::event::KeyCode;
+    use serde_json::{Value, json};
+
+    use super::super::{App, Modal, ToastKind, handle_key, join_test_workers, on_tick};
+    use super::{Scripted, ScriptedEvents};
+    use crate::testutil::{HomeSandbox, key};
+
+    const NOT_REMOVED: &str = "cleanupPeriodDays not removed";
+
+    fn operator(home: &Path) -> PathBuf {
+        home.join(".claude").join("settings.json")
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, serde_json::to_vec_pretty(value).expect("serialize")).expect("write");
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
+    }
+
+    /// One check, as the settings sync and the daemon leg run it.
+    fn check(home: &Path) {
+        let members = crate::settings_sync::known_paths().expect("members");
+        let sync_record = crate::settings_sync::written_record_path().expect("sync record");
+        crate::lock::with_state_lock(|held| {
+            crate::retention::settle(held, &operator(home), &members, &sync_record)
+        })
+        .expect("the check runs");
+    }
+
+    /// The record's `(days, question_open)`.
+    fn question() -> (Option<u64>, bool) {
+        let record = crate::retention::load().expect("load the retention record");
+        (record.days, record.question_open)
+    }
+
+    /// The operator file holds `days` and a check remembers it.
+    fn remember(home: &Path, days: u64) {
+        write_json(
+            &operator(home),
+            &json!({"cleanupPeriodDays": days, "theme": "light"}),
+        );
+        check(home);
+        assert_eq!(question(), (Some(days), false), "the check remembers it");
+    }
+
+    /// The key goes missing and the next check puts `days` back: the event
+    /// that opens the question.
+    fn lose_and_put_back(home: &Path, days: u64) {
+        write_json(&operator(home), &json!({"theme": "light"}));
+        check(home);
+        assert_eq!(question(), (Some(days), true), "the put-back opens it");
+    }
+
+    fn put_back(home: &Path, days: u64) {
+        remember(home, days);
+        lose_and_put_back(home, days);
+    }
+
+    fn bare_app() -> App {
+        super::bare_app()
+    }
+
+    /// A live `clauth start` session's copy, `runtime-4242-0/settings.json`,
+    /// written and recorded by clauth. Keep the marker for the copy to stay a
+    /// member.
+    fn live_copy(home: &Path, value: &Value) -> (PathBuf, fs::File) {
+        let profile = home.join(".clauth").join("profiles").join("p1");
+        let sessions = profile.join("sessions-4242-0");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let marker = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("pid");
+        marker.lock().expect("lock pid");
+        let copy = profile.join("runtime-4242-0").join("settings.json");
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_005);
+        crate::jsonsync::write_copy_and_record(
+            Some(&crate::settings_sync::written_record_path().expect("sync record")),
+            &copy,
+            &serde_json::to_vec_pretty(value).expect("serialize"),
+            (1_700_000_005, 0),
+            true,
+            Some(when),
+        )
+        .expect("write the live copy");
+        (copy, marker)
+    }
+
+    /// Add `file` to the record's spawn files, as a shared launch registers
+    /// the `--settings` file it wrote.
+    fn register_spawn_file(file: &Path) {
+        let mut record = crate::retention::load().expect("load");
+        record.spawn_files.insert(file.to_path_buf(), None);
+        fs::write(
+            crate::retention::record_path().expect("record path"),
+            serde_json::to_vec_pretty(&record).expect("serialize"),
+        )
+        .expect("write the record");
+    }
+
+    fn cleanup_modals(app: &App) -> Vec<(u64, bool)> {
+        app.modals
+            .iter()
+            .filter_map(|m| match m {
+                Modal::TranscriptCleanup(form) => Some((form.days, form.on_remove)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn toasts(app: &App) -> Vec<(ToastKind, String)> {
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.clone()))
+            .collect()
+    }
+
+    /// What the frame loop records once a frame showed the question, the half
+    /// second its keys wait passing on the injected clock with the queue seen
+    /// empty at its end, and the frame then drawn with the buttons live (the
+    /// mark its render publishes): the next key reaches the question.
+    fn seen(app: &mut App) {
+        let drawn = app.anim_ms();
+        app.anim_phase_ms = Some(drawn);
+        let _ = app.frame_drawn();
+        app.anim_phase_ms = Some(drawn + 500);
+        app.queue_seen_empty();
+        app.transcript_cleanup.set_drawn_live(true);
+        let _ = app.frame_drawn();
+        app.queue_seen_empty();
+    }
+
+    /// `remove it` through the keys of a question already seen, its worker
+    /// joined and its answer landed through the frame loop's tick.
+    fn press_remove(app: &mut App) {
+        seen(app);
+        handle_key(app, key(KeyCode::Right));
+        handle_key(app, key(KeyCode::Enter));
+        join_test_workers();
+        on_tick(app);
+    }
+
+    /// The failure shape every `remove` error lands in: the Danger toast over
+    /// the error's own text, the modal still open on `remove it`.
+    fn assert_not_removed(app: &App, body: &str) {
+        assert_eq!(
+            toasts(app),
+            vec![(ToastKind::Danger, format!("{NOT_REMOVED}\n{body}"))],
+            "the Danger toast over the error's text"
+        );
+        assert_eq!(
+            cleanup_modals(app),
+            vec![(3650, true)],
+            "the modal stays open on `remove it`"
+        );
+    }
+
+    /// The remove's error over a record torn to `{`.
+    fn torn_record_body(record: &Path) -> String {
+        format!(
+            "{0} cannot be read or does not parse, so cleanupPeriodDays was not removed; \
+             the key may still be there: failed to parse {0} at line 1, column 1",
+            record.display()
+        )
+    }
+
+    /// Draw the whole TUI twice (the footer reads bounds the first frame
+    /// publishes) and return every row, plus the modal's own rows and the
+    /// buffer cell origin of its top-left corner.
+    fn render(
+        app: &App,
+        w: u16,
+        h: u16,
+    ) -> (
+        ratatui::buffer::Buffer,
+        Vec<String>,
+        Vec<String>,
+        (u16, u16),
+    ) {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("backend");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let rows = crate::testutil::buffer_rows(&buf);
+        // The modal is the box whose top-left corner is ACCENT_2.
+        let orange = crate::tui::theme::accent_2_color();
+        let (left, top) = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "\u{256d}" && buf[(x, y)].fg == orange)
+            .unwrap_or_else(|| panic!("no open modal:\n{}", rows.join("\n")));
+        let right = (left + 1..buf.area.width)
+            .find(|&x| buf[(x, top)].symbol() == "\u{256e}")
+            .expect("the modal's top-right corner");
+        let bottom = (top + 1..buf.area.height)
+            .find(|&y| buf[(left, y)].symbol() == "\u{2570}")
+            .expect("the modal's bottom-left corner");
+        let modal = (top..=bottom)
+            .map(|y| (left..=right).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        (buf, rows, modal, (left, top))
+    }
+
+    /// `TestBackend` behind a flush that can take a draw's real time or fail:
+    /// the draw outcomes the frame loop meets besides a quick success.
+    struct FrameBackend {
+        inner: ratatui::backend::TestBackend,
+        /// How long each next flush takes, one entry per draw; none is quick.
+        holds: std::collections::VecDeque<Duration>,
+        /// How far each next flush moves the shared injected clock, one entry
+        /// per draw: a draw whose own time crosses the window's end.
+        advances: std::collections::VecDeque<u64>,
+        clock: Option<Arc<AtomicU64>>,
+        fail_next: bool,
+    }
+
+    impl ratatui::backend::Backend for FrameBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|never| match never {})
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor().map_err(|never| match never {})
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor().map_err(|never| match never {})
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            self.inner
+                .get_cursor_position()
+                .map_err(|never| match never {})
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear().map_err(|never| match never {})
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            self.inner.size().map_err(|never| match never {})
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size().map_err(|never| match never {})
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if let Some(advance) = self.advances.pop_front()
+                && let Some(clock) = &self.clock
+            {
+                clock.fetch_add(advance, Ordering::Relaxed);
+            }
+            if let Some(hold) = self.holds.pop_front() {
+                std::thread::sleep(hold);
+            }
+            if std::mem::take(&mut self.fail_next) {
+                return Err(std::io::Error::other("the frame's write failed"));
+            }
+            self.inner.flush().map_err(|never| match never {})
+        }
+    }
+
+    type FrameTerminal = ratatui::Terminal<FrameBackend>;
+
+    fn terminal() -> FrameTerminal {
+        ratatui::Terminal::new(FrameBackend {
+            inner: ratatui::backend::TestBackend::new(100, 30),
+            holds: std::collections::VecDeque::new(),
+            advances: std::collections::VecDeque::new(),
+            clock: None,
+            fail_next: false,
+        })
+        .expect("backend")
+    }
+
+    /// A terminal whose first `advances` entries move the shared clock by that
+    /// much on the matching draw's flush (a draw's own time).
+    fn clocked_terminal(clock: Arc<AtomicU64>, advances: &[u64]) -> FrameTerminal {
+        let mut term = terminal();
+        term.backend_mut().clock = Some(clock);
+        term.backend_mut().advances.extend(advances.iter().copied());
+        term
+    }
+
+    /// One pass of the production frame loop: the draw, the drop it decides,
+    /// then at most one queued event handled.
+    fn frame(term: &mut FrameTerminal, app: &mut App, events: &mut ScriptedEvents) {
+        crate::tui::run_frame(term, app, events, std::time::Instant::now())
+            .expect("the frame draws");
+    }
+
+    /// The injected clock reads `ms`.
+    fn at(app: &mut App, ms: u64) {
+        app.anim_phase_ms = Some(ms);
+    }
+
+    /// A scripted source over a shared injected clock installed on the app:
+    /// a waiting poll moves it by `wait_ms`, a read of a queued event by
+    /// `read_ms` (the drop's own time). The clock comes back for a terminal
+    /// whose draws move it too. `at` still pins the clock the fixed way on an
+    /// app without one.
+    fn clocked(app: &mut App, wait_ms: u64, read_ms: u64) -> (ScriptedEvents, Arc<AtomicU64>) {
+        let clock = Arc::new(AtomicU64::new(0));
+        app.anim_phase_shared = Some(Arc::clone(&clock));
+        (
+            ScriptedEvents::moving(Arc::clone(&clock), wait_ms, read_ms),
+            clock,
+        )
+    }
+
+    /// A key read after the last frame's draw, as the frame loop's own read
+    /// hands it to the handler.
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, key(code));
+    }
+
+    /// The foreground of the first cell of `label` in the last drawn frame.
+    fn label_fg(term: &FrameTerminal, label: &str) -> ratatui::style::Color {
+        let buf = term.backend().inner.buffer();
+        let glyphs: Vec<String> = label.chars().map(String::from).collect();
+        let width = u16::try_from(glyphs.len()).expect("a short label");
+        (0..buf.area.height)
+            .flat_map(|y| (0..=buf.area.width - width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                glyphs
+                    .iter()
+                    .zip(x..)
+                    .all(|(glyph, cx)| buf[(cx, y)].symbol() == glyph)
+            })
+            .map_or_else(
+                || {
+                    panic!(
+                        "no {label:?} drawn:\n{}",
+                        crate::testutil::buffer_rows(buf).join("\n")
+                    )
+                },
+                |(x, y)| buf[(x, y)].fg,
+            )
+    }
+
+    /// Whether the last drawn frame shows both buttons faint, as a question
+    /// whose keys do nothing yet draws them; otherwise `keep <days>` is the
+    /// focused inverse block or `remove it` the focused danger block.
+    fn buttons_faint(term: &FrameTerminal, days: u64) -> bool {
+        let faint = crate::tui::theme::text_faint_color();
+        let keep = label_fg(term, &format!("keep {days}"));
+        let remove = label_fg(term, "remove it");
+        assert_eq!(
+            keep == faint,
+            remove == faint,
+            "both buttons faint or neither: keep {keep:?}, remove {remove:?}"
+        );
+        keep == faint
+    }
+
+    /// A TUI started over a put-back of 3650 draws the cleanup modal: title,
+    /// the three body rows (the identifier and the path keep their case),
+    /// `keep 3650` focused as the inverse block and `remove it` in DANGER,
+    /// right-aligned, and the button-confirm footer row.
+    #[test]
+    fn a_tui_started_over_a_put_back_draws_the_cleanup_modal() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+
+        let (buf, rows, modal, (left, top)) = render(&app, 100, 30);
+        let row = |text: &str| format!("│  {text:<54}  │");
+        assert_eq!(
+            modal,
+            vec![
+                format!("╭─ TRANSCRIPT CLEANUP {}╮", "─".repeat(37)),
+                row(""),
+                row("cleanupPeriodDays is gone from ~/.claude/settings.json"),
+                row("clauth put 3650 back"),
+                row("was removing it intentional? without it claude code"),
+                row("deletes every transcript older than 30 days"),
+                row(""),
+                row(&format!("{} keep 3650   remove it ", " ".repeat(31))),
+                row(""),
+                format!("╰{}╯", "─".repeat(58)),
+            ]
+        );
+        // The buttons row: ` keep 3650 ` at inner columns 31..42, ` remove it `
+        // at 43..54; the inner row starts 3 cells right of the corner.
+        let cell = |x: u16| &buf[(left + 3 + x, top + 7)];
+        for x in 31..42 {
+            assert_eq!(
+                (cell(x).fg, cell(x).bg),
+                (crate::tui::theme::bg(), crate::tui::theme::text_color()),
+                "`keep 3650` is the focused inverse block at {x}"
+            );
+        }
+        for x in 43..54 {
+            assert_eq!(
+                cell(x).fg,
+                crate::tui::theme::danger_color(),
+                "`remove it` is a DANGER button at {x}"
+            );
+        }
+        // The body styles: the identifier row is TEXT, the number and
+        // the loss line below it TEXT_DIM.
+        assert_eq!(
+            buf[(left + 3, top + 2)].fg,
+            crate::tui::theme::text_color(),
+            "`cleanupPeriodDays is gone ...` is TEXT"
+        );
+        assert_eq!(
+            buf[(left + 3, top + 3)].fg,
+            crate::tui::theme::text_dim_color(),
+            "`clauth put 3650 back` is TEXT_DIM"
+        );
+        assert_eq!(
+            buf[(left + 3, top + 4)].fg,
+            crate::tui::theme::text_dim_color(),
+            "`was removing it intentional? ...` is TEXT_DIM"
+        );
+        assert_eq!(
+            rows.last().map(|r| r.trim().to_string()),
+            Some("←→ pick   ↵ choose   q back".to_string()),
+            "the footer row"
+        );
+    }
+
+    /// No question, or a closed one, asks nothing at start; the open one does.
+    #[test]
+    fn a_tui_started_with_no_open_question_asks_nothing() {
+        let home = HomeSandbox::new();
+        let app = bare_app();
+        assert_eq!(cleanup_modals(&app), vec![], "nothing remembered");
+
+        remember(home.home(), 3650);
+        let app = bare_app();
+        assert_eq!(cleanup_modals(&app), vec![], "remembered, question closed");
+
+        lose_and_put_back(home.home(), 3650);
+        let app = bare_app();
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the open question"
+        );
+    }
+
+    /// A put-back while the TUI runs shows the modal on the next tick, once.
+    #[test]
+    fn a_put_back_while_the_tui_runs_asks_once() {
+        let home = HomeSandbox::new();
+        remember(home.home(), 3650);
+        let mut app = bare_app();
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![], "nothing to ask yet");
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the put-back asks"
+        );
+        on_tick(&mut app);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "asked once");
+    }
+
+    /// A question the tick opens in a TUI that already drew a frame waits for
+    /// the frame that shows it, and 500 ms after that: its own open is the
+    /// only change to what its keys answer, and it must count.
+    #[test]
+    fn a_tick_opened_question_waits_for_its_own_frame() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        remember(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![], "no question yet");
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "the tick asked");
+
+        at(&mut app, 10_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            buttons_faint(&term, 3650),
+            "the tick's question draws faint"
+        );
+        at(&mut app, 10_499);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "↵ 499 ms after the frame that showed it"
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+        at(&mut app, 10_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![], "↵ 500 ms after it keeps");
+        assert_eq!(question(), (Some(3650), false), "the keep landed");
+    }
+
+    /// A keep answers one put-back. The next put-back of the same number is a
+    /// new question and asks again, even when both record writes land between
+    /// two ticks.
+    #[test]
+    fn a_put_back_after_a_keep_is_asked_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(cleanup_modals(&app), vec![], "the keep closes it");
+        assert_eq!(question(), (Some(3650), false), "the question is closed");
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "a new put-back asks again"
+        );
+    }
+
+    /// A question answered elsewhere closes the modal on the next tick, and a
+    /// later put-back asks again.
+    #[test]
+    fn a_put_back_after_an_answer_seen_closed_is_asked_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "the question");
+
+        crate::retention::keep(3650).expect("answer it elsewhere");
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![],
+            "the closed question closes it"
+        );
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "a later put-back asks again"
+        );
+    }
+
+    fn assert_kept(home: &Path, app: &App) {
+        assert_eq!(cleanup_modals(app), vec![], "the modal closed");
+        assert_eq!(
+            question(),
+            (Some(3650), false),
+            "remembered, question closed"
+        );
+        assert_eq!(
+            read_json(&operator(home))["cleanupPeriodDays"],
+            json!(3650),
+            "the operator file keeps its key"
+        );
+        assert_eq!(
+            cleanup_modals(&bare_app()),
+            vec![],
+            "a restart asks nothing"
+        );
+    }
+
+    #[test]
+    fn enter_on_keep_closes_the_question_and_keeps_the_number() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_kept(home.home(), &app);
+    }
+
+    #[test]
+    fn esc_closes_the_question_and_keeps_the_number() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_kept(home.home(), &app);
+    }
+
+    #[test]
+    fn q_closes_the_question_and_keeps_the_number() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        assert_kept(home.home(), &app);
+    }
+
+    /// A `keep` the record cannot take says so, keeps the question open for a
+    /// restart, and is not asked again in this run.
+    #[cfg(unix)]
+    #[test]
+    fn a_keep_that_cannot_be_written_says_so_and_asks_again_after_a_restart() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let record = crate::retention::record_path().expect("path");
+        let read_only = crate::testutil::UnwritableDir::new(record.parent().expect("dir"));
+
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        on_tick(&mut app);
+        drop(read_only);
+
+        assert_eq!(
+            toasts(&app),
+            vec![(
+                ToastKind::Danger,
+                format!(
+                    "save failed\nPermission denied (os error 13) · failed to write {}",
+                    record.display()
+                )
+            )]
+        );
+        assert_eq!(cleanup_modals(&app), vec![], "not asked again in this run");
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+        assert_eq!(
+            cleanup_modals(&bare_app()),
+            vec![(3650, false)],
+            "a restart asks again"
+        );
+    }
+
+    /// A failed keep keeps its question asked: a later record write that
+    /// leaves the question open (a shared launch registering its spawn file)
+    /// does not re-open the modal in this run.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_write_after_a_failed_keep_does_not_ask_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let record = crate::retention::record_path().expect("path");
+        let read_only = crate::testutil::UnwritableDir::new(record.parent().expect("dir"));
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Esc));
+        on_tick(&mut app);
+        drop(read_only);
+
+        let spawn = home
+            .home()
+            .join(".clauth")
+            .join("runtime-4242-0")
+            .join("settings.json");
+        fs::create_dir_all(spawn.parent().expect("parent")).expect("mkdir");
+        fs::write(&spawn, b"{}").expect("write the spawn file");
+        register_spawn_file(&spawn);
+        on_tick(&mut app);
+
+        assert_eq!(cleanup_modals(&app), vec![], "not asked again in this run");
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// While a remove runs only `esc`/`q` act: the pick keys and `↵` do
+    /// nothing, the footer drops to `q back`, and `esc` closes the modal.
+    #[test]
+    fn while_a_remove_runs_only_back_keys_act() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let (_, rows, _, _) = render(&app, 80, 24);
+        assert_eq!(
+            rows.last().map(|r| r.trim().to_string()),
+            Some("←→ pick   ↵ choose   q back".to_string()),
+            "the button footer row"
+        );
+
+        seen(&mut app);
+        app.transcript_cleanup.removing = true;
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Left));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the pick keys and ↵ are inert"
+        );
+
+        let (_, rows, _, _) = render(&app, 80, 24);
+        assert_eq!(
+            rows.last().map(|r| r.trim().to_string()),
+            Some("q back".to_string()),
+            "the back-only footer row"
+        );
+
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(cleanup_modals(&app), vec![], "esc closes it");
+        assert_eq!(
+            question(),
+            (Some(3650), true),
+            "esc answers nothing while a remove runs"
+        );
+
+        let mut app = bare_app();
+        seen(&mut app);
+        app.transcript_cleanup.removing = true;
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        assert_eq!(cleanup_modals(&app), vec![], "q closes it");
+        assert_eq!(
+            question(),
+            (Some(3650), true),
+            "q answers nothing while a remove runs"
+        );
+    }
+
+    /// Closing the modal with esc while a remove runs leaves its answer to land
+    /// as the toast, with no modal left to carry it.
+    #[test]
+    fn a_remove_closed_with_esc_still_toasts_its_answer() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(cleanup_modals(&app), vec![], "esc closes it while it runs");
+
+        join_test_workers();
+        on_tick(&mut app);
+        assert_eq!(
+            toasts(&app),
+            vec![(
+                ToastKind::Success,
+                "cleanupPeriodDays removed\nclaude code now deletes transcripts older than 30 days"
+                    .to_string()
+            )],
+            "the answer lands as the success toast"
+        );
+        assert_eq!(cleanup_modals(&app), vec![], "it is not reopened");
+    }
+
+    /// A question that opens while another modal is open waits for that modal
+    /// to close.
+    #[test]
+    fn a_new_question_waits_for_another_modal_to_close() {
+        let home = HomeSandbox::new();
+        remember(home.home(), 3650);
+        let mut app = bare_app();
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Help)),
+            "help is open"
+        );
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![],
+            "it waits behind the help modal"
+        );
+
+        handle_key(&mut app, key(KeyCode::Esc));
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "it asks once the help modal closes"
+        );
+    }
+
+    /// `keep` closes only the question about its own number: another number's
+    /// open question stays owed.
+    #[test]
+    fn a_keep_about_another_number_leaves_the_question_open() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 7);
+        crate::retention::keep(3650).expect("keep another number");
+        assert_eq!(question(), (Some(7), true), "the other question stays owed");
+        crate::retention::keep(7).expect("keep its own number");
+        assert_eq!(question(), (Some(7), false), "its own number closes it");
+    }
+
+    /// `remove it` takes the key out of the operator file and a live session
+    /// copy, forgets the record, and says so.
+    #[test]
+    fn remove_it_removes_the_key_everywhere_and_says_so() {
+        let home = HomeSandbox::new();
+        let (copy, _marker) = live_copy(
+            home.home(),
+            &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+        );
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+
+        press_remove(&mut app);
+
+        assert_eq!(read_json(&operator(home.home())), json!({"theme": "light"}));
+        assert_eq!(read_json(&copy), json!({"theme": "light"}));
+        assert!(
+            !crate::retention::record_path().expect("path").exists(),
+            "no record"
+        );
+        assert_eq!(cleanup_modals(&app), vec![], "the modal closed");
+        assert_eq!(
+            toasts(&app),
+            vec![(
+                ToastKind::Success,
+                "cleanupPeriodDays removed\nclaude code now deletes transcripts older than 30 days"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// The remove runs off the TUI thread, and a second `↵` while it runs
+    /// starts nothing.
+    #[test]
+    fn remove_it_runs_on_a_worker_once() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let operator_path = operator(home.home());
+        let threads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&threads);
+        crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+            if path == operator_path.as_path() {
+                seen.lock().expect("lock").push(std::thread::current().id());
+            }
+        })));
+
+        self::seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let ran_inline = threads
+            .lock()
+            .expect("lock")
+            .contains(&std::thread::current().id());
+        self::seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Enter));
+        join_test_workers();
+        on_tick(&mut app);
+        crate::retention::set_rewrite_hook(None);
+
+        assert!(!ran_inline, "the key handler never runs the remove itself");
+        let threads = threads.lock().expect("lock").clone();
+        assert_eq!(threads.len(), 1, "one remove ran: {threads:?}");
+        assert_ne!(threads[0], std::thread::current().id(), "on a worker");
+        assert_eq!(
+            toasts(&app).len(),
+            1,
+            "one answer landed: {:?}",
+            toasts(&app)
+        );
+    }
+
+    /// The question closing while the modal is open (the operator set another
+    /// number) closes the modal with no toast.
+    #[test]
+    fn a_new_number_closes_the_open_modal_silently() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)]);
+
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        assert_eq!(question(), (Some(7), false));
+        on_tick(&mut app);
+
+        assert_eq!(cleanup_modals(&app), vec![], "the modal closed");
+        assert_eq!(toasts(&app), vec![], "with no toast");
+    }
+
+    /// Another clauth answering `keep` closes this one's modal with no toast.
+    #[test]
+    fn an_answer_elsewhere_closes_the_open_modal_silently() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)]);
+
+        crate::retention::keep(3650).expect("keep");
+        on_tick(&mut app);
+
+        assert_eq!(cleanup_modals(&app), vec![], "the modal closed");
+        assert_eq!(toasts(&app), vec![], "with no toast");
+    }
+
+    /// With the re-bind offer due too, both are asked: the offer first, as at
+    /// any start, and the question once the offer closes, so no modal ever
+    /// sits under the question.
+    #[test]
+    fn the_rebind_offer_and_the_cleanup_question_are_both_asked() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = super::rebind_app(None, super::rebind_fixture());
+        assert_eq!(app.modals.len(), 2, "both asked: {:?}", app.modals);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Rebind(_))),
+            "the re-bind offer is asked first"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        assert!(
+            matches!(app.modals.last(), Some(Modal::TranscriptCleanup(_))),
+            "the cleanup question is next"
+        );
+        assert_eq!(question(), (Some(3650), true), "the question is still owed");
+
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        assert!(app.modals.is_empty(), "both answered");
+        assert_eq!(question(), (Some(3650), false), "the cleanup answer landed");
+    }
+
+    /// At 40 columns the body wraps between words and both buttons draw whole.
+    #[test]
+    fn a_narrow_terminal_wraps_the_body_and_keeps_both_buttons() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+
+        let (_, _, modal, _) = render(&app, 40, 30);
+        let row = |text: &str| format!("│  {text:<30}  │");
+        assert_eq!(
+            modal,
+            vec![
+                format!("╭─ TRANSCRIPT CLEANUP {}╮", "─".repeat(13)),
+                row(""),
+                row("cleanupPeriodDays is gone from"),
+                row("~/.claude/settings.json"),
+                row("clauth put 3650 back"),
+                row("was removing it intentional?"),
+                row("without it claude code deletes"),
+                row("every transcript older than 30"),
+                row("days"),
+                row(""),
+                row(&format!("{} keep 3650   remove it ", " ".repeat(7))),
+                row(""),
+                format!("╰{}╯", "─".repeat(34)),
+            ]
+        );
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ reaches `remove it`"
+        );
+        handle_key(&mut app, key(KeyCode::Left));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "← reaches `keep 3650`"
+        );
+    }
+
+    // Each `retention::remove` error lands as the Danger toast's body, pinned
+    // by equality.
+
+    /// The record does not parse.
+    #[test]
+    fn a_record_that_does_not_parse_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let record = crate::retention::record_path().expect("path");
+        fs::write(&record, "{").expect("tear the record");
+
+        press_remove(&mut app);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "{0} cannot be read or does not parse, so cleanupPeriodDays was not removed; \
+                 the key may still be there: failed to parse {0} at line 1, column 1",
+                record.display()
+            ),
+        );
+        assert_eq!(fs::read(&record).expect("read"), b"{", "the record stays");
+    }
+
+    /// The record cannot be read.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_cannot_be_read_is_not_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let record = crate::retention::record_path().expect("path");
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        press_remove(&mut app);
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "{0} cannot be read or does not parse, so cleanupPeriodDays was not removed; \
+                 the key may still be there: failed to read {0}: Permission denied (os error 13)",
+                record.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A live copy that cannot be statted.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_that_cannot_be_statted_is_not_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = HomeSandbox::new();
+        let (copy, _marker) = live_copy(
+            home.home(),
+            &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+        );
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let dir = copy.parent().expect("dir").to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        press_remove(&mut app);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "failed to stat {}, so its cleanupPeriodDays was not removed; the key may still \
+                 be there: Permission denied (os error 13)",
+                copy.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A live copy that stays unparseable across three tries.
+    #[test]
+    fn a_member_that_stays_unreadable_is_not_removed() {
+        let home = HomeSandbox::new();
+        let (copy, _marker) = live_copy(
+            home.home(),
+            &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+        );
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        fs::write(&copy, br#"{"cleanupPeriodDays": 36"#).expect("tear the copy");
+
+        press_remove(&mut app);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "{} cannot be read or does not parse, so its cleanupPeriodDays was not removed; \
+                 the key may still be there",
+                copy.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A live copy Claude Code rewrites in every read-to-write window.
+    #[test]
+    fn a_member_that_keeps_changing_is_not_removed() {
+        let home = HomeSandbox::new();
+        let (copy, _marker) = live_copy(
+            home.home(),
+            &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+        );
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let moving = copy.clone();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let n_hook = std::sync::Arc::clone(&n);
+        crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+            if path == moving.as_path() {
+                let i = n_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_json(
+                    &moving,
+                    &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+                );
+                crate::testutil::set_mtime(
+                    &moving,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100 + i),
+                );
+            }
+        })));
+
+        press_remove(&mut app);
+        crate::retention::set_rewrite_hook(None);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "{} kept changing while its cleanupPeriodDays was being removed; the key is \
+                 still there",
+                copy.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// The operator file cannot be written.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_that_cannot_be_written_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let operator_path = operator(home.home());
+        let read_only = crate::testutil::UnwritableDir::new(operator_path.parent().expect("dir"));
+
+        press_remove(&mut app);
+        drop(read_only);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "failed to write {}: Permission denied (os error 13)",
+                operator_path.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A registered spawn file that cannot be read.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_file_that_cannot_be_read_is_not_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let spawn = home.home().join("spawn").join("spawn-settings-1.json");
+        write_json(&spawn, &json!({"cleanupPeriodDays": 3650}));
+        register_spawn_file(&spawn);
+        let mut app = bare_app();
+        fs::set_permissions(&spawn, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        press_remove(&mut app);
+        fs::set_permissions(&spawn, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "failed to read {}, so its cleanupPeriodDays was not removed; the key may still \
+                 be there: Permission denied (os error 13)",
+                spawn.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A registered spawn file that does not parse.
+    #[test]
+    fn a_spawn_file_that_does_not_parse_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let spawn = home.home().join("spawn").join("spawn-settings-1.json");
+        fs::create_dir_all(spawn.parent().expect("dir")).expect("mkdir");
+        fs::write(&spawn, "not json").expect("write");
+        register_spawn_file(&spawn);
+        let mut app = bare_app();
+
+        press_remove(&mut app);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "{} cannot be read or does not parse, so its cleanupPeriodDays was not removed; \
+                 the key may still be there",
+                spawn.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A registered spawn file that cannot be rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_file_that_cannot_be_written_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let spawn = home.home().join("spawn").join("spawn-settings-1.json");
+        write_json(&spawn, &json!({"cleanupPeriodDays": 3650}));
+        register_spawn_file(&spawn);
+        let mut app = bare_app();
+        let read_only = crate::testutil::UnwritableDir::new(spawn.parent().expect("dir"));
+
+        press_remove(&mut app);
+        drop(read_only);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "failed to write {}, so its cleanupPeriodDays was not removed; the key may still \
+                 be there: Permission denied (os error 13)",
+                spawn.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// The record cannot be removed once every key is out.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_cannot_be_removed_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let record = crate::retention::record_path().expect("path");
+        let read_only = crate::testutil::UnwritableDir::new(record.parent().expect("dir"));
+
+        press_remove(&mut app);
+        drop(read_only);
+
+        assert_not_removed(
+            &app,
+            &format!(
+                "failed to remove {}: Permission denied (os error 13)",
+                record.display()
+            ),
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// The state lock file cannot be opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_lock_that_cannot_be_opened_is_not_removed() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let lock = home.home().join(".clauth").join(".lock");
+        fs::remove_file(&lock).expect("drop the lock file");
+        fs::create_dir_all(&lock).expect("a directory in its place");
+
+        press_remove(&mut app);
+        fs::remove_dir(&lock).expect("restore");
+
+        assert_not_removed(
+            &app,
+            "failed to open clauth state lock file: Is a directory (os error 21)",
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// With the operator file edited to another number since the put-back,
+    /// `remove it` changes nothing: the operator's own number stands, the
+    /// record and the live copy are untouched, and the modal closes silently.
+    #[test]
+    fn remove_it_leaves_a_number_the_operator_set_since_the_put_back() {
+        let home = HomeSandbox::new();
+        let (copy, _marker) = live_copy(
+            home.home(),
+            &json!({"cleanupPeriodDays": 3650, "theme": "light"}),
+        );
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the question is up"
+        );
+
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 90, "theme": "light"}),
+        );
+        press_remove(&mut app);
+
+        assert_eq!(
+            read_json(&operator(home.home()))["cleanupPeriodDays"],
+            json!(90),
+            "the operator's own number stands"
+        );
+        assert_eq!(
+            read_json(&copy)["cleanupPeriodDays"],
+            json!(3650),
+            "the live copy is untouched"
+        );
+        assert_eq!(question(), (Some(3650), true), "the record is untouched");
+        assert_eq!(cleanup_modals(&app), vec![], "the modal closes");
+        assert_eq!(toasts(&app), vec![], "with no toast");
+    }
+
+    /// A remove that fails after the modal was closed still toasts its Danger
+    /// answer, with no modal left to carry it.
+    #[test]
+    fn a_remove_closed_with_esc_still_toasts_its_failure() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let spawn = home.home().join("spawn").join("spawn-settings-1.json");
+        write_json(&spawn, &json!({"cleanupPeriodDays": 3650}));
+        register_spawn_file(&spawn);
+        let mut app = bare_app();
+        fs::write(&spawn, "not json").expect("tear the spawn file");
+
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(cleanup_modals(&app), vec![], "esc closes it while it runs");
+
+        join_test_workers();
+        on_tick(&mut app);
+        assert_eq!(
+            toasts(&app),
+            vec![(
+                ToastKind::Danger,
+                format!(
+                    "{NOT_REMOVED}\n{} cannot be read or does not parse, so its \
+                     cleanupPeriodDays was not removed; the key may still be there",
+                    spawn.display()
+                )
+            )],
+            "the answer lands as the Danger toast"
+        );
+        assert_eq!(cleanup_modals(&app), vec![], "it is not reopened");
+    }
+
+    /// A remove that times out on a wedged state flock shows the house timeout
+    /// line under `cleanupPeriodDays not removed`, keeps the modal on
+    /// `remove it`, and leaves the question open.
+    #[test]
+    fn a_remove_that_times_out_on_the_state_lock_says_so() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let lock = home.home().join(".clauth").join(".lock");
+        let holder = crate::profile::open_state_file(&lock).expect("open the lock file");
+        holder.lock().expect("hold the state flock");
+        crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+
+        press_remove(&mut app);
+
+        crate::lock::set_state_lock_timeout_override(None);
+        drop(holder);
+
+        assert_not_removed(
+            &app,
+            "timed out after 1s acquiring the state lock; another clauth process holds \
+             ~/.clauth/.lock",
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// The state-lock timeout body at the production deadline, pinned by
+    /// equality through the worker's own answer channel.
+    #[test]
+    fn the_lock_timeout_body_is_pinned_at_the_production_deadline() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        app.transcript_cleanup.removing = true;
+        app.transcript_cleanup
+            .tx
+            .send(Err(anyhow::Error::new(
+                crate::lock::StateLockTimeout::stub(),
+            )))
+            .expect("send the timeout answer");
+
+        on_tick(&mut app);
+
+        assert_not_removed(
+            &app,
+            "timed out after 25s acquiring the state lock; another clauth process holds \
+             ~/.clauth/.lock",
+        );
+    }
+
+    /// A panicking remove still answers: the house internal-error line under
+    /// `cleanupPeriodDays not removed`, pinned by equality.
+    #[test]
+    fn a_remove_that_panics_in_its_worker_says_so() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        crate::retention::set_rewrite_hook(Some(Box::new(|_| panic!("a remove that crashes"))));
+
+        press_remove(&mut app);
+        crate::retention::set_rewrite_hook(None);
+
+        assert_not_removed(&app, "clauth hit an internal error, restart clauth");
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+    }
+
+    /// A question a peer's remove answered between construction and the first
+    /// tick closes the modal on that tick, with no toast.
+    #[test]
+    fn a_peer_remove_before_the_first_tick_closes_the_modal_silently() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the question is up"
+        );
+
+        crate::retention::remove(3650).expect("a peer answers it");
+        on_tick(&mut app);
+
+        assert_eq!(cleanup_modals(&app), vec![], "the modal closed");
+        assert_eq!(toasts(&app), vec![], "with no toast");
+    }
+
+    /// An answer landing before the first tick spends this run's ask: a later
+    /// put-back is a new question and asks again.
+    #[test]
+    fn a_put_back_after_an_answer_before_the_first_tick_is_asked_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+
+        press_remove(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![], "the remove closed it");
+
+        remember(home.home(), 3650);
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the new put-back asks again"
+        );
+    }
+
+    /// At runtime a question that opens while the re-bind offer is open waits
+    /// for it to close; at start both are still asked, as
+    /// `the_rebind_offer_and_the_cleanup_question_are_both_asked` drives.
+    #[test]
+    fn a_new_question_waits_for_the_rebind_offer_to_close() {
+        let home = HomeSandbox::new();
+        remember(home.home(), 3650);
+        let mut app = super::rebind_app(None, super::rebind_fixture());
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Rebind(_))),
+            "the offer is open at start"
+        );
+        assert_eq!(cleanup_modals(&app), vec![], "nothing to ask at start");
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![],
+            "it waits behind the re-bind offer"
+        );
+        assert_eq!(question(), (Some(3650), true), "the question is still owed");
+
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "it asks once the offer closes"
+        );
+    }
+
+    /// A question never opens during an exit wait; the next start asks it.
+    #[test]
+    fn a_question_does_not_open_during_an_exit_wait() {
+        let home = HomeSandbox::new();
+        remember(home.home(), 3650);
+        let mut app = bare_app();
+        app.exit_wait = true;
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![],
+            "no modal during the exit wait"
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays owed");
+        assert_eq!(
+            cleanup_modals(&bare_app()),
+            vec![(3650, false)],
+            "the next start asks"
+        );
+    }
+
+    /// The open modal follows the record's question when it changes to another
+    /// number under it: the asked number and the `keep <n>` button both update.
+    #[test]
+    fn the_open_modal_follows_a_changed_question_number() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the 3650 question"
+        );
+
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        lose_and_put_back(home.home(), 7);
+        on_tick(&mut app);
+
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(7, false)],
+            "the modal follows 7"
+        );
+        let (_, _, modal, _) = render(&app, 100, 30);
+        let row = |text: &str| format!("│  {text:<54}  │");
+        assert_eq!(modal[3], row("clauth put 7 back"), "the asked number");
+        assert_eq!(
+            modal[7],
+            row(&format!("{} keep 7   remove it ", " ".repeat(34))),
+            "the keep button"
+        );
+    }
+
+    /// A followed number is a new question: `keep <n>` takes the focus back,
+    /// as when the modal opens.
+    #[test]
+    fn a_followed_number_focuses_keep_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "remove it focused"
+        );
+
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        lose_and_put_back(home.home(), 7);
+        on_tick(&mut app);
+
+        assert_eq!(cleanup_modals(&app), vec![(7, false)], "keep 7 focused");
+    }
+
+    /// A keep that cannot be written on a modal that followed a changed
+    /// number is not asked again in this run, like any failed keep.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_keep_on_a_followed_number_is_not_asked_again() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        lose_and_put_back(home.home(), 7);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(7, false)],
+            "the modal follows 7"
+        );
+
+        let record = crate::retention::record_path().expect("path");
+        let read_only = crate::testutil::UnwritableDir::new(record.parent().expect("dir"));
+        seen(&mut app);
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        on_tick(&mut app);
+        on_tick(&mut app);
+        drop(read_only);
+
+        assert_eq!(question(), (Some(7), true), "the question stays open");
+        assert_eq!(cleanup_modals(&app), vec![], "not asked again in this run");
+    }
+
+    /// A `remove it` on a followed number, answered after the record moved
+    /// back to the first number's open question, asks that question.
+    #[test]
+    fn a_superseded_remove_on_a_followed_number_asks_the_new_question() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        lose_and_put_back(home.home(), 7);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(7, false)],
+            "the modal follows 7"
+        );
+
+        put_back(home.home(), 3650);
+        press_remove(&mut app);
+        on_tick(&mut app);
+
+        assert_eq!(toasts(&app), vec![], "the answer is Superseded silently");
+        assert_eq!(question(), (Some(3650), true), "the 3650 question is open");
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "and asked in this run"
+        );
+    }
+
+    /// An open editor holds the question like a modal does: keys typed into
+    /// the field never answer it, and it opens once the editor closes.
+    #[test]
+    fn a_new_question_waits_for_an_open_editor() {
+        let home = HomeSandbox::new();
+        let mut app = bare_app();
+        super::on_refresh_row(&mut app);
+        super::super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+        put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![], "the editor keeps the keys");
+
+        handle_key(&mut app, key(KeyCode::Right));
+        handle_key(&mut app, key(KeyCode::Enter));
+        join_test_workers();
+        on_tick(&mut app);
+
+        assert_eq!(
+            question(),
+            (Some(3650), true),
+            "the editor's keys answered nothing"
+        );
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "asked once the editor closed"
+        );
+    }
+
+    // The question's keys act only once a drawn frame showed what they answer
+    // for 500 ms, and keys queued ahead of such a frame are dropped.
+
+    /// A key read within 500 ms of the frame that first showed the question
+    /// does nothing and the buttons draw faint; from 500 ms the keys act and
+    /// the buttons draw as written. At start-up and on a tick alike.
+    #[test]
+    fn a_key_inside_the_first_drawn_half_second_does_nothing() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 499);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ at 499 ms");
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "faint at 499 ms");
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "drawn as written at 500 ms");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ at 500 ms");
+        press(&mut app, KeyCode::Left);
+
+        // A question a tick opens in a running TUI.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(cleanup_modals(&app), vec![], "kept");
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        at(&mut app, 10_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            buttons_faint(&term, 3650),
+            "the tick's question draws faint"
+        );
+        at(&mut app, 10_499);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "↵ at 499 ms");
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+        at(&mut app, 10_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![], "↵ at 500 ms keeps");
+        assert_eq!(question(), (Some(3650), false), "the keep landed");
+    }
+
+    /// A modal over the question closing, through `pop_modal` or
+    /// `retain_modals`, makes the next key inert until the uncovered question
+    /// is drawn and 500 ms pass.
+    #[test]
+    fn an_uncovered_question_waits_until_drawn_for_half_a_second() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+
+        // Help over the question, closed by its own `esc` (`pop_modal`).
+        app.open_modal(Modal::Help);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::TranscriptCleanup(_))),
+            "the help closed"
+        );
+        at(&mut app, 5_000);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ before the uncovered question is drawn"
+        );
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 5_499);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ at 499 ms");
+        at(&mut app, 5_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ at 500 ms");
+
+        // Help over the question, closed by `retain_modals`.
+        app.open_modal(Modal::Help);
+        frame(&mut term, &mut app, &mut events);
+        app.retain_modals(|m| !matches!(m, Modal::Help));
+        at(&mut app, 9_000);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "← before the uncovered question is drawn"
+        );
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 9_499);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "← at 499 ms");
+        at(&mut app, 9_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "← at 500 ms");
+    }
+
+    /// The open question's number changing makes the keys inert until the new
+    /// number is drawn and 500 ms pass.
+    #[test]
+    fn a_changed_number_waits_until_drawn_for_half_a_second() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+
+        write_json(
+            &operator(home.home()),
+            &json!({"cleanupPeriodDays": 7, "theme": "light"}),
+        );
+        check(home.home());
+        lose_and_put_back(home.home(), 7);
+        on_tick(&mut app);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(7, false)],
+            "the modal follows 7"
+        );
+        at(&mut app, 5_000);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(7, false)],
+            "→ before 7 is drawn"
+        );
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 7), "7 draws faint");
+        at(&mut app, 5_499);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(7, false)], "→ at 499 ms");
+        at(&mut app, 5_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(7, true)], "→ at 500 ms");
+    }
+
+    /// A `remove it` that fails turns `esc`/`q` from closing the modal back
+    /// into `keep <n>`: its landing makes the keys inert until it is drawn and
+    /// 500 ms pass.
+    #[test]
+    fn a_failed_remove_landing_waits_until_drawn_for_half_a_second() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        let record = crate::retention::record_path().expect("path");
+        fs::write(&record, "{").expect("tear the record");
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.transcript_cleanup.removing(), "the remove runs");
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 1_000);
+        frame(&mut term, &mut app, &mut events);
+
+        join_test_workers();
+        on_tick(&mut app);
+        assert!(!app.transcript_cleanup.removing(), "the failure landed");
+        assert_not_removed(&app, &torn_record_body(&record));
+        at(&mut app, 5_000);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "q before the landing is drawn"
+        );
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 5_499);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "q at 499 ms");
+        at(&mut app, 5_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(cleanup_modals(&app), vec![], "q at 500 ms answers keep");
+    }
+
+    /// A `remove it` start alone turns `esc`/`q` from `keep <n>` into closing
+    /// the modal: until the start is drawn and 500 ms pass, `esc` leaves the
+    /// modal open and the remove running.
+    #[test]
+    fn a_remove_start_waits_until_drawn_for_half_a_second() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.transcript_cleanup.removing(), "the remove runs");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "esc before the start is drawn"
+        );
+        assert!(app.transcript_cleanup.removing(), "the remove still runs");
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 999);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "esc at 499 ms");
+        at(&mut app, 1_000);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(cleanup_modals(&app), vec![], "esc at 500 ms closes it");
+        assert!(
+            app.transcript_cleanup.removing(),
+            "leaving the remove running"
+        );
+
+        join_test_workers();
+        on_tick(&mut app);
+    }
+
+    /// A `remove it` that starts and fails with no frame drawn between makes
+    /// the next key inert, however long ago the question was drawn.
+    #[test]
+    fn a_remove_that_starts_and_lands_between_two_frames_waits_for_a_frame() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        let record = crate::retention::record_path().expect("path");
+        fs::write(&record, "{").expect("tear the record");
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        join_test_workers();
+        on_tick(&mut app);
+        assert!(!app.transcript_cleanup.removing(), "the failure landed");
+        assert_not_removed(&app, &torn_record_body(&record));
+
+        at(&mut app, 60_000);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "q before any frame showed the landing"
+        );
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 60_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(cleanup_modals(&app), vec![], "q at 500 ms answers keep");
+    }
+
+    /// Keys typed while start-up works, however long it takes, are queued
+    /// ahead of the first frame that shows the question: dropped, and the
+    /// window starts at that frame, not at start-up.
+    #[test]
+    fn keys_typed_during_start_up_never_answer_the_question() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::keys(&[KeyCode::Right, KeyCode::Enter]);
+
+        at(&mut app, 25_000);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "both keys were read");
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "and dropped");
+        assert!(!app.transcript_cleanup.removing(), "no remove started");
+
+        at(&mut app, 25_100);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "↵ at 100 ms");
+        at(&mut app, 25_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![], "↵ at 500 ms keeps");
+    }
+
+    /// A draw that takes 600 ms leaves the whole window after it returns: the
+    /// keys typed during it are dropped, and the keys are inert 499 ms after
+    /// the stamp the post-draw clock recorded and live 500 ms after it. The
+    /// draw's real duration is the subject; the keys read the injected clock
+    /// so a scheduler stall after the draw decides nothing.
+    #[test]
+    fn a_slow_draw_leaves_the_whole_window_after_it() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        term.backend_mut()
+            .holds
+            .push_back(Duration::from_millis(600));
+        let mut events = ScriptedEvents::keys(&[KeyCode::Right, KeyCode::Enter]);
+
+        let drew_at = app.anim_ms();
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            events.queued(),
+            vec![],
+            "the keys typed during it were read"
+        );
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "and dropped");
+        let since = app
+            .transcript_cleanup
+            .drawn
+            .expect("the frame recorded")
+            .since_ms;
+        assert!(
+            since >= drew_at + 600,
+            "the window starts on the clock read after the 600 ms draw: \
+             {since} vs {drew_at}"
+        );
+        at(&mut app, since + 499);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "↵ 499 ms after the draw's stamp"
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+        at(&mut app, since + 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(cleanup_modals(&app), vec![], "↵ 500 ms after it keeps");
+    }
+
+    /// The keys queued behind the frame that first shows the question are
+    /// read and dropped, never handled: a queued `x` leaves the toast up. The
+    /// same `x` queued at a frame that shows nothing new dismisses it.
+    #[test]
+    fn keys_queued_behind_a_changed_frame_are_dropped_unhandled() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        app.toast(ToastKind::Info, "a note");
+        let mut term = terminal();
+        let mut events = ScriptedEvents::keys(&[KeyCode::Char('x')]);
+
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the x was read");
+        assert_eq!(
+            toasts(&app),
+            vec![(ToastKind::Info, "a note".to_string())],
+            "and dropped"
+        );
+
+        at(&mut app, 500);
+        events.push(&[KeyCode::Char('x')]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(toasts(&app), vec![], "an x at a frame showing nothing new");
+    }
+
+    /// At a frame whose question was already drawn, queued keys are handled
+    /// one per pass, as before.
+    #[test]
+    fn keys_queued_at_an_unchanged_frame_are_handled_one_per_pass() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::keys(&[KeyCode::Right]);
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ dropped");
+
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right, KeyCode::Left]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ handled");
+        assert_eq!(events.queued(), vec![KeyCode::Left], "← waits");
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "← handled");
+        assert_eq!(events.queued(), vec![], "one per pass");
+    }
+
+    /// The drop reads only what is queued when the draw returns: a key that
+    /// arrives after that instant is left for the loop's own read, so the drop
+    /// ends while keys keep arriving.
+    #[test]
+    fn the_drop_ends_at_the_keys_queued_when_the_draw_returned() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let arriving = 1_000;
+        let mut events = ScriptedEvents::keys(&[KeyCode::Right]);
+        for _ in 0..arriving {
+            events.steps.push_back(Scripted::Later);
+            events.steps.push_back(Scripted::Key(KeyCode::Esc));
+        }
+
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ dropped");
+        let left = events.queued();
+        assert!(
+            left.len() >= arriving - 1 && left.iter().all(|&code| code == KeyCode::Esc),
+            "the keys arriving later stay queued (the loop's own read may take \
+             one): {} of {arriving} left",
+            left.len()
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+    }
+
+    /// The question closed by `keep` and reopened with the same number before
+    /// the next frame is a new question: the next key is inert however late,
+    /// the keys queued at the frame that shows it are dropped, and its keys
+    /// act 500 ms after that frame.
+    #[test]
+    fn a_same_number_reopen_between_two_frames_waits_for_its_own_frame() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(question(), (Some(3650), false), "kept");
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "asked again");
+
+        at(&mut app, 10_000);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ before the reopened question is drawn"
+        );
+        events.push(&[KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the queued ↵ was read");
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "and dropped");
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+        at(&mut app, 10_499);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ at 499 ms");
+        at(&mut app, 10_500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ at 500 ms");
+    }
+
+    /// The frame that draws the closed question drops the keys queued at it,
+    /// but a remove landing after the modal closed, with no question on the
+    /// screen before or after, drops nothing: a queued `?` opens the help.
+    #[test]
+    fn a_remove_landing_with_no_question_shown_drops_no_key() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 1_000);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(cleanup_modals(&app), vec![], "esc closed it");
+
+        events.push(&[KeyCode::Char('?')]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            events.queued(),
+            vec![],
+            "the ? queued at the close was read"
+        );
+        assert!(app.modals.is_empty(), "and dropped");
+
+        join_test_workers();
+        on_tick(&mut app);
+        assert_eq!(
+            toasts(&app),
+            vec![(
+                ToastKind::Success,
+                "cleanupPeriodDays removed\nclaude code now deletes transcripts older than 30 days"
+                    .to_string()
+            )],
+            "the remove landed"
+        );
+        events.push(&[KeyCode::Char('?')]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Help)),
+            "the ? queued at the landing opens the help: {:?}",
+            app.modals
+        );
+    }
+
+    /// `esc` answers the question, and a `↵` queued behind it is dropped at
+    /// the frame that draws the close: it switches no account on the Overview
+    /// under it. The same `↵` at the next frame offers the switch.
+    #[test]
+    fn a_key_queued_behind_the_answer_is_dropped_at_the_close() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = super::app_with(vec![
+            crate::testutil::oauth_profile("alpha", "rt-alpha"),
+            crate::testutil::oauth_profile("beta", "rt-beta"),
+        ]);
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Esc, KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![], "esc answered it");
+        assert_eq!(question(), (Some(3650), false), "kept");
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the ↵ was read");
+        assert!(app.modals.is_empty(), "and dropped: {:?}", app.modals);
+
+        events.push(&[KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            matches!(
+                app.modals.last(),
+                Some(Modal::Confirm(state))
+                    if matches!(state.on_confirm, super::super::ConfirmAction::Switch(_))
+            ),
+            "the next ↵ offers the switch: {:?}",
+            app.modals
+        );
+    }
+
+    /// A modal pushed over the drawn question drops the key queued at the
+    /// frame that covers it, so the key typed for the question never answers
+    /// the cover.
+    #[test]
+    fn a_cover_drops_the_key_queued_at_it() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        app.open_modal(Modal::Help);
+        events.push(&[KeyCode::Esc]);
+        frame(&mut term, &mut app, &mut events);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the esc was read");
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Help)),
+            "the esc queued at the cover was dropped: {:?}",
+            app.modals
+        );
+    }
+
+    /// The question closed off a tick (another clauth answered it) drops the
+    /// key queued at the frame that draws its close, so a `↵` typed for the
+    /// question switches no account.
+    #[test]
+    fn a_tick_close_drops_the_key_queued_at_it() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = super::app_with(vec![
+            crate::testutil::oauth_profile("alpha", "rt-alpha"),
+            crate::testutil::oauth_profile("beta", "rt-beta"),
+        ]);
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        crate::retention::keep(3650).expect("keep");
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![], "the tick closed it");
+        events.push(&[KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the ↵ was read");
+        assert!(app.modals.is_empty(), "and dropped: {:?}", app.modals);
+    }
+
+    /// Neither a question removed before any frame showed it nor a draw that
+    /// failed leaves a later question inert or faint: each later question
+    /// acts 500 ms after the first frame that showed it.
+    #[test]
+    fn an_undrawn_question_and_a_failed_draw_leave_no_stuck_wait() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+
+        crate::retention::keep(3650).expect("answered elsewhere before any frame");
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![], "closed undrawn");
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "asked again");
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 499);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ at 499 ms");
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "drawn as written");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ at 500 ms");
+
+        app.open_modal(Modal::Help);
+        app.pop_modal();
+        term.backend_mut().fail_next = true;
+        at(&mut app, 1_000);
+        let failed =
+            crate::tui::run_frame(&mut term, &mut app, &mut events, std::time::Instant::now());
+        assert!(failed.is_err(), "the draw failed");
+        at(&mut app, 2_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "the next frame shows it new");
+        at(&mut app, 2_499);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "← at 499 ms");
+        at(&mut app, 2_500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "drawn as written again");
+        press(&mut app, KeyCode::Left);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "← at 500 ms");
+    }
+
+    /// A key typed inside the window stays inert when it waits in the queue
+    /// while the next, unchanged frame's draw holds past the window: it may
+    /// have arrived inside the window however late it is read. Only an empty
+    /// poll past the window makes the keys live again. Every moment the test
+    /// reasons about is the injected clock, so a descheduled test thread
+    /// changes nothing it reads.
+    #[test]
+    fn keys_typed_inside_the_window_behind_a_stalled_frame_change_nothing() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        let since = app.transcript_cleanup.drawn.expect("drawn").since_ms;
+        assert_eq!(since, 0, "the injected clock stamped the window");
+        at(&mut app, 1);
+        events.push(&[KeyCode::Right, KeyCode::Enter]);
+        term.backend_mut()
+            .holds
+            .push_back(Duration::from_millis(600));
+        at(&mut app, 600);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ read past the window"
+        );
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "↵ read past the window"
+        );
+        assert!(!app.transcript_cleanup.removing(), "no remove started");
+
+        // The empty poll past the window marks the queue quiet; only then a
+        // key acts.
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ after the quiet moment acts"
+        );
+
+        // Control: the same keys at a quick next frame are read inside the
+        // window, so they are inert too.
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 100);
+        events.push(&[KeyCode::Right, KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ at a quick frame"
+        );
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "↵ at a quick frame"
+        );
+        assert!(!app.transcript_cleanup.removing(), "no remove started");
+    }
+
+    /// The injected clock stands in for a key thread held inside the window (a
+    /// tick or a handler taking that long): no poll saw the queue empty
+    /// between the two clock points, so a key read after it may have arrived
+    /// inside the window and changes nothing. An empty poll past the window
+    /// then makes the next key act.
+    #[test]
+    fn a_key_queued_while_the_key_thread_is_held_inside_the_window_changes_nothing() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+
+        // The key is queued while the thread is held: the clock jumps with no
+        // poll in between, so no pass saw the queue empty inside the hold.
+        events.push(&[KeyCode::Right]);
+        at(&mut app, 600);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ read after the hold"
+        );
+
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ after the quiet moment acts"
+        );
+    }
+
+    /// While the keys are inert the loop's wait ends with their window, so the
+    /// frame drawn when the window ends shows both buttons live with no key
+    /// pressed, and a key queued right after it acts.
+    #[test]
+    fn the_frame_drawn_at_the_windows_end_shows_live_buttons_and_the_next_key_acts() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "faint inside the window");
+
+        at(&mut app, 480);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "still faint at 480 ms");
+        let wait = events.waits.last().copied().expect("a waiting poll");
+        assert!(
+            wait <= Duration::from_millis(20),
+            "the wait ends with the window: {wait:?}"
+        );
+
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "live at the window's end");
+        assert_eq!(
+            app.key_window_wait(),
+            None,
+            "the window is over: no wait left to cap"
+        );
+
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "a key queued right after acts"
+        );
+    }
+
+    /// Keys that keep arriving during the loop's waits each leave the queue
+    /// empty at the next pass, and each pass's own check records that moment:
+    /// typing faster than a wait's timeout never keeps the question inert once
+    /// its window has passed.
+    #[test]
+    fn keys_arriving_during_each_wait_do_not_keep_the_question_inert() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+
+        // The key arrives after the waiting poll began, so no poll times out:
+        // the pass's own zero-timeout check is the only proof the queue stood
+        // empty before it.
+        events.steps.push_back(Scripted::Later);
+        events.push(&[KeyCode::Right]);
+        at(&mut app, 600);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ typed after the pass's empty check acts"
+        );
+    }
+
+    /// The terminal losing focus hides the question with everything else: its
+    /// keys answer nothing before focus returns, however long its window has
+    /// been over, and its buttons draw faint until then.
+    #[test]
+    fn a_focus_loss_makes_the_question_unseen_until_focus_returns() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "live while focused");
+
+        events.push_focus(false);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 60_000);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ while unfocused"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "↵ while unfocused"
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "faint while unfocused");
+    }
+
+    /// A focus report queued behind the frame that first shows the question is
+    /// read by that frame's own drop and still reaches the app: it is not a
+    /// key, and losing it would leave the question answering an unfocused
+    /// terminal.
+    #[test]
+    fn a_focus_loss_queued_at_the_questions_first_frame_is_not_dropped() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        events.push_focus(false);
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert!(events.steps.is_empty(), "the focus report was read");
+
+        at(&mut app, 60_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "faint while unfocused");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ while unfocused"
+        );
+    }
+
+    /// Some terminals report focus on request: a regain with no loss before it
+    /// is a fresh sighting of the question. It restarts the window, dropping
+    /// the key queued at the frame that shows it, and changes nothing else.
+    #[test]
+    fn a_focus_regain_restarts_the_window_and_changes_nothing_else() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        at(&mut app, 500);
+        frame(&mut term, &mut app, &mut events);
+        assert!(!buttons_faint(&term, 3650), "live before the regain");
+
+        events.push_focus(true);
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the queued key was read");
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "and dropped");
+        assert_eq!(toasts(&app), vec![], "nothing else changed");
+        at(&mut app, 999);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "→ at 499 ms");
+        at(&mut app, 1_000);
+        frame(&mut term, &mut app, &mut events);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ at 500 ms");
+    }
+
+    /// A question that opens while the terminal is unfocused is unseen: its
+    /// keys stay inert past the window, and the regain starts a fresh window,
+    /// dropping the keys queued at the frame that shows it.
+    #[test]
+    fn a_question_opened_while_unfocused_ignores_the_keys_queued_at_the_regain() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        remember(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        events.push_focus(false);
+        frame(&mut term, &mut app, &mut events);
+        assert!(app.modals.is_empty(), "nothing opened yet");
+
+        lose_and_put_back(home.home(), 3650);
+        on_tick(&mut app);
+        assert_eq!(cleanup_modals(&app), vec![(3650, false)], "the tick asked");
+        at(&mut app, 10_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "unfocused draws faint");
+        at(&mut app, 60_000);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "still faint past the window");
+
+        events.push_focus(true);
+        events.push(&[KeyCode::Right, KeyCode::Enter]);
+        frame(&mut term, &mut app, &mut events);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "the queued keys were read");
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "and dropped: the modal stays on `keep 3650`"
+        );
+        assert_eq!(question(), (Some(3650), true), "the question stays open");
+
+        at(&mut app, 60_500);
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ acts once the regain's frame and half a second have passed"
+        );
+    }
+
+    /// A focus report with no question in the modal stack changes nothing on
+    /// screen, and the keys around it are handled as usual.
+    #[test]
+    fn focus_reports_without_the_question_change_nothing_on_screen() {
+        let _home = HomeSandbox::new();
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        events.push_focus(false);
+        events.push_focus(true);
+        events.push(&[KeyCode::Char('?')]);
+        frame(&mut term, &mut app, &mut events);
+        frame(&mut term, &mut app, &mut events);
+        assert!(app.modals.is_empty(), "the focus reports opened nothing");
+        assert_eq!(toasts(&app), vec![], "and toasted nothing");
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Help)),
+            "the key behind them still opens the help: {:?}",
+            app.modals
+        );
+    }
+
+    /// Input that keeps the queue from ever reading empty past the window
+    /// leaves the keys inert, so the buttons draw faint there too: the faint
+    /// and the key gate read the same arrival. Once a pass finds the queue
+    /// empty the frame draws live and a key acts.
+    #[test]
+    fn buttons_draw_faint_while_the_queue_has_not_been_seen_quiet_past_the_window() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "faint inside the window");
+
+        at(&mut app, 600);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            buttons_faint(&term, 3650),
+            "faint past the window while the queue never read empty"
+        );
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the → changed nothing"
+        );
+
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            !buttons_faint(&term, 3650),
+            "live once the queue read empty"
+        );
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ acts");
+    }
+
+    /// A key typed after the window ended but before the first frame that drew
+    /// the buttons live changes nothing, however soon after the window it
+    /// arrives: the loop can only prove the queue quiet past that frame.
+    #[test]
+    fn a_key_typed_before_the_first_live_frame_changes_nothing() {
+        let home = HomeSandbox::new();
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        let mut events = ScriptedEvents::default();
+        at(&mut app, 0);
+        frame(&mut term, &mut app, &mut events);
+
+        // The loop's wait runs out at the window's end; a tick then runs long
+        // before the next draw, so the key is queued past the window and before
+        // any frame drew the buttons live.
+        at(&mut app, 500);
+        app.queue_seen_empty();
+        at(&mut app, 800);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ before the first live frame"
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+
+        // A quiet poll past that frame, then a key acts.
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, true)],
+            "→ after the live frame and a quiet poll acts"
+        );
+    }
+
+    /// A draw that starts inside the window and returns past it drew faint
+    /// buttons, so it is not the frame that shows them live: a key typed after
+    /// its return and before the next drawn-live frame changes nothing.
+    #[test]
+    fn a_draw_that_crosses_the_windows_end_does_not_show_live_buttons() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let (mut events, clock) = clocked(&mut app, 0, 0);
+        let mut term = clocked_terminal(Arc::clone(&clock), &[0, 30]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "the first frame drew faint");
+
+        // The next draw starts at 480 (inside the window) and its own 30 ms
+        // move the clock past the window's end; what it drew is faint.
+        clock.store(480, Ordering::Relaxed);
+        frame(&mut term, &mut app, &mut events);
+        assert!(buttons_faint(&term, 3650), "the crossing frame drew faint");
+        assert_eq!(app.anim_ms(), 510, "the draw returned past the window");
+
+        // A key queued after that return, before any frame drew them live.
+        events.push(&[KeyCode::Right]);
+        clock.store(520, Ordering::Relaxed);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "→ before the first drawn-live frame"
+        );
+        assert_eq!(question(), (Some(3650), true), "answered nothing");
+
+        // A quiet poll past that frame, then a key acts.
+        frame(&mut term, &mut app, &mut events);
+        events.push(&[KeyCode::Right]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(cleanup_modals(&app), vec![(3650, true)], "→ after it acts");
+    }
+
+    /// A drop that outlasts the window leaves the queue seen empty past it:
+    /// the next frame draws the buttons live even with a key already queued,
+    /// which only the drop's own record can prove when the wait recorded
+    /// nothing.
+    #[test]
+    fn a_drop_that_outlasts_the_window_leaves_the_queue_seen_quiet_past_it() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        // The drop reads a key typed ahead of the question and takes 600 ms
+        // over it; another key arrives during the pass's wait, so that wait
+        // records nothing.
+        let (mut events, _clock) = clocked(&mut app, 0, 600);
+        events.push(&[KeyCode::Char('x')]);
+        events.steps.push_back(Scripted::Later);
+        events.push(&[KeyCode::Char('y')]);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(events.queued(), vec![], "both keys were read");
+        assert!(
+            buttons_faint(&term, 3650),
+            "the question's own frame drew inside the window"
+        );
+
+        // A key already queued at the next frame keeps its pass-start check
+        // from recording, so its live buttons can only come from the drop.
+        events.push(&[KeyCode::Char('x')]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            !buttons_faint(&term, 3650),
+            "the drop's record drew it live"
+        );
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "nothing answered"
+        );
+    }
+
+    /// A wait that runs out at the window's end leaves the queue seen empty
+    /// there: the next frame draws the buttons live even with a key already
+    /// queued, which nothing but that record proves.
+    #[test]
+    fn a_wait_that_times_out_past_the_window_leaves_the_queue_seen_quiet_there() {
+        let home = HomeSandbox::new();
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        put_back(home.home(), 3650);
+        let mut app = bare_app();
+        let mut term = terminal();
+        // The first pass's wait runs out at the window's end; a key already
+        // queued at the next frame keeps that pass's own check from recording.
+        let (mut events, _clock) = clocked(&mut app, 500, 0);
+        frame(&mut term, &mut app, &mut events);
+        assert_eq!(app.anim_ms(), 500, "the wait ran to the window's end");
+        assert!(
+            buttons_faint(&term, 3650),
+            "the frame itself drew inside the window"
+        );
+
+        events.push(&[KeyCode::Char('x')]);
+        frame(&mut term, &mut app, &mut events);
+        assert!(
+            !buttons_faint(&term, 3650),
+            "the wait's record drew it live"
+        );
+        assert_eq!(
+            cleanup_modals(&app),
+            vec![(3650, false)],
+            "the key answered nothing"
+        );
     }
 }

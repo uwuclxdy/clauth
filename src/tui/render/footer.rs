@@ -380,6 +380,9 @@ fn owner_hints(
                 ("↵", "choose"),
                 ("q", "not now"),
             ]),
+            // While its remove runs only `q` (and `esc`) does anything.
+            Some(Modal::TranscriptCleanup(_)) if app.transcript_cleanup.removing() => Some(Q_BACK),
+            Some(Modal::TranscriptCleanup(_)) => Some(BUTTON_KEYS),
             Some(Modal::Login | Modal::CodexLogin) | None => None,
         },
         KeyOwner::SetupField

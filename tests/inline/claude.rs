@@ -543,9 +543,10 @@ fn every_effort_value_rides_the_env_override_alone() {
     }
 }
 
-/// An empty value reads as no value at startup and returns a running session to
-/// the model default, where removing the key leaves it on the old value, so an
-/// account with no effort writes `""`.
+/// An empty value is no value, so a running session falls back to a level set
+/// with `/effort`, else the per-model level its own settings held for the model
+/// when it started, else the model default; removing the key instead leaves it
+/// on the old value, so an account with no effort writes `""`.
 #[test]
 fn an_unset_effort_writes_an_empty_env_override() {
     let v = built_with_effort(None, None);
@@ -8997,10 +8998,10 @@ fn an_unparseable_saved_record_refuses_the_uncover_without_quoting_it() {
 /// file fails either way; which error text arrives depends on the order, so
 /// the pin reads it: the stat must come first.
 #[test]
-fn set_settings_env_key_stats_before_it_reads() {
+fn set_settings_effort_stats_before_it_reads() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let missing = tmp.path().join("no-such-settings.json");
-    let err = set_settings_env_key(&missing, None, "CLAUDE_CODE_EFFORT_LEVEL", "max")
+    let err = set_settings_effort(&missing, None, "CLAUDE_CODE_EFFORT_LEVEL", "max", None)
         .expect_err("a missing settings file fails the write");
     assert!(
         format!("{err:#}").contains("failed to stat"),

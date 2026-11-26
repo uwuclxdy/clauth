@@ -40,6 +40,7 @@ mod login_page;
 mod logline;
 mod mcp;
 mod mcp_sync;
+mod model_effort;
 mod oauth;
 mod oauth_login;
 mod out;
@@ -257,7 +258,7 @@ fn usage_error(msg: impl Into<String>) -> anyhow::Error {
 /// anyhow's `Result` `Termination` did (`Error: {:?}`) — an
 /// [`InterruptedAfter`] its failure — except the [`HelpRendered`],
 /// [`Interrupted`], [`FailureReported`] and [`ReaderLeft`] arms, whose
-/// commands already said what happened on stderr or have no reader left — so
+/// commands already said what happened or have no reader left — so
 /// the message surface is unchanged now that `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     // Through `errln!`, so a test's stderr capture takes the line too.
@@ -435,6 +436,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
             dump_openapi,
+            exec_handover,
         } => cmd_daemon(
             standby,
             replace,
@@ -442,6 +444,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             listen,
             daemon::api::tls::CertSource::from_flags(cert, key),
             dump_openapi,
+            exec_handover,
         ),
         Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
@@ -475,6 +478,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Restore { session_id } => hook_resume::run_restore(&session_id),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Rex { cmd } => match cmd {
+            cli::RexCommand::Install { yes } => rex::install(yes),
+            cli::RexCommand::Uninstall { yes } => rex::uninstall(yes),
+        },
         Command::Proxy { cmd } => cmd_proxy(cmd),
         Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
@@ -482,6 +489,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the daemon verbs arrive as the CLI's own flags; folding them into an enum is a CLI plumbing change"
+)]
 fn cmd_daemon(
     standby: bool,
     replace: bool,
@@ -489,7 +500,19 @@ fn cmd_daemon(
     listen: Option<std::net::SocketAddr>,
     certs: daemon::api::tls::CertSource,
     dump_openapi: bool,
+    exec_handover: bool,
 ) -> Result<()> {
+    // The capability answer first: it must arrive before any singleton claim —
+    // the probe judges the binary, and the answer is all it needs. A
+    // replacement that will serve the API reads its certificate as part of
+    // the answer (the exact listener decision `serve` runs), so the probe can
+    // never judge a different start than the exec runs. That read touches the
+    // home (`~/.clauth/tls.json`) but writes nothing there: the first-use
+    // default is the start's write, not the answer's.
+    if exec_handover {
+        let mut stdout = std::io::stdout().lock();
+        return write_exec_handover_answer(&mut stdout, listen, &certs);
+    }
     // The dump arm is first: it must return before any listener, certificate
     // read, singleton claim or home access, so CI can pin the spec without a
     // daemon.
@@ -505,6 +528,53 @@ fn cmd_daemon(
         daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
         daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// Write the restart-handover probe's answer: a replacement that will serve
+/// the API (`--listen` given and the REST kill switch off) runs the exact
+/// listener decision [`daemon::serve`] runs — the certificate read, nothing
+/// bound — before it answers, so a certificate it cannot load never reads as
+/// capable. Ok: the bare token, exit 0. Err: the cert-refused marker line
+/// then the error as one line, and [`FailureReported`] (exit 1, no `Error:`
+/// line on stderr). No `--listen`, or the kill switch on, loads no
+/// certificate and answers the bare token. Split out from [`cmd_daemon`] so
+/// both arms' bytes are unit-testable without capturing stdout; the marker,
+/// the reason and a failing exit are also pinned end to end by
+/// `tests/daemon_handover_probe.rs`.
+fn write_exec_handover_answer<W: std::io::Write>(
+    writer: &mut W,
+    listen: Option<std::net::SocketAddr>,
+    certs: &daemon::api::tls::CertSource,
+) -> Result<()> {
+    let Err(error) = daemon::listener_setup(listen, certs) else {
+        return write_exec_handover_token(writer);
+    };
+    crate::out::write_chunk(
+        writer,
+        format_args!("{}\n{error:#}", daemon::EXEC_HANDOVER_CERT_REFUSED),
+        false,
+        "stdout",
+    );
+    Err(anyhow::Error::new(FailureReported))
+}
+
+/// Write the restart-handover capability token verbatim — the exact bytes
+/// the daemon's re-exec probe compares against the spawn's stdout, with no
+/// trailing newline or framing. Split out from [`write_exec_handover_answer`]
+/// so the byte-for-byte contract is unit-testable without capturing stdout.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result keeps this arm uniform with the cert-refused answer beside it, whose tests assert both through one shape"
+)]
+fn write_exec_handover_token<W: std::io::Write>(writer: &mut W) -> Result<()> {
+    match crate::out::write_chunk(
+        writer,
+        format_args!("{}", daemon::EXEC_HANDOVER_TOKEN),
+        false,
+        "stdout",
+    ) {
+        crate::out::Wrote::Yes | crate::out::Wrote::ReaderGone => Ok(()),
     }
 }
 
@@ -755,9 +825,8 @@ impl std::fmt::Display for RebindPartial {
 
 impl std::error::Error for RebindPartial {}
 
-/// The failure's lines were already printed to stderr (a re-bind's, one per
-/// failed account; a refused bare-item settle's `clauth:` line; the TUI's
-/// `Error:` line, dropped when stderr cannot take it);
+/// The command already printed its failure (on stderr, or on stdout where
+/// stdout is the answer, as the restart-handover probe's is);
 /// [`exit_code`] maps this to exit 1 with no `Error:` line, the way
 /// [`HelpRendered`] maps to 2 after help already printed.
 #[derive(Debug)]
@@ -765,7 +834,7 @@ pub(crate) struct FailureReported;
 
 impl std::fmt::Display for FailureReported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("failure reported on stderr")
+        f.write_str("failure already reported")
     }
 }
 

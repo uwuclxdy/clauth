@@ -18,8 +18,8 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{
     NO_DATA, ResetFmt, activity_verb, duration_label, grapheme_cells, is_past_reset,
-    overdue_phrase, past_deadline_age, reading_due_age, relative_age, reset_in_secs_at,
-    reset_phrase, spinner_frame, spinner_style, truncate,
+    overdue_phrase, past_deadline_age, plan_end_text, reading_due_age, relative_age,
+    reset_in_secs_at, reset_phrase, spinner_frame, spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_ORG_REFUSED,
@@ -157,7 +157,7 @@ pub(super) fn draw(
 
     match app.usage_selection() {
         SetupSelection::Item(MainItemKind::Profile(_)) | SetupSelection::New => {
-            draw_usage_detail(frame, detail, app, readings, toast_rects);
+            draw_usage_detail(frame, detail, app, readings, toast_rects, now_epoch_secs());
         }
         SetupSelection::Item(MainItemKind::Codex(_)) => draw_codex_usage_detail(frame, detail, app),
         SetupSelection::Item(MainItemKind::Shunt(..)) => {
@@ -205,6 +205,7 @@ fn draw_usage_detail(
     app: &App,
     readings: &ReadingsSnapshot,
     toast_rects: &[Rect],
+    now: i64,
 ) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
@@ -243,6 +244,8 @@ fn draw_usage_detail(
     // rank below it) — the spend-uncapped check under the guard never re-reads
     // the durable verdict per member.
     let key_rejected = app.key_rejected_names();
+    // Read before the Config lock too, which the store ranks below.
+    let dead_logins = super::overview::dead_logins(app);
     let cfg = app.config();
     let profile = cfg.profiles.get(
         app.profile_cursor
@@ -377,10 +380,15 @@ fn draw_usage_detail(
         }
         None => (inner, None),
     };
+    let plan_frame = PlanFrame {
+        now,
+        login_dead: super::overview::login_dead(app, &cfg, profile, &dead_logins, now),
+    };
     let lines = build_usage_lines(
         profile,
         inner.width,
         &header,
+        plan_frame,
         app,
         readings,
         show_estimates,
@@ -683,6 +691,7 @@ fn build_usage_lines(
     profile: &Profile,
     inner_w: u16,
     header: &HeaderState,
+    plan_frame: PlanFrame,
     app: &App,
     readings: &ReadingsSnapshot,
     show_estimates: bool,
@@ -690,7 +699,7 @@ fn build_usage_lines(
     reset_fmt: ResetFmt,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, header, inner_w, readings));
+    lines.extend(header_lines(profile, header, plan_frame, inner_w, readings));
     lines.push(Line::from(""));
     // The banked-reset row sits right under the plan row, ahead of the
     // pricing and status rows: the account's resets read as part of its
@@ -1620,6 +1629,7 @@ fn bar_spans(
 fn header_lines(
     profile: &Profile,
     header: &HeaderState,
+    plan_frame: PlanFrame,
     inner_w: u16,
     readings: &ReadingsSnapshot,
 ) -> Vec<Line<'static>> {
@@ -1639,25 +1649,36 @@ fn header_lines(
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
-    // as a real plan on the one row an operator checks their plan from.
+    // as a real plan on the one row a user checks their plan from.
     let plan_w = plan.as_deref().map(grapheme_cells).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
     };
     let plan_key = key_span("plan");
-    let left_w = plan_key.width() + plan_w;
+    let mut left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
+    let row_w = usize::from(inner_w);
     // A plan with no 5h limit has no window the kick could open, and no kick
     // leg spends a chain clauth never spends, so either way the countdown
     // would name a kick that never fires.
-    let no_five_hour_limit = readings.no_five_hour_limit(profile.name.as_str());
-    if profile.has_effective_auto_start() && !no_five_hour_limit {
-        plan_spans.extend(kick_spans(
-            &kick_text(profile, header, readings),
-            left_w,
-            inner_w as usize,
-        ));
+    let kick = (profile.has_effective_auto_start()
+        && !readings.no_five_hour_limit(profile.name.as_str()))
+    .then(|| kick_text(profile, header, readings));
+    // When the plan ends or renews, beside its name in the room the countdown
+    // leaves: the countdown and its gap stay reserved, so the date drops
+    // before the countdown shortens.
+    let kick_room = kick.as_deref().map_or(0, |k| grapheme_cells(k) + KICK_GAP);
+    if let Some((text, style)) = plan_end_tail(profile, plan_frame, readings) {
+        let tail = format!(" · {text}");
+        let tail_w = grapheme_cells(&tail);
+        if left_w + tail_w + kick_room <= row_w {
+            left_w += tail_w;
+            plan_spans.push(Span::styled(tail, style));
+        }
+    }
+    if let Some(kick) = kick {
+        plan_spans.extend(kick_spans(&kick, left_w, row_w));
     }
     let mut lines = vec![Line::from(plan_spans)];
     if let Some(peak) = header.peak {
@@ -1665,6 +1686,40 @@ fn header_lines(
     }
     lines.extend(status_lines(profile, header, inner_w, readings));
     lines
+}
+
+/// The frame facts the `plan` row's date reads beside the profile and its
+/// reading: the wall clock (epoch seconds), read once per frame, and whether
+/// the Overview's marker column draws the account's login dead
+/// ([`super::overview::login_dead`]).
+#[derive(Clone, Copy)]
+struct PlanFrame {
+    now: i64,
+    login_dead: bool,
+}
+
+/// The `plan` row's plan-end phrase ([`plan_end_text`]) and its style: the
+/// warning color exactly while the Overview flags the date in its plan chip
+/// ([`super::overview::plan_chip`]), faint otherwise. `None` when no date
+/// applies, a renewal included on a plan whose reading says it cannot serve
+/// (the status the Overview's `⊖` marks).
+fn plan_end_tail(
+    profile: &Profile,
+    frame: PlanFrame,
+    readings: &ReadingsSnapshot,
+) -> Option<(String, Style)> {
+    let today = crate::format::local_day(frame.now)?;
+    let refuses_service =
+        crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name));
+    let end = profile.plan_dates().end(today, refuses_service)?;
+    let flagged =
+        super::overview::plan_chip(profile, readings, frame.login_dead, frame.now).is_some();
+    let style = if flagged {
+        theme::warning()
+    } else {
+        theme::faint()
+    };
+    Some((plan_end_text(end, today), style))
 }
 
 /// The `speed` and `rate` rows: each reads `live · 5m · 1h · today`, one figure
@@ -1859,20 +1914,23 @@ fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapsho
     }
 }
 
+/// The house minimum gap, in cells, between the `plan` row's left content and
+/// its flush-right countdown.
+const KICK_GAP: usize = 3;
+
 /// Spans putting `text` flush against the pane's right edge on the `plan` row,
-/// keeping the house 3-cell minimum gap from the row's left content. Truncates
-/// with `…` when the row can't hold both; drops the kick when not even a
-/// countdown hint fits.
+/// keeping the [`KICK_GAP`] from the row's left content. Truncates with `…`
+/// when the row can't hold both; drops the kick when not even a countdown hint
+/// fits.
 fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
-    let avail = inner_w.saturating_sub(left_w);
-    if avail < 3 {
+    let Some(room) = inner_w.saturating_sub(left_w).checked_sub(KICK_GAP) else {
         return Vec::new();
-    }
-    let text = truncate(text, avail - 3);
+    };
+    let text = truncate(text, room);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - Span::raw(&text).width();
+    let pad = room.saturating_sub(Span::raw(&text).width()) + KICK_GAP;
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),

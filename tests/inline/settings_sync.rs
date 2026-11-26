@@ -504,7 +504,7 @@ fn advisor_model_stays_exactly_where_it_was() {
 // Each member keeps its own `modelPicker`; shared keys still propagate.
 #[test]
 fn model_picker_stays_per_member_while_shared_keys_sync() {
-    let custom_env = BTreeSet::new();
+    let custom_env = PerProfileKeys::default();
     assert_eq!(
         key_role(KeyPath::Top("modelPicker"), &custom_env),
         KeyRule::PerProfile,
@@ -768,16 +768,22 @@ fn runtime_copies_are_owner_only_and_the_base_keeps_its_posture() {
 
 #[test]
 fn every_managed_env_key_is_per_profile() {
-    let custom_env = BTreeSet::new();
+    let custom_env = PerProfileKeys::default();
     for key in MANAGED_ENV_KEYS {
         assert_eq!(
-            key_role(KeyPath::Nested(key), &custom_env),
+            key_role(KeyPath::Nested { parent: "env", key }, &custom_env),
             KeyRule::PerProfile,
             "{key} routes or authenticates one account and must never propagate"
         );
     }
     assert_eq!(
-        key_role(KeyPath::Nested("EDITOR"), &custom_env),
+        key_role(
+            KeyPath::Nested {
+                parent: "env",
+                key: "EDITOR"
+            },
+            &custom_env
+        ),
         KeyRule::Shared
     );
 }
@@ -788,7 +794,7 @@ fn every_managed_env_key_is_per_profile() {
 /// pins its login to the wrong org.
 #[test]
 fn every_credential_minting_top_level_key_is_per_profile() {
-    let custom_env = BTreeSet::new();
+    let custom_env = PerProfileKeys::default();
     for key in [
         "apiKeyHelper",
         "proxyAuthHelper",
@@ -870,6 +876,137 @@ fn custom_env_keys_are_unioned_across_every_profile() {
         keys,
         BTreeSet::from(["A_KEY".to_string(), "B_KEY".to_string()])
     );
+}
+
+#[test]
+fn only_a_pinned_models_effort_stays_per_profile() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p", "[model_effort]\nopus = \"high\"\n");
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "low", "autoCompactWindow": 200000},
+            "haiku": {"effortLevel": "medium"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "high", "maxEffortLevel": "xhigh"},
+            "haiku": {"effortLevel": "low"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    let after = read_json(&runtime);
+    assert_eq!(
+        after,
+        serde_json::json!({
+            "modelSettings": {
+                "claude-opus-4-5": {"effortLevel": "high", "autoCompactWindow": 200000},
+                "haiku": {"effortLevel": "medium"}
+            }
+        })
+    );
+}
+
+/// A pinned `[models]` id keeps the level under its model's canonical name per
+/// profile, while another model of its tier and another tier still sync.
+#[test]
+fn a_pinned_id_keeps_its_own_models_level_and_syncs_the_rest_of_its_tier() {
+    let home = HomeSandbox::new();
+    write_config(
+        home.home(),
+        "p",
+        "[models]\nopus = \"claude-opus-4-5-20251101[1m]\"\n\n[model_effort]\nopus = \"high\"\n",
+    );
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "low"},
+            "claude-opus-5-5": {"effortLevel": "low"},
+            "claude-sonnet-4-5": {"effortLevel": "low"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-opus-4-5": {"effortLevel": "high"},
+            "claude-opus-5-5": {"effortLevel": "high"},
+            "claude-sonnet-4-5": {"effortLevel": "high"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    assert_eq!(
+        read_json(&runtime),
+        serde_json::json!({
+            "modelSettings": {
+                "claude-opus-4-5": {"effortLevel": "high"},
+                "claude-opus-5-5": {"effortLevel": "low"},
+                "claude-sonnet-4-5": {"effortLevel": "low"}
+            }
+        })
+    );
+}
+
+/// A pinned bare tier alias keeps a legacy family-last model id of its tier
+/// per profile, while an id of another tier still syncs.
+#[test]
+fn an_alias_pin_keeps_a_legacy_family_last_model_per_profile() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p", "[model_effort]\nsonnet = \"high\"\n");
+    let source = serde_json::json!({
+        "modelSettings": {
+            "claude-3-5-sonnet": {"effortLevel": "low"},
+            "claude-3-opus": {"effortLevel": "low"}
+        }
+    });
+    let target = serde_json::json!({
+        "modelSettings": {
+            "claude-3-5-sonnet": {"effortLevel": "high"},
+            "claude-3-opus": {"effortLevel": "high"}
+        }
+    });
+    let base = base_path(home.home());
+    let runtime = runtime_path(home.home(), "p");
+    write_json(&base, &source, t(2));
+    let _marker = live_recorded_json(home.home(), &runtime, &target, t(1));
+    sync();
+    assert_eq!(
+        read_json(&runtime),
+        serde_json::json!({
+            "modelSettings": {
+                "claude-3-5-sonnet": {"effortLevel": "high"},
+                "claude-3-opus": {"effortLevel": "low"}
+            }
+        })
+    );
+}
+
+/// A model the live record still covers stays per-profile though no config
+/// pins it any more, and a record that does not parse pauses the sync.
+#[test]
+fn a_model_only_the_record_covers_stays_per_profile_and_a_torn_record_pauses() {
+    let _home = HomeSandbox::new();
+    let record = crate::claude::saved_base_env_path().unwrap();
+    crate::profile::atomic_write_600(
+        &record,
+        r#"{"v":2,"keys":{},"model_effort":{"claude-opus-4-5":{"base":"low","wrote":"digest"}}}"#,
+    )
+    .unwrap();
+    let keys = per_profile_keys().expect("the record parses");
+    assert!(keys.models.contains("claude-opus-4-5"));
+
+    crate::profile::atomic_write_600(&record, "{torn").unwrap();
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    assert!(
+        per_profile_keys().is_none(),
+        "an unknown cover pauses the sync"
+    );
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
 }
 
 /// The union walks the same DIRECTORY listing the member set is derived from
@@ -2580,6 +2717,7 @@ fn remembered(days: u64, question_open: bool) -> crate::retention::Retention {
     crate::retention::Retention {
         days: Some(days),
         question_open,
+        spawn_files: std::collections::BTreeMap::new(),
     }
 }
 
@@ -2846,7 +2984,7 @@ fn remove_forgets_the_number_and_deletes_the_key_everywhere_until_a_new_number_a
         "the loss opened the question"
     );
 
-    crate::retention::remove().expect("remove");
+    crate::retention::remove(3650).expect("remove");
 
     let keyless = json!({"theme": "light", "env": {}});
     assert_eq!(read_json(&base), keyless, "the operator file loses the key");
@@ -2872,6 +3010,148 @@ fn remove_forgets_the_number_and_deletes_the_key_everywhere_until_a_new_number_a
         retention(),
         remembered(30, false),
         "a new number arms it again"
+    );
+}
+
+/// The answer names the number the question asked about: a valid number the
+/// operator set in the file since the put-back is honoured silently, and
+/// `remove` changes nothing.
+#[test]
+fn remove_refuses_a_number_the_operator_set_since_the_put_back() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the loss opened the question"
+    );
+
+    write_json(
+        &base,
+        &json!({"cleanupPeriodDays": 90, "theme": "light", "env": {}}),
+        t(30),
+    );
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded
+    );
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(90),
+        "the operator's own number stands"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the live copy is untouched"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the record is untouched"
+    );
+}
+
+/// A question about another number is still owed its own answer: a stale
+/// `remove it` naming the old number changes nothing.
+#[test]
+fn remove_refuses_a_question_about_another_number() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let copy = session_runtime_path(home.home(), "p1", "4242-0");
+    remember_through_a_pass(home.home(), 3650);
+    let _live = live_recorded_json(
+        home.home(),
+        &copy,
+        &json!({"cleanupPeriodDays": 3650, "theme": "light", "env": {}}),
+        t(5),
+    );
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(retention(), remembered(3650, true), "the 3650 question");
+
+    // A put-back of another number whose question write landed and whose
+    // operator write did not: the record asks about 7 over a keyless file.
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(30));
+    let mut record = crate::retention::load().expect("load");
+    record.days = Some(7);
+    record.question_open = true;
+    fs::write(
+        crate::retention::record_path().expect("path"),
+        serde_json::to_vec_pretty(&record).expect("serialize"),
+    )
+    .expect("write the record");
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded,
+        "the 7 question is still owed its own answer"
+    );
+    assert_eq!(
+        read_json(&base).get("cleanupPeriodDays"),
+        None,
+        "the keyless file stays keyless"
+    );
+    assert_eq!(
+        read_json(&copy)["cleanupPeriodDays"],
+        json!(3650),
+        "the live copy is untouched"
+    );
+    assert_eq!(retention(), remembered(7, true), "the record is untouched");
+}
+
+/// An operator save landing in the operator file's read-to-re-stat window is
+/// still honoured: the rewrite refuses to overwrite it, and the re-check on
+/// the retry's read answers `Superseded`, leaving the new number in place.
+#[test]
+fn remove_refuses_a_number_that_lands_after_the_guard_read() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    remember_through_a_pass(home.home(), 3650);
+    write_json(&base, &json!({"theme": "light", "env": {}}), t(20));
+    sync();
+    assert_eq!(retention(), remembered(3650, true), "the 3650 question");
+
+    let saved = std::sync::Arc::new(std::sync::Once::new());
+    let base_for_hook = base.clone();
+    crate::retention::set_rewrite_hook(Some(Box::new(move |path| {
+        if path == base_for_hook.as_path() {
+            saved.call_once(|| {
+                write_json(
+                    &base_for_hook,
+                    &json!({"cleanupPeriodDays": 90, "theme": "light", "env": {}}),
+                    t(40),
+                );
+            });
+        }
+    })));
+
+    assert_eq!(
+        crate::retention::remove(3650).expect("the answer runs"),
+        crate::retention::RemoveOutcome::Superseded
+    );
+    crate::retention::set_rewrite_hook(None);
+
+    assert_eq!(
+        read_json(&base)["cleanupPeriodDays"],
+        json!(90),
+        "the save that landed inside the remove stands"
+    );
+    assert_eq!(
+        retention(),
+        remembered(3650, true),
+        "the record is untouched"
     );
 }
 
@@ -3471,7 +3751,7 @@ fn remove_errors_on_a_live_copy_that_does_not_parse_and_says_so() {
     std::fs::write(&copy, br#"{"cleanupPeriodDays": 36"#).expect("tear the copy");
 
     let started = std::time::Instant::now();
-    let err = crate::retention::remove().expect_err("an unparseable copy fails the remove");
+    let err = crate::retention::remove(3650).expect_err("an unparseable copy fails the remove");
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(200),
         "each re-read of the torn copy waits for a write in flight to land"
@@ -3528,7 +3808,7 @@ fn remove_errors_on_a_live_copy_it_cannot_stat_and_keeps_the_record() {
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     let restore = ModeGuard(runtime_dir, 0o700);
 
-    let err = crate::retention::remove().expect_err("an unstattable copy fails the remove");
+    let err = crate::retention::remove(3650).expect_err("an unstattable copy fails the remove");
     drop(restore);
 
     assert!(
@@ -3868,7 +4148,8 @@ fn remove_errors_on_a_member_that_keeps_moving_and_keeps_the_record() {
         }
     })));
 
-    let err = crate::retention::remove().expect_err("a member that keeps moving fails the remove");
+    let err =
+        crate::retention::remove(3650).expect_err("a member that keeps moving fails the remove");
     crate::retention::set_rewrite_hook(None);
 
     assert!(
@@ -3919,7 +4200,7 @@ fn remove_succeeds_on_a_member_that_moves_once() {
         }
     })));
 
-    crate::retention::remove().expect("a member that moves once is removed on the retry");
+    crate::retention::remove(3650).expect("a member that moves once is removed on the retry");
     crate::retention::set_rewrite_hook(None);
 
     assert_eq!(

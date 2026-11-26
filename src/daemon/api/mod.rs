@@ -284,6 +284,10 @@ impl Prepared {
 /// The legacy import runs in [`serve_prepared`] too, below the claim and below
 /// a standby's promotion, so a start that dies on this certificate or yields
 /// as redundant imports nothing.
+///
+/// The handover probe's answer runs the same read (via
+/// `daemon::listener_setup`), so the probe judges the exact start the exec
+/// would run.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
     let identity = tls::server_config(certs, listen.ip())?;
     Ok(Prepared {
@@ -328,10 +332,12 @@ pub(crate) fn build_context(
 /// the claim died `--replace --listen` on the port its dying incumbent still
 /// held, exited a plain second instance non-zero on a boot race its contract
 /// says it wins by yielding, and had a parked standby holding a listening
-/// socket nothing accepted on for the whole park. Every failure here is fatal
-/// to the daemon by design (the caller propagates it): the operator asked for
-/// a listener, and a daemon that silently ran without one would look healthy
-/// while the remote client stayed dark.
+/// socket nothing accepted on for the whole park. A re-exec'd image whose
+/// handed-over listener validated adopts that socket instead of binding: it
+/// never closed, so the port never dropped between the images. Every failure
+/// here is fatal to the daemon by design (the caller propagates it): the
+/// operator asked for a listener, and a daemon that silently ran without one
+/// would look healthy while the remote client stayed dark.
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     config: ConfigHandle,
@@ -344,8 +350,17 @@ pub(crate) fn serve_prepared(
         tls_config,
         served_name,
     } = prepared;
-    let listener = TcpListener::bind(listen)
-        .with_context(|| format!("failed to bind the REST API to {listen}"))?;
+    let listener = match super::exec_handover::take_listener(listen) {
+        Some(listener) => listener,
+        None => TcpListener::bind(listen)
+            .with_context(|| format!("failed to bind the REST API to {listen}"))?,
+    };
+    // Registered so THIS image's own re-exec hands the socket over in turn.
+    #[cfg(unix)]
+    super::exec_handover::register_listener({
+        use std::os::fd::AsRawFd as _;
+        listener.as_raw_fd()
+    });
     // The port the kernel picked when `:0` was asked, not the asked-for one.
     let bound = listener
         .local_addr()

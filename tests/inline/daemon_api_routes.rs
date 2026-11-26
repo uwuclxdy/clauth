@@ -1763,8 +1763,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             &mut produced,
         );
         // An open question ask refuses a decision (the wrong form), an answer
-        // naming none of its questions, then an empty one, keeping the ask
-        // open for all three.
+        // naming none of its questions, an empty one, then a note its mod
+        // (one declaring no capabilities) would drop, keeping the ask open
+        // for all four.
         let question = serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "ask_opened", "ask": "q2", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
         assert_eq!(
             ctx_bridge
@@ -1779,6 +1780,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             r#"{"decision":"allow"}"#,
             r#"{"answers":{"Which color?":"blue"}}"#,
             r#"{"answers":{"Which colour?":""}}"#,
+            r#"{"answers":{"Which colour?":"blue"},"notes":{"Which colour?":"darker"}}"#,
         ] {
             let refused = call(
                 &ctx_bridge,
@@ -1895,6 +1897,101 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             "/sessions/{id}/asks/{ask}",
             503,
             &answer_busy,
+            &mut driven,
+            &mut produced,
+        );
+    }
+
+    // A mod declaring answer receipts, under a short receipt wait: an answer
+    // no poll takes is withdrawn (503), one a poll takes with no receipt
+    // after it is unconfirmed (504).
+    {
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let table = std::sync::Mutex::new(rows);
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| table.lock().unwrap().get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::with_receipt_wait(
+            true,
+            resolver,
+            std::time::Duration::from_secs(1),
+        );
+        let _stream = hub.subscribe_as(Some(&Tier::Control));
+        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "prompt_reports": true, "load": 1, "caps": ["notes", "answer_receipts"]});
+        assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
+        for (seq, ask) in [(2, FIXTURE_ASK_ID), (3, "r2")] {
+            let opened = serde_json::json!({"session": FIXTURE_ID, "seq": seq, "kind": "ask_opened", "ask": ask, "tool": "Bash", "input": {"command": "ls"}});
+            assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
+        }
+        let ctx_receipts = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            std::sync::Arc::clone(&hub),
+        );
+        let answer_withdrawn = call(
+            &ctx_receipts,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            503,
+            &answer_withdrawn,
+            &mut driven,
+            &mut produced,
+        );
+        // The answer runs on its own thread, so the poll below takes it before
+        // the receipt wait ends whatever the box's load; the route still waits
+        // out the bound and answers 504. The poll starts first: it either finds
+        // the answer queued or parks and is woken by it.
+        let route = {
+            let ctx = std::sync::Arc::clone(&ctx_receipts);
+            std::thread::spawn(move || {
+                call(
+                    &ctx,
+                    &req(
+                        "POST",
+                        &format!("{API_PREFIX}/sessions/{FIXTURE_ID}/asks/r2"),
+                        Some(TOKEN),
+                        r#"{"decision":"allow"}"#,
+                    ),
+                )
+            })
+        };
+        let (_, polled) = hub.poll_declaring(
+            100,
+            FIXTURE_ID,
+            std::time::Duration::from_secs(5),
+            &[
+                crate::daemon::bridge::Cap::Notes,
+                crate::daemon::bridge::Cap::AnswerReceipts,
+            ],
+        );
+        let answer_unconfirmed = route.join().expect("the answer thread");
+        assert_eq!(
+            polled["commands"],
+            serde_json::json!([{"kind": "answer", "ask": "r2", "decision": "allow"}])
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            504,
+            &answer_unconfirmed,
             &mut driven,
             &mut produced,
         );
@@ -2280,6 +2377,73 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         "the stream carries the current feed: {rendered_text:?}"
     );
     driven.insert(("GET".to_string(), "/events".to_string(), 200));
+
+    // The stream's document names the subagent frame with its four fields and
+    // each snapshot entry's open turn and subagent list, and a stream over a
+    // live bridge opens with a snapshot carrying both.
+    {
+        let Some(utoipa::openapi::RefOr::T(streamed)) = doc_operation(&doc, "GET", "/events")
+            .expect("GET /events is in the document")
+            .responses
+            .responses
+            .get("200")
+        else {
+            panic!("GET /events must document an inline 200");
+        };
+        for named in [
+            "`event: session.agent`",
+            r#"`{"session","agent_id","state":"start"|"end","turn"}`"#,
+            r#"{"session","cwd","interactive","caps","turn","agents"}"#,
+            r#"`[{"agent_id","turn"},…]`"#,
+        ] {
+            assert!(
+                streamed.description.contains(named),
+                "GET /events 200 must name {named}"
+            );
+        }
+
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| rows.get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        for body in [
+            serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true}),
+            serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "turn_start", "turn": "m1"}),
+            serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "agent_turn", "agent_id": "a1", "state": "start", "turn": "t1"}),
+        ] {
+            assert_eq!(hub.event(100, body.to_string().as_bytes()).0, 200, "{body}");
+        }
+        let ctx_bridge = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            hub,
+        );
+        let events = call(&ctx_bridge, &req("GET", "/api/v1/events", Some(TOKEN), ""));
+        assert_eq!(events.status, 200);
+        let rendered = render_stream(
+            events,
+            std::time::Instant::now() + std::time::Duration::from_millis(300),
+        );
+        let rendered_text = String::from_utf8_lossy(&rendered);
+        let snapshot = rendered_text
+            .split("event: session.snapshot\ndata: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or_else(|| panic!("the stream opens with a snapshot: {rendered_text:?}"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(snapshot).expect("snapshot json")["sessions"],
+            serde_json::json!([{"session": FIXTURE_ID, "cwd": "/w", "interactive": true, "caps": [], "turn": "m1", "agents": [{"agent_id": "a1", "turn": "t1"}]}])
+        );
+    }
 
     let switched = call(
         &ctx,
@@ -5343,8 +5507,8 @@ fn status_body_requires_only_what_every_supported_daemon_sends() {
 }
 
 /// [`status_body_requires_only_what_every_supported_daemon_sends`] for one
-/// `profiles[]` entry: `auto_start_queue` is `#[serde(default)]`, so it is
-/// documented but optional.
+/// `profiles[]` entry: `auto_start_queue` and `plan_end` are
+/// `#[serde(default)]`, so they are documented but optional.
 #[test]
 fn profile_entry_requires_only_what_every_supported_daemon_sends() {
     assert_eq!(
@@ -5374,6 +5538,10 @@ fn profile_entry_requires_only_what_every_supported_daemon_sends() {
     assert!(
         documents("ProfileEntry", "auto_start_queue"),
         "ProfileEntry documents auto_start_queue"
+    );
+    assert!(
+        documents("ProfileEntry", "plan_end"),
+        "ProfileEntry documents plan_end"
     );
     assert!(
         documents("ProfileEntry", "limit_resets"),
@@ -5417,13 +5585,12 @@ fn status_serves_the_banked_resets_each_account_read() {
     assert_eq!(count("alpha"), 2, "alpha reached the route");
 }
 
-/// `SessionRow`'s `via`/`lacks` stay optional (the 2026-10-16 additive-field
-/// ruling): documented, but absent from `required`, so a generated client never
-/// types them as required.
+/// `SessionRow`'s additive `via`/`lacks`/`caps` stay optional: documented, but
+/// absent from `required`, so a generated client never types them as required.
 #[test]
-fn session_row_keeps_via_and_lacks_optional() {
+fn session_row_keeps_its_reach_fields_optional() {
     let required = served_required("SessionRow");
-    for additive in ["via", "lacks"] {
+    for additive in ["via", "lacks", "caps"] {
         assert!(
             documents("SessionRow", additive),
             "SessionRow documents {additive}"

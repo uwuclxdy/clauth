@@ -367,7 +367,25 @@ impl DaemonLock {
     /// running daemon.
     fn active(file: File) -> Self {
         let _ = stamp_pid();
+        // Registered so this image's own re-exec hands the flock's open file
+        // description to the next image.
+        #[cfg(unix)]
+        super::exec_handover::register_lock({
+            use std::os::fd::AsRawFd as _;
+            file.as_raw_fd()
+        });
         Self { _file: file }
+    }
+
+    /// Adopt the lock file the replaced image handed over across the exec:
+    /// the flock rides the open file description and this process already
+    /// holds it, so no claim runs and a parked `--standby` never slips into
+    /// the gap a fresh claim would open. The pid sidecar is stamped as on
+    /// any claim (the exec keeps the pid, so it restamps the same number),
+    /// and the descriptor is registered for this image's own next re-exec.
+    #[cfg(unix)]
+    pub(crate) fn adopt_handed_over(file: File) -> Self {
+        Self::active(file)
     }
 }
 
@@ -779,15 +797,8 @@ pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
 /// operator re-runs against the settled successor rather than signalling blind.
 #[cfg(target_os = "linux")]
 fn pid_is_clauth_daemon(pid: u32) -> bool {
-    // `/proc/<pid>/cmdline` is NUL-separated argv; a gone pid fails the read.
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    cmdline_is_daemon(
-        raw.split(|&b| b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| a.to_vec()),
-    )
+    // A gone pid and a thread's id read no argv.
+    crate::runtime::process_argv(pid).is_some_and(|argv| cmdline_is_daemon(argv.into_iter()))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]

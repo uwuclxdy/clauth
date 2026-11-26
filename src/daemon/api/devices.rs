@@ -11,6 +11,8 @@
 //! owner-only writer, and reaches the disk before anything that depends on it
 //! moves ([`write_store`]).
 
+#[cfg(all(test, unix))]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -417,19 +419,53 @@ pub(crate) fn seed_for_tests(name: &str, tier: Tier, token: &str) -> Result<()> 
     })
 }
 
+/// Flush the directory entry the atomic writer's rename landed in: the file's
+/// own bytes are already synced by [`atomic_write_600`], and the rename lives
+/// in the directory, so only its sync makes the new name outlast a crash. A
+/// failed sync returns an error after the new file has replaced the old one:
+/// the caller stops before what it deletes next, while readers already see
+/// the new bytes. Unix only; elsewhere there is no directory sync to take.
 pub(super) fn sync_to_disk(path: &Path) -> std::io::Result<()> {
-    // Opened for writing: `FlushFileBuffers` wants a writable handle on Windows.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .sync_all()?;
-    // The rename lives in the directory entry, so only the directory's sync
-    // makes it outlast a crash.
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+        let synced = std::fs::File::open(dir)?.sync_all();
+        #[cfg(test)]
+        let synced = take_dir_sync_fault(path).and(synced);
+        synced?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
+}
+
+/// The paths whose next directory sync fails, as a failing disk's `sync_all`
+/// would. One-shot and per path, so a sibling store's write is unaffected;
+/// every test that arms it holds a sandbox, whose lock serializes them.
+#[cfg(all(test, unix))]
+static DIR_SYNC_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_dir_sync(path: &Path) {
+    if let Ok(mut faults) = DIR_SYNC_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The directory sync's result in a test build: an armed fault answers in
+/// place of the real call's, so the flush's handling of a failed sync is what
+/// a test exercises.
+#[cfg(all(test, unix))]
+fn take_dir_sync_fault(path: &Path) -> std::io::Result<()> {
+    let planted = DIR_SYNC_FAULTS
+        .lock()
+        .is_ok_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted directory sync fault"))
+    } else {
+        Ok(())
+    }
 }
 
 /// The device `presented` authenticates as, or `None`. A request with no

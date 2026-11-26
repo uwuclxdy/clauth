@@ -42,8 +42,8 @@ use crate::claude::{
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
-    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
-    parse_threshold, threshold_for,
+    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, StartupSwitch, SwitchAction,
+    auto_switch_if_needed, parse_threshold, threshold_for,
 };
 use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
@@ -953,9 +953,10 @@ pub(crate) enum GlobalConfigRow {
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
     /// Background self-update (`AppState.update.auto_update`) — ON by default.
-    /// The binary updater reads it at next launch, the daemon's herdr leg on
-    /// its next reload, a new MCP server at startup (`check on launch`; no
-    /// live process is cancelled). The row renders the persisted value and
+    /// Every running update loop reads it before its next hourly check (a
+    /// daemon or TUI that started with it off runs no loop until it restarts),
+    /// the daemon's herdr leg on its next reload, a new MCP server at startup.
+    /// The row renders the persisted value and
     /// stays editable even under `CLAUTH_NO_UPDATE=1`, which still disables
     /// every leg until the env var goes. ENUMERATED on/off, ⏎ mirrors space.
     AutoUpdate,
@@ -2793,6 +2794,201 @@ pub(crate) enum Modal {
     /// A capture's login matches no stored one but looks like an account's:
     /// save it into that account, capture it as a new one, or cancel.
     CaptureOwner(CaptureOwnerForm),
+    /// clauth put a lost `cleanupPeriodDays` back: keep the number or remove
+    /// it.
+    TranscriptCleanup(TranscriptCleanupForm),
+}
+
+/// The `TRANSCRIPT CLEANUP` question over the number clauth put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptCleanupForm {
+    /// The remembered number the question is about.
+    pub(crate) days: u64,
+    /// Focused button: `false` = `keep <days>`, `true` = `remove it`.
+    pub(crate) on_remove: bool,
+}
+
+/// The retention record's keep-or-remove question as this TUI last read it,
+/// and its one `remove it` worker. The record is the question's only source:
+/// a put-back opens it in whichever clauth process ran the check, so the tick
+/// follows the record file's own writes rather than any one writer.
+#[derive(Debug)]
+pub(crate) struct TranscriptCleanup {
+    /// The record's write stamp at the read below; the tick reads the record
+    /// again only when it moves.
+    stamp: Option<StoreStamp>,
+    /// The number whose put-back waits for an answer, as last read.
+    question: Option<u64>,
+    /// The number this run already asked about, the open modal's own once it
+    /// follows a changed question. Cleared when a tick reads the record's
+    /// question closed and when a `keep` answer lands, so a later put-back
+    /// asks again; an answer that leaves the record unchanged (a failed keep,
+    /// a closed failed remove) keeps it asked until a restart.
+    asked: Option<u64>,
+    /// A `remove it` worker runs; its result drains each tick.
+    removing: bool,
+    tx: std::sync::mpsc::Sender<anyhow::Result<crate::retention::RemoveOutcome>>,
+    rx: std::sync::mpsc::Receiver<anyhow::Result<crate::retention::RemoveOutcome>>,
+    /// What the question's keys would answer, as a count of its changes:
+    /// every event that changes it moves it, where the event happens
+    /// ([`Self::meaning_changed`]), so a change undone before the next frame
+    /// still counts.
+    meaning: u64,
+    /// The last frame drawn: the meaning it showed and whether the question
+    /// was on top in it. `None` until a frame is drawn.
+    drawn: Option<DrawnMeaning>,
+    /// The clock when the frame loop last found its event queue empty
+    /// ([`App::queue_seen_empty`]): a key read after that may have been typed
+    /// as early as then, so the keys have to have been live at that moment.
+    quiet_at: Option<u64>,
+    /// Whether the frame being drawn showed the buttons live, published by the
+    /// render pass ([`Self::set_drawn_live`]) and taken by
+    /// [`App::frame_drawn`]: the frame's own liveness by the clock the draw
+    /// read, never a recomputation after a draw that returned past the window.
+    drawn_live: std::cell::Cell<bool>,
+}
+
+/// What a drawn frame showed of the transcript question.
+#[derive(Debug, Clone, Copy)]
+struct DrawnMeaning {
+    /// [`TranscriptCleanup::meaning`] when the frame was drawn.
+    meaning: u64,
+    /// The clock ([`App::anim_ms`]) read after the first frame showing this
+    /// meaning returned from its draw.
+    since_ms: u64,
+    /// The clock read after the first frame of this meaning that drew the
+    /// buttons live, `None` until such a frame is drawn: a key typed before it
+    /// was typed before the user could have seen the question's keys act.
+    live_at: Option<u64>,
+    /// The question was the top modal, the one the frame drew.
+    on_top: bool,
+}
+
+/// How long the question's keys do nothing after a frame first shows what
+/// they would answer, so a key typed for what was there before lands
+/// harmlessly.
+const CLEANUP_ARM_MS: u64 = 500;
+
+impl TranscriptCleanup {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            stamp: None,
+            question: None,
+            asked: None,
+            removing: false,
+            tx,
+            rx,
+            meaning: 0,
+            drawn: None,
+            quiet_at: None,
+            drawn_live: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a `remove it` worker runs.
+    pub(crate) fn removing(&self) -> bool {
+        self.removing
+    }
+
+    /// What the question's keys would answer changed: it opened, closed, was
+    /// covered or uncovered, its number changed, or a remove started or
+    /// landed.
+    fn meaning_changed(&mut self) {
+        self.meaning = self.meaning.wrapping_add(1);
+    }
+
+    /// Whether the drawn frame shows the question's buttons live: it shows what
+    /// the keys would answer, the terminal is focused, the window has passed,
+    /// and the event queue was last seen empty no earlier than the window's
+    /// end — the earliest a key read now may have been typed. The render reads
+    /// this; [`Self::keys_live`] adds the live-frame bound.
+    pub(crate) fn buttons_live(&self, now_ms: u64, focus_held: bool) -> bool {
+        let Some(drawn) = self.drawn.filter(|drawn| drawn.meaning == self.meaning) else {
+            return false;
+        };
+        focus_held
+            && now_ms.saturating_sub(drawn.since_ms) >= CLEANUP_ARM_MS
+            && self
+                .quiet_at
+                .is_some_and(|quiet| quiet >= drawn.since_ms.saturating_add(CLEANUP_ARM_MS))
+    }
+
+    /// Whether a key read at `now_ms` reaches the question: the buttons are
+    /// live, and the queue was last seen empty no earlier than the first frame
+    /// drawn live for this meaning. A key read now may have been typed as
+    /// early as that moment, so however late a stalled frame or tick reads it,
+    /// a key typed before the first live frame never answers the question.
+    fn keys_live(&self, now_ms: u64, focus_held: bool) -> bool {
+        self.buttons_live(now_ms, focus_held)
+            && self.drawn.is_some_and(|drawn| {
+                drawn
+                    .live_at
+                    .is_some_and(|live| self.quiet_at.is_some_and(|quiet| quiet >= live))
+            })
+    }
+
+    /// Publish what the frame being drawn shows: the render decides the
+    /// buttons' liveness by the clock it read, and [`App::frame_drawn`] records
+    /// exactly that, so a draw that started inside the window and returned
+    /// past it is no live frame.
+    pub(crate) fn set_drawn_live(&self, live: bool) {
+        self.drawn_live.set(live);
+    }
+
+    /// What the last drawn frame showed live, cleared so a frame drawn without
+    /// the question never leaves a stale mark for a later one.
+    fn take_drawn_live(&self) -> bool {
+        self.drawn_live.replace(false)
+    }
+
+    /// The event queue stood empty at `now_ms`: the earliest a key read later
+    /// may have been typed.
+    fn queue_seen_empty(&mut self, now_ms: u64) {
+        self.quiet_at = Some(now_ms);
+    }
+
+    /// Milliseconds left of the drawn question's window while it is on top and
+    /// its keys are still inert: the frame loop waits no longer, so the frame
+    /// drawn when the window ends shows the buttons live.
+    fn window_left(&self, now_ms: u64) -> Option<u64> {
+        let drawn = self
+            .drawn
+            .filter(|drawn| drawn.meaning == self.meaning && drawn.on_top)?;
+        let left = drawn
+            .since_ms
+            .saturating_add(CLEANUP_ARM_MS)
+            .saturating_sub(now_ms);
+        (left > 0).then_some(left)
+    }
+
+    /// Record the frame just drawn at `now_ms`, which drew the buttons live
+    /// when `live`; whether the events queued ahead of it are to be dropped: it
+    /// shows a meaning no earlier frame showed, and the question is on top in
+    /// it or was in the frame before.
+    fn frame_drawn(&mut self, on_top: bool, now_ms: u64, live: bool) -> bool {
+        let fresh = self.drawn.is_none_or(|drawn| drawn.meaning != self.meaning);
+        let was_on_top = self.drawn.is_some_and(|drawn| drawn.on_top);
+        let since_ms = match self.drawn {
+            Some(drawn) if !fresh => drawn.since_ms,
+            Some(_) | None => now_ms,
+        };
+        let seen_live = self.drawn.and_then(|drawn| drawn.live_at);
+        let live_at = if fresh {
+            None
+        } else if live {
+            seen_live.or(Some(now_ms))
+        } else {
+            seen_live
+        };
+        self.drawn = Some(DrawnMeaning {
+            meaning: self.meaning,
+            since_ms,
+            live_at,
+            on_top,
+        });
+        fresh && (on_top || was_on_top)
+    }
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -5785,8 +5981,10 @@ pub(crate) struct App {
     /// a clamp) returns the cursor to it where the item set still holds it. A
     /// claude row is remembered as `profile_cursor` itself (the stored index
     /// is ignored, never a copy), a codex or pool row literally, so a pick on
-    /// another tab lands the Overview there for free while a codex/pool row
-    /// stays put; a filter merely hides it, so the round trip restores it.
+    /// another tab lands the Overview there for free (a disabled account, which
+    /// has no row there, excepted: the placement clamps and
+    /// [`App::overview_held`] keeps the pick) while a codex/pool row stays put;
+    /// a filter merely hides it, so the round trip restores it.
     pub(crate) overview_remembered: Option<MainItemKind>,
     /// The disabled claude account the shared selection named when the
     /// Overview was entered over it, with the shared cursor's move count right
@@ -5911,7 +6109,8 @@ pub(crate) struct App {
     /// width at which the Overview accounts row still reads whole (the binding
     /// surface; the Fallback picker and blurb fit narrower).
     pub(crate) below_width_floor: bool,
-    /// Startup update check result; drained in `on_tick`. Silent on errors.
+    /// The update loop's results, each version once; drained in `on_tick`.
+    /// Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
@@ -6033,6 +6232,13 @@ pub(crate) struct App {
     /// holds exactly while it is set, and each change into `Some` tints the
     /// Services tab. Starts `None`, so a first changed reading counts.
     pub(crate) daemon_binary_change: Option<ExeChange>,
+    /// When the daemon feed first read `binary_replaced` true this run, as
+    /// wall-clock ms: the Replaced toast and card line wait until the feed
+    /// has said so continuously for [`DAEMON_BINARY_REPLACED_GRACE_MS`] — a
+    /// daemon that re-execs itself flips the feed back to false inside its
+    /// two-tick detection window and must never trip the advice. `None`
+    /// while no grace runs. UI-thread-only.
+    pub(crate) daemon_binary_replaced_since_ms: Option<u64>,
     /// The kinds of daemon binary change whose toast was raised; each kind
     /// toasts once per run.
     pub(crate) daemon_toasted_kinds: ToastedKinds,
@@ -6040,6 +6246,8 @@ pub(crate) struct App {
     /// each kind toasts once per run, never on a probe made while this
     /// process's own self-update holds its mark.
     pub(crate) own_toasted_kinds: ToastedKinds,
+    /// Whether this run already toasted a higher major release.
+    pub(crate) major_release_toasted: bool,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -6056,6 +6264,8 @@ pub(crate) struct App {
     /// its account's spend is in flight shows `Spending`, so a press cannot
     /// start a second spend. UI-thread-only.
     pub(crate) limit_reset_in_flight: HashSet<String>,
+    /// The `TRANSCRIPT CLEANUP` question and its `remove it` worker.
+    pub(crate) transcript_cleanup: TranscriptCleanup,
     /// Where a TUI spend's calls go: the live endpoints, and in a test build a
     /// port nothing answers until a test points it at its own stub, so no test
     /// can reach a live account.
@@ -6150,6 +6360,12 @@ pub(crate) struct App {
     pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
+    /// Whether the terminal reports itself focused. Frames drawn while it is
+    /// lost are unseen, so the transcript question's keys stay inert and its
+    /// buttons faint until focus returns; tracked whether or not the question
+    /// is open, and held at start so a terminal that sends no focus report
+    /// keeps the behaviour the drawn window alone gives.
+    pub(crate) focus_held: bool,
     /// Header mascot playback: one big animation at launch, then a
     /// [`mascot::Cue`] a producer raises or a quiet key's hello, under the
     /// slot rules in [`mascot::Stage`].
@@ -6162,11 +6378,22 @@ pub(crate) struct App {
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
+    /// The animation phase a scripted event source moves during the frame
+    /// loop's own wait or drop, so a test can put a clock step inside one
+    /// pass; read before `anim_phase_ms`. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) anim_phase_shared: Option<Arc<AtomicU64>>,
     /// Pinned wall clock for render tests that must advance a tps snapshot past
     /// its stale window without sleeping. `fresh_tps` reads this when set, so
     /// freshness is still judged per call. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) tps_now_override: Option<u64>,
+    /// Pinned wall clock for tests that must advance the daemon
+    /// binary-replaced grace without sleeping; [`App::daemon_now_ms`] reads
+    /// this when set, the same shape [`App::tps_now_ms`] uses. Never compiled
+    /// into the binary.
+    #[cfg(test)]
+    pub(crate) daemon_now_override: Option<u64>,
     /// The day-list notices last surfaced, empty while the lists are ordinary.
     /// Holding the MESSAGES rather than a flag is what makes the gate right on
     /// both axes `AppConfig::day_claim_collision` documents: each string
@@ -6758,7 +6985,7 @@ impl App {
             }
         }
 
-        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
+        // Start the hourly update loop; each result lands in `update_results`, toasted from `on_tick`.
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
         let update_handle = update::spawn(update_sender, config.state.update.auto_update);
 
@@ -7048,8 +7275,10 @@ impl App {
             gateway_unrun: false,
             left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
             daemon_binary_change: None,
+            daemon_binary_replaced_since_ms: None,
             daemon_toasted_kinds: ToastedKinds::default(),
             own_toasted_kinds: ToastedKinds::default(),
+            major_release_toasted: false,
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -7057,6 +7286,7 @@ impl App {
             limit_reset_rx,
             limit_reset_tx,
             limit_reset_in_flight: HashSet::new(),
+            transcript_cleanup: TranscriptCleanup::new(),
             reset_urls: if cfg!(test) {
                 crate::usage::codex_reset::ResetUrls {
                     list: "http://127.0.0.1:9/list".to_string(),
@@ -7106,12 +7336,17 @@ impl App {
             snapshot,
             unsaved_live_login: false,
             started_at: Instant::now(),
+            focus_held: true,
             mascot,
             mascot_seen,
             #[cfg(test)]
             anim_phase_ms: None,
             #[cfg(test)]
+            anim_phase_shared: None,
+            #[cfg(test)]
             tps_now_override: None,
+            #[cfg(test)]
+            daemon_now_override: None,
             day_claim_notices: Vec::new(),
             name_notices: Vec::new(),
             tick_count: 0,
@@ -7201,6 +7436,9 @@ impl App {
         refresh_shunt_mark(&mut app);
         app.refresh_unsaved_live_login();
         app.refresh_form_predicates();
+        // Under the re-bind offer, so the offer is asked first, as at any
+        // start, and the transcript question after it.
+        open_startup_transcript_cleanup(&mut app);
         let rebind_form = {
             let config = app.config();
             Self::startup_rebind_form(&config)
@@ -7286,9 +7524,9 @@ impl App {
     /// landing done in `[herdr] first_landing_done` — once, forever. Every other
     /// launch — a plain TUI, and herdr after the first — opens the top-level
     /// `home_tab` (default overview); the herdr header tag is unaffected. A modal
-    /// already open at construction (the startup re-bind confirm) also takes the
-    /// non-landing arm and leaves `first_landing_done` UNSET, so the next herdr
-    /// launch still lands. The
+    /// already open at construction (the startup re-bind confirm or transcript
+    /// cleanup question) also takes the non-landing arm and leaves
+    /// `first_landing_done` UNSET, so the next herdr launch still lands. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
     /// lands on the herdr row by label in the recompute that adopts the probe,
@@ -7407,14 +7645,63 @@ impl App {
         crate::usage::now_ms()
     }
 
+    /// The wall clock the daemon binary-replaced grace reads: the test
+    /// override when pinned, else the real clock — the same clock and
+    /// override shape [`App::tps_now_ms`] gives the tps cache's age.
+    pub(crate) fn daemon_now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = self.daemon_now_override {
+            return ms;
+        }
+        crate::usage::now_ms()
+    }
+
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
     /// opened, wrapped by each effect's own period.
     pub(crate) fn anim_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.anim_phase_shared {
+            return clock.load(Ordering::Relaxed);
+        }
         #[cfg(test)]
         if let Some(ms) = self.anim_phase_ms {
             return ms;
         }
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Record the frame the loop just drew, its draw returned: a frame showing
+    /// the transcript question's keys a meaning no earlier frame showed starts
+    /// their wait from the clock read now, and the first frame that drew them
+    /// live is the earliest a key typed for the question can have arrived. What
+    /// the frame drew came from the render pass, not a recomputation now, so a
+    /// draw that started inside the window and returned past it is no live
+    /// frame. Whether the events already queued are to be dropped: typed before
+    /// this frame, they were meant for what it replaced.
+    #[must_use]
+    pub(super) fn frame_drawn(&mut self) -> bool {
+        let on_top = matches!(self.modals.last(), Some(Modal::TranscriptCleanup(_)));
+        let now_ms = self.anim_ms();
+        let live = self.transcript_cleanup.take_drawn_live() && on_top;
+        self.transcript_cleanup.frame_drawn(on_top, now_ms, live)
+    }
+
+    /// The event queue stood empty at the clock read now: the earliest a key
+    /// read next may have been typed, and so a moment the transcript
+    /// question's keys have to have been live at to answer it.
+    pub(super) fn queue_seen_empty(&mut self) {
+        let now_ms = self.anim_ms();
+        self.transcript_cleanup.queue_seen_empty(now_ms);
+    }
+
+    /// How long the frame loop's next wait may last at most: the remainder of
+    /// the drawn question's key window while it is on top and its keys are
+    /// still inert, so the frame drawn when the window ends shows the buttons
+    /// live.
+    pub(super) fn key_window_wait(&self) -> Option<Duration> {
+        self.transcript_cleanup
+            .window_left(self.anim_ms())
+            .map(Duration::from_millis)
     }
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
@@ -7814,22 +8101,29 @@ impl App {
             }
         };
         match switched {
-            Some(SwitchAction::To(target)) => {
+            Some(StartupSwitch {
+                action: SwitchAction::To(target),
+                left,
+            }) => {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
+                let target = ProfileName::from(target);
                 let key_rejected = self.key_rejected_names();
-                let returned = self
-                    .config()
-                    .is_home_today(&ProfileName::from(target.clone()), &key_rejected);
+                let returned = self.config().is_home_today(&target, &key_rejected);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
                     format!("auto-switched to '{target}'")
                 };
+                log_auto_switch(self, left.as_ref(), &target);
                 self.toast(ToastKind::Warning, msg);
             }
-            Some(SwitchAction::Off) => {
+            Some(StartupSwitch {
+                action: SwitchAction::Off,
+                left,
+            }) => {
+                log_switch_off(self, left.as_ref());
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
@@ -8514,36 +8808,57 @@ impl App {
         self.modal_generation
             .set(self.modal_generation.get().wrapping_add(1));
         // Opening any modal (help, the action menu, a confirm, a login) moves
-        // focus away: an armed codex/pool 2-step disarms and its label restores
-        // (the cloudy-tui Inline 2-step rule).
+        // focus away: an armed codex/pool 2-step disarms and its label restores.
         disarm_codex_2step(self);
         disarm_pool_2step(self);
+        // The transcript question opening, or a modal covering it.
+        if matches!(modal, Modal::TranscriptCleanup(_)) || self.cleanup_stacked() {
+            self.transcript_cleanup.meaning_changed();
+        }
         self.modals.push(modal);
     }
 
-    /// Every modal closes here. The [`open_modal`] bump alone carries the
-    /// scroll soundness (a reopen bumps the generation past any bound published
-    /// before it), so the close bump is belt-and-braces.
+    /// Every modal closes here. The [`Self::open_modal`] bump alone carries
+    /// the scroll soundness (a reopen bumps the generation past any bound
+    /// published before it), so the close bump is belt-and-braces.
     pub(crate) fn pop_modal(&mut self) -> Option<Modal> {
+        let stacked = self.cleanup_stacked();
         let popped = self.modals.pop();
         if popped.is_some() {
             self.modal_generation
                 .set(self.modal_generation.get().wrapping_add(1));
+            // The transcript question closing, or a modal over it closing.
+            if stacked {
+                self.transcript_cleanup.meaning_changed();
+            }
         }
         popped
     }
 
     /// Drop every modal matching `pred` and bump the modal generation once
     /// when any dropped, so a scroll bound published before the close is
-    /// stale. The login modals close through here; [`pop_modal`] covers the
-    /// top-modal pop.
+    /// stale. The login modals close through here; [`Self::pop_modal`] covers
+    /// the top-modal pop.
     fn retain_modals(&mut self, pred: impl Fn(&Modal) -> bool) {
+        let stacked = self.cleanup_stacked();
         let before = self.modals.len();
         self.modals.retain(pred);
         if self.modals.len() != before {
             self.modal_generation
                 .set(self.modal_generation.get().wrapping_add(1));
+            // The transcript question closing, or a modal over it closing.
+            if stacked {
+                self.transcript_cleanup.meaning_changed();
+            }
         }
+    }
+
+    /// Whether the transcript question is anywhere in the modal stack, so a
+    /// write to the stack can change what its keys answer.
+    fn cleanup_stacked(&self) -> bool {
+        self.modals
+            .iter()
+            .any(|m| matches!(m, Modal::TranscriptCleanup(_)))
     }
 
     /// Every write of [`App::gateway_state`] after construction lands here.
@@ -9376,8 +9691,9 @@ impl App {
     }
 
     /// The disabled account the shared selection names: the Overview gives it
-    /// no row, so the entry placement moves the shared cursor onto a shown
-    /// row, and [`App::overview_held`] puts the selection back on leave.
+    /// no row, so the entry placement moves the shared cursor onto the shown
+    /// claude row it lands on (a codex or pool landing leaves it), and
+    /// [`App::overview_held`] puts the selection back on leave.
     fn hidden_claude_selection(&self) -> Option<ProfileName> {
         let cursor = self.profile_cursor.read();
         if !self.is_disabled_item(MainItemKind::Profile(cursor)) {
@@ -10183,6 +10499,20 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
         Tab::Services => handle_services_key(app, key),
+    }
+}
+
+/// The terminal lost or regained focus. Frames drawn while it is lost are
+/// unseen, so the transcript question's keys are inert and its buttons draw
+/// faint ([`TranscriptCleanup::keys_live`]) until a regain; a regain while the
+/// question is in the modal stack changes what its keys would answer, so it
+/// bumps the one count at its site, and the next drawn frame starts a fresh
+/// window and drops the keys queued at it. Every focus event reaches here
+/// whatever is on screen; nothing else reacts to it.
+pub(super) fn handle_focus(app: &mut App, held: bool) {
+    app.focus_held = held;
+    if held && app.cleanup_stacked() {
+        app.transcript_cleanup.meaning_changed();
     }
 }
 
@@ -14196,10 +14526,17 @@ pub(crate) fn herdr_check(
 }
 
 /// The Services tab's `rex` row (experimental, read-only): the clauth plugin
-/// beside Rex's config and whether a pane-label watcher runs.
+/// beside Rex's config and whether a pane-label watcher runs. A missing or
+/// stale install names `clauth rex install`, the command that writes it; the
+/// row itself runs nothing.
 pub(crate) fn rex_check(status: &crate::rex::RexStatus) -> Check {
     let this = env!("CARGO_PKG_VERSION");
     let mut detail = Vec::new();
+    let install_hint = match &status.plugin {
+        crate::rex::PluginDir::Absent => true,
+        crate::rex::PluginDir::Managed { version } => version != this,
+        _ => false,
+    };
     let health = match &status.plugin {
         crate::rex::PluginDir::Absent => {
             detail.push("plugin: not installed".to_string());
@@ -14262,6 +14599,10 @@ pub(crate) fn rex_check(status: &crate::rex::RexStatus) -> Check {
         }
     ));
     detail.push("experimental: may change in any release".to_string());
+    if install_hint {
+        detail.push(String::new());
+        detail.push(format!("  {}", prose::cmd("clauth rex install")));
+    }
     Check {
         label: "rex",
         health,
@@ -19297,9 +19638,10 @@ fn activate_main_item(app: &mut App) {
     }
 }
 
-/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` swaps the account under the
-/// Overview cursor between, `None` off an account row or at that end of the
-/// roster.
+/// The roster slots a `⇧↑` (`delta` < 0) or `⇧↓` moves the account under the
+/// Overview cursor between: its own and the next claude row the Overview
+/// shows that way, past any disabled account; `None` off a claude row or
+/// at that end of the shown claude rows.
 fn main_reorder_slots(app: &App, delta: i32) -> Option<(usize, usize)> {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return None;
@@ -19506,7 +19848,7 @@ where
                 }
                 let gate = if self.settling {
                     SwitchGate::Held(BareItemOutcome::Settled(Err(anyhow::anyhow!(
-                        BARE_ITEM_WORKER_PANICKED
+                        WORKER_PANICKED
                     ))))
                 } else {
                     SwitchGate::Gated {
@@ -19659,8 +20001,8 @@ fn spawn_bare_item_settle(app: &mut App, write: BareItemWrite) {
     });
 }
 
-/// The second line of the toast a held write's panicked worker leaves.
-const BARE_ITEM_WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
+/// The second line of the failure toast a panicked worker's answer lands as.
+const WORKER_PANICKED: &str = "clauth hit an internal error, restart clauth";
 
 /// A bare-item worker's answer for its held write. Dropped unsent, as a
 /// panicked worker drops it, it posts a failed settle, so the write the user
@@ -19694,10 +20036,10 @@ impl BareItemAnswerGuard {
 impl Drop for BareItemAnswerGuard {
     fn drop(&mut self) {
         if let Some(write) = self.write.take() {
-            let _ = self.tx.send(BareItemAnswer {
+            drop(self.tx.send(BareItemAnswer {
                 write,
-                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED))),
-            });
+                outcome: BareItemOutcome::Settled(Err(anyhow::anyhow!(WORKER_PANICKED))),
+            }));
         }
     }
 }
@@ -20273,7 +20615,7 @@ fn finalize_switch(
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
-    let outgoing = app.config().state.active_profile.as_ref().cloned();
+    let outgoing = Option::clone(&app.config().state.active_profile);
     // An account whose config is unclassifiable gets no prompt: no answer
     // can tell whether the live login belongs in it.
     if let Err(e) = crate::actions::refuse_switch_off_unclassifiable(outgoing.as_ref(), name) {
@@ -20284,9 +20626,9 @@ fn finalize_switch(
         );
         return;
     }
-    if let Some(active) = outgoing
-        && active != *name
-        && active_diverged_unsaved(&active)
+    if let Some(active) = outgoing.as_ref()
+        && active != name
+        && active_diverged_unsaved(active)
     {
         clear_activity(&app.activity, name);
         prompt_divergence(app, active.to_string(), "switching");
@@ -20296,9 +20638,19 @@ fn finalize_switch(
     let result = switch_profile_gated(&app.config, name, gated);
     clear_activity(&app.activity, name);
     match result {
-        Ok(_switched) => {
+        Ok(outcome) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            // A queued switch is the chain's own move: leave its line in
+            // clauth.log, which outlives the toast below. The account named is
+            // the one the switch's own hold found active, never `outgoing`,
+            // the copy read before it.
+            if queued {
+                log_auto_switch(app, outcome.left.as_ref(), name);
+            }
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
@@ -20315,11 +20667,65 @@ fn finalize_switch(
     }
 }
 
+/// Resolve the account behind a chain-move log line and the reading it left.
+/// The config guard holds a clone and nothing else, and is dropped before the
+/// disk read a copy miss needs and before either store is locked: the stores
+/// rank below `Config`. A peer's rename, or an account it added and switched
+/// onto, is on disk alone until the next reload. `None` when no profile loads:
+/// the line still names the account and reads no figure.
+fn left_account(app: &App, name: &ProfileName) -> Option<crate::fallback::LeftAccount> {
+    let cached = app.config().find(name).cloned();
+    crate::fallback::left_account(name, cached, &app.usage_store, &app.third_party_usage_store)
+}
+
+/// Log an auto-switch the chain made from `from` to `to`
+/// ([`crate::fallback::auto_switch_log_line`]) with `from`'s last reading and
+/// how long ago it read it. The name is the switch's own result, so it rides
+/// the line whatever loads. A move onto the account already active logs
+/// nothing.
+fn log_auto_switch(app: &App, from: Option<&ProfileName>, to: &ProfileName) {
+    if from == Some(to) {
+        return;
+    }
+    let left = from.and_then(|name| left_account(app, name));
+    let key_rejected = app.key_rejected_names();
+    let line = {
+        let cfg = app.config();
+        crate::fallback::auto_switch_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            from.map(ProfileName::as_str),
+            to.as_str(),
+            cfg.is_home_today(to, &key_rejected),
+            left.as_ref(),
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
+}
+
+/// Log a chain switch-off ([`crate::fallback::switch_off_log_line`]) with the
+/// account it left and that account's last reading. Only a switch-off the chain
+/// decided is logged this way. A switch-off that left no account — disk already
+/// switched off — logs the bare line, the shape the daemon's twin writes.
+fn log_switch_off(app: &App, left: Option<&ProfileName>) {
+    let account = left.and_then(|name| left_account(app, name));
+    let line = {
+        let cfg = app.config();
+        crate::fallback::switch_off_log_line(
+            crate::logline::role(crate::logline::stamped()),
+            left.map(ProfileName::as_str),
+            account.as_ref(),
+            cfg.state.weekly_switch_threshold_pct(),
+        )
+    };
+    crate::logline::logline!("{line}");
+}
+
 /// Turn off all accounts on the UI thread. Mirrors `finalize_switch`'s
 /// divergence guard: an unsaved `/login` must be resolved before clearing live
 /// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
+    let Some(active) = Option::clone(&app.config().state.active_profile) else {
         return;
     };
     if active_diverged_unsaved(&active) {
@@ -20331,9 +20737,13 @@ fn perform_switch_off(app: &mut App) {
     };
     let result = switch_off(&app.config);
     match result {
-        Ok(()) => {
+        Ok(departed) => {
             app.refresh_tokens();
+            // The forgets land before the line, as they do in the daemon: a
+            // pending forget says the account's stored identity moved, so its
+            // cached figures are no longer that account's to report.
             app.apply_forgets();
+            log_switch_off(app, departed.as_ref());
             app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
@@ -21440,9 +21850,9 @@ fn toggle_preemptive_rotation(app: &mut App) {
 }
 
 /// Flip the background self-update (`[update].auto_update`, default on). Same
-/// persistence shape as `toggle_preemptive_rotation`; `check on launch` timing
-/// — the binary updater reads the flag at next launch, the daemon's herdr leg
-/// on its next reload, a new MCP server at startup. The row stays live under
+/// persistence shape as `toggle_preemptive_rotation`; every running update
+/// loop reads the saved flag before its next hourly check, the daemon's herdr
+/// leg on its next reload, a new MCP server at startup. The row stays live under
 /// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
 /// env var keeps overriding it until it goes.
 fn toggle_auto_update(app: &mut App) {
@@ -23010,6 +23420,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::BareItem(_) => handle_bare_item_key(app, key),
         Modal::BareItemOwner(_) => handle_bare_item_owner_key(app, key),
         Modal::CaptureOwner(_) => handle_capture_owner_key(app, key),
+        Modal::TranscriptCleanup(_) => handle_transcript_cleanup_key(app, key),
     }
 }
 
@@ -25848,7 +26259,11 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         ),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
-        effort: InputState::new(profile.and_then(|p| p.effort.as_deref()).unwrap_or("")),
+        effort: InputState::new(
+            &profile
+                .and_then(crate::model_effort::row_level)
+                .unwrap_or_default(),
+        ),
         opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
@@ -26985,7 +27400,9 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::Model => profile
             .and_then(|p| p.models.default.clone())
             .unwrap_or_default(),
-        ConfigRow::Effort => profile.and_then(|p| p.effort.clone()).unwrap_or_default(),
+        ConfigRow::Effort => profile
+            .and_then(crate::model_effort::row_level)
+            .unwrap_or_default(),
         ConfigRow::OpusModel => profile
             .and_then(|p| p.models.opus.clone())
             .unwrap_or_default(),
@@ -27041,6 +27458,19 @@ fn commit_config_field(app: &mut App, field: ConfigRow) -> CommitResult {
         .unwrap_or(true);
     if is_new {
         if let Some(d) = app.config_draft.as_mut() {
+            if field == ConfigRow::Effort
+                && crate::model_effort::invalid_row_level(
+                    crate::model_effort::names_one_model(d.model.trimmed()),
+                    d.effort.trimmed(),
+                )
+            {
+                return CommitResult::Refused;
+            }
+            if field == ConfigRow::Model
+                && let Some(seed) = &d.field_seed
+            {
+                reseed_new_effort(&mut d.effort, seed.trim(), d.model.trimmed());
+            }
             d.active = None;
             // A name edit retires the refusals the old name carried.
             if field == ConfigRow::Name {
@@ -27119,9 +27549,19 @@ fn commit_model_field(app: &mut App, field: ConfigRow) -> bool {
                 let cfg = app.config();
                 row_committed_value(cfg.find(&name), &name, field)
             };
+            let effort = (field == ConfigRow::Model).then(|| {
+                let cfg = app.config();
+                cfg.find(&name)
+                    .and_then(crate::model_effort::row_level)
+                    .unwrap_or_default()
+            });
             if let Some(d) = app.config_draft.as_mut() {
                 if let Some(input) = d.field_mut(field) {
                     *input = InputState::new(&value);
+                }
+                if let Some(effort) = effort {
+                    // The effort row follows the model it now edits.
+                    d.effort = InputState::new(&effort);
                 }
                 d.active = None;
             }
@@ -27157,6 +27597,14 @@ fn commit_effort_field(app: &mut App) -> bool {
         .and_then(|d| d.field(ConfigRow::Effort))
         .map(|i| i.trimmed().to_string())
         .unwrap_or_default();
+    let per_model = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .is_some_and(|p| crate::model_effort::selected_model(&p.models).is_some())
+    };
+    if crate::model_effort::invalid_row_level(per_model, &raw) {
+        return false;
+    }
     let effort = (!raw.is_empty()).then_some(raw);
     let result = {
         let mut cfg = app.config();
@@ -27378,6 +27826,7 @@ fn cycle_model(app: &mut App) {
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
             let next = next_model_preset(d.model.trimmed_some().as_deref()).unwrap_or_default();
+            reseed_new_effort(&mut d.effort, d.model.trimmed(), &next);
             d.model = InputState::new(&next);
         }
         return;
@@ -27390,14 +27839,22 @@ fn cycle_model(app: &mut App) {
     };
     match result {
         Ok(()) => {
-            let value = {
+            let (value, effort) = {
                 let cfg = app.config();
-                cfg.find(&name)
-                    .and_then(|p| p.models.default.clone())
-                    .unwrap_or_default()
+                let profile = cfg.find(&name);
+                (
+                    profile
+                        .and_then(|p| p.models.default.clone())
+                        .unwrap_or_default(),
+                    profile
+                        .and_then(crate::model_effort::row_level)
+                        .unwrap_or_default(),
+                )
             };
             if let Some(d) = app.config_draft.as_mut() {
                 d.model = InputState::new(&value);
+                // The effort row follows the model it now edits.
+                d.effort = InputState::new(&effort);
             }
         }
         Err(e) => app.toast(
@@ -27407,6 +27864,15 @@ fn cycle_model(app: &mut App) {
                 escape_control(&error_toast_detail(&e))
             ),
         ),
+    }
+}
+
+/// A new draft has no saved effort for a different model. The account-wide
+/// row still refers to the same value across default and opusplan.
+fn reseed_new_effort(effort: &mut InputState, previous: &str, next: &str) {
+    use crate::model_effort::names_one_model;
+    if previous != next && (names_one_model(previous) || names_one_model(next)) {
+        *effort = InputState::new("");
     }
 }
 
@@ -27436,15 +27902,22 @@ pub(crate) fn cycle_effort(app: &mut App) {
         .map(ProfileName::from);
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
-            let next = next_effort_preset(d.effort.trimmed_some().as_deref()).unwrap_or_default();
+            let per_model = crate::model_effort::names_one_model(&d.model.value);
+            let next = next_effort_preset(d.effort.trimmed_some().as_deref(), per_model)
+                .unwrap_or_default();
             d.effort = InputState::new(&next);
         }
         return;
     };
+    let per_model = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .is_some_and(|p| crate::model_effort::selected_model(&p.models).is_some())
+    };
     let result = {
         let mut cfg = app.config();
         edit_profile_effort(&mut cfg, &name, |slot| {
-            *slot = next_effort_preset(slot.as_deref());
+            *slot = next_effort_preset(slot.as_deref(), per_model);
         })
     };
     match result {
@@ -27452,7 +27925,7 @@ pub(crate) fn cycle_effort(app: &mut App) {
             let value = {
                 let cfg = app.config();
                 cfg.find(&name)
-                    .and_then(|p| p.effort.clone())
+                    .and_then(crate::model_effort::row_level)
                     .unwrap_or_default()
             };
             if let Some(d) = app.config_draft.as_mut() {
@@ -27471,12 +27944,18 @@ pub(crate) fn cycle_effort(app: &mut App) {
 
 /// Advance the `effort` cycle: unset → low → medium → high → xhigh → max →
 /// unset. A value outside [`EFFORT_PRESETS`] (a custom value) collapses to
-/// unset.
-fn next_effort_preset(current: Option<&str>) -> Option<String> {
+/// unset. `per_model` (the `model` row names one model) drops `max`, which
+/// Claude Code does not keep per model ([`crate::model_effort::LEVELS`]).
+pub(crate) fn next_effort_preset(current: Option<&str>, per_model: bool) -> Option<String> {
+    let presets: &[&str] = if per_model {
+        &crate::model_effort::LEVELS
+    } else {
+        &EFFORT_PRESETS
+    };
     match current {
-        None => Some(EFFORT_PRESETS[0].to_string()),
-        Some(cur) => match EFFORT_PRESETS.iter().position(|p| *p == cur) {
-            Some(i) if i + 1 < EFFORT_PRESETS.len() => Some(EFFORT_PRESETS[i + 1].to_string()),
+        None => presets.first().map(|p| (*p).to_string()),
+        Some(cur) => match presets.iter().position(|p| *p == cur) {
+            Some(i) if i + 1 < presets.len() => Some(presets[i + 1].to_string()),
             _ => None,
         },
     }
@@ -28525,6 +29004,15 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, escape_control(&error_toast_detail(&e)));
         return;
     }
+    if crate::model_effort::invalid_row_level(
+        crate::model_effort::selected_model(&models).is_some(),
+        effort.as_deref().unwrap_or_default(),
+    ) {
+        if let Some(index) = config_row_index(app, ConfigRow::Effort) {
+            app.config_action_cursor = index;
+        }
+        return;
+    }
     // A fresh login becomes the active one when none is, linking the live
     // slot. Settled before the gateway mint below, so a held create has
     // minted nothing. A captured live login needs no settle: the capture
@@ -28797,7 +29285,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
                                 crate::claude::BareItemWriter::SignOut,
                             )
                         }))
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)));
                         // The check ends with the settle, not with the
                         // delete's own rescue walk after it.
                         drop(check);
@@ -28995,7 +29483,7 @@ fn start_rolling_switch(app: &mut App, name: &ProfileName) {
                     let settle = catch_unwind(AssertUnwindSafe(|| {
                         settle_bare_keychain_item(source, crate::claude::BareItemWriter::Switch)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!(BARE_ITEM_WORKER_PANICKED)));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)));
                     // The check ends with the settle, not with the arm's
                     // own writes after it.
                     drop(check);
@@ -31136,6 +31624,212 @@ fn store_rebind_digest(app: &mut App, digest: &str) {
             ToastKind::Danger,
             format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
         ),
+    }
+}
+
+/// The `TRANSCRIPT CLEANUP` toast after a `remove it` that landed.
+const CLEANUP_REMOVED: &str =
+    "cleanupPeriodDays removed\nclaude code now deletes transcripts older than 30 days";
+
+/// The head of the Danger toast over a `remove it` that failed.
+const CLEANUP_NOT_REMOVED: &str = "cleanupPeriodDays not removed";
+
+/// Keys on the `TRANSCRIPT CLEANUP` question. `←`/`→` pick the button; `↵`
+/// runs it: `keep <n>` closes the question, `remove it` starts the remove on
+/// its worker. `esc`/`q` are `keep <n>`. While the remove runs only `esc`/`q`
+/// act, closing the modal and leaving the remove's answer to land as a toast,
+/// so a second press starts nothing. Every key does nothing while
+/// [`TranscriptCleanup::keys_live`] is false: the terminal is unfocused, no
+/// drawn frame has shown what the key would answer for [`CLEANUP_ARM_MS`], or
+/// the frame loop last saw its event queue empty before the first frame that
+/// drew that answer's buttons live — so a key typed before the user could have
+/// seen it act changes nothing, however late it is read.
+fn handle_transcript_cleanup_key(app: &mut App, key: KeyEvent) {
+    if !app
+        .transcript_cleanup
+        .keys_live(app.anim_ms(), app.focus_held)
+    {
+        return;
+    }
+    let removing = app.transcript_cleanup.removing;
+    let Some(Modal::TranscriptCleanup(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') if removing => {
+            app.pop_modal();
+        }
+        _ if removing => {}
+        KeyCode::Left | KeyCode::Right => form.on_remove = !form.on_remove,
+        KeyCode::Enter if form.on_remove => {
+            let days = form.days;
+            start_transcript_cleanup_remove(app, days);
+        }
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+            let days = form.days;
+            app.pop_modal();
+            match crate::retention::keep(days) {
+                // The answer closes this question, so a later put-back is a
+                // new one and asks again.
+                Ok(()) => app.transcript_cleanup.asked = None,
+                Err(e) => app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+                ),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Run `remove it` on a worker: it holds the state flock and pauses on a
+/// member Claude Code is mid-write on, never on the key thread. The answer
+/// names the number the modal asked about, so a question that moved on
+/// meanwhile is left alone.
+fn start_transcript_cleanup_remove(app: &mut App, days: u64) {
+    app.transcript_cleanup.removing = true;
+    // `esc`/`q` close the modal now rather than answer `keep <n>`.
+    app.transcript_cleanup.meaning_changed();
+    let tx = app.transcript_cleanup.tx.clone();
+    spawn_worker(move || {
+        let result = cleanup_remove_answer(|| crate::retention::remove(days));
+        drop(tx.send(result));
+    });
+}
+
+/// One answer per worker spawn, a crashed remove included: the drain clears
+/// `removing` off the answer, so a run that sent none would leave the question
+/// unanswerable until a restart.
+fn cleanup_remove_answer(
+    run: impl FnOnce() -> anyhow::Result<crate::retention::RemoveOutcome>,
+) -> anyhow::Result<crate::retention::RemoveOutcome> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!(WORKER_PANICKED)))
+}
+
+/// Land a finished `remove it`: a success closes the modal and says what
+/// Claude Code now does; a question that moved on closes it silently, the
+/// operator's own new number honoured; a failure toasts the remove's own error
+/// and keeps the modal open on `remove it`, the question still open in the
+/// record.
+fn drain_transcript_cleanup(app: &mut App) {
+    while let Ok(result) = app.transcript_cleanup.rx.try_recv() {
+        app.transcript_cleanup.removing = false;
+        // `esc`/`q` answer `keep <n>` again on a modal a failure leaves open.
+        app.transcript_cleanup.meaning_changed();
+        match result {
+            Ok(crate::retention::RemoveOutcome::Removed) => {
+                app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_)));
+                app.toast(ToastKind::Success, CLEANUP_REMOVED);
+            }
+            Ok(crate::retention::RemoveOutcome::Superseded) => {
+                app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_)));
+            }
+            Err(e) => {
+                for modal in &mut app.modals {
+                    if let Modal::TranscriptCleanup(form) = modal {
+                        form.on_remove = true;
+                    }
+                }
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "{CLEANUP_NOT_REMOVED}\n{}",
+                        escape_control(&format!("{e:#}"))
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Ask the record's open question at startup, under the re-bind offer, so both
+/// are asked and the offer comes first, as at any start. The write stamp is
+/// taken before the read, like the tick's, so a record that moves between the
+/// two is re-read on the first tick rather than asking a question that is
+/// gone.
+fn open_startup_transcript_cleanup(app: &mut App) {
+    app.transcript_cleanup.stamp = crate::retention::record_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    let Ok(record) = crate::retention::load() else {
+        return;
+    };
+    let Some(days) = record.open_question() else {
+        return;
+    };
+    open_transcript_cleanup(app, days);
+}
+
+/// Ask the record's open question: at startup before the re-bind offer opens
+/// over it, on the tick only while nothing owns the keyboard
+/// ([`keyboard_owner`]), so no modal ever sits under the question.
+fn open_transcript_cleanup(app: &mut App, days: u64) {
+    app.transcript_cleanup.question = Some(days);
+    app.transcript_cleanup.asked = Some(days);
+    app.open_modal(Modal::TranscriptCleanup(TranscriptCleanupForm {
+        days,
+        on_remove: false,
+    }));
+}
+
+/// Follow the retention record's question: re-read the record when its write
+/// stamp moved, then ask a question this run has not asked yet, follow a
+/// changed number, and close the modal once the question reads closed (another
+/// clauth answered it, or `~/.claude/settings.json` holds a number again), with
+/// no toast. A new question waits while a modal or an editor holds the keys
+/// ([`keyboard_owner`]) and never opens during an exit wait, so keys typed for
+/// one never answer it; the startup call opens it under the re-bind offer
+/// instead, so both are asked. While a remove runs its own answer decides the
+/// modal, so nothing here touches it.
+fn poll_transcript_cleanup(app: &mut App) {
+    if app.transcript_cleanup.removing {
+        return;
+    }
+    let stamp = crate::retention::record_path()
+        .ok()
+        .and_then(|path| store_stamp(&path));
+    let watch = &mut app.transcript_cleanup;
+    if stamp != watch.stamp {
+        watch.stamp = stamp;
+        // A record that cannot be read keeps the last question it held: the
+        // check reports the fault, and an open modal's `remove it` and
+        // `keep` each say why they fail.
+        if let Ok(record) = crate::retention::load() {
+            watch.question = record.open_question();
+        }
+        if watch.question.is_none() {
+            watch.asked = None;
+        }
+    }
+    let (question, asked) = (watch.question, watch.asked);
+    let open = app.cleanup_stacked();
+    match question {
+        Some(days) if open => {
+            // The ask moves with the modal: a question that changed number
+            // under it is this run's ask now, so a failed answer on the new
+            // number is not re-asked and a stale `Superseded` does not spend
+            // the new question's ask.
+            app.transcript_cleanup.asked = Some(days);
+            for modal in &mut app.modals {
+                // A new number is a new question: its `keep <n>` takes the
+                // focus back, as when it opens.
+                if let Modal::TranscriptCleanup(form) = modal
+                    && form.days != days
+                {
+                    *form = TranscriptCleanupForm {
+                        days,
+                        on_remove: false,
+                    };
+                    app.transcript_cleanup.meaning_changed();
+                }
+            }
+        }
+        None if open => app.retain_modals(|m| !matches!(m, Modal::TranscriptCleanup(_))),
+        Some(days) if asked != Some(days) && keyboard_owner(app).is_none() && !app.exit_wait => {
+            open_transcript_cleanup(app, days);
+        }
+        Some(_) | None => {}
     }
 }
 
@@ -33296,6 +33990,15 @@ pub(crate) fn on_tick(app: &mut App) {
                     ),
                 );
             }
+            UpdateEvent::MajorAvailable(v) => {
+                if !app.major_release_toasted {
+                    app.major_release_toasted = true;
+                    app.toast(
+                        ToastKind::Warning,
+                        format!("v{v} is out\nnot installed automatically: read the release note"),
+                    );
+                }
+            }
         }
     }
 
@@ -33453,6 +34156,10 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_services_refresh(app);
     drain_daemon_control(app);
     drain_limit_reset(app);
+    // The drain first: a remove's own answer closes or keeps the modal before
+    // the record it rewrote is read.
+    drain_transcript_cleanup(app);
+    poll_transcript_cleanup(app);
     poll_daemon_health(app);
     poll_tps(app);
     poll_finished_speeds(app);
@@ -33766,12 +34473,38 @@ fn own_binary_completions_refusal(change: ExeChange, stale: bool) -> String {
     }
 }
 
+/// How long the daemon feed must read `binary_replaced` true, continuously,
+/// before the Replaced toast and card line raise: a daemon that re-execs
+/// itself flips the feed back to false inside its two-tick detection window
+/// (a second or two), so the grace spares it the advice; an old daemon holds
+/// the flag until it is restarted and raises after the grace. `Removed`
+/// raises at once — a removed binary never re-execs.
+const DAEMON_BINARY_REPLACED_GRACE_MS: u64 = 10_000;
+
 /// Apply how a fresh daemon's binary changed, from the probe the caller already
-/// read. A change into `Some` tints the Services tab and raises its kind's
-/// toast, once per kind per run; any change rebuilds the plugin card, so its
-/// line follows the feed on this cadence rather than waiting for a Services
-/// recompute.
+/// read. A Replaced reading waits out its grace: nothing applies (no tint, no
+/// toast, no card line) until the feed has read `binary_replaced` true
+/// continuously for [`DAEMON_BINARY_REPLACED_GRACE_MS`], so a daemon
+/// mid-re-exec never trips it; a grace that ends because the daemon went away
+/// raises nothing — a dead daemon already reads as not running — and clearing
+/// it here restarts the wait if a fresh Replaced reading follows. A change
+/// into `Some` tints the Services tab and raises its kind's toast, once per
+/// kind per run; any change rebuilds the plugin card, so its line follows the
+/// feed on this cadence rather than waiting for a Services recompute.
 fn apply_daemon_binary_change(app: &mut App, change: Option<ExeChange>) {
+    match change {
+        Some(ExeChange::Replaced) => {
+            let now = app.daemon_now_ms();
+            let since = *app.daemon_binary_replaced_since_ms.get_or_insert(now);
+            if app.daemon_now_ms().saturating_sub(since) < DAEMON_BINARY_REPLACED_GRACE_MS {
+                return;
+            }
+            app.daemon_binary_replaced_since_ms = None;
+        }
+        _ => {
+            app.daemon_binary_replaced_since_ms = None;
+        }
+    }
     if change == app.daemon_binary_change {
         return;
     }
@@ -34483,14 +35216,18 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
-/// Whether a modal other than the startup re-bind confirm holds the tick: the
-/// confirm never blocks the switch gates, the wrap-off drain, the divergence
-/// poll or bootstrap — a Divergence prompt those raise stacks ABOVE the
-/// confirm. Every other modal keeps the pre-confirm gate, so no prompt stacks
-/// under one. Callers: [`drain_switch_gates`], [`drain_pending_switch_off`],
-/// [`poll_credentials_divergence`], [`maybe_spawn_bootstrap`].
+/// Whether a modal other than the startup re-bind confirm or the transcript
+/// cleanup question holds the tick: neither blocks the switch gates, the
+/// wrap-off drain, the divergence poll or bootstrap — a Divergence prompt
+/// those raise stacks ABOVE them. Every other modal keeps the pre-confirm
+/// gate, so no prompt stacks under one. Callers: [`drain_switch_gates`],
+/// [`drain_pending_switch_off`], [`poll_credentials_divergence`],
+/// [`maybe_spawn_bootstrap`], [`drain_bare_item_answers`],
+/// [`drain_capture_login`] and [`drain_capture_probe`].
 fn blocking_modal_open(app: &App) -> bool {
-    app.modals.iter().any(|m| !matches!(m, Modal::Rebind(_)))
+    app.modals
+        .iter()
+        .any(|m| !matches!(m, Modal::Rebind(_) | Modal::TranscriptCleanup(_)))
 }
 
 /// Complete switches whose off-thread AUTH-1 gate answered: clear the pending
@@ -35071,7 +35808,8 @@ pub(crate) struct Shutdown {
     config: ConfigHandle,
     /// The scheduler's tick thread once bootstrap started it.
     scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
-    /// The update check thread; `None` when the saved toggle is off.
+    /// The update loop's thread; `None` when updates were off at start or the
+    /// thread could not start.
     update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
     /// How many times the shutdown's body started.
     #[cfg(test)]
@@ -35147,9 +35885,9 @@ impl Shutdown {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Wait up to 5 s for the update check to finish, detaching a
-        // still-running check after that (a slow download shouldn't delay TUI
-        // exit) — but a running replace step is waited for, up to
+        // End the update loop: one sleeping between checks ends at once, a
+        // check in flight gets up to 5 s, detached after that (a slow download
+        // shouldn't delay TUI exit) — but a running replace step is waited for, up to
         // `update::REPLACE_WAIT_CAP` (60 s) past those 5 s, so this shutdown
         // path strands the self-replace's staged file beside the binary only
         // behind a replace that outlasts that cap.

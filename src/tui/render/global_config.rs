@@ -324,10 +324,12 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         } else {
             "a /design-login is dropped at the next switch, and outside macOS at any relink"
         }),
+        // On names what the sharing reaches, shared codex sessions included;
+        // off names what stays local and what codex sessions go without.
         GlobalConfigRow::SyncMcpLogins => String::from(if rows.sync_mcp_logins {
-            "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch"
+            "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; every shared codex session uses your codex's MCP server logins"
         } else {
-            "each account keeps its own MCP server logins"
+            "each account keeps its own MCP server logins, and codex sessions get none of your codex's"
         }),
         GlobalConfigRow::RefreshInterval => {
             String::from("how often clauth checks every account's usage")
@@ -383,11 +385,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
         } else {
             "rotate the login only when a request rejects it"
         }),
-        // The on-state hint names the env override plus the timing: the check
-        // runs at launch (and the daemon's herdr leg at its next reload), so
-        // toggling never cancels a live process.
+        // The on-state hint names the env override plus the cadence: every
+        // daemon and TUI checks hourly, reading the saved toggle before each
+        // check, so an off saved here stops the next one everywhere.
         GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
-            "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+            "checks for updates hourly, unless CLAUTH_NO_UPDATE=1"
         } else {
             "no update checks"
         }),

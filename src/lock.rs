@@ -241,13 +241,6 @@ pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
 }
 
 /// Whether this thread holds the state flock right now (any depth).
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the only caller is the macOS copied-bearer re-point"
-    )
-)]
 pub(crate) fn state_lock_held() -> bool {
     DEPTH.get() > 0
 }

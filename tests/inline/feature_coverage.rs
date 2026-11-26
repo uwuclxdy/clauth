@@ -83,6 +83,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "rate_strips",
             "cost_sums",
             "total_cost_counts_unpriced",
+            // The Overview's chip for a plan that bills or ends before its
+            // week resets.
+            "plan_chip_renews_in_n_days_before_the_week_resets",
+            "plan_chip_ends_in_n_days_or_today_before_the_week_resets",
         ],
     ),
     (
@@ -100,6 +104,9 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // `build_status_auto_start_queue_` status tests, and `queue` alone
             // matches every name carrying that substring.
             "auto_start_queue_",
+            // A future `plan_ends` caps the soonest-weekly-reset key, so a
+            // canceled plan is spent before it lapses.
+            "walk_order_soonest_plan_ends_",
         ],
     ),
     (

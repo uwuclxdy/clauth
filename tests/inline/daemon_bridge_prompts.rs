@@ -90,8 +90,18 @@ fn start_older_mod(hub: &Hub, pid: u32, session: &str) {
     assert_eq!(status, 200, "start {session}: {answer}");
 }
 
+/// One poll of a [`start`] session's mod, which announces reports on every
+/// poll as on its start.
 fn commands(hub: &Hub, pid: u32, session: &str) -> serde_json::Value {
-    let (status, answer) = hub.poll(pid, session, Duration::ZERO);
+    polled(hub.poll_as(pid, session, Duration::ZERO, true), session)
+}
+
+/// One poll of a [`start_older_mod`] session's mod: no reports flag.
+fn older_mod_commands(hub: &Hub, pid: u32, session: &str) -> serde_json::Value {
+    polled(hub.poll(pid, session, Duration::ZERO), session)
+}
+
+fn polled((status, answer): (u16, serde_json::Value), session: &str) -> serde_json::Value {
     assert_eq!(status, 200, "poll {session}: {answer}");
     answer["commands"].clone()
 }
@@ -308,7 +318,7 @@ fn an_older_mod_gets_no_prompt_ids() {
         )
     );
     assert_eq!(
-        commands(&hub, 100, "s-one"),
+        older_mod_commands(&hub, 100, "s-one"),
         json!([{"kind": "prompt", "text": "fix it"}])
     );
     assert_eq!(hub.snapshot()["prompts"], json!([]));
@@ -660,11 +670,12 @@ fn queued_prompts_are_capped_even_when_polled_out() {
     minted(&answer);
 }
 
-/// The silence close is a removal path like an `end`: a prompt still queued
-/// when the sweep closes the instance is reported dropped `session_end`
-/// before the `end` status.
+/// The silence close ends the session's stream view but keeps its queued
+/// prompts aside: a module 40 s without a poll may only be stopped, so the
+/// `end` status goes out with no prompt drop, and a reconnecting stream's
+/// snapshot still lists each such prompt `queued` under its session id.
 #[test]
-fn a_silence_close_drops_every_queued_prompt() {
+fn a_silence_close_keeps_every_queued_prompt_listed() {
     let _home = HomeSandbox::new();
     seed_device(DEVICE, Tier::Control, TOKEN);
     let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
@@ -682,16 +693,16 @@ fn a_silence_close_drops_every_queued_prompt() {
     }
     assert_eq!(
         frames,
-        vec![
-            (
-                "session.prompt".to_string(),
-                json!({"session": "s-one", "prompt": id, "state": "dropped", "reason": "session_end"})
-            ),
-            (
-                "session.status".to_string(),
-                json!({"session": "s-one", "state": "end"})
-            ),
-        ]
+        vec![(
+            "session.status".to_string(),
+            json!({"session": "s-one", "state": "end"})
+        )]
+    );
+    let snapshot = hub.snapshot();
+    assert_eq!(snapshot["sessions"], json!([]));
+    assert_eq!(
+        snapshot["prompts"],
+        json!([{"session": "s-one", "prompt": id, "state": "queued"}])
     );
 }
 

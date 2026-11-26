@@ -2,6 +2,9 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "clauth",
   "version": "0.18.2",
+  "engines": {
+    "claude-code": ">=2.1.326"
+  },
   "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
   "author": {
     "name": "uwuclxdy"
