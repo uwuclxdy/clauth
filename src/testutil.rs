@@ -213,6 +213,7 @@ pub(crate) struct HomeSandbox {
     prev_appdata: Option<std::ffi::OsString>,
     prev_ssl_cert_file: Option<std::ffi::OsString>,
     prev_ssl_cert_dir: Option<std::ffi::OsString>,
+    prev_no_api: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
@@ -231,10 +232,6 @@ impl HomeSandbox {
         Self::open(None)
     }
 
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by this sandbox or its caller"
-    )]
     fn open(guard: Option<crate::lockorder::RankedGuard<'static, ()>>) -> Self {
         // A prior test that panicked mid-override leaks it into this one: clear
         // it here (and on drop) so a parallel test never inherits a shortened
@@ -268,50 +265,32 @@ impl HomeSandbox {
         // the only answer, the rule `profile::home_dir` already states for the
         // home. A test that WANTS one pins it with [`ConfigDirSandbox`], which
         // borrows this guard and so always sets it after this clear.
-        let prev_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let prev_config_dir = take_env("CLAUDE_CONFIG_DIR");
         // Same for the live Claude Code session the suite may run under: its
         // session id and process would stamp a minted delegate's host and decide
         // a hook's own process, passing or failing by where the suite ran.
-        let prev_session_id = std::env::var_os("CLAUDE_CODE_SESSION_ID");
-        let prev_claude_pid = std::env::var_os("CLAUDE_PID");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
-            std::env::remove_var("CLAUDE_PID");
-        }
+        let prev_session_id = take_env("CLAUDE_CODE_SESSION_ID");
+        let prev_claude_pid = take_env("CLAUDE_PID");
         // A Windows browser manifest's dir reads this before the home, so it
         // would name the real profile.
-        let prev_appdata = std::env::var_os("APPDATA");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("APPDATA");
-        }
+        let prev_appdata = take_env("APPDATA");
         // The two codex homes this process reads, cleared for the same reason:
         // a suite run from inside a `clauth start` codex session inherits a
         // session `CODEX_HOME` and a carried operator home, and both outrank
-        // the sandbox for `build_codex_home`, the switch and the delete. A
+        // the sandbox for `build_codex_home_with`, the switch and the delete. A
         // test that WANTS one pins it with [`CodexHomeSandbox`] or [`EnvPin`],
         // which borrow this guard and so always set it after this clear.
-        let prev_codex_home = std::env::var_os("CODEX_HOME");
-        let prev_operator_codex_home = std::env::var_os("CLAUTH_OPERATOR_CODEX_HOME");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("CODEX_HOME");
-            std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME");
-        }
+        let prev_codex_home = take_env("CODEX_HOME");
+        let prev_operator_codex_home = take_env("CLAUTH_OPERATOR_CODEX_HOME");
         // The TLS root decision reads these on every agent build: a runner's
         // own bundle would otherwise decide every test's trust store (and the
         // root decision logs a warning inside whichever test builds first). A
         // test that WANTS one pins it with [`EnvPin`].
-        let prev_ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
-        let prev_ssl_cert_dir = std::env::var_os("SSL_CERT_DIR");
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("SSL_CERT_FILE");
-            std::env::remove_var("SSL_CERT_DIR");
-        }
+        let prev_ssl_cert_file = take_env("SSL_CERT_FILE");
+        let prev_ssl_cert_dir = take_env("SSL_CERT_DIR");
+        // The REST kill switch: a runner exporting it would turn every
+        // listener decision under test into the no-API arm.
+        let prev_no_api = take_env("CLAUTH_NO_API");
         Self {
             _tmp: tmp,
             _guard: guard,
@@ -324,6 +303,7 @@ impl HomeSandbox {
             prev_appdata,
             prev_ssl_cert_file,
             prev_ssl_cert_dir,
+            prev_no_api,
         }
     }
 
@@ -333,11 +313,35 @@ impl HomeSandbox {
     }
 }
 
+/// Read `key` and remove it from the process env, for [`HomeSandbox`] to hand
+/// back on drop through [`set_env`].
+#[expect(
+    unsafe_code,
+    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the sandbox or its caller"
+)]
+fn take_env(key: &str) -> Option<std::ffi::OsString> {
+    let prev = std::env::var_os(key);
+    // SAFETY: test-only, called with `HOME_TEST_LOCK` held, restored on drop.
+    unsafe { std::env::remove_var(key) };
+    prev
+}
+
+/// Set `key` to `value`, or remove it for `None`: the one env write behind
+/// every [`HomeSandbox`] restore and [`EnvPin`].
+#[expect(
+    unsafe_code,
+    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by a sandbox or a caller's guard, which every pin borrows"
+)]
+fn set_env(key: &str, value: Option<impl AsRef<std::ffi::OsStr>>) {
+    match value {
+        // SAFETY: test-only, called with `HOME_TEST_LOCK` held.
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        // SAFETY: test-only, called with `HOME_TEST_LOCK` held.
+        None => unsafe { std::env::remove_var(key) },
+    }
+}
+
 impl Drop for HomeSandbox {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, still held here"
-    )]
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // worker still running past the join bound is detached, so its next
@@ -382,39 +386,18 @@ impl Drop for HomeSandbox {
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, still held.
-        match self.prev_config_dir.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-        match self.prev_session_id.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") },
-        }
-        match self.prev_claude_pid.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
-            None => unsafe { std::env::remove_var("CLAUDE_PID") },
-        }
-        match self.prev_codex_home.take() {
-            Some(prev) => unsafe { std::env::set_var("CODEX_HOME", prev) },
-            None => unsafe { std::env::remove_var("CODEX_HOME") },
-        }
-        match self.prev_ssl_cert_file.take() {
-            Some(prev) => unsafe { std::env::set_var("SSL_CERT_FILE", prev) },
-            None => unsafe { std::env::remove_var("SSL_CERT_FILE") },
-        }
-        match self.prev_ssl_cert_dir.take() {
-            Some(prev) => unsafe { std::env::set_var("SSL_CERT_DIR", prev) },
-            None => unsafe { std::env::remove_var("SSL_CERT_DIR") },
-        }
-        match self.prev_operator_codex_home.take() {
-            Some(prev) => unsafe { std::env::set_var("CLAUTH_OPERATOR_CODEX_HOME", prev) },
-            None => unsafe { std::env::remove_var("CLAUTH_OPERATOR_CODEX_HOME") },
-        }
-        match self.prev_appdata.take() {
-            Some(prev) => unsafe { std::env::set_var("APPDATA", prev) },
-            None => unsafe { std::env::remove_var("APPDATA") },
-        }
+        set_env("CLAUDE_CONFIG_DIR", self.prev_config_dir.take());
+        set_env("CLAUDE_CODE_SESSION_ID", self.prev_session_id.take());
+        set_env("CLAUDE_PID", self.prev_claude_pid.take());
+        set_env("CODEX_HOME", self.prev_codex_home.take());
+        set_env("SSL_CERT_FILE", self.prev_ssl_cert_file.take());
+        set_env("SSL_CERT_DIR", self.prev_ssl_cert_dir.take());
+        set_env(
+            "CLAUTH_OPERATOR_CODEX_HOME",
+            self.prev_operator_codex_home.take(),
+        );
+        set_env("APPDATA", self.prev_appdata.take());
+        set_env("CLAUTH_NO_API", self.prev_no_api.take());
         // A non-panicking miss ran the whole teardown above; panic LAST naming
         // the count and the bound. The unwind then drops the guard (poisoning
         // `HOME_TEST_LOCK`, which the next sandbox recovers) and the tempdir.
@@ -434,33 +417,19 @@ const KNOWN_CODEX_KEYS: [(&str, &str); 2] = [
 /// Run `check` over a sandbox built under [`KNOWN_CODEX_KEYS`], with the run's
 /// own values restored before `HOME_TEST_LOCK` is released. One lock is held
 /// across the set, the sandbox and the restore, so the fake values are never
-/// live outside it — not even for an unsandboxed reader.
-#[expect(
-    unsafe_code,
-    reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held here"
-)]
+/// live outside it — not even for an unsandboxed reader — and the pin puts
+/// them back even when `check` panics.
 fn with_known_codex_keys<T>(check: impl FnOnce(HomeSandbox) -> T) -> T {
     let lock = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let originals: Vec<Option<std::ffi::OsString>> = KNOWN_CODEX_KEYS
+    let pins: Vec<(&str, Option<&std::ffi::OsStr>)> = KNOWN_CODEX_KEYS
         .iter()
-        .map(|&(key, _)| std::env::var_os(key))
+        .map(|&(key, value)| (key, Some(std::ffi::OsStr::new(value))))
         .collect();
-    // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored below.
-    for &(key, value) in &KNOWN_CODEX_KEYS {
-        unsafe { std::env::set_var(key, value) };
-    }
+    let pin = EnvPin::under_lock(&lock, &pins);
     let seen = check(HomeSandbox::open_under(&lock));
-    // SAFETY: as above — put back the values the run itself started with.
-    for (&(key, _), prev) in KNOWN_CODEX_KEYS.iter().zip(&originals) {
-        unsafe {
-            match prev {
-                Some(prev) => std::env::set_var(key, prev),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
+    drop(pin);
     drop(lock);
     seen
 }
@@ -507,6 +476,30 @@ fn the_home_sandbox_restores_both_codex_home_keys() {
             "{key} comes back with the value the sandbox found"
         );
     }
+}
+
+/// The REST kill switch is unset for the sandbox's whole life and comes back on
+/// drop: a runner exporting `CLAUTH_NO_API=1` must not turn a listener test's
+/// answer into the no-API arm, nor lose its own value to a later test.
+#[test]
+fn the_home_sandbox_clears_and_restores_the_rest_kill_switch() {
+    let lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pin = EnvPin::under_lock(&lock, &[("CLAUTH_NO_API", Some(std::ffi::OsStr::new("1")))]);
+    let sandbox = HomeSandbox::open_under(&lock);
+    let inside = std::env::var_os("CLAUTH_NO_API");
+    drop(sandbox);
+    let after = std::env::var_os("CLAUTH_NO_API");
+    drop(pin);
+    drop(lock);
+
+    assert_eq!(inside, None, "the kill switch is unset inside the sandbox");
+    assert_eq!(
+        after.as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "the kill switch comes back with the value the sandbox found"
+    );
 }
 
 /// Run a switch fn (`switch_profile`/`switch_off`/`auto_switch_if_needed`, all
@@ -1337,31 +1330,37 @@ impl<'a> ConfigDirSandbox<'a> {
 /// One or more process env pins, restored to their previous values on drop
 /// (even on panic), in reverse order. Same contract as every pin here: the env
 /// is process-global, serialized by `HOME_TEST_LOCK`, so the pin BORROWS the
-/// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
-/// time instead of a race nothing checks.
+/// [`HomeSandbox`] that holds it (or, through `under_lock`, the lock guard
+/// itself); dropping the holder first is E0505 at compile time instead of a
+/// race nothing checks.
 pub(crate) struct EnvPin<'a> {
     prevs: Vec<(String, Option<std::ffi::OsString>)>,
     _home: std::marker::PhantomData<&'a HomeSandbox>,
 }
 
 impl<'a> EnvPin<'a> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
     pub(crate) fn new(_home: &'a HomeSandbox, pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
-        let mut prevs = Vec::with_capacity(pins.len());
-        for &(key, value) in pins {
-            let prev = std::env::var_os(key);
-            // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-            prevs.push((key.to_string(), prev));
-        }
+        Self::pin(pins)
+    }
+
+    /// The same pin for a caller holding `HOME_TEST_LOCK` with no sandbox
+    /// open yet: a value the sandbox must find at open is set here first.
+    fn under_lock(
+        _held: &'a crate::lockorder::RankedGuard<'static, ()>,
+        pins: &[(&str, Option<&std::ffi::OsStr>)],
+    ) -> Self {
+        Self::pin(pins)
+    }
+
+    fn pin(pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
+        let prevs = pins
+            .iter()
+            .map(|&(key, value)| {
+                let prev = std::env::var_os(key);
+                set_env(key, value);
+                (key.to_string(), prev)
+            })
+            .collect();
         Self {
             prevs,
             _home: std::marker::PhantomData,
@@ -1370,19 +1369,9 @@ impl<'a> EnvPin<'a> {
 }
 
 impl Drop for EnvPin<'_> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
     fn drop(&mut self) {
-        // SAFETY: same as `new` — restore the prior values under the same lock.
-        for (key, prev) in self.prevs.iter().rev() {
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
+        for (key, prev) in self.prevs.drain(..).rev() {
+            set_env(&key, prev);
         }
     }
 }
@@ -2263,6 +2252,19 @@ pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::
 /// `subtext0`, `#a6adc8`).
 pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
 
+/// Runs `f` on the local calendar day, again whenever the day turned while it
+/// ran, so a pin seeded off `today` and a render reading its own clock always
+/// agree on the day, a run straddling local midnight included.
+pub(crate) fn on_one_local_day<T>(mut f: impl FnMut(chrono::NaiveDate) -> T) -> T {
+    loop {
+        let today = chrono::Local::now().date_naive();
+        let out = f(today);
+        if chrono::Local::now().date_naive() == today {
+            return out;
+        }
+    }
+}
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
@@ -2277,11 +2279,14 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         env: Default::default(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -2568,8 +2573,9 @@ pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
 
 /// Writes `name`'s claude banked-reset reading (`limit_resets.json`, the
 /// scheduler's hourly side read or the CLI's post-spend refresh) with no banked
-/// total, as an older reading stores it: the usable count, the next grant's raw
-/// window names and end, and the read's own epoch-ms stamp.
+/// total and no grant, as an older clauth stored it: the usable count, the
+/// next grant's raw window names and end it kept then, and the read's own
+/// epoch-ms stamp.
 pub(crate) fn write_claude_limit_resets(
     name: &str,
     usable: u32,
@@ -2689,6 +2695,25 @@ pub(crate) fn register_names(names: &[&str]) {
             state.profiles.push((*name).into());
         }
     }
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Leave `name`'s `config.toml` unloadable as a profile: valid TOML holding a
+/// value the profile schema rejects, the hand-edit typo a real config can
+/// carry. [`crate::profile::read_profile`] and a whole-config load fail on it
+/// while the credential store, the roster and the proxy claim still read.
+pub(crate) fn break_profile_config(name: &str) {
+    let path = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::write(&path, "fallback_threshold = \"x\"\n").expect("break the profile's config");
+}
+
+/// A peer's write: `profiles.toml`'s active marker moves to `name` (or to
+/// none) while the process's config copy still names the account it loaded.
+pub(crate) fn peer_switches_active_to(name: Option<&str>) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    state.active_profile = name.map(Into::into);
     crate::profile::save_app_state(&state).expect("save app state");
 }
 
@@ -3350,6 +3375,107 @@ pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
 pub(crate) fn proc_start_of(pid: u32) -> Option<String> {
     crate::runtime::proc_bsdinfo(pid)
         .map(|info| crate::runtime::format_proc_start(info.pbi_start_tvsec))
+}
+
+/// `N` pids that name no running process: each is a child spawned and reaped
+/// here, never one this process handed out before, so the fixture pids of one
+/// test stay distinct however the OS reissues a freed pid. A made-up literal
+/// can name any process or thread the box runs once the kernel has issued
+/// that number.
+pub(crate) fn dead_pids<const N: usize>() -> [u32; N] {
+    // A leaf: nothing is acquired while it is held, so it never orders
+    // against `HOME_TEST_LOCK`.
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut handed_out = HANDED_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Every child stays unreaped until the last pid is picked, so a pid
+    // refused as handed out cannot come straight back to the next spawn.
+    let mut children = Vec::new();
+    let pids = std::array::from_fn(|_| {
+        loop {
+            #[cfg(unix)]
+            let child = Command::new("true").spawn();
+            #[cfg(windows)]
+            let child = Command::new("cmd").args(["/D", "/C", "exit 0"]).spawn();
+            let child = child.expect("spawn a child to reap");
+            let pid = child.id();
+            children.push(child);
+            if handed_out.insert(pid) {
+                break pid;
+            }
+        }
+    });
+    for mut child in children {
+        child.wait().expect("reap the child");
+    }
+    pids
+}
+
+/// A live thread of the test process that is not its thread-group leader,
+/// parked until drop: linux answers `kill(tid, 0)` and every `/proc/<tid>/…`
+/// file for it as for a process, the shape a recorded pid takes once the
+/// kernel reissues it as another program's thread id.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ParkedThread {
+    pub(crate) tid: u32,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl ParkedThread {
+    pub(crate) fn spawn() -> Self {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|link| link.file_name()?.to_str()?.parse::<u32>().ok());
+            let _ = tid_tx.send(tid);
+            // Returns once the owner releases it or drops the sender.
+            let _ = parked.recv();
+        });
+        let tid = tid_rx
+            .recv()
+            .ok()
+            .flatten()
+            .expect("the parked thread reads its tid off /proc/thread-self");
+        assert_ne!(
+            tid,
+            std::process::id(),
+            "the parked thread is no thread-group leader"
+        );
+        Self {
+            tid,
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ParkedThread {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            // A panic the parked thread raised is dropped: `Drop` never asserts.
+            drop(thread.join());
+        }
+    }
+}
+
+/// A thread of the live process `pid` other than its leader, off
+/// `/proc/<pid>/task`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn a_thread_of(pid: u32) -> u32 {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("list the process's threads")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|tid| *tid != pid)
+        .expect("the process runs a thread besides its leader")
 }
 
 /// A stateful slow `claude` shim: `--version` and `plugin` probes answer
@@ -4318,23 +4444,25 @@ fn fixture_proxy_parent_parks() {
 }
 
 /// A live re-entered test binary that parks until SIGTERM or its parent's
-/// death, with `leading` as
-/// its argv — used to pose a live pid whose argv does NOT hold `daemon run`
-/// while its environment (readable on macOS only for non-platform binaries)
-/// carries the tree's `CLAUDE_CONFIG_DIR`. The caller records its start and
-/// owns its reap; the reaped `Owned` kills and waits on drop.
+/// death, with `arg0` (the binary's path when `None`) and `leading` as its
+/// argv: a live pid whose argv does NOT hold `daemon run` while its
+/// environment (readable on macOS only for non-platform binaries) carries the
+/// tree's `CLAUDE_CONFIG_DIR`, or one posing as a `clauth` subcommand. The
+/// caller records its start and owns its reap; the reaped `Owned` kills and
+/// waits on drop.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn spawn_parked(config_dir: &Path, leading: &[&str]) -> Owned {
+pub(crate) fn spawn_parked(config_dir: &Path, arg0: Option<&str>, leading: &[&str]) -> Owned {
+    use std::os::unix::process::CommandExt as _;
     let dir = tempfile::tempdir().expect("parked re-entry dir");
     let ready = dir.path().join("ready");
+    let mut cmd = reenter_parked(config_dir, leading, &ready);
+    if let Some(arg0) = arg0 {
+        cmd.arg0(arg0);
+    }
     // The child is owned from the spawn, so a panic during the readiness wait
     // below still kills and reaps it (the `Owned` Drop) instead of leaking a
     // forever-parked process.
-    let child = Owned(
-        reenter_parked(config_dir, leading, &ready)
-            .spawn()
-            .expect("spawn the re-entered test binary"),
-    );
+    let child = Owned(cmd.spawn().expect("spawn the re-entered test binary"));
     // Wait for the park test to write the ready file before returning, so the
     // caller records a pid that is already parked (and the tempdir can drop:
     // the ready path is no longer needed).
@@ -4363,14 +4491,14 @@ pub(crate) struct FakeSupervisor {
     pub(crate) proc_start: String,
 }
 
-/// Reaps the child it owns when [`FakeSupervisor::spawn`] panics between the
-/// spawn and the `FakeSupervisor` hand-back (the readiness assert or the
-/// start-time read). Drop never asserts — the reaping is best-effort, exactly
-/// like [`FakeSupervisor`]'s own.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-struct ReapChild(Option<std::process::Child>);
+/// Kills and reaps the child it owns on drop, so a test or helper that
+/// panics between the spawn and its own cleanup (a readiness assert, a
+/// later check) leaves no process looping. Drop never asserts — the reaping
+/// is best-effort, exactly like [`FakeSupervisor`]'s own.
+#[cfg(all(test, unix))]
+pub(crate) struct ReapChild(pub(crate) Option<std::process::Child>);
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, unix))]
 impl Drop for ReapChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {

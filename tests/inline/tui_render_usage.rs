@@ -54,7 +54,7 @@ fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
         note: None,
         value: None,
     };
-    let lines = stat.render(6, 20, 0, 0);
+    let lines = stat.render(6, 20, 0);
     assert_eq!(
         lines[0].spans.last().map(|s| s.content.as_ref()),
         Some("1%")
@@ -1301,10 +1301,15 @@ fn header_lines_plan_falls_back_to_account_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     let expected = crate::format::account_tier(&profile, None)
         .and_then(|t| t.display())
         .expect("a 'max' token claims a tier");
@@ -1376,10 +1381,9 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+    let plan_row: String = header_lines(&profile, &header, sound_frame(), 52, &readings)
         .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("Claude Ultra"),
         "hybrid plan row shows its fetched tier, got {plan_row:?}"
@@ -1429,13 +1433,436 @@ fn header_lines_plan_shows_the_server_plan_name() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &readings)
+    let plan_row: String = header_lines(&profile, &header, sound_frame(), 52, &readings)
         .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+        .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("Claude Ultra Lite"),
         "the plan row shows the server's name, got {plan_row:?}"
+    );
+}
+
+/// Noon local on 2020-04-06, the `plan` row fixtures' frame clock: years
+/// before any real run.
+fn plan_now() -> i64 {
+    chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2020, 4, 6, 12, 0, 0)
+        .single()
+        .expect("an hour no clock change skips or repeats")
+        .timestamp()
+}
+
+/// The frame facts at [`plan_now`] for an account whose login is sound.
+fn sound_frame() -> PlanFrame {
+    PlanFrame {
+        now: plan_now(),
+        login_dead: false,
+    }
+}
+
+/// The Usage tab's `plan` tail at [`plan_now`] for a lone account `a` whose
+/// plan ends tomorrow while its 7d week resets two days out, with `adjust`
+/// applied to the built config: returns the `(1d)` tail's row and its last
+/// cell's foreground.
+fn plan_tail_drawn(
+    adjust: impl FnOnce(&mut crate::profile::AppConfig),
+) -> (String, ratatui::style::Color) {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::tui::app::App;
+
+    let now = plan_now();
+    let tomorrow = crate::format::local_day(now)
+        .expect("the frame clock's local day")
+        .succ_opt()
+        .expect("a next day");
+    let mut profile = crate::testutil::blank_profile(&ProfileName::from("a"));
+    profile.plan_ends = Some(tomorrow);
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 30.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 2 * 86_400)),
+            }),
+            ..Default::default()
+        },
+    );
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("a")],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    adjust(&mut config);
+    let mut app = App::new(config);
+    app.profile_cursor.set(0);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let y = rows
+        .iter()
+        .position(|row| row.contains("(1d)"))
+        .unwrap_or_else(|| panic!("the plan tail draws: {rows:#?}")) as u16;
+    let row = &rows[usize::from(y)];
+    let at = row.find("(1d)").expect("the tail text");
+    let x = row[..at].chars().count() as u16 + "(1d)".chars().count() as u16 - 1;
+    (row.clone(), buf.cell((x, y)).expect("the tail cell").fg)
+}
+
+/// The `plan` row names the next billing day off `plan_renews` and a marked
+/// `plan_ends` in its place, `ended` once past unless a `plan_renews` later
+/// than it is set, all faint: with no 7d reading the Overview flags none of
+/// them. A row too narrow for the phrase keeps the plan name alone.
+#[test]
+fn header_lines_plan_names_the_renewal_or_the_marked_end() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "dated",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let row = |profile: &crate::profile::Profile, width: u16| -> Vec<Span<'static>> {
+        header_lines(profile, &header, sound_frame(), width, &readings)
+            .first()
+            .map_or_default(|l| l.spans.clone())
+    };
+    // Each case: the row's text and its last span's style.
+    let shown = |profile: &crate::profile::Profile, width: u16| {
+        let spans = row(profile, width);
+        let style = spans.last().map_or_default(|s| s.style);
+        (
+            spans.iter().map(|s| s.content.clone()).collect::<String>(),
+            style,
+        )
+    };
+    let body = crate::tui::theme::body();
+    let faint = crate::tui::theme::faint();
+    let today = chrono::NaiveDate::from_ymd_opt(2020, 4, 6).expect("the fixture's day");
+    let mut cases = vec![shown(&profile, 52)];
+    profile.plan_renews = Some(today + chrono::Duration::days(20));
+    cases.push(shown(&profile, 52));
+    profile.plan_ends = Some(today + chrono::Duration::days(10));
+    cases.push(shown(&profile, 52));
+    cases.push(shown(&profile, 24));
+    profile.plan_ends = Some(today);
+    cases.push(shown(&profile, 52));
+    profile.plan_ends = Some(today - chrono::Duration::days(1));
+    profile.plan_renews = None;
+    cases.push(shown(&profile, 52));
+    // A billing day set after the plan's marked end: the plan came back.
+    profile.plan_ends = Some(today - chrono::Duration::days(30));
+    profile.plan_renews = Some(today + chrono::Duration::days(20));
+    cases.push(shown(&profile, 52));
+    let expected = vec![
+        ("plan      Claude Ultra".to_string(), body),
+        (
+            "plan      Claude Ultra · renews apr 26 (20d)".to_string(),
+            faint,
+        ),
+        (
+            "plan      Claude Ultra · ends apr 16 (10d)".to_string(),
+            faint,
+        ),
+        ("plan      Claude Ultra".to_string(), body),
+        ("plan      Claude Ultra · ends today".to_string(), faint),
+        ("plan      Claude Ultra · ended apr 5".to_string(), faint),
+        (
+            "plan      Claude Ultra · renews apr 26 (20d)".to_string(),
+            faint,
+        ),
+    ];
+    assert_eq!(
+        cases, expected,
+        "no date; a renewal; a marked end over it; no room; ending today; \
+         ended; a renewal later than a past end"
+    );
+}
+
+/// A plan whose reading says it cannot serve, canceled or refused by its
+/// organization, shows no renewal on the `plan` row: the row reads exactly
+/// as it does with no date given.
+#[test]
+fn header_lines_plan_shows_no_renewal_for_a_plan_that_cannot_serve() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let plan_row = |status: &str, renews: Option<chrono::NaiveDate>| -> String {
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+        profile.plan_renews = renews;
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "dated",
+            crate::usage::UsageInfo {
+                plan: Some(crate::usage::PlanInfo {
+                    tier: crate::usage::PlanTier::Max(Some(20)),
+                    subscription_status: Some(status.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        // Wide enough for `· renews dec 15, 2099 (…d)` beside the plan name.
+        header_lines(&profile, &header, sound_frame(), 80, &readings)
+            .first()
+            .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    };
+    let renews = chrono::NaiveDate::from_ymd_opt(2099, 12, 15);
+    assert_eq!(
+        [
+            plan_row("canceled", renews),
+            plan_row(crate::usage::ORG_REFUSED_STATUS, renews),
+        ],
+        [
+            plan_row("canceled", None),
+            plan_row(crate::usage::ORG_REFUSED_STATUS, None),
+        ],
+        "(canceled, org refused) with a billing day read as with none"
+    );
+    assert_eq!(
+        plan_row("canceled", None),
+        "plan      Claude Ultra",
+        "control: the dateless row"
+    );
+}
+
+/// The `usage auto-start in …` countdown keeps its room on the `plan` row: at
+/// 52 and 48 cells it reads whole and the plan date, which no longer fits
+/// beside it, drops; a row wide enough for both draws both, the countdown
+/// flush right past the house 3-cell gap.
+#[test]
+fn header_lines_plan_date_takes_only_the_room_the_countdown_leaves() {
+    let header = HeaderState {
+        fetches_here: true,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::ThirdParty,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    };
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(crate::testutil::countdown_reset_in(8880)),
+            }),
+            ..Default::default()
+        },
+    );
+    let kick = "usage auto-start in 2h 28m";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.auto_start = true;
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2020, 4, 26);
+    let rows = [52, 48, 72].map(|width| {
+        header_lines(&profile, &header, sound_frame(), width, &readings)
+            .first()
+            .map_or_default(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+    });
+    let tail = " · renews apr 26 (20d)";
+    // `plan` + the no-data dash measure 11 cells.
+    let flush = |width: usize, left: &str| {
+        format!(
+            "{left}{}{kick}",
+            " ".repeat(width - left.chars().count() - kick.chars().count())
+        )
+    };
+    let expected = [
+        flush(52, "plan      —"),
+        flush(48, "plan      —"),
+        flush(72, &format!("plan      —{tail}")),
+    ];
+    assert_eq!(rows, expected, "(52, 48, 72) cells");
+}
+
+/// The `plan` row's date reads in the warning color exactly while the
+/// Overview's plan chip flags it, faint otherwise, for a renewal and a marked
+/// end alike: a day starting before the 7d window's reset, today's included,
+/// is amber; a day starting past the reset, an end months away, a reading
+/// with no 7d window, an account whose login the Overview marks dead and a
+/// canceled plan's marked end are faint.
+#[test]
+fn header_lines_plan_tail_is_amber_exactly_while_the_overview_flags_it() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let local_at = |d: u32, hour: u32| {
+        chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2020, 4, d, hour, 0, 0)
+            .single()
+            .expect("an hour no clock change skips or repeats")
+            .timestamp()
+    };
+    let day = |m: u32, d: u32| chrono::NaiveDate::from_ymd_opt(2020, m, d);
+    let week = Some(local_at(11, 18));
+    let tail = |status: &str, ends, renews, reset: Option<i64>, login_dead: bool| {
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("dated"));
+        profile.plan_ends = ends;
+        profile.plan_renews = renews;
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "dated",
+            crate::usage::UsageInfo {
+                plan: Some(crate::usage::PlanInfo {
+                    tier: crate::usage::PlanTier::Max(Some(20)),
+                    subscription_status: Some(status.to_string()),
+                    ..Default::default()
+                }),
+                seven_day: reset.map(|reset| crate::usage::UsageWindow {
+                    utilization: 30.0,
+                    resets_at: Some(crate::usage::epoch_secs_to_iso(reset)),
+                }),
+                ..Default::default()
+            },
+        );
+        let header = HeaderState {
+            fetches_here: true,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        };
+        let frame = PlanFrame {
+            now: plan_now(),
+            login_dead,
+        };
+        let spans = header_lines(&profile, &header, frame, 80, &readings)
+            .first()
+            .map_or_default(|l| l.spans.clone());
+        (
+            spans.last().map_or_default(|s| s.content.to_string()),
+            spans.last().map_or_default(|s| s.style),
+        )
+    };
+    let warning = crate::tui::theme::warning();
+    let faint = crate::tui::theme::faint();
+    assert_eq!(
+        [
+            tail("active", None, day(1, 9), week, false),
+            tail("active", None, day(3, 6), week, false),
+            tail("active", day(4, 10), None, week, false),
+        ],
+        [
+            (" · renews apr 9 (3d)".to_string(), warning),
+            (" · renews today".to_string(), warning),
+            (" · ends apr 10 (4d)".to_string(), warning),
+        ],
+        "(a renewal before the reset, one today, an end before the reset)"
+    );
+    assert_eq!(
+        [
+            tail("active", None, day(1, 9), Some(local_at(7, 18)), false),
+            tail("active", day(7, 5), None, week, false),
+            tail("active", day(4, 10), None, None, false),
+            tail("active", day(4, 10), None, week, true),
+            tail("canceled", day(4, 10), None, week, false),
+        ],
+        [
+            (" · renews apr 9 (3d)".to_string(), faint),
+            (" · ends jul 5 (90d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+            (" · ends apr 10 (4d)".to_string(), faint),
+        ],
+        "(a renewal past the reset, an end months away, no 7d reading, a dead login, \
+         a canceled plan before the reset)"
+    );
+}
+
+/// A disabled account selected in the Usage tab reads its `plan` tail faint:
+/// the chip predicate refuses the account, so a plan day before the week's
+/// reset never flags amber. The same account enabled reads the tail amber.
+#[test]
+fn draw_usage_detail_disabled_account_reads_a_faint_plan_tail() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["a"]);
+    let (flagged, flagged_fg) = plan_tail_drawn(|_| {});
+    assert_eq!(
+        flagged_fg,
+        theme::warning_color(),
+        "control, enabled: the flagged tail is amber: {flagged}"
+    );
+    let (disabled, disabled_fg) = plan_tail_drawn(|c| c.profiles[0].disabled = true);
+    assert_eq!(
+        disabled_fg,
+        theme::text_faint_color(),
+        "a disabled account's tail is faint: {disabled}"
+    );
+}
+
+/// The `plan` tail's amber comes through `draw_usage_detail`'s own `PlanFrame`
+/// wire-up, not only through `header_lines`: at [`plan_now`] an account whose
+/// plan day is tomorrow and whose 7d week resets two days out draws the tail
+/// amber, and the same account with a broken login draws it faint.
+#[test]
+fn draw_usage_detail_plan_tail_follows_the_overview_flag() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::register_names(&["a"]);
+    let (live, live_fg) = plan_tail_drawn(|_| {});
+    assert_eq!(
+        live_fg,
+        theme::warning_color(),
+        "the flagged tail is amber: {live}"
+    );
+    let (dead, dead_fg) = plan_tail_drawn(|c| c.state.auth_broken.push("a".into()));
+    assert_eq!(
+        dead_fg,
+        theme::text_faint_color(),
+        "a dead login's tail is faint: {dead}"
     );
 }
 
@@ -1470,7 +1897,13 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let lines = header_lines(&profile, &header, 52, &ReadingsSnapshot::default());
+    let lines = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    );
     let plan_line = lines.first().expect("plan row");
     let value = plan_line.spans.last().expect("plan value span");
     assert_eq!(value.content, "—", "plan value, got {:?}", plan_line.spans);
@@ -1522,7 +1955,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             diag: DiagFlags::default(),
             peak: None,
         };
-        header_lines(&profile, &header, 52, &readings)
+        header_lines(&profile, &header, sound_frame(), 52, &readings)
             .iter()
             .map(|l| {
                 l.spans
@@ -1646,7 +2079,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         peak: None,
     };
     let row = |w: u16| {
-        header_lines(&profile, &header, w, &readings)[0]
+        header_lines(&profile, &header, sound_frame(), w, &readings)[0]
             .spans
             .iter()
             .map(|s| s.content.clone())
@@ -1694,10 +2127,15 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         !plan_row.contains("api"),
         "a key with no endpoint has no third-party arm to head: {plan_row:?}"
@@ -1714,6 +2152,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         &profile,
         52,
         &header,
+        sound_frame(),
         &app,
         &ReadingsSnapshot::default(),
         true,
@@ -1762,10 +2201,15 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
-        .first()
-        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-        .unwrap_or_default();
+    let plan_row: String = header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        52,
+        &ReadingsSnapshot::default(),
+    )
+    .first()
+    .map_or_default(|l| l.spans.iter().map(|s| s.content.clone()).collect());
     assert!(
         plan_row.contains("api"),
         "api-key plan row stays 'api', got {plan_row:?}"
@@ -1831,7 +2275,13 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     // names the STATUS. Folding "canceled" into the tier is what made the JSON
     // surfaces disagree about the same account, and this is where a reader
     // would first be tempted to do it again.
-    let header_text = text(header_lines(&profile, &header, 120, &readings));
+    let header_text = text(header_lines(
+        &profile,
+        &header,
+        sound_frame(),
+        120,
+        &readings,
+    ));
     let plan_row = header_text.lines().next().expect("plan row");
     assert!(
         plan_row.contains("Claude Free") && !plan_row.contains("canceled"),
@@ -3534,8 +3984,17 @@ fn the_usage_pane_draws_the_failed_fetch_mark_from_the_streak_store() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
         rows.iter().any(|row| row.contains("[ cached ]")),
@@ -3893,7 +4352,7 @@ fn render_usage_buffer(u: crate::usage::UsageInfo, auto_start: bool) -> ratatui:
     );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
         .expect("draw");
     term.backend().buffer().clone()
 }
@@ -4046,7 +4505,7 @@ fn a_plan_with_no_five_hour_limit_takes_no_burn_rate() {
     );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let at = rows
@@ -4104,7 +4563,7 @@ fn the_usage_tab_sizes_the_queue_without_a_plan_that_has_no_five_hour_limit() {
     let rows_of = |readings: &ReadingsSnapshot| -> Vec<String> {
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[]))
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, readings, &[], now_epoch_secs()))
             .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
@@ -4223,7 +4682,7 @@ fn a_hybrid_plan_with_no_five_hour_limit_is_judged_off_its_oauth_entry() {
         app.profile_cursor.set(cursor);
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[]))
+        term.draw(|f| draw_usage_detail(f, f.area(), &app, &readings, &[], now_epoch_secs()))
             .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
@@ -5122,10 +5581,16 @@ fn header_lines_pricing_row_only_with_windows() {
             next_flip: Some((false, 60)),
         }),
     };
-    let rows: Vec<String> = header_lines(&profile, &base, 60, &ReadingsSnapshot::default())
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+    let rows: Vec<String> = header_lines(
+        &profile,
+        &base,
+        sound_frame(),
+        60,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    .collect();
     assert!(
         rows.iter().any(|r| r.contains("pricing")),
         "windowed profile gets the row: {rows:?}"
@@ -5135,10 +5600,16 @@ fn header_lines_pricing_row_only_with_windows() {
     assert!(idx == 1, "second header row, under plan: {rows:?}");
 
     let flat = HeaderState { peak: None, ..base };
-    let rows: Vec<String> = header_lines(&profile, &flat, 60, &ReadingsSnapshot::default())
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+    let rows: Vec<String> = header_lines(
+        &profile,
+        &flat,
+        sound_frame(),
+        60,
+        &ReadingsSnapshot::default(),
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    .collect();
     assert!(
         !rows.iter().any(|r| r.contains("pricing")),
         "flat pricing renders no row: {rows:?}"
@@ -5465,8 +5936,17 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     let fetch_row = rows
@@ -5519,8 +5999,17 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     assert!(
@@ -5564,8 +6053,17 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     // Border `│` + 1 block-padding cell + the 2-cell indent = 3 leading cells.
@@ -5634,8 +6132,17 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
     assert!(
@@ -6043,13 +6550,12 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
         burn_rate: Some(12.2),
         rate_unit: "d",
         pace_pct: None,
-        reset_secs: None,
+        reset_secs: Some(7 * 86_400),
         trailing: String::new(),
         note: None,
         value: None,
     };
-    let max_rate_w = stat.rate_section_width();
-    let lines = stat.render(8, 20, max_rate_w, 5);
+    let lines = stat.render(8, 20, 5);
     let texts: Vec<String> = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -6061,6 +6567,475 @@ fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
             "         12.2  24.5%",
             "██░░░░░░"
         ]
+    );
+}
+
+/// A row's label is sized by its own rate section, never the block's widest:
+/// a `7d sonnet` row at 0% beside a burning 5h row keeps its whole name and
+/// its `%`, and the `%` stays at the far column. Where the burning row cannot
+/// sit beside its `%`, its run-dry estimate moves onto the line the `%` drops to.
+#[test]
+fn a_row_without_a_rate_keeps_its_whole_label_beside_a_burning_row() {
+    let burning = Stat {
+        label: "5h".to_string(),
+        pct: Some(50.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: Some(18_000),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let idle = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(0.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [burning, idle];
+    for (width, expected) in [
+        (
+            30u16,
+            vec![
+                "5h · 12.2 %/h".to_string(),
+                format!("4h 5m left{}50%", " ".repeat(17)),
+                "███████████████░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                   0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            32,
+            vec![
+                "5h · 12.2 %/h · 4h 5m left   50%".to_string(),
+                "████████████████░░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                     0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            36,
+            vec![
+                "5h · 12.2 %/h · 4h 5m left       50%".to_string(),
+                "██████████████████░░░░░░░░░░░░░░░░░░".to_string(),
+                String::new(),
+                "7d sonnet                         0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+    ] {
+        let drawn: Vec<String> = render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        assert_eq!(
+            drawn, expected,
+            "each row is sized by its own rate section at a {width}-cell interior"
+        );
+    }
+}
+
+/// A run-dry estimate that lands after its window resets is not drawn: the
+/// window refills first, so the figure never comes true, and at a low pace it
+/// can spell a duration longer than the row. The rate section it leaves keeps
+/// the label's name whole.
+#[test]
+fn a_run_dry_estimate_past_the_reset_is_not_drawn() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(0.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(0.001),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    for (width, expected) in [
+        (
+            30u16,
+            vec![
+                "7d sonnet · 0.0 %/d         0%".to_string(),
+                "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░".to_string(),
+            ],
+        ),
+        (
+            60,
+            vec![
+                format!("7d sonnet · 0.0 %/d{}0%", " ".repeat(39)),
+                "░".repeat(60),
+            ],
+        ),
+    ] {
+        let drawn: Vec<String> = render_stat_block(std::slice::from_ref(&stat), width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        assert_eq!(
+            drawn, expected,
+            "the whole eyebrow at a {width}-cell interior carries no estimate past the reset"
+        );
+    }
+}
+
+/// A window with no reset stamp draws no run-dry estimate: with no reset to
+/// land before, the clause never gains its warning, and the eyebrow carries
+/// the rate alone.
+#[test]
+fn a_run_dry_estimate_without_a_reset_stamp_is_not_drawn() {
+    let stat = Stat {
+        label: "5h".to_string(),
+        pct: Some(50.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let drawn: Vec<String> = render_stat_block(std::slice::from_ref(&stat), 30)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        drawn,
+        vec![
+            format!("5h · 12.2 %/h{}50%", " ".repeat(14)),
+            format!("{}{}", "█".repeat(15), "░".repeat(15)),
+        ],
+        "a window with no reset stamp carries the rate alone"
+    );
+}
+
+/// A rate section that leaves one or two cells still never runs the eyebrow
+/// past `pct_col`: the label is cut to the room that is left, down to `…` alone
+/// at one cell. A produced window pace is capped (`window_avg_pace_per_day`),
+/// while an OAuth 5h rate is a least-squares slope with no cap; the hand-built
+/// rates here stand for either.
+#[test]
+fn a_label_beside_a_rate_section_leaving_under_three_cells_stays_inside_the_row() {
+    for rate in [1e18, 1e19] {
+        let stat = Stat {
+            label: "7d sonnet".to_string(),
+            pct: Some(0.0),
+            amount: String::new(),
+            color: theme::body(),
+            burn_rate: Some(rate),
+            rate_unit: "d",
+            pace_pct: None,
+            reset_secs: None,
+            trailing: String::new(),
+            note: None,
+            value: None,
+        };
+        let lines = stat.render(10, 30, 0);
+        for line in &lines {
+            let cells: usize = line.spans.iter().map(|s| grapheme_cells(&s.content)).sum();
+            assert!(cells <= 30, "the eyebrow overruns at rate {rate}: {line:?}");
+        }
+        let first = lines[0].spans.first().map(|s| s.content.as_ref());
+        assert!(
+            first.is_some_and(|label| label.ends_with('…')),
+            "the label is cut to the room left at rate {rate}: {first:?}"
+        );
+    }
+}
+
+/// With an amount column, two cells still separate the label from the figure
+/// after it: at its pre-gap exact fit the amount drops to its own line rather
+/// than run into the label's last digit.
+#[test]
+fn a_label_never_runs_into_the_amount_column() {
+    let stat = Stat {
+        label: "5h balance | 90 left of 1001".to_string(),
+        pct: Some(20.0),
+        amount: "234 / 2000".to_string(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let rows = |width: u16| -> Vec<String> {
+        render_stat_block(std::slice::from_ref(&stat), width)
+            .iter()
+            .map(|row| row.spans.iter().map(|span| span.content.clone()).collect())
+            .collect()
+    };
+    let bar = |width: usize| format!("{}{}", "█".repeat(9), "░".repeat(width - 9));
+    assert_eq!(
+        rows(43),
+        vec![
+            "5h balance | 90 left of 1001".to_string(),
+            format!("{}234 / 2000  20%", " ".repeat(28)),
+            bar(43),
+        ],
+        "at the pre-gap exact fit the amount drops to its own line"
+    );
+    assert_eq!(
+        rows(44),
+        vec![
+            "5h balance | 90 left of 1001".to_string(),
+            format!("{}234 / 2000  20%", " ".repeat(29)),
+            bar(44),
+        ],
+        "one cell of pad is not the two cells the label keeps before the amount"
+    );
+    assert_eq!(
+        rows(45),
+        vec![
+            "5h balance | 90 left of 1001  234 / 2000  20%".to_string(),
+            bar(45),
+        ],
+        "two cells separate the label from the amount once the line holds it"
+    );
+}
+
+/// A row with no amount in a block that has an amount column already stands
+/// `max_amount_w + 2` blank cells clear of its `%`, so it keeps the `%` on
+/// its line wherever the line holds it: a burning `5h` row beside two amount
+/// rows (a zai reply mixes a percentage-only bar with amount bars) fits whole
+/// at 42 and 43 cells, as it does at 44.
+#[test]
+fn a_row_without_an_amount_keeps_its_percent_beside_an_amount_column() {
+    let row = |label: &str, pct: f64, amount: &str, burn_rate: Option<f64>| Stat {
+        label: label.to_string(),
+        pct: Some(pct),
+        amount: amount.to_string(),
+        color: theme::body(),
+        burn_rate,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: burn_rate.map(|_| 5 * 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [
+        row("5h", 12.0, "", Some(30.0)),
+        row("mcp tools", 25.0, "250 / 1000", None),
+        row("1mo", 25.0, "5 / 20", None),
+    ];
+    let rows = |width: u16| -> Vec<String> {
+        render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect()
+    };
+    let at_44 = rows(44);
+    assert_eq!(
+        at_44[0],
+        format!("5h · 30.0 %/h · 2h 56m left{}12%", " ".repeat(14)),
+        "the fitting width this pin is anchored on"
+    );
+    for (width, gap) in [(42u16, 12usize), (43, 13)] {
+        let drawn = rows(width);
+        assert_eq!(
+            (drawn[0].clone(), drawn.len()),
+            (
+                format!("5h · 30.0 %/h · 2h 56m left{}12%", " ".repeat(gap)),
+                at_44.len()
+            ),
+            "the `5h` row keeps its `%` on its line at a {width}-cell interior"
+        );
+    }
+}
+
+/// An over-pace per-model row keeps its whole name: when the row with its
+/// run-dry estimate does not fit beside its `%`, the estimate moves onto the
+/// line the `%` drops to (in the warning colour), and the eyebrow carries the
+/// name and the rate alone. Where the whole row fits, it stays one line.
+#[test]
+fn a_warning_row_moves_its_estimate_to_the_percent_line_before_cutting_its_name() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let rows = |width: u16| render_stat_block(std::slice::from_ref(&stat), width);
+    let text = |line: &ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|span| span.content.clone()).collect()
+    };
+    for width in [30u16, 34, 36, 37, 38, 39] {
+        let drawn = rows(width);
+        let pad = usize::from(width) - "23h 50m left".len() - "37%".len();
+        assert_eq!(
+            (text(&drawn[0]), text(&drawn[1])),
+            (
+                "7d sonnet · 63.4 %/d".to_string(),
+                format!("23h 50m left{}37%", " ".repeat(pad)),
+            ),
+            "the name stays whole and the estimate rides the `%` line at a {width}-cell interior"
+        );
+        let estimate = drawn[1]
+            .spans
+            .iter()
+            .find(|span| span.content == "23h 50m left")
+            .unwrap_or_else(|| panic!("the estimate is its own span at {width}"));
+        assert_eq!(
+            estimate.style.fg,
+            theme::warning().fg,
+            "the estimate keeps the warning colour at {width}"
+        );
+    }
+    assert_eq!(
+        text(&rows(40)[0]),
+        "7d sonnet · 63.4 %/d · 23h 50m left  37%",
+        "a row that fits whole stays on one line"
+    );
+    let one_line = rows(40);
+    let estimate = one_line[0]
+        .spans
+        .iter()
+        .find(|span| span.content == "23h 50m left")
+        .expect("the one-line estimate is its own span");
+    assert_eq!(
+        estimate.style.fg,
+        theme::warning().fg,
+        "the one-line estimate keeps the warning colour"
+    );
+}
+
+/// A warning row with no amount, in a block whose other row has one, counts
+/// no blank amount column on the line its `%` drops to: its estimate moves
+/// there and its name stays whole wherever `name · rate` fits its eyebrow.
+#[test]
+fn a_warning_row_beside_an_amount_column_moves_its_estimate_and_keeps_its_name() {
+    let warning = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: String::new(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let metered = Stat {
+        label: "mcp tools".to_string(),
+        pct: Some(25.0),
+        amount: "250 / 1000".to_string(),
+        color: theme::body(),
+        burn_rate: None,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [warning, metered];
+    for width in [24u16, 27, 30, 31] {
+        let drawn: Vec<String> = render_stat_block(&stats, width)
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        let pad = usize::from(width) - "23h 50m left".len() - "37%".len();
+        assert_eq!(
+            (drawn[0].clone(), drawn[1].clone()),
+            (
+                "7d sonnet · 63.4 %/d".to_string(),
+                format!("23h 50m left{}37%", " ".repeat(pad)),
+            ),
+            "the warning row keeps its name and moves its estimate at a {width}-cell interior"
+        );
+    }
+}
+
+/// A row whose amount is one cell shorter than the block's column fills that
+/// cell with the two-cell gap's own blank, so it keeps its `%` on its line at
+/// the width its label, rate, estimate, column and `%` exactly fill.
+#[test]
+fn a_one_cell_shorter_amount_keeps_its_percent_on_its_line() {
+    let row = |label: &str, pct: f64, amount: &str, burn_rate: Option<f64>| Stat {
+        label: label.to_string(),
+        pct: Some(pct),
+        amount: amount.to_string(),
+        color: theme::body(),
+        burn_rate,
+        rate_unit: "h",
+        pace_pct: None,
+        reset_secs: burn_rate.map(|_| 5 * 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let stats = [
+        row("5h", 12.0, "25 / 1000", Some(30.0)),
+        row("mcp tools", 25.0, "250 / 1000", None),
+    ];
+    let drawn: Vec<String> = render_stat_block(&stats, 43)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        drawn[0], "5h · 30.0 %/h · 2h 56m left  25 / 1000  12%",
+        "the shorter amount's one-cell gap keeps the `5h` row on one line at a 43-cell interior"
+    );
+}
+
+/// A moved estimate line that fills the row exactly still moves: at the width
+/// its estimate, the two-cell gap, the amount column and the `%` exactly fill,
+/// the `%` line carries the estimate and the label stays whole.
+#[test]
+fn a_moved_estimate_filling_the_row_exactly_stays_moved() {
+    let stat = Stat {
+        label: "7d sonnet".to_string(),
+        pct: Some(37.0),
+        amount: "1.2M / 4M".to_string(),
+        color: theme::body(),
+        burn_rate: Some(63.4),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: Some(7 * 86_400 - 3_600),
+        trailing: String::new(),
+        note: None,
+        value: None,
+    };
+    let texts: Vec<String> = render_stat_block(std::slice::from_ref(&stat), 28)
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "7d sonnet · 63.4 %/d".to_string(),
+            "23h 50m left  1.2M / 4M  37%".to_string(),
+            format!("{}{}", "█".repeat(10), "░".repeat(18)),
+        ],
+        "a `%` line that fills a 28-cell interior exactly keeps the estimate moved"
     );
 }
 
@@ -6540,20 +7515,10 @@ fn claude_resets_rows(detail: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `ends` as the resets line dates it: the local month and day.
-fn local_day(ends_secs: i64) -> String {
-    use chrono::TimeZone as _;
-    chrono::Local
-        .timestamp_opt(ends_secs, 0)
-        .single()
-        .expect("a local instant")
-        .format("%b %-d")
-        .to_string()
-}
-
 /// A claude account's pane carries its banked resets off the hourly side
-/// read: the usable count, the windows the next grant clears and its end;
-/// a reading under 75 min old carries no age.
+/// read; a reading an older clauth stored (a count and the next grant's
+/// windows and end, no grant) shows its count alone, and a reading under
+/// 75 min old carries no age.
 #[test]
 fn the_usage_claude_pane_shows_its_banked_resets() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -6572,32 +7537,36 @@ fn the_usage_claude_pane_shows_its_banked_resets() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        [format!(
-            "resets 1 available · resets 5h, 7d · expires {}",
-            local_day(ends)
-        )],
+        ["resets 1 available"],
         "{detail:?}"
+    );
+    assert!(
+        !detail
+            .iter()
+            .any(|r| r.starts_with('├') || r.starts_with('└')),
+        "no grant stored, no rail: {detail:?}"
     );
 }
 
-/// The window Fable counts into reads `7d fable` in the resets row, as the
+/// The window Fable counts into reads `7d fable` on the resets rail, as the
 /// pane's own bar names it.
 #[test]
 fn the_claude_resets_row_names_the_fable_weekly_7d_fable() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let now = crate::usage::now_ms();
-    crate::testutil::write_claude_limit_resets_banked(
-        "cl1",
-        1,
-        1,
-        &["seven_day_overage_included"],
-        now,
-    );
-    let (_, detail) = t6_panes(&t6_app());
+    let reading = crate::usage::LimitResets {
+        usable: 1,
+        banked: Some(1),
+        grants: vec![stored_grant(serde_json::json!({
+            "id": "g", "resets_total": 1, "resets_left": 1,
+            "clears": ["seven_day_overage_included"], "usable_now": true}))],
+        ..crate::usage::LimitResets::default()
+    };
     assert_eq!(
-        claude_resets_rows(&detail),
-        ["resets 1 available · resets 7d fable"],
-        "{detail:?}"
+        line_texts(&claude_resets_block(&reading, 60)),
+        [
+            "resets    1 available",
+            "└ limit reset",
+            "  resets 7d fable"
+        ]
     );
 }
 
@@ -6611,7 +7580,7 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2/3 available · resets 5h"],
+        ["resets 2/3 available"],
         "{detail:?}"
     );
 
@@ -6629,7 +7598,7 @@ fn the_usage_claude_pane_counts_available_resets_against_the_banked_total() {
     let (_, detail) = t6_panes(&t6_app());
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 available · resets 5h"],
+        ["resets 2 available"],
         "{detail:?}"
     );
 
@@ -6653,7 +7622,7 @@ fn a_stale_claude_resets_reading_says_its_age() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 2 available · resets 5h · read 3h ago"],
+        ["resets 2 available · read 3h ago"],
         "{detail:?}"
     );
 }
@@ -7220,7 +8189,7 @@ fn a_hybrid_profile_with_a_reading_shows_the_resets_row() {
     let (_, detail) = t6_panes(&app);
     assert_eq!(
         claude_resets_rows(&detail),
-        ["resets 1 available · resets 5h"],
+        ["resets 1 available"],
         "{detail:?}"
     );
 }
@@ -7286,52 +8255,30 @@ fn the_resets_row_says_its_age_only_past_75_minutes() {
     );
 }
 
-/// A row too wide for its pane ends on `…`: a bare clip turned `expires Nov 26`
-/// into a false `expires Nov 2`. At 57 columns the pane holds 53 cells, 43 of
-/// them after the key, one short of this 44-cell value. A row that fits keeps
+/// A count line too wide for its pane ends on `…`, so a cut figure never
+/// reads as another: `0/1 available · cooldown (4h 46m)` is 33 cells, and a
+/// 42-cell pane leaves 32 after the key, one short. A line that fits keeps
 /// every part, the exact fit included.
 #[test]
 fn a_claude_resets_row_past_its_pane_says_it_was_cut() {
-    use chrono::TimeZone as _;
-
-    fn row_at(app: &App, width: u16) -> String {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
-            .expect("terminal");
-        term.draw(|f| draw(f, f.area(), app, &app.readings_snapshot(), &[]))
-            .expect("draw");
-        let rows = crate::testutil::buffer_rows(term.backend().buffer());
-        let at = rows
-            .iter()
-            .find(|r| r.contains("resets  "))
-            .unwrap_or_else(|| panic!("a resets row at {width}: {rows:?}"));
-        let tail = &at[at.find("resets  ").expect("the row")..];
-        let end = tail.find(['│', '┊', '┃']).unwrap_or(tail.len());
-        tail[..end].split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    let _home = crate::testutil::HomeSandbox::new();
-    let ends = chrono::Local
-        .with_ymd_and_hms(2099, 11, 26, 12, 0, 0)
-        .single()
-        .expect("a local instant")
-        .to_rfc3339();
-    crate::testutil::write_claude_limit_resets(
-        "cl1",
-        1,
-        &["five_hour", "seven_day"],
-        Some(&ends),
-        crate::usage::now_ms() - 10 * 60_000,
-    );
-    let app = t6_app();
-
+    let now = crate::usage::now_epoch_secs();
+    let reading = crate::usage::LimitResets {
+        usable: 0,
+        banked: Some(1),
+        grants: vec![stored_grant(serde_json::json!({
+            "id": "g", "label": "Held", "resets_total": 1, "resets_left": 1,
+            "usable_now": false}))],
+        cooldown_until: Some(rfc3339(now + 4 * 3600 + 46 * 60 + 30)),
+        ..crate::usage::LimitResets::default()
+    };
     assert_eq!(
-        row_at(&app, 57),
-        "resets 1 available · resets 5h, 7d · expires Nov …"
+        line_texts(&claude_resets_block(&reading, 42))[0],
+        "resets    0/1 available · cooldown (4h 46…"
     );
     assert_eq!(
-        row_at(&app, 58),
-        "resets 1 available · resets 5h, 7d · expires Nov 26",
-        "44 cells in a 44-cell budget fit"
+        line_texts(&claude_resets_block(&reading, 43))[0],
+        "resets    0/1 available · cooldown (4h 46m)",
+        "33 cells in a 33-cell budget fit"
     );
 }
 
@@ -7431,8 +8378,17 @@ fn a_keyless_proxy_account_holding_a_pair_names_its_login_in_the_empty_body() {
         app.profile_cursor.set(0);
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
-        term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-            .expect("draw");
+        term.draw(|f| {
+            draw_usage_detail(
+                f,
+                f.area(),
+                &app,
+                &app.readings_snapshot(),
+                &[],
+                now_epoch_secs(),
+            )
+        })
+        .expect("draw");
         crate::testutil::buffer_rows(term.backend().buffer())
     };
     let proxy_row = format!(
@@ -7522,8 +8478,17 @@ fn usage_detail_rows(profile: crate::profile::Profile, width: u16) -> Vec<String
     app.profile_cursor.set(0);
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot(), &[]))
-        .expect("draw");
+    term.draw(|f| {
+        draw_usage_detail(
+            f,
+            f.area(),
+            &app,
+            &app.readings_snapshot(),
+            &[],
+            now_epoch_secs(),
+        )
+    })
+    .expect("draw");
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
@@ -8283,5 +9248,560 @@ fn a_probed_accounts_overdue_fetch_row_derives_from_its_probe_interval() {
             .collect::<String>(),
         "status    [ failed ]  retry overdue · read 2m ago",
         "the probe's 90 s cadence dates the reading, not the 300 s base"
+    );
+}
+
+/// The pool reading's rows render exactly and fit the pane: every row is its
+/// key cell plus its whole value at a wide interior, and at 41 cells a value's
+/// parts pop WHOLE from the right (never a mid-word clip), the composite rows
+/// starting at the value column like every other text row.
+#[test]
+fn pool_rows_render_exactly_and_fit_a_narrow_interior() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let body = serde_json::json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": [
+            {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 10.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 18000,
+             "resets_at": null, "chain": "5h", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 604800,
+             "resets_at": null, "chain": "7d", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 204977981.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+        {"account": "acct-2", "state": "ready", "available": true, "figures": [
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 79999980.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let render = |width: u16| -> Vec<String> {
+        build_tp_rows(
+            &profile,
+            width,
+            &readings,
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect()
+    };
+    let row = |label: &str, value: &str| format!("  {label:<13}{value}");
+
+    assert_eq!(
+        render(120),
+        vec![
+            row("accounts", "2 ready | 0 unread"),
+            row("acct-1", "5h 10% | 7d 100% | 205M left"),
+            row("acct-2", "5h - | 7d - | 80M left"),
+        ],
+        "every row carries its whole value at a wide interior"
+    );
+    assert_eq!(
+        render(41),
+        vec![
+            row("accounts", "2 ready | 0 unread"),
+            row("acct-1", "5h 10% | 7d 100%"),
+            row("acct-2", "5h - | 7d - | 80M left"),
+        ],
+        "a long value pops whole parts from the right, never a mid-word clip"
+    );
+}
+
+/// A proxy account id wider than the key column still fits: the value column
+/// is measured from the row's own drawn key cell, so an id over `TP_KEY_W`
+/// cells never pushes its value past the pane.
+#[test]
+fn a_pool_account_id_wider_than_the_key_column_still_fits_its_value() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let body = serde_json::json!({"accounts": [
+        {"account": "wc5cdzkad0ps", "state": "ready", "available": true, "figures": [
+            {"kind": "window", "id": "quota-5h", "label": "5h window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 18000,
+             "resets_at": null, "chain": "5h", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "window", "id": "quota-7d", "label": "7d window", "used": 100.0,
+             "limit": 100.0, "unit": "percent", "window_secs": 604800,
+             "resets_at": null, "chain": "7d", "read_at": "2030-01-01T00:00:00Z"},
+            {"kind": "balance", "id": "credit", "label": "credit", "remaining": 1.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let rows: Vec<String> = build_tp_rows(
+        &profile,
+        41,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "  accounts     1 ready | 0 unread".to_string(),
+            "  wc5cdzkad0ps  5h 100% | 7d 100%".to_string(),
+        ],
+        "a 12-cell id fits its value: the last whole part that fits the row's column"
+    );
+}
+
+/// A pool bar's label is fitted to the pane like a row's value: every drawn
+/// line stays inside the interior, a cut label ends on `…`, and whenever the
+/// `%` shares the label's line at least two cells separate the label's last
+/// character from it — a figure never runs into the percentage. A label that
+/// fits its own line stays whole and drops the `%` to its own line instead.
+#[test]
+fn a_pool_bar_label_fits_a_narrow_interior() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let body = serde_json::json!({"accounts": [
+        {"account": "acct-1", "state": "ready", "available": true, "figures": [
+            {"kind": "balance", "id": "credit", "label": "campaign balance flash",
+             "remaining": 204977981.0, "limit": 300000000.0, "used": 95022019.0,
+             "unit": "tokens", "read_at": "2030-01-01T00:00:00Z"},
+        ]},
+    ]});
+    let (stats, _dates) =
+        crate::proxy_account::pool_stats(body["accounts"].as_array().expect("accounts"), &|text| {
+            text.to_string()
+        })
+        .expect("the pool body builds stats");
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let label = "campaign balance flash | 205M left of 300M";
+    for width in [41u16, 42, 44, 45, 48, 49, 50] {
+        let rows = build_tp_rows(
+            &profile,
+            width,
+            &readings,
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        );
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+            .collect();
+        for line in &lines {
+            assert!(
+                line.chars().count() <= width as usize,
+                "every drawn line stays inside the {width}-cell interior: {line:?}"
+            );
+        }
+        let at = lines
+            .iter()
+            .position(|line| line.contains("campaign balance flash"))
+            .expect("the bar label is drawn");
+        let label_cell = rows[at]
+            .spans
+            .first()
+            .map_or("", |span| span.content.as_ref());
+        let whole = label_cell == label;
+        let cut = label_cell.ends_with('…');
+        assert!(
+            whole || cut,
+            "the label is drawn whole or cut with an ellipsis at {width}: {label_cell:?}"
+        );
+        if width >= 42 {
+            assert!(
+                whole,
+                "a label that fits its own {width}-cell line stays whole: {label_cell:?}"
+            );
+        }
+        let label_line = &lines[at];
+        if let Some(pct_at) = label_line.rfind('%') {
+            // The percentage is one span (`31.67%`): the reserved gap sits
+            // before the figure, never between its last digit and the `%`.
+            let before =
+                label_line[..pct_at].trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+            let gap = before.chars().rev().take_while(|c| *c == ' ').count();
+            assert!(
+                gap >= 2,
+                "at {width} the label keeps at least two cells before the `%`: {label_line:?}"
+            );
+        } else {
+            assert!(
+                whole,
+                "the `%` leaves the line only for a whole label at {width}: {label_line:?}"
+            );
+        }
+    }
+}
+
+/// A single-part value wider than the column ends on an ellipsis at exactly the
+/// column's width: the truncate branch of the fit.
+#[test]
+fn a_single_part_value_ends_on_an_ellipsis() {
+    let profile = crate::profile::Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9101".to_string()),
+        Some("clp_stub-key-0".to_string()),
+    );
+    let long = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_string();
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![crate::providers::StatRow {
+            label: "summary".to_string(),
+            value: long.clone(),
+            kind: crate::providers::StatRowKind::Body,
+            raw: None,
+        }],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    let readings = snap_with_stats(ReadingsSnapshot::default(), "px", stats);
+    let lines: Vec<String> = build_tp_rows(
+        &profile,
+        41,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+    .collect();
+    assert_eq!(
+        lines,
+        vec![format!("  {:<13}{}…", "summary", &long[..25])],
+        "one over-wide part keeps 25 cells and ends on the ellipsis in a 26-cell column"
+    );
+}
+
+/// The claude pane's `resets` row counts the banked resets, then names each
+/// one on the rail beneath it: its label, then what it resets and the local
+/// day it stays valid until, the year added once it differs from this one.
+#[test]
+fn the_claude_resets_row_names_each_reset_on_the_rail() {
+    use chrono::{Datelike as _, TimeZone as _};
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let later = now + 400 * 86_400;
+    let iso = |secs: i64| {
+        chrono::DateTime::from_timestamp(secs, 0)
+            .expect("instant")
+            .to_rfc3339()
+    };
+    let valid_until = |secs: i64| {
+        let local = chrono::Local
+            .timestamp_opt(secs, 0)
+            .single()
+            .expect("a local instant");
+        if local.year() == chrono::Local::now().year() {
+            local.format("%b %-d").to_string()
+        } else {
+            local.format("%b %-d, %Y").to_string()
+        }
+    };
+    let body = include_str!("../fixtures/cedar-ember-three-banked.json")
+        .replace("2026-12-10T22:00:00+00:00", &iso(soon))
+        .replace("2027-03-09T07:59:00+00:00", &iso(later));
+    let status = crate::usage::claude_reset::read_status(&body).expect("a cedar_ember block");
+    crate::testutil::register_names(&["cl1"]);
+    let path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("cl1"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+    )
+    .expect("limit_resets path");
+    crate::profile::mkdir_700(path.parent().expect("profile dir")).expect("mkdir profile dir");
+    crate::profile_cache::write_profile_cache_for(
+        crate::harness::Harness::Claude,
+        &crate::profile::ProfileName::from("cl1"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+        &crate::usage::claude_reset::status_reading(&status),
+    );
+    let app = t6_app();
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).expect("terminal");
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let split = rows[0]
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '╭')
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a selector and a detail pane");
+    let detail: Vec<String> = rows[1..rows.len() - 1]
+        .iter()
+        .map(|row| {
+            // Only the pane's own border and scrollbar go: the rail's `│`
+            // inside the padding is content.
+            let pane: String = row.chars().skip(split).collect();
+            let pane = pane
+                .trim_end_matches(|c: char| c == '│' || c == '┊' || c == '┃' || c.is_whitespace());
+            pane.strip_prefix('│')
+                .unwrap_or(pane)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let at = detail
+        .iter()
+        .position(|r| r.starts_with("resets "))
+        .unwrap_or_else(|| panic!("a resets row: {detail:#?}"));
+    let block: Vec<&str> = detail[at..].iter().take(7).map(String::as_str).collect();
+    assert_eq!(
+        block,
+        [
+            "resets 3 available".to_string(),
+            "├ One full limit reset (November 2026)".to_string(),
+            format!("│ resets 7d, 7d fable · valid until {}", valid_until(soon)),
+            "├ New model launch: one Fable reset for Max, Team Premium and Enterprise Premium"
+                .to_string(),
+            format!("│ resets 7d fable · valid until {}", valid_until(later)),
+            "└ New model launch: one more Fable reset at 6 months' tenure".to_string(),
+            format!("resets 7d fable · valid until {}", valid_until(later)),
+        ],
+        "{detail:#?}"
+    );
+}
+
+/// Each line's text, its spans joined.
+fn line_texts(lines: &[Line<'_>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+/// A stored grant off its wire shape, so a test names only what it varies.
+fn stored_grant(fields: serde_json::Value) -> crate::usage::claude_reset::Grant {
+    serde_json::from_value(fields).expect("a grant")
+}
+
+/// `valid until <day>` as the rail spells a local instant, the year added off
+/// this one — computed here from chrono, not by the renderer.
+fn rail_day(secs: i64) -> String {
+    use chrono::{Datelike as _, TimeZone as _};
+    let local = chrono::Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .expect("a local instant");
+    if local.year() == chrono::Local::now().year() {
+        local.format("%b %-d").to_string()
+    } else {
+        local.format("%b %-d, %Y").to_string()
+    }
+}
+
+fn rfc3339(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .expect("instant")
+        .to_rfc3339()
+}
+
+/// The claude `resets` block whole, row by row at a fixed width: the count
+/// line counts the usable resets against the held ones and names the block's
+/// cooldown while it holds a reset back; the rail names each reset still held
+/// (a used grant names nothing to spend and is left off), its label then its
+/// windows and day, the rail glyph in the hairline colour and the text faint.
+#[test]
+fn the_resets_rail_names_each_held_reset_and_the_cooldown() {
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let later = now + 400 * 86_400;
+    let reading = crate::usage::LimitResets {
+        usable: 1,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "g-1", "label": "First reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(soon), "clears": ["seven_day"], "usable_now": true})),
+            stored_grant(serde_json::json!({
+                "id": "g-2", "label": "Second reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(later), "clears": ["seven_day_overage_included"],
+                "usable_now": false})),
+            stored_grant(serde_json::json!({
+                "id": "g-3", "label": "Spent reset", "resets_total": 1, "resets_left": 0,
+                "clears": ["five_hour"], "usable_now": false})),
+        ],
+        cooldown_until: Some(rfc3339(now + 4 * 3600 + 46 * 60 + 30)),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..crate::usage::LimitResets::default()
+    };
+    let lines = claude_resets_block(&reading, 60);
+    assert_eq!(
+        line_texts(&lines),
+        [
+            "resets    1/2 available · cooldown (4h 46m)".to_string(),
+            "├ First reset".to_string(),
+            format!("│ resets 7d · valid until {}", rail_day(soon)),
+            "└ Second reset".to_string(),
+            format!("  resets 7d fable · valid until {}", rail_day(later)),
+        ]
+    );
+    for line in &lines[1..] {
+        assert_eq!(line.spans[0].style, theme::line(), "{line:?}");
+        assert_eq!(line.spans[1].style, theme::faint(), "{line:?}");
+    }
+
+    let calm = crate::usage::LimitResets {
+        cooldown_until: Some(rfc3339(now - 60)),
+        ..reading.clone()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&calm, 60))[0],
+        "resets    1/2 available",
+        "a cooldown behind now names nothing"
+    );
+
+    // A grant the server paused, and one it will only use at a limit the
+    // account sits under, name their STATE word on the tail, so the rail
+    // never reads them as spendable.
+    let held_back = crate::usage::LimitResets {
+        usable: 0,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "p-1", "label": "Paused reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(soon), "clears": ["seven_day"],
+                "usable_now": false, "paused": true})),
+            stored_grant(serde_json::json!({
+                "id": "l-1", "label": "At-limit reset", "resets_total": 1, "resets_left": 1,
+                "ends_at": rfc3339(now + 41 * 86_400), "clears": ["seven_day"],
+                "usable_now": false, "use_requires_limit": true})),
+        ],
+        fetched_at: Some(crate::usage::now_ms()),
+        ..crate::usage::LimitResets::default()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&held_back, 60)),
+        [
+            "resets    0/2 available".to_string(),
+            "├ Paused reset".to_string(),
+            format!("│ resets 7d · valid until {} · paused", rail_day(soon)),
+            "└ At-limit reset".to_string(),
+            format!(
+                "  resets 7d · valid until {} · at limit only",
+                rail_day(now + 41 * 86_400)
+            ),
+        ]
+    );
+}
+
+/// A label too long for the pane wraps on the rail with the `│ `
+/// continuation, never cut, and its detail follows on the rail; a stale
+/// reading keeps its age on the count line.
+#[test]
+fn a_long_reset_label_wraps_on_the_rail() {
+    let reading = crate::usage::LimitResets {
+        usable: 2,
+        banked: Some(2),
+        grants: vec![
+            stored_grant(serde_json::json!({
+                "id": "g-1",
+                "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+                "resets_total": 1, "resets_left": 1, "clears": ["seven_day_overage_included"],
+                "usable_now": true})),
+            stored_grant(serde_json::json!({
+                "id": "g-2", "label": "Short", "resets_total": 1, "resets_left": 1,
+                "usable_now": true})),
+        ],
+        fetched_at: Some(crate::usage::now_ms() - 3 * 3_600_000),
+        ..crate::usage::LimitResets::default()
+    };
+    assert_eq!(
+        line_texts(&claude_resets_block(&reading, 40)),
+        [
+            "resets    2 available · read 3h ago",
+            "├ New model launch: one Fable reset for",
+            "│ Max, Team Premium and Enterprise",
+            "│ Premium",
+            "│ resets 7d fable",
+            "└ Short",
+        ]
+    );
+}
+
+/// The codex `resets` block: off a stored list read, the credits that read
+/// available on the rail (a redeemed one left off) with what each resets and
+/// its day or `no expiry`; with no list read, the usage poll's count alone.
+#[test]
+fn the_codex_resets_rail_names_each_available_credit() {
+    let now = crate::usage::now_epoch_secs();
+    let soon = now + 20 * 86_400;
+    let credit = |id: &str, status: &str, expires: Option<String>, title: Option<&str>| {
+        crate::usage::codex_reset::ResetCredit {
+            id: id.to_string(),
+            reset_type: "codex_rate_limits".to_string(),
+            status: status.to_string(),
+            granted_at: None,
+            expires_at: expires,
+            title: title.map(str::to_string),
+        }
+    };
+    let list =
+        crate::usage::codex_reset::credits_reading(&crate::usage::codex_reset::ResetCredits {
+            credits: vec![
+                credit(
+                    "c-1",
+                    "available",
+                    Some(rfc3339(soon)),
+                    Some("Full reset (Weekly + 5 hr)"),
+                ),
+                credit("c-2", "redeemed", None, None),
+                credit("c-3", "available", None, None),
+            ],
+            available_count: 2,
+        });
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: None,
+        seven_day: None,
+        resets: Some(5),
+        fetched_at: None,
+    };
+    assert_eq!(
+        line_texts(&codex_resets_block(&row, Some(&list), 60)),
+        [
+            "resets    2 available".to_string(),
+            "├ Full reset (Weekly + 5 hr)".to_string(),
+            format!("│ resets usage windows · valid until {}", rail_day(soon)),
+            "└ usage-limit reset".to_string(),
+            "  resets usage windows · no expiry".to_string(),
+        ]
+    );
+    assert_eq!(
+        line_texts(&codex_resets_block(&row, None, 60)),
+        ["resets    5 available"],
+        "no list read: the poll's count, no rail"
     );
 }

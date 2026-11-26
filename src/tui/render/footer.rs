@@ -103,6 +103,16 @@ const BUTTON_SCROLL_KEYS: &[(&str, &str)] = &[
 /// `q` backs out.
 const LIST_KEYS: &[(&str, &str)] = &[("↑↓", "pick"), ("↵", "choose"), ("q", "back")];
 
+/// The limit-reset modal: ↑↓ walks the resets (the body follows the cursor,
+/// so the same key scrolls it at an overflow), ←→ the two buttons, ↵ runs the
+/// highlighted one, `q` backs out.
+const LIMIT_RESET_KEYS: &[(&str, &str)] = &[
+    ("↑↓", "reset"),
+    ("←→", "button"),
+    ("↵", "choose"),
+    ("q", "back"),
+];
+
 /// The preset picker adds `d` (delete a saved preset; the body also teaches
 /// it) and ↵ applies the picked preset. A built-in row has no file to drop, so
 /// its footer drops `d delete` — the same predicate the `d` handler reads.
@@ -352,6 +362,13 @@ fn owner_hints(
                 Some(PRESET_PICKER_KEYS)
             }
             Some(Modal::PresetPicker(_)) => Some(PRESET_PICKER_BUILTIN_KEYS),
+            // While the spend runs only `q` (and `esc`) does anything.
+            Some(Modal::LimitReset(form))
+                if form.phase == super::super::app::LimitResetPhase::Spending =>
+            {
+                Some(Q_BACK)
+            }
+            Some(Modal::LimitReset(_)) => Some(LIMIT_RESET_KEYS),
             Some(Modal::CaptureName(_)) => Some(CAPTURE_NAME_KEYS),
             Some(Modal::NamePrompt(_)) => Some(NAME_PROMPT_KEYS),
             // The re-bind confirm walks an account list the cursor steps over,
@@ -363,6 +380,9 @@ fn owner_hints(
                 ("↵", "choose"),
                 ("q", "not now"),
             ]),
+            // While its remove runs only `q` (and `esc`) does anything.
+            Some(Modal::TranscriptCleanup(_)) if app.transcript_cleanup.removing() => Some(Q_BACK),
+            Some(Modal::TranscriptCleanup(_)) => Some(BUTTON_KEYS),
             Some(Modal::Login | Modal::CodexLogin) | None => None,
         },
         KeyOwner::SetupField

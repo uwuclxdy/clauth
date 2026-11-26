@@ -31,9 +31,10 @@ use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
     FetchStatus, LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration,
-    now_epoch_secs, now_ms, selected_next_refresh, switch_grade_kick_lifts, usage_interval_ms,
+    iso_to_epoch_secs, now_epoch_secs, now_ms, selected_next_refresh, switch_grade_kick_lifts,
+    usage_interval_ms,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -66,7 +67,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &Read
     ])
     .areas(area);
 
-    draw_overview_accounts(frame, accounts_area, app, readings);
+    draw_overview_accounts(frame, accounts_area, app, readings, now_epoch_secs());
     draw_fallback_overview(frame, chain_area, chain_lines);
 }
 
@@ -135,11 +136,12 @@ fn more_members_line(hidden: usize) -> Line<'static> {
 
 /// The accounts panel's title-right meta: one count per harness — every
 /// harness whatever the filter shows, since the counts describe the rows the
-/// table lists, never the view. A roster with no accounts drops out of the
-/// words; with all empty there is nothing to count and no slot renders.
+/// table lists, never the view; a disabled account has no row, so no count.
+/// A roster with no accounts drops out of the words; with all empty there is
+/// nothing to count and no slot renders.
 fn harness_counts(app: &App) -> String {
     let mut terms: Vec<String> = Vec::new();
-    let claude_n = app.config().profiles.len();
+    let claude_n = app.config().enabled_profiles().count();
     if claude_n > 0 {
         terms.push(format!("{claude_n} claude"));
     }
@@ -154,11 +156,15 @@ fn harness_counts(app: &App) -> String {
     terms.join(" · ")
 }
 
+/// The accounts table as of `now`, the frame's one wall-clock read (epoch
+/// seconds) that [`OverviewWidths`] carries to every plan chip it sizes and
+/// every row draws.
 fn draw_overview_accounts(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     readings: &ReadingsSnapshot,
+    now: i64,
 ) {
     // Sole interactive content panel on this screen — always focused.
     let focused = true;
@@ -186,23 +192,47 @@ fn draw_overview_accounts(
             ShuntPool::NotRead(_) => true,
             ShuntPool::Absent => false,
         };
-    if app.config().profiles.is_empty() && codex.is_empty() && !shunt_draws {
+    // A disabled account draws no row, so a roster of disabled accounts alone
+    // leaves the claude rows as empty as no roster at all; it says which. A
+    // filter hiding the claude rows is what empties them then, so the filter's
+    // own empty table draws instead.
+    let (roster_n, shown_n) = {
+        let cfg = app.config();
+        (cfg.profiles.len(), cfg.enabled_profiles().count())
+    };
+    let all_disabled = roster_n > 0 && shown_n == 0 && app.harness_filter.shows_claude();
+    if (roster_n == 0 || all_disabled) && codex.is_empty() && !shunt_draws {
         app.overview_selector.offset.set(0);
         app.overview_selector.viewport.set(0);
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        if all_disabled {
+            empty_state(
+                frame,
+                inner,
+                "every claude account is disabled",
+                "\u{2325}4",
+                "to enable one on the setup tab",
+            );
+        } else {
+            empty_state(frame, inner, "no accounts yet", "n", "to create one");
+        }
         return;
     }
 
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
+    // Read before the config guard the widths take below, which the store
+    // ranks below: one snapshot sizes the slot and draws every row, so a
+    // verdict landing mid-frame cannot size a chip no row draws.
+    let dead_logins = dead_logins(app);
     let widths = if list_area.width > OVERVIEW_MAX_W {
-        OverviewWidths::new(OVERVIEW_MAX_W, app, readings).filled(usize::from(list_area.width))
+        OverviewWidths::new(OVERVIEW_MAX_W, app, readings, &dead_logins, now)
+            .filled(usize::from(list_area.width))
     } else {
-        OverviewWidths::new(list_area.width, app, readings)
+        OverviewWidths::new(list_area.width, app, readings, &dead_logins, now)
     };
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
@@ -214,7 +244,7 @@ fn draw_overview_accounts(
         let cfg = app.config();
         (ResetFmt::from_state(&cfg.state), cfg.state.reduce_motion)
     };
-    let entries = app.band_entries(app.harness_filter);
+    let entries = app.band_entries(app.harness_filter, true);
     let ranges = App::heading_ranges(&entries);
 
     // One pass over the shared band walk builds both the rendered rows and the
@@ -249,9 +279,15 @@ fn draw_overview_accounts(
             BandEntry::Item(item) => {
                 starts.push(rendered);
                 let line = match *item {
-                    MainItemKind::Profile(_) => {
-                        render_overview_row(app, flat, &widths, flat == sel, focused, readings)
-                    }
+                    MainItemKind::Profile(idx) => render_overview_row_with(
+                        app,
+                        idx,
+                        &widths,
+                        flat == sel,
+                        focused,
+                        readings,
+                        &dead_logins,
+                    ),
                     MainItemKind::Codex(idx) => render_codex_row(
                         &codex[idx],
                         flat,
@@ -301,15 +337,20 @@ struct OverviewWidths {
     /// `TPS_W` when the per-account speed column fits, `0` when it is dropped
     /// (the fill restores it whole once the slack covers its slot).
     tps: usize,
-    /// The `↺ N` chip slot right behind the last usage column, ahead of `live`
-    /// and `t/s` (gap + the widest visible chip text across codex and claude
-    /// rows), charged whenever a visible row of either kind carries a banked
-    /// reset and the row has room for it; `0` when none does or the chip
-    /// sheds whole, so the renderer drops the chip instead of clipping it
-    /// mid-glyph. One shared slot every row kind and the header pad: a chip
-    /// never clips, sheds the same way on both kinds, and the columns after
-    /// it stay aligned.
+    /// The chip slot right behind the last usage column, ahead of `live` and
+    /// `t/s` (gap + the widest visible chip text), charged whenever a
+    /// visible row carries a chip and the row has room for it: a codex or
+    /// claude row's banked `↺ N`, a claude row's plan chip ([`plan_chip`]),
+    /// or on one row both, `↺ N`, a [`Self::gap`] and the plan chip. Short of
+    /// room it sheds every `↺ N` first ([`Self::chip_resets`]), keeping the
+    /// plan chips, then whole: `0`, so the renderer drops the chips instead
+    /// of clipping one mid-glyph. One shared slot every row kind and the
+    /// header pad: a chip never clips, sheds the same way on every kind, and
+    /// the columns after it stay aligned.
     chip_w: usize,
+    /// The frame's wall clock (epoch seconds), the one `now` the sizing and
+    /// every row read each plan chip off.
+    now: i64,
     /// Name cells the chip's charge took at the laid-out width (the uncharged
     /// name minus the laid-out one). Past [`OVERVIEW_MAX_W`] the slack restores
     /// them one cell at a time, before anything else.
@@ -322,12 +363,19 @@ struct OverviewWidths {
     /// column first; the suffix draws clipped until its whole width fits.
     five_restore: usize,
     seven_restore: usize,
-    /// The `↺ N` chip slot (gap + text) the laid-out row hid for room. The
-    /// chip cannot draw partly, so past [`OVERVIEW_MAX_W`] the split waits
-    /// until the slack covers the slot whole: nothing grows until then, so no
-    /// bar or gap ever shrinks. `0` when the chip was drawn or no visible
-    /// row banks a reset.
+    /// The chip slot (gap + text) the laid-out row hid whole for room: the
+    /// plan chips alone when a visible row carries one, else the `↺ N`
+    /// chips. A chip cannot draw partly, so past [`OVERVIEW_MAX_W`] the split
+    /// waits until the slack covers the slot whole: nothing grows until then,
+    /// so no bar or gap ever shrinks. `0` when the slot was drawn or no
+    /// visible row carries a chip.
     chip_deferred: usize,
+    /// The whole slot, `↺ N` beside the plan chips, while the laid-out row
+    /// draws (or defers) the plan chips alone: past [`OVERVIEW_MAX_W`] the
+    /// split waits, after the plan chips, until the slack covers the
+    /// difference. `0` when the laid-out slot holds `↺ N` or no row needs
+    /// the swap.
+    resets_deferred: usize,
     /// The live column's slot (gap + [`LIVE_W`]) the laid-out frame cut for
     /// room. The column cannot draw partly, so past [`OVERVIEW_MAX_W`] the
     /// fill restores it whole once the slack covers the slot — before the t/s
@@ -466,14 +514,14 @@ const GAP_MIN: usize = 2;
 /// The width the accounts table lays its columns out at. Past it the table
 /// starts from the exact laid-out frame and only grows: the panel's spare
 /// width (the slack) restores the room that frame leaves short — a name the
-/// `↺ N` chip shrank, each wall-clock stamp's room up to the widest suffix
-/// its display mode draws, a dropped live or t/s column (whole) — then
-/// widens the 5h and 7d bars that draw and the column gaps until the table
-/// spans the panel ([`OverviewWidths::filled`]).
+/// chip slot shrank, each wall-clock stamp's room up to the widest suffix
+/// its display mode draws, a dropped live or t/s column, then a shed chip
+/// slot (each whole) — then widens the 5h and 7d bars that draw and the
+/// column gaps until the table spans the panel ([`OverviewWidths::filled`]).
 const OVERVIEW_MAX_W: u16 = 122;
 
-/// The gaps of a table row, each named by the column it opens. The `↺ N`
-/// chip's gap is not one: the chip slot keeps its laid-out width.
+/// The gaps of a table row, each named by the column it opens. The chip
+/// slot's gap is not one: the slot keeps its laid-out width.
 #[derive(Debug, Clone, Copy)]
 enum Gap {
     Kind,
@@ -491,9 +539,18 @@ impl Gap {
 impl OverviewWidths {
     /// The laid-out width: the panel at or below [`OVERVIEW_MAX_W`] lays the
     /// columns out at the panel's own width; past it the table starts from
-    /// this exact frame ([`Self::filled`] then only grows it).
-    fn new(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
-        Self::build(width, app, readings)
+    /// this exact frame ([`Self::filled`] then only grows it). `dead_logins`
+    /// is the frame's one read of the usage probe's dead-login verdicts and
+    /// `now` its one read of the wall clock, both taken by the caller so the
+    /// sizing and every row draw the same frame.
+    fn new(
+        width: u16,
+        app: &App,
+        readings: &ReadingsSnapshot,
+        dead_logins: &HashMap<String, u64>,
+        now: i64,
+    ) -> Self {
+        Self::build(width, app, readings, dead_logins, now)
     }
 
     /// Spreads the slack between the laid-out row and a `total`-cell panel,
@@ -509,7 +566,8 @@ impl OverviewWidths {
     /// them — a pending slot withholds everything past the name and the
     /// stamps, so no bar or gap ever shrinks. The deferred chip slot comes
     /// back the same way, after t/s, into its place behind the last usage
-    /// column. What is left then splits a third to the
+    /// column: the plan chips first, then the `↺ N` beside them. What is
+    /// left then splits a third to the
     /// 5h and 7d bars that actually draw (a lone bar takes the whole third,
     /// none the whole slack) and the rest over the gaps, the leftmost gaps
     /// taking a cell each where it does not divide evenly. The row then
@@ -549,6 +607,14 @@ impl OverviewWidths {
             self.chip_w = self.chip_deferred;
             slack -= self.chip_deferred;
         }
+        if !self.chip_resets() {
+            let more = self.resets_deferred - self.chip_w;
+            if more > slack {
+                return self;
+            }
+            self.chip_w = self.resets_deferred;
+            slack -= more;
+        }
         // The bars collectively take a third of the slack (a lone bar the
         // whole of it); shared between two bars the 7d takes the odd cell, so
         // the collective share grows at most one cell per slack cell and the
@@ -586,6 +652,13 @@ impl OverviewWidths {
         self
     }
 
+    /// Whether the chip slot draws the rows' `↺ N`: `false` while it holds
+    /// the plan chips alone, short of the [`Self::resets_deferred`] cells
+    /// the whole slot takes.
+    fn chip_resets(&self) -> bool {
+        self.chip_w >= self.resets_deferred
+    }
+
     /// The cells of the gap that opens `before`'s column.
     fn gap_before(&self, before: Gap) -> usize {
         let base = match before {
@@ -595,19 +668,25 @@ impl OverviewWidths {
         base + self.gap_extra[before as usize]
     }
 
-    fn build(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
+    fn build(
+        width: u16,
+        app: &App,
+        readings: &ReadingsSnapshot,
+        dead_logins: &HashMap<String, u64>,
+        now: i64,
+    ) -> Self {
         let total = width as usize;
+        // Sized off the rows the table draws: a disabled account has none.
         let max_name = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
         let fmt = ResetFmt::from_state(&app.config().state);
         let shows_clock = fmt.shows_clock();
         let claude_labels = if app.harness_filter.shows_claude() {
-            LabelWidths::of(app.config().profiles.iter().map(|p| {
+            LabelWidths::of(app.config().enabled_profiles().map(|p| {
                 let (five, seven) = overview_windows(p, readings);
                 // A DeepSeek row's 5h cell holds its balance, not a reading.
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
@@ -649,72 +728,59 @@ impl OverviewWidths {
             LabelWidths::default()
         };
         let labels = claude_labels.widest(codex_labels).widest(pool_labels);
-        // The widest `↺ N` chip text across visible codex and claude rows, `0`
-        // when none carries a banked reset. Only the text: the gap before it
-        // joins the column gaps in the width budget below.
-        let codex_chip_text = if app.harness_filter.shows_codex() {
-            app.codex_rows
+        // Each visible row's chip texts, `(↺ N, plan chip)` in cells, `0` for
+        // a chip the row lacks. Only the texts: the gap before the slot joins
+        // the column gaps in the width budget below.
+        let mut chips: Vec<(usize, usize)> = Vec::new();
+        if app.harness_filter.shows_codex() {
+            chips.extend(
+                app.codex_rows
+                    .iter()
+                    .filter_map(|r| r.resets)
+                    .map(|count| (grapheme_cells(&format!("↺ {count}")), 0)),
+            );
+        }
+        if app.harness_filter.shows_claude() {
+            let cfg = app.config();
+            chips.extend(cfg.enabled_profiles().filter_map(|p| {
+                let resets = app
+                    .claude_resets
+                    .get(p.name.as_str())
+                    .map(|r| r.usable)
+                    .filter(|count| *count > 0)
+                    .map_or(0, |count| grapheme_cells(&format!("↺ {count}")));
+                let plan = overview_plan_chip(app, &cfg, p, readings, dead_logins, now)
+                    .map_or(0, |chip| grapheme_cells(&chip));
+                (resets > 0 || plan > 0).then_some((resets, plan))
+            }));
+        }
+        // The widest text the slot holds at `gap`: a row's `↺ N`, its plan
+        // chip, or both with the gap between them; `resets` false sheds every
+        // `↺ N`, keeping the plan chips.
+        let chip_text = |gap: usize, resets: bool| {
+            chips
                 .iter()
-                .filter_map(|r| r.resets)
-                .map(|count| grapheme_cells(&format!("↺ {count}")))
+                .map(|&(r, p)| match (resets && r > 0, p > 0) {
+                    (true, true) => r + gap + p,
+                    (true, false) => r,
+                    (false, _) => p,
+                })
                 .max()
                 .unwrap_or(0)
-        } else {
-            0
         };
-        let claude_chip_text = if app.harness_filter.shows_claude() {
-            app.config()
-                .profiles
-                .iter()
-                .filter_map(|p| app.claude_resets.get(p.name.as_str()))
-                .map(|r| r.usable)
-                .filter(|count| *count > 0)
-                .map(|count| grapheme_cells(&format!("↺ {count}")))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let chip_text = codex_chip_text.max(claude_chip_text);
-        let (five_excess, seven_excess) = labels.excess();
-        let (mut name, kind, mut five_hour, mut seven_day) =
-            overview_tiers(max_name, total, labels);
-        let live = live_column_width(max_name, total, labels);
-
-        // The speed column exists from the first frame; cells are blank until a
-        // fresh producer answers. It drops whole before `live` (it needs both
-        // columns to fit) and before the 7d stamp. The wall-clock stamps are
-        // granted first, so the speed column takes only the slack they leave,
-        // and the countdown cells keep their room.
+        let (_, seven_excess) = labels.excess();
+        let cols = laid_out_columns(max_name, total, labels, shows_clock);
+        let Columns {
+            mut name,
+            kind,
+            five_hour,
+            seven_day,
+            live,
+            tps,
+            mut gap,
+        } = cols;
         let mut five_restore = 0;
         let mut seven_restore = 0;
-        if shows_clock {
-            // A wall-clock stamp's clock half takes [`CLOCK_COLS`] cells
-            // beyond the countdown. Take them ONLY from slack the layout would
-            // otherwise spend on gap padding, after the live column and the
-            // shrink loop have settled, so at the laid-out width turning the
-            // setting on can add a stamp but never costs a countdown, a bar or
-            // the live column. Widening the tier itself instead pushed the 7d
-            // column down to 5 at 130 columns, deleting its bar. A column that
-            // gets only part of the room still degrades cleanly in
-            // `reset_suffix`.
-            let slack = |five: usize, seven: usize| {
-                total.saturating_sub(
-                    fixed_overview_width_cols(name, kind, five, seven, live, 0, GAP_MIN)
-                        + TIMER_SLOT,
-                )
-            };
-            let five_stamp_col = five_hour == FIVE_HOUR_MAX + five_excess;
-            if five_stamp_col {
-                let five_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
-                five_hour += five_grant;
-            }
-            let seven_stamp_col = seven_day == SEVEN_DAY_MAX + seven_excess;
-            if seven_stamp_col {
-                let seven_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
-                seven_day += seven_grant;
-            }
-        }
         let facts = column_facts(app, readings);
         // A usage column whose laid-out width cannot hold the bar block beside
         // the widest reading it renders takes neither a share of the fill's
@@ -762,75 +828,59 @@ impl OverviewWidths {
             };
         }
         let seven_bar = facts.seven_bar && seven_day >= SEVEN_DAY_BAR + seven_excess;
-        let tps = if tps_column_width(max_name, total, labels) > 0 {
-            let need =
-                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
-                    + TIMER_SLOT;
-            if need <= total { TPS_W } else { 0 }
-        } else {
-            0
-        };
 
-        let base = fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, GAP_MIN);
-        let column_count =
-            3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
-        let gap_slots = column_count.saturating_sub(1).max(1);
-        // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
-        // widening gaps from that undercounted figure overflows the row at
-        // narrow widths and clips the tail of the 5h column. Widen from the
-        // real leftover instead.
-        let mut gap =
-            (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
-        let mut chip_w = if chip_text > 0 { gap + chip_text } else { 0 };
+        // The chip slot is charged against the flexible widths
+        // ([`charge_slot`]). A slot the row cannot hold sheds every `↺ N` and
+        // is charged again for the plan chips alone; past that it sheds whole,
+        // nothing charged: the name and gap keep the uncharged layout, and the
+        // renderer drops the chips rather than letting one peek in. A name
+        // the chip shrank is recorded, so the fill restores it before
+        // anything else grows.
+        let mut chip_w = 0;
         let mut chip_deferred = 0;
-
-        // The name column is the one flexible text column (the only column that
-        // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
-        // is at its ceiling and the clock bonus has taken what it wants, spare
-        // width goes to the name instead of stranding at the row end. The chip
-        // slot is charged after this, so the name absorbs its own slack exactly
-        // as it would without the chip.
-        if gap == 8 {
-            name += total.saturating_sub(
-                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
-                    + TIMER_SLOT,
-            );
-        }
-        // The chip slot is charged against the flexible widths: the gap first,
-        // down to its floor, then the name down to `NAME_READING_FLOOR`. Past
-        // that the chip sheds whole, nothing charged: the name and gap revert
-        // to the uncharged layout, and the renderer drops the chip rather than
-        // letting it peek in. A name the chip shrank is recorded, so the fill
-        // restores it before anything else grows.
+        let mut resets_deferred = 0;
         let mut name_short = 0;
-        if chip_text > 0 {
-            let name_uncharged = name;
-            let gap_uncharged = gap;
-            loop {
-                let row =
-                    fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
-                        + TIMER_SLOT
-                        + chip_w;
-                if row <= total {
-                    break;
-                }
-                if gap > GAP_MIN {
-                    gap -= 1;
-                    chip_w = gap + chip_text;
-                } else if name > NAME_READING_FLOOR {
-                    name -= 1;
-                } else {
-                    name = name_uncharged;
-                    gap = gap_uncharged;
-                    chip_w = 0;
-                    // Past the layout width the fill may still charge the
-                    // slot the row could not fit.
-                    chip_deferred = gap + chip_text;
-                    break;
-                }
+        if !chips.is_empty() {
+            let charge = |cols: Columns, total: usize, resets: bool| {
+                charge_slot(cols, total, |gap| chip_text(gap, resets))
+            };
+            let any_plan = chips.iter().any(|&(_, p)| p > 0);
+            // Some row's `↺ N` can shed while a plan chip stays.
+            let sheds_resets = any_plan && chips.iter().any(|&(r, _)| r > 0);
+            let holds = |resets: bool| {
+                (total..=total.max(usize::from(OVERVIEW_MAX_W))).all(|wider| {
+                    charge(
+                        laid_out_columns(max_name, wider, labels, shows_clock),
+                        wider,
+                        resets,
+                    )
+                    .is_some()
+                })
+            };
+            // A plan chip shows only where the plan chips alone fit at every
+            // wider laid-out width too (the frame past [`OVERVIEW_MAX_W`] is
+            // the one at it), so a chip that appears stays as the panel
+            // widens: the live column's rule. Beside a plan chip `↺ N` takes
+            // the same rule, so it never hides as the panel widens; a table
+            // without plan chips keeps the fits-at-this-width rule.
+            let plan_holds = !any_plan || holds(false);
+            let resets_hold = !sheds_resets || holds(true);
+            let full = charge(cols, total, true).filter(|_| plan_holds && resets_hold);
+            let alone = charge(cols, total, false).filter(|_| plan_holds && sheds_resets);
+            // Whether the slot the frame lays out holds `↺ N`.
+            let with_resets = full.is_some() || !sheds_resets;
+            if let Some(charged) = full.or(alone) {
+                name = charged.name;
+                gap = charged.gap;
+                chip_w = gap + chip_text(gap, with_resets);
+                name_short = cols.name.saturating_sub(name);
+            } else {
+                // Past the layout width the fill may still charge the slot
+                // the row could not fit, the plan chips first.
+                chip_deferred = gap + chip_text(gap, with_resets);
             }
-            if chip_w > 0 {
-                name_short = name_uncharged.saturating_sub(name);
+            if !with_resets {
+                resets_deferred = gap + chip_text(gap, true);
             }
         }
         // The live and t/s columns the laid-out frame cut for room come back
@@ -848,8 +898,7 @@ impl OverviewWidths {
 
         let deepseek_amount_w = app
             .config()
-            .profiles
-            .iter()
+            .enabled_profiles()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
@@ -866,10 +915,12 @@ impl OverviewWidths {
             live,
             tps,
             chip_w,
+            now,
             name_short,
             five_restore,
             seven_restore,
             chip_deferred,
+            resets_deferred,
             live_deferred,
             tps_deferred,
             five_bar,
@@ -887,7 +938,7 @@ impl OverviewWidths {
     }
 
     /// The width the table's widest row draws at these columns, before the
-    /// `↺ N` chip: the cursor and bell prefix, every column and its gap, and
+    /// chip slot: the cursor and bell prefix, every column and its gap, and
     /// the timer slot. The widest row the layout can draw is this plus
     /// [`Self::chip_w`], the chip slot every row carries behind its last
     /// usage column.
@@ -951,7 +1002,7 @@ fn column_facts(app: &App, readings: &ReadingsSnapshot) -> ColumnFacts {
         }
     };
     if app.harness_filter.shows_claude() {
-        for profile in &app.config().profiles {
+        for profile in app.config().enabled_profiles() {
             let (five_window, seven_window) = overview_windows(profile, readings);
             // A DeepSeek row's 5h cell holds its balance, not a window; every
             // other row draws the column's bar shape even with no reading (the
@@ -983,6 +1034,135 @@ fn column_facts(app: &App, readings: &ReadingsSnapshot) -> ColumnFacts {
         }
     }
     facts
+}
+
+/// The table's column widths and gap at one laid-out width, before the chip
+/// slot is charged.
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    name: usize,
+    kind: usize,
+    five_hour: usize,
+    seven_day: usize,
+    live: usize,
+    tps: usize,
+    gap: usize,
+}
+
+/// The columns at a laid-out width of `total` cells: the tiers, the live
+/// column, the wall-clock stamps' room when `shows_clock`, the speed column,
+/// the gap and the name's share of the slack the gap leaves.
+fn laid_out_columns(
+    max_name: usize,
+    total: usize,
+    labels: LabelWidths,
+    shows_clock: bool,
+) -> Columns {
+    let (five_excess, seven_excess) = labels.excess();
+    let (mut name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total, labels);
+    let live = live_column_width(max_name, total, labels);
+
+    // The speed column exists from the first frame; cells are blank until a
+    // fresh producer answers. It drops whole before `live` (it needs both
+    // columns to fit) and before the 7d stamp. The wall-clock stamps are
+    // granted first, so the speed column takes only the slack they leave,
+    // and the countdown cells keep their room.
+    if shows_clock {
+        // A wall-clock stamp's clock half takes [`CLOCK_COLS`] cells
+        // beyond the countdown. Take them ONLY from slack the layout would
+        // otherwise spend on gap padding, after the live column and the
+        // shrink loop have settled, so at the laid-out width turning the
+        // setting on can add a stamp but never costs a countdown, a bar or
+        // the live column. Widening the tier itself instead pushed the 7d
+        // column down to 5 at 130 columns, deleting its bar. A column that
+        // gets only part of the room still degrades cleanly in
+        // `reset_suffix`.
+        let slack = |five: usize, seven: usize| {
+            total.saturating_sub(
+                fixed_overview_width_cols(name, kind, five, seven, live, 0, GAP_MIN) + TIMER_SLOT,
+            )
+        };
+        let five_stamp_col = five_hour == FIVE_HOUR_MAX + five_excess;
+        if five_stamp_col {
+            let five_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
+            five_hour += five_grant;
+        }
+        let seven_stamp_col = seven_day == SEVEN_DAY_MAX + seven_excess;
+        if seven_stamp_col {
+            let seven_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
+            seven_day += seven_grant;
+        }
+    }
+    let tps = if tps_column_width(max_name, total, labels) > 0 {
+        let need =
+            fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
+                + TIMER_SLOT;
+        if need <= total { TPS_W } else { 0 }
+    } else {
+        0
+    };
+
+    let base = fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, GAP_MIN);
+    let column_count =
+        3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
+    let gap_slots = column_count.saturating_sub(1).max(1);
+    // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
+    // widening gaps from that undercounted figure overflows the row at
+    // narrow widths and clips the tail of the 5h column. Widen from the
+    // real leftover instead.
+    let gap = (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
+
+    // The name column is the one flexible text column (the only column that
+    // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
+    // is at its ceiling and the clock bonus has taken what it wants, spare
+    // width goes to the name instead of stranding at the row end. The chip
+    // slot is charged after this, so the name absorbs its own slack exactly
+    // as it would without the chip.
+    if gap == 8 {
+        name += total.saturating_sub(
+            fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
+                + TIMER_SLOT,
+        );
+    }
+    Columns {
+        name,
+        kind,
+        five_hour,
+        seven_day,
+        live,
+        tps,
+        gap,
+    }
+}
+
+/// `cols` charged a chip slot of the gap plus `text(gap)` cells within
+/// `total`: the gap first, down to its floor, then the name down to
+/// [`NAME_READING_FLOOR`]. `None` when the row cannot hold the slot even
+/// then.
+fn charge_slot(mut cols: Columns, total: usize, text: impl Fn(usize) -> usize) -> Option<Columns> {
+    loop {
+        let row = fixed_overview_width_cols(
+            cols.name,
+            cols.kind,
+            cols.five_hour,
+            cols.seven_day,
+            cols.live,
+            cols.tps,
+            cols.gap,
+        ) + TIMER_SLOT
+            + cols.gap
+            + text(cols.gap);
+        if row <= total {
+            return Some(cols);
+        }
+        if cols.gap > GAP_MIN {
+            cols.gap -= 1;
+        } else if cols.name > NAME_READING_FLOOR {
+            cols.name -= 1;
+        } else {
+            return None;
+        }
+    }
 }
 
 /// The four semantic column widths after the tier ladders and the shrink loop
@@ -1212,7 +1392,7 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
             theme::label(),
         ));
     }
-    push_chip_slot(&mut spans, widths, None);
+    push_chip_slot(&mut spans, widths, None, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
@@ -1224,26 +1404,45 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The `↺ N` banked-reset chip slot, right behind the last usage column drawn
-/// and ahead of `live` and `t/s`: the same [`OverviewWidths::chip_w`] cells on
-/// every row kind and the header, so the columns after it line up whether a
-/// row carries a chip or not, and a reset count never sits under `live` or
-/// `t/s`. `count` is the row's banked reset count, `None` for a blank slot;
-/// nothing while the slot is not charged.
-fn push_chip_slot(spans: &mut Vec<Span<'static>>, widths: &OverviewWidths, count: Option<i64>) {
+/// The chip slot, right behind the last usage column drawn and ahead of
+/// `live` and `t/s`: the same [`OverviewWidths::chip_w`] cells on every row
+/// kind and the header, so the columns after it line up whether a row
+/// carries a chip or not, and a chip never sits under `live` or `t/s`.
+/// `count` is the row's banked reset count, drawn `↺ N` while the slot holds
+/// them ([`OverviewWidths::chip_resets`]); `plan` its plan chip
+/// ([`plan_chip`]), in the warning color, a gap after `↺ N` when both draw.
+/// `None` for each a row lacks; nothing while the slot is not charged.
+fn push_chip_slot(
+    spans: &mut Vec<Span<'static>>,
+    widths: &OverviewWidths,
+    count: Option<i64>,
+    plan: Option<String>,
+) {
     if widths.chip_w == 0 {
         return;
     }
-    let text_w = widths.chip_w.saturating_sub(widths.gap);
+    let mut room = widths.chip_w.saturating_sub(widths.gap);
     spans.push(Span::raw(" ".repeat(widths.gap)));
-    match count {
-        Some(count) => {
-            let (chip, pad) = fixed_split(&format!("↺ {count}"), text_w);
-            spans.push(Span::styled(chip, theme::dim()));
-            spans.push(Span::raw(pad));
-        }
-        None => spans.push(Span::raw(" ".repeat(text_w))),
+    let resets = count
+        .filter(|_| widths.chip_resets())
+        .map(|count| format!("↺ {count}"));
+    let both = resets.is_some() && plan.is_some();
+    if let Some(resets) = resets {
+        let (chip, _) = fixed_split(&resets, room);
+        room = room.saturating_sub(grapheme_cells(&chip));
+        spans.push(Span::styled(chip, theme::dim()));
     }
+    if let Some(plan) = plan {
+        if both {
+            let gap = widths.gap.min(room);
+            spans.push(Span::raw(" ".repeat(gap)));
+            room -= gap;
+        }
+        let (chip, _) = fixed_split(&plan, room);
+        room = room.saturating_sub(grapheme_cells(&chip));
+        spans.push(Span::styled(chip, theme::warning()));
+    }
+    spans.push(Span::raw(" ".repeat(room)));
 }
 
 /// The phase a row's identity wave samples: the animation clock, or under
@@ -1332,7 +1531,7 @@ fn render_codex_row(
         spans.push(gap(widths, Gap::SevenDay));
         spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
-    push_chip_slot(&mut spans, widths, row.resets);
+    push_chip_slot(&mut spans, widths, row.resets, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1414,7 +1613,7 @@ fn render_pool_row(
     spans.push(gap(widths, Gap::Timer));
     spans.push(timer);
     // Flatten the bar's threshold colors and reset countdown to dim for a
-    // paused/disabled row, the same pass the claude row applies.
+    // paused/disabled row.
     let flatten = |mut spans: Vec<Span<'static>>| {
         if disabled {
             for s in &mut spans {
@@ -1462,7 +1661,7 @@ fn render_pool_row(
             " ".repeat(widths.seven_day.saturating_sub(seven_len)),
         ));
     }
-    push_chip_slot(&mut spans, widths, None);
+    push_chip_slot(&mut spans, widths, None, None);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
@@ -1524,27 +1723,27 @@ fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
 /// dash instead.
 const NO_FIVE_HOUR_LIMIT: &str = "no limit";
 
-fn render_overview_row(
+fn render_overview_row_with(
     app: &App,
     idx: usize,
     widths: &OverviewWidths,
     selected: bool,
     focused: bool,
     readings: &ReadingsSnapshot,
+    dead_logins: &HashMap<String, u64>,
 ) -> Line<'static> {
-    // Read before the config guard, which it ranks below.
-    let dead_logins = app
-        .third_party_broken
-        .lock()
-        .map(|m| m.clone())
-        .unwrap_or_default();
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
+    // The row's place in the drawn list, the step its crest staggers by: the
+    // claude rows lead the list, less every disabled account, which has none.
+    let position = cfg.profiles[..idx]
+        .iter()
+        .filter(|p| !p.is_disabled())
+        .count();
 
     let active = cfg.is_active(&profile.name);
-    let disabled = profile.is_disabled();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
@@ -1569,30 +1768,17 @@ fn render_overview_row(
     // A setup token the usage probe found refused rests: no probe follows, so
     // its slot counts nothing down, though the tick that lands the refusal
     // publishes a countdown before the verdict reaches this map.
-    let token_refused = crate::usage::dead_login_is_setup_token(profile)
-        && crate::usage::dead_login_fingerprint(profile)
-            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
+    let token_refused = setup_token_refused(profile, dead_logins);
     let inner = TIMER_SLOT - 1;
     let timer_span = if not_current {
         // An unpolled row drawing a cached reading carries the amber `⋯` where a
         // polled row would count down to its next refresh: the figures beside it
-        // are last-known, and no fetch leg currently refreshes them (a re-enable,
-        // a login or a key puts the profile back on a list). Styled directly
-        // rather than through `hue`, so a disabled row keeps this one hue while
-        // every other span still flattens to dim.
+        // are last-known, and no fetch leg currently refreshes them (a login or
+        // a key puts the profile back on a list).
         Span::styled(
             format!("{:>inner$} ", NOT_CURRENT_MARK, inner = inner),
             theme::warning(),
         )
-    } else if disabled {
-        // A disabled account is filtered out of the scheduler's polling set
-        // (`AppConfig::enabled_profiles`), and `publish_countdowns` republishes
-        // the `next_refresh_per_profile` map from the work-list snapshots on
-        // every tick, so its entry is dropped rather than left to tick to zero.
-        // With no reading to mark stale, blank the slot rather than claim a
-        // countdown, keeping its width so no column shifts. The spinner goes too —
-        // nothing can be in flight for a profile nothing polls.
-        Span::raw(" ".repeat(TIMER_SLOT))
     } else if token_refused {
         Span::raw(" ".repeat(TIMER_SLOT))
     } else if !app.fetch_lease.fetches_here()
@@ -1686,18 +1872,9 @@ fn render_overview_row(
         }
     };
 
-    // Long-lived-token state from the per-frame-free cache (App::session_tokens).
-    // `token_danger` (expired or mis-filled, or refused by the usage probe, the
-    // same credential and the same re-mint) drives the `⊘` marker.
-    let token_status = app.session_tokens.get(profile.name.as_str());
-    let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
+    let token_danger = token_danger(app, profile, dead_logins, widths.now);
 
     let mut spans = vec![cursor];
-    // A disabled row flattens every semantic hue to dim — the whole row reads as
-    // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
-    // mark/`▲` still distinguish themselves without the color.
-    let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: a running delete (its spinner) > canceled subscription
     // or organization refusal (⊖) > broken login (×) > token danger (⊘) > bell
     // (!) > active (✻ / its working frame / ⏣ / ⥋) > peak hours (▲). A refused
@@ -1710,30 +1887,27 @@ fn render_overview_row(
     // authenticates as beats a schedule the Usage tab's pricing row already names.
     let auth_broken = cfg.is_auth_broken(&profile.name);
     if app.deleting.as_ref() == Some(&profile.name) {
-        spans.push(Span::styled(
-            spinner_frame(app.tick_count),
-            hue(theme::accent()),
-        ));
+        spans.push(Span::styled(spinner_frame(app.tick_count), theme::accent()));
         spans.push(Span::raw(" "));
     } else if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
-        spans.push(Span::styled("⊖", hue(theme::danger())));
+        spans.push(Span::styled("⊖", theme::danger()));
         spans.push(Span::raw(" "));
     } else if auth_broken {
         spans.push(Span::styled(
             theme::dead_credential_glyph(),
-            hue(theme::danger()),
+            theme::danger(),
         ));
         spans.push(Span::raw(" "));
     } else if token_danger {
-        spans.push(Span::styled("⊘", hue(theme::danger())));
+        spans.push(Span::styled("⊘", theme::danger()));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.is_ringing(profile.name.as_str()) {
-        spans.push(Span::styled("!", hue(theme::danger())));
+        spans.push(Span::styled("!", theme::danger()));
         spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
             active_mark(app, profile),
-            hue(Style::default().fg(theme::accent_2_color())),
+            Style::new().fg(theme::accent_2_color()),
         ));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
@@ -1741,22 +1915,13 @@ fn render_overview_row(
         // so an active profile on peak hours keeps its mark and the `▲` reads
         // "this other account is on the surcharged rate right now". The
         // pricing row on the Usage tab names the schedule and the flip.
-        spans.push(Span::styled("▲", hue(theme::warning())));
+        spans.push(Span::styled("▲", theme::warning()));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    // A disabled account can never be active (the disable action itself
-    // refuses on an active target), so dim always wins over `name_color`.
-    let ns = bold_when(
-        if disabled {
-            theme::dim()
-        } else {
-            name_color(active)
-        },
-        selected && focused,
-    );
+    let ns = bold_when(name_color(active), selected && focused);
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths, Gap::Kind));
@@ -1766,22 +1931,20 @@ fn render_overview_row(
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
     // The identity wave is ambient MOTION, which reads as "this thing is live".
-    // A disabled or quarantined account is not, so it renders the same flat dim
-    // cell an unrecognized provider gets — dimming the crest would still animate.
+    // A quarantined account is not, so it renders the same flat dim cell an
+    // unrecognized provider gets — dimming the crest would still animate.
     if let Some(provider) = crest_provider(profile)
-        && !disabled
         && !auth_broken
         && !no_tier
     {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), idx);
-        spans.extend(identity_wave_spans(&clamped, provider, idx, wave_ms));
+        let wave_ms = wave_phase_ms(cfg.state.reduce_motion, app.anim_ms(), position);
+        spans.extend(identity_wave_spans(&clamped, provider, position, wave_ms));
         spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
-        // whole cell. A disabled row still flattens to dim, outranking no-data
-        // the way it outranks stale.
-        let style = if no_tier && !disabled {
+        // whole cell.
+        let style = if no_tier {
             theme::faint()
         } else {
             theme::dim()
@@ -1807,28 +1970,12 @@ fn render_overview_row(
         )
     };
     let reset_fmt = ResetFmt::from_state(&cfg.state);
-    // Flatten the bar's threshold colors and drain-colored reset countdown to dim
-    // for a disabled row. The NUMBERS stay — they're the last real reading and
-    // still informative; it's the semantic hue that lies once the data is frozen.
-    // Post-processed here rather than threaded through
-    // `window_summary_spans_bracketed`: that helper lives in the shared
-    // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
-    // future caller the way a new parameter would. Widths are unaffected (the
-    // pad math measures display cells, not styles).
-    let flatten = |mut spans: Vec<Span<'static>>| {
-        if disabled {
-            for s in &mut spans {
-                s.style = theme::dim();
-            }
-        }
-        spans
-    };
     let five_spans = if profile.provider == Some(Provider::DeepSeek) {
-        flatten(deepseek_balance_cell(
+        deepseek_balance_cell(
             widths.five_hour,
             widths.deepseek_amount_w,
             readings.stats_of(&profile.name),
-        ))
+        )
     } else if readings
         .usage_of(&profile.name)
         .is_some_and(|usage| usage.no_five_hour_limit)
@@ -1837,9 +1984,9 @@ fn render_overview_row(
         // Opens the cell where a bar's `[` does; the row pad fills the rest,
         // so the 7d column keeps its place. A narrower cell falls through to
         // the dash, since `overview_windows` hides the 5h window under the mark.
-        flatten(vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())])
+        vec![Span::styled(NO_FIVE_HOUR_LIMIT, theme::faint())]
     } else {
-        flatten(window_summary_spans_bracketed(
+        window_summary_spans_bracketed(
             five_window.as_ref(),
             widths.five_hour,
             widths.claude_labels.five,
@@ -1850,7 +1997,7 @@ fn render_overview_row(
             0,
             widths.five_bar_grow,
             widths.fill,
-        ))
+        )
     };
     let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
@@ -1884,14 +2031,11 @@ fn render_overview_row(
         );
         if seven_monthly && seven_bar {
             // The header stays `7d`, so the cell names the window itself.
-            // Inserted BEFORE the disabled-row flatten so a disabled monthly
-            // row dims it with the rest of the cell.
             seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
         }
-        let seven_spans = flatten(seven_cell);
-        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
+        let seven_len: usize = seven_cell.iter().map(|s| grapheme_cells(&s.content)).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
-        spans.extend(seven_spans);
+        spans.extend(seven_cell);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
     let resets = app
@@ -1899,7 +2043,8 @@ fn render_overview_row(
         .get(profile.name.as_str())
         .map(|r| i64::from(r.usable))
         .filter(|n| *n > 0);
-    push_chip_slot(&mut spans, widths, resets);
+    let plan = overview_plan_chip(app, &cfg, profile, readings, dead_logins, widths.now);
+    push_chip_slot(&mut spans, widths, resets, plan);
     if widths.live > 0 {
         spans.push(gap(widths, Gap::Live));
         spans.push(live_cell(
@@ -1915,11 +2060,140 @@ fn render_overview_row(
     Line::from(spans)
 }
 
+/// Tests render one row off a snapshot of its own: no scheduler thread moves
+/// the store between the sizing and the row in a test.
+#[cfg(test)]
+fn render_overview_row(
+    app: &App,
+    idx: usize,
+    widths: &OverviewWidths,
+    selected: bool,
+    focused: bool,
+    readings: &ReadingsSnapshot,
+) -> Line<'static> {
+    render_overview_row_with(
+        app,
+        idx,
+        widths,
+        selected,
+        focused,
+        readings,
+        &dead_logins(app),
+    )
+}
+
+/// The dead-login fingerprints the usage probe landed, per account
+/// ([`App::third_party_broken`]). Taken before the config guard, which the
+/// store ranks below.
+pub(super) fn dead_logins(app: &App) -> HashMap<String, u64> {
+    app.third_party_broken.lock().map_or_default(|m| m.clone())
+}
+
+/// Whether the usage probe found the account's setup token refused: the
+/// dead-login fingerprint it landed is this login's own.
+fn setup_token_refused(profile: &Profile, dead_logins: &HashMap<String, u64>) -> bool {
+    crate::usage::dead_login_is_setup_token(profile)
+        && crate::usage::dead_login_fingerprint(profile)
+            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp))
+}
+
+/// Whether a claude row's marker column draws `⊘` at `now` (epoch seconds):
+/// its long-lived token is expired or mis-filled, read off the
+/// per-frame-free [`App::session_tokens`] cache, or the usage probe found its
+/// setup token refused. Either way the next switch signs its sessions out.
+fn token_danger(
+    app: &App,
+    profile: &Profile,
+    dead_logins: &HashMap<String, u64>,
+    now: i64,
+) -> bool {
+    setup_token_refused(profile, dead_logins)
+        || app
+            .session_tokens
+            .get(profile.name.as_str())
+            .is_some_and(|s| s.is_danger(now.saturating_mul(1000)))
+}
+
+/// Whether a claude row's marker column draws a dead login at `now` (epoch
+/// seconds): `×` (a broken login) or `⊘` ([`token_danger`]). The login half
+/// of the working-account gate [`plan_chip`] takes.
+pub(super) fn login_dead(
+    app: &App,
+    cfg: &AppConfig,
+    profile: &Profile,
+    dead_logins: &HashMap<String, u64>,
+    now: i64,
+) -> bool {
+    cfg.is_auth_broken(&profile.name) || token_danger(app, profile, dead_logins, now)
+}
+
+/// [`plan_chip`] for an Overview row, its login read off [`login_dead`].
+fn overview_plan_chip(
+    app: &App,
+    cfg: &AppConfig,
+    profile: &Profile,
+    readings: &ReadingsSnapshot,
+    dead_logins: &HashMap<String, u64>,
+    now: i64,
+) -> Option<String> {
+    let dead = login_dead(app, cfg, profile, dead_logins, now);
+    plan_chip(profile, readings, dead, now)
+}
+
+/// The plan chip a claude row carries in its chip slot at `now` (epoch
+/// seconds, the frame's clock): `renews in 3d` / `renews today` off
+/// `plan_renews`, `ends in 3d` / `ends today` off `plan_ends`, while the
+/// plan's day starts before the account's 7d window resets
+/// ([`crate::usage::PlanDates::end_before_reset`]), so the plan bills or
+/// ends with this week's allowance still running. No 7d reading, no chip.
+/// Only a working account carries one: enabled, its login sound
+/// (`login_dead` false) and its plan still serving (no `⊖`). The one
+/// predicate the Overview's sizing, its rows and the Usage tab's `plan` tail
+/// all read.
+pub(super) fn plan_chip(
+    profile: &Profile,
+    readings: &ReadingsSnapshot,
+    login_dead: bool,
+    now: i64,
+) -> Option<String> {
+    if profile.is_disabled()
+        || login_dead
+        || crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name))
+    {
+        return None;
+    }
+    let end = profile
+        .plan_dates()
+        .end_before_reset(now, week_reset(profile, readings)?)?;
+    let today = crate::format::local_day(now)?;
+    let verb = end.verb(today);
+    Some(match end.days_left(today) {
+        0 => format!("{verb} today"),
+        days => format!("{verb} in {days}d"),
+    })
+}
+
+/// The epoch second the account's aggregate 7d window resets: `usage.seven_day`
+/// off a reading, else the `7d` stats bar. Never a per-model week or a monthly
+/// quota; `None` with no such window or no parseable reset.
+fn week_reset(profile: &Profile, readings: &ReadingsSnapshot) -> Option<i64> {
+    let resets_at = match readings.usage_of(&profile.name) {
+        Some(usage) => usage.seven_day.as_ref()?.resets_at.as_deref(),
+        None => readings
+            .stats_of(&profile.name)?
+            .bars
+            .iter()
+            .find(|b| b.label == LABEL_7D)?
+            .resets_at
+            .as_deref(),
+    };
+    iso_to_epoch_secs(resets_at?)
+}
+
 /// The row's speed cell: the account's live speed off a fresh producer, blank
 /// when absent (never a dash standing in for a figure clauth did not read).
 /// Right-aligned to the column, and a figure ≥ 10 000 abbreviates to whole `k`
-/// (`12k`) so the column never clips a number into `…`. Already the `TEXT_DIM`
-/// tier a disabled row flattens to, so it needs no `hue` pass of its own.
+/// (`12k`) so the column never clips a number into `…`.
 fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
     let speed = app
         .fresh_tps()
@@ -1942,8 +2216,7 @@ fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
 /// names the one profile a bare `claude` authenticates as; an account can
 /// carry either, both, or neither.
 /// That is why the header reads `live` and not `active` — `active` is the
-/// active mark's sense app-wide. Already the `TEXT_DIM` tier a disabled row
-/// flattens to, so it needs no `hue` pass of its own.
+/// active mark's sense app-wide.
 fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
@@ -1963,8 +2236,7 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
 /// column header and the per-row cell both swap to carry it.
 fn any_deepseek(app: &App) -> bool {
     app.config()
-        .profiles
-        .iter()
+        .enabled_profiles()
         .any(|p| p.provider == Some(Provider::DeepSeek))
 }
 

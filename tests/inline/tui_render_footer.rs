@@ -49,11 +49,14 @@ fn the_usage_hints_advertise_the_note_key() {
         env: BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -428,6 +431,57 @@ type HintRow = &'static [(&'static str, &'static str)];
 /// cannot produce it at the two pinned sizes); `row_45` the 45-col row when it
 /// sheds. `prep` sets the frame state the `hints` describe — the scroll bound,
 /// a built-in pick — so the derivation drive is deterministic without a draw.
+/// A limit-reset modal on two usable resets, `cancel` focused.
+fn two_reset_form() -> crate::tui::app::LimitResetForm {
+    let choice = |id: &str| crate::tui::app::ResetChoice {
+        id: id.to_string(),
+        label: format!("reset {id}"),
+        rows: vec![("id", id.to_string())],
+        usable: true,
+        held: true,
+    };
+    crate::tui::app::LimitResetForm {
+        name: crate::profile::ProfileName::from("cl1"),
+        harness: crate::harness::Harness::Claude,
+        available: "2 available".to_string(),
+        resets: vec![choice("g-1"), choice("g-2")],
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: crate::tui::app::LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(crate::tui::app::ScrollStamp::default()),
+    }
+}
+
+/// A limit-reset modal whose list overflows an 80x24 frame: thirteen one-row
+/// resets fill 17 body lines against the 14 the modal's body holds.
+fn scrolled_reset_form() -> crate::tui::app::LimitResetForm {
+    let choice = |id: &str| crate::tui::app::ResetChoice {
+        id: id.to_string(),
+        label: format!("reset {id}"),
+        rows: vec![("id", id.to_string())],
+        usable: true,
+        held: true,
+    };
+    crate::tui::app::LimitResetForm {
+        name: crate::profile::ProfileName::from("cl1"),
+        harness: crate::harness::Harness::Claude,
+        available: "13 available".to_string(),
+        resets: (0..13).map(|i| choice(&format!("g-{i}"))).collect(),
+        cursor: 0,
+        on_use: false,
+        pinned: None,
+        phase: crate::tui::app::LimitResetPhase::Idle,
+        spending: None,
+        scroll: std::cell::Cell::new(0),
+        max_scroll: std::cell::Cell::new(0),
+        scroll_stamp: std::cell::Cell::new(crate::tui::app::ScrollStamp::default()),
+    }
+}
+
 struct ModalCase {
     name: &'static str,
     modal: Modal,
@@ -706,6 +760,40 @@ fn modal_cases() -> Vec<ModalCase> {
             prep: |_| {},
         },
         ModalCase {
+            name: "limit reset",
+            modal: Modal::LimitReset(two_reset_form()),
+            row: Some("↑↓ reset   ←→ button   ↵ choose   q back"),
+            row_45: None,
+            hints: &[
+                ("↑↓", "reset"),
+                ("←→", "button"),
+                ("↵", "choose"),
+                ("q", "back"),
+            ],
+            prep: |_| {},
+        },
+        ModalCase {
+            name: "limit reset scroll",
+            modal: Modal::LimitReset(scrolled_reset_form()),
+            // The overflowing list's ↑↓ scrolls the body and is the same ↑↓
+            // that walks it: one row, as every list modal whose body follows
+            // its cursor shows.
+            row: Some("↑↓ reset   ←→ button   ↵ choose   q back"),
+            row_45: None,
+            hints: &[
+                ("↑↓", "reset"),
+                ("←→", "button"),
+                ("↵", "choose"),
+                ("q", "back"),
+            ],
+            prep: |a| {
+                if let Some(Modal::LimitReset(f)) = a.modals.last_mut() {
+                    f.max_scroll.set(1);
+                    f.scroll_stamp.set(fresh_stamp());
+                }
+            },
+        },
+        ModalCase {
             name: "preset picker builtin",
             modal: Modal::PresetPicker(PresetPickerForm {
                 target: PresetTarget::NewAccount,
@@ -884,6 +972,27 @@ fn modal_cases() -> Vec<ModalCase> {
             ],
             prep: |_| {},
         },
+        ModalCase {
+            name: "transcript cleanup",
+            modal: Modal::TranscriptCleanup(crate::tui::app::TranscriptCleanupForm {
+                days: 3650,
+                on_remove: false,
+            }),
+            row: Some("←→ pick   ↵ choose   q back"),
+            row_45: None,
+            hints: &[("←→", "pick"), ("↵", "choose"), ("q", "back")],
+            // Its keys act once a drawn frame showed the question for half a
+            // second, an empty poll followed, and a frame drew it live.
+            prep: |app| {
+                app.anim_phase_ms = Some(0);
+                let _ = app.frame_drawn();
+                app.anim_phase_ms = Some(500);
+                app.queue_seen_empty();
+                app.transcript_cleanup.set_drawn_live(true);
+                let _ = app.frame_drawn();
+                app.queue_seen_empty();
+            },
+        },
     ]
 }
 
@@ -913,6 +1022,8 @@ fn modal_index(modal: &Modal) -> usize {
         Modal::BareItem(_) => 16,
         Modal::BareItemOwner(_) => 17,
         Modal::CaptureOwner(_) => 18,
+        Modal::LimitReset(_) => 19,
+        Modal::TranscriptCleanup(_) => 20,
     }
 }
 
@@ -920,7 +1031,7 @@ fn modal_index(modal: &Modal) -> usize {
 /// Bumped with `modal_index` — the coverage test reds when an index has no
 /// case. That guard fires only once `MODAL_COUNT` is bumped past the new arm's
 /// index.
-const MODAL_COUNT: usize = 19;
+const MODAL_COUNT: usize = 21;
 
 /// Every `Modal` variant has a case driving its row; the two login modals are
 /// the variants a case cannot cover (their login-in-flight lines own the
@@ -965,6 +1076,7 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::BareItem(f)) => format!("{}", f.cursor),
         Some(Modal::BareItemOwner(f)) => format!("{}", f.cursor),
         Some(Modal::CaptureOwner(f)) => format!("{}", f.cursor),
+        Some(Modal::LimitReset(f)) => format!("{}:{}:{:?}", f.cursor, f.on_use, f.phase),
         Some(Modal::EnvCollision(f)) => format!(
             "{}:{}:{}:{}",
             f.cursor,
@@ -975,6 +1087,7 @@ fn modal_selection(app: &App) -> String {
         Some(Modal::CaptureName(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::NamePrompt(f)) => format!("{}:{}", f.input.value, f.input.cursor),
         Some(Modal::Rebind(f)) => format!("{}:{}:{:?}", f.choice, f.cursor, f.checked),
+        Some(Modal::TranscriptCleanup(f)) => format!("{}:{}", f.days, f.on_remove),
         Some(Modal::Help) => format!("{}", app.help_scroll),
         Some(Modal::CheckOutput(_)) => format!("{}", app.check_output_scroll),
         Some(Modal::Login) => String::new(),
@@ -3043,6 +3156,37 @@ fn the_overview_footer_with_a_row_names_the_edit_key() {
     assert_eq!(
         settled_footer(&app, 80, 24),
         "←→ tabs   e edit   a actions   c harness   ? help   q quit"
+    );
+}
+
+/// `⇧↑↓` counts the rows the reorder reaches, never the roster: beside a
+/// disabled account, which has no Overview row, one shown account has no
+/// neighbour to swap with and two do.
+#[test]
+fn the_overview_footer_counts_the_rows_the_reorder_reaches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let footer = |names: &[&str]| {
+        let mut off = crate::testutil::blank_profile(&crate::profile::ProfileName::from("off"));
+        off.disabled = true;
+        let shown = names
+            .iter()
+            .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n)));
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: std::iter::once(off).chain(shown).collect(),
+        });
+        app.tab = Tab::Overview;
+        settled_footer(&app, 80, 24)
+    };
+    assert_eq!(
+        footer(&["p1"]),
+        "←→ tabs   e edit   a actions   c harness   ? help   q quit",
+        "one shown row beside a disabled account"
+    );
+    assert_eq!(
+        footer(&["p1", "p2"]),
+        "←→ tabs   ⇧↑↓ reorder   e edit   a actions   c harness   ? help   q quit",
+        "two shown rows beside a disabled account"
     );
 }
 

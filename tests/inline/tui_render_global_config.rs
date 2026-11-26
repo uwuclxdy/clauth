@@ -944,7 +944,7 @@ fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
     let hint_on = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
     assert_eq!(
         hint_on,
-        "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+        "checks for updates hourly, unless CLAUTH_NO_UPDATE=1"
     );
     let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
     assert_eq!(hint_off, "no update checks");
@@ -1794,11 +1794,11 @@ fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
     }
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, toggles(), tunables()).expect("hint"),
-        "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch"
+        "every account keeping a Claude login or MCP logins gets the newest copy of each MCP server login it shares, a login for each server it never signed out of, and every sign-out, a running session at its next switch; every shared codex session uses your codex's MCP server logins"
     );
     assert_eq!(
         row_hint(GlobalConfigRow::SyncMcpLogins, off_state, tunables()).expect("hint"),
-        "each account keeps its own MCP server logins"
+        "each account keeps its own MCP server logins, and codex sessions get none of your codex's"
     );
 }
 

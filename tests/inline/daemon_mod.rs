@@ -17,7 +17,9 @@ use crate::profile::{
     AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
     reload_fingerprint, save_app_state, save_profile,
 };
-use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
+use crate::testutil::{
+    HomeSandbox, blank_profile, peer_switches_active_to, set_mtime, through_handle,
+};
 #[cfg(unix)]
 use crate::testutil::{git_shim, heal_env, lightweight_tag, stateful_heal_shim};
 use crate::usage::{
@@ -596,6 +598,334 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         active_of(&daemon).as_deref(),
         Some("beta"),
         "an idle, clean, installable target must be switched to"
+    );
+}
+
+/// The daemon's switch line names the account it left and that account's
+/// reading against its lines, not just the target.
+#[test]
+fn drain_pending_switch_logs_the_left_account_and_its_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 97.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "beta");
+    // Pinned unstamped: a sibling test may have flipped the sticky
+    // process-wide stamp, which would date the captured line.
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("beta"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'beta' from 'alpha'; 'alpha' read 5h 97% (line 95%) 4m ago"),
+        "the daemon names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A move onto the home account carries the same reading and age: the return's
+/// own line shape, not the plain switch's.
+#[test]
+fn drain_pending_switch_logs_the_home_move_with_the_left_reading_age() {
+    let _home = HomeSandbox::new();
+    let alpha = profile_with_creds("alpha", "at-alpha");
+    let mut beta = profile_with_creds("beta", "at-beta");
+    beta.preferred = true;
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 90_000);
+    config.state.fallback_chain = vec!["alpha".into(), "beta".into()];
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "beta");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("beta"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: returned to preferred account 'beta' from 'alpha'; 'alpha' read 5h 92% (line 95%) 4m ago"),
+        "the home move names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A third-party member's figures are dated by the cache file they land in —
+/// the clock the status feed reads — so the line carries that age.
+#[test]
+fn drain_pending_switch_logs_a_third_party_age_from_its_cache_file() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    let stats = crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar("5h", 97.0),
+        crate::testutil::bar("7d", 70.0),
+    ]);
+    daemon
+        .third_party_usage_store
+        .lock()
+        .expect("third-party usage")
+        .insert("tp".to_string(), stats.clone());
+    assert!(
+        crate::profile_cache::write_third_party_copy(
+            &crate::profile::ProfileName::from("tp"),
+            &stats,
+            None,
+            crate::usage::now_ms(),
+            std::time::SystemTime::now() - std::time::Duration::from_mins(4),
+        ),
+        "the figures land in tp's third-party cache"
+    );
+
+    stage_switch(&daemon, "oauth");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("oauth"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'oauth' from 'tp'; 'tp' read 5h 97% (line 95%), 7d 70% (line 98%) 4m ago"),
+        "a third-party member's figures are dated by their cache file: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A third-party reading whose cache file is gone carries no clock: the line
+/// says the time is unknown rather than inventing one.
+#[test]
+fn drain_pending_switch_logs_an_undated_third_party_reading() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    daemon
+        .third_party_usage_store
+        .lock()
+        .expect("third-party usage")
+        .insert(
+            "tp".to_string(),
+            crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 97.0)]),
+        );
+
+    stage_switch(&daemon, "oauth");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("oauth"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'oauth' from 'tp'; 'tp' read 5h 97% (line 95%) at an unknown time"),
+        "a third-party reading with no cache file is undated: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer's switch landing after the daemon loaded its config must not change
+/// what the line reports: the account left is the one `profiles.toml` names
+/// under the switch's own hold, never the process's older copy.
+#[test]
+fn drain_pending_switch_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "beta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(Some("beta"));
+
+    stage_switch(&daemon, "gamma");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("gamma"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'gamma' from 'beta'; 'beta' read 5h 92% (line 95%) 4m ago"),
+        "the line names the account the switch's own hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after the daemon loaded
+/// leaves only the disk naming the account the switch will leave; the line
+/// still names it, with its reading.
+#[test]
+fn drain_pending_switch_names_a_left_account_its_config_copy_lacks() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded: only
+    // disk carries it, with its own threshold and a stored reading.
+    let mut delta = profile_with_creds("delta", "at-delta");
+    delta.fallback_threshold = Some(90.0);
+    save_profile(&delta).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "gamma");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("gamma"));
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: auto-switched to 'gamma' from 'delta'; 'delta' read 5h 92% (line 90%) 4m ago"),
+        "the line names the account the switch's own hold left, which only disk knew, and reads it at its own line: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the switch line: the name comes from the switch's own result, and only the
+/// figures need a profile. Its stored reading cannot fill them without one.
+#[test]
+fn drain_pending_switch_names_a_left_account_with_no_loadable_profile() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded.
+    save_profile(&profile_with_creds("delta", "at-delta")).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "delta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 92.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    stage_switch(&daemon, "gamma");
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        daemon.drain_pending_switch();
+    }
+
+    assert_eq!(active_of(&daemon).as_deref(), Some("gamma"));
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l
+                == "clauth daemon: auto-switched to 'gamma' from 'delta'; 'delta' read nothing"),
+        "the line names the account the switch's own result left, whatever loads: {:?}",
+        lines.snapshot()
     );
 }
 
@@ -1679,6 +2009,254 @@ fn drain_pending_switch_off_strips_the_outgoing_oauth_account() {
     assert!(
         after.get("oauthAccount").is_none(),
         "the daemon wrap-off drain must strip the outgoing identity block"
+    );
+}
+
+/// The daemon's wrap-off line names the account it left and that account's
+/// reading, dated like the switch lines.
+#[test]
+fn drain_pending_switch_off_logs_the_left_account_and_its_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: switched off: all accounts spent; 'alpha' read 5h 100% (line 95%) 4m ago"),
+        "the wrap-off names the left account, its reading and the reading's age: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer's switch landing after the daemon loaded its config must not change
+/// what the wrap-off line reports: the account left is the one `profiles.toml`
+/// names under the switch-off's own hold.
+#[test]
+fn drain_pending_switch_off_logs_the_account_its_hold_left_after_a_peer_switch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "beta".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(Some("beta"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines.snapshot().iter().any(|l| l
+            == "clauth daemon: switched off: all accounts spent; 'beta' read 5h 100% (line 95%) 4m ago"),
+        "the wrap-off line names the account its hold left: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A peer that logs in an account and switches onto it after the daemon loaded
+/// leaves only the disk naming the account the wrap-off will leave; the line
+/// still names it, with its reading.
+#[test]
+fn drain_pending_switch_off_names_a_left_account_its_config_copy_lacks() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded.
+    save_profile(&profile_with_creds("delta", "at-delta")).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth daemon: switched off: all accounts spent; 'delta' read nothing"),
+        "the wrap-off line names the account its hold left, which only disk knew: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A left account whose own `config.toml` no longer loads still names itself in
+/// the wrap-off line: the name comes from the switch-off's own result, and only
+/// the figures need a profile.
+#[test]
+fn drain_pending_switch_off_names_a_left_account_with_no_loadable_profile() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    link_active_clean("beta");
+    let mut daemon = daemon_for(config);
+    // A peer saves `delta` and switches onto it after the daemon loaded.
+    save_profile(&profile_with_creds("delta", "at-delta")).expect("save delta");
+    crate::testutil::register_names(&["delta"]);
+    peer_switches_active_to(Some("delta"));
+    crate::testutil::break_profile_config("delta");
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "precondition: the wrap-off turned everything off"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth daemon: switched off: all accounts spent; 'delta' read nothing"),
+        "the wrap-off line names the account the switch-off's own result left, whatever loads: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A wrap-off `profiles.toml` already made is no switch-off of this process's:
+/// the line keeps the bare shape instead of reporting a reading for an account
+/// it did not turn off.
+#[test]
+fn drain_pending_switch_off_logs_no_reading_when_disk_is_already_off() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms() - 240_000),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    peer_switches_active_to(None);
+
+    let _stamp = crate::logline::StampOverride::new(false);
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off") = true;
+        daemon.drain_pending_switch_off();
+    }
+
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|l| l == "clauth daemon: switched off: all accounts spent"),
+        "a wrap-off the disk already made logs the bare line: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains("'alpha' read")),
+        "the line reports no reading for an account this process did not turn off: {:?}",
+        lines.snapshot()
     );
 }
 
@@ -11151,6 +11729,53 @@ fn daemon_serve_child_for_stop_tests() {
     );
 }
 
+/// The daemon start reaches the update spawn: `serve` calls
+/// `update::spawn_for_daemon()` before its run loop, and a test build's loop
+/// returns before any request, so the spawn's own line is the only trace it
+/// leaves, naming its start gate's verdict. Deleting the spawn leaves the line
+/// unsaid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_daemon_start_runs_the_update_spawn() {
+    const SPAWN_LINE: &str = "the update spawn ran (loop started: false)";
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let stub = crate::testutil::TokenStub::new(scratch.path().join("answered"));
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let child = crate::testutil::Owned(
+        crate::testutil::serve_stop_child_command(child_home.path(), &stub.base, stderr)
+            .spawn()
+            .expect("spawn the serve child"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log
+            .lines()
+            .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == SPAWN_LINE))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon start never reached the update spawn; its log: {log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The stub holds the child's first token POST inline, so the child goes
+    // first and the stub is released before its thread joins.
+    drop(child);
+    stub.release();
+    drop(stub.finish());
+}
+
 /// The real [`serve`] waits out the scheduler's token spend before dying of the
 /// SIGTERM a stop sent: a child holding an in-flight refresh gets SIGTERM, the
 /// drain refuses new spends and waits (bounded by `SPEND_DRAIN_BOUND`) for the
@@ -11219,6 +11844,253 @@ fn a_parked_fixture_child_exits_when_its_parent_is_sigkilled() {
     proxy.0.kill().expect("SIGKILL the fixture parent");
     let _ = proxy.0.wait();
     crate::testutil::assert_child_exits(child, &start, "the parked fixture child");
+}
+
+// ── E2E `serve` re-exec ──────────────────────────────────────────────────────
+
+/// The env var carrying the child's home dir into the re-entered re-exec test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REEXEC_CHILD_HOME_ENV: &str = "CLAUTH_TEST_REEXEC_CHILD_HOME";
+/// The env var carrying the recorded-binary path (the scratch file the parent
+/// replaces mid-run) into the re-entered re-exec test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const REEXEC_BIN_ENV: &str = "CLAUTH_TEST_REEXEC_BIN";
+
+/// The re-entry target for the E2E re-exec test: with the marker env absent
+/// (the normal suite run) it passes instantly; with it present it pins this
+/// process's recorded self-exe at the parent's scratch file and runs the real
+/// [`super::serve`], whose run loop re-execs — and aborts once the exec of
+/// the non-executable file fails — after the parent replaces that file.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn daemon_serve_child_for_reexec_test() {
+    let Some(home) = std::env::var_os(REEXEC_CHILD_HOME_ENV) else {
+        return;
+    };
+    let bin = std::env::var_os(REEXEC_BIN_ENV).expect("the parent set the recorded binary path");
+    // A SIGKILLed fixture parent runs no `Drop`: watch the pid this child
+    // started under and exit once the reparent moves it, so no `serve` process
+    // outlives its fixture parent.
+    let parent = std::os::unix::process::parent_id();
+    let _watcher = std::thread::spawn(move || crate::testutil::exit_when_reparented(parent));
+    crate::profile::set_home_override(std::path::PathBuf::from(home));
+    let _pin = crate::plugin_host::SelfExeOverride::pin(Some(std::path::Path::new(&bin)));
+    drop(super::serve(
+        super::StartMode::ExitIfRunning,
+        None,
+        &super::api::tls::CertSource::Lego,
+    ));
+}
+
+/// The run loop's stand-down end to end: the real `serve` child reads its
+/// own binary as replaced on two consecutive checks, probes the
+/// replacement (an executable stub that never answers the hidden flag and
+/// counts its own invocations), and stands down — same pid, still serving,
+/// `binary_replaced` still true in status.json, the verdict line logged
+/// once, no re-executing line, and no second probe while the file stays
+/// the same. A loop that re-exec'd into the stub would die (the stub
+/// exits 0), which reds here.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_run_loop_stands_down_on_a_replacement_that_cannot_take_the_handover() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let bin = scratch.path().join("clauth");
+    let probes = scratch.path().join("probes");
+    let stub = |body: &str| format!("#!/bin/sh\necho x >> '{}'\n{body}\n", probes.display());
+    std::fs::write(&bin, stub("exit 0")).expect("write the recorded binary");
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::tests::daemon_serve_child_for_reexec_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("CLAUTH_NO_UPDATE", "1")
+        .env(REEXEC_CHILD_HOME_ENV, child_home.path())
+        .env(REEXEC_BIN_ENV, &bin)
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = crate::testutil::Owned(cmd.spawn().expect("spawn the serve child"));
+
+    // The child pins its recorded self-exe before `serve`, so the first
+    // `status.json` write proves the pin is installed: the replace below
+    // then reads as replaced, never as the recorded identity.
+    let status_path = child_home.path().join(".clauth/status.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !status_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote status.json"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The replacement: the probe can spawn it (executable), and it answers
+    // nothing — not capable. Each spawn appends one line to the probes file.
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub executable");
+    std::fs::write(&bin, stub("exit 0 # replaced")).expect("replace the recorded binary");
+
+    // The stand-down: after two ticks (arm + due) and the probe, the child
+    // is still alive with the same pid, and keeps rewriting the feed.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        child.0.try_wait().ok().flatten().is_none(),
+        "the daemon never exec'd the stub: it kept its pid and kept running"
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_path).expect("status.json"))
+            .expect("status.json parses");
+    assert_eq!(
+        status["binary_replaced"], true,
+        "the feed keeps naming the replacement: {status}"
+    );
+    let rewritten = std::fs::metadata(&status_path)
+        .expect("status.json")
+        .modified()
+        .expect("the mtime");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let rewritten_after = std::fs::metadata(&status_path)
+        .expect("status.json")
+        .modified()
+        .expect("the mtime");
+    assert!(
+        rewritten_after > rewritten,
+        "the daemon kept serving: the feed kept moving"
+    );
+    // One probe, and none on the checks after the stand-down.
+    assert_eq!(
+        std::fs::read_to_string(&probes).map_or(0, |text| text.lines().count()),
+        1,
+        "the one replacement probed once, never on every check"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let verdict = format!(
+        "clauth daemon: {} does not understand the restart handover; keeping this image running until a manual restart",
+        bin.display()
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == verdict))
+            .count(),
+        1,
+        "the verdict line logged once: {log}"
+    );
+    assert!(
+        !log.lines().any(|l| l.contains("re-executing")),
+        "no re-executing line after a stand-down: {log}"
+    );
+}
+
+/// The run loop's capable path end to end: a replacement that answers the
+/// hidden flag still gets the stop and the exec. The probe's spawn is
+/// counted by the stub's flag arm, the exec keeps the child's pid, and the
+/// stub's exec'd run (the daemon's argv, no flag) exits 1, which the
+/// parent observes as the daemon's exit. The re-executing line logs, no
+/// stand-down line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_run_loop_reexecs_into_a_replacement_that_answers_the_probe() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = HomeSandbox::new();
+    let child_home = tempfile::tempdir().expect("child home");
+    let scratch = tempfile::tempdir().expect("test scratch");
+    let bin = scratch.path().join("clauth");
+    let answers = scratch.path().join("answers");
+    let stub = format!(
+        "#!/bin/sh\nfor last; do :; done\nif [ \"$1\" = \"daemon\" ] && [ \"$last\" = \"{}\" ]; \
+         then printf '{}'; echo y >> '{}'; exit 0; fi\nexit 1\n",
+        crate::daemon::EXEC_HANDOVER_FLAG,
+        crate::daemon::EXEC_HANDOVER_TOKEN,
+        answers.display()
+    );
+    std::fs::write(&bin, &stub).expect("write the recorded binary");
+    let log_path = scratch.path().join("daemon.log");
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("daemon log");
+    let mut cmd = crate::testutil::reentry_command(
+        "daemon::tests::daemon_serve_child_for_reexec_test",
+        &["daemon"],
+    );
+    cmd.env_clear()
+        .env("HOME", child_home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("CLAUTH_NO_UPDATE", "1")
+        .env(REEXEC_CHILD_HOME_ENV, child_home.path())
+        .env(REEXEC_BIN_ENV, &bin)
+        .stderr(std::process::Stdio::from(stderr));
+    let mut child = crate::testutil::Owned(cmd.spawn().expect("spawn the serve child"));
+
+    // The child pins its recorded self-exe before `serve`, so the first
+    // `status.json` write proves the pin is installed: the replace below
+    // then reads as replaced, never as the recorded identity.
+    let status_path = child_home.path().join(".clauth/status.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !status_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote status.json"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The replacement: executable (the probe must be able to spawn it),
+    // then rewritten (a new identity).
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stub executable");
+    std::fs::write(&bin, format!("{stub}# replaced\n")).expect("replace the recorded binary");
+
+    // The probe runs, the stop and the exec follow: the stub's exec'd run
+    // exits 1, and the pid is the one the child was spawned with.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                panic!("the child never finished the re-exec");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => panic!("waiting on the serve child failed: {e}"),
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the exec'd stub ran with the daemon's argv and exited 1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&answers).map_or(0, |text| text.lines().count()),
+        1,
+        "the capability probe spawned the replacement once"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let due = format!(
+        "clauth daemon: its binary was replaced; re-executing {}",
+        bin.display()
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.split_once(' ').is_some_and(|(_, msg)| msg == due)),
+        "the due line logged: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|l| l.contains("does not understand the restart handover")),
+        "no stand-down line on the capable path: {log}"
+    );
 }
 
 // ── reload operator-log + stale-bearer pins ──────────────────────────────────

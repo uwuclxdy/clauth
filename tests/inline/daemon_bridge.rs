@@ -62,7 +62,15 @@ fn ctx_over(hub: &Arc<Hub>) -> Arc<ApiContext> {
     ApiContext::for_tests_with_bridge(config(), status_path, no_herdr(), Arc::clone(hub))
 }
 
+/// A session whose mod declares the `notes` capability, as the current mod does.
 fn start(hub: &Hub, pid: u32, session: &str) {
+    let body = serde_json::json!({"session": session, "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]});
+    let (status, answer) = hub.event(pid, body.to_string().as_bytes());
+    assert_eq!(status, 200, "start for {session} from {pid}: {answer}");
+}
+
+/// A session whose mod predates capabilities: its `start` declares none.
+fn start_older_mod(hub: &Hub, pid: u32, session: &str) {
     let body = serde_json::json!({"session": session, "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true});
     let (status, answer) = hub.event(pid, body.to_string().as_bytes());
     assert_eq!(status, 200, "start for {session} from {pid}: {answer}");
@@ -784,6 +792,103 @@ fn a_refused_answer_is_refused_before_a_full_queue() {
     );
 }
 
+const NOTES_UNSUPPORTED: &str =
+    "this session's mod predates notes and would drop them; send the answers without notes.";
+
+/// A note to a session whose mod declares no `notes` capability is refused by
+/// name, since that mod would drop it: nothing is queued and the ask stays
+/// open. A body of the wrong form keeps its own refusal first, a note's
+/// refusal comes before a full queue's, and the same answers with no note, or
+/// with only empty notes (which are no note), go through.
+#[test]
+fn a_note_to_a_mod_without_the_notes_cap_is_refused() {
+    let _home = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let (_t, resolver) = table(&[(100, instance("s-one", "1"))]);
+    let hub = Hub::new(true, resolver);
+    let _stream = hub.subscribe_as(Some(&Tier::Control));
+    start_older_mod(&hub, 100, "s-one");
+    open_question(&hub, 100, "s-one", 2, "q1");
+    let ctx = ctx_over(&hub);
+
+    let noted = serde_json::json!({"answers": {LOGO: "Red"}, "notes": {LOGO: "a darker red"}});
+    let resp = answer_question(&ctx, "q1", &noted);
+    assert_eq!(resp.status, 400, "{}", body_json(&resp));
+    let got = body_json(&resp);
+    assert_eq!(got["error"], "notes_unsupported");
+    assert_eq!(got["reason"], NOTES_UNSUPPORTED);
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([]),
+        "a refused note queues nothing"
+    );
+
+    for (body, code) in [
+        (
+            serde_json::json!({"answers": {"Which colour?": "Red"}, "notes": {LOGO: "darker"}}),
+            "answer_unknown_question",
+        ),
+        (
+            serde_json::json!({"answers": {LOGO: ""}, "notes": {LOGO: "darker"}}),
+            "answer_empty",
+        ),
+    ] {
+        let resp = answer_question(&ctx, "q1", &body);
+        assert_eq!(resp.status, 400, "{body}");
+        assert_eq!(body_json(&resp)["error"], code, "{body}");
+    }
+    let permission = serde_json::json!({"session": "s-one", "seq": 3, "kind": "ask_opened", "ask": "a1", "tool": "Bash", "input": {"command": "ls"}});
+    assert_eq!(hub.event(100, permission.to_string().as_bytes()).0, 200);
+    let resp = answer_question(&ctx, "a1", &noted);
+    assert_eq!(resp.status, 400, "{}", body_json(&resp));
+    assert_eq!(
+        body_json(&resp)["error"],
+        "answer_wrong_form",
+        "answers and a note to a permission ask keep the form's refusal"
+    );
+
+    {
+        let mut inner = hub.inner.lock().unwrap();
+        let live = inner.instances.get_mut(&100).expect("the live instance");
+        for _ in 0..MAX_QUEUED_COMMANDS {
+            live.commands
+                .push_back(serde_json::json!({"kind": "prompt", "text": "x"}));
+        }
+    }
+    let resp = answer_question(&ctx, "q1", &noted);
+    assert_eq!(resp.status, 400, "{}", body_json(&resp));
+    assert_eq!(body_json(&resp)["error"], "notes_unsupported");
+    {
+        let mut inner = hub.inner.lock().unwrap();
+        let live = inner.instances.get_mut(&100).expect("the live instance");
+        assert_eq!(
+            live.commands.len(),
+            MAX_QUEUED_COMMANDS,
+            "a refused note queues nothing on a full queue either"
+        );
+        assert!(
+            live.open_asks.iter().any(|(id, _)| id == "q1"),
+            "a refused note leaves the ask open"
+        );
+        live.commands.clear();
+    }
+
+    let resp = answer_question(
+        &ctx,
+        "q1",
+        &serde_json::json!({"answers": {LOGO: "Red"}, "notes": {LOGO: ""}}),
+    );
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+    assert_eq!(
+        commands(&hub, 100, "s-one"),
+        serde_json::json!([{"kind": "answer", "ask": "q1", "answers": {LOGO: "Red"}}])
+    );
+
+    open_question(&hub, 100, "s-one", 4, "q2");
+    let resp = answer_question(&ctx, "q2", &serde_json::json!({"answers": {LOGO: "Blue"}}));
+    assert_eq!(resp.status, 200, "{}", body_json(&resp));
+}
+
 /// An ask's kind comes from its tool, never its input's shape: a permission
 /// ask whose tool input happens to be an array of `question` objects (an MCP
 /// tool's own input) still takes a decision and refuses answers keyed by
@@ -1386,4 +1491,22 @@ fn a_wait_after_the_grace_lapsed_releases_at_once() {
     assert_eq!(late.status, 404, "a released ask takes no answer");
     assert_eq!(body_json(&late)["error"], "ask_not_found");
     assert_eq!(hub.snapshot()["asks"][0]["held"], false, "released");
+}
+
+/// A launcher's thread id is no launch: the thread answers with the
+/// `clauth start` argv of its process, so a pid the kernel reissued as one of
+/// a launcher's threads would join that launcher's session row.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launchers_thread_id_is_no_clauth_launch() {
+    let home = HomeSandbox::new();
+    let launcher = crate::testutil::spawn_parked(home.home(), Some("clauth"), &["start"]);
+    let pid = launcher.0.id();
+    let tid = crate::testutil::a_thread_of(pid);
+    let verdicts = (is_clauth_launch(tid), is_clauth_launch(pid));
+    assert_eq!(
+        verdicts,
+        (false, true),
+        "(thread, leader) of a parked `clauth start`"
+    );
 }

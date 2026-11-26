@@ -646,6 +646,24 @@ fn app_state_walk_order_defaults_chain_and_every_value_round_trips() {
     );
 }
 
+// `walk_order` takes exactly three spellings: `soonest-plan-end`, like any
+// other, fails the parse and the error names the three.
+#[test]
+fn app_state_walk_order_refuses_soonest_plan_end_like_any_unknown_spelling() {
+    for spelling in ["soonest-plan-end", "fastest"] {
+        let err =
+            toml::from_str::<AppState>(&format!("profiles = []\nwalk_order = \"{spelling}\"\n"))
+                .expect_err("an unknown walk order fails the parse");
+        assert_eq!(
+            err.message(),
+            format!(
+                "unknown variant `{spelling}`, expected one of `chain`, \
+                 `soonest-weekly-reset`, `most-weekly-headroom`"
+            )
+        );
+    }
+}
+
 // On must round-trip explicitly; off (the default) is omitted entirely from
 // the rendered profiles.toml, matching `show_pace`/`count_cache`'s treatment
 // of their own default-off booleans.
@@ -2569,11 +2587,14 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         effort: None,
+        model_effort: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
         preferred_days: Vec::new(),
+        plan_ends: None,
+        plan_renews: None,
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -3142,6 +3163,41 @@ fn model_settings_round_trip_through_config_toml() {
     );
 }
 
+/// Per-model effort is its own `[model_effort]` table, outside `[models]`
+/// (presets replace `[models]` whole), keyed by a tier or a model id, and
+/// survives a render→parse round-trip; an empty map writes only the commented
+/// example.
+#[test]
+fn model_effort_round_trips_as_its_own_table() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models.default = Some("opus".to_string());
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("# [model_effort]\n# sonnet = \"xhigh\"\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.model_effort.is_empty());
+
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.model_effort, profile.model_effort);
+    assert_eq!(
+        parsed.models, profile.models,
+        "per-model effort never lands in [models]"
+    );
+    assert!(
+        rendered.contains(
+            "[model_effort]\nclaude-opus-4-5-20251101 = \"medium\"\nsonnet = \"xhigh\"\n"
+        ),
+        "{rendered}"
+    );
+}
+
 /// The account's effort is its own top-level `effort` key, outside `[models]`
 /// (presets re-bind and launch demand read `[models]`), and survives a
 /// render→parse round-trip; an unset effort writes no key at all.
@@ -3183,10 +3239,11 @@ fn the_config_comment_names_the_effort_carrier() {
     let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
     assert!(
         rendered.contains(concat!(
-            "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n",
-            "# (`effortLevel` is Claude Code's own key).\n",
+            "# Reasoning effort for this account. With one model selected, low, medium,\n",
+            "# high and xhigh set that model's level unless [model_effort] sets it.\n",
+            "# Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n",
         )),
-        "the comment names the key and its one carrier: {rendered}"
+        "the comment describes model and account-wide effort: {rendered}"
     );
     assert!(
         rendered.contains("# effort = \"high\"\n"),
@@ -6410,6 +6467,240 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
 
+/// A sync fault planted on one path fails that path's write the way a failing
+/// disk's `sync_all` does: the error propagates, the destination keeps its old
+/// bytes and no temp is left. The fault is per path and one-shot, so a sibling
+/// file's write never sees it and the armed path's next write lands.
+#[test]
+fn a_planted_sync_fault_keeps_the_old_bytes_and_leaves_no_temp() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.json");
+    let sibling = dir.join("other.json");
+    std::fs::write(&path, b"old").unwrap();
+
+    fail_next_sync(&path);
+    let err = atomic_write_600(&path, b"new").expect_err("the planted sync failure propagates");
+    assert_eq!(err.to_string(), "planted sync fault");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["settings.json"], "a temp stayed behind");
+
+    atomic_write_600(&sibling, b"sibling").expect("the fault is per path");
+    atomic_write_600(&path, b"new").expect("the fault is one-shot");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+}
+
+/// The synced writers and the unsynced one land the same file: the new bytes
+/// over the old ones, owner-only on Unix whatever the old file's mode, and no
+/// temp left beside it. The syncs run for real here ([`sync_in_tests`]), but
+/// whether one reached the disk is not observable; this pins only that they
+/// succeed and change nothing a reader sees.
+#[test]
+fn the_synced_and_the_fast_writers_land_the_same_owner_only_file() {
+    sync_in_tests();
+    type Writer = fn(&Path, &[u8]) -> std::io::Result<()>;
+    let writers: [(&str, Writer); 4] = [
+        ("atomic_write_600", |p, b| atomic_write_600(p, b)),
+        ("atomic_write_600_with", |p, b| {
+            atomic_write_600_with(p, |f| std::io::Write::write_all(f, b))
+        }),
+        ("atomic_write_600_fast", |p, b| atomic_write_600_fast(p, b)),
+        ("atomic_write", |p, b| atomic_write(p, b)),
+    ];
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (label, write) in writers {
+        let path = dir.join(format!("{label}.json"));
+        std::fs::write(&path, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new", "{label}");
+        #[cfg(unix)]
+        if label != "atomic_write" {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{label} landed {mode:o}");
+        }
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "atomic_write.json",
+            "atomic_write_600.json",
+            "atomic_write_600_fast.json",
+            "atomic_write_600_with.json",
+        ],
+        "a temp stayed behind"
+    );
+}
+
+/// A dated write synced before its temp takes the mtime still lands carrying
+/// that mtime: the sync goes through the writing handle, the date through a
+/// handle of its own afterwards.
+#[test]
+fn a_synced_dated_write_still_lands_its_mtime() {
+    sync_in_tests();
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cache.json");
+    std::fs::write(&path, b"old").unwrap();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    atomic_write_600_dated(&path, b"new", Some(at)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), at);
+}
+
+/// The unsynced writer stays on the files a tick rewrites and the next tick
+/// rebuilds (`status.json`, `tps_cache.json`). A new call anywhere else, a
+/// credential store above all, has to change this list, and so has to say why
+/// that file may come back empty after a power loss. The scan reads call sites
+/// by name: an alias or a function pointer to the writer is invisible to it.
+#[test]
+fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let scanned = crate::testutil::rs_files(&root);
+    assert!(
+        scanned.len() > 10,
+        "the scan found {} files under src/ — it is not reading the crate",
+        scanned.len()
+    );
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    for file in scanned {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let n = text
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .filter(|code| code.contains("atomic_write_600_fast(") && !code.contains("fn "))
+            .count();
+        if n > 0 {
+            let rel = file.strip_prefix(&root).unwrap();
+            calls.push((rel.to_string_lossy().replace('\\', "/"), n));
+        }
+    }
+    calls.sort();
+    let expected: Vec<(String, usize)> = UNSYNCED_WRITERS
+        .iter()
+        .map(|(module, count, _)| ((*module).to_string(), *count))
+        .collect();
+    assert_eq!(calls, expected, "the unsynced writer's callers moved");
+}
+
+/// The documents that name the unsynced writer's files name exactly the files
+/// in `UNSYNCED_WRITERS`: `SECURITY.md`'s writes bullet, the writer's own doc
+/// comment, and the scan test's above. Each text is read for the backticked
+/// `.json` names it holds, in any order, so a third backticked name anywhere
+/// in it reds; a bare, unbackticked name is invisible to the extractor. The
+/// bullet is located by its "skip both syncs" sentence, so a reword keeps the
+/// check green only while that sentence stays, and the two doc blocks by the
+/// functions they document; a name in prose elsewhere in `SECURITY.md` falls
+/// outside the window. The expected names come from the table the scan pins,
+/// so a caller added there reds here until these documents name its file too.
+#[test]
+fn the_documents_name_the_same_files_as_the_unsynced_writer() {
+    // Controls: the extractor reads the two in either order, flags a third,
+    // and ignores a backticked path that is not a store, so a scan that read
+    // nothing could not keep this green.
+    assert_eq!(
+        json_names("files `status.json`, `tps_cache.json`"),
+        ["status.json", "tps_cache.json"]
+    );
+    assert_eq!(
+        json_names("files `tps_cache.json`, `status.json`"),
+        ["tps_cache.json", "status.json"]
+    );
+    assert_eq!(
+        json_names("files `status.json`, `tps_attribution.json`"),
+        ["status.json", "tps_attribution.json"]
+    );
+    assert_eq!(
+        json_names("`credentials.json.staged` at `0600`"),
+        Vec::<&str>::new()
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let security = std::fs::read_to_string(root.join("SECURITY.md")).unwrap();
+    let security_bullet = security
+        .lines()
+        .find(|line| line.contains("skip both syncs"))
+        .expect("SECURITY.md's writes bullet");
+    let profile = std::fs::read_to_string(root.join("src/profile.rs")).unwrap();
+    let writer_doc = doc_comment_above(&profile, "pub(crate) fn atomic_write_600_fast(");
+    let this_file = std::fs::read_to_string(root.join("tests/inline/profile.rs")).unwrap();
+    let scan_doc = doc_comment_above(
+        &this_file,
+        "fn only_the_per_tick_rebuilt_files_take_the_unsynced_writer()",
+    );
+    let mut expected: Vec<&str> = UNSYNCED_WRITERS.iter().map(|(_, _, file)| *file).collect();
+    expected.sort_unstable();
+    expected.dedup();
+    for (label, text) in [
+        ("SECURITY.md", security_bullet),
+        ("atomic_write_600_fast's doc comment", writer_doc.as_str()),
+        ("the caller scan's doc comment", scan_doc.as_str()),
+    ] {
+        let mut names = json_names(text);
+        names.sort_unstable();
+        assert_eq!(names, expected, "{label}");
+    }
+}
+
+/// The backticked names ending in `.json` that `text` holds, in order.
+fn json_names(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            Path::new(token)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect()
+}
+
+/// The `///` block above the line holding `anchor`, its markers stripped, its
+/// attributes skipped and its lines joined.
+fn doc_comment_above(text: &str, anchor: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(anchor))
+        .expect("the anchored line");
+    let mut doc: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("///") || line.starts_with("#["))
+        .filter(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches("///").trim())
+        .collect();
+    doc.reverse();
+    doc.join(" ")
+}
+
+/// The unsynced writer's call sites, per module and count, and the file each
+/// rebuilds. Ordered by module, as the scan sorts them.
+const UNSYNCED_WRITERS: &[(&str, usize, &str)] = &[
+    ("daemon/mod.rs", 2, "status.json"),
+    ("usage/scheduler.rs", 1, "tps_cache.json"),
+];
+
 // ── a profile's id: what a login in flight lands by ──────────────────────────
 
 fn create_account(name: &str) {
@@ -7661,6 +7952,38 @@ fn the_pre_put_back_env_doc_toggles_its_example_in_place() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
+/// A file written before the `effort` doc named the per-model level still
+/// toggles `effort` in place under its own older doc block, and unsetting
+/// gives the file back byte for byte.
+#[test]
+fn the_account_wide_effort_doc_toggles_its_example_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("oldeffort".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("oldeffort")).unwrap();
+    let template = std::fs::read_to_string(&path).unwrap();
+    let current = "# Reasoning effort for this account. With one model selected, low, medium,\n\
+                   # high and xhigh set that model's level unless [model_effort] sets it.\n\
+                   # Account-wide effort uses CLAUDE_CODE_EFFORT_LEVEL.\n\
+                   # effort = \"high\"\n";
+    assert_eq!(template.matches(current).count(), 1);
+    let older = "# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n\
+                 # (`effortLevel` is Claude Code's own key).\n\
+                 # effort = \"high\"\n";
+    let original = template.replace(current, older);
+    std::fs::write(&path, &original).unwrap();
+
+    let mut profile = load_profile(&ProfileName::from("oldeffort")).unwrap();
+    profile.effort = Some("high".to_string());
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replace("# effort = \"high\"\n", "effort = \"high\"\n")
+    );
+    profile.effort = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
 /// The `advisor` row saves into `[models]` in place beside the other rows and
 /// loads back, and clearing it deletes its line alone.
 #[test]
@@ -8490,12 +8813,15 @@ fn every_profile_config_scalar_is_modelled() {
         env: BTreeMap::new(),
         models: ModelSettings::default(),
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
         rolling_token: true,
         preferred: true,
         preferred_days: vec!["sat".to_string()],
+        plan_ends: Some("2026-12-31".to_string()),
+        plan_renews: Some("2026-12-15".to_string()),
         max_auto_spend: Some(0.0),
         check_weekly: Some(false),
         check_scoped: Some(false),
@@ -8606,12 +8932,15 @@ fn every_profile_config_table_is_modelled() {
             advisor: Some("v".to_string()),
         },
         effort: Some("x".to_string()),
+        model_effort: BTreeMap::from([("sonnet".to_string(), "xhigh".to_string())]),
         fallback_threshold: Some(0.0),
         weekly_threshold: Some(0.0),
         last_resort: true,
         rolling_token: true,
         preferred: true,
         preferred_days: vec!["sat".to_string()],
+        plan_ends: Some("2026-12-31".to_string()),
+        plan_renews: Some("2026-12-15".to_string()),
         max_auto_spend: Some(0.0),
         check_weekly: Some(false),
         check_scoped: Some(false),
@@ -8641,7 +8970,10 @@ fn every_profile_config_table_is_modelled() {
         .map(|(k, _)| k.as_str())
         .collect();
     tables.sort_unstable();
-    assert_eq!(tables, ["console", "env", "model_picker", "models"]);
+    assert_eq!(
+        tables,
+        ["console", "env", "model_effort", "model_picker", "models"]
+    );
 }
 
 /// Every field the writer's edit step handles is pinned behaviourally: an empty
@@ -8677,6 +9009,10 @@ fn a_save_writes_every_modelled_field_from_an_empty_file() {
         advisor: Some("v".to_string()),
     };
     profile.effort = Some("high".to_string());
+    profile.model_effort = BTreeMap::from([
+        ("sonnet".to_string(), "xhigh".to_string()),
+        ("claude-opus-4-5-20251101".to_string(), "medium".to_string()),
+    ]);
     profile.fallback_threshold = Some(50.0);
     profile.weekly_threshold = Some(70.0);
     profile.last_resort = true;
@@ -8900,6 +9236,14 @@ fn every_current_doc_block_matches_its_pinned_digest() {
             "fd83d4867fb64b1be1e65d7fb4b2f2e2de0a84cfe84abba1a2dc7b25b78a5cfc",
         ),
         (
+            "plan_ends",
+            "3ab519338145b4db500fbc0f9ea8d1460e68142d1527bca829f62ed71151cd66",
+        ),
+        (
+            "plan_renews",
+            "18a64bad58623f35933c5ace3295207f9ceff9f0fe992ed2d044ca5bf7a8e151",
+        ),
+        (
             "rolling_token",
             "c46cddebec5c30ab676b4d85eaaa9bc8f271d6a538e6f7d2ad1d0b04d5b8b7f6",
         ),
@@ -8929,7 +9273,7 @@ fn every_current_doc_block_matches_its_pinned_digest() {
         ),
         (
             "effort",
-            "6c78fc0ab64d4df00a2325391b3a9081f006eac6f95b3d835d9869ff139058c3",
+            "a0ca0deab2ea9914f17cff3cd3d401b3fb44c9b5355785a5266ff29ce3c4730e",
         ),
         (
             "console",
@@ -8944,17 +9288,23 @@ fn every_current_doc_block_matches_its_pinned_digest() {
             "b1ecf434ca77d914fe3ad1493532e7c46a760ea8b3f6a1d43da92d7375921257",
         ),
         (
+            "model_effort",
+            "fef5875d92d9db9522d714fcfb654ec75d981c22ee5e415349741bcc3d5403b4",
+        ),
+        (
             "model_picker",
             "bb720e928f81efb70ae020299fbca5f00518a86c302b424777c6a98f05b4640a",
         ),
     ]
     .into_iter()
     .collect();
-    for key in MODELLED_SCALARS
-        .iter()
-        .copied()
-        .chain(["console", "models", "env", "model_picker"])
-    {
+    for key in MODELLED_SCALARS.iter().copied().chain([
+        "console",
+        "models",
+        "env",
+        "model_effort",
+        "model_picker",
+    ]) {
         let Some(&digest) = pinned.get(key) else {
             panic!("`{key}` has no pinned doc digest: add its row");
         };
@@ -9188,6 +9538,222 @@ fn a_load_keeps_a_typoed_weekday_line_commented_above_the_fixed_one() {
     let expected = "# preferred_days = [\"sat\", \"Saturdy\"]\npreferred_days = [\"sat\"]\nlast_resort = true\n";
     assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     assert_next_load_writes_nothing("days", &path, expected);
+}
+
+/// A `plan_ends` date reads into the profile, and the load leaves a canonical
+/// line alone.
+#[test]
+fn a_load_reads_a_plan_ends_date_and_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let body = "plan_ends = \"2026-11-20\"  # canceled on the 3rd\nlast_resort = true\n";
+    let path = raw_config("ends", body);
+    let profile = load_profile(&ProfileName::from("ends")).unwrap();
+    assert_eq!(
+        profile.plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 20)
+    );
+    assert_next_load_writes_nothing("ends", &path, body);
+}
+
+/// A `plan_ends` that is no date is commented out where it sits, as typed,
+/// and the plan keeps its renewal.
+#[test]
+fn a_load_comments_out_an_unreadable_plan_ends() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "endstypo",
+        "plan_ends = \"20/11/2026\"\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("endstypo")).unwrap();
+    assert_eq!(profile.plan_ends, None);
+    let expected = "# plan_ends = \"20/11/2026\"\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endstypo", &path, expected);
+}
+
+/// A readable date spelled without its zero padding is written back in its
+/// `YYYY-MM-DD` form, in place.
+#[test]
+fn a_load_writes_an_unpadded_plan_ends_in_its_canonical_form() {
+    let _home = HomeSandbox::new();
+    let path = raw_config("endspad", "plan_ends = \"2026-12-1\"\n");
+    let profile = load_profile(&ProfileName::from("endspad")).unwrap();
+    assert_eq!(
+        profile.plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 12, 1)
+    );
+    let expected = "plan_ends = \"2026-12-01\"\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endspad", &path, expected);
+}
+
+/// Both plan keys read a date typed unquoted (a TOML date) the same as a
+/// quoted one, the load leaves either spelling as written, and a save beside
+/// a bare date edits the file instead of refusing it.
+#[test]
+fn a_load_reads_a_plan_date_typed_bare_or_quoted() {
+    let _home = HomeSandbox::new();
+    for (name, body) in [
+        ("bare", "plan_ends = 2026-11-20\nplan_renews = 2026-12-15\n"),
+        (
+            "quoted",
+            "plan_ends = \"2026-11-20\"\nplan_renews = \"2026-12-15\"\n",
+        ),
+    ] {
+        let path = raw_config(name, body);
+        let profile = load_profile(&ProfileName::from(name)).unwrap();
+        assert_eq!(
+            (profile.plan_ends, profile.plan_renews),
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 20),
+                chrono::NaiveDate::from_ymd_opt(2026, 12, 15),
+            ),
+            "{name}: (plan_ends, plan_renews)"
+        );
+        assert_next_load_writes_nothing(name, &path, body);
+    }
+
+    let mut profile = load_profile(&ProfileName::from("bare")).unwrap();
+    profile.last_resort = true;
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(profile_config_path(&ProfileName::from("bare")).unwrap()).unwrap(),
+        "plan_ends = 2026-11-20\nplan_renews = \"2027-01-31\"\nlast_resort = true\n"
+    );
+}
+
+/// A TOML date-time or time where a plan date belongs is no date: the load
+/// comments it out where it sits, as typed, and keeps the account.
+#[test]
+fn a_load_comments_out_a_plan_date_typed_as_a_date_time() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "endsat",
+        "plan_ends = 2026-11-20T10:00:00\nplan_renews = 07:32:00\nlast_resort = true\n",
+    );
+    let profile = load_profile(&ProfileName::from("endsat")).unwrap();
+    assert_eq!((profile.plan_ends, profile.plan_renews), (None, None));
+    let expected =
+        "# plan_ends = 2026-11-20T10:00:00\n# plan_renews = 07:32:00\nlast_resort = true\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("endsat", &path, expected);
+}
+
+/// A plan date whose year is not four digits is no date: `26-12-15` is
+/// commented out as typed, never read as the year 26 and written back as
+/// `0026-12-15`.
+#[test]
+fn a_load_comments_out_a_plan_date_without_a_four_digit_year() {
+    let _home = HomeSandbox::new();
+    let path = raw_config(
+        "shortyear",
+        "plan_ends = \"26-12-15\"\nplan_renews = \"202-01-05\"\n",
+    );
+    let profile = load_profile(&ProfileName::from("shortyear")).unwrap();
+    assert_eq!((profile.plan_ends, profile.plan_renews), (None, None));
+    let expected = "# plan_ends = \"26-12-15\"\n# plan_renews = \"202-01-05\"\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    assert_next_load_writes_nothing("shortyear", &path, expected);
+}
+
+/// The `plan_ends` scalar saves into the template in place: a set date
+/// uncomments the example where it sits, and clearing it turns the line back
+/// into the example, so the file is byte for byte the template again.
+#[test]
+fn a_save_writes_and_clears_the_plan_ends_in_place() {
+    let _home = HomeSandbox::new();
+    save_profile_config(&Profile::new("endstoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("endstoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# plan_ends = \"2026-12-31\"\n").count(),
+        1,
+        "the template holds one plan_ends example:\n{original}"
+    );
+
+    let mut profile = load_profile(&ProfileName::from("endstoggle")).unwrap();
+    profile.plan_ends = chrono::NaiveDate::from_ymd_opt(2026, 11, 20);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original.replacen(
+            "# plan_ends = \"2026-12-31\"\n",
+            "plan_ends = \"2026-11-20\"\n",
+            1
+        )
+    );
+    assert_eq!(
+        load_profile(&ProfileName::from("endstoggle"))
+            .unwrap()
+            .plan_ends,
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 20),
+        "the saved date reads back"
+    );
+
+    profile.plan_ends = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+/// `plan_renews` reads like `plan_ends`: a canonical date stays as written, a
+/// typo is commented out where it sits, and both keys save into the template
+/// in place and clear back to it.
+#[test]
+fn plan_renews_reads_saves_and_clears_like_plan_ends() {
+    let _home = HomeSandbox::new();
+    let body = "plan_renews = \"2026-12-15\"  # from the billing page\n";
+    let path = raw_config("renews", body);
+    assert_eq!(
+        load_profile(&ProfileName::from("renews"))
+            .unwrap()
+            .plan_renews,
+        chrono::NaiveDate::from_ymd_opt(2026, 12, 15)
+    );
+    assert_next_load_writes_nothing("renews", &path, body);
+
+    let path = raw_config("renewstypo", "plan_renews = \"8 dec\"\n");
+    assert_eq!(
+        load_profile(&ProfileName::from("renewstypo"))
+            .unwrap()
+            .plan_renews,
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# plan_renews = \"8 dec\"\n"
+    );
+
+    save_profile_config(&Profile::new("renewstoggle".to_string(), None, None)).unwrap();
+    let path = profile_config_path(&ProfileName::from("renewstoggle")).unwrap();
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        original.matches("# plan_renews = \"2026-12-15\"\n").count(),
+        1,
+        "the template holds one plan_renews example:\n{original}"
+    );
+    let mut profile = load_profile(&ProfileName::from("renewstoggle")).unwrap();
+    profile.plan_renews = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+    profile.plan_ends = chrono::NaiveDate::from_ymd_opt(2026, 11, 20);
+    save_profile_config(&profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original
+            .replacen(
+                "# plan_ends = \"2026-12-31\"\n",
+                "plan_ends = \"2026-11-20\"\n",
+                1
+            )
+            .replacen(
+                "# plan_renews = \"2026-12-15\"\n",
+                "plan_renews = \"2027-01-31\"\n",
+                1
+            )
+    );
+    profile.plan_renews = None;
+    profile.plan_ends = None;
+    save_profile_config(&profile).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
 /// Every weekday a typo: the line is just commented out, no empty list.

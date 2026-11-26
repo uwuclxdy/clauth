@@ -731,26 +731,38 @@ impl PlanInfo {
 pub(crate) const ORG_REFUSED_STATUS: &str = "org_refused";
 
 /// One provider-neutral banked limit-reset reading. A codex poll fills
-/// `usable` alone (its body names no windows, no end and no `banked`); the
-/// claude scheduler's hourly side read and the CLI's post-spend refresh fill
-/// every field, read `usable` as 0 while the server's next reset cannot be
-/// spent, and count every grant in `banked`. The enclosing `None` means the
-/// harness carried no reading, never that the count was zero.
+/// `usable` alone (its body lists no reset); a read of the resets themselves
+/// (the claude scheduler's hourly side read, the post-spend refresh, the codex
+/// listing) fills every field, keeping each reset the server lists so every
+/// surface names them all. The enclosing `None` means the harness carried no
+/// reading, never that the count was zero. Every field past `usable` is
+/// skipped while empty, so a codex poll's cache bytes and an older file's
+/// load do not change.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct LimitResets {
     pub(crate) usable: u32,
-    /// Every grant's resets left, usable or not: the Usage row counts `usable`
-    /// against this total. Absent from a reading that never carried it (a
-    /// codex poll, an older file), so those cache bytes do not change.
+    /// Every reset left, usable or not: the Usage row counts `usable` against
+    /// this total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) banked: Option<u32>,
+    /// Every claude grant the read listed, in the server's order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) clears: Vec<String>,
+    pub(crate) grants: Vec<super::claude_reset::Grant>,
+    /// Every codex credit the list read named, in the server's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) credits: Vec<super::codex_reset::ResetCredit>,
+    /// The claude block's one cooldown stamp, raw server spelling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) ends_at: Option<String>,
+    pub(crate) cooldown_until: Option<String>,
+    /// The claude block's weekly reset, raw server spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_resets_at: Option<String>,
+    /// Whether the claude account sat at a limit a reset covers when read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) at_limit: bool,
     /// Epoch ms of the read that produced this reading, the reading's own
-    /// stamp. `None` on a codex reading (its poll stamps the surrounding
-    /// [`UsageInfo`] instead), so codex cache bytes do not change.
+    /// stamp. `None` on a codex poll's reading (its poll stamps the surrounding
+    /// [`UsageInfo`] instead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
 }
@@ -2229,6 +2241,58 @@ pub(crate) fn seed_plan_cache(
     if let Err(e) = crate::profile::atomic_write_600(&path, json) {
         logline!("clauth: {name}: could not save the login's plan: {e}");
     }
+}
+
+/// Replace the plan in `name`'s usage cache with the one a same-account re-login
+/// just read, when the two disagree on tier or subscription status. Resubscribing
+/// changes the plan without changing the account, so [`seed_plan_cache`] never
+/// runs for it, and a cached `canceled` would keep the account out of every walk
+/// until the next `/profile` read. A cache holding no plan has nothing to correct
+/// and is left to that read. Answers whether the two disagreed — once they do,
+/// every exit answers `true`, a cache path that will not resolve or a body that
+/// will not serialize included — the caller's cue to expire the `/profile`
+/// clock for processes holding the old plan in memory.
+///
+/// Only the plan moves, and the file keeps its mtime: the windows beside it are
+/// as old as they were, and for a body carrying no `fetched_at` the mtime is
+/// the age clock, so a plan-only rewrite must not advance it.
+pub(crate) fn correct_cached_plan(
+    name: &ProfileName,
+    plan: PlanInfo,
+    account_uuid: &AccountId,
+) -> bool {
+    if plan
+        .email
+        .as_ref()
+        .is_some_and(|email| account_uuid.trim() != email.account.trim())
+    {
+        return false;
+    }
+    let Some(mut info) =
+        load_profile_cache::<UsageInfo>(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return false;
+    };
+    let agrees = info.plan.as_ref().is_none_or(|cached| {
+        cached.tier == plan.tier && cached.subscription_status == plan.subscription_status
+    });
+    if agrees {
+        return false;
+    }
+    let Some(path) =
+        crate::profile_cache::profile_cache_path(name, crate::profile_cache::USAGE_CACHE_FILE)
+    else {
+        return true;
+    };
+    let dated = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    info.plan = Some(plan);
+    let Ok(json) = serde_json::to_vec(&info) else {
+        return true;
+    };
+    if let Err(e) = crate::profile::atomic_write_600_dated(&path, &json, dated) {
+        logline!("clauth: {name}: could not save the login's plan: {e}");
+    }
+    true
 }
 
 /// Whether `name`'s stored `/usage` body says its plan has no 5h limit. Reads

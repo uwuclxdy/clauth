@@ -116,13 +116,15 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 ///   whose `config.toml` holds the raw key, so propagating that one string hands
 ///   one account's key to another without any `env` entry moving; `model`,
 ///   `advisorModel`, and `modelPicker` (it lists one account's models) are
-///   routing. `effortLevel` stays shared — it is Claude
-///   Code's own key; clauth's effort carrier is the managed
+///   routing. The top-level `effortLevel` stays shared; clauth's account-wide
+///   effort carrier is the managed
 ///   `CLAUDE_CODE_EFFORT_LEVEL` env key below.
 /// - inside `env`, key by key rather than skipping the whole object (the block
 ///   also carries plain shared vars): [`MANAGED_ENV_KEYS`] plus `custom_env`,
 ///   every key any profile declares in its own `config.toml` `[env]` and every
 ///   key `~/.clauth/base-env.json` records as covered.
+/// - inside `modelSettings`, only the `effortLevel` of a model any account
+///   pins or the base-env record covers stays per-profile.
 ///
 /// `custom_env` is the union across ALL profiles, not just the member's own
 /// owner, and that is REQUIRED — not merely the conservative choice.
@@ -134,19 +136,42 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// propagate them into every sibling runtime — precisely the leak that strip
 /// exists to prevent. The cost of the union is nil: a key one account declares
 /// simply stays put in each member, and the next start re-derives it.
-fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
+fn key_role(path: KeyPath<'_>, keys: &PerProfileKeys) -> KeyRule {
     match path {
-        KeyPath::Top("env") => KeyRule::Nested,
+        KeyPath::Top("env" | "modelSettings") => KeyRule::Nested,
         KeyPath::Top(key) if PER_PROFILE_TOP_FIELDS.contains(&key) => KeyRule::PerProfile,
         KeyPath::Top(_) => KeyRule::Shared,
-        KeyPath::Nested(key) => {
-            if MANAGED_ENV_KEYS.contains(&key) || custom_env.contains(key) {
+        KeyPath::Nested {
+            parent: "modelSettings",
+            key,
+        } if crate::model_effort::is_pinned(&keys.models, key) => KeyRule::Nested,
+        KeyPath::Nested {
+            parent: "modelSettings",
+            ..
+        } => KeyRule::Shared,
+        KeyPath::Leaf {
+            parent: "modelSettings",
+            key: "effortLevel",
+            ..
+        } => KeyRule::PerProfile,
+        KeyPath::Leaf { .. } => KeyRule::Shared,
+        KeyPath::Nested { key, .. } => {
+            if MANAGED_ENV_KEYS.contains(&key) || keys.env.contains(key) {
                 KeyRule::PerProfile
             } else {
                 KeyRule::Shared
             }
         }
     }
+}
+
+/// The nested keys every member keeps as its own: `env` keys any profile
+/// declares or the base-env record covers, and `modelSettings` models (by
+/// model key) any profile pins or the per-model record covers.
+#[derive(Debug, Default)]
+pub(crate) struct PerProfileKeys {
+    pub(crate) env: BTreeSet<String>,
+    pub(crate) models: BTreeSet<String>,
 }
 
 /// Every `settings.json` a reconcile pass may join: the operator's own
@@ -167,6 +192,12 @@ pub(crate) fn known_paths() -> Result<Vec<PathBuf>> {
 struct EnvOnlyConfig {
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    models: crate::profile::ModelSettings,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    model_effort: BTreeMap<String, String>,
 }
 
 /// Union of every profile's custom `[env]` keys and every key
@@ -191,8 +222,17 @@ struct EnvOnlyConfig {
 /// nothing either way. The roster is a codex file, and the fix class this
 /// walk's codex skip belongs to exists to keep a codex file from stalling a
 /// claude subsystem.
+#[cfg(test)]
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
+    per_profile_keys().map(|keys| keys.env)
+}
+
+/// [`per_profile_env_keys`] plus the `modelSettings` models every profile
+/// pins and `~/.clauth/base-env.json` covers, read in the same walk and
+/// failing closed the same way.
+fn per_profile_keys() -> Option<PerProfileKeys> {
     let mut keys = BTreeSet::new();
+    let mut models = BTreeSet::new();
     // The union must cover every profile the MEMBER SET can contain, and the
     // members (`known_paths` → `live_shared_runtime_dirs`) are DIRECTORY-derived —
     // so the union walks the same directory listing. A roster-driven union
@@ -268,7 +308,17 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
             Err(e) => return warn_paused(&path, &format!("could not be read ({e})")),
         };
         match toml::from_str::<EnvOnlyConfig>(&raw) {
-            Ok(config) => keys.extend(config.env.into_keys()),
+            Ok(config) => {
+                models.extend(
+                    crate::model_effort::resolved_parts(
+                        &config.models,
+                        config.effort.as_deref(),
+                        &config.model_effort,
+                    )
+                    .into_keys(),
+                );
+                keys.extend(config.env.into_keys());
+            }
             Err(e) => {
                 let reason = crate::format::parse_refusal(
                     "is not valid TOML",
@@ -279,22 +329,24 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
             }
         }
     }
-    // A key the active account covers stays per-profile while its record
-    // entry lives, though a hand edit dropped it from that `config.toml`.
-    match crate::claude::saved_base_env_keys() {
-        Ok(covered) => keys.extend(covered),
+    // Covers survive a config edit until the recorded values are restored.
+    match crate::claude::saved_profile_keys() {
+        Ok((covered_env, covered_models)) => {
+            keys.extend(covered_env);
+            models.extend(covered_models);
+        }
         Err(_) => {
             let path = crate::claude::saved_base_env_path().ok()?;
             return warn_paused(&path, "does not parse");
         }
     }
     ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
-    Some(keys)
+    Some(PerProfileKeys { env: keys, models })
 }
 
 /// Report the first file failure that pauses settings sync, then latch.
 /// Always returns `None` so callers can `return warn_paused(..)` directly.
-fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
+fn warn_paused<T>(path: &Path, reason: &str) -> Option<T> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
             "clauth: settings.json sync paused: {} {reason}. \
@@ -338,16 +390,19 @@ pub(crate) struct SyncPass {
     /// Whether the merge ran: `false` when a failed operator put-back skipped
     /// it, or an unreadable `config.toml` paused it.
     pub(crate) merged: bool,
-    /// Whether the pass wrote a file or failed to: a retention put-back or
-    /// record write, a merge write.
+    /// Whether the pass wrote a file, failed to, or could not read or parse a
+    /// registered spawn file it had a number for: a retention put-back or
+    /// record write, a spawn-file keep-current rewrite, a merge write.
     pub(crate) attempted_write: bool,
 }
 
 impl SyncPass {
-    /// Whether the fast path may key this pass: the merge ran, and the pass
-    /// wrote no file and failed to write none. A stat key taken before a pass
-    /// that wrote describes bytes the pass replaced, so the same bytes
-    /// restored at the same stat would read as settled.
+    /// Whether the fast path may key this pass: the merge ran, the pass wrote
+    /// no file and failed to write none, and it could read and parse every
+    /// spawn file it had a number for. A stat key taken before a pass that
+    /// wrote describes bytes the pass replaced, so the same bytes restored at
+    /// the same stat would read as settled; one taken before a pass that owes
+    /// a retry would skip the retry.
     pub(crate) fn cacheable(self) -> bool {
         self.merged && !self.attempted_write
     }
@@ -405,7 +460,7 @@ fn sync_members() -> Result<SyncPass> {
         if !retention.merge_ok {
             return Ok(skipped);
         }
-        let Some(custom_env) = per_profile_env_keys() else {
+        let Some(per_profile) = per_profile_keys() else {
             return Ok(skipped);
         };
         let merge_attempted_write = crate::jsonsync::sync_paths_reporting_writes(
@@ -413,7 +468,7 @@ fn sync_members() -> Result<SyncPass> {
             Some(&operator_file),
             Some(&record),
             crate::jsonsync::SETTINGS_PROTECTED_KEYS,
-            |path| key_role(path, &custom_env),
+            |path| key_role(path, &per_profile),
         )?;
         Ok(SyncPass {
             merged: true,

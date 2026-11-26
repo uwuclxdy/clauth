@@ -50,6 +50,14 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
   // An `ask_opened` the daemon refuses (a 403/409 the event route answers
   // before it records the ask).
   const opened = { refuse: false }
+  // The next `fail` `ask_closed` posts answer 500, standing in for any 5xx
+  // (the bridge's own is `503 busy`).
+  const closed = { fail: 0 }
+  // The next `fail` `answer_receipt` posts answer 500, the same way.
+  const receipt = { fail: 0 }
+  // An `agent_turn` answers 400 `bad_request`, as a daemon that predates the
+  // kind does.
+  const agentTurn = { refuse: false }
   // A device answer: the daemon closes the ask and keeps the answer for its
   // wait. An ask already closed refuses (the device got `ask_closed`).
   const answer = (ask: string, payload: Record<string, unknown>): void => {
@@ -110,6 +118,17 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
       asks.set(body.ask as string, { answer: null, closed: false })
       return res(200, JSON.stringify({ ok: true, remote: true, hold: askHold }))
     }
+    if (body !== undefined && body.kind === 'agent_turn' && agentTurn.refuse) {
+      return res(400, JSON.stringify({ error: 'bad_request' }))
+    }
+    if (body !== undefined && body.kind === 'ask_closed' && closed.fail > 0) {
+      closed.fail -= 1
+      return res(500, 'boom')
+    }
+    if (body !== undefined && body.kind === 'answer_receipt' && receipt.fail > 0) {
+      receipt.fail -= 1
+      return res(500, 'boom')
+    }
     if (body !== undefined && body.kind === 'ask_closed') {
       const st = asks.get(body.ask as string)
       if (st && !st.closed) st.closed = true
@@ -117,7 +136,7 @@ function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, 
     }
     return res(200, JSON.stringify({ ok: true }))
   })
-  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, answer }
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, start, opened, closed, receipt, agentTurn, answer }
 }
 
 function installBoilerplate(
@@ -692,6 +711,226 @@ test('B2: append wakes carry exactly session, seq, kind, uuid and agent_id', asy
   expect(appends[0]!.uuid).toBe('u1')
   expect(Object.keys(appends[1]!).sort()).toEqual(['agent_id', 'kind', 'seq', 'session', 'uuid'])
   expect(appends[1]!.agent_id).toBe('agent-1')
+})
+
+// The turn events the mod posted, in post order, without their seq.
+function turnPosts(bridge: { events: EventBody[] }) {
+  return bridge.events
+    .filter(e => e.kind === 'turn_start' || e.kind === 'turn_end' || e.kind === 'agent_turn')
+    .map(({ seq: _seq, ...rest }) => rest)
+}
+
+test('AT1: a subagent turn posts agent_turn with its agent_id and turn; the main loop posts turn_start/turn_end as before', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'Reply with exactly OK', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  // Resumed under its first id, with a new turn.
+  await $.turn.start({ text: 'Reply with exactly TWO', turnId: 't2', agentId: 'a1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't2' })
+  await clock.settle()
+
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'turn_start', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't2' },
+    { session: 'sid-1', kind: 'turn_end', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't2' },
+  ])
+})
+
+test('AT2: a daemon refusing agent_turn leaves the main loop posting in order', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  bridge.agentTurn.refuse = true
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.start({ text: 'y', turnId: 'm2' })
+  await clock.settle()
+
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'turn_start', turn: 'm1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'end', turn: 't1' },
+    { session: 'sid-1', kind: 'turn_end', turn: 'm1' },
+    { session: 'sid-1', kind: 'turn_start', turn: 'm2' },
+  ])
+})
+
+test('AT3: a subagent turn start leaves the idle queue draining as an idle main loop does', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // A SendMessage resume runs a subagent in the background while the main
+  // loop waits: its turn must not make the main loop read as busy.
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual(['idle'])
+  expect(turnPosts(bridge)).toEqual([
+    { session: 'sid-1', kind: 'agent_turn', agent_id: 'a1', state: 'start', turn: 't1' },
+  ])
+})
+
+test('AT4: a subagent turn complete leaves the open main turn holding the queue', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual([])
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  expect(submissions).toEqual(['queued'])
+})
+
+// The value one poll URL's query carries for `key`, or null when it carries
+// none: the same `key=value` scan the daemon's own poll parse does.
+function queryValue(url: string, key: string): string | null {
+  const query = url.split('?')[1] ?? ''
+  for (const pair of query.split('&')) {
+    const at = pair.indexOf('=')
+    if (at >= 0 && pair.slice(0, at) === key) return pair.slice(at + 1)
+  }
+  return null
+}
+
+// The last poll URL the mod fetched, once it has polled at least once.
+function lastPollUrl(bridge: { fetches: FetchRecord[] }): string {
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(0)
+  return polls[polls.length - 1]!.url
+}
+
+// The open subagent turns one poll URL lists, each entry as its encoded
+// `<agent_id>:<turn>` text.
+function pollAgents(url: string): string[] {
+  const agents = queryValue(url, 'agents') ?? ''
+  return agents === '' ? [] : agents.split(',')
+}
+
+test('AT6: every poll carries the open turns as it sends them; none survive the session end', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  await $.turn.start({ text: 'x', turnId: 'm1' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('m1')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  // Each side is percent-encoded, so an id carrying the separator or a comma
+  // still reaches the daemon as one entry.
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await $.turn.start({ text: 'look', turnId: 't:2', agentId: 'a:2' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t1', 'a%3A2:t%3A2'])
+
+  // A resumed subagent replaces its entry in place.
+  await $.turn.start({ text: 'again', turnId: 't3', agentId: 'a1' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t3', 'a%3A2:t%3A2'])
+
+  await $.turn.complete({ ...agentEnd('a1'), turnId: 't3' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a%3A2:t%3A2'])
+
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 'm1' })
+  await $.turn.complete({ ...agentEnd('a:2'), turnId: 't:2' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+
+  // An end clears both even with an open main turn and an open subagent: the
+  // conversation they belonged to is gone, so the next poll reports none. The
+  // main turn id is percent-encoded like an `agents` side, so a separator in
+  // it stays part of the value.
+  await $.turn.start({ text: 'x', turnId: 'm2&3' })
+  await $.turn.start({ text: 'look', turnId: 't4', agentId: 'a4' })
+  await clock.advance(PARK_MS)
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('m2%263')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a4:t4'])
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  for (let i = 0; i < 5; i++) await clock.advance(PARK_MS)
+  expect(lastPollUrl(bridge)).toContain('/poll?session=sid-2')
+  expect(queryValue(lastPollUrl(bridge), 'turn')).toBe('')
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
+})
+
+test('AT7: with 65 subagent turns open a poll lists only the first 64', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 65; i++) {
+    await $.turn.start({ text: 'look', turnId: `t${i}`, agentId: `a${i}` })
+  }
+  await clock.advance(PARK_MS)
+  const listed = pollAgents(lastPollUrl(bridge))
+  expect(listed).toHaveLength(64)
+  expect(listed[0]).toBe('a0:t0')
+  expect(listed[63]).toBe('a63:t63')
+  // A start past the bound lists nothing, yet its own event still posts: the
+  // 65th subagent's start is the last start event the daemon was sent.
+  const starts = turnPosts(bridge).filter(p => p.kind === 'agent_turn' && p.state === 'start')
+  expect(starts[starts.length - 1]).toEqual({
+    session: 'sid-1',
+    kind: 'agent_turn',
+    agent_id: 'a64',
+    state: 'start',
+    turn: 't64',
+  })
+  // At the bound a resumed subagent replaces its listed turn in place.
+  await $.turn.start({ text: 'again', turnId: 't0b', agentId: 'a0' })
+  await clock.advance(PARK_MS)
+  const resumed = pollAgents(lastPollUrl(bridge))
+  expect(resumed).toHaveLength(64)
+  expect(resumed[0]).toBe('a0:t0b')
+  // The module keeps the first 64 subagents: the one the bound left out stays
+  // out when a slot frees, rather than riding in later.
+  await $.turn.complete({ ...agentEnd('a0'), turnId: 't0b' })
+  await clock.advance(PARK_MS)
+  const freed = pollAgents(lastPollUrl(bridge))
+  expect(freed).toHaveLength(63)
+  expect(freed).not.toContain('a64:t64')
+  // A new start then fills the freed slot, last in first-start order.
+  await $.turn.start({ text: 'late', turnId: 't64', agentId: 'a64' })
+  await clock.advance(PARK_MS)
+  const later = pollAgents(lastPollUrl(bridge))
+  expect(later).toHaveLength(64)
+  expect(later).not.toContain('a0:t0')
+  expect(later[63]).toBe('a64:t64')
+})
+
+test('AT8: a session start restores no open turn from $.state', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'look', turnId: 't1', agentId: 'a1' })
+  await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual(['a1:t1'])
+  await $.session.end({ sessionId: 'sid-1', reason: 'other' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  expect(pollAgents(lastPollUrl(bridge))).toEqual([])
 })
 
 test('B3: on Windows the mod is inert — no fetch at all', async ($, on) => {
@@ -1443,10 +1682,10 @@ test('CL3: the clear end goes out under the ended id, and the new id start carri
   session.id = 'sid-2'
   for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
   expect(bridge.events.filter(b => b.kind === 'end').map(b => b.session)).toEqual(['sid-1'])
-  const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, ...rest }) => rest)
+  const starts = bridge.events.filter(b => b.kind === 'start').map(({ seq, load, ...rest }) => rest)
   expect(starts).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
-    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true },
+    { session: 'sid-1', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
+    { session: 'sid-2', kind: 'start', cwd: '/w', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
   ])
 })
 
@@ -1758,6 +1997,201 @@ test('U4: a held ask that the phone answered posts no close', async ($, on) => {
   expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
 })
 
+// --- answer receipts (group AR) ---
+
+// The answer receipts the mod posted, in post order, as the daemon reads them.
+function receipts(bridge: { events: EventBody[] }) {
+  return bridge.events
+    .filter(e => e.kind === 'answer_receipt')
+    .map(e => ({ session: e.session, ask: e.ask, state: e.state }))
+}
+
+test('AR1: a phone answer the hold takes posts its applied receipt', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.answer(ask, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  expect(receipts(bridge)).toEqual([{ session: 'sid-1', ask, state: 'applied' }])
+})
+
+test('AR2: a phone answer reaching the mod after the desk settled its ask posts not_held', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'allow' })
+  expect(await p).toEqual({ decision: 'allow' })
+  await ui.unmount()
+  // The daemon took the phone's deny before the desk's close reached it, and
+  // hands it over on the poll.
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'deny' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  expect(receipts(bridge)).toEqual([{ session: 'sid-1', ask, state: 'not_held' }])
+})
+
+// The poll's copy of an answer the hold wait took reports the same `applied`:
+// this load did apply it, and the copy never reads as a loss.
+test('AR3: an answer both the hold wait and the poll carry reports applied twice', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  expect(receipts(bridge).map(r => r.state)).toEqual(['applied', 'applied'])
+})
+
+test('AR4: a failed ask_closed post is posted again, three posts at most', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const closes = (ask: string) => bridge.events.filter(b => b.kind === 'ask_closed' && b.ask === ask)
+  const deskAllow = async () => {
+    const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+    await clock.settle()
+    const ask = bridge.lastAsk()!
+    const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+    await ui.press({ key: 'allow' })
+    expect(await p).toEqual({ decision: 'allow' })
+    await ui.unmount()
+    return ask
+  }
+
+  bridge.closed.fail = 1
+  const retried = await deskAllow()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(closes(retried)).toHaveLength(2)
+
+  bridge.closed.fail = 99
+  const refused = await deskAllow()
+  for (let i = 0; i < 10; i++) await clock.advance(1000)
+  expect(closes(refused)).toHaveLength(3)
+})
+
+test('AR6: a failed answer receipt is posted again, three posts at most', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const deviceAnswer = async () => {
+    const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+    await clock.settle()
+    const ask = bridge.lastAsk()!
+    bridge.answer(ask, { decision: 'allow' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'allow' })
+    await clock.settle()
+    return ask
+  }
+  const posted = (ask: string) => receipts(bridge).filter(r => r.ask === ask)
+
+  bridge.receipt.fail = 1
+  const retried = await deviceAnswer()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(posted(retried)).toHaveLength(2)
+
+  bridge.receipt.fail = 99
+  const refused = await deviceAnswer()
+  for (let i = 0; i < 10; i++) await clock.advance(1000)
+  expect(posted(refused)).toHaveLength(3)
+})
+
+// A first `applied` post drew a 5xx, so its retry is still pending when the
+// poll's copy of the same answer arrives. That copy must report `applied`
+// again, never `not_held`: the loss would land ahead of the retry and answer
+// the phone `409` for an answer the hold applied.
+test('AR7: a duplicate of an applied answer re-reports applied when its receipt post failed', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.receipt.fail = 1
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  for (let i = 0; i < 5; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => r.state)).toEqual(['applied', 'applied', 'applied'])
+})
+
+// An applied id leaves with the conversation that applied it: once the answer's
+// posts stopped landing, no duplicate arriving under the next session's poll
+// reports an `applied` the new conversation never made.
+test('AR8: a /clear drops the applied ids, so a duplicate under the next id reports the loss', async ($, on) => {
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  // Every applied post fails, so nothing but the conversation's end takes the
+  // id out.
+  bridge.receipt.fail = 99
+  bridge.answer(ask, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  for (let i = 0; i < 3; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => [r.session, r.state])).toEqual([
+    ['sid-1', 'applied'],
+    ['sid-1', 'applied'],
+    ['sid-1', 'applied'],
+  ])
+  bridge.receipt.fail = 0
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  session.id = 'sid-2'
+  // Let the next conversation register and settle its first poll: a poll issued
+  // before the end drops the commands it lands with.
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  for (let i = 0; i < 2; i++) await clock.advance(PARK_MS)
+  expect(receipts(bridge).filter(r => r.session === 'sid-2')).toEqual([
+    { session: 'sid-2', ask, state: 'not_held' },
+  ])
+})
+
+test('AR9: a later duplicate of an applied answer still reports applied', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.receipt.fail = 1
+  bridge.answer(ask, { decision: 'allow' })
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  await clock.settle()
+  bridge.poll.commands = [{ kind: 'answer', ask, decision: 'allow' }]
+  await clock.advance(PARK_MS)
+  await clock.settle()
+  for (let i = 0; i < 3; i++) await clock.advance(1000)
+  expect(receipts(bridge).map(r => r.state)).toEqual([
+    'applied',
+    'applied',
+    'applied',
+    'applied',
+  ])
+})
+
 // The unheld question stays open while Claude Code's own dialog is up, and its
 // close goes under the session it opened in even once a `/clear` moved the
 // module on to the next one.
@@ -2017,13 +2451,13 @@ test('PQ8: a delivered prompt is reported by its id, and one with no id reports 
   expect(promptReports(bridge)).toEqual([{ prompt: 'p7', state: 'delivered' }])
 })
 
-test('PQ9: the start event tells the daemon this mod reports prompt outcomes', async ($, on) => {
+test('PQ9: the start event tells the daemon this mod reports prompt outcomes, takes notes and sends answer receipts', async ($, on) => {
   const { clock, bridge } = setup(on)
   await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
   await clock.settle()
   const starts = bridge.events.filter(e => e.kind === 'start')
-  expect(starts.map(({ seq, ...rest }) => rest)).toEqual([
-    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true },
+  expect(starts.map(({ seq, load, ...rest }) => rest)).toEqual([
+    { session: 'sid-1', kind: 'start', cwd: '/home/u', interactive: true, prompt_reports: true, caps: ['notes', 'answer_receipts'] },
   ])
 })
 
@@ -2067,6 +2501,91 @@ test('PQ15: every poll tells the daemon this mod reports prompt outcomes', async
   for (const f of polls) {
     expect(f.url).toContain('prompt_reports=1')
   }
+})
+
+// A restarted daemon meets a live mod by its poll first, so every poll names
+// the mod's capabilities as well as its start.
+test('PQ23: every poll tells the daemon this mod takes notes and sends answer receipts', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(1)
+  for (const f of polls) {
+    expect(/[?&]caps=notes,answer_receipts(&|$)/.test(f.url)).toBe(true)
+  }
+})
+
+// The last module load's number, as `$.state` keeps it across a reload.
+const LOAD = { plugin: 'clauth', key: 'load' }
+
+// `$.state` answers `stored` for the load number while it holds none, standing
+// for the load before this one; `empty.once` makes the next read find none,
+// as a `/clear` leaves it.
+function seedLoad(on: On, stored: number, empty = { once: false }) {
+  on('state.get', async ($, e, next) => {
+    const r = (await next(e)) as { value?: { value?: unknown; version: number } }
+    if (e.plugin !== LOAD.plugin || e.key !== LOAD.key) return r as never
+    if (empty.once) {
+      empty.once = false
+      return { value: { value: undefined, version: r!.value!.version } }
+    }
+    if (r?.value?.value === undefined) return { value: { value: stored, version: r!.value!.version } }
+    return r as never
+  })
+}
+
+function loadWrites(on: On): unknown[] {
+  const writes: unknown[] = []
+  on('state.set', async ($, e, next) => {
+    if (e.plugin === LOAD.plugin && e.key === LOAD.key) writes.push(e.value)
+    return next(e)
+  })
+  return writes
+}
+
+test('LD1: a fresh load sends one more than the last load number on its start and every poll, and keeps it', async ($, on) => {
+  seedLoad(on, 6)
+  const writes = loadWrites(on)
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS)
+  expect(bridge.events.filter(e => e.kind === 'start').map(e => e.load)).toEqual([7])
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?'))
+  expect(polls.length).toBeGreaterThan(1)
+  for (const f of polls) {
+    expect(/[?&]load=7(&|$)/.test(f.url)).toBe(true)
+  }
+  expect(writes).toEqual([7])
+})
+
+test('LD2: the start retry and the re-registration after a /clear carry the load number and write it back', async ($, on) => {
+  const empty = { once: false }
+  seedLoad(on, 6, empty)
+  const writes = loadWrites(on)
+  const session = { down: false, id: 'sid-1' }
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, true, session)
+  bridge.start.refuse = 'sid-2'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(PARK_MS)
+  await $.session.end({ sessionId: 'sid-1', reason: 'clear' })
+  empty.once = true
+  const writesAtClear = writes.length
+  session.id = 'sid-2'
+  for (let i = 0; i < 3; i++) await clock.advance(PARK_MS)
+  bridge.start.refuse = null
+  for (let i = 0; i < 8; i++) await clock.advance(PARK_MS)
+  const starts = bridge.events.filter(b => b.kind === 'start')
+  expect(starts.filter(b => b.session === 'sid-2').length).toBeGreaterThan(1)
+  for (const b of starts) expect(b.load).toBe(7)
+  const polls = bridge.fetches.filter(f => f.url.includes('/poll?session=sid-2'))
+  expect(polls.length).toBeGreaterThan(0)
+  for (const f of polls) expect(/[?&]load=7(&|$)/.test(f.url)).toBe(true)
+  const after = writes.slice(writesAtClear)
+  expect(after.length).toBeGreaterThan(0)
+  for (const w of after) expect(w).toBe(7)
 })
 
 // A fresh load of the module (a hooks-worker respawn or a reload) starts with
@@ -2622,6 +3141,26 @@ test('R3c: an interrupt landing while ask_opened is in flight still closes that 
   await new Promise(r => setTimeout(() => r(undefined), 50))
   bridge.poll.commands = [{ kind: 'interrupt' }]
   await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 500))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask: bridge.lastAsk(), by: 'interrupt' }])
+})
+
+test('AT5: a background subagent turn complete inside an in-flight interrupt keeps the aborted ask by interrupt', { timeoutMs: 15000, plugins: [engineAbort, slowOpen] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  // The interrupt lands while the ask_opened post is in flight (R3c), and a
+  // background subagent's turn ends before the held ask's close is decided:
+  // a SendMessage resume runs one while the main loop waits.
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await new Promise(r => setTimeout(() => r(undefined), 50))
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete(agentEnd('a1'))
   await p
   await new Promise(r => setTimeout(() => r(undefined), 500))
   const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))

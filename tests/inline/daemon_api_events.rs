@@ -646,7 +646,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         assert_eq!(status, 200, "{answer}");
     };
     bridge_event(serde_json::json!({
-        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true, "caps": ["notes"]
     }));
 
     let sink = SharedSink::new();
@@ -708,7 +708,7 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
         .expect("a snapshot frame");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&snapshot.2).expect("snapshot json")["sessions"],
-        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true}])
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true, "caps": ["notes"], "turn": null, "agents": []}])
     );
     let ask = frames
         .iter()
@@ -740,6 +740,116 @@ fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
     assert!(
         snapshot_idx < status_idx,
         "the snapshot precedes the first status frame"
+    );
+    assert_single_line_data(&sink.bytes());
+}
+
+/// A stream opened mid-turn reads the open main turn and the subagent with an
+/// open turn off its snapshot, then sees that subagent's end as one
+/// `session.agent` frame, with no `session.status` frame for it.
+#[test]
+fn a_subagent_turn_reaches_the_stream_as_its_own_frame() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    let bridge_event = |body: serde_json::Value| {
+        let (status, answer) = hub.event(100, body.to_string().as_bytes());
+        assert_eq!(status, 200, "{answer}");
+    };
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+    }));
+    bridge_event(
+        serde_json::json!({"session": "s-one", "seq": 2, "kind": "turn_start", "turn": "98c5"}),
+    );
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 3, "kind": "agent_turn", "agent_id": "a50c94990f67d7980", "state": "start", "turn": "f4dd"
+    }));
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_resolve = Arc::clone(&none);
+    let stream_hub = Arc::clone(&hub);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        run_stream_with_config(
+            &mut sink,
+            // A backstop only: the stream is ended on the agent frame below.
+            Instant::now() + Duration::from_secs(30),
+            &path,
+            stream_resolve.as_ref(),
+            &TerminalHolders::new(),
+            &StreamConfig::DEFAULT,
+            None,
+            #[cfg(unix)]
+            Some(&stream_hub),
+            #[cfg(unix)]
+            None,
+        )
+    });
+
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.snapshot")
+        },
+        Duration::from_secs(2),
+    );
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 4, "kind": "agent_turn", "agent_id": "a50c94990f67d7980", "state": "end", "turn": "f4dd"
+    }));
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.agent")
+        },
+        Duration::from_secs(2),
+    );
+    hub.drop_subscriptions();
+    stream
+        .join()
+        .expect("stream thread")
+        .expect("a dropped subscription ends the stream cleanly");
+
+    let frames = parse_frames(&sink.bytes());
+    let snapshot = frames
+        .iter()
+        .find(|f| f.0 == "session.snapshot")
+        .expect("a snapshot frame");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&snapshot.2).expect("snapshot json")["sessions"],
+        serde_json::json!([{
+            "session": "s-one", "cwd": "/w/app", "interactive": true, "caps": [],
+            "turn": "98c5", "agents": [{"agent_id": "a50c94990f67d7980", "turn": "f4dd"}]
+        }])
+    );
+    let relayed: Vec<(&str, serde_json::Value)> = frames
+        .iter()
+        .filter(|f| f.0.starts_with("session.") && f.0 != "session.snapshot")
+        .map(|f| {
+            (
+                f.0.as_str(),
+                serde_json::from_str(&f.2).expect("frame json"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        relayed,
+        vec![(
+            "session.agent",
+            serde_json::json!({"session": "s-one", "agent_id": "a50c94990f67d7980", "state": "end", "turn": "f4dd"})
+        )]
     );
     assert_single_line_data(&sink.bytes());
 }

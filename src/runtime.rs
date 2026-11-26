@@ -65,7 +65,7 @@
 //! profile's delete does the same for its own trees first
 //! ([`rescue_profile_trees`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,7 +76,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::claude::{build_claude_settings_json, create_symlink};
+use crate::claude::{build_runtime_settings_json, create_symlink};
 use crate::claude_jobs::JobTrees;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
@@ -1507,9 +1507,10 @@ fn fanout_warning(
 }
 
 /// What blocks a macOS rotation, and therefore which refusal line the caller
-/// renders. The three causes are distinct operator next-steps: retry a moment
-/// (a launcher's own session), `claude stop` (a background job), or retry once
-/// the named store clears (clauth cannot read it).
+/// renders. The four causes are distinct operator next-steps: retry a moment
+/// (a launcher's own session), `claude stop` (a background job), retry once
+/// the named store clears (clauth cannot read it), or delete the named job dir
+/// (it never clears on its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RotationBlock {
     /// A live `clauth start` marker session holds a store with a refresh token.
@@ -1520,6 +1521,11 @@ pub(crate) enum RotationBlock {
     /// Carries the store dir the refusal names (the global store, or the
     /// account's own tree-local store).
     UnreadableJobStore(PathBuf),
+    /// The job store holds a job dir that never clears on its own, so the
+    /// chains that store covers (every profile's for the global store, the
+    /// account's own for a tree-local one) cannot be judged until it is
+    /// deleted. Carries that job dir.
+    UnreadableJobDir(PathBuf),
 }
 
 /// [`rotation_blocked_by_live_session`] over the two things that strand a
@@ -1578,8 +1584,10 @@ pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
 /// read through [`credential_holds_refresh_token`], so a job on a
 /// `session-token.json` sidecar (linked or copied) frees the chain exactly like
 /// a marker session on one. A tree the read cannot judge (no file, a dangling
-/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or a
-/// profile dir that cannot be resolved, blocks with the store's path named.
+/// link, unparseable bytes) holds. Fail closed: an unreadable job store, or
+/// a profile dir that cannot be resolved, blocks with the store's path
+/// named, or with the job dir named when a stuck one made the store
+/// unreadable.
 ///
 /// The under-the-profile arm cannot see a handed-off per-launch chain tree
 /// correctly: the tree sits under its START profile's dir while the session
@@ -1608,7 +1616,12 @@ fn job_block(name: &ProfileName) -> Option<RotationBlock> {
     };
     let trees = match jobs.unfinished_under(&dir) {
         Ok(trees) => trees,
-        Err(store) => return Some(RotationBlock::UnreadableJobStore(store)),
+        Err(refusal) => {
+            return Some(match refusal.stuck_dir {
+                Some(job_dir) => RotationBlock::UnreadableJobDir(job_dir),
+                None => RotationBlock::UnreadableJobStore(refusal.store),
+            });
+        }
     };
     let rows = crate::live_sessions::list();
     let chain_trees: HashSet<PathBuf> = rows
@@ -1782,10 +1795,10 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-// Test seam posing WHICH cause blocks, so the three refusal lines' rendering
+// Test seam posing WHICH cause blocks, so the four refusal lines' rendering
 // paths are drivable from a Linux host. The bool seam above keeps its arms on
-// [`RotationBlock::LiveSession`]; this one covers the two job-store causes the
-// host can only reach on macOS.
+// [`RotationBlock::LiveSession`]; this one covers the job-store causes the host
+// can only reach on macOS.
 #[cfg(test)]
 thread_local! {
     static ROTATION_BLOCK_CAUSE_OVERRIDE: std::cell::RefCell<Option<RotationBlock>> =
@@ -2052,12 +2065,12 @@ fn gc_codex_homes() {
     if candidates.is_empty() {
         return;
     }
-    let _ = with_state_lock(|_held| {
+    drop(with_state_lock(|_held| {
         for (home, sessions) in candidates {
             // The liveness read and the removal BOTH belong under the state
             // lock, because the acquire's whole critical section runs under it
             // and the marker's flock is taken AFTER the home is built. Read
-            // unlocked, the entire `build_codex_home` window shows a home
+            // unlocked, the entire `build_codex_home_with` window shows a home
             // present beside a marker dir that is empty — indistinguishable
             // from a crash's leftover — and this sweep would reap a session
             // that is starting. Under the lock the only two states left are
@@ -2073,14 +2086,217 @@ fn gc_codex_homes() {
             }
         }
         Ok::<_, anyhow::Error>(())
-    });
+    }));
+}
+
+/// The `--plugin-dir` values of every live process, read once per sweep, again
+/// before deciding unless a live session marker holds the tree, and once more
+/// just before it is retired.
+///
+/// Claude Code records a plugin by the absolute path it was launched with, and
+/// `--plugin-dir <runtime>/<plugin>` stays bound to that runtime for the life
+/// of the process. If its `clauth start` dies (killed, OOM) while the `claude`
+/// keeps running, the marker lock dies with it and the config-dir liveness
+/// reads no longer hold the tree, yet `/reload-plugins` still resolves the
+/// plugin through it. Sparing on the launch-time path keeps that reload working.
+enum LivePluginDirs {
+    /// Every readable live process's `--plugin-dir` values.
+    Named(Vec<PathBuf>),
+    /// The process table could not be listed: spare every tree this sweep, the
+    /// fail-closed direction the job-store snapshot takes.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "constructed only by the linux/macos process-table read"
+        )
+    )]
+    Unreadable,
+    /// Plugin dirs play no part (the delete path, where the profile dir goes
+    /// either way and a spared tree would read as unrescued).
+    Off,
+}
+
+impl LivePluginDirs {
+    /// The snapshot to re-take before acting on a tree: a fresh read, except
+    /// that [`LivePluginDirs::Off`] stays off.
+    fn refreshed(&self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            _ => live_plugin_dirs(),
+        }
+    }
+
+    /// A snapshot holding exactly `dirs`.
+    #[cfg(test)]
+    fn named(dirs: Vec<PathBuf>) -> Self {
+        Self::Named(dirs)
+    }
+
+    /// Whether a live process's `--plugin-dir` lies inside `tree`, or the
+    /// snapshot is unreadable.
+    fn spares(&self, tree: &Path) -> bool {
+        match self {
+            Self::Unreadable => true,
+            Self::Off => false,
+            Self::Named(dirs) => dirs.iter().any(|dir| plugin_dir_inside_tree(dir, tree)),
+        }
+    }
+
+    /// Announce a per-pair spare for a NAMED hit, and nothing else: `spares`
+    /// is true for every pair under an unreadable process table, and the
+    /// sweep-level line already covered that case once per sweep. Call only
+    /// after [`Self::spares`] returned true.
+    fn announce_spare(&self, tree: &Path) {
+        if matches!(self, Self::Named(_)) {
+            logline!(
+                "clauth: spared runtime tree {}: a live process still loads a plugin from it \
+                 (--plugin-dir)",
+                tree.display()
+            );
+        }
+    }
+}
+
+/// Every value an argv gives `--plugin-dir`, in both the `--plugin-dir X` and
+/// `--plugin-dir=X` spellings. PURE.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn argv_plugin_dirs(argv: &[&[u8]]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        let value = if *arg == b"--plugin-dir" {
+            args.next().copied()
+        } else {
+            arg.strip_prefix(b"--plugin-dir=")
+        };
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            dirs.push(bytes_to_path(value));
+        }
+    }
+    dirs
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// Whether `dir` lies inside `tree`, by path prefix in the tree's walked or
+/// canonical spelling. Never canonicalizes `dir`: the plugin entry is a symlink
+/// out of the tree, and following it would hide the very reference this check
+/// exists to see. PURE apart from the tree's own canonicalize.
+fn plugin_dir_inside_tree(dir: &Path, tree: &Path) -> bool {
+    dir.starts_with(tree)
+        || crate::canonical::identity(tree).is_ok_and(|canonical| dir.starts_with(canonical))
+}
+
+/// One snapshot of every live process's `--plugin-dir` values. Linux reads
+/// `/proc/<pid>/cmdline`, macOS the `KERN_PROCARGS2` argv; a process whose argv
+/// the kernel withholds (another user's) is skipped, and elsewhere nothing is
+/// inspected, so behaviour there is unchanged.
+fn live_plugin_dirs() -> LivePluginDirs {
+    debug_assert!(
+        !crate::lock::state_lock_held(),
+        "the live process-table read must never span the state flock"
+    );
+    #[cfg(test)]
+    PLUGIN_DIR_READS.with(|count| count.set(count.get() + 1));
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if PLUGIN_DIRS_UNREADABLE.with(std::cell::Cell::get) {
+        return LivePluginDirs::Unreadable;
+    }
+    #[cfg(test)]
+    if let Some(dirs) = PLUGIN_DIRS_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return LivePluginDirs::Named(dirs);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(pids) = live_process_pids() else {
+            return LivePluginDirs::Unreadable;
+        };
+        LivePluginDirs::Named(
+            pids.into_iter()
+                .filter(|pid| process_is_ours(*pid))
+                .filter_map(process_argv)
+                .flat_map(|argv| {
+                    let argv: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+                    argv_plugin_dirs(&argv)
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        LivePluginDirs::Named(Vec::new())
+    }
+}
+
+/// Whether the process `pid` runs as this process's effective uid: linux reads
+/// the owner of `/proc/<pid>` (it serves `cmdline` of every user's process, so
+/// another user's argv must not keep a tree on disk), macOS the `pbi_uid` of
+/// `proc_bsdinfo`. A pid that vanished reads as not ours.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_ours(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        path_owned_by_euid(&PathBuf::from(format!("/proc/{pid}")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        proc_bsdinfo(pid).is_some_and(|info| info.pbi_uid == effective_uid())
+    }
+}
+
+/// The effective uid of this process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    #[expect(unsafe_code, reason = "geteuid takes no arguments and cannot fail")]
+    let euid = unsafe { libc::geteuid() };
+    euid
+}
+
+/// Whether `path` is owned by the effective uid of this process.
+#[cfg(target_os = "linux")]
+fn path_owned_by_euid(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let euid = effective_uid();
+    std::fs::metadata(path).is_ok_and(|meta| meta.uid() == euid)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`live_plugin_dirs`] returns exactly these dirs.
+    static PLUGIN_DIRS_OVERRIDE: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam: when set, [`live_plugin_dirs`] reads as
+    /// [`LivePluginDirs::Unreadable`]. Gated to the platforms where the process
+    /// table is read: a construction anywhere else would make the variant live
+    /// and leave its `expect(dead_code)` unfulfilled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static PLUGIN_DIRS_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: how many times [`live_plugin_dirs`] ran on this thread, so a
+    /// test can pin which pairs pay the read and which skip it.
+    static PLUGIN_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn plugin_dir_reads() -> usize {
+    PLUGIN_DIR_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_plugin_dir_reads() {
+    PLUGIN_DIR_READS.with(|count| count.set(0));
 }
 
 fn gc_runtime_trees() {
     // One snapshot of Claude Code's job store per sweep, before the pair loop,
     // so the fast path never pays the walk per pair. A dead pair the snapshot
     // did not name pays one more store read, under the state flock (the
-    // `gc_one_pair_synced` re-read). An unreadable store spares every dead pair
+    // `gc_one_pair_synced_with` re-read). An unreadable store spares every dead pair
     // this sweep — the fail-closed direction `is_session_alive` takes — and the
     // log names the offending job dir, never its contents.
     let job_trees = crate::claude_jobs::job_trees();
@@ -2126,8 +2342,15 @@ fn gc_runtime_trees() {
         return;
     };
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
+    let plugin_dirs = live_plugin_dirs();
+    if matches!(plugin_dirs, LivePluginDirs::Unreadable) {
+        logline!(
+            "clauth: spared every dead runtime tree this sweep: the live \
+             process table could not be read for --plugin-dir"
+        );
+    }
     for profile in entries.flatten() {
-        gc_profile_trees(&profile.path(), &job_trees);
+        gc_profile_trees(&profile.path(), &job_trees, &plugin_dirs);
     }
 }
 
@@ -2135,7 +2358,7 @@ fn gc_runtime_trees() {
 /// first, then every dead runtime tree, retired and rescued. Tombstones go
 /// first because a kept `runtime.rescuing` blocks the rename that would retire
 /// a dead `runtime` beside it.
-fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
+fn gc_profile_trees(profile: &Path, job_trees: &JobTrees, plugin_dirs: &LivePluginDirs) {
     // Strict predicates, not the loose pairing split: these walks hand
     // `remove_dir_all` whatever they match, so a future `runtime_state` or
     // `sessions.json` under a profile must fall through untouched.
@@ -2158,11 +2381,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
         if is_runtime_dir_name(&child_name)
             && let Some(sessions) = paired_sessions_name(&child_name)
         {
-            let _ = gc_one_pair(
+            drop(gc_one_pair(
                 &profile.join(&child_name),
                 &profile.join(sessions),
                 job_trees,
-            );
+                plugin_dirs,
+            ));
         } else if is_sessions_dir_name(&child_name)
             && let Some(runtime) = paired_runtime_name(&child_name)
         {
@@ -2172,7 +2396,12 @@ fn gc_profile_trees(profile: &Path, job_trees: &JobTrees) {
             // rather than a reused one.
             let runtime = profile.join(runtime);
             if runtime.symlink_metadata().is_err() {
-                let _ = gc_one_pair(&runtime, &profile.join(&child_name), job_trees);
+                drop(gc_one_pair(
+                    &runtime,
+                    &profile.join(&child_name),
+                    job_trees,
+                    plugin_dirs,
+                ));
             }
         }
     }
@@ -2205,7 +2434,14 @@ pub(crate) fn rescue_profile_trees(profile: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
     let _rescue_wait = crate::sessions::RescueLockBudget::arm();
-    gc_profile_trees(profile, &crate::claude_jobs::job_trees());
+    gc_profile_trees(
+        profile,
+        &crate::claude_jobs::job_trees(),
+        // The profile dir goes either way: a tree spared here would count as
+        // unrescued, so `delete` would refuse and `delete --force` would drop
+        // its transcripts unrescued.
+        &LivePluginDirs::Off,
+    );
     let children = match std::fs::read_dir(profile) {
         Ok(children) => children,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -2500,18 +2736,31 @@ pub(crate) mod namespaced_keychain_ledger {
 
     /// Whether a pid names a running process — `kill(pid, 0)` semantics on
     /// unix: the probe succeeds when the process exists, and `EPERM` (a
-    /// process this user may not signal) still proves existence. False on
-    /// non-unix, where no guarded delete ever runs and every row falls back
-    /// to the age bound.
-    #[allow(unsafe_code)]
+    /// process this user may not signal) still proves existence. On linux a
+    /// thread's id, which `kill` answers as well, reads false
+    /// (`pid_is_thread`). False on non-unix, where no guarded delete
+    /// ever runs and every row falls back to the age bound.
     pub(crate) fn pid_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
+            #[expect(
+                unsafe_code,
+                reason = "kill has no safe std wrapper; signal 0 probes existence and sends nothing"
+            )]
             // SAFETY: `pid` is a plain integer the OS interprets as a process
             // id; signal 0 probes existence and sends nothing (the same shape
             // `start::forward_signal` uses).
             let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            let exists =
+                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            #[cfg(target_os = "linux")]
+            {
+                exists && !super::pid_is_thread(pid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                exists
+            }
         }
         #[cfg(not(unix))]
         {
@@ -3803,12 +4052,17 @@ fn rescue_claimed_tombstone(tombstone: &Path) {
 /// it is renamed to a tombstone under the lock and rescued outside it
 /// ([`retire_tree`]), and the flock is never held across a tree-sized walk; a
 /// runtime path that is itself a link is unlinked alone.
-fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<()> {
+fn gc_one_pair(
+    runtime: &Path,
+    sessions: &Path,
+    job_trees: &JobTrees,
+    plugin_dirs: &LivePluginDirs,
+) -> Result<()> {
     // The job check sits here as a FAST PATH, before the state flock
-    // `gc_one_pair_synced` takes: the store was read once above and the check
+    // `gc_one_pair_synced_with` takes: the store was read once above and the check
     // is a canonicalize + set lookup, not a walk. It is not the decision — a
     // job written after the snapshot but before the marker frees is caught by
-    // the fresh re-read `gc_one_pair_synced` makes under the lock. Spared
+    // the fresh re-read `gc_one_pair_synced_with` makes under the lock. Spared
     // before the flock means a named tree is never renamed to its rescue
     // tombstone — the one order that would rescue-and-delete a tree a live job
     // still reads.
@@ -3825,7 +4079,16 @@ fn gc_one_pair(runtime: &Path, sessions: &Path, job_trees: &JobTrees) -> Result<
         }
         return Ok(());
     }
-    gc_one_pair_synced(runtime, sessions, || {})
+    // A live process's launch-time `--plugin-dir` into this tree spares it even
+    // when nothing else holds the tree: its `clauth start` died (killed, OOM)
+    // and took the marker lock with it while `claude` keeps running. This is
+    // the fast path off the sweep's snapshot; `gc_one_pair_synced_with`
+    // re-reads it fresh before deciding and again before it retires the tree.
+    if plugin_dirs.spares(runtime) {
+        plugin_dirs.announce_spare(runtime);
+        return Ok(());
+    }
+    gc_one_pair_synced_with(runtime, sessions, plugin_dirs, || {})
 }
 
 #[cfg(test)]
@@ -3874,11 +4137,41 @@ fn gc_held_marker_set(file: File) {
 /// The removal hold renames the tree to its tombstone ([`retire_tree`]), and
 /// the rescue runs once the lock drops, because nothing but that tree may hold
 /// what its dead session wrote.
+#[cfg(test)]
 fn gc_one_pair_synced(
     runtime: &Path,
     sessions: &Path,
     remint_interleave: impl FnOnce(),
 ) -> Result<()> {
+    gc_one_pair_synced_with(runtime, sessions, &LivePluginDirs::Off, remint_interleave)
+}
+
+/// [`gc_one_pair_synced`] with the plugin-dir mode: [`LivePluginDirs::Off`]
+/// skips the plugin-dir reads, anything else re-reads the live dirs fresh
+/// before deciding unless a live session marker holds the tree, and again
+/// before retiring it.
+fn gc_one_pair_synced_with(
+    runtime: &Path,
+    sessions: &Path,
+    plugin_dirs: &LivePluginDirs,
+    remint_interleave: impl FnOnce(),
+) -> Result<()> {
+    // Re-read the live `--plugin-dir`s BEFORE the decide hold: a `claude`
+    // launched with one into this tree after the sweep's snapshot must spare
+    // it while no supervisor has been stopped yet. Sparing here sends no
+    // SIGTERM and stamps no in-flight stop record. The re-read just before
+    // the retire hold below stays, for a dir that appears after this one.
+    // A tree a live session marker holds skips this read: the decide hold
+    // spares it already, and the read walks the whole process table on linux
+    // and spawns `ps` on macOS. A marker count the probe could not take reads
+    // as no live marker, keeping this read and the line it logs.
+    if live_sessions_at(sessions).is_none_or(|live| live == 0) {
+        let refreshed = plugin_dirs.refreshed();
+        if refreshed.spares(runtime) {
+            refreshed.announce_spare(runtime);
+            return Ok(());
+        }
+    }
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
     // the tree is removed. Collected after the closures below, where a
@@ -3943,6 +4236,18 @@ fn gc_one_pair_synced(
     #[cfg(test)]
     on_gc_recheck_hold(runtime, sessions);
 
+    // Re-read the live `--plugin-dir`s: a `claude` launched with one into this
+    // tree after the sweep's snapshot must still spare it, and the spare is
+    // announced here as the earlier reads announce theirs. Taken here, just
+    // before the hold, because on macOS the process listing shells out to
+    // `ps` and no subprocess may span the state flock; the hold below then
+    // acts on this read the way it acts on the marker and job re-reads.
+    let late = plugin_dirs.refreshed();
+    let plugin_spare = late.spares(runtime);
+    if plugin_spare {
+        late.announce_spare(runtime);
+    }
+
     // Re-check under a FRESH lock hold, then collect: between the decide above
     // and this hold a concurrently starting session can re-mint this same path,
     // so the removal keys on the world it runs in — markers, the job store AND
@@ -3950,6 +4255,7 @@ fn gc_one_pair_synced(
     // delete below takes.
     let renamed = with_state_lock(|_held| {
         let spares = prune_stale_sessions(sessions).unwrap_or(1) != 0
+            || plugin_spare
             || crate::claude_jobs::job_trees().spares(runtime)
             || !matches!(
                 supervisor_state(runtime),
@@ -5311,10 +5617,13 @@ pub(crate) fn swap_target_precondition(
 struct SwapPlan {
     member: ProfileName,
     store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]: its `[env]` entry when present,
-    /// else the field, else `""`), carried into the swap's settings.json
-    /// rewrite. The converge branch mints `None`:
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]: with one model selected, the value
+    /// that makes the session apply what a fresh launch applies, which is the
+    /// carrier's own value when Claude Code's parser takes it and the
+    /// per-model level or `""` otherwise; with no selected model, the
+    /// account-wide carrier as it stands), carried into the swap's
+    /// settings.json rewrite. The converge branch mints `None`:
     /// [`converge_in_place`](SessionSwap::converge_in_place) writes nothing
     /// new, so no caller reads the field there.
     effort: Option<String>,
@@ -5662,8 +5971,8 @@ struct SwapItemRetry {
     member: ProfileName,
     store: PathBuf,
     previous_store: PathBuf,
-    /// The intended member's effort as a launch on it would carry
-    /// ([`crate::claude::effective_effort`]), written into the session's
+    /// The intended member's effort for the running session
+    /// ([`crate::claude::live_effort`]), written into the session's
     /// settings.json once the item legs land (on macOS the handover write is
     /// deferred to that point). `None` (the adopting read failed) writes `""`.
     effort: Option<String>,
@@ -6161,7 +6470,7 @@ impl SessionSwap {
         Ok(SwapPlan {
             member: intended,
             store,
-            effort: Some(crate::claude::effective_effort(&profile)),
+            effort: Some(crate::claude::live_effort(&profile)),
         })
     }
 
@@ -6457,15 +6766,33 @@ impl SessionSwap {
 
     /// The swap's effort handover write: the member's effort (`""` when it
     /// holds none) into `env.CLAUDE_CODE_EFFORT_LEVEL` of the session's
-    /// runtime settings.json, recorded through the same owner-only path the
-    /// launch uses. Best-effort — a failure is logged naming the session dir
-    /// and the swap stands, per the handover's contract.
+    /// runtime settings.json, and its per-model levels into `modelSettings`
+    /// ([`crate::claude::set_settings_effort`]), recorded through the same
+    /// owner-only path the launch uses. The levels are read under the hold the
+    /// caller owns (`read_profile`, the under-hold form); an unreadable member
+    /// hands over the carrier alone. Best-effort — a failure is logged naming
+    /// the session dir and the swap stands, per the handover's contract.
     fn write_effort_env(&self, member: &ProfileName, effort: Option<&str>, record: Option<&Path>) {
-        if let Err(e) = crate::claude::set_settings_env_key(
+        let levels = match crate::profile::read_profile(member) {
+            Ok(profile) => Some(crate::model_effort::resolved(&profile)),
+            Err(e) => {
+                logline!(
+                    "clauth: session {} swapped onto {} but its per-model effort could not be \
+                     read: {e:#}",
+                    self.session.as_str(),
+                    member,
+                );
+                None
+            }
+        };
+        if let Err(e) = crate::claude::set_settings_effort(
             &self.runtime.join("settings.json"),
             record,
             "CLAUDE_CODE_EFFORT_LEVEL",
             effort.unwrap_or(""),
+            levels
+                .as_ref()
+                .map(|incoming| (incoming, self.isolation == Isolation::Shared)),
         ) {
             logline!(
                 "clauth: session {} swapped onto {} but {} did not take the effort: {e:#}",
@@ -7639,14 +7966,15 @@ impl ProfileRuntime {
                     // the re-armed legs land: the swap that armed them is gone,
                     // so its plan's value is unrecoverable, and the adoption
                     // reads the member's current one instead — the value a
-                    // launch on it would carry (`effective_effort`: its `[env]`
-                    // entry or the field). The read-only form is the under-hold
+                    // running session uses (`live_effort`: the carrier's value
+                    // when Claude Code's parser takes it, else the selected
+                    // model's level). The read-only form is the under-hold
                     // one: `load_profile` may rewrite `config.toml` and adopt a
                     // legacy `.pending` sidecar, both through the state flock
                     // this hold already owns.
                     let effort = crate::profile::read_profile(&member)
                         .ok()
-                        .map(|profile| crate::claude::effective_effort(&profile));
+                        .map(|profile| crate::claude::live_effort(&profile));
                     item_retry =
                         adopted_item_retry(launch_store.as_deref(), &canonical, &member, effort);
                 }
@@ -8563,12 +8891,17 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     }
 }
 
-/// The per-spawn `--settings` file for the CC permission exemption
+/// The per-spawn `--settings` file for the CC permission exemption and a
+/// shared launch's remembered `cleanupPeriodDays`
 /// ([`crate::cc_exempt::apply_spawn_settings`]). Lives BESIDE the runtime tree
 /// (the profile dir), not inside it, so the fake-mode mirror never publishes
 /// it into `~/.claude` and `settings_sync` (which reconciles only
-/// `settings.json`) never reads it. Unique per session id; kept while
-/// [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
+/// `settings.json`) never reads it. A launch that carries the number into
+/// this file registers it in the retention record, which rewrites the file
+/// when the number changes — a delegate's own value sits as a floor under the
+/// remembered number, and a value the operator passed on their own
+/// `clauth start -- --settings` is never registered. Unique per session id;
+/// kept while [`crate::claude_jobs::JobTrees::spares_settings`] spares it.
 pub(crate) fn spawn_settings_file(config_dir: &Path, session_id: &str) -> PathBuf {
     // The name carries the session's flavor so GC can find its marker: an
     // isolated session's marker lives in `sessions-isolated-<sid>`, a shared
@@ -8850,13 +9183,52 @@ fn environ_bytes_config_dir_is(environ: &[u8], tree: &Path) -> bool {
     }
 }
 
+/// Whether `<proc_root>/<pid>` is a thread that is not its thread-group
+/// leader. Linux answers `kill(tid, 0)` and every `/proc/<tid>/…` file for
+/// such a thread as for a process (measured 2026-11-17; only the `/proc`
+/// listing leaves it out), so a recorded pid the kernel reissued as another
+/// program's thread id would read as that program. `status` names the leader
+/// in `Tgid` and the entry in `Pid`. False when `status` cannot be read or
+/// parsed (the pid gone, a `hidepid` mount): each reader then keeps the
+/// verdict its own read gives.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_entry_is_thread(proc_root: &Path, pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")) else {
+        return false;
+    };
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(':')?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+    };
+    matches!((field("Tgid"), field("Pid")), (Some(tgid), Some(own)) if tgid != own)
+}
+
+/// [`proc_entry_is_thread`] under the host's `/proc`: every linux per-pid
+/// reader of a recorded pid asks it before trusting a read, except the
+/// daemon's inherited-children reads (`gateway::zombie_start`,
+/// `gateway::probe_inherited`), whose start-time match already refuses a
+/// reused pid. The children listing reads only ids the `/proc` listing
+/// names, which leaves threads out.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_is_thread(pid: u32) -> bool {
+    proc_entry_is_thread(Path::new("/proc"), pid)
+}
+
 /// The process `pid`'s environment as NUL-separated `KEY=value` bytes, read as
 /// the supervisor checks read it: `/proc/<pid>/environ` on linux, the
-/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, and on
-/// every other platform.
+/// `KERN_PROCARGS2` env tail on macOS. `None` where it cannot be read, for a
+/// thread's id on linux, and on every other platform.
 pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         std::fs::read(format!("/proc/{pid}/environ")).ok()
     }
     #[cfg(target_os = "macos")]
@@ -8872,10 +9244,13 @@ pub(crate) fn process_environ(pid: u32) -> Option<Vec<u8>> {
 
 /// The process `pid`'s argv, argv0 first: `/proc/<pid>/cmdline` on linux with
 /// empty words dropped, the `KERN_PROCARGS2` argv on macOS. `None` where it
-/// cannot be read, and on every other platform.
+/// cannot be read, for a thread's id on linux, and on every other platform.
 pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     #[cfg(target_os = "linux")]
     {
+        if pid_is_thread(pid) {
+            return None;
+        }
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         Some(
             cmdline
@@ -9253,9 +9628,10 @@ fn supervisor_state(tree: &Path) -> SupervisorState {
 #[cfg(target_os = "linux")]
 fn verify_supervisor_record(tree: &Path, pid: u32, start: &str) -> SupervisorState {
     // kill(0) proves the pid still names a process — live, zombie, or a
-    // hidepid-hidden one — without reading /proc. False means the pid is
-    // positively gone (only that counts as dead, never an unreadable or
-    // hidden `/proc/<pid>/stat`).
+    // hidepid-hidden one — and a readable `status` naming another thread-group
+    // leader turns it down as a thread's id. False means the pid is
+    // positively gone or a thread (only that counts as dead, never an
+    // unreadable or hidden `/proc/<pid>/stat`).
     if !namespaced_keychain_ledger::pid_alive(pid) {
         return SupervisorState::Gone;
     }
@@ -9672,9 +10048,12 @@ fn supervisor_argv_and_config_dir_match(pid: u32, tree: &Path) -> bool {
 
 /// Whether the process `pid`'s cmdline holds `daemon` immediately followed by
 /// `run` — the transient supervisor's argv shape (`claude daemon run --origin
-/// transient`, measured).
+/// transient`, measured). False for a thread's id.
 #[cfg(target_os = "linux")]
 fn cmdline_holds_daemon_run(pid: u32) -> bool {
+    if pid_is_thread(pid) {
+        return false;
+    }
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
@@ -9687,10 +10066,7 @@ fn cmdline_holds_daemon_run(pid: u32) -> bool {
 /// mismatch is another tree's supervisor.
 #[cfg(target_os = "linux")]
 fn environ_config_dir_is(pid: u32, tree: &Path) -> bool {
-    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
-        return false;
-    };
-    environ_bytes_config_dir_is(&environ, tree)
+    process_environ(pid).is_some_and(|environ| environ_bytes_config_dir_is(&environ, tree))
 }
 
 /// Whether the process `pid` holds the transient supervisor's argv AND its
@@ -10996,7 +11372,8 @@ fn write_merged_settings(
         }
         _ => None,
     };
-    let mut merged = build_claude_settings_json(base.as_deref(), profile, stale_env_keys)?;
+    let (mut merged, levels) =
+        build_runtime_settings_json(base.as_deref(), profile, stale_env_keys)?;
     if let Some(days) = carried_days {
         merged = crate::retention::carry_into(merged, days)?;
     }
@@ -11037,6 +11414,19 @@ fn write_merged_settings(
             atomic_write_600(&settings_dst, &merged)
                 .context("failed to write runtime settings.json")?;
         }
+    }
+    // The record only tells a later swap which levels this launch wrote, so
+    // its failure never fails a launch whose settings landed. A swap then
+    // reads whatever record the tree holds: none on a fresh tree, so nothing
+    // goes back; on a reused tree an earlier launch's, through
+    // `RuntimeLevels::read`, which keeps only the levels the session still
+    // holds.
+    if let Err(e) = crate::model_effort::RuntimeLevels::write(
+        &settings_dst,
+        levels,
+        std::collections::BTreeMap::new(),
+    ) {
+        logline!("clauth: {e:#}");
     }
     Ok(())
 }
@@ -11398,6 +11788,34 @@ pub(crate) fn live_session_runtime_dirs() -> Vec<LiveRuntime> {
         }
     }
     out
+}
+
+/// Refresh the effort carrier of managed sessions on the globally active
+/// account after a Setup edit. The caller holds the state lock.
+pub(crate) fn update_live_effort(profile: &Profile) {
+    let effort = crate::claude::live_effort(profile);
+    let levels = crate::model_effort::resolved(profile);
+    let written = crate::settings_sync::written_record_path().ok();
+    for live in sessions_on_member(live_session_runtime_dirs(), &profile.name) {
+        let shared = live
+            .runtime
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_shared_runtime_dir_name);
+        let record = if shared { written.as_deref() } else { None };
+        if let Err(e) = crate::claude::set_settings_effort(
+            &live.runtime.join("settings.json"),
+            record,
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            &effort,
+            Some((&levels, shared)),
+        ) {
+            logline!(
+                "clauth: session {} could not take the updated effort: {e:#}",
+                live.session
+            );
+        }
+    }
 }
 
 /// Whether a daemon-side writer may adopt the unowned per-session item of
@@ -14359,18 +14777,55 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
 const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
 const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
 
-/// Copy the operator's `config.toml` into a session home with the escape keys
-/// removed. An unparseable config copies through verbatim: codex will reject it
-/// the same way, and a session that cannot start is a better answer than one
-/// silently reshaped by a parse this function got wrong. Comments and key order
-/// are lost in the rewrite, which costs nothing — the copy is codex's to write
-/// in place and is discarded at teardown, never synced back over the original.
+/// What a copied config does with the hooks declared inline under its `[hooks]` table.
+/// Inline hooks execute code like `hooks.json` does, so they ride the same opt-in: kept only on a shared home whose profile sets [`CodexProfileOpts::hooks_json`], stripped everywhere else.
+#[derive(Debug, Clone, Copy)]
+enum InlineHooks<'a> {
+    /// Drop every inline hook entry, and every `[hooks.state]` entry keyed to one of these session spellings: a copy with no operator file left has no trust to derive it from, so a hook the operator trusted must ask again.
+    /// The operator's own entries stay.
+    Strip(&'a [PathBuf]),
+    /// Keep them, and re-key the operator's trust onto the session home.
+    Carry(&'a HookTrust),
+}
+
+/// Where the operator's hook trust is keyed, and where a session's must be.
+/// Codex keys trust as `<source>:<event>:<group>:<handler>`, `<source>` being the resolved `CODEX_HOME` joined with the declaring file (`hooks.json`, `config.toml` or a `<name>.config.toml` layer).
+#[derive(Debug)]
+struct HookTrust {
+    /// The operator home's spellings, resolved first, then the raw one when it differs.
+    /// Codex writes the resolved spelling when `CODEX_HOME` is set, so that one wins when both spellings key one hook.
+    operator: Vec<PathBuf>,
+    /// The session home as codex resolves it, never the link's target, which would be the operator's own file.
+    session: PathBuf,
+    /// Every file name a hook can be declared in.
+    sources: Vec<String>,
+}
+
+/// The spellings a codex home may be keyed under: the resolved form codex writes when `CODEX_HOME` is set, then `home` itself when the two differ.
+/// A home that does not resolve yet keeps its given spelling.
+fn codex_home_spellings(home: &Path) -> Result<Vec<PathBuf>> {
+    match crate::canonical::codex_home(home) {
+        Ok(resolved) if resolved.as_path() != home => Ok(vec![resolved, home.to_path_buf()]),
+        Ok(_) => Ok(vec![home.to_path_buf()]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![home.to_path_buf()]),
+        Err(e) => Err(e).with_context(|| format!("failed to resolve {}", home.display())),
+    }
+}
+
+/// The `<source>:` prefix of every trust key a hook declared in `source` gets, `source` spelled byte for byte as given: a Windows verbatim `\\?\` home stays verbatim, the spelling codex keys with.
+fn hook_trust_prefix(source: &Path) -> String {
+    format!("{}:", source.display())
+}
+
+/// Copy the operator's `config.toml` (or a `<name>.config.toml` layer) into a session home with the escape keys removed and its inline hooks handled per `hooks`.
+/// An unparseable config copies through verbatim: codex will reject it the same way, and a session that cannot start is a better answer than one silently reshaped by a parse this function got wrong.
+/// Comments and key order are lost in the rewrite.
+/// The copy is derived, never synced back: every build rewrites it from the operator's current file, which drops what codex wrote into it in place, the state a per-session home loses at teardown anyway.
 ///
-/// Every branch lands owner-only: the copy sits in a tree the perms sweep
-/// stops short of, so the operator's own mode would otherwise be what it keeps.
-fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+/// Every branch lands owner-only through the atomic writer, so a sibling codex reading mid-build sees the old file or the new one, never a partial one: the copy sits in a tree the perms sweep stops short of, so the operator's own mode would otherwise be what it keeps.
+fn copy_codex_config(src: &Path, dst: &Path, hooks: InlineHooks<'_>) -> Result<()> {
     let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    let bytes = match stripped_codex_config(&raw) {
+    let bytes = match rewritten_codex_config(&raw, hooks) {
         Some(parsed) => toml::to_string(&parsed)
             .with_context(|| format!("failed to re-render {}", src.display()))?
             .into_bytes(),
@@ -14380,21 +14835,104 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("failed to write {}", dst.display()))
 }
 
-/// The parsed config with the escape keys removed, or `None` when there was
-/// nothing to strip or the bytes do not parse, so the copy goes verbatim.
-fn stripped_codex_config(raw: &[u8]) -> Option<toml::Value> {
+/// The parsed config with the escape keys removed and its inline hooks stripped or their trust carried, or `None` when nothing changed or the bytes do not parse, so the copy goes verbatim.
+fn rewritten_codex_config(raw: &[u8], hooks: InlineHooks<'_>) -> Option<toml::Value> {
     let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
     let table = parsed.as_table_mut()?;
-    let mut stripped = false;
+    let mut changed = false;
     for key in CODEX_CONFIG_STRIP_KEYS {
-        stripped |= table.remove(*key).is_some();
+        changed |= table.remove(*key).is_some();
     }
     for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
         if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
-            stripped |= sub.remove(*key).is_some();
+            changed |= sub.remove(*key).is_some();
         }
     }
-    stripped.then_some(parsed)
+    changed |= match hooks {
+        InlineHooks::Strip(session) => {
+            let stripped = strip_inline_hooks(table);
+            let dropped = drop_session_trust(table, session);
+            stripped || dropped
+        }
+        InlineHooks::Carry(trust) => carry_hook_trust(table, trust),
+    };
+    changed.then_some(parsed)
+}
+
+/// Drop every key of the `[hooks]` table but `state`: codex reads the fourteen event keys there as hook declarations and ignores any other key, so nothing else is a hook that could run.
+/// The operator's trust entries stay.
+/// A `hooks` that is not a table is left for codex to reject.
+fn strip_inline_hooks(table: &mut toml::Table) -> bool {
+    let Some(hooks) = table.get_mut("hooks").and_then(toml::Value::as_table_mut) else {
+        return false;
+    };
+    let before = hooks.len();
+    hooks.retain(|key, _| key == "state");
+    if hooks.len() == before {
+        return false;
+    }
+    if hooks.is_empty() {
+        table.remove("hooks");
+    }
+    true
+}
+
+/// Drop the `[hooks.state]` entries keyed to one of `session`'s spellings: the carry wrote them for this home, so keeping them would run a hook trusted after the operator took the trust away with their config.
+/// The operator's own entries stay.
+fn drop_session_trust(table: &mut toml::Table, session: &[PathBuf]) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let prefixes: Vec<String> = session
+        .iter()
+        .map(|home| format!("{}{}", home.display(), std::path::MAIN_SEPARATOR))
+        .collect();
+    let before = state.len();
+    state.retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
+    state.len() != before
+}
+
+/// Codex keys a hook's trust by the resolved path of the file that declares it, and a session home is not the operator's home, so a hook the operator trusted reads as new in a session and codex asks again.
+/// Re-key each entry whose source is one of the operator's hook files onto the same file under the session home.
+/// The hash is copied, never computed: a hook changed since the operator trusted it still fails codex's check and still asks.
+/// The operator's own entries stay, and an entry already present under the session key wins.
+/// When both operator spellings key one hook, the resolved spelling's entry is the one carried.
+fn carry_hook_trust(table: &mut toml::Table, trust: &HookTrust) -> bool {
+    let Some(state) = table
+        .get_mut("hooks")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let mut carried: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for file in &trust.sources {
+        let to = hook_trust_prefix(&trust.session.join(file));
+        for operator in &trust.operator {
+            let from = hook_trust_prefix(&operator.join(file));
+            for (key, value) in state.iter() {
+                if let Some(rest) = key.strip_prefix(&from) {
+                    carried
+                        .entry(format!("{to}{rest}"))
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+    }
+    let mut changed = false;
+    for (key, value) in carried {
+        if let toml::map::Entry::Vacant(slot) = state.entry(key) {
+            slot.insert(value);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
@@ -14471,6 +15009,19 @@ enum ConvergePrior {
     Teardown,
 }
 
+/// Land a fake-mode session copy's bytes in the profile store through the
+/// synced owner-only writer: the store is what the rotation and capture
+/// machinery read, and it holds a single-use refresh token, so a power loss
+/// must not bring it back as its old bytes. The session-side copy keeps
+/// [`copy_file`], whose sync per file the bulk `~/.claude` mirror cannot
+/// afford.
+fn publish_copy_to_store(copy: &Path, store: &Path) -> Result<()> {
+    let bytes =
+        std::fs::read(copy).with_context(|| format!("failed to read {}", copy.display()))?;
+    crate::profile::atomic_write_600(store, bytes)
+        .with_context(|| format!("failed to write {}", store.display()))
+}
+
 /// Converge the profile store and a fake-mode home's `auth.json` copy at a
 /// session boundary; content-equal is a no-op. The chain's own event decides:
 /// the later `last_refresh` wins, mtime only where a side has no parseable
@@ -14488,7 +15039,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
         (true, false) => copy_file(store, copy),
         // The store must never lag a chain that exists only in the copy: the
         // rotation and capture machinery read the STORE.
-        (false, true) => copy_file(copy, store),
+        (false, true) => publish_copy_to_store(copy, store),
         (true, true) => {
             if files_match(store, copy).unwrap_or(false) {
                 return Ok(());
@@ -14501,7 +15052,7 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> 
                 },
             };
             if copy_wins {
-                copy_file(copy, store)
+                publish_copy_to_store(copy, store)
             } else {
                 copy_file(store, copy)
             }
@@ -14524,7 +15075,7 @@ fn last_refresh_ms_of(path: &Path) -> Option<i64> {
 /// reader and unknown keys stay tolerated.
 #[derive(Default, serde::Deserialize)]
 struct CodexProfileOpts {
-    /// Link the operator codex home's `hooks.json` into shared session homes.
+    /// Link the operator codex home's `hooks.json` into shared session homes and keep the inline hooks of their copied configs, carrying the operator's trust for both.
     #[serde(default)]
     hooks_json: bool,
 }
@@ -14539,9 +15090,22 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
     }
 }
 
-/// Build one codex session home. Additive over an existing tree, like the
-/// claude build: a link already in place is left alone, so a rebuild over a
-/// live shared tree cannot yank entries out from under a sibling.
+/// The names in `dir` codex reads as a config: `config.toml` and each `<name>.config.toml` profile layer.
+/// An unreadable `dir` lists none.
+fn codex_config_names(dir: &Path) -> impl Iterator<Item = String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name == "config.toml" || name.ends_with(".config.toml")).then_some(name)
+        })
+}
+
+/// Build one codex session home.
+/// Links are additive over an existing tree, like the claude build: a link already in place is left alone, so a rebuild over a live shared tree cannot yank entries out from under a sibling.
+/// The derived copies are the exception: `config.toml`, each layer and the fake transport's `hooks.json` copy are rewritten from the operator's current files on every build, because a home can outlive the build that made it (the fake transport's bare stems, a per-session home under a recycled sid) and which hooks it runs must follow the profile's current opt-in.
 ///
 /// The table (from the codex plan):
 /// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
@@ -14552,9 +15116,8 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   already documents, sharpened by codex's single-use refresh chain: the
 ///   copy is a second carrier whose refreshes strand the store, and a
 ///   fake-mode host accepts that or does not run codex sessions.
-/// - `config.toml` — a COPY of the operator's (codex writes it in place, so a
-///   link would mutate the operator's own file). Absent operator config copies
-///   nothing.
+/// - `config.toml` and each layer — a COPY of the operator's (codex writes it in place, so a link would mutate the operator's own file), its inline hooks kept and their trust carried only where `hooks.json` links in.
+///   Absent operator config copies nothing, and a copy whose operator file is gone is stripped in place with the trust carried for this home.
 /// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
 ///   links (fake: copies); isolated links nothing from the operator.
 /// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
@@ -14567,7 +15130,24 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   `create_dir_all` cannot pass a dangling dir link). Isolated: a real
 ///   per-session `sessions/`, discarded by design. Fake: the home IS the
 ///   global store.
-fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
+/// - `.credentials.json` and `mcp-oauth-locks` — shared flavor under real
+///   symlinks, with `sync_mcp_logins` on: see [`share_codex_mcp_oauth`].
+///
+/// `opts` are the profile's codex knobs as the caller read them, and
+/// `sync_mcp_logins` the global toggle as it read it, so the teardown acts on
+/// the same decision. Returns, when the home shares the operator's MCP OAuth
+/// logins, the record of the `.credentials.json` the home held when this build
+/// ended, read from the home's own path after the share attempt, whatever that
+/// attempt did (linked the operator's file, found a file already there, placed
+/// nothing, or failed): the one input of [`carry_codex_mcp_oauth_back`].
+fn build_codex_home_with(
+    home: &Path,
+    name: &str,
+    isolation: Isolation,
+    mode: LinkMode,
+    opts: &CodexProfileOpts,
+    sync_mcp_logins: bool,
+) -> Result<Option<McpOauthAtBuild>> {
     let operator = operator_codex_home()?;
     let global = codex_global_home(name)?;
     let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
@@ -14598,27 +15178,54 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
     }
 
-    let operator_config = operator.join("config.toml");
-    if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
-        copy_codex_config(&operator_config, &home.join("config.toml"))?;
+    let link_hooks = isolation == Isolation::Shared && opts.hooks_json;
+    let (operator_hooks, session_hooks) = (operator.join("hooks.json"), home.join("hooks.json"));
+    let session_homes = codex_home_spellings(home)?;
+
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the base config, and CODEX_HOME is this session home, so without the layers the flag resolves to an empty layer and silently runs the base config.
+    // They are sanitized like the base file: a layer can spell the same escapes, and declare hooks of its own.
+    let operator_configs: BTreeSet<String> = codex_config_names(&operator)
+        .filter(|file| operator.join(file).exists())
+        .collect();
+    let trust = if link_hooks {
+        Some(HookTrust {
+            operator: codex_home_spellings(&operator)?,
+            session: session_homes[0].clone(),
+            sources: std::iter::once("hooks.json".to_owned())
+                .chain(operator_configs.iter().cloned())
+                .collect(),
+        })
+    } else {
+        None
+    };
+    let inline = trust
+        .as_ref()
+        .map_or(InlineHooks::Strip(&[]), InlineHooks::Carry);
+    for file in &operator_configs {
+        copy_codex_config(&operator.join(file), &home.join(file), inline)?;
     }
-    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
-    // base config, and CODEX_HOME is this session home — so without these the
-    // flag resolves to an empty layer and silently runs the base config. They
-    // are sanitized like the base file: a layer can spell the same escapes.
-    if let Ok(entries) = std::fs::read_dir(&operator) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if !name.ends_with(".config.toml") {
-                continue;
-            }
-            let dst = home.join(name);
-            if dst.symlink_metadata().is_err() {
-                copy_codex_config(&entry.path(), &dst)?;
-            }
+    // A copy whose operator file is gone derives from no declaration at all, so it keeps no inline hook and no trust carried for this home.
+    // Stripped in place rather than removed: codex may have created it itself.
+    for file in codex_config_names(home).filter(|file| !operator_configs.contains(file)) {
+        let dst = home.join(&file);
+        if dst.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
+            copy_codex_config(&dst, &dst, InlineHooks::Strip(&session_homes))?;
+        }
+    }
+
+    // Under Fake the home's `hooks.json` is clauth's copy, derived like the configs: rewritten from the operator's current file while the opt-in holds, removed once it does not.
+    if mode == LinkMode::Fake {
+        if link_hooks && operator_hooks.is_file() {
+            let bytes = std::fs::read(&operator_hooks)
+                .with_context(|| format!("failed to read {}", operator_hooks.display()))?;
+            crate::profile::atomic_write_600(&session_hooks, bytes)
+                .with_context(|| format!("failed to write {}", session_hooks.display()))?;
+        } else if session_hooks
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_file())
+        {
+            std::fs::remove_file(&session_hooks)
+                .with_context(|| format!("failed to remove {}", session_hooks.display()))?;
         }
     }
 
@@ -14626,8 +15233,8 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         for entry in CODEX_OPERATOR_ENTRIES {
             place(&operator.join(entry), &home.join(entry))?;
         }
-        if codex_profile_opts(name).hooks_json {
-            place(&operator.join("hooks.json"), &home.join("hooks.json"))?;
+        if link_hooks && mode == LinkMode::Real {
+            place(&operator_hooks, &session_hooks)?;
         }
         if mode == LinkMode::Real {
             crate::profile::mkdir_700(&global)
@@ -14650,16 +15257,221 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
         }
     }
 
+    // Sharing is best-effort: a server that cannot see the logins only loses
+    // its tools, never the session. The record is read whatever the share did,
+    // so no path through it can leave the teardown without one; one that cannot
+    // be read leaves none, and the teardown carries nothing.
+    let mcp_oauth_at_build =
+        if isolation == Isolation::Shared && mode == LinkMode::Real && sync_mcp_logins {
+            if let Err(e) = share_codex_mcp_oauth(&operator, home) {
+                logline!("clauth: sharing codex MCP OAuth logins failed: {e:#}");
+            }
+            #[cfg(test)]
+            run_mcp_oauth_record_hook();
+            McpOauthAtBuild::read(home)
+                .inspect_err(|e| {
+                    logline!("clauth: sharing codex MCP OAuth logins failed: {e:#}");
+                })
+                .ok()
+        } else {
+            None
+        };
+
     let sessions = home.join("sessions");
     if sessions.symlink_metadata().is_err() {
         crate::profile::mkdir_700(&sessions)
             .with_context(|| format!("failed to create {}", sessions.display()))?;
     }
+    Ok(mcp_oauth_at_build)
+}
+
+/// Codex's MCP OAuth file store (`rmcp-client/src/oauth.rs`), used when no OS
+/// keyring answers, and its aggregate-store lock dir (`oauth/store_lock.rs`).
+const CODEX_MCP_OAUTH_FILE: &str = ".credentials.json";
+const CODEX_MCP_OAUTH_LOCKS: &str = "mcp-oauth-locks";
+
+/// While `sync_mcp_logins` is on (the default, the toggle that shares Claude
+/// Code's MCP logins too), a shared session sees the operator's MCP OAuth
+/// logins (`codex mcp login <server>`), which live in the operator codex home's
+/// `.credentials.json` when no OS keyring answers. Without them every OAuth
+/// server answers AuthRequired and codex starts the session without its tools.
+/// Those are bearer credentials for every server the operator signed in to:
+/// every profile's shared sessions can read and use them while the toggle is on.
+///
+/// The file is a HARD link, not a symlink: codex opens it for writing with
+/// `O_NOFOLLOW`, so a symlink would fail every refresh, and its write truncates
+/// in place, so one inode keeps a rotated refresh token visible to the operator
+/// and to every sibling session. A hard link cannot cross filesystems: with the
+/// two homes on different ones the link fails, the caller logs it, and the
+/// session runs without the logins. This decides only what to place; what the
+/// teardown may carry back is the build's record, read after this returns.
+///
+/// Limits: removing a server's login inside a session when it is the store's
+/// last login deletes the file, which unlinks only that home's name, so the
+/// login comes back in the next session. With two or more logins codex rewrites
+/// the shared file in place, so that logout reaches the operator home and every
+/// session. And when the operator has no file yet, only one session's first
+/// login is kept: see [`carry_codex_mcp_oauth_back`].
+fn share_codex_mcp_oauth(operator: &Path, home: &Path) -> Result<()> {
+    if !operator.is_dir() {
+        return Ok(());
+    }
+    // Created even before the first login. codex creates its lock dir on
+    // demand (`rmcp-client/src/oauth/store_lock.rs`), but the session's lock
+    // path is the link below, and it must reach the operator's dir so the
+    // operator and every session serialize on one lock, not one each.
+    let locks = operator.join(CODEX_MCP_OAUTH_LOCKS);
+    crate::profile::mkdir_700(&locks)
+        .with_context(|| format!("failed to create {}", locks.display()))?;
+    let locks_dst = home.join(CODEX_MCP_OAUTH_LOCKS);
+    if locks_dst.symlink_metadata().is_err() {
+        link_entry(&locks, &locks_dst)?;
+    }
+    let src = operator.join(CODEX_MCP_OAUTH_FILE);
+    let dst = home.join(CODEX_MCP_OAUTH_FILE);
+    if src.is_file() && dst.symlink_metadata().is_err() {
+        std::fs::hard_link(&src, &dst).with_context(|| {
+            format!("failed to hard-link {} -> {}", dst.display(), src.display())
+        })?;
+    }
     Ok(())
 }
 
+/// What a file is on disk, to tell the file a session home held at build from
+/// one written since: (dev, ino) on unix, the birth time elsewhere.
+#[cfg(unix)]
+type FileIdent = (u64, u64);
+#[cfg(not(unix))]
+type FileIdent = Option<std::time::SystemTime>;
+
+#[cfg(unix)]
+fn file_ident(meta: &std::fs::Metadata) -> FileIdent {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_ident(meta: &std::fs::Metadata) -> FileIdent {
+    meta.created().ok()
+}
+
+/// The `.credentials.json` a shared session home held when its build ended,
+/// whatever the share did: read from the home's own path, so a logout landing
+/// in the operator's home after the link was placed still finds the link here.
+/// `None` when the home held none, so any file there at teardown is the
+/// session's own login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McpOauthAtBuild(Option<FileIdent>);
+
+impl McpOauthAtBuild {
+    fn read(home: &Path) -> Result<Self> {
+        let path = home.join(CODEX_MCP_OAUTH_FILE);
+        match path.symlink_metadata() {
+            Ok(meta) => Ok(Self(Some(file_ident(&meta)))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            Err(e) => Err(e).with_context(|| format!("failed to stat {}", path.display())),
+        }
+    }
+
+    /// Whether `meta` is the file this record names.
+    fn names(self, meta: &std::fs::Metadata) -> bool {
+        self.0 == Some(file_ident(meta))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MCP_OAUTH_RECORD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam for [`build_codex_home_with`]'s record: a hook run once between
+/// the share attempt and the record, posing a logout in the operator's home
+/// landing in that window. Test-only.
+// Its one caller is a unix-only test; on other targets the test build would flag it as dead code.
+#[cfg(all(test, unix))]
+struct McpOauthRecordHook;
+
+#[cfg(all(test, unix))]
+impl McpOauthRecordHook {
+    fn arm(hook: impl FnMut() + 'static) -> Self {
+        MCP_OAUTH_RECORD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for McpOauthRecordHook {
+    fn drop(&mut self) {
+        MCP_OAUTH_RECORD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_mcp_oauth_record_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&MCP_OAUTH_RECORD_HOOK) {
+        hook();
+    }
+}
+
+/// The teardown half of [`share_codex_mcp_oauth`]: a file the session wrote
+/// into its home after the build, its first MCP login, reaches the operator as
+/// one more hard link before the home is removed, the operator home created
+/// owner-only when it is missing. Only such a file is carried: one `at_build`
+/// names, the file the home held when its build ended whatever the share did
+/// (the operator's own link, or a dead session's leftover), stays where it is,
+/// so a logout made in the operator's home is never undone.
+/// A carried file that is not the operator's while the operator has one of its
+/// own is left alone and logged: neither side is provably newer, and the
+/// operator's stays. So when two sessions both make a first login before either
+/// ends, the first teardown's file becomes the operator's and the second's is
+/// logged and dropped with its home.
+fn carry_codex_mcp_oauth_back(
+    operator: &Path,
+    home: &Path,
+    at_build: McpOauthAtBuild,
+) -> Result<()> {
+    let session = home.join(CODEX_MCP_OAUTH_FILE);
+    let meta = match session.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", session.display())),
+    };
+    if !meta.is_file() || at_build.names(&meta) {
+        return Ok(());
+    }
+    let target = operator.join(CODEX_MCP_OAUTH_FILE);
+    match target.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::profile::mkdir_700(operator)
+                .with_context(|| format!("failed to create {}", operator.display()))?;
+            std::fs::hard_link(&session, &target).with_context(|| {
+                format!(
+                    "failed to hard-link {} -> {}",
+                    target.display(),
+                    session.display()
+                )
+            })
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to stat {}", target.display())),
+        Ok(op_meta) => {
+            #[cfg(unix)]
+            if file_ident(&op_meta) != file_ident(&meta) {
+                logline!(
+                    "clauth: kept {}, this session's copy differs",
+                    target.display()
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = op_meta;
+            Ok(())
+        }
+    }
+}
+
 /// Live codex session guard — the codex [`ProfileRuntime`]. On drop: converges
-/// a fake-mode auth copy back to the store, carries a durable store codex
+/// a fake-mode auth copy back to the store, carries a first MCP OAuth login the
+/// session made to the operator home, carries a durable store codex
 /// healed in place back into the profile-global home, drops the registry row
 /// and marker, and removes the per-session home (its rollout roots are links,
 /// so the rollouts stay in the store); the bare `codex-home` (the durable
@@ -14672,6 +15484,13 @@ pub(crate) struct CodexRuntime {
     profile: String,
     isolation: Isolation,
     mode: LinkMode,
+    /// The `.credentials.json` this home held when its build ended, whatever
+    /// the share did; `None` when the home does not share the operator's MCP
+    /// OAuth logins (`sync_mcp_logins` off at acquire, an isolated or fake
+    /// home) or the record could not be read. The teardown carries back only a
+    /// file this record does not name, and nothing without one, whatever the
+    /// toggle says by then.
+    mcp_oauth_at_build: Option<McpOauthAtBuild>,
     _pid_lock: File,
 }
 
@@ -14685,8 +15504,11 @@ impl CodexRuntime {
         // (phase 4) can decide against this profile, or the rotation gate
         // reads the account as idle while a session is mid-start on it.
         let _rotation_guard = RotationGuard::acquire(&owned)?;
+        // Read once, before the state flock: a plain file read, and the
+        // teardown acts on this value whatever the toggle says by then.
+        let sync_mcp_logins = crate::claude::sync_mcp_logins();
 
-        let (session, home, sessions, pid_file, pid_lock, mode) = with_state_lock(|_held| {
+        let (session, home, sessions, pid_file, pid_lock, mode, rec) = with_state_lock(|_held| {
             crate::profile::mkdir_700(&profile_root)
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
@@ -14740,7 +15562,7 @@ impl CodexRuntime {
             // per-session and was wiped. That home holds a physical auth.json
             // COPY, and a session that died before Drop could converge leaves
             // the rotated chain nowhere else — the wipe destroyed it, and
-            // `build_codex_home` then converged the SPENT store token back out
+            // `build_codex_home_with` then converged the SPENT store token back out
             // for codex to replay into `refresh_token_reused`. The predicate
             // that already answers this correctly demands a session id, so
             // both bare stems keep the state that must outlive a session.
@@ -14756,7 +15578,14 @@ impl CodexRuntime {
             }
             crate::profile::mkdir_700(&home)
                 .with_context(|| format!("failed to create {}", home.display()))?;
-            build_codex_home(&home, name, isolation, mode)?;
+            let rec = build_codex_home_with(
+                &home,
+                name,
+                isolation,
+                mode,
+                &codex_profile_opts(name),
+                sync_mcp_logins,
+            )?;
 
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
@@ -14783,7 +15612,7 @@ impl CodexRuntime {
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live codex session failed: {e}");
             }
-            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode))
+            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode, rec))
         })?;
 
         Ok(Self {
@@ -14794,6 +15623,7 @@ impl CodexRuntime {
             profile: name.to_string(),
             isolation,
             mode,
+            mcp_oauth_at_build: rec,
             _pid_lock: pid_lock,
         })
     }
@@ -14820,6 +15650,14 @@ impl Drop for CodexRuntime {
             )
         {
             logline!("clauth: codex auth converge at teardown failed: {e:#}");
+        }
+        // The operator home resolves as the build resolved it, so a first login
+        // reaches the codex the operator runs, never a `~/.codex` it does not.
+        if let Some(at_build) = self.mcp_oauth_at_build
+            && let Err(e) = operator_codex_home()
+                .and_then(|operator| carry_codex_mcp_oauth_back(&operator, &self.home, at_build))
+        {
+            logline!("clauth: carrying codex MCP OAuth logins at teardown failed: {e:#}");
         }
         // Carry a durable store codex healed in place back into the
         // profile-global home — best-effort, never failing a completed

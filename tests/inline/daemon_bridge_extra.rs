@@ -2,7 +2,8 @@
 
 //! The bridge's route-side pins beyond the socket and hub core: the herdr
 //! fallback's exact argv and its none/ambiguous refusals, the listing's
-//! `via`/`lacks`, and a bind failure leaving the daemon serving with no bridge.
+//! `via`/`lacks`/`caps`, and a bind failure leaving the daemon serving with no
+//! bridge.
 
 #![cfg(unix)]
 
@@ -192,8 +193,8 @@ fn the_herdr_fallback_refuses_none_and_ambiguous() {
     }
 }
 
-/// The listing's `via`/`lacks`: a mod-live session, a pane-joined session, and
-/// one with neither reach.
+/// The listing's `via`/`lacks`/`caps`: a mod-live session, a pane-joined
+/// session, and one with neither reach.
 #[test]
 fn the_listing_flags_mod_and_herdr_reach() {
     let sb = HomeSandbox::new();
@@ -215,8 +216,7 @@ fn the_listing_flags_mod_and_herdr_reach() {
         (200, instance("s-both", "2")),
     ]);
     let hub = Hub::new(true, resolver);
-    let start =
-        json!({"session": "s-mod", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
+    let start = json!({"session": "s-mod", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "caps": ["notes"]});
     assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
     let start_both =
         json!({"session": "s-both", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
@@ -256,6 +256,80 @@ fn the_listing_flags_mod_and_herdr_reach() {
     assert_eq!(row("s-none")["lacks"], json!([]));
     assert_eq!(row("s-both")["via"], json!(["herdr", "mod"]));
     assert_eq!(row("s-both")["lacks"], json!([]));
+
+    // `caps` names what the session's live mod declared: none for an older
+    // mod, and none without a live mod at all.
+    assert_eq!(row("s-mod")["caps"], json!(["notes"]));
+    assert_eq!(row("s-both")["caps"], json!([]));
+    assert_eq!(row("s-pane")["caps"], json!([]));
+    assert_eq!(row("s-none")["caps"], json!([]));
+}
+
+/// Two live mod instances on one session id (SB-4) list a capability only
+/// when both declare it, whichever declared last: a note could reach either
+/// one. An instance whose `end` already owns its final read takes no more
+/// answers, so it no longer counts, while the session stays listed by the mod.
+#[test]
+fn two_instances_on_one_id_list_only_the_caps_both_declare() {
+    let sb = HomeSandbox::new();
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let path = sb.home().join(".claude/projects/-w/s-one.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "{\"sessionId\":\"s-one\",\"cwd\":\"/w\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}",
+    )
+    .unwrap();
+
+    let (_t, resolver) = table(&[(100, instance("s-one", "1")), (200, instance("s-one", "2"))]);
+    let hub = Hub::new(true, resolver);
+    let older =
+        json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
+    assert_eq!(hub.event(200, older.to_string().as_bytes()).0, 200);
+    let capable = json!({"session": "s-one", "seq": 1, "kind": "start", "cwd": "/w", "interactive": true, "caps": ["notes"]});
+    assert_eq!(hub.event(100, capable.to_string().as_bytes()).0, 200);
+
+    let no_panes: PaneProbe = Box::new(|_, _| HerdrProbeOut::NotInstalled);
+    let ctx =
+        ApiContext::for_tests_with_bridge(config(), status_path(), no_panes, Arc::clone(&hub));
+    let caps = |ctx: &ApiContext| {
+        let resp = call(ctx, &req("GET", "/api/v1/sessions", Some(TOKEN), ""));
+        assert_eq!(resp.status, 200);
+        body_json(&resp)["sessions"][0]["caps"].clone()
+    };
+    assert_eq!(caps(&ctx), json!([]), "one instance lacks notes");
+
+    let reloaded = json!({"session": "s-one", "seq": 2, "kind": "start", "cwd": "/w", "interactive": true, "caps": ["notes"]});
+    assert_eq!(hub.event(200, reloaded.to_string().as_bytes()).0, 200);
+    assert_eq!(caps(&ctx), json!(["notes"]), "both declare notes");
+
+    let downgraded =
+        json!({"session": "s-one", "seq": 3, "kind": "start", "cwd": "/w", "interactive": true});
+    assert_eq!(hub.event(200, downgraded.to_string().as_bytes()).0, 200);
+    assert_eq!(
+        caps(&ctx),
+        json!([]),
+        "a reload onto an older mod lacks notes"
+    );
+    hub.inner
+        .lock()
+        .unwrap()
+        .instances
+        .get_mut(&200)
+        .expect("the older instance")
+        .ending = true;
+    let resp = call(&ctx, &req("GET", "/api/v1/sessions", Some(TOKEN), ""));
+    let row = body_json(&resp)["sessions"][0].clone();
+    assert_eq!(
+        row["caps"],
+        json!(["notes"]),
+        "an ending instance no longer counts"
+    );
+    assert_eq!(
+        row["via"],
+        json!(["mod"]),
+        "the session stays listed by the mod"
+    );
 }
 
 /// A bind failure (a live squatter on the path) leaves `start()` returning no

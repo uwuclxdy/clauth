@@ -113,10 +113,9 @@ fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     assert!(!snap.exists(), "the sidecar moved too");
 }
 
-/// `run`'s rescue leg cannot be driven without a real `claude` child, which this
-/// crate never fakes, so it is pinned over the source: the teardown tests own
-/// whether the move works, and this owns what stands between the stamp leg and
-/// the end of the teardown region.
+/// `run`'s rescue leg is pinned over the source: the teardown tests own whether
+/// the move works, and this owns what stands between the stamp leg and the end
+/// of the teardown region.
 ///
 /// An EQUALITY rather than a `contains`, because a needle that only looks for the
 /// condition is blind to every spelling that leaves the condition's own bytes
@@ -1001,7 +1000,7 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
     std::fs::create_dir_all(&session_home).expect("mkdir home");
     // The operator's own setting, faithfully copied into the session home by
-    // `build_codex_home` — codex would resolve its DBs there, not here.
+    // `build_codex_home_with` — codex would resolve its DBs there, not here.
     std::fs::write(
         session_home.join("config.toml"),
         b"sqlite_home = \"/tmp/one-shared-dir\"\n",
@@ -3516,7 +3515,7 @@ fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
     let tree = background_tree(&shim);
     // A live process with the right config dir and the recorded (real) start,
     // but argv that is NOT `daemon run`.
-    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let mut foreign = crate::testutil::spawn_parked(&tree, None, &["not", "a", "supervisor"]);
     let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
     crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
     for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {

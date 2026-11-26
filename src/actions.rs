@@ -384,14 +384,28 @@ pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Resul
 /// install a stored login no gate vouched for.
 ///
 /// The no-op switch (already active) republishes nothing: the feed on disk
-/// already names this account. Returns whether the active account moved, or
-/// the live slot moved onto it ([`relink_login_saved_elsewhere`]).
+/// already names this account. Returns the switch's outcome
+/// ([`SwitchOutcome`]): whether the active account moved, or the live slot
+/// moved onto it ([`relink_login_saved_elsewhere`]), and the account
+/// `profiles.toml` named active under the switch's own hold.
 pub(crate) fn switch_profile_gated(
     config: &ConfigHandle,
     name: &ProfileName,
     gated: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     switch_profile_synced_gated(config, name, gated, || {})
+}
+
+/// What a switch did to the global account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchOutcome {
+    /// The active account moved, or the live slot moved onto the already-active
+    /// target ([`relink_login_saved_elsewhere`]).
+    pub(crate) changed: bool,
+    /// The account `profiles.toml` named active under the switch's own state
+    /// hold: the one the switch moved off. `None` when it named none; the
+    /// target's own name when it already named the target (no move).
+    pub(crate) left: Option<ProfileName>,
 }
 
 /// Test-only: [`switch_profile_synced_gated`] with `gated: true`.
@@ -401,7 +415,7 @@ fn switch_profile_synced(
     name: &ProfileName,
     before_commit: impl FnOnce(),
 ) -> Result<bool> {
-    switch_profile_synced_gated(config, name, true, before_commit)
+    switch_profile_synced_gated(config, name, true, before_commit).map(|outcome| outcome.changed)
 }
 
 /// The injected closure runs after the switch has persisted and released both
@@ -414,19 +428,19 @@ fn switch_profile_synced_gated(
     name: &ProfileName,
     gated: bool,
     before_commit: impl FnOnce(),
-) -> Result<bool> {
-    #[allow(
+) -> Result<SwitchOutcome> {
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = switch_profile_locked_with(&mut guard, name, gated, true)?;
+    let outcome = switch_profile_locked_with(&mut guard, name, gated, true)?;
     drop(guard);
-    strip_stale_identity_after_switch(changed);
-    if changed {
+    strip_stale_identity_after_switch(outcome.changed);
+    if outcome.changed {
         crate::daemon::publish_status_with(config, before_commit);
     }
-    Ok(changed)
+    Ok(outcome)
 }
 
 /// issue #17: after a switch that moved the active profile (or switched off),
@@ -446,25 +460,27 @@ fn strip_stale_identity_after_switch(changed: bool) {
 /// Test-only: [`switch_profile_locked_gated`] with `gated: true`.
 #[cfg(test)]
 pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
-    switch_profile_locked_gated(config, name, true)
+    switch_profile_locked_gated(config, name, true).map(|outcome| outcome.changed)
 }
 
 /// [`switch_profile_gated`]'s locked body: the caller holds the config guard and
-/// receives the did-the-active-move answer so it can gate its own republish.
-/// Guard acquired before the flock — see the wrapper. `gated` names whether
-/// the caller ran the AUTH-1 gate: under the hold a `gated: false` switch that
-/// would install `name`'s STORED login (the relink fires, or the target is no
-/// longer active on disk) changes nothing and returns [`GateNeeded`]; the
-/// entry points then run the gate and retry once with `gated: true`. The
-/// daemon's tick drain and `fallback::auto_switch_if_needed` are the
-/// cross-module callers: each takes the guard first and holds it across this
-/// fn's flock (the fallback so its decision and dispatch share one state
-/// hold), keeping the config guard outer, the ranked order.
+/// receives the switch's outcome ([`SwitchOutcome`]: did the active move, and
+/// the account the hold found active) so it can gate its own republish and
+/// name the account it left. Guard acquired before the flock — see the
+/// wrapper. `gated` names whether the caller ran the AUTH-1 gate: under the
+/// hold a `gated: false` switch that would install `name`'s STORED login (the
+/// relink fires, or the target is no longer active on disk) changes nothing
+/// and returns [`GateNeeded`]; the entry points then run the gate and retry
+/// once with `gated: true`. The daemon's tick drain and
+/// `fallback::auto_switch_if_needed` are the cross-module callers: each takes
+/// the guard first and holds it across this fn's flock (the fallback so its
+/// decision and dispatch share one state hold), keeping the config guard
+/// outer, the ranked order.
 pub(crate) fn switch_profile_locked_gated(
     config: &mut AppConfig,
     name: &ProfileName,
     gated: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     switch_profile_locked_with(config, name, gated, false)
 }
 
@@ -477,18 +493,21 @@ fn switch_profile_locked_with(
     name: &ProfileName,
     gated: bool,
     manual: bool,
-) -> Result<bool> {
+) -> Result<SwitchOutcome> {
     with_state_lock(|held| {
         let target = ensure_switch_target_ok(config, name, held)?;
-        let outgoing = mirror_active_on_disk(config, held)?;
+        let left = mirror_active_on_disk(config, held)?;
         if already_active(config, name, held)? {
             if !gated && crate::claude::live_login_saved_elsewhere(name) {
                 bail!(GateNeeded);
             }
-            return relink_login_saved_elsewhere(name);
+            return Ok(SwitchOutcome {
+                changed: relink_login_saved_elsewhere(name)?,
+                left,
+            });
         }
         if manual {
-            refuse_switch_off_unclassifiable(outgoing.as_ref(), name)?;
+            refuse_switch_off_unclassifiable(left.as_ref(), name)?;
         }
         if !gated {
             bail!(GateNeeded);
@@ -526,7 +545,10 @@ fn switch_profile_locked_with(
             engine.force_install_credentials(name)?;
         }
         finish_switch(config, target, held)?;
-        Ok(true)
+        Ok(SwitchOutcome {
+            changed: true,
+            left,
+        })
     })
 }
 
@@ -1284,8 +1306,8 @@ pub(crate) fn switch_profile_cli(
         None => {
             let switch = |gated: bool| switch_profile_gated(&config, canonical, gated);
             match switch(gated) {
-                Ok(changed) => {
-                    if changed {
+                Ok(outcome) => {
+                    if outcome.changed {
                         Reconciled::Switched
                     } else {
                         Reconciled::AlreadyActive
@@ -1293,7 +1315,7 @@ pub(crate) fn switch_profile_cli(
                 }
                 Err(e) if !gated && e.downcast_ref::<GateNeeded>().is_some() => {
                     run_gate(&config)?;
-                    if switch(true)? {
+                    if switch(true)?.changed {
                         Reconciled::Switched
                     } else {
                         Reconciled::AlreadyActive
@@ -1633,34 +1655,41 @@ pub(crate) fn switch_profile_noninteractive(
 /// the stored identity), so a fresh `/login` is dropped: the TUI gates that on
 /// the divergence prompt, while the automatic wrap-off leg accepts the drop,
 /// unattended by design. A first login over an unclassifiable account is no
-/// such drop: the switch-off holds ([`switch_off_locked`]).
-pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
-    #[allow(
+/// such drop: the switch-off holds ([`switch_off_locked`]). Returns the
+/// account `profiles.toml` named active under its hold — the one the
+/// switch-off departed — or `None` when it named none (nothing switched off).
+pub(crate) fn switch_off(config: &ConfigHandle) -> Result<Option<ProfileName>> {
+    #[expect(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = switch_off_locked(&mut guard)?;
+    // The departed account comes back from the hold that cleared the marker, so
+    // it is the one the switch-off left, never the caller's older copy and
+    // never a second read of disk.
+    let departed = switch_off_locked(&mut guard)?;
+    let changed = departed.is_some();
     drop(guard);
     strip_stale_identity_after_switch(changed);
     if changed {
         crate::daemon::publish_status(config);
     }
-    Ok(())
+    Ok(departed)
 }
 
 /// [`switch_off`]'s locked body: the caller holds the config guard (ranked
-/// outer of the state flock) and receives the did-anything-change answer so
-/// it can gate its own republish. An unclassifiable active account holding a
-/// first login refuses with [`SwitchOffHeld`], changing nothing.
-pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
+/// outer of the state flock) and receives the account the switch-off departed,
+/// so it can gate its own republish and name the account it left. An
+/// unclassifiable active account holding a first login refuses with
+/// [`SwitchOffHeld`], changing nothing.
+pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<ProfileName>> {
     with_state_lock(|held| {
         // Off already in the caller's copy AND on disk: memory alone misses a
         // peer's switch onto an account, and the snapshot below captures into
         // the account disk names. The mirror makes memory equal disk, so one
         // `None` answers both.
         let Some(departed) = mirror_active_on_disk(config, held)? else {
-            return Ok(false);
+            return Ok(None);
         };
         // The snapshot would skip this login and the clear would delete the
         // only copy of it, so usage goes on until the config is fixed.
@@ -1702,7 +1731,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
                  {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
             );
         }
-        Ok(true)
+        Ok(Some(departed))
     })
 }
 
@@ -1795,6 +1824,7 @@ fn finish_switch(config: &mut AppConfig, target: Profile, held: &StateLockHeld) 
         profile.env = target.env;
         profile.models = target.models;
         profile.effort = target.effort;
+        profile.model_effort = target.model_effort;
     }
     Ok(())
 }
@@ -2010,11 +2040,19 @@ pub(crate) fn edit_profile_model(
     })
 }
 
-/// Persist a profile's effort: `edit` changes what disk holds now, so the
-/// fields the caller does not touch keep a peer's edit to them. Re-applies to
-/// the live `~/.claude/settings.json` when the profile is active, so a running
-/// `claude` picks the new effort up on its next settings read. Mirrors
-/// [`edit_profile_model`].
+/// Persist a profile's effort against the current config on disk. For the
+/// active profile, update the live carrier so running Claude sessions see the
+/// selected model's new level on their next settings read.
+///
+/// The slot `edit` sees is the Setup row's ([`crate::model_effort::row_level`]):
+/// while the `model` row names one model, the value
+/// [`crate::model_effort::selected_effort`] reports for it. An edit writes the
+/// report's `entry` and clears the account's `effort`, which was either that
+/// model's level already or a value the per-model edit replaces; a clear
+/// removes the `entry` and the `effort`, except that while the row showed a
+/// carrier value (the account's `effort` or an `[env]` entry) it removes that
+/// `effort` alone, leaving the entry it overrode and the `[env]` entry in
+/// place. Otherwise the slot is the account-wide `effort`.
 pub(crate) fn edit_profile_effort(
     config: &mut AppConfig,
     name: &ProfileName,
@@ -2023,17 +2061,36 @@ pub(crate) fn edit_profile_effort(
     with_state_lock(|held| {
         let active = active_on_disk(name, held)?;
         let (fresh, ()) = update_profile_config(name, |fresh| {
-            edit(&mut fresh.effort);
+            match crate::model_effort::selected_effort(fresh) {
+                Some(selected) => {
+                    let mut slot = selected.shown;
+                    edit(&mut slot);
+                    match slot {
+                        Some(level) => {
+                            fresh.model_effort.insert(selected.entry, level);
+                            fresh.effort = None;
+                        }
+                        None if selected.account_wide => fresh.effort = None,
+                        None => {
+                            fresh.model_effort.remove(&selected.entry);
+                            fresh.effort = None;
+                        }
+                    }
+                }
+                None => edit(&mut fresh.effort),
+            }
             Ok(())
         })?
         .with_context(|| format!("profile '{name}' not found"))?;
         if let Some(profile) = config.find_mut(name) {
             profile.effort = fresh.effort.clone();
+            profile.model_effort = fresh.model_effort.clone();
         }
 
         if active {
             let prev_env_keys: Vec<String> = fresh.env.keys().cloned().collect();
             apply_profile_to_claude_settings(&fresh, &prev_env_keys)?;
+            crate::runtime::update_live_effort(&fresh);
         }
         Ok(())
     })
@@ -4502,6 +4559,7 @@ pub(crate) fn duplicate_profile(
         profile.models = src.models.clone();
         profile.model_picker = src.model_picker.clone();
         profile.effort = src.effort.clone();
+        profile.model_effort = src.model_effort.clone();
         profile.fallback_threshold = src.fallback_threshold;
         profile.weekly_threshold = src.weekly_threshold;
         profile.max_auto_spend = src.max_auto_spend;
@@ -5395,8 +5453,9 @@ fn rollback_first_account_create(
 /// each half's fetch caches are dropped only when that half's stored identity
 /// actually changed (a proven same-account re-login forgets nothing), never
 /// unconditionally. The `/profile` TTL clock describes the old account too, so
-/// it is expired only when the OAuth half changed — a proven same-account
-/// re-login keeps the stamp and its memo — otherwise the swapped-in account's
+/// it is expired when the OAuth half changed — a proven same-account re-login
+/// keeps the stamp and its memo unless its probe corrected a disagreeing
+/// cached plan, which expires it too — otherwise the swapped-in account's
 /// tier stays unfetched (and, with `usage_cache.json` just dropped, unrendered)
 /// for up to an hour. A snapshot carrying a proven identity (an interactive
 /// login's probe) re-anchors the profile here, on the commit — the confirm-gated
@@ -5426,26 +5485,27 @@ pub(crate) fn overwrite_captured_profile_with(
     snapshot: CaptureSnapshot,
     deactivate: bool,
 ) -> Result<Result<()>> {
-    let oauth_moved =
+    let plan_read_due =
         match overwrite_captured_profile_held(config, name, account, snapshot, deactivate)? {
-            Ok(oauth_moved) => oauth_moved,
+            Ok(plan_read_due) => plan_read_due,
             Err(refusal) => return Ok(Err(refusal)),
         };
     // Outside the hold — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
     // `update_profile` leaves the new credentials on disk under the old account's
-    // stamp. Only when the OAuth half actually changed: a proven same-account
-    // re-login keeps the stamp and its memo.
-    if oauth_moved {
+    // stamp. Only when the OAuth half changed or the login corrected the cached
+    // plan: any other proven same-account re-login keeps the stamp and its memo.
+    if plan_read_due {
         crate::usage::expire_profile_ttl(name);
     }
     Ok(Ok(()))
 }
 
 /// [`overwrite_captured_profile_with`]'s write, for a caller that runs it
-/// inside a state flock hold of its own: answers whether the OAuth half
-/// moved, and the caller expires `name`'s `/profile` clock once its hold
-/// releases (the TTL store ranks below the flock). The inner `Err` is
+/// inside a state flock hold of its own: answers whether `name`'s `/profile`
+/// clock must lapse (the OAuth half moved, or a same-account re-login corrected
+/// the cached plan), and the caller expires it once its hold releases (the TTL
+/// store ranks below the flock). The inner `Err` is
 /// [`refuse_relogin_off_proxy`]'s refusal, or [`CaptureRefused`] for a
 /// `config.toml` that cannot say whether `name` is an account on a proxy; each
 /// wrote nothing. With `deactivate` (a capture out of a divergence), the live
@@ -5470,7 +5530,7 @@ pub(crate) fn overwrite_captured_profile_held(
     // login install: the anchor stays exactly as found. Every other overwrite
     // installs a login that may be a different account.
     let installs_login = !matches!(anchor, AnchorAction::Unchanged);
-    let mut oauth_moved = false;
+    let mut plan_read_due = false;
     let mut refusal = Ok(());
     with_state_lock(|held| {
         refusal = refuse_relogin_off_proxy(name);
@@ -5534,6 +5594,7 @@ pub(crate) fn overwrite_captured_profile_held(
         // only when the forget plan dropped the OAuth half (a same-account
         // re-login forgets nothing and keeps its live windows).
         let mut seed_guard = SeedCleanupGuard::new();
+        let mut plan_corrected = false;
         // The overwrite lands on the profile re-read off disk under this hold:
         // the caller's copy predates the login's waits, and every field this
         // overwrite does not set (a ceiling, a threshold, a disable, the env)
@@ -5608,18 +5669,25 @@ pub(crate) fn overwrite_captured_profile_held(
                 credentials.is_some(),
             );
             forget_disk_plan(name, plan);
-            if plan.oauth
-                && let Some(seed) = seed_plan
-            {
-                crate::usage::seed_plan_cache(
-                    name,
-                    seed,
-                    match &anchor {
-                        AnchorAction::Proven(uuid) => Some(uuid),
-                        _ => None,
-                    },
-                );
-                seed_guard.arm(name);
+            let login_uuid = match &anchor {
+                AnchorAction::Proven(uuid) => Some(uuid),
+                _ => None,
+            };
+            match seed_plan {
+                Some(seed) if plan.oauth => {
+                    crate::usage::seed_plan_cache(name, seed, login_uuid);
+                    seed_guard.arm(name);
+                }
+                // A proven re-login onto the same account keeps its windows, but
+                // its plan can still have changed (a resubscribe). No cleanup
+                // guard: the reading is true of this account whether or not the
+                // install goes on to land, and the guard would drop the windows.
+                Some(seed) => {
+                    if let Some(uuid) = login_uuid {
+                        plan_corrected = crate::usage::correct_cached_plan(name, seed, uuid);
+                    }
+                }
+                None => {}
             }
             #[cfg(test)]
             run_seed_order_hook(name.as_str());
@@ -5651,7 +5719,7 @@ pub(crate) fn overwrite_captured_profile_held(
             Ok(plan)
         })?
         .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
-        oauth_moved = plan.oauth;
+        plan_read_due = plan.oauth || plan_corrected;
         note_forget_plan(name, plan);
         if let Some(profile) = config.find_mut(name) {
             profile.base_url = fresh.base_url.clone();
@@ -5732,7 +5800,7 @@ pub(crate) fn overwrite_captured_profile_held(
         }
         saved
     })?;
-    Ok(refusal.map(|()| oauth_moved))
+    Ok(refusal.map(|()| plan_read_due))
 }
 
 /// Blank a profile's OAuth login: drop its stored credentials and per-account

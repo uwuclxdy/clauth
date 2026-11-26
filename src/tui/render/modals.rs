@@ -17,9 +17,9 @@ use super::super::app::{
     LoginMethod, LoginStage, LossWarningButton, LossWarningState, MainItemKind, Modal,
     NamePromptForm, PageAction, PaneState, PresetApplyButton, PresetApplyForm, PresetPickerForm,
     RebindForm, ScrollStamp, ServicesFocus, SetupSelection, StatusFocus, Tab, TokenPickerForm,
-    TokenView, action_menu_opens, chain_candidates, chain_enter_acts, chain_items,
-    chain_reorder_moves, config_rows, config_step_lands, dash_walks, detail_scrolls, fallback_hint,
-    fallback_row_acts, fallback_row_steps, global_config_row_live, herdr_space_acts,
+    TokenView, TranscriptCleanupForm, action_menu_opens, chain_candidates, chain_enter_acts,
+    chain_items, chain_reorder_moves, config_rows, config_step_lands, dash_walks, detail_scrolls,
+    fallback_hint, fallback_row_acts, fallback_row_steps, global_config_row_live, herdr_space_acts,
     main_reorder_moves, minted_key_row, overview_edit_acts, overview_enter_switches, page_keys_act,
     pane_state, services_fix_keys_act, setup_card_row_count, shunt_esc_folds, token_model_count,
     walk_moves,
@@ -66,6 +66,10 @@ pub(super) fn draw(
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input, toast_rects),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form, toast_rects),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
+        Modal::LimitReset(form) => {
+            draw_limit_reset(frame, area, form, app.tick_count);
+            form.scroll_stamp.set(stamp(area, app));
+        }
         Modal::PresetApply(form) => {
             draw_preset_apply(frame, area, form);
             form.scroll.stamp.set(stamp(area, app));
@@ -97,6 +101,16 @@ pub(super) fn draw(
         Modal::BareItem(form) => draw_bare_item(frame, area, form),
         Modal::BareItemOwner(form) => draw_bare_item_owner(frame, area, form),
         Modal::CaptureOwner(form) => draw_capture_owner(frame, area, form),
+        Modal::TranscriptCleanup(form) => {
+            // What this frame shows, published for the frame loop's record:
+            // the liveness by the clock this draw reads, so a draw that runs
+            // past the window's end is not the frame that shows the keys act.
+            let live = app
+                .transcript_cleanup
+                .buttons_live(app.anim_ms(), app.focus_held);
+            app.transcript_cleanup.set_drawn_live(live);
+            draw_transcript_cleanup(frame, area, form, live);
+        }
     }
 }
 
@@ -1434,6 +1448,58 @@ fn loss_warning_buttons(state: &LossWarningState) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The `TRANSCRIPT CLEANUP` question: what went missing, the number clauth
+/// put back, and what letting it go costs, over `keep <n>` (the default) and
+/// the destructive `remove it`. Its body never scrolls, the loss warning's
+/// shape. Until a drawn frame has shown this answer for half a second, with
+/// the queue seen empty past that and the terminal focused, both buttons draw
+/// faint, the limit-reset modal's unpressable-button shape; the first frame
+/// drawn live still refuses a key read before the loop next finds the queue
+/// empty.
+fn draw_transcript_cleanup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &TranscriptCleanupForm,
+    live: bool,
+) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "cleanupPeriodDays is gone from ~/.claude/settings.json",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            format!("clauth put {} back", form.days),
+            theme::dim(),
+        )),
+        Line::from(Span::styled(
+            "was removing it intentional? without it claude code deletes every transcript older than 30 days",
+            theme::dim(),
+        )),
+    ];
+    let keep = format!("keep {}", form.days);
+    let buttons = if live {
+        choice_buttons(form.on_remove, &keep, true, "remove it")
+    } else {
+        Line::from(vec![
+            Span::styled(format!(" {keep} "), theme::faint()),
+            Span::raw(" "),
+            Span::styled(" remove it ", theme::faint()),
+        ])
+    };
+    draw_modal_scrolled(
+        frame,
+        area,
+        "TRANSCRIPT CLEANUP",
+        BodyLine::all(lines),
+        0,
+        None,
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
+}
+
 /// The startup re-bind confirm: grouped account moves, one checkbox row per
 /// account, and a `not now` / `apply` button pair. The view follows the cursor
 /// and the render publishes each account row's line geometry for the page
@@ -2168,6 +2234,86 @@ fn draw_name_field(
             toast_rects,
         },
     );
+}
+
+/// The widest reset label the pick list shows before it cuts with `…`.
+const RESET_LABEL_CELLS: usize = 44;
+
+/// `USE A LIMIT RESET`: the account and its count, one pick row per reset,
+/// the focused reset's static key/value rows, then the spend's state — a
+/// spinner while it runs, its refusal (or a fresh record's pin on another
+/// reset) in the error colour — over `cancel` and `use reset`, the latter
+/// faint while it cannot be pressed.
+fn draw_limit_reset(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &super::super::app::LimitResetForm,
+    tick: u64,
+) {
+    use super::super::app::LimitResetPhase;
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("{} · {}", form.name, form.available),
+            theme::body(),
+        )),
+        Line::from(""),
+    ];
+    let cursor = form.cursor.min(form.resets.len().saturating_sub(1));
+    for (i, reset) in form.resets.iter().enumerate() {
+        lines.push(option_line(
+            i == cursor,
+            truncate(&reset.label, RESET_LABEL_CELLS),
+        ));
+    }
+    if let Some(reset) = form.focused() {
+        lines.push(Line::from(""));
+        for (key, value) in &reset.rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<10}"), theme::label()),
+                Span::styled(value.clone(), theme::body()),
+            ]));
+        }
+    }
+    let state = match &form.phase {
+        LimitResetPhase::Spending => Some(Line::from(Span::styled(
+            format!("{} using the reset", spinner_frame(tick)),
+            theme::accent(),
+        ))),
+        LimitResetPhase::Refused(line) => {
+            Some(Line::from(Span::styled(line.clone(), theme::danger())))
+        }
+        LimitResetPhase::Idle => form
+            .pinned_refusal()
+            .map(|line| Line::from(Span::styled(line.to_string(), theme::danger()))),
+    };
+    if let Some(state) = state {
+        lines.push(Line::from(""));
+        lines.push(state);
+    }
+    let use_label = " use reset ";
+    let use_button = if form.can_use() {
+        modal_button(use_label, form.on_use)
+    } else {
+        Span::styled(use_label, theme::faint())
+    };
+    let buttons = Line::from(vec![
+        modal_button(" cancel ", !form.on_use),
+        Span::raw(" "),
+        use_button,
+    ]);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "USE A LIMIT RESET",
+        BodyLine::all(lines),
+        0,
+        Some((2 + cursor..3 + cursor, &form.scroll, FocusEnd::Head)),
+        ModalTail {
+            extra: Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+            toast_rects: &[],
+        },
+    );
+    form.max_scroll.set(d.max_scroll);
 }
 
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`

@@ -67,17 +67,19 @@ fn limit_reset_list_parses_codexs_body_and_ignores_the_rest() {
         serde_json::from_str(r#"{"credits": [{"id": "c"}]}"#).expect("sparse parses");
     assert_eq!(sparse.available_count, 0);
     assert!(
-        sparse.next_to_use().is_none(),
+        matches!(
+            sparse.try_spend_credit_id("c"),
+            Err(CreditRefusal::NotAvailable(_))
+        ),
         "no status is not 'available'"
     );
 }
 
-/// The credit spent is the one that would expire first: available only, a
-/// `codex_rate_limits` credit over any other type, then the earliest expiry,
-/// a credit with no expiry after every dated one, and the earliest grant as
-/// the tie-break.
+/// Any available credit is the one its id names, whatever it expires or is
+/// typed; a credit that does not read available refuses as such, and an id
+/// the list does not name, or an empty list, refuses as not listed.
 #[test]
-fn limit_reset_picks_the_available_credit_that_expires_first() {
+fn limit_reset_takes_any_available_credit_its_id_names() {
     let credits = list_of(
         vec![
             credit(
@@ -132,72 +134,34 @@ fn limit_reset_picks_the_available_credit_that_expires_first() {
         ],
         5,
     );
-    assert_eq!(
-        credits.next_to_use().map(|c| c.id.as_str()),
-        Some("soon-granted-first"),
-        "earliest expiry, the same instant spelled two ways ties, the earlier grant breaks it"
-    );
-
-    let undated_last = list_of(
-        vec![
-            credit(
-                "no-expiry",
-                "codex_rate_limits",
-                "available",
-                "2026-01-01T00:00:00Z",
-                None,
-            ),
-            credit(
-                "garbled",
-                "codex_rate_limits",
-                "available",
-                "2026-01-01T00:00:00Z",
-                Some("soon"),
-            ),
-            credit(
-                "dated",
-                "codex_rate_limits",
-                "available",
-                "2026-01-09T00:00:00Z",
-                Some("2027-01-01T00:00:00Z"),
-            ),
-        ],
-        3,
-    );
-    assert_eq!(
-        undated_last.next_to_use().map(|c| c.id.as_str()),
-        Some("dated"),
-        "a credit that can wait (no expiry, or one that does not parse) goes last"
-    );
-
-    let only_other_type = list_of(
-        vec![credit(
-            "x",
-            "something_else",
-            "available",
-            "2026-01-01T00:00:00Z",
-            None,
-        )],
-        1,
-    );
-    assert_eq!(
-        only_other_type.next_to_use().map(|c| c.id.as_str()),
-        Some("x"),
-        "another type is preferred against, never refused"
-    );
-
-    let none = list_of(
-        vec![credit(
-            "r",
-            "codex_rate_limits",
-            "redeemed",
-            "2026-01-01T00:00:00Z",
-            None,
-        )],
-        0,
-    );
-    assert!(none.next_to_use().is_none());
-    assert!(list_of(Vec::new(), 0).next_to_use().is_none());
+    for id in [
+        "other-type",
+        "no-expiry",
+        "late",
+        "soon-granted-later",
+        "soon-granted-first",
+    ] {
+        assert_eq!(
+            credits.try_spend_credit_id(id).map(|c| c.id.as_str()).ok(),
+            Some(id),
+            "an available credit is spent by its id, another type included"
+        );
+    }
+    for id in ["redeemed", "redeeming"] {
+        match credits.try_spend_credit_id(id) {
+            Err(CreditRefusal::NotAvailable(c)) => assert_eq!(c.id, id),
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+    assert_eq!(credits.available(), 5);
+    assert!(matches!(
+        credits.try_spend_credit_id("gone"),
+        Err(CreditRefusal::NotListed)
+    ));
+    assert!(matches!(
+        list_of(Vec::new(), 0).try_spend_credit_id("gone"),
+        Err(CreditRefusal::NotListed)
+    ));
 }
 
 /// `reset` and `already_redeemed` are both done (codex reads them so);
@@ -233,13 +197,57 @@ fn limit_reset_consume_codes_map_to_their_outcomes() {
     );
 }
 
+/// The reason a refusal hands its surface is the code the server answered
+/// with, terminal-safe; a reply that landed, or a code clauth does not know,
+/// names no refusal.
+#[test]
+fn limit_reset_a_refused_consume_names_the_reason_the_modal_shows() {
+    let reason = |body: &str| {
+        serde_json::from_str::<ConsumeReply>(body)
+            .expect("parses")
+            .refusal_reason()
+    };
+    assert_eq!(
+        reason(r#"{"code": "nothing_to_reset"}"#).as_deref(),
+        Some("nothing_to_reset")
+    );
+    assert_eq!(
+        reason(r#"{"code": "no_credit"}"#).as_deref(),
+        Some("no_credit")
+    );
+    for body in [
+        r#"{"code": "reset"}"#,
+        r#"{"code": "already_redeemed"}"#,
+        r#"{"code": "partially_reset"}"#,
+        // An unknown code, even one spelled near a refusal, leaves the outcome
+        // open: it is never shown as a refusal, so its bytes never reach the
+        // modal through this path.
+        r#"{"code": "no\u001b[2Jcredit"}"#,
+    ] {
+        assert_eq!(reason(body), None, "{body}");
+    }
+}
+
 /// What each outcome prints or fails with. A success is one `clauth: ` line
 /// (a caller shows it as it stands); only a success says the reset was
 /// used, and every uncertain failure names the re-run that re-sends it.
 #[test]
 fn limit_reset_outcome_lines_say_what_was_spent() {
     let sent_at_ms = 1_700_000_000_000;
-    let credits = list_of(Vec::new(), 3);
+    let credits = list_of(
+        (0..3)
+            .map(|i| {
+                credit(
+                    &format!("c-{i}"),
+                    "codex_rate_limits",
+                    "available",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+            })
+            .collect(),
+        3,
+    );
     let reply = |code: &str, windows_reset: i64| ConsumeReply {
         code: code.to_string(),
         windows_reset,
@@ -252,7 +260,16 @@ fn limit_reset_outcome_lines_say_what_was_spent() {
     assert_eq!(
         outcome_line(
             "work",
-            &list_of(Vec::new(), 1),
+            &list_of(
+                vec![credit(
+                    "c",
+                    "codex_rate_limits",
+                    "available",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )],
+                1,
+            ),
             &reply("already_redeemed", 1),
             sent_at_ms,
         ),
@@ -518,15 +535,23 @@ fn limit_reset_prompt_opens_on_the_expiry_when_the_credit_has_no_title() {
 }
 
 /// The prompt for one credit, the only one in its list, under a server count
-/// (3) that differs from the list's length, so the "1 of N" figure is pinned
-/// to the server's count and never to the list.
+/// (3) that differs from the list's own, so the "1 of N" figure is pinned to
+/// the list's own available credits and never to the server's count.
 fn sole_prompt(credit: &ResetCredit) -> String {
     limit_reset_prompt("work", &list_of(vec![credit.clone()], 3), credit)
 }
 
-/// The `--list` row for one credit, the only one in its list.
+/// The listing's table row for one credit, the only one in its list.
 fn sole_list_row(credit: &ResetCredit) -> String {
-    describe_reset_credits("work", &list_of(vec![credit.clone()], 3))[1].clone()
+    describe_reset_credits("work", &list_of(vec![credit.clone()], 3))[3].clone()
+}
+
+/// The table row of a lone credit with a one-letter id, no expiry and the
+/// `codex_rate_limits` type, padded by hand: every column at its header's
+/// width but RESETS and EXPIRES, which their cells widen, and STATE, which a
+/// cell past five cells widens.
+fn lone_row(id: &str, left: &str, state: &str, label: &str) -> String {
+    format!("  {id}   {left}   {state:<5}  usage windows  no expiry  {label}")
 }
 
 /// A credit whose grant stamp does not parse, so its `--list` row is shown
@@ -542,7 +567,7 @@ fn fixed_credit(expires_at: Option<&str>) -> ResetCredit {
 }
 
 const PROMPT_TAIL: &str =
-    ", 1 of 3 available. It reopens the account's usage windows now and cannot be undone.";
+    ", 1 of 1 available. It reopens the account's usage windows now and cannot be undone.";
 
 fn titled_credit(title: &str) -> ResetCredit {
     ResetCredit {
@@ -572,7 +597,7 @@ fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
     );
     assert_eq!(
         sole_list_row(&blank),
-        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+        lone_row("a", "1/1", "ready", "usage-limit reset")
     );
 
     let long = titled(&"x".repeat(70));
@@ -591,7 +616,7 @@ fn limit_reset_prompt_shows_the_title_as_sent_minus_what_hides_the_line() {
     );
     assert_eq!(
         sole_list_row(&bidi),
-        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+        lone_row("a", "1/1", "ready", "Full reset")
     );
 }
 
@@ -610,19 +635,19 @@ fn limit_reset_invisible_title_reads_as_untitled() {
         let c = titled(invisible);
         assert_eq!(
             sole_prompt(&c),
-            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. \
              It reopens the account's usage windows now and cannot be undone.",
             "title {invisible:?}"
         );
         assert_eq!(
             sole_list_row(&c),
-            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            lone_row("a", "1/1", "ready", "usage-limit reset"),
             "title {invisible:?}"
         );
     }
     assert_eq!(
         sole_prompt(&titled("a\u{200b}")),
-        "clauth: use a usage-limit reset on 'work'? a\u{200b}, no expiry, 1 of 3 available. \
+        "clauth: use a usage-limit reset on 'work'? a\u{200b}, no expiry, 1 of 1 available. \
          It reopens the account's usage windows now and cannot be undone."
     );
 }
@@ -660,7 +685,7 @@ fn limit_reset_every_ignorable_range_end_reads_as_untitled() {
             };
             assert_eq!(
                 sole_prompt(&c),
-                "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+                "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. \
                  It reopens the account's usage windows now and cannot be undone.",
                 "U+{cp:04X}"
             );
@@ -668,30 +693,30 @@ fn limit_reset_every_ignorable_range_end_reads_as_untitled() {
     }
 }
 
-/// A `--list` row drops a status or a grant stamp that shows nothing instead
-/// of printing an empty clause; the codex body that sends neither (a credit
-/// with only an id) still lists.
+/// A listing row reads a status that shows nothing as `-` instead of an empty
+/// cell, and a grant stamp never reaches the table; the codex body that sends
+/// neither a status nor a type (a credit with only an id) still lists.
 #[test]
-fn limit_reset_list_row_drops_a_status_or_grant_that_shows_nothing() {
+fn limit_reset_list_row_reads_a_status_that_shows_nothing_as_a_dash() {
     for blank in ["", "   ", "\u{7}", "\u{200b}"] {
         let no_status = credit("c", "codex_rate_limits", blank, "not-a-stamp", None);
         assert_eq!(
-            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
-            "    usage-limit reset: no expiry, granted not-a-stamp",
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[3],
+            lone_row("c", "0/1", "-", "usage-limit reset"),
             "status {blank:?}"
         );
         let no_grant = credit("c", "codex_rate_limits", "available", blank, None);
         assert_eq!(
-            describe_reset_credits("work", &list_of(vec![no_grant], 1))[1],
-            "  * usage-limit reset: available, no expiry  (used next)",
+            describe_reset_credits("work", &list_of(vec![no_grant], 1))[3],
+            lone_row("c", "1/1", "ready", "usage-limit reset"),
             "granted_at {blank:?}"
         );
     }
     let sparse: ResetCredits =
         serde_json::from_str(r#"{"credits": [{"id": "c"}]}"#).expect("a sparse credit parses");
     assert_eq!(
-        describe_reset_credits("work", &sparse)[1],
-        "    usage-limit reset: no expiry"
+        describe_reset_credits("work", &sparse)[3],
+        "  c   0/1   -      -       no expiry  usage-limit reset"
     );
 }
 
@@ -714,23 +739,23 @@ fn limit_reset_blank_expiry_reads_as_no_expiry() {
         let c = fixed_credit(Some(blank));
         assert_eq!(
             sole_prompt(&c),
-            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 3 available. \
+            "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. \
              It reopens the account's usage windows now and cannot be undone.",
             "expires_at {blank:?}"
         );
         assert_eq!(
             sole_list_row(&c),
-            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            lone_row("a", "1/1", "ready", "usage-limit reset"),
             "expires_at {blank:?}"
         );
     }
 }
 
-/// The prompt names the credit, its expiry, and "1 of N"; the listing marks
-/// the credit the prompt would name. A missing title falls back to the generic
-/// name in the listing, and a count lagging its own list never reads "1 of 0".
+/// The prompt names the credit, its expiry, and "1 of N"; the listing names
+/// every credit and marks none. A missing title falls back to the generic
+/// name in the listing, and the count never reads "1 of 0".
 #[test]
-fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
+fn limit_reset_prompt_names_the_credit_and_the_listing_marks_none() {
     let mut titled = credit(
         "a",
         "codex_rate_limits",
@@ -758,26 +783,26 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     let titled_prompt = limit_reset_prompt("work", &list_of(vec![titled.clone()], 0), &titled);
     assert!(
         titled_prompt.contains("Full reset (Weekly + 5 hr), no expiry, 1 of 1 available."),
-        "control characters dropped, count floored at one: {titled_prompt}"
+        "control characters dropped, the count is the list's own single credit: \
+         {titled_prompt}"
     );
 
     let lines = describe_reset_credits("work", &credits);
+    let ends = crate::format::local_minute_stamp(1_769_904_000).expect("stamp");
+    let w = ends.chars().count();
     assert_eq!(
-        lines[0],
-        "clauth: 'work' has 2 usage-limit resets available."
+        lines,
+        [
+            "clauth: 'work' has 2 usage-limit resets available.".to_string(),
+            String::new(),
+            format!("  ID  LEFT  STATE  RESETS         {:<w$}  LABEL", "EXPIRES"),
+            format!(
+                "  a   1/1   ready  usage windows  {:<w$}  Full reset (Weekly + 5 hr)",
+                "no expiry"
+            ),
+            format!("  b   1/1   ready  usage windows  {ends}  usage-limit reset"),
+        ]
     );
-    assert_eq!(lines.len(), 3);
-    assert!(
-        lines[1].starts_with("    Full reset (Weekly + 5 hr): available, no expiry, granted "),
-        "{}",
-        lines[1]
-    );
-    assert!(
-        lines[2].starts_with("  * usage-limit reset: available, expires "),
-        "{}",
-        lines[2]
-    );
-    assert!(lines[2].ends_with("(used next)"), "{}", lines[2]);
 
     let spent = list_of(
         vec![credit(
@@ -791,10 +816,83 @@ fn limit_reset_prompt_and_listing_name_the_credit_that_would_be_spent() {
     );
     let lines = describe_reset_credits("work", &spent);
     assert_eq!(
-        lines[0],
-        "clauth: no usage-limit resets available on 'work'."
+        lines,
+        [
+            "clauth: 'work' has 0 usage-limit resets available.",
+            "",
+            "  ID  LEFT  STATE     RESETS         EXPIRES    LABEL",
+            "  r   0/1   redeemed  usage windows  no expiry  usage-limit reset",
+        ]
     );
-    assert!(!lines[1].contains("used next"), "{}", lines[1]);
+    assert_eq!(
+        describe_reset_credits("work", &list_of(Vec::new(), 0)),
+        ["clauth: no usage-limit resets available on 'work'."]
+    );
+}
+
+/// The prompt's "1 of N" and the listing's count state the list's own
+/// available credits, never the server's count: a list whose server count
+/// (2) differs from its one available credit prompts "1 of 1", and the
+/// listing's count line agrees.
+#[test]
+fn limit_reset_prompt_and_listing_agree_on_the_lists_own_count() {
+    let c = credit(
+        "c",
+        "codex_rate_limits",
+        "available",
+        "2026-01-01T00:00:00Z",
+        None,
+    );
+    let credits = list_of(vec![c.clone()], 2);
+    assert_eq!(
+        limit_reset_prompt("work", &credits, &c),
+        "clauth: use a usage-limit reset on 'work'? No expiry, 1 of 1 available. \
+         It reopens the account's usage windows now and cannot be undone."
+    );
+    assert_eq!(
+        describe_reset_credits("work", &credits)[0],
+        "clauth: 'work' has 1 usage-limit reset available."
+    );
+}
+
+/// The codex failed-re-read line names the read's failure and only what the
+/// refresh did with the stored list under the gate: dropped, left alone by
+/// the account gate or a state flock, or (with the drop-failure line after
+/// it) not removed.
+#[test]
+fn the_codex_refresh_read_failure_line_says_what_became_of_the_stored_list() {
+    let err = ResetCallError::Status(503);
+    assert_eq!(
+        refresh_read_failure("cx", &err, crate::usage::claude_reset::RefreshDrop::Dropped),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the stored list was dropped"
+    );
+    assert_eq!(
+        refresh_read_failure(
+            "cx",
+            &err,
+            crate::usage::claude_reset::RefreshDrop::LoginChanged
+        ),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the stored login changed or could not be read, so nothing was touched"
+    );
+    assert_eq!(
+        refresh_read_failure(
+            "cx",
+            &err,
+            crate::usage::claude_reset::RefreshDrop::LockTimedOut
+        ),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP \
+         503); the state lock was unavailable, so nothing was touched"
+    );
+    assert_eq!(
+        refresh_read_failure("cx", &err, crate::usage::claude_reset::RefreshDrop::Failed),
+        "clauth: 'cx': the reset list read after the spend failed (codex answered with HTTP 503)"
+    );
+    assert_eq!(
+        refresh_drop_failure("cx"),
+        "clauth: 'cx': could not remove the stored reset list"
+    );
 }
 
 /// An expiry or grant stamp that does not parse is shown as sent, but with its
@@ -823,9 +921,8 @@ fn limit_reset_unparseable_stamps_reach_the_terminal_without_control_characters(
          1 of 1 available. It reopens the account's usage windows now and cannot be undone."
     );
     assert_eq!(
-        lines[1],
-        "  * usage-limit reset: available, expires 2026-01-01T00:00:00]52;c;AAAA, \
-         granted 2026-01-01T00:00:00]52;c;AAAA  (used next)"
+        lines[3],
+        "  h   1/1   ready  usage windows  2026-01-01T00:00:00]52;c;AAAA  usage-limit reset"
     );
 }
 
@@ -843,7 +940,7 @@ fn limit_reset_title_cap_counts_only_drawn_characters() {
     );
     assert_eq!(
         sole_list_row(&titled_credit(&padded)),
-        format!("  * {padded}: available, no expiry, granted not-a-stamp  (used next)")
+        lone_row("a", "1/1", "ready", &padded)
     );
 
     let heart = "\u{2764}\u{fe0f}";
@@ -890,19 +987,70 @@ fn limit_reset_title_cap_counts_wide_glyphs_by_cells() {
     );
 }
 
-/// The `--list` status cap (20) counts only drawn characters too.
+/// The table's LABEL column caps at 44 drawn cells: a wide title keeps whole
+/// glyphs inside that width, a 44-cell one prints whole, and a 45-cell one
+/// cuts to 41 and `...`.
+#[test]
+fn the_listing_cuts_a_label_at_forty_four_drawn_cells() {
+    let wide = titled_credit(&"漢".repeat(30));
+    assert_eq!(
+        sole_list_row(&wide),
+        lone_row("a", "1/1", "ready", &format!("{}...", "漢".repeat(20)))
+    );
+    assert_eq!(
+        sole_list_row(&titled_credit(&"x".repeat(44))),
+        lone_row("a", "1/1", "ready", &"x".repeat(44))
+    );
+    assert_eq!(
+        sole_list_row(&titled_credit(&"x".repeat(45))),
+        lone_row("a", "1/1", "ready", &format!("{}...", "x".repeat(41)))
+    );
+}
+
+/// The ID cell is the text a spend takes back, so it prints whole at a real
+/// codex credit id's length, past any cap the other cells keep: the id read
+/// back off the row's first column is the one the spend's lookup finds, and
+/// the columns after it still line up under a shorter id's row.
+#[test]
+fn the_listing_prints_a_codex_credit_id_whole() {
+    let long = "RateLimitResetCredit_3f9a1c7e5b2d4f6a8c0e1b3d5f7a9c2e";
+    let credits = list_of(
+        vec![
+            credit(long, "codex_rate_limits", "available", "not-a-stamp", None),
+            credit("a", "codex_rate_limits", "available", "not-a-stamp", None),
+        ],
+        2,
+    );
+    let lines = describe_reset_credits("work", &credits);
+    assert!(lines[3].contains(long), "row {:?} names {long}", lines[3]);
+    let read_back = lines[3].split_whitespace().next().expect("an ID cell");
+    assert_eq!(
+        credits
+            .try_spend_credit_id(read_back)
+            .map(|c| c.id.as_str())
+            .ok(),
+        Some(long),
+        "the listed id is the one a spend of it finds"
+    );
+    let left_at = |line: &str| line.find("1/1").expect("a LEFT cell");
+    assert_eq!(left_at(&lines[3]), left_at(&lines[4]), "{lines:#?}");
+    assert_eq!(left_at(&lines[3]), lines[2].find("LEFT").expect("LEFT"));
+}
+
+/// The STATE cell's status cap (20) counts only drawn characters too, and the
+/// column pads by drawn cells, so the zero-width characters widen nothing.
 #[test]
 fn limit_reset_status_cap_counts_only_drawn_characters() {
     let status = format!("re{}deemed", "\u{200b}".repeat(25));
     let c = credit("c", "codex_rate_limits", &status, "not-a-stamp", None);
     assert_eq!(
-        describe_reset_credits("work", &list_of(vec![c], 0))[1],
-        format!("    usage-limit reset: {status}, no expiry, granted not-a-stamp")
+        describe_reset_credits("work", &list_of(vec![c], 0))[3],
+        format!("  c   0/1   {status}  usage windows  no expiry  usage-limit reset")
     );
 }
 
 /// An unparseable stamp's cap (40) counts only drawn characters too, on the
-/// expiry and the grant alike.
+/// prompt's expiry and the table's alike.
 #[test]
 fn limit_reset_raw_stamp_cap_counts_only_drawn_characters() {
     let raw = format!("{}soon", "\u{200b}".repeat(45));
@@ -910,10 +1058,9 @@ fn limit_reset_raw_stamp_cap_counts_only_drawn_characters() {
         sole_prompt(&fixed_credit(Some(&raw))),
         format!("clauth: use a usage-limit reset on 'work'? Expires {raw}{PROMPT_TAIL}")
     );
-    let granted = credit("a", "codex_rate_limits", "available", &raw, None);
     assert_eq!(
-        sole_list_row(&granted),
-        format!("  * usage-limit reset: available, no expiry, granted {raw}  (used next)")
+        sole_list_row(&fixed_credit(Some(&raw))),
+        format!("  a   1/1   ready  usage windows  {raw}     usage-limit reset")
     );
 }
 
@@ -930,7 +1077,7 @@ fn limit_reset_braille_blank_alone_shows_nothing() {
         );
         assert_eq!(
             sole_list_row(&titled_credit(&text)),
-            "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)",
+            lone_row("a", "1/1", "ready", "usage-limit reset"),
             "title {text:?}"
         );
         assert_eq!(
@@ -940,14 +1087,14 @@ fn limit_reset_braille_blank_alone_shows_nothing() {
         );
         let no_status = credit("c", "codex_rate_limits", &text, "not-a-stamp", None);
         assert_eq!(
-            describe_reset_credits("work", &list_of(vec![no_status], 0))[1],
-            "    usage-limit reset: no expiry, granted not-a-stamp",
+            describe_reset_credits("work", &list_of(vec![no_status], 0))[3],
+            lone_row("c", "0/1", "-", "usage-limit reset"),
             "status {text:?}"
         );
         let no_grant = credit("c", "codex_rate_limits", "available", &text, None);
         assert_eq!(
             sole_list_row(&no_grant),
-            "  * usage-limit reset: available, no expiry  (used next)",
+            lone_row("c", "1/1", "ready", "usage-limit reset"),
             "granted_at {text:?}"
         );
     }
@@ -963,25 +1110,38 @@ fn limit_reset_title_trims_braille_blanks_off_its_ends() {
     );
     assert_eq!(
         sole_list_row(&c),
-        "  * Full reset: available, no expiry, granted not-a-stamp  (used next)"
+        lone_row("a", "1/1", "ready", "Full reset")
     );
 }
 
-/// A status sent with blanks around `available` is available: it is the one
-/// `limit-reset` spends, and `--list` prints it trimmed.
+/// The listing's header and the table above a lone credit's row.
+fn lone_table(count: &str, row: String) -> Vec<String> {
+    vec![
+        format!("clauth: 'work' has {count} available."),
+        String::new(),
+        "  ID  LEFT  STATE  RESETS         EXPIRES    LABEL".to_string(),
+        row,
+    ]
+}
+
+/// A status sent with blanks around `available` is available: it is one a
+/// spend of its id consumes, and the listing reads it `ready`.
 #[test]
 fn limit_reset_spends_an_available_status_sent_with_blanks() {
     for status in [" available ", "\u{2800}available\t"] {
         let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
         let credits = list_of(vec![c.clone()], 3);
-        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            credits.try_spend_credit_id("a").ok(),
+            Some(&c),
+            "status {status:?}"
+        );
         assert_eq!(
             describe_reset_credits("work", &credits),
-            vec![
-                "clauth: 'work' has 3 usage-limit resets available.".to_string(),
-                "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
-                    .to_string(),
-            ],
+            lone_table(
+                "1 usage-limit reset",
+                lone_row("a", "1/1", "ready", "usage-limit reset")
+            ),
             "status {status:?}"
         );
     }
@@ -1015,34 +1175,32 @@ fn limit_reset_hangul_fillers_count_and_trim_as_blank() {
         None,
     );
     let credits = list_of(vec![c.clone()], 3);
-    assert_eq!(credits.next_to_use(), Some(&c));
+    assert_eq!(credits.try_spend_credit_id("a").ok(), Some(&c));
     assert_eq!(
-        describe_reset_credits("work", &credits)[1],
-        "  * usage-limit reset: available, no expiry, granted not-a-stamp  (used next)"
+        describe_reset_credits("work", &credits)[3],
+        lone_row("a", "1/1", "ready", "usage-limit reset")
     );
 }
 
-/// A credit is spent when the status `--list` shows for it reads `available`:
-/// control, bidi and invisible characters never keep a row that reads
-/// `available` from being the one `limit-reset` spends.
+/// A credit is one a spend consumes when the status the listing reads for it
+/// is `available`: control, bidi and invisible characters never keep a row
+/// that reads `ready` from being spent by its id.
 #[test]
 fn limit_reset_spends_the_status_list_shows_as_available() {
-    for (status, shown) in [
-        ("available\u{7}", "available"),
-        ("available\u{202e}", "available"),
-        ("\u{200b}available", "available"),
-    ] {
+    for status in ["available\u{7}", "available\u{202e}", "\u{200b}available"] {
         let c = credit("a", "codex_rate_limits", status, "not-a-stamp", None);
         let credits = list_of(vec![c.clone()], 3);
-        assert_eq!(credits.next_to_use(), Some(&c), "status {status:?}");
+        assert_eq!(
+            credits.try_spend_credit_id("a").ok(),
+            Some(&c),
+            "status {status:?}"
+        );
         assert_eq!(
             describe_reset_credits("work", &credits),
-            vec![
-                "clauth: 'work' has 3 usage-limit resets available.".to_string(),
-                format!(
-                    "  * usage-limit reset: {shown}, no expiry, granted not-a-stamp  (used next)"
-                ),
-            ],
+            lone_table(
+                "1 usage-limit reset",
+                lone_row("a", "1/1", "ready", "usage-limit reset")
+            ),
             "status {status:?}"
         );
     }
@@ -1088,12 +1246,17 @@ fn limit_reset_soft_hyphen_takes_a_cell() {
         None,
     );
     let credits = list_of(vec![c], 0);
-    assert_eq!(credits.next_to_use(), None);
+    assert!(matches!(
+        credits.try_spend_credit_id("a"),
+        Err(CreditRefusal::NotAvailable(_))
+    ));
     assert_eq!(
         describe_reset_credits("work", &credits),
         vec![
-            "clauth: no usage-limit resets available on 'work'.".to_string(),
-            "    usage-limit reset: avail\u{ad}able, no expiry, granted not-a-stamp".to_string(),
+            "clauth: 'work' has 0 usage-limit resets available.".to_string(),
+            String::new(),
+            "  ID  LEFT  STATE       RESETS         EXPIRES    LABEL".to_string(),
+            "  a   0/1   avail\u{ad}able  usage windows  no expiry  usage-limit reset".to_string(),
         ]
     );
 
@@ -1158,7 +1321,13 @@ fn limit_reset_list_and_consume_send_codexs_request() {
 
     let listed =
         list_reset_credits_at(&urls.list, "at.secret", Some("acc-1"), true).expect("200 lists");
-    assert_eq!(listed.next_to_use().map(|c| c.id.as_str()), Some("c-1"));
+    assert_eq!(
+        listed
+            .try_spend_credit_id("c-1")
+            .map(|c| c.id.as_str())
+            .ok(),
+        Some("c-1")
+    );
     let reply = consume_reset_credit_at(
         &urls.consume,
         "at.secret",
@@ -1302,14 +1471,84 @@ fn limit_reset_resend_prompt_names_the_earlier_request() {
 fn limit_reset_list_note_points_at_the_rerun() {
     let sent_at_ms = 1_780_741_000_000u64;
     assert_eq!(
-        list_pending_note("work", sent_at_ms),
+        list_pending_note("work", "credit-1", sent_at_ms),
         format!(
-            "clauth: a usage-limit reset sent at {} got no answer; run `clauth limit-reset work` \
-             again before {} to re-send it.",
+            "clauth: a usage-limit reset sent at {} got no answer; run `clauth limit-reset work \
+             credit-1` before {} to re-send it.",
             local_at(sent_at_ms),
             resend_deadline(sent_at_ms)
         )
     );
+}
+
+/// The refusals of a pick the list cannot spend: an id it does not name
+/// (escaped, as the operator typed it), a credit that does not read available
+/// (its STATE word), and a fresh record's pin on another credit.
+#[test]
+fn limit_reset_a_refused_pick_names_why() {
+    assert_eq!(
+        not_listed_line("work", "c\u{7}x"),
+        "'work' has no usage-limit reset with the id \"c\\u{7}x\", so no reset was used; run \
+         `clauth limit-reset work` to list its resets"
+    );
+    let redeemed = credit(
+        "r",
+        "codex_rate_limits",
+        "redeemed",
+        "2026-01-01T00:00:00Z",
+        None,
+    );
+    assert_eq!(
+        unavailable_credit_line("work", &redeemed),
+        "the usage-limit reset \"r\" on 'work' cannot be used now (redeemed), so no reset was used"
+    );
+    let sent_at_ms = 1_780_741_000_000u64;
+    assert_eq!(
+        pinned_record_line("work", "credit-1", sent_at_ms),
+        format!(
+            "a usage-limit reset sent at {} on 'work' got no answer; run `clauth limit-reset \
+             work credit-1` before {} to re-send it, no other reset is used until then",
+            local_at(sent_at_ms),
+            resend_deadline(sent_at_ms)
+        )
+    );
+}
+
+/// The reading a codex list read lands keeps every credit as the list sent
+/// it, counts the available ones, and stamps the read; it round-trips through
+/// the file.
+#[test]
+fn limit_reset_a_list_read_lands_every_credit() {
+    let credits = list_of(
+        vec![
+            ResetCredit {
+                title: Some("Full reset".to_string()),
+                ..credit(
+                    "a",
+                    "codex_rate_limits",
+                    "available",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+            },
+            credit(
+                "r",
+                "codex_rate_limits",
+                "redeemed",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+        ],
+        5,
+    );
+    let reading = credits_reading(&credits);
+    assert_eq!((reading.usable, reading.banked), (1, Some(1)));
+    assert_eq!(reading.credits, credits.credits);
+    assert!(reading.grants.is_empty());
+    assert!(reading.fetched_at.is_some());
+    let text = serde_json::to_string(&reading).expect("serializes");
+    let back: crate::usage::LimitResets = serde_json::from_str(&text).expect("loads back");
+    assert_eq!(back.credits, credits.credits);
 }
 
 /// A consume reply settles the record exactly when its code is a defined one;
