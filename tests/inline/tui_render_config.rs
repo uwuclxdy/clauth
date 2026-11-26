@@ -3735,6 +3735,7 @@ fn a_short_picker_value_ends_in_an_ellipsis() {
     for (w, want) in [
         (49, "picker          5 options (replaces built-in)"),
         (48, "picker          5 options…"),
+        (29, "picker          5 option…"),
         (28, "picker          5 optio…"),
     ] {
         let rows = picker_frame(Some(five.clone()), w, 40);
@@ -3744,6 +3745,39 @@ fn a_short_picker_value_ends_in_an_ellipsis() {
             .find(|r| r.starts_with("picker "))
             .unwrap_or_else(|| panic!("[{w} cols] no picker line:\n{}", rows.join("\n")));
         assert_eq!(line, want, "[{w} cols]\n{}", rows.join("\n"));
+    }
+}
+
+// At every width a cut value ends in `…`, so one that shed ` (replaces
+// built-in)` never reads as a picker that keeps the built-in lineup; the
+// width where the bare count fits exactly cuts the count too.
+#[test]
+fn a_cut_picker_value_ends_in_an_ellipsis_at_every_width() {
+    const FIVE: &str = "5 options (replaces built-in)";
+    for width in 0..=30 {
+        let fit = fit_picker_summary(FIVE, width);
+        assert!(grapheme_cells(&fit) <= width, "[{width}] {fit:?}");
+        assert!(
+            fit == FIVE || fit.ends_with('…') || (width == 0 && fit.is_empty()),
+            "[{width}] a cut value ends in the mark: {fit:?}"
+        );
+    }
+    for (summary, width, want) in [
+        (FIVE, 29, FIVE),
+        (FIVE, 28, "5 options…"),
+        (FIVE, 10, "5 options…"),
+        (FIVE, 9, "5 option…"),
+        (FIVE, 8, "5 optio…"),
+        (FIVE, 1, "…"),
+        (FIVE, 0, ""),
+        ("2 options", 9, "2 options"),
+        ("2 options", 5, "2 op…"),
+    ] {
+        assert_eq!(
+            fit_picker_summary(summary, width),
+            want,
+            "[{width}] {summary}"
+        );
     }
 }
 

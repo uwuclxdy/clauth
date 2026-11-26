@@ -7638,10 +7638,10 @@ fn render_config_toml(profile: &Profile) -> String {
     ] {
         push_scalar_doc(&mut out, key);
         match date {
-            Some(date) => out.push_str(&format!(
-                "{key} = {}\n",
-                toml_str(&crate::usage::render_plan_date(date))
-            )),
+            Some(date) => {
+                let date = crate::usage::render_plan_date(date);
+                _ = writeln!(out, "{key} = {}", toml_str(&date));
+            }
             None => out.push_str(&scalar_example(key)),
         }
         out.push('\n');
@@ -7709,7 +7709,7 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push('\n');
 
     // Tables last: every key after a `[table]` header belongs to that table, so
-    // this block and the three below must follow every scalar key above.
+    // this block and the four below must follow every scalar key above.
     push_console_doc(&mut out);
     match profile.console.as_ref() {
         Some(c) => {
@@ -7751,11 +7751,7 @@ fn render_config_toml(profile: &Profile) -> String {
     } else {
         out.push_str("[model_effort]\n");
         for (k, v) in &profile.model_effort {
-            out.push_str(&format!(
-                "{} = {}\n",
-                toml_edit::Key::new(k.as_str()),
-                toml_str(v)
-            ));
+            _ = writeln!(out, "{} = {}", toml_edit::Key::new(k.as_str()), toml_str(v));
         }
     }
     out.push('\n');
@@ -7801,18 +7797,18 @@ fn claim_model_picker(doc: &mut toml_edit::DocumentMut, picker: Option<&ModelPic
 fn render_model_picker_table(mp: &ModelPicker) -> String {
     let mut out = String::from("[model_picker]\n");
     if let Some(b) = mp.replace_built_in {
-        out.push_str(&format!("replace_built_in = {b}\n"));
+        _ = writeln!(out, "replace_built_in = {b}");
     }
     for o in &mp.options {
         out.push_str("\n[[model_picker.options]]\n");
-        out.push_str(&format!("model = {}\n", toml_str(&o.model)));
+        _ = writeln!(out, "model = {}", toml_str(&o.model));
         for (k, v) in [
             ("label", &o.label),
             ("description", &o.description),
             ("behaves_as", &o.behaves_as),
         ] {
             if let Some(v) = v {
-                out.push_str(&format!("{k} = {}\n", toml_str(v)));
+                _ = writeln!(out, "{k} = {}", toml_str(v));
             }
         }
     }

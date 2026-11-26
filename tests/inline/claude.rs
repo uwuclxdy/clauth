@@ -9925,6 +9925,43 @@ fn the_record_names_the_model_picker_before_the_live_write() {
     assert!(read_live_settings().get("modelPicker").is_none());
 }
 
+// A hand-set picker an account's picker replaces rides the record as the
+// entry's `base`, raw, through a failed live write too, and comes back on the
+// apply of an account without a picker.
+#[test]
+fn a_hand_set_model_picker_rides_the_record_as_its_base() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mine = serde_json::json!({"options": [{"model": "mine"}]});
+    write_live_settings(&serde_json::json!({"modelPicker": mine}));
+    let a = picker_profile(None, vec![picker_row("a-model")]);
+    let c = picker_profile(None, vec![picker_row("c-model")]);
+    let none = Profile::new("b".to_string(), None, None);
+    apply_profile_to_claude_settings(&a, &[]).expect("apply a");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"base": mine, "wrote": PICKER_A_DIGEST})
+    );
+
+    let fault = FailLiveSettingsWrite::new(&home);
+    let failed = apply_profile_to_claude_settings(&c, &[]);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"base": mine, "wrote": PICKER_C_DIGEST, "pending": PICKER_A_DIGEST})
+    );
+    apply_profile_to_claude_settings(&none, &[]).expect("apply without a picker");
+    assert_eq!(
+        read_live_settings()["modelPicker"],
+        mine,
+        "the hand-set picker comes back"
+    );
+    assert!(
+        base_env_record().get("top").is_none(),
+        "the entry retires with the value"
+    );
+}
+
 // A record written before top-level entries existed loads and writes back
 // byte for byte; one holding an entry loads and keeps it.
 #[test]

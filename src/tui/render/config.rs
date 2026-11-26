@@ -502,17 +502,17 @@ fn picker_summary(picker: Option<&crate::profile::ModelPicker>) -> String {
     out
 }
 
-/// `summary` fitted to `width` cells: whole when it fits, else without
-/// [`PICKER_REPLACES`] and ending in `…`, else cut to end in `…`.
+/// `summary` fitted to `width` cells: whole when it fits, else cut to end in
+/// `…`, shedding [`PICKER_REPLACES`] first, so a value that lost it always
+/// shows the mark.
 fn fit_picker_summary(summary: &str, width: usize) -> String {
     if grapheme_cells(summary) <= width {
         return summary.to_string();
     }
-    let count = summary.strip_suffix(PICKER_REPLACES).unwrap_or(summary);
-    if count.len() < summary.len() && grapheme_cells(count) < width {
-        return format!("{count}…");
+    match summary.strip_suffix(PICKER_REPLACES) {
+        Some(count) => truncate(&format!("{count}…"), width),
+        None => truncate(summary, width),
     }
-    truncate(count, width)
 }
 
 fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {

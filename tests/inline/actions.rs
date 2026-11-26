@@ -17977,8 +17977,8 @@ fn a_switch_off_that_cannot_put_back_the_values_logs_one_line() {
     assert_eq!(
         lines.snapshot(),
         [format!(
-            "clauth: switched off, but could not put back the settings.json values a's \
-             [env] keys covered: {read_error:#}; the next switch that lands puts them back"
+            "clauth: switched off, but could not put back the settings.json values a \
+             covered: {read_error:#}; the next switch that lands puts them back"
         )],
         "one line, naming the account and the read failure"
     );
@@ -23466,16 +23466,68 @@ fn hand_set_model_picker(picker: &serde_json::Value) {
     );
 }
 
-/// A switch onto an account without a picker keeps a `modelPicker` the user
-/// set by hand and removes the one clauth wrote for the account it leaves; an
-/// account's own picker replaces whatever the file held, a hand-set one or
-/// another account's, and the replacing one is clauth's in turn.
+/// Remove `modelPicker` from the live `settings.json` by hand.
+fn hand_remove_model_picker() {
+    let path = crate::claude::claude_settings_path().expect("settings path");
+    let mut live = live_settings();
+    live.as_object_mut()
+        .expect("settings object")
+        .remove("modelPicker");
+    crate::profile::atomic_write(&path, serde_json::to_string(&live).expect("ser"))
+        .expect("hand-remove the picker");
+    assert_eq!(live_model_picker(), None, "control: removed");
+}
+
+/// A switch onto an account without a picker removes the `modelPicker` clauth
+/// wrote and keeps one the user set by hand; an account's own picker replaces
+/// whatever the file held, and a hand-set one it replaced comes back on the
+/// next switch onto an account without a picker.
 #[test]
 fn a_switch_removes_only_the_model_picker_clauth_wrote() {
     let _home = HomeSandbox::new();
-    let names = seed_captured(&["a", "b", "c", "d"]);
-    let [a, b, c, d] = names.as_slice() else {
-        panic!("four accounts");
+    let names = seed_captured(&["a", "b", "d"]);
+    let [a, b, d] = names.as_slice() else {
+        panic!("three accounts");
+    };
+    give_model_picker(a, "a-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        None,
+        "a's picker leaves with a: the file held none before it"
+    );
+
+    let mine = one_row_picker("mine");
+    hand_set_model_picker(&mine);
+    assert!(switch_profile_locked(&mut config, d).expect("switch to d"));
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "a hand-set picker stays through a switch onto a picker-less account"
+    );
+
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "a's picker leaves with a and the hand-set one comes back"
+    );
+}
+
+/// A picker account's takeover over clauth's own value carries the hand-set
+/// picker the record saved, so the next picker-less switch gives it back.
+#[test]
+fn a_picker_account_takeover_keeps_the_saved_hand_set_model_picker() {
+    let _home = HomeSandbox::new();
+    let names = seed_captured(&["a", "b", "c"]);
+    let [a, b, c] = names.as_slice() else {
+        panic!("three accounts");
     };
     give_model_picker(a, "a-model");
     give_model_picker(c, "c-model");
@@ -23483,28 +23535,53 @@ fn a_switch_removes_only_the_model_picker_clauth_wrote() {
     assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
     let mine = one_row_picker("mine");
     hand_set_model_picker(&mine);
-
-    assert!(switch_profile_locked(&mut config, d).expect("switch to d"));
-    assert_eq!(
-        live_model_picker(),
-        Some(mine),
-        "a hand-set picker stays through a switch onto a picker-less account"
-    );
-
     assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
     assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
-    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
-    assert_eq!(live_model_picker(), None, "a's picker leaves with a");
-
-    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
     assert!(switch_profile_locked(&mut config, c).expect("switch to c"));
     assert_eq!(live_model_picker(), Some(one_row_picker("c-model")));
     assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
-    assert_eq!(live_model_picker(), None, "c's picker leaves with c");
+    assert_eq!(
+        live_model_picker(),
+        Some(mine),
+        "c's picker leaves with c and the hand-set one a replaced comes back"
+    );
+}
+
+/// A `modelPicker` the user deletes while clauth's is live stays deleted: a
+/// switch away puts back none of the hand-set one clauth saved, and another
+/// picker account's takeover carries none of it either.
+#[test]
+fn a_model_picker_deleted_by_hand_stays_deleted_through_a_switch_away() {
+    let _home = HomeSandbox::new();
+    let names = seed_captured(&["a", "b", "c"]);
+    let [a, b, c] = names.as_slice() else {
+        panic!("three accounts");
+    };
+    give_model_picker(a, "a-model");
+    give_model_picker(c, "c-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    hand_set_model_picker(&one_row_picker("mine"));
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    hand_remove_model_picker();
+    assert!(switch_profile_locked(&mut config, c).expect("switch to c"));
+    assert_eq!(
+        live_model_picker(),
+        Some(one_row_picker("c-model")),
+        "c's own picker lands over the deletion"
+    );
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        None,
+        "the user's deletion survives the takeover"
+    );
 }
 
 /// A picker clauth wrote that the user then edits in the live file is theirs:
-/// a switch onto a picker-less account keeps it.
+/// a switch onto a picker-less account keeps it, and a picker account that
+/// replaces it gives it back.
 #[test]
 fn a_model_picker_edited_in_the_live_file_survives_a_switch_away() {
     let _home = HomeSandbox::new();
@@ -23517,31 +23594,60 @@ fn a_model_picker_edited_in_the_live_file_survives_a_switch_away() {
     let edited = serde_json::json!({"options": [{"model": "a-model", "label": "Mine"}]});
     hand_set_model_picker(&edited);
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
-    assert_eq!(live_model_picker(), Some(edited));
-}
-
-/// Deleting the active account keeps a hand-set picker and removes the one
-/// clauth wrote for it.
-#[test]
-fn deleting_the_active_account_removes_only_the_model_picker_clauth_wrote() {
-    let _home = HomeSandbox::new();
-    let (a, b) = seed_two_captured();
-    give_model_picker(&a, "a-model");
-    let mut config = crate::profile::load_config().expect("read");
-    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
-    let mine = one_row_picker("mine");
-    hand_set_model_picker(&mine);
-    let rotation = crate::actions::rotation_guard_for_mutation(&b).expect("rotation guard");
-    delete_profile(&mut config, &b, false, &rotation).expect("delete b");
-    drop(rotation);
-    assert_eq!(live_model_picker(), Some(mine), "the hand-set picker stays");
+    assert_eq!(live_model_picker().as_ref(), Some(&edited));
 
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
-    let rotation = crate::actions::rotation_guard_for_mutation(&a).expect("rotation guard");
-    delete_profile(&mut config, &a, false, &rotation).expect("delete a");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(edited),
+        "a's visit kept the edited picker and gives it back"
+    );
+}
+
+/// Deleting the active account keeps a hand-set picker, gives back one its
+/// picker replaced, and removes the one clauth wrote over none.
+#[test]
+fn deleting_the_active_account_removes_only_the_model_picker_clauth_wrote() {
+    let _home = HomeSandbox::new();
+    let names = seed_captured(&["a", "b", "c"]);
+    let [a, b, c] = names.as_slice() else {
+        panic!("three accounts");
+    };
+    give_model_picker(a, "a-model");
+    give_model_picker(c, "c-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    let mine = one_row_picker("mine");
+    hand_set_model_picker(&mine);
+    let rotation = crate::actions::rotation_guard_for_mutation(b).expect("rotation guard");
+    delete_profile(&mut config, b, false, &rotation).expect("delete b");
     drop(rotation);
-    assert_eq!(live_model_picker(), None, "a's picker leaves with a");
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "the hand-set picker stays"
+    );
+
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    let rotation = crate::actions::rotation_guard_for_mutation(a).expect("rotation guard");
+    delete_profile(&mut config, a, false, &rotation).expect("delete a");
+    drop(rotation);
+    assert_eq!(
+        live_model_picker(),
+        Some(mine),
+        "a's picker leaves with a and the hand-set one comes back"
+    );
+
+    hand_remove_model_picker();
+    assert!(switch_profile_locked(&mut config, c).expect("switch to c"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("c-model")));
+    let rotation = crate::actions::rotation_guard_for_mutation(c).expect("rotation guard");
+    delete_profile(&mut config, c, false, &rotation).expect("delete c");
+    drop(rotation);
+    assert_eq!(live_model_picker(), None, "c's picker leaves with c");
 }
 
 /// Every edit that re-applies the active account keeps a hand-set picker;
@@ -23580,23 +23686,40 @@ fn an_edit_to_the_active_account_removes_only_the_model_picker_clauth_wrote() {
     .expect("endpoint edit");
     assert_eq!(live_model_picker().as_ref(), Some(&mine), "endpoint edit");
 
-    give_model_picker(&a, "a-model");
-    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
-    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
     let path = crate::profile::profile_dir(&a)
         .expect("profile dir")
         .join("config.toml");
-    let body = std::fs::read_to_string(&path).expect("read config.toml");
-    let (kept, _) = body
-        .rsplit_once("\n[model_picker]\n")
-        .expect("the picker table");
-    std::fs::write(&path, kept).expect("drop the picker by hand");
+    let drop_picker = || {
+        let body = std::fs::read_to_string(&path).expect("read config.toml");
+        let (kept, _) = body
+            .rsplit_once("\n[model_picker]\n")
+            .expect("the picker table");
+        std::fs::write(&path, kept).expect("drop the picker by hand");
+    };
+    give_model_picker(&a, "a-model");
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    drop_picker();
+    edit_profile_effort(&mut config, &a, |effort| *effort = Some("low".to_string()))
+        .expect("effort edit on a");
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "clauth's own picker leaves once a no longer holds it, and the hand-set one comes back"
+    );
+
+    hand_remove_model_picker();
+    give_model_picker(&a, "a-model");
+    edit_profile_effort(&mut config, &a, |effort| *effort = Some("high".to_string()))
+        .expect("effort edit on a");
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    drop_picker();
     edit_profile_effort(&mut config, &a, |effort| *effort = Some("low".to_string()))
         .expect("effort edit on a");
     assert_eq!(
         live_model_picker(),
         None,
-        "clauth's own picker leaves once a no longer holds it"
+        "clauth's own picker that replaced none leaves once a no longer holds it"
     );
 }
 
@@ -23644,10 +23767,82 @@ fn a_live_model_picker_without_an_entry_is_clauths_only_while_the_record_is_sile
     assert_eq!(live_model_picker(), Some(mine), "no account holds it");
 }
 
-/// A switch-off leaves the live `modelPicker` as it is, clauth's own and a
-/// hand-set one alike; the next switch then judges it as any switch does.
+/// What a switch by a clauth that predates the record does to the picker it
+/// finds: name `to` active and leave `picker` live, writing no record entry.
+fn old_clauth_switches_with_picker(
+    config: &mut AppConfig,
+    to: &crate::profile::ProfileName,
+    picker: &serde_json::Value,
+) {
+    hand_set_model_picker(picker);
+    let mut state = crate::profile::load_app_state().expect("read state");
+    state.active_profile = Some(to.clone());
+    crate::profile::save_app_state(&state).expect("save state");
+    *config = crate::profile::load_config().expect("re-read");
+}
+
+/// After a switch by a clauth that predates the record, a live picker equal
+/// to some account's own is clauth's, with an entry naming another value or
+/// none: a switch onto a picker-less account removes it, or gives back the
+/// hand-set picker the entry saved. One no account holds stays the user's.
 #[test]
-fn a_switch_off_leaves_the_live_model_picker() {
+fn a_live_model_picker_an_account_holds_is_clauths_after_an_older_clauths_switch() {
+    let _home = HomeSandbox::new();
+    let names = seed_captured(&["a", "b", "c", "d"]);
+    let [a, b, c, d] = names.as_slice() else {
+        panic!("four accounts");
+    };
+    give_model_picker(a, "a-model");
+    give_model_picker(c, "c-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+
+    // No entry: a's own picker reads as clauth's.
+    old_clauth_switches_with_picker(&mut config, d, &one_row_picker("a-model"));
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        None,
+        "an entry-less picker equal to a's own leaves"
+    );
+
+    // No entry, a value no account holds: the user's.
+    let mine = one_row_picker("mine");
+    old_clauth_switches_with_picker(&mut config, d, &mine);
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "an entry-less picker no account holds stays"
+    );
+
+    // An entry naming a's picker and saving `mine`; c's own picker is live.
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    old_clauth_switches_with_picker(&mut config, c, &one_row_picker("c-model"));
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "c's own picker leaves and the saved one comes back"
+    );
+
+    // An entry naming a's picker; a value no account holds is live.
+    assert!(switch_profile_locked(&mut config, a).expect("switch to a"));
+    let theirs = one_row_picker("theirs");
+    old_clauth_switches_with_picker(&mut config, d, &theirs);
+    assert!(switch_profile_locked(&mut config, b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(theirs),
+        "a picker no account holds stays, whatever the entry saved"
+    );
+}
+
+/// A switch-off keeps a hand-set `modelPicker`, gives back one the departing
+/// account's picker replaced, and leaves clauth's own that replaced none; the
+/// next switch then judges the live value as any switch does.
+#[test]
+fn a_switch_off_puts_back_only_a_model_picker_clauth_replaced() {
     let _home = HomeSandbox::new();
     let (a, b) = seed_two_captured();
     give_model_picker(&a, "a-model");
@@ -23673,6 +23868,32 @@ fn a_switch_off_leaves_the_live_model_picker() {
     );
 
     assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    assert_eq!(live_model_picker(), Some(one_row_picker("a-model")));
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "switch-off gives back the hand-set picker a replaced"
+    );
+    let record: serde_json::Value =
+        crate::profile::read_json_file(&base_env_path()).expect("read the record");
+    assert!(
+        record.get("top").is_none(),
+        "the entry retires with the put-back"
+    );
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker().as_ref(),
+        Some(&mine),
+        "and it is the user's again"
+    );
+
+    hand_remove_model_picker();
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
     assert!(
         switch_off_locked(&mut config)
             .expect("switch off")
@@ -23681,10 +23902,73 @@ fn a_switch_off_leaves_the_live_model_picker() {
     assert_eq!(
         live_model_picker(),
         Some(one_row_picker("a-model")),
-        "switch-off keeps clauth's own"
+        "switch-off keeps clauth's own that replaced none"
     );
     assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
     assert_eq!(live_model_picker(), None, "and it is still clauth's after");
+
+    hand_set_model_picker(&mine);
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    let edited = serde_json::json!({"options": [{"model": "a-model", "label": "Mine"}]});
+    hand_set_model_picker(&edited);
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
+    assert_eq!(
+        live_model_picker(),
+        Some(edited),
+        "switch-off keeps a picker the user edited over clauth's"
+    );
+}
+
+/// A switch-off over a `~/.clauth/base-env.json` that does not read, with a
+/// live picker whose saved value only the record holds, lands and says it
+/// could not put it back, leaving the record as it was.
+#[test]
+fn a_switch_off_over_an_unreadable_record_with_a_live_picker_says_so() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_model_picker(&a, "a-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    hand_set_model_picker(&one_row_picker("mine"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    std::fs::write(base_env_path(), "{ torn").expect("tear the record");
+    // The parse failure comes off the same read the put-back makes.
+    let read_error = crate::profile::read_json_file::<serde_json::Value>(&base_env_path())
+        .expect_err("control: the torn record does not parse");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("the switch-off lands")
+            .is_some()
+    );
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read the record"),
+        "{ torn",
+        "the record is as it was"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        [format!(
+            "clauth: switched off, but could not put back the settings.json values a \
+             covered: {}: {read_error:#}; the next switch that lands puts them back",
+            base_env_refusal()
+        )],
+        "one line, naming the account and the record's refusal"
+    );
+}
+
+/// The refusal of a `~/.clauth/base-env.json` that does not read.
+fn base_env_refusal() -> String {
+    format!(
+        "{} holds env values, per-model effort levels and the modelPicker covered in \
+         ~/.claude/settings.json; repair it (removing it gives those values up)",
+        base_env_path().display()
+    )
 }
 
 /// An active proxy account's delete decides the live apply's refusals before
@@ -23732,14 +24016,7 @@ fn a_proxy_delete_with_an_unreadable_record_refuses_before_any_proxy_request() {
         .expect_err("the delete refuses");
     drop(rotation);
 
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "{} holds env values and per-model effort levels covered in ~/.claude/settings.json; \
-             repair it (removing it gives those values up)",
-            base_env_path().display()
-        )
-    );
+    assert_eq!(err.to_string(), base_env_refusal());
     assert!(config.find(&name).is_some(), "the profile stays");
     crate::testutil::assert_nothing_sent(&listener);
 }
@@ -23767,14 +24044,16 @@ fn a_picker_only_apply_refuses_a_record_it_cannot_read() {
     let err = crate::claude::apply_profile_to_claude_settings(&profile, &[])
         .expect_err("an unreadable record could hide the picker clauth wrote");
     assert!(format!("{err:#}").contains("base-env.json"), "{err:#}");
+    assert_eq!(err.to_string(), base_env_refusal(), "it names the picker");
     assert_eq!(
         std::fs::read_to_string(base_env_path()).expect("read the record"),
         "{ torn",
         "the refused apply left the record alone"
     );
-    assert!(
-        live_settings().get("modelPicker").is_none(),
-        "nothing was written"
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read the live file"),
+        "{}",
+        "the live file is as seeded"
     );
 
     forget_base_env_record();
@@ -23806,9 +24085,15 @@ fn a_levels_only_apply_refuses_a_record_it_cannot_read() {
     let err = crate::claude::apply_profile_to_claude_settings(&profile, &[])
         .expect_err("an unreadable record could hide a level clauth wrote");
     assert!(format!("{err:#}").contains("base-env.json"), "{err:#}");
-    assert!(
-        live_settings().get("modelSettings").is_none(),
-        "nothing was written"
+    assert_eq!(
+        std::fs::read_to_string(base_env_path()).expect("read the record"),
+        "{ torn",
+        "the refused apply left the record alone"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read the live file"),
+        "{}",
+        "the live file is as seeded"
     );
 
     forget_base_env_record();

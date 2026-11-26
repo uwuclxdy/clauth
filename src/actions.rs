@@ -1698,7 +1698,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<Profile
             && crate::claude::is_first_login(&departed)?
         {
             bail!(SwitchOffHeld {
-                account: departed.clone(),
+                account: departed,
                 login: crate::claude::UnsavedLogin::live(),
             });
         }
@@ -1728,7 +1728,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<Profile
         if let Err(e) = crate::claude::release_saved_base_env(&prev_env_keys, held) {
             crate::logline::logline!(
                 "clauth: switched off, but could not put back the settings.json values \
-                 {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
+                 {departed} covered: {e:#}; the next switch that lands puts them back" // PLACEHOLDER(copy)
             );
         }
         Ok(Some(departed))

@@ -24,10 +24,11 @@
 //!   would be undone on every start.
 //! - `~/.claude/settings.json` is NOT a pristine operator base.
 //!   `claude::apply_profile_to_claude_settings` rewrites the ACTIVE profile's
-//!   managed env keys, `apiKeyHelper`, `model`, `advisorModel`, and
-//!   `modelPicker` into that very file on every switch. It is a member carrying its own per-profile
-//!   fields, so those must neither propagate outward nor be overwritten by a
-//!   sibling's — which the symmetric [`key_role`] rule gives for free.
+//!   managed env keys, `apiKeyHelper`, `model`, `advisorModel`, and a picker
+//!   account's `modelPicker` into that very file on every switch. It is a
+//!   member carrying its own per-profile fields, so those must neither
+//!   propagate outward nor be overwritten by a sibling's — which the
+//!   symmetric [`key_role`] rule gives for free.
 //!
 //! With no live `clauth start` session there is no copy to merge: teardown
 //! discards each session's runtime tree, so the base is the only surviving
