@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 fn oauth(name: &str, auto: bool) -> Profile {
     Profile {
+        model_picker: None,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -3220,6 +3221,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
 /// off `auth_broken`, so the chip tests need no live windows.
 fn bare(name: &str) -> Profile {
     Profile {
+        model_picker: None,
         name: name.into(),
         base_url: None,
         api_key: None,

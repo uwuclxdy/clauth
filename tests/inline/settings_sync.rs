@@ -501,6 +501,58 @@ fn advisor_model_stays_exactly_where_it_was() {
     );
 }
 
+// Each member keeps its own `modelPicker`; shared keys still propagate.
+#[test]
+fn model_picker_stays_per_member_while_shared_keys_sync() {
+    let custom_env = PerProfileKeys::default();
+    assert_eq!(
+        key_role(KeyPath::Top("modelPicker"), &custom_env),
+        KeyRule::PerProfile,
+        "modelPicker lists one account's models and must never propagate"
+    );
+
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let p1 = runtime_path(home.home(), "p1");
+    let p2 = runtime_path(home.home(), "p2");
+    write_json(&base, &json!({"env": {}}), t(1));
+    let _live_p1 = live_recorded_json(
+        home.home(),
+        &p1,
+        &json!({"modelPicker": {"options": [{"model": "a"}]}, "theme": "light", "env": {}}),
+        t(5),
+    );
+    let _live_p2 = live_recorded_json(
+        home.home(),
+        &p2,
+        &json!({"modelPicker": {"options": [{"model": "b"}]}, "theme": "dark", "env": {}}),
+        t(10),
+    );
+
+    sync();
+
+    assert_eq!(
+        read_json(&p1)["modelPicker"],
+        json!({"options": [{"model": "a"}]}),
+        "p1 lost its own picker to the newer sibling"
+    );
+    assert_eq!(
+        read_json(&p2)["modelPicker"],
+        json!({"options": [{"model": "b"}]}),
+        "p2 changed its own picker"
+    );
+    assert!(
+        read_json(&base).get("modelPicker").is_none(),
+        "the base received a member's picker"
+    );
+    assert_eq!(
+        read_json(&p1)["theme"],
+        json!("dark"),
+        "precondition: the newer member's shared key reached p1"
+    );
+    assert_eq!(read_json(&base)["theme"], json!("dark"));
+}
+
 #[test]
 fn unparseable_member_is_skipped_not_clobbered() {
     let home = HomeSandbox::new();

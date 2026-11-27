@@ -9637,3 +9637,410 @@ fn global_switch_stamps_a_store_whose_mtime_already_differs() {
         "a relink onto the same store is not a swap"
     );
 }
+
+// ---- [model_picker] -> settings.json `modelPicker` ----
+
+fn picker_row(model: &str) -> crate::profile::ModelPickerOption {
+    crate::profile::ModelPickerOption {
+        model: model.to_string(),
+        label: None,
+        description: None,
+        behaves_as: None,
+    }
+}
+
+fn picker_profile(
+    replace_built_in: Option<bool>,
+    options: Vec<crate::profile::ModelPickerOption>,
+) -> Profile {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.model_picker = Some(crate::profile::ModelPicker {
+        replace_built_in,
+        options,
+    });
+    profile
+}
+
+/// Settings JSON built from `profile` over an optional base file body.
+fn picker_settings(base_body: Option<&str>, profile: &Profile) -> serde_json::Value {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    if let Some(body) = base_body {
+        fs::write(&base, body).expect("write base");
+    }
+    let json = build_claude_settings_json(Some(&base), profile, &[]).expect("build settings");
+    serde_json::from_str(&json).expect("parse settings")
+}
+
+// A two-row picker lands as camelCase `modelPicker`, with no null keys.
+#[test]
+fn a_model_picker_lands_as_camel_case() {
+    let profile = picker_profile(
+        Some(true),
+        vec![
+            crate::profile::ModelPickerOption {
+                label: Some("Kimi K3.1 Pro".to_string()),
+                ..picker_row("kimi-k3.1-pro-uncensored")
+            },
+            crate::profile::ModelPickerOption {
+                description: Some("fast".to_string()),
+                behaves_as: Some("claude-opus-4-8".to_string()),
+                ..picker_row("glm-5.3-uncensored")
+            },
+        ],
+    );
+    let v = picker_settings(None, &profile);
+    assert_eq!(
+        v["modelPicker"],
+        serde_json::json!({
+            "replaceBuiltInOptions": true,
+            "options": [
+                {"model": "kimi-k3.1-pro-uncensored", "label": "Kimi K3.1 Pro"},
+                {"model": "glm-5.3-uncensored", "description": "fast", "behavesAs": "claude-opus-4-8"}
+            ]
+        })
+    );
+}
+
+// Account B's picker replaces account A's base `modelPicker` wholesale.
+#[test]
+fn a_profile_picker_replaces_the_base_picker() {
+    let base = r#"{"modelPicker": {"replaceBuiltInOptions": true, "options": [{"model": "a-model", "label": "A"}]}}"#;
+    let profile = picker_profile(Some(false), vec![picker_row("b-model")]);
+    let v = picker_settings(Some(base), &profile);
+    assert_eq!(
+        v["modelPicker"],
+        serde_json::json!({
+            "replaceBuiltInOptions": false,
+            "options": [{"model": "b-model"}]
+        })
+    );
+}
+
+fn write_live_settings(settings: &serde_json::Value) {
+    let path = claude_settings_path().expect("settings path");
+    fs::create_dir_all(path.parent().expect("settings dir")).expect("create ~/.claude");
+    fs::write(&path, serde_json::to_string(settings).expect("ser")).expect("write settings");
+}
+
+fn read_live_settings() -> serde_json::Value {
+    let path = claude_settings_path().expect("settings path");
+    serde_json::from_str(&fs::read_to_string(path).expect("read settings")).expect("parse settings")
+}
+
+/// `~/.clauth/base-env.json` as JSON.
+fn base_env_record() -> serde_json::Value {
+    let path = saved_base_env_path().expect("record path");
+    serde_json::from_str(&fs::read_to_string(path).expect("read record")).expect("parse record")
+}
+
+// A `modelPicker` set by hand in `~/.claude/settings.json` stays through the
+// live apply of an account without a picker, and so do the other keys.
+#[test]
+fn a_hand_set_model_picker_survives_an_apply_without_a_picker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let hand_set = serde_json::json!({"options": [{"model": "x"}]});
+    write_live_settings(&serde_json::json!({
+        "modelPicker": hand_set,
+        "theme": "dark",
+        "hooks": {"Stop": []}
+    }));
+    let profile = Profile::new("p".to_string(), None, None);
+    assert!(profile.model_picker.is_none());
+    apply_profile_to_claude_settings(&profile, &[]).expect("apply");
+    let v = read_live_settings();
+    assert_eq!(v["modelPicker"], hand_set, "the hand-set picker stays: {v}");
+    assert_eq!(v["theme"], "dark");
+    assert_eq!(v["hooks"], serde_json::json!({"Stop": []}));
+}
+
+// A `clauth start` copy is clauth's own file: a picker-less member's copy holds
+// no `modelPicker` whatever the base holds, and a picker with no live row
+// counts as none.
+#[test]
+fn a_runtime_copy_of_a_picker_less_member_holds_no_model_picker() {
+    let base = r#"{"modelPicker": {"options": [{"model": "x"}]}, "theme": "dark"}"#;
+    for (case, profile) in [
+        ("no table", Profile::new("p".to_string(), None, None)),
+        (
+            "all blank rows",
+            picker_profile(Some(true), vec![picker_row(""), picker_row("  ")]),
+        ),
+        ("options = []", picker_profile(Some(true), Vec::new())),
+    ] {
+        let v = picker_settings(Some(base), &profile);
+        assert!(
+            v.get("modelPicker").is_none(),
+            "{case}: the copy holds no modelPicker: {v}"
+        );
+        assert_eq!(v["theme"], "dark", "{case}: other keys stay");
+        let without_base = picker_settings(None, &profile);
+        assert!(
+            without_base.get("modelPicker").is_none(),
+            "{case}: no modelPicker written: {without_base}"
+        );
+    }
+}
+
+// Blank rows are dropped, `model` is trimmed, and `label` is emitted as written.
+#[test]
+fn blank_picker_rows_are_dropped_and_models_trimmed() {
+    let profile = picker_profile(
+        None,
+        vec![
+            picker_row(""),
+            picker_row("   "),
+            crate::profile::ModelPickerOption {
+                label: Some(" GLM ".to_string()),
+                ..picker_row("  glm-5.3  ")
+            },
+        ],
+    );
+    let v = picker_settings(None, &profile);
+    assert_eq!(
+        v["modelPicker"]["options"],
+        serde_json::json!([{"model": "glm-5.3", "label": " GLM "}])
+    );
+}
+
+// An all-blank picker and an empty `options` each count as no picker on the
+// live apply: a hand-set `modelPicker` stays.
+#[test]
+fn a_picker_without_live_rows_keeps_a_hand_set_model_picker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let hand_set = serde_json::json!({"options": [{"model": "x"}]});
+    for (case, profile) in [
+        (
+            "all blank rows",
+            picker_profile(Some(true), vec![picker_row(""), picker_row("  ")]),
+        ),
+        ("options = []", picker_profile(Some(true), Vec::new())),
+    ] {
+        write_live_settings(&serde_json::json!({"modelPicker": hand_set, "theme": "dark"}));
+        apply_profile_to_claude_settings(&profile, &[]).expect("apply");
+        let v = read_live_settings();
+        assert_eq!(
+            v["modelPicker"], hand_set,
+            "{case}: the hand-set picker stays"
+        );
+        assert_eq!(v["theme"], "dark", "{case}: other keys stay");
+    }
+}
+
+// The picker clauth wrote still reads as its own after the live file is
+// rewritten with every object's keys in another order.
+#[test]
+fn clauths_own_picker_reads_as_its_own_after_a_key_reorder() {
+    let written = serde_json::json!({
+        "replaceBuiltInOptions": true,
+        "options": [{"model": "m", "label": "M"}]
+    });
+    let reordered: serde_json::Value = serde_json::from_str(
+        r#"{"options": [{"label": "M", "model": "m"}], "replaceBuiltInOptions": true}"#,
+    )
+    .expect("parse");
+    assert_eq!(
+        wrote_digest(&written),
+        wrote_digest(&reordered),
+        "the digest is key-order free"
+    );
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = picker_profile(
+        Some(true),
+        vec![crate::profile::ModelPickerOption {
+            label: Some("M".to_string()),
+            ..picker_row("m")
+        }],
+    );
+    apply_profile_to_claude_settings(&profile, &[]).expect("apply the picker");
+    let mut live = read_live_settings();
+    assert_eq!(live["modelPicker"], written, "control: the picker landed");
+    live["modelPicker"] = reordered;
+    let path = claude_settings_path().expect("settings path");
+    fs::write(&path, serde_json::to_string(&live).expect("ser")).expect("reorder");
+    assert!(
+        fs::read_to_string(&path)
+            .expect("read")
+            .contains(r#""modelPicker":{"options":[{"label":"M","model":"m"}]"#),
+        "control: the live file holds the reordered keys"
+    );
+    apply_profile_to_claude_settings(&Profile::new("q".to_string(), None, None), &[])
+        .expect("apply without a picker");
+    assert!(
+        read_live_settings().get("modelPicker").is_none(),
+        "clauth's own picker leaves"
+    );
+}
+
+const PICKER_A_DIGEST: &str = "fc4a195c054f92a3fb48975748f02a89aeb31cd28c842d560ca9922a6cbfd48f";
+const PICKER_C_DIGEST: &str = "ca0ffbd8f01699c286deda61bbf31368aaa9f9cfdac5df30b6c3529b48d242a8";
+
+// The record names the picker clauth is about to write before the live write:
+// a failed write leaves the value still live clauth's, and one that lands
+// lands the entry alone.
+#[test]
+fn the_record_names_the_model_picker_before_the_live_write() {
+    let home = crate::testutil::HomeSandbox::new();
+    let a = picker_profile(None, vec![picker_row("a-model")]);
+    let c = picker_profile(None, vec![picker_row("c-model")]);
+    let none = Profile::new("b".to_string(), None, None);
+    apply_profile_to_claude_settings(&a, &[]).expect("apply a");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"wrote": PICKER_A_DIGEST})
+    );
+
+    let fault = FailLiveSettingsWrite::new(&home);
+    let failed = apply_profile_to_claude_settings(&c, &[]);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        read_live_settings()["modelPicker"],
+        serde_json::json!({"options": [{"model": "a-model"}]}),
+        "a's picker is still live"
+    );
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"wrote": PICKER_C_DIGEST, "pending": PICKER_A_DIGEST})
+    );
+    apply_profile_to_claude_settings(&none, &[]).expect("apply without a picker");
+    assert!(
+        read_live_settings().get("modelPicker").is_none(),
+        "a's picker is still clauth's, so it leaves"
+    );
+    assert!(
+        base_env_record().get("top").is_none(),
+        "the entry retires with the value"
+    );
+
+    apply_profile_to_claude_settings(&a, &[]).expect("apply a");
+    apply_profile_to_claude_settings(&c, &[]).expect("apply c");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"wrote": PICKER_C_DIGEST}),
+        "a landed takeover keeps no pending digest"
+    );
+    apply_profile_to_claude_settings(&none, &[]).expect("apply without a picker");
+    assert!(read_live_settings().get("modelPicker").is_none());
+}
+
+// A hand-set picker an account's picker replaces rides the record as the
+// entry's `base`, raw, through a failed live write too, and comes back on the
+// apply of an account without a picker.
+#[test]
+fn a_hand_set_model_picker_rides_the_record_as_its_base() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mine = serde_json::json!({"options": [{"model": "mine"}]});
+    write_live_settings(&serde_json::json!({"modelPicker": mine}));
+    let a = picker_profile(None, vec![picker_row("a-model")]);
+    let c = picker_profile(None, vec![picker_row("c-model")]);
+    let none = Profile::new("b".to_string(), None, None);
+    apply_profile_to_claude_settings(&a, &[]).expect("apply a");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"base": mine, "wrote": PICKER_A_DIGEST})
+    );
+
+    let fault = FailLiveSettingsWrite::new(&home);
+    let failed = apply_profile_to_claude_settings(&c, &[]);
+    drop(fault);
+    assert!(failed.is_err(), "control: the live write failed");
+    assert_eq!(
+        base_env_record()["top"]["modelPicker"],
+        serde_json::json!({"base": mine, "wrote": PICKER_C_DIGEST, "pending": PICKER_A_DIGEST})
+    );
+    apply_profile_to_claude_settings(&none, &[]).expect("apply without a picker");
+    assert_eq!(
+        read_live_settings()["modelPicker"],
+        mine,
+        "the hand-set picker comes back"
+    );
+    assert!(
+        base_env_record().get("top").is_none(),
+        "the entry retires with the value"
+    );
+}
+
+// A record written before top-level entries existed loads and writes back
+// byte for byte; one holding an entry loads and keeps it.
+#[test]
+fn a_record_keeps_its_shape_with_and_without_top_level_entries() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = saved_base_env_path().expect("record path");
+    fs::create_dir_all(path.parent().expect("record dir")).expect("create ~/.clauth");
+    let wrote = "0".repeat(64);
+    let env_only = format!(
+        "{{\n  \"v\": 1,\n  \"active\": \"a\",\n  \"keys\": {{\n    \"ENDPOINT\": {{\n      \"base\": \"user\",\n      \"wrote\": \"{wrote}\"\n    }}\n  }}\n}}"
+    );
+    let with_top = format!(
+        "{{\n  \"v\": 1,\n  \"active\": \"a\",\n  \"keys\": {{}},\n  \"top\": {{\n    \"modelPicker\": {{\n      \"wrote\": \"{wrote}\"\n    }}\n  }}\n}}"
+    );
+    for (case, body) in [("env only", env_only), ("a top-level entry", with_top)] {
+        fs::write(&path, &body).expect("write record");
+        let saved = read_saved_base_env()
+            .unwrap_or_else(|e| panic!("{case}: the record loads: {e:#}"))
+            .expect("present");
+        write_saved_base_env(&saved).expect("write back");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            body,
+            "{case}: byte for byte"
+        );
+    }
+}
+
+// `replace_built_in` unset writes no `replaceBuiltInOptions` key.
+#[test]
+fn an_unset_replace_built_in_writes_no_key() {
+    let profile = picker_profile(None, vec![picker_row("glm-5.3")]);
+    let v = picker_settings(None, &profile);
+    let picker = v["modelPicker"].as_object().expect("modelPicker object");
+    assert!(
+        !picker.contains_key("replaceBuiltInOptions"),
+        "no replaceBuiltInOptions key: {picker:?}"
+    );
+    assert_eq!(
+        v["modelPicker"]["options"],
+        serde_json::json!([{"model": "glm-5.3"}])
+    );
+}
+
+// A profile whose only setting is a live picker creates settings.json.
+#[test]
+fn a_live_picker_alone_writes_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+    assert!(!path.exists(), "sandbox starts without settings.json");
+
+    let profile = picker_profile(None, vec![picker_row("glm-5.3-uncensored")]);
+    apply_profile_to_claude_settings(&profile, &[]).expect("apply");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("settings written"))
+            .expect("parse settings");
+    assert_eq!(
+        v["modelPicker"]["options"][0]["model"],
+        "glm-5.3-uncensored"
+    );
+}
+
+// An all-blank picker alone creates no settings.json. The live-row control at
+// the end proves the gate reads the picker at all (without it the blank case
+// passes vacuously before the gate counts pickers).
+#[test]
+fn a_blank_picker_alone_writes_no_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = claude_settings_path().expect("settings path");
+
+    let blank = picker_profile(None, vec![picker_row("")]);
+    apply_profile_to_claude_settings(&blank, &[]).expect("apply blank");
+    assert!(
+        !path.exists(),
+        "an all-blank picker counts as unset: no settings.json"
+    );
+
+    let live = picker_profile(None, vec![picker_row("glm-5.3-uncensored")]);
+    apply_profile_to_claude_settings(&live, &[]).expect("apply live");
+    assert!(path.exists(), "a live picker does create settings.json");
+}

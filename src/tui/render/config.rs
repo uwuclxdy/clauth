@@ -18,7 +18,7 @@ use super::super::app::{
     new_form_draft, pool_auth_label,
 };
 use super::super::theme;
-use super::format::{NO_DATA, middle_truncate, spinner_frame, truncate};
+use super::format::{NO_DATA, grapheme_cells, middle_truncate, spinner_frame, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, ListView, MIN_VALUE_W, bold_when,
     cycle_row_lines, draw_following_list, draw_scrolled_lines, head_cols, help_tooltip_lines,
@@ -248,6 +248,9 @@ struct Snap {
     fable: String,
     subagent: String,
     advisor: String,
+    /// The read-only `picker` summary line (`picker_summary`); `none` when the
+    /// profile has no live `[model_picker]` row.
+    model_picker: String,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     /// The key an Overwrite left pending (`ConfigDraft::env_pending`) on this
@@ -439,6 +442,7 @@ impl Snap {
             fable: String::new(),
             subagent: String::new(),
             advisor: String::new(),
+            model_picker: "none".to_string(),
             env: Vec::new(),
             env_pending: None,
             auto_start: false,
@@ -477,6 +481,37 @@ impl Snap {
             create_refusal: None,
             login_disabled_reason: None,
         }
+    }
+}
+
+/// The tail the `picker` value carries while the picker hides Claude Code's
+/// built-in lineup; the first part to shed in a short value column.
+const PICKER_REPLACES: &str = " (replaces built-in)";
+
+/// The Setup header's `picker` value: `none` without a live row, else
+/// `N option(s)`, plus [`PICKER_REPLACES`] when `replace_built_in` is true.
+fn picker_summary(picker: Option<&crate::profile::ModelPicker>) -> String {
+    let n = picker.map_or(0, |mp| mp.live_options().count());
+    let Some(mp) = picker.filter(|_| n > 0) else {
+        return "none".to_string();
+    };
+    let mut out = format!("{n} option{}", if n == 1 { "" } else { "s" });
+    if mp.replace_built_in == Some(true) {
+        out.push_str(PICKER_REPLACES);
+    }
+    out
+}
+
+/// `summary` fitted to `width` cells: whole when it fits, else cut to end in
+/// `…`, shedding [`PICKER_REPLACES`] first, so a value that lost it ends in
+/// the mark once one cell fits.
+fn fit_picker_summary(summary: &str, width: usize) -> String {
+    if grapheme_cells(summary) <= width {
+        return summary.to_string();
+    }
+    match summary.strip_suffix(PICKER_REPLACES) {
+        Some(count) => truncate(&format!("{count}…"), width),
+        None => truncate(summary, width),
     }
 }
 
@@ -567,6 +602,7 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 fable: text(&p.models.fable),
                 subagent: text(&p.models.subagent),
                 advisor: text(&p.models.advisor),
+                model_picker: picker_summary(p.model_picker.as_ref()),
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -1222,11 +1258,24 @@ fn draw_settings_rows(
         ));
     }
 
+    // Read-only: no row, focus stop or editor. Hand-edited in `config.toml`.
+    if !is_new_form {
+        let key = key_cell("picker", DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+        let value_w = usize::from(inner.width).saturating_sub(grapheme_cells(&key));
+        lines.push(Line::from(vec![
+            Span::styled(key, theme::label()),
+            Span::styled(
+                fit_picker_summary(&snap.model_picker, value_w),
+                theme::dim(),
+            ),
+        ]));
+    }
+
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
     // (optional status + type + optional email + optional provider + optional
-    // session + blank),
+    // session + picker + blank),
     // so the row loop's base index is simply what has been pushed so far.
     let mut edit_caret: Option<(u16, std::borrow::Cow<'_, InputState>, usize)> = None;
     let mut line_idx: u16 = lines.len() as u16;

@@ -25,6 +25,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
     };
     (
         Profile {
+            model_picker: None,
             name: name.into(),
             base_url: None,
             api_key: None,

@@ -1645,8 +1645,9 @@ pub(crate) fn switch_profile_noninteractive(
 }
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account,
-/// clear the active marker, and then put the `[env]` values the account covered
-/// back the way a switch away does. Used by wrap-off mode when the whole chain
+/// clear the active marker, and then put back the `[env]` values the account
+/// covered and a hand-set `modelPicker` its picker replaced, the way a switch
+/// away does. Used by wrap-off mode when the whole chain
 /// is exhausted. No-op when no profile is active. The put-back is best-effort
 /// and last: a `settings.json` or saved-values record that cannot be read or
 /// written logs one line and leaves the covers live until the next apply that
@@ -1698,7 +1699,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<Profile
             && crate::claude::is_first_login(&departed)?
         {
             bail!(SwitchOffHeld {
-                account: departed.clone(),
+                account: departed,
                 login: crate::claude::UnsavedLogin::live(),
             });
         }
@@ -1728,7 +1729,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<Profile
         if let Err(e) = crate::claude::release_saved_base_env(&prev_env_keys, held) {
             crate::logline::logline!(
                 "clauth: switched off, but could not put back the settings.json values \
-                 {departed}'s [env] keys covered: {e:#}; the next switch that lands puts them back"
+                 {departed} covered: {e:#}; the next switch that lands puts them back"
             );
         }
         Ok(Some(departed))
@@ -2831,6 +2832,21 @@ fn refuse_use_of_claude_login(profile: &Profile, ending: &str) -> Result<()> {
     }
 }
 
+/// The env keys the live unwire of `name` settles: the caller's copy's and
+/// disk's, where a peer's edit may have stamped a key live.
+fn active_env_keys(config: &AppConfig, name: &ProfileName) -> Vec<String> {
+    config
+        .find(name)
+        .into_iter()
+        .flat_map(|p| p.env.keys().cloned())
+        .chain(
+            crate::profile::read_profile(name)
+                .into_iter()
+                .flat_map(|p| p.env.into_keys()),
+        )
+        .collect()
+}
+
 /// Delete a PROXY account: its account on the proxy (`DELETE /accounts/{id}`,
 /// which drops its upstream login), then the profile. Every local refusal
 /// that can be decided before that irreversible request is decided first —
@@ -2861,12 +2877,8 @@ pub(crate) fn delete_proxy_profile(
         crate::gateway_tokens::refuse_profile_delete(token.as_ref(), name.as_str(), held)?;
         if config.is_active(name) {
             let blank = Profile::new(name.to_string(), None, None);
-            let env_keys: Vec<String> = config
-                .find(name)
-                .map(|p| p.env.keys().cloned().collect())
-                .unwrap_or_default();
-            let settings = crate::claude::claude_settings_path()?;
-            crate::claude::build_claude_settings_json(Some(&settings), &blank, &env_keys)?;
+            let env_keys = active_env_keys(config, name);
+            crate::claude::refuse_live_apply_build(&blank, &env_keys)?;
         }
         Ok(())
     })?;
@@ -3005,23 +3017,12 @@ fn delete_profile_inner<C: std::ops::DerefMut<Target = AppConfig>>(
         if was_active {
             // An active API profile's base_url + api_key (and model-tier keys)
             // live in ~/.claude/settings.json, not the credentials link. Capture
-            // its custom env keys before removal so the unwire can strip those too:
-            // the caller's copy's and disk's, where a peer's edit may have stamped
-            // a key live.
-            let active_env_keys: Vec<String> = config
-                .find(name)
-                .map(|p| p.env.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-                .into_iter()
-                .chain(
-                    crate::profile::read_profile(name)
-                        .map(|p| p.env.into_keys().collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                )
-                .collect();
+            // its custom env keys before removal so the unwire can strip those
+            // too.
+            let env_keys = active_env_keys(&config, name);
             clear_claude_credentials()?;
             let blank = Profile::new(name.to_string(), None, None);
-            apply_profile_to_claude_settings(&blank, &active_env_keys)?;
+            apply_profile_to_claude_settings(&blank, &env_keys)?;
         }
         // Dir before state: a failed removal keeps the profile in state so the
         // user can retry; persisting state first would leave an orphan dir.
@@ -4557,6 +4558,7 @@ pub(crate) fn duplicate_profile(
         profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
+        profile.model_picker = src.model_picker.clone();
         profile.effort = src.effort.clone();
         profile.model_effort = src.model_effort.clone();
         profile.fallback_threshold = src.fallback_threshold;

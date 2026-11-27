@@ -165,6 +165,7 @@ fn helpers_budget_katakana_sound_marks_by_cell_width() {
 fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
     (
         Profile {
+            model_picker: None,
             name: "p".into(),
             base_url: None,
             api_key: None,

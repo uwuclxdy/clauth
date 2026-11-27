@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -365,6 +366,10 @@ pub(crate) struct Profile {
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
     pub(crate) models: ModelSettings,
+    /// The hand-edited `[model_picker]` table: the per-account `/model` picker
+    /// written as Claude Code's `modelPicker` setting. A save never writes it;
+    /// a create over a leftover `config.toml` replaces the leftover's.
+    pub(crate) model_picker: Option<ModelPicker>,
     /// Per-account Claude Code reasoning effort. While the `model` row names
     /// no single model (unset or `opusplan`) it is written as
     /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json`, the carrier a running
@@ -563,6 +568,7 @@ impl Profile {
             usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
+            model_picker: None,
             effort: None,
             model_effort: BTreeMap::new(),
             fallback_threshold: None,
@@ -2300,6 +2306,50 @@ pub(crate) struct ModelSettings {
     pub(crate) advisor: Option<String>,
 }
 
+/// The `[model_picker]` table: Claude Code's `modelPicker` setting for this
+/// account, each option one entry. With `replace_built_in = true` the picker
+/// shows only the Default row and these entries; false or unset adds them
+/// after the built-in lineup (the 2.1.323 settings schema). Hand-edited: a
+/// save never writes it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ModelPicker {
+    #[serde(
+        default,
+        alias = "replaceBuiltInOptions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) replace_built_in: Option<bool>,
+    #[serde(default)]
+    pub(crate) options: Vec<ModelPickerOption>,
+}
+
+/// One `[[model_picker.options]]` row. A row missing `model` parses as a blank
+/// model, so one bad row never fails the load; [`ModelPicker::live_options`]
+/// drops it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ModelPickerOption {
+    #[serde(default)]
+    pub(crate) model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(default, alias = "behavesAs", skip_serializing_if = "Option::is_none")]
+    pub(crate) behaves_as: Option<String>,
+}
+
+impl ModelPicker {
+    /// The rows that reach `settings.json`, each with its trimmed `model`:
+    /// blank-model rows dropped, config order kept, other fields as written.
+    /// The one blank-row rule every consumer shares.
+    pub(crate) fn live_options(&self) -> impl Iterator<Item = (&str, &ModelPickerOption)> {
+        self.options.iter().filter_map(|row| {
+            let model = row.model.trim();
+            (!model.is_empty()).then_some((model, row))
+        })
+    }
+}
+
 impl ModelSettings {
     pub(crate) fn is_empty(&self) -> bool {
         self.default.is_none()
@@ -2516,6 +2566,11 @@ struct ProfileConfig {
     /// must render after every scalar key in `render_config_toml`.
     #[serde(default)]
     console: ConsoleConfig,
+    /// `[model_picker]`, hand-edited: no save edits it, and only a create over
+    /// a leftover file replaces it (`claim_model_picker`). A TABLE, so it
+    /// renders last in `render_config_toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_picker: Option<ModelPicker>,
 }
 
 /// A plan date as `config.toml` holds it: a quoted string as typed, or an
@@ -5443,7 +5498,7 @@ pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
             return Ok(id);
         }
         let id = ProfileId::mint()?;
-        write_config_render(&read_profile(name)?, Some(&id), false)?;
+        write_config_render(&read_profile(name)?, Some(&id), false, false)?;
         Ok(id)
     })
 }
@@ -6149,6 +6204,7 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
+        model_picker: config.model_picker,
         effort: config.effort,
         model_effort: config.model_effort,
         fallback_threshold: finite_pct(config.fallback_threshold),
@@ -6238,6 +6294,7 @@ fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
         bell_threshold: profile.bell_threshold,
         disabled: profile.disabled,
         console: profile.saved_console(),
+        model_picker: profile.model_picker.clone(),
     }
 }
 
@@ -6285,13 +6342,20 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 &fresh_profile,
                 ConfigEditMode::Load,
                 None,
+                false,
             );
             return Ok(());
         }
         // An edit the writer refuses (a non-plain or unreadable shape) is a
         // no-op for the load: the value is already normalized in memory.
-        let _ =
-            edit_existing_config_toml(config_path, raw_config, profile, ConfigEditMode::Load, None);
+        let _ = edit_existing_config_toml(
+            config_path,
+            raw_config,
+            profile,
+            ConfigEditMode::Load,
+            None,
+            false,
+        );
         Ok(())
     });
 }
@@ -6533,7 +6597,7 @@ fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<(
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
         match fresh {
-            Some(id) => write_config_render(profile, Some(&id), true),
+            Some(id) => write_config_render(profile, Some(&id), true, true),
             None => write_profile_config(profile),
         }
     })
@@ -6589,8 +6653,10 @@ pub(crate) fn update_profile_config<T>(
 /// A save over a modelled key whose on-disk shape the writer does not edit.
 /// In a profile's `config.toml`: an inline table, a dotted or implicit table, a
 /// multi-line string, a multi-line array, a value of the wrong type, a table
-/// where a value belongs or a value where a table belongs, or the `kick_timer`
-/// alias beside `auto_start`. In a [`StateFile`], which edits every readable
+/// where a value belongs or a value where a table belongs, the `kick_timer`
+/// alias beside `auto_start`, or a `[model_picker]` field in both spellings
+/// (named `model_picker.replaceBuiltInOptions` or
+/// `model_picker.options.behavesAs`). In a [`StateFile`], which edits every readable
 /// shape in place: a key its model cannot read. Nothing is written; the file
 /// and the key are named and the file is left byte for byte. A distinct type so
 /// a caller can `downcast_ref` the refusal instead of matching its text.
@@ -6670,7 +6736,7 @@ impl std::error::Error for ConfigParseRefusal {}
 /// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
     let id = profile_id_at(&profile_config_path(&profile.name)?);
-    write_config_render(profile, id.as_ref(), false)
+    write_config_render(profile, id.as_ref(), false, false)
 }
 
 /// The `id` key of the `config.toml` at `config_path`, read on its own so a
@@ -6686,11 +6752,14 @@ fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
 /// is true only for a create claiming a fresh directory: a leftover config the
 /// writer cannot read belongs to no account, so it is replaced instead of
 /// refusing, and the create's undo still names it if the roster write then
-/// fails.
+/// fails. `claim_picker` is true only for that create too: a readable
+/// leftover's `[model_picker]` is no account's either, so it is replaced by
+/// the profile's own, or removed ([`claim_model_picker`]).
 fn write_config_render(
     profile: &Profile,
     id: Option<&ProfileId>,
     replace_unreadable: bool,
+    claim_picker: bool,
 ) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
     let rendered = with_profile_id(render_config_toml(profile), id);
@@ -6703,7 +6772,14 @@ fn write_config_render(
             return Err(e).with_context(|| format!("failed to read {}/config.toml", profile.name));
         }
     };
-    edit_existing_config_toml(&config_path, &raw, profile, ConfigEditMode::Save, id)
+    edit_existing_config_toml(
+        &config_path,
+        &raw,
+        profile,
+        ConfigEditMode::Save,
+        id,
+        claim_picker,
+    )
 }
 
 /// Which edit step a config write runs: the save writes every drifted key; the
@@ -6724,6 +6800,7 @@ fn edit_existing_config_toml(
     profile: &Profile,
     mode: ConfigEditMode,
     id: Option<&ProfileId>,
+    claim_picker: bool,
 ) -> Result<()> {
     let lf = raw.replace("\r\n", "\n");
     let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
@@ -6750,6 +6827,9 @@ fn edit_existing_config_toml(
         }
     };
     apply_config_edits(&mut doc, &on_disk, &canonical, mode);
+    if claim_picker {
+        claim_model_picker(&mut doc, profile.model_picker.as_ref());
+    }
     if let Some(id) = id
         && doc.get("id").and_then(|v| v.as_str()) != Some(id.0.as_str())
     {
@@ -7414,6 +7494,27 @@ fn env_doc() -> String {
 const ENV_EXAMPLE: &str = "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n";
 
 #[rustfmt::skip]
+fn push_model_picker_doc(out: &mut String) {
+    out.push_str("# Per-account /model picker, written as Claude Code's `modelPicker` setting\n");
+    out.push_str("# in this profile's settings.json. Each [[model_picker.options]] row is one\n");
+    out.push_str("# entry (`model`, optional `label`, `description`, `behaves_as`), and the\n");
+    out.push_str("# table is written only while one row has a `model`. With\n");
+    out.push_str("# `replace_built_in = true` the picker shows only the Default row and these\n");
+    out.push_str("# entries; false or unset adds them after the built-in lineup. A switch to an\n");
+    out.push_str("# account without a picker removes only the picker clauth wrote. A save\n");
+    out.push_str("# never edits this table; creating an account over a leftover config.toml\n");
+    out.push_str("# replaces it.\n");
+}
+
+fn model_picker_doc() -> String {
+    let mut out = String::new();
+    push_model_picker_doc(&mut out);
+    out
+}
+
+const MODEL_PICKER_EXAMPLE: &str = "# [model_picker]\n# replace_built_in = true\n#\n# [[model_picker.options]]\n# model = \"<model id>\"\n# label = \"My model\"\n";
+
+#[rustfmt::skip]
 fn push_model_effort_doc(out: &mut String) {
     out.push_str("# Per-model reasoning effort, keyed by a `model` value: a tier (fable,\n");
     out.push_str("# opus, sonnet, haiku) or a model id. Each is written as that model's\n");
@@ -7431,24 +7532,24 @@ fn model_effort_doc() -> String {
 
 const MODEL_EFFORT_EXAMPLE: &str = "# [model_effort]\n# sonnet = \"xhigh\"\n";
 
+fn toml_str(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
+}
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
-    fn toml_str(s: &str) -> String {
-        toml::Value::String(s.to_string()).to_string()
-    }
-
     let mut out = String::from("# clauth profile configuration\n\n");
 
     push_scalar_doc(&mut out, "base_url");
     match profile.saved_base_url().as_deref() {
-        Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
+        Some(v) => _ = writeln!(out, "base_url = {}", toml_str(v)),
         None => out.push_str(&scalar_example("base_url")),
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "api_key");
     match profile.api_key.as_deref() {
-        Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
+        Some(v) => _ = writeln!(out, "api_key = {}", toml_str(v)),
         None => out.push_str(&scalar_example("api_key")),
     }
     out.push('\n');
@@ -7473,23 +7574,24 @@ fn render_config_toml(profile: &Profile) -> String {
     if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
         out.push_str(&scalar_example("usage_probe_interval_ms"));
     } else {
-        out.push_str(&format!(
-            "usage_probe_interval_ms = {}\n",
+        _ = writeln!(
+            out,
+            "usage_probe_interval_ms = {}",
             profile.usage_probe_interval_ms
-        ));
+        );
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "fallback_threshold");
     match profile.fallback_threshold {
-        Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
+        Some(v) => _ = writeln!(out, "fallback_threshold = {v}"),
         None => out.push_str(&scalar_example("fallback_threshold")),
     }
     out.push('\n');
 
     push_scalar_doc(&mut out, "weekly_threshold");
     match profile.weekly_threshold {
-        Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
+        Some(v) => _ = writeln!(out, "weekly_threshold = {v}"),
         None => out.push_str(&scalar_example("weekly_threshold")),
     }
     out.push('\n');
@@ -7536,10 +7638,10 @@ fn render_config_toml(profile: &Profile) -> String {
     ] {
         push_scalar_doc(&mut out, key);
         match date {
-            Some(date) => out.push_str(&format!(
-                "{key} = {}\n",
-                toml_str(&crate::usage::render_plan_date(date))
-            )),
+            Some(date) => {
+                let date = crate::usage::render_plan_date(date);
+                _ = writeln!(out, "{key} = {}", toml_str(&date));
+            }
             None => out.push_str(&scalar_example(key)),
         }
         out.push('\n');
@@ -7555,7 +7657,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     push_scalar_doc(&mut out, "max_auto_spend");
     match profile.max_auto_spend {
-        Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
+        Some(v) => _ = writeln!(out, "max_auto_spend = {v}"),
         None => out.push_str(&scalar_example("max_auto_spend")),
     }
     out.push('\n');
@@ -7586,7 +7688,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     push_scalar_doc(&mut out, "bell_threshold");
     match profile.bell_threshold {
-        Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
+        Some(v) => _ = writeln!(out, "bell_threshold = {v}"),
         None => out.push_str(&scalar_example("bell_threshold")),
     }
     out.push('\n');
@@ -7601,20 +7703,20 @@ fn render_config_toml(profile: &Profile) -> String {
 
     push_scalar_doc(&mut out, "effort");
     match profile.effort.as_deref() {
-        Some(v) => out.push_str(&format!("effort = {}\n", toml_str(v))),
+        Some(v) => _ = writeln!(out, "effort = {}", toml_str(v)),
         None => out.push_str(&scalar_example("effort")),
     }
     out.push('\n');
 
     // Tables last: every key after a `[table]` header belongs to that table, so
-    // this block and the two below must follow every scalar key above.
+    // this block and the four below must follow every scalar key above.
     push_console_doc(&mut out);
     match profile.console.as_ref() {
         Some(c) => {
             out.push_str("[console]\n");
-            out.push_str(&format!("token = {}\n", toml_str(&c.token)));
-            out.push_str(&format!("site = {}\n", toml_str(c.site.as_str())));
-            out.push_str(&format!("region = {}\n", toml_str(&c.region)));
+            _ = writeln!(out, "token = {}", toml_str(&c.token));
+            _ = writeln!(out, "site = {}", toml_str(c.site.as_str()));
+            _ = writeln!(out, "region = {}", toml_str(&c.region));
         }
         None => out.push_str(CONSOLE_EXAMPLE),
     }
@@ -7637,7 +7739,7 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("[models]\n");
         for (k, v) in scalars {
             if let Some(v) = v {
-                out.push_str(&format!("{k} = {}\n", toml_str(v)));
+                _ = writeln!(out, "{k} = {}", toml_str(v));
             }
         }
     }
@@ -7649,11 +7751,7 @@ fn render_config_toml(profile: &Profile) -> String {
     } else {
         out.push_str("[model_effort]\n");
         for (k, v) in &profile.model_effort {
-            out.push_str(&format!(
-                "{} = {}\n",
-                toml_edit::Key::new(k.as_str()),
-                toml_str(v)
-            ));
+            _ = writeln!(out, "{} = {}", toml_edit::Key::new(k.as_str()), toml_str(v));
         }
     }
     out.push('\n');
@@ -7667,14 +7765,53 @@ fn render_config_toml(profile: &Profile) -> String {
             // The key encoder, never `toml_str`: a value encoder emits a
             // multi-line string for a newline or for both quote kinds, which
             // TOML refuses as a key.
-            out.push_str(&format!(
-                "{} = {}\n",
-                toml_edit::Key::new(k.as_str()),
-                toml_str(v)
-            ));
+            _ = writeln!(out, "{} = {}", toml_edit::Key::new(k.as_str()), toml_str(v));
         }
     }
+    out.push('\n');
 
+    push_model_picker_doc(&mut out);
+    match profile.model_picker.as_ref() {
+        None => out.push_str(MODEL_PICKER_EXAMPLE),
+        Some(mp) => out.push_str(&render_model_picker_table(mp)),
+    }
+
+    out
+}
+
+/// A create over a leftover `config.toml` it can read: the leftover belongs to
+/// no account, so its `[model_picker]` is replaced by the new profile's (or
+/// dropped when the profile has none). A save never edits the table.
+fn claim_model_picker(doc: &mut toml_edit::DocumentMut, picker: Option<&ModelPicker>) {
+    doc.remove("model_picker");
+    let Some(mp) = picker else { return };
+    if let Ok(mut parsed) = render_model_picker_table(mp).parse::<toml_edit::DocumentMut>()
+        && let Some(item) = parsed.remove("model_picker")
+    {
+        doc.insert("model_picker", item);
+    }
+}
+
+/// The real `[model_picker]` table as the template writes it: rows as stored,
+/// blank ones included.
+fn render_model_picker_table(mp: &ModelPicker) -> String {
+    let mut out = String::from("[model_picker]\n");
+    if let Some(b) = mp.replace_built_in {
+        _ = writeln!(out, "replace_built_in = {b}");
+    }
+    for o in &mp.options {
+        out.push_str("\n[[model_picker.options]]\n");
+        _ = writeln!(out, "model = {}", toml_str(&o.model));
+        for (k, v) in [
+            ("label", &o.label),
+            ("description", &o.description),
+            ("behaves_as", &o.behaves_as),
+        ] {
+            if let Some(v) = v {
+                _ = writeln!(out, "{k} = {}", toml_str(v));
+            }
+        }
+    }
     out
 }
 
@@ -7814,6 +7951,16 @@ fn known_doc_blocks(key: &str) -> Vec<String> {
              # fallback_threshold {EM_DASH} this profile still switches away at its own\n\
              # threshold whenever another chain member has headroom.\n"
         )),
+        // 34096310 wrote the first block, which said a switch removes any
+        // picker and that clauth never edits the table.
+        "model_picker" => docs.push(
+            "# Per-account /model picker, written as Claude Code's `modelPicker` setting\n\
+             # in this profile's settings.json. `replace_built_in = true` hides the\n\
+             # built-in model list; each [[model_picker.options]] row is one entry\n\
+             # (`model`, optional `label`, `description`, `behaves_as`). A switch to an\n\
+             # account without a picker removes it. clauth never edits this table.\n"
+                .to_string(),
+        ),
         // 09a1dd3c reworded the switch-away clause (f4c9ca1e wrote the older
         // block).
         "env" => docs.push(
@@ -7832,6 +7979,7 @@ fn doc_block_for(key: &str) -> String {
         "models" => models_doc(),
         "model_effort" => model_effort_doc(),
         "env" => env_doc(),
+        "model_picker" => model_picker_doc(),
         k => scalar_doc(k),
     }
 }
@@ -8704,7 +8852,8 @@ fn edit_string_table(
 
 /// The on-disk config typed whole: `Ok` when the file parses into
 /// [`ProfileConfig`], `Err` when it holds a modelled key clauth cannot read
-/// (a wrong type, or the `kick_timer` alias beside `auto_start`, which serde
+/// (a wrong type, or an alias beside its field — `kick_timer` beside
+/// `auto_start`, a `[model_picker]` field in both spellings — which serde
 /// counts as one field). An `Err` file still reaches the shape check, which
 /// then refuses on the first unreadable key and never runs the
 /// non-plain/`edited` comparison over a defaulted view; one the shape check
@@ -8936,17 +9085,48 @@ fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool
     }
 }
 
+/// A `[model_picker]` field written in both spellings, named by its table and
+/// its camelCase alias: serde counts the alias and the field as one field, so
+/// the file cannot parse, the way `kick_timer` beside `auto_start` cannot.
+fn model_picker_doubled_field(item: &toml_edit::Item) -> Option<&'static str> {
+    let table = item.as_table_like()?;
+    if table.contains_key("replace_built_in") && table.contains_key("replaceBuiltInOptions") {
+        return Some("model_picker.replaceBuiltInOptions");
+    }
+    let doubled = |row: &dyn toml_edit::TableLike| {
+        row.contains_key("behaves_as") && row.contains_key("behavesAs")
+    };
+    let rows = table.get("options");
+    let block_rows = rows
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .is_some_and(|rows| rows.iter().any(|row| doubled(row)));
+    let inline_rows = rows
+        .and_then(toml_edit::Item::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .filter_map(toml_edit::Value::as_inline_table)
+                .any(|row| doubled(row))
+        });
+    (block_rows || inline_rows).then_some("model_picker.options.behavesAs")
+}
+
 /// The first modelled key, in file order, whose on-disk shape the save cannot
 /// leave as written: an unreadable key, or a readable-but-non-plain key the
 /// save would edit. When the typed parse failed (`on_disk` is `None`), only the
-/// unreadable arm and the `kick_timer` pair run — the non-plain/`edited` test
-/// never compares a defaulted view. `None` when every edit is over a plain shape.
+/// unreadable arm and the alias pairs (`kick_timer`, the `[model_picker]`
+/// spellings) run — the non-plain/`edited` test never compares a defaulted
+/// view. `None` when every edit is over a plain shape.
 fn non_plain_edit(
     doc: &toml_edit::DocumentMut,
     on_disk: Option<&ProfileConfig>,
     canonical: &ProfileConfig,
 ) -> Option<&'static str> {
     for (key, item) in doc.iter() {
+        if key == "model_picker"
+            && let Some(doubled) = model_picker_doubled_field(item)
+        {
+            return Some(doubled);
+        }
         if key == "kick_timer"
             && doc.get("auto_start").is_some_and(|it| {
                 key_shape("auto_start", it).is_some_and(|(s, _)| s != KeyShape::Unreadable)
