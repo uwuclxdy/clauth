@@ -6370,10 +6370,12 @@ pub(crate) fn refuse_live_apply_build(profile: &Profile, prev_env_keys: &[String
 /// value, or leaves when the user had none, and a listed key a profile field
 /// sets leaves, exactly as a switch onto an account without them would. A
 /// `modelPicker` the departing account wrote over one of the user's goes back
-/// to the user's ([`release_top_level`]). The other keys its profile fields
-/// wrote (endpoint, models, a `modelPicker` that replaced none,
-/// `apiKeyHelper`) stay as it wrote them, and so do their record entries. A
-/// carrier holding a covered model level is also cleared.
+/// to the user's; one that replaced none stays as the account wrote it
+/// ([`release_top_level`]). A picker the user has since edited or deleted
+/// stays as the user made it, and its entry retires. The other keys its
+/// profile fields wrote (endpoint, models, `apiKeyHelper`) stay as it wrote
+/// them, and so do their record entries. A carrier holding a covered model
+/// level is also cleared.
 ///
 /// Errors when `settings.json` or the record cannot be read or written,
 /// leaving the live file as it was. The caller treats that as a failed
@@ -6427,7 +6429,7 @@ pub(crate) fn release_saved_base_env(
     if env != unchanged_env {
         obj.insert("env".into(), env.into());
     }
-    release_top_level(obj, prev_env_keys, &mut record)?;
+    release_top_level(obj, &mut record)?;
     // A switch-off pins no model: every level a switch covered goes back.
     apply_live_model_effort(obj, &BTreeMap::new(), &mut record, &path)?;
     let content = if settings == unchanged {
@@ -6628,7 +6630,7 @@ fn read_saved_base_env() -> Result<Option<SavedBaseEnv>> {
     }
     let context = || {
         format!(
-            "{} holds env values, per-model effort levels and the modelPicker covered in ~/.claude/settings.json; repair it (removing it gives those values up)", // PLACEHOLDER(copy)
+            "{} holds your own ~/.claude/settings.json values that clauth replaced (env values, per-model effort levels, the modelPicker); repair it (removing it gives those values up)",
             path.display()
         )
     };
@@ -7244,14 +7246,12 @@ fn settle_top_level(
             settings.insert(key.to_string(), value);
         }
         None => {
-            if clauths {
-                match base {
-                    Some(base) => {
-                        settings.insert(key.to_string(), base);
-                    }
-                    None => {
-                        settings.remove(key);
-                    }
+            match base {
+                Some(base) => {
+                    settings.insert(key.to_string(), base);
+                }
+                None => {
+                    settings.remove(key);
                 }
             }
             record.landed.top.remove(key);
@@ -7262,29 +7262,34 @@ fn settle_top_level(
 
 /// Switch-off's put-back of the recorded top-level keys: a key whose entry
 /// saved the user's own value goes back to it while the live value is still
-/// clauth's, and its entry retires. A key with no saved value keeps the value
-/// the departing account wrote, and its entry, as a switch-off leaves that
-/// account's other profile fields.
+/// clauth's, and its entry retires either way, as a leaving env key's does. A
+/// key with no saved value and a live value clauth wrote keeps both, so the
+/// entry goes on judging the value clauth's; over a live value the user's, the
+/// entry retires and the value stays.
 fn release_top_level(
     settings: &mut serde_json::Map<String, serde_json::Value>,
-    prev_env_keys: &[String],
     record: &mut RecordPlan,
 ) -> Result<()> {
-    let mut outgoing = OutgoingValues::new(&[], prev_env_keys);
+    let mut outgoing = OutgoingValues::new(&[], &[]);
     for (key, entry) in &record.captured.top {
-        let Some(base) = &entry.base else {
-            continue;
-        };
-        if top_level_is_clauths(
+        let clauths = top_level_is_clauths(
             settings.get(key),
             Some(entry),
             record.judge,
             key,
             &mut outgoing,
-        )? {
-            settings.insert(key.clone(), base.clone());
-            record.landed.top.remove(key);
+        )?;
+        if clauths {
+            match &entry.base {
+                Some(base) => {
+                    settings.insert(key.clone(), base.clone());
+                }
+                // The departing account's own picker stays live; its entry
+                // goes on judging it clauth's.
+                None => continue,
+            }
         }
+        record.landed.top.remove(key);
     }
     Ok(())
 }

@@ -1645,8 +1645,9 @@ pub(crate) fn switch_profile_noninteractive(
 }
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account,
-/// clear the active marker, and then put the `[env]` values the account covered
-/// back the way a switch away does. Used by wrap-off mode when the whole chain
+/// clear the active marker, and then put back the `[env]` values the account
+/// covered and a hand-set `modelPicker` its picker replaced, the way a switch
+/// away does. Used by wrap-off mode when the whole chain
 /// is exhausted. No-op when no profile is active. The put-back is best-effort
 /// and last: a `settings.json` or saved-values record that cannot be read or
 /// written logs one line and leaves the covers live until the next apply that
@@ -1728,7 +1729,7 @@ pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<Option<Profile
         if let Err(e) = crate::claude::release_saved_base_env(&prev_env_keys, held) {
             crate::logline::logline!(
                 "clauth: switched off, but could not put back the settings.json values \
-                 {departed} covered: {e:#}; the next switch that lands puts them back" // PLACEHOLDER(copy)
+                 {departed} covered: {e:#}; the next switch that lands puts them back"
             );
         }
         Ok(Some(departed))

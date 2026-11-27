@@ -23921,6 +23921,110 @@ fn a_switch_off_puts_back_only_a_model_picker_clauth_replaced() {
         Some(edited),
         "switch-off keeps a picker the user edited over clauth's"
     );
+    assert!(
+        base_env_record().get("top").is_none(),
+        "and retires the entry the user's edit left unclaimed"
+    );
+    let own = one_row_picker("a-model");
+    hand_set_model_picker(&own);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(own),
+        "a's own picker, set by hand again, is the user's"
+    );
+}
+
+/// A switch-off retires the recorded picker entry over a live picker the user
+/// deleted too: a later hand-set equal to the departed account's own is the
+/// user's, not clauth's.
+#[test]
+fn a_switch_off_retires_the_recorded_picker_entry_over_a_deleted_picker() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_model_picker(&a, "a-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    hand_set_model_picker(&one_row_picker("mine"));
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    hand_remove_model_picker();
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
+    assert_eq!(live_model_picker(), None, "the user's deletion stands");
+    assert!(
+        base_env_record().get("top").is_none(),
+        "and the entry retires"
+    );
+    let own = one_row_picker("a-model");
+    hand_set_model_picker(&own);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(own),
+        "a's own picker, set by hand again, is the user's"
+    );
+}
+
+/// A switch-off retires a recorded picker entry that saved no value once the
+/// user owns the live picker: over the user's edit, and over a deletion.
+#[test]
+fn a_switch_off_retires_a_no_base_entry_over_a_user_owned_picker() {
+    let _home = HomeSandbox::new();
+    let (a, b) = seed_two_captured();
+    give_model_picker(&a, "a-model");
+    let mut config = crate::profile::load_config().expect("read");
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    // No live picker: the entry saves no `base`.
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    let edited = serde_json::json!({"options": [{"model": "a-model", "label": "Mine"}]});
+    hand_set_model_picker(&edited);
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
+    assert_eq!(
+        live_model_picker(),
+        Some(edited),
+        "switch-off keeps the user's edit"
+    );
+    assert!(
+        base_env_record().get("top").is_none(),
+        "and retires the entry over it"
+    );
+    let own = one_row_picker("a-model");
+    hand_set_model_picker(&own);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(own.clone()),
+        "a's own picker, set by hand, is the user's"
+    );
+
+    // Over the user's deletion too.
+    hand_remove_model_picker();
+    assert!(switch_profile_locked(&mut config, &a).expect("switch to a"));
+    hand_remove_model_picker();
+    assert!(
+        switch_off_locked(&mut config)
+            .expect("switch off")
+            .is_some()
+    );
+    assert_eq!(live_model_picker(), None, "the deletion stands");
+    assert!(
+        base_env_record().get("top").is_none(),
+        "the entry retires over the deletion too"
+    );
+    hand_set_model_picker(&own);
+    assert!(switch_profile_locked(&mut config, &b).expect("switch to b"));
+    assert_eq!(
+        live_model_picker(),
+        Some(own),
+        "and a's own stays the user's"
+    );
 }
 
 /// A switch-off over a `~/.clauth/base-env.json` that does not read, with a
@@ -23965,8 +24069,9 @@ fn a_switch_off_over_an_unreadable_record_with_a_live_picker_says_so() {
 /// The refusal of a `~/.clauth/base-env.json` that does not read.
 fn base_env_refusal() -> String {
     format!(
-        "{} holds env values, per-model effort levels and the modelPicker covered in \
-         ~/.claude/settings.json; repair it (removing it gives those values up)",
+        "{} holds your own ~/.claude/settings.json values that clauth replaced (env \
+         values, per-model effort levels, the modelPicker); repair it (removing it gives \
+         those values up)",
         base_env_path().display()
     )
 }

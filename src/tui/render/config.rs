@@ -503,8 +503,8 @@ fn picker_summary(picker: Option<&crate::profile::ModelPicker>) -> String {
 }
 
 /// `summary` fitted to `width` cells: whole when it fits, else cut to end in
-/// `…`, shedding [`PICKER_REPLACES`] first, so a value that lost it always
-/// shows the mark.
+/// `…`, shedding [`PICKER_REPLACES`] first, so a value that lost it ends in
+/// the mark once one cell fits.
 fn fit_picker_summary(summary: &str, width: usize) -> String {
     if grapheme_cells(summary) <= width {
         return summary.to_string();
