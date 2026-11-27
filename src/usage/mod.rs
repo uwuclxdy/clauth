@@ -18,6 +18,7 @@ pub(crate) mod limit_reset_pending;
 // Usage read off an inference response's headers, one parse per provider, and
 // the probe that asks for it.
 mod inference;
+pub(crate) mod observed;
 // When a plan ends or renews, off the two dates the user copies from
 // claude.ai's billing page.
 mod plan_end;
