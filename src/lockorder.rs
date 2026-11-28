@@ -355,6 +355,12 @@ pub(crate) mod rank {
         /// holds it across its reads, writes, prompts and HTTP round trip with
         /// no ranked lock acquired underneath, so nothing ever nests inside it.
         LimitResetSpend = 1950;
+        /// The `held question dot` pass's cross-process flock
+        /// (`herdr_detect::hold_lock`, `~/.clauth/herdr-detection.lock`). A
+        /// true leaf: the pass under it reads and writes files and runs herdr
+        /// subprocesses, never a ranked acquisition.
+        #[cfg(not(windows))]
+        HerdrDetect = 1960;
     }
 }
 

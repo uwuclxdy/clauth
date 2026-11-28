@@ -2236,7 +2236,8 @@ fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
 }
 
 /// The herdr detail: the read-only prose above, then an `options` section of
-/// six focusable form rows editing the `AppState.herdr` knobs. While the
+/// focusable form rows ([`HERDR_OPTIONS`]) editing the `AppState.herdr`
+/// knobs, the `held question dot` row trailed by its card while on. While the
 /// detail pane is descended, ↑↓ walks the rows and the whole form scrolls so
 /// the focused row (plus its tooltip) stays on screen — the form-pane
 /// `draw_scrolled_lines` shape, so the prose scrolls to follow the cursor
@@ -2331,6 +2332,13 @@ fn draw_herdr_detail(
                     ));
                 }
             }
+        }
+        #[cfg(not(windows))]
+        if *row == HerdrOption::HeldQuestionDot && settings.held_question_dot {
+            lines.extend(held_question_dot_card(
+                &app.services.herdr_detection,
+                inner.width as usize,
+            ));
         }
         if selected {
             focus.1 = lines.len();
@@ -2444,8 +2452,33 @@ fn option_row(
             spans.extend(toggle_value(settings.delegate_row_text, inert))
         }
         HerdrOption::RestoreNotice => spans.extend(toggle_value(settings.restore_notice, inert)),
+        #[cfg(not(windows))]
+        HerdrOption::HeldQuestionDot => {
+            spans.extend(toggle_value(settings.held_question_dot, inert));
+        }
     }
     vec![Line::from(spans)]
+}
+
+/// The `held question dot` card under its toggle row: the `detection` row
+/// and its notes as detail lines, keyed on their own `detection` column and
+/// set in the form rows' caret gutter.
+#[cfg(not(windows))]
+fn held_question_dot_card(card: &[String], width: usize) -> Vec<Line<'static>> {
+    const KEY: &str = "detection";
+    card.iter()
+        .map(|text| {
+            let line = detail_line(
+                &escape_control(text),
+                KEY.len(),
+                width.saturating_sub(2),
+                None,
+            );
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The plugin detail's `idle wake` option row, in [`option_row`]'s caret
@@ -2496,6 +2529,8 @@ fn option_unit(row: HerdrOption) -> &'static str {
         | HerdrOption::DelegateDot
         | HerdrOption::DelegateRowText
         | HerdrOption::RestoreNotice => "",
+        #[cfg(not(windows))]
+        HerdrOption::HeldQuestionDot => "",
     }
 }
 

@@ -4021,10 +4021,10 @@ fn herdr_options_app(config: ConfigStatus) -> App {
     app
 }
 
-/// The seven rows render their real values and glyphs on BOTH tiers — the
+/// Every options row renders its real values and glyphs on BOTH tiers — the
 /// toggle glyph is the one control the tier changes, so each tier pins its own.
 #[test]
-fn herdr_options_render_all_seven_rows_on_both_tiers() {
+fn herdr_options_render_every_row_on_both_tiers() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = herdr_options_app(healthy_config());
     let row_with = |rows: &[String], label: &str| -> String {
@@ -4062,6 +4062,11 @@ fn herdr_options_render_all_seven_rows_on_both_tiers() {
         row_with(&rows, "delegate row text").contains("○─"),
         "delegate row text off:\n{screen}"
     );
+    #[cfg(not(windows))]
+    assert!(
+        row_with(&rows, "held question dot").contains("○─"),
+        "held question dot off:\n{screen}"
+    );
     assert!(
         row_with(&rows, "restore notice").contains("─●"),
         "restore notice on:\n{screen}"
@@ -4086,6 +4091,11 @@ fn herdr_options_render_all_seven_rows_on_both_tiers() {
     assert!(
         row_with(&rows, "delegate row text").contains("[off]"),
         "delegate row text [off]:\n{screen}"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        row_with(&rows, "held question dot").contains("[off]"),
+        "held question dot [off]:\n{screen}"
     );
     assert!(
         row_with(&rows, "restore notice").contains("[on]"),
@@ -13796,4 +13806,154 @@ fn a_stopped_record_draws_its_own_facts() {
         drawn, "  ○ stopped   D1  stopped 5s ago",
         "the drawn row is the stopped one's own facts, exactly"
     );
+}
+
+/// The herdr options with `held question dot` focused, its toggle at `on`
+/// and the card lines the pass left.
+#[cfg(not(windows))]
+fn held_question_dot_app(on: bool, card: &[&str]) -> App {
+    let mut state = AppState::default();
+    state.herdr.held_question_dot = on;
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: Vec::new(),
+    });
+    let probe = healthy_probe();
+    app.services.herdr = Some(Some(probe.clone()));
+    app.services.herdr_config = Some(healthy_config());
+    app.services.checks = vec![herdr_check(&probe, Some(&healthy_config()))];
+    app.services.cursor = 0;
+    app.services.focus = crate::tui::app::ServicesFocus::Detail;
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.herdr_detection = card.iter().map(|l| (*l).to_string()).collect();
+    app.services.herdr_options_cursor = crate::tui::app::HERDR_OPTIONS
+        .iter()
+        .position(|row| *row == crate::tui::app::HerdrOption::HeldQuestionDot)
+        .expect("the row exists off Windows");
+    app
+}
+
+/// The rendered rows from the toggle row down, each trimmed at the end, the
+/// caret gutter and the selection tint left out of the text. Drawn wide
+/// enough that the longest note is not cut.
+#[cfg(not(windows))]
+fn held_question_dot_rows(app: &App) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(180, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &[])).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let start = rows
+        .iter()
+        .position(|r| r.contains("held question dot"))
+        .unwrap_or_else(|| panic!("no toggle row:\n{}", rows.join("\n")));
+    let at = rows[start].find("held question dot").unwrap();
+    let gutter = rows[start][..at].chars().count() - 2;
+    rows[start..]
+        .iter()
+        .map(|r| {
+            let detail: String = r.chars().skip(gutter).collect();
+            detail
+                .trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every card string the toggle draws is the approved copy, byte for byte:
+/// the form row, the three detection rows with their notes, the waiting row
+/// and both failure lines.
+#[cfg(not(windows))]
+#[test]
+fn held_question_dot_card_strings_are_byte_exact() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let cases: [(&[&str], &[&str]); 6] = [
+        (
+            &["detection: waiting for herdr to download its claude manifest"],
+            &["  detection  waiting for herdr to download its claude manifest"],
+        ),
+        (
+            &["detection: herdr manifest 2026.10.11.1 + clauth rule"],
+            &["  detection  herdr manifest 2026.10.11.1 + clauth rule"],
+        ),
+        (
+            &[
+                "detection: your override + clauth rule",
+                "  your override hides herdr's manifest updates",
+            ],
+            &[
+                "  detection  your override + clauth rule",
+                "    your override hides herdr's manifest updates",
+            ],
+        ),
+        (
+            &[
+                "detection: your override, which already has the rule",
+                "  a hand-kept rule won't follow clauth's band changes",
+            ],
+            &[
+                "  detection  your override, which already has the rule",
+                "    a hand-kept rule won't follow clauth's band changes",
+            ],
+        ),
+        (
+            &[
+                "detection: herdr manifest 2026.10.11.1 + clauth rule",
+                "  herdr couldn't load the override, so clauth put the previous one back",
+            ],
+            &[
+                "  detection  herdr manifest 2026.10.11.1 + clauth rule",
+                "    herdr couldn't load the override, so clauth put the previous one back",
+            ],
+        ),
+        (
+            &[
+                "detection: herdr manifest 2026.10.11.1 + clauth rule",
+                "  herdr didn't reload, so the change applies at its next start",
+            ],
+            &[
+                "  detection  herdr manifest 2026.10.11.1 + clauth rule",
+                "    herdr didn't reload, so the change applies at its next start",
+            ],
+        ),
+    ];
+    for (card, drawn) in cases {
+        let app = held_question_dot_app(true, card);
+        let rows = held_question_dot_rows(&app);
+        assert!(
+            rows[0].ends_with("held question dot  [on]"),
+            "the form row:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            &rows[1..=drawn.len()],
+            drawn,
+            "the card under the toggle:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[drawn.len() + 1].contains("restore notice"),
+            "the next option row follows the card:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
+/// Off, the row reads `off` and no detection row renders, whatever card a
+/// stale pass left.
+#[cfg(not(windows))]
+#[test]
+fn held_question_dot_off_draws_no_detection_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let app = held_question_dot_app(false, &["detection: your override + clauth rule"]);
+    let rows = held_question_dot_rows(&app);
+    assert!(
+        rows[0].ends_with("held question dot  [off]"),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(rows[1].contains("restore notice"), "{}", rows.join("\n"));
+    assert!(!rows.iter().any(|r| r.contains("detection")));
 }

@@ -78,3 +78,60 @@ fn display_of_an_identity_path_equals_plain() {
         crate::canonical::plain(&p).unwrap().as_path()
     );
 }
+
+/// A write target is `path` itself for a regular file or nothing there, and
+/// the resolved file for a link; anything a regular file could not be written
+/// through (a dangling link, a link loop, a directory) is refused.
+#[cfg(unix)]
+#[test]
+fn write_target_follows_a_link_and_refuses_what_is_not_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+
+    let regular = base.join("regular.toml");
+    std::fs::write(&regular, b"x").unwrap();
+    assert_eq!(
+        crate::canonical::write_target(&regular).unwrap(),
+        crate::canonical::WriteTarget {
+            file: regular.clone(),
+            linked: false,
+        }
+    );
+
+    let absent = base.join("absent.toml");
+    assert_eq!(
+        crate::canonical::write_target(&absent).unwrap(),
+        crate::canonical::WriteTarget {
+            file: absent.clone(),
+            linked: false,
+        }
+    );
+
+    let real = base.join("dotfiles/claude.toml");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, b"x").unwrap();
+    let link = base.join("link.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        crate::canonical::write_target(&link).unwrap(),
+        crate::canonical::WriteTarget {
+            file: crate::canonical::identity(&real).unwrap(),
+            linked: true,
+        }
+    );
+
+    let dangling = base.join("dangling.toml");
+    std::os::unix::fs::symlink(base.join("missing.toml"), &dangling).unwrap();
+    crate::canonical::write_target(&dangling).unwrap_err();
+
+    let looped = base.join("looped.toml");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    crate::canonical::write_target(&looped).unwrap_err();
+
+    let a_dir = base.join("a-dir");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let dir_link = base.join("dir-link.toml");
+    std::os::unix::fs::symlink(&a_dir, &dir_link).unwrap();
+    crate::canonical::write_target(&dir_link).unwrap_err();
+    crate::canonical::write_target(&a_dir).unwrap_err();
+}

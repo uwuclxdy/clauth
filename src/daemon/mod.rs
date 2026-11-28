@@ -103,6 +103,12 @@ const BARE_ITEM_SCAN_EVERY_TICKS: u64 = 30;
 /// `.credentials.json`, one `security` read each.
 #[cfg(target_os = "macos")]
 const STALE_COPY_SWEEP_EVERY_TICKS: u64 = 300;
+/// How often (in `TICK`s) the tick's `held question dot` leg runs
+/// (`herdr_detect::watch_detached`): the leg decides by file reads alone, then
+/// runs a due pass, which spawns herdr, per ~30 s. With the toggle off only a
+/// record an earlier pass left makes one due.
+#[cfg(not(windows))]
+const HERDR_DETECT_EVERY_TICKS: u64 = 30;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
@@ -3329,6 +3335,10 @@ struct Daemon {
     /// ([`STALE_COPY_SWEEP_EVERY_TICKS`]).
     #[cfg(target_os = "macos")]
     bare_item_scan_ticks: u64,
+    /// Ticks since boot, for the `held question dot` leg's cadence
+    /// ([`HERDR_DETECT_EVERY_TICKS`]).
+    #[cfg(not(windows))]
+    herdr_detect_ticks: u64,
     /// The listener start this daemon booted with, named by the cert-refused
     /// verdict's manual-restart advice (the re-exec check reads it).
     #[cfg(unix)]
@@ -3419,6 +3429,8 @@ impl Daemon {
             background: BackgroundHolds::new(),
             #[cfg(target_os = "macos")]
             bare_item_scan_ticks: 0,
+            #[cfg(not(windows))]
+            herdr_detect_ticks: 0,
             #[cfg(unix)]
             restart_advice: RestartAdvice::default(),
         };

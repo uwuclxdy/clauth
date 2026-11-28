@@ -296,6 +296,16 @@ fn the_config_root_is_derived_from_herdrs_own_path_or_refused() {
         "root has no config.toml of herdr's"
     );
     assert_eq!(config_path_from_plugin_dir("clauth"), None);
+    assert_eq!(
+        config_path_from_plugin_dir("rel/plugins/config/clauth"),
+        None,
+        "a relative print names a root under herdr's own cwd, refused as not absolute"
+    );
+    assert_eq!(
+        config_path_from_plugin_dir("plugins/config/clauth"),
+        None,
+        "a print with no root before its last three components names no directory"
+    );
 }
 
 /// The seam `install` writes through: a plan appended onto its file must strip back to that file, byte for byte. `uninstall`'s strip is knob-agnostic, so the delegate row (knob on) has to round-trip the same as today's.
@@ -2323,6 +2333,7 @@ fn herdr_settings_round_trip_through_the_app_load_path() {
         delegate_dot: false,
         delegate_row_text: true,
         restore_notice: false,
+        held_question_dot: false,
         first_landing_done: true,
     };
     assert_eq!(config.state.herdr, want);

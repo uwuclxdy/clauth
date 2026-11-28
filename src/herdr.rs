@@ -317,7 +317,22 @@ pub(crate) fn config_path(bin: &str) -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(explicit));
     }
+    default_config_path(bin)
+}
 
+/// herdr's config root: the directory its default `config.toml` sits in and
+/// its `agent-detection/` overrides always sit in. `HERDR_CONFIG_PATH` moves
+/// only the `config.toml` file, so it plays no part here.
+#[cfg(not(windows))]
+pub(crate) fn config_root(bin: &str) -> Result<PathBuf> {
+    let path = default_config_path(bin)?;
+    path.parent()
+        .map(Path::to_path_buf)
+        .with_context(|| format!("herdr's config path {} has no parent", path.display()))
+}
+
+/// Where herdr reads `config.toml` when `HERDR_CONFIG_PATH` is unset.
+fn default_config_path(bin: &str) -> Result<PathBuf> {
     let out = bounded_output(bin, &["plugin", "config-dir", PLUGIN_ID], &[])
         .with_context(|| format!("`{bin} plugin config-dir` timed out or could not run"))?;
     let printed = String::from_utf8_lossy(&out.stdout);
@@ -333,17 +348,23 @@ pub(crate) fn config_path(bin: &str) -> Result<PathBuf> {
 }
 
 /// herdr prints `<root>/plugins/config/<component>`, and `<root>` is where its
-/// `config.toml` lives. Three components off the end, and the result has to
-/// still be a real prefix rather than the empty path a relative print leaves.
+/// `config.toml` lives. Three components off the end leave no root at all for
+/// a print that starts at `plugins`; a relative root names one under herdr's
+/// own working directory, which clauth cannot know; and the filesystem root is
+/// no place herdr keeps a config. Each would have this write somewhere nobody
+/// reads.
 fn config_path_from_plugin_dir(printed: &str) -> Option<PathBuf> {
     if printed.is_empty() {
         return None;
     }
     let root = PathBuf::from(printed).ancestors().nth(3)?.to_path_buf();
-    // The empty path comes off a relative print, and a root with no parent of
-    // its own is the filesystem root: neither is a directory herdr keeps a
-    // config in, and both would have this write somewhere nobody reads.
-    if root.as_os_str().is_empty() || root.parent().is_none() {
+    if root.components().next().is_some() && !root.is_absolute() {
+        return None;
+    }
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    if root.is_absolute() && root.parent().is_none() {
         return None;
     }
     Some(root.join("config.toml"))

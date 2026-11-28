@@ -126,6 +126,25 @@ impl super::Daemon {
             .map(|c| c.state.sync_mcp_logins)
             .unwrap_or(true);
         crate::runtime::sync_mcp_logins_detached(sync_mcp);
+        // The `held question dot` watcher: on its cadence, rebuild clauth's
+        // herdr override when herdr's cached remote manifest moved, or undo
+        // what the toggle's off left. Off with nothing to undo, it reads only
+        // clauth's own record; a due pass runs detached.
+        #[cfg(not(windows))]
+        {
+            if self
+                .herdr_detect_ticks
+                .is_multiple_of(super::HERDR_DETECT_EVERY_TICKS)
+            {
+                // A poisoned config mutex falls back to the knob's default: off.
+                let on = self
+                    .config
+                    .lock()
+                    .is_ok_and(|c| c.state.herdr.held_question_dot);
+                crate::herdr_detect::watch_detached(on);
+            }
+            self.herdr_detect_ticks = self.herdr_detect_ticks.wrapping_add(1);
+        }
     }
 
     /// Hand this tick's background-tree work to the hold worker: adopt every

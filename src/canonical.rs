@@ -47,6 +47,58 @@ pub(crate) fn display(path: &Path) -> &Path {
     dunce::simplified(path)
 }
 
+/// The file a write to `path` acts on, and whether the user keeps a link at
+/// `path`.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteTarget {
+    /// The regular file clauth writes, replaces or removes.
+    pub(crate) file: PathBuf,
+    /// A symlink sits at `path`: the user's, never clauth's own file.
+    pub(crate) linked: bool,
+}
+
+/// Resolve the file an override write acts on: `path` itself for a regular
+/// file or nothing there, the resolved target for a symlink, so a link the
+/// user keeps stays a link and clauth writes, replaces or removes only the
+/// file it points at. A path that is neither a regular file nor a link to one
+/// (a dangling link, a link loop, a directory) is an error: clauth writes
+/// nothing there.
+#[cfg(not(windows))]
+pub(crate) fn write_target(path: &Path) -> io::Result<WriteTarget> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(WriteTarget {
+                file: path.to_path_buf(),
+                linked: false,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_symlink() {
+        return if meta.is_file() {
+            Ok(WriteTarget {
+                file: path.to_path_buf(),
+                linked: false,
+            })
+        } else {
+            Err(io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            )))
+        };
+    }
+    let file = identity(path)?;
+    if !std::fs::metadata(&file)?.is_file() {
+        return Err(io::Error::other(format!(
+            "{} does not resolve to a regular file",
+            path.display()
+        )));
+    }
+    Ok(WriteTarget { file, linked: true })
+}
+
 /// `path` spelled as Claude Code keys its project dirs on Windows: `\\?\`
 /// dropped at any length, `\\?\UNC\server\…` as `\\server\…`.
 pub(crate) fn claude_code_spelling(path: &str) -> String {

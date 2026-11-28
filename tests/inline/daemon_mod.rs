@@ -13288,3 +13288,224 @@ fn the_retention_check_failure_line_is_latched_and_rearmed() {
     }
     assert_eq!(lines.snapshot().len(), 2, "the next failure run logs again");
 }
+
+/// The tick's `held question dot` leg: with the toggle on and herdr's cached
+/// remote manifest at a newer version than clauth's file was built from, one
+/// tick rebuilds the file and reloads herdr; the next tick due by cadence,
+/// the version unmoved, runs no herdr at all.
+#[cfg(not(windows))]
+#[test]
+fn a_tick_rebuilds_clauths_herdr_override_when_the_cache_moves() {
+    use crate::herdr_detect::tests::{BLOCK, CACHE_V1, CACHE_V2, HEADER, ONE_SERVER, SHIM};
+    let home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let dir = home.home().join("shim");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The shim's own file must not sit where herdr's config root does.
+    let bin = crate::testutil::write_shim(&dir, "herdr-shim", SHIM);
+    std::fs::write(dir.join("sessions.json"), ONE_SERVER).unwrap();
+    let state = home.home().join("xdg-state");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("HERDR_BIN_PATH", Some(bin.as_os_str())),
+            ("XDG_STATE_HOME", Some(state.as_os_str())),
+        ],
+    );
+    let cache = state.join("herdr/agent-detection/remote/claude.toml");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, CACHE_V1).unwrap();
+    let mut config = persist(Vec::new(), None, 90_000);
+    config.state.herdr.held_question_dot = true;
+    save_app_state(&config.state).unwrap();
+    crate::herdr_detect::run_now();
+    let override_path = dir.join("herdr/agent-detection/claude.toml");
+    assert_eq!(
+        std::fs::read_to_string(&override_path).unwrap(),
+        format!("{HEADER}{CACHE_V1}{BLOCK}")
+    );
+    std::fs::write(&cache, CACHE_V2).unwrap();
+    std::fs::remove_file(dir.join("herdr.log")).unwrap();
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+    assert_eq!(
+        std::fs::read_to_string(&override_path).unwrap(),
+        format!("{HEADER}{CACHE_V2}{BLOCK}")
+    );
+    let log = std::fs::read_to_string(dir.join("herdr.log")).unwrap();
+    assert_eq!(
+        log.matches("server reload-agent-manifests").count(),
+        1,
+        "{log}"
+    );
+
+    // The leg runs on its cadence: a version moving again waits for the next
+    // cadence tick. The literals pin the spec's ~30 s; the constant under
+    // test cannot stand in for the expectation.
+    std::fs::remove_file(dir.join("herdr.log")).unwrap();
+    std::fs::write(&cache, CACHE_V1).unwrap();
+    for _ in 1..30 {
+        daemon.tick();
+    }
+    assert!(
+        !dir.join("herdr.log").exists(),
+        "between cadence ticks no leg runs"
+    );
+    daemon.tick();
+    assert_eq!(
+        std::fs::read_to_string(&override_path).unwrap(),
+        format!("{HEADER}{CACHE_V1}{BLOCK}")
+    );
+
+    std::fs::remove_file(dir.join("herdr.log")).unwrap();
+    for _ in 0..30 {
+        daemon.tick();
+    }
+    assert!(
+        !dir.join("herdr.log").exists(),
+        "an unmoved version runs no herdr"
+    );
+}
+
+/// The tick's `held question dot` leg with the toggle off and nothing
+/// recorded: no pass is due, so the tick reads no herdr cache and starts no
+/// herdr subprocess.
+#[cfg(not(windows))]
+#[test]
+fn a_tick_with_the_toggle_off_and_no_record_runs_no_herdr() {
+    use crate::herdr_detect::tests::{CACHE_V1, ONE_SERVER, SHIM};
+    let home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let dir = home.home().join("shim");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = crate::testutil::write_shim(&dir, "herdr-shim", SHIM);
+    std::fs::write(dir.join("sessions.json"), ONE_SERVER).unwrap();
+    let state = home.home().join("xdg-state");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("HERDR_BIN_PATH", Some(bin.as_os_str())),
+            ("XDG_STATE_HOME", Some(state.as_os_str())),
+        ],
+    );
+    let cache = state.join("herdr/agent-detection/remote/claude.toml");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, CACHE_V1).unwrap();
+    let config = persist(Vec::new(), None, 90_000);
+    assert!(
+        !config.state.herdr.held_question_dot,
+        "the toggle defaults off"
+    );
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+
+    assert!(
+        !dir.join("herdr.log").exists(),
+        "the tick reads no cache and starts no subprocess"
+    );
+}
+
+/// The tick's leg with the toggle off and a record an on pass left: one tick
+/// runs the off pass that undoes it, and the tick after starts nothing.
+#[cfg(not(windows))]
+#[test]
+fn a_tick_with_the_toggle_off_undoes_a_record_an_on_pass_left() {
+    use crate::herdr_detect::tests::{BLOCK, CACHE_V1, HEADER, ONE_SERVER, SHIM, record_path};
+    let home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let dir = home.home().join("shim");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = crate::testutil::write_shim(&dir, "herdr-shim", SHIM);
+    std::fs::write(dir.join("sessions.json"), ONE_SERVER).unwrap();
+    let state = home.home().join("xdg-state");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("HERDR_BIN_PATH", Some(bin.as_os_str())),
+            ("XDG_STATE_HOME", Some(state.as_os_str())),
+        ],
+    );
+    let cache = state.join("herdr/agent-detection/remote/claude.toml");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, CACHE_V1).unwrap();
+    let mut config = persist(Vec::new(), None, 90_000);
+    config.state.herdr.held_question_dot = true;
+    save_app_state(&config.state).unwrap();
+    crate::herdr_detect::run_now();
+    let override_path = dir.join("herdr/agent-detection/claude.toml");
+    assert_eq!(
+        std::fs::read_to_string(&override_path).unwrap(),
+        format!("{HEADER}{CACHE_V1}{BLOCK}")
+    );
+
+    config.state.herdr.held_question_dot = false;
+    save_app_state(&config.state).unwrap();
+    std::fs::remove_file(dir.join("herdr.log")).unwrap();
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+
+    assert!(!override_path.exists(), "the off pass undid clauth's file");
+    let log = std::fs::read_to_string(dir.join("herdr.log")).unwrap();
+    assert_eq!(
+        log.matches("server reload-agent-manifests").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        !record_path(&clauth_dir().unwrap()).exists(),
+        "the record goes with the undo"
+    );
+
+    std::fs::remove_file(dir.join("herdr.log")).unwrap();
+    for _ in 0..30 {
+        daemon.tick();
+    }
+    assert!(
+        !dir.join("herdr.log").exists(),
+        "nothing left to undo starts nothing"
+    );
+}
+
+/// The tick's leg with the toggle on and no record runs its pass: the cache
+/// is applied and the record written (a hardcoded off would do neither).
+#[cfg(not(windows))]
+#[test]
+fn a_tick_with_the_toggle_on_and_no_record_runs_its_pass() {
+    use crate::herdr_detect::tests::{BLOCK, CACHE_V1, HEADER, ONE_SERVER, SHIM, record_path};
+    let home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let dir = home.home().join("shim");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = crate::testutil::write_shim(&dir, "herdr-shim", SHIM);
+    std::fs::write(dir.join("sessions.json"), ONE_SERVER).unwrap();
+    let state = home.home().join("xdg-state");
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            ("HERDR_BIN_PATH", Some(bin.as_os_str())),
+            ("XDG_STATE_HOME", Some(state.as_os_str())),
+        ],
+    );
+    let cache = state.join("herdr/agent-detection/remote/claude.toml");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, CACHE_V1).unwrap();
+    let mut config = persist(Vec::new(), None, 90_000);
+    config.state.herdr.held_question_dot = true;
+    save_app_state(&config.state).unwrap();
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("herdr/agent-detection/claude.toml")).unwrap(),
+        format!("{HEADER}{CACHE_V1}{BLOCK}")
+    );
+    assert!(record_path(&clauth_dir().unwrap()).exists());
+}

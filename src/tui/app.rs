@@ -4546,6 +4546,10 @@ impl ShuntActionWorker {
 /// [`ServicesState::cc_version`]); the herdr, standalone-shunt, Rex plugin and
 /// Rex watcher probes run on workers ([`ProbeWorker`]).
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one detail pane's own focus or view flag, read by its own key handler and render"
+)]
 pub(crate) struct ServicesState {
     pub(crate) focus: ServicesFocus,
     /// Cursor over the service rows (`0..checks.len()`).
@@ -4815,6 +4819,15 @@ pub(crate) struct ServicesState {
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
+    /// The `held question dot` pass: on the toggle's flip, and on a recompute
+    /// whose watcher finds one due. It lands the card the pass leaves.
+    #[cfg(not(windows))]
+    pub(crate) herdr_detect_pass: ProbeWorker<Vec<String>>,
+    /// The `held question dot` card under its toggle row, as detail lines
+    /// (`crate::herdr_detect::card_lines`): re-read on every recompute and
+    /// on a pass's landing, never per frame. Empty while the toggle is off.
+    #[cfg(not(windows))]
+    pub(crate) herdr_detection: Vec<String>,
     /// The last-seen plugin row health, the baseline for the out-of-view
     /// activity poll: the first reading establishes it (no color), a later
     /// change colors the Services tab. Updated by every recompute while the
@@ -4905,6 +4918,10 @@ impl Default for ServicesState {
             herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
+            #[cfg(not(windows))]
+            herdr_detect_pass: ProbeWorker::new(crate::herdr_detect::run_now),
+            #[cfg(not(windows))]
+            herdr_detection: Vec::new(),
             plugin_health: None,
             herdr_health: None,
             land_on_herdr: false,
@@ -5158,19 +5175,28 @@ pub(crate) enum HerdrOption {
     BorderLabel,
     DelegateDot,
     DelegateRowText,
+    /// The `held question dot` toggle: herdr's Claude detection carries
+    /// clauth's rule, so a pane whose mod holds a question reads blocked
+    /// (`crate::herdr_detect`). Absent on Windows, which has no bridge to
+    /// hold one.
+    #[cfg(not(windows))]
+    HeldQuestionDot,
     /// The `restore notice` toggle: whether a herdr restore that dropped
     /// launch options refuses the conversation's first prompt with the notice.
     RestoreNotice,
 }
 
-/// The options section's row order — also the ↑↓ walk order.
-pub(crate) const HERDR_OPTIONS: [HerdrOption; 7] = [
+/// The options section's row order — also the ↑↓ walk order. Its length is
+/// per OS: `held question dot` is absent on Windows.
+pub(crate) const HERDR_OPTIONS: &[HerdrOption] = &[
     HerdrOption::PopupWidth,
     HerdrOption::PaneTag,
     HerdrOption::TagRefresh,
     HerdrOption::BorderLabel,
     HerdrOption::DelegateDot,
     HerdrOption::DelegateRowText,
+    #[cfg(not(windows))]
+    HerdrOption::HeldQuestionDot,
     HerdrOption::RestoreNotice,
 ];
 
@@ -5184,6 +5210,8 @@ impl HerdrOption {
             Self::BorderLabel => "border label",
             Self::DelegateDot => "delegate dot",
             Self::DelegateRowText => "delegate row text",
+            #[cfg(not(windows))]
+            Self::HeldQuestionDot => "held question dot",
             Self::RestoreNotice => "restore notice",
         }
     }
@@ -14122,6 +14150,14 @@ fn activate_herdr_option(app: &mut App, row: HerdrOption) {
         HerdrOption::RestoreNotice => {
             toggle_herdr_bool(app, |h| h.restore_notice = !h.restore_notice);
         }
+        // The pass runs on the flip, off the UI thread: it reloads every
+        // running herdr server, and the follow-up the restart queues behind
+        // a pass in flight sees this flip's state.
+        #[cfg(not(windows))]
+        HerdrOption::HeldQuestionDot => {
+            toggle_herdr_bool(app, |h| h.held_question_dot = !h.held_question_dot);
+            app.services.herdr_detect_pass.restart();
+        }
     }
 }
 
@@ -14715,6 +14751,19 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         app.services.herdr_probe.start();
     }
 
+    // `held question dot`: with no daemon this refresh is the watcher of
+    // herdr's cached manifest; a due pass runs on its worker. The reads are
+    // clauth's record, herdr's caches and the override's own path, never a
+    // subprocess.
+    #[cfg(not(windows))]
+    {
+        let on = app.config().state.herdr.held_question_dot;
+        if crate::herdr_detect::due_pass(on).is_some() {
+            app.services.herdr_detect_pass.start();
+        }
+        app.services.herdr_detection = crate::herdr_detect::card(on);
+    }
+
     let mut checks: Vec<Check> = Vec::with_capacity(5);
 
     // shunt row — the gateway's control surface: the daemon's feed when one is
@@ -15004,6 +15053,10 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
 /// recompute or never: a herdr probe that resolved without landing it (herdr
 /// absent) drops the intent, so no later refresh can move the view.
 pub(crate) fn drain_service_probes(app: &mut App) {
+    #[cfg(not(windows))]
+    if let Some(card) = app.services.herdr_detect_pass.drain() {
+        app.services.herdr_detection = card;
+    }
     let herdr = app.services.herdr_probe.drain();
     let standalone = app.services.standalone_probe.drain();
     let move_plan = app.services.move_plan_probe.drain();
@@ -35922,3 +35975,7 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/inline/tui_app.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/tui_held_question_dot.rs"]
+mod held_question_dot_tests;

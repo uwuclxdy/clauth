@@ -21,6 +21,10 @@ mod gateway_edit;
 mod gateway_tokens;
 mod harness;
 mod herdr;
+// No Windows bridge holds a question for the phone, so the toggle and every
+// write it makes exist off Windows only.
+#[cfg(not(windows))]
+mod herdr_detect;
 mod hook_context;
 mod hook_jobs;
 mod hook_note;

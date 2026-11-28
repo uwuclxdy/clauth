@@ -1106,6 +1106,10 @@ impl PopupWidth {
 /// rather than erroring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one `[herdr]` knob in profiles.toml, a published read contract"
+)]
 pub(crate) struct HerdrSettings {
     /// Which open shape `open-pane.sh` resolves per open: popup sizing for
     /// `fit`/`half`, a real split pane for `split-right`/`split-top`.
@@ -1128,6 +1132,11 @@ pub(crate) struct HerdrSettings {
     /// Read by the hook only; the TUI toggle persists it without pushing
     /// anything live.
     pub(crate) restore_notice: bool,
+    /// Whether herdr's Claude detection carries clauth's `clauth_held_ask`
+    /// rule, so a pane whose mod holds a question reads blocked
+    /// (`crate::herdr_detect`). Never set on Windows, where the toggle is
+    /// absent.
+    pub(crate) held_question_dot: bool,
     /// Set once the first herdr-mode landing fires, so that landing happens
     /// exactly once; every later launch — herdr mode included — opens the
     /// top-level `home_tab` instead.
@@ -1144,6 +1153,7 @@ impl Default for HerdrSettings {
             delegate_dot: true,
             delegate_row_text: false,
             restore_notice: true,
+            held_question_dot: false,
             first_landing_done: false,
         }
     }
@@ -3843,8 +3853,8 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
 /// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
-/// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`,
-/// `limit-reset-locks/<name>.lock`) routes
+/// `usage-fetch.lock`, `herdr-detection.lock`, session PID files,
+/// `rotation-locks/<name>.lock`, `limit-reset-locks/<name>.lock`) routes
 /// through here so no lock is born at the process umask — the file itself
 /// carries nothing secret, but a blanket owner-only tree is the invariant the
 /// perms test can check without an exceptions list.
