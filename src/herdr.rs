@@ -358,13 +358,7 @@ fn config_path_from_plugin_dir(printed: &str) -> Option<PathBuf> {
         return None;
     }
     let root = PathBuf::from(printed).ancestors().nth(3)?.to_path_buf();
-    if root.components().next().is_some() && !root.is_absolute() {
-        return None;
-    }
-    if root.as_os_str().is_empty() {
-        return None;
-    }
-    if root.is_absolute() && root.parent().is_none() {
+    if !root.is_absolute() || root.parent().is_none() {
         return None;
     }
     Some(root.join("config.toml"))

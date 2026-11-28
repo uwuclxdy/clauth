@@ -633,7 +633,9 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 /// device is refused before the open, and the opened handle's own metadata
 /// closes the window between the two calls, so a path a user or herdr
 /// controls cannot block a check that only meant to read it. An absent path
-/// keeps its `NotFound`, which callers read as a change.
+/// keeps its `NotFound`: `held_state_moved` and `refused_file_changed` read it
+/// as a change (the latter unless the refusal recorded the absence), while
+/// `unchanged_since_read` reads it as unchanged.
 fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let meta = std::fs::metadata(path)?;
@@ -743,13 +745,10 @@ fn write_atomic(path: &Path, old: Option<&[u8]>, new: &[u8]) -> Result<()> {
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let temp = dir.join(format!(".{name}.clauth-tmp"));
+    let temp = crate::profile::tmp_sibling(path);
     let target_mode = std::fs::metadata(path).ok().map(|meta| meta.permissions());
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     if let Some(mode) = &target_mode {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -1075,6 +1074,14 @@ pub(crate) fn pass(ctx: &Ctx) -> Result<()> {
 /// leaves stale. `None` when neither exists.
 fn resolve_override(ctx: &Ctx, record: Option<&Record>) -> Option<(PathBuf, String)> {
     let root = crate::herdr::config_root(&ctx.bin.to_string_lossy());
+    #[cfg(test)]
+    if let Ok(root) = &root {
+        assert!(
+            crate::profile::home_dir().is_ok_and(|home| root.starts_with(home)),
+            "herdr's config root resolved to {} outside the test's sandbox home",
+            root.display()
+        );
+    }
     if let Ok(root) = &root
         && let Some(app) = app_dir(root)
     {

@@ -3482,7 +3482,8 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
 /// bound the read with `take(cap + 1)`. Returns the UTF-8 text or a plain
 /// detail string (an io error's own Display, "not a regular file", or the cap
 /// refusal) — callers render their own copy around it. Shared by the MCP
-/// prompt reader and the cc-exemption settings reader.
+/// prompt reader, the cc-exemption settings reader and herdr's cached-manifest
+/// reader.
 pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::result::Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {

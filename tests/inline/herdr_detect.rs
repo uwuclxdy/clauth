@@ -2480,6 +2480,79 @@ fn write_atomic_births_its_temp_at_the_targets_mode() {
     );
 }
 
+/// A symlink at the fixed staging name the old write used is not followed:
+/// the write lands in a fresh sibling, and the link's target keeps its bytes
+/// and mode.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_old_temp_name_is_not_followed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fx = Fixture::new();
+    fx.write_cache(CACHE_V1);
+    fx.run(true).unwrap();
+    let override_path = fx.override_path();
+    std::fs::set_permissions(&override_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let sentinel = fx.home.home().join("sentinel");
+    std::fs::write(&sentinel, "the user's bytes").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(
+        &sentinel,
+        fx.dir.join("herdr/agent-detection/.claude.toml.clauth-tmp"),
+    )
+    .unwrap();
+
+    fx.write_cache(CACHE_V2);
+    fx.run(true).unwrap();
+
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"the user's bytes",
+        "the link's target is not written"
+    );
+    assert_eq!(
+        std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the link's target keeps its mode"
+    );
+    assert_eq!(
+        fx.read_override().unwrap(),
+        format!("{HEADER}{CACHE_V2}{BLOCK}")
+    );
+    assert_eq!(
+        std::fs::metadata(&override_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640,
+        "the override keeps its mode"
+    );
+}
+
+/// A FIFO at the fixed staging name the old write used cannot block the
+/// write: the write stages under a fresh name and lands.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_old_temp_name_does_not_block_the_write() {
+    let fx = Fixture::new();
+    let dir = fx.dir.join("herdr/agent-detection");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::testutil::mkfifo(&dir.join(".claude.toml.clauth-tmp"));
+    fx.write_cache(CACHE_V1);
+    save_app_state(&on_state(true)).unwrap();
+    let ctx = fx.ctx.clone();
+
+    assert_eq!(
+        within_deadline(move || pass(&ctx).is_ok()),
+        Some(true),
+        "a FIFO at the old temp name does not block the write"
+    );
+    assert_eq!(
+        fx.read_override().unwrap(),
+        format!("{HEADER}{CACHE_V1}{BLOCK}")
+    );
+}
+
 /// A user's bytes are never rewritten: an append writes the block's own bytes
 /// and a trailing block's removal only truncates, so a crash mid-write cannot
 /// lose a byte the user wrote.
@@ -3126,8 +3199,8 @@ fn a_fifo_at_the_cache_path_reads_as_no_cache() {
 }
 
 /// A symlink at the cache path to a path that is not a regular file reads as
-/// no cache: the metadata check follows the link and refuses the FIFO before
-/// any open, so the check returns instead of waiting in it.
+/// no cache: the read refuses it and returns, so the moved-version rule makes
+/// the held file due instead of the check waiting in the open.
 #[cfg(unix)]
 #[test]
 fn a_symlink_at_the_cache_path_to_a_fifo_is_refused() {
@@ -3188,4 +3261,37 @@ fn unchanged_since_read_refuses_a_path_that_is_not_a_regular_file() {
         Some(true),
         "the re-read does not wait on a FIFO"
     );
+}
+
+/// A herdr that answers a config root outside the sandbox home is refused
+/// before any write: the resolver's test-build guard fires, and nothing
+/// lands outside the sandbox.
+#[cfg(unix)]
+#[should_panic(expected = "outside the test's sandbox home")]
+#[test]
+fn a_config_root_outside_the_sandbox_is_refused_before_any_write() {
+    let fx = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let bin = write_shim(
+        outside.path(),
+        "herdr-outside",
+        r#"d=${0%/*}; printf '%s\n' "$d/herdr-root/plugins/config/clauth""#,
+    );
+    let ctx = Ctx {
+        bin,
+        clauth_dir: fx.ctx.clauth_dir,
+    };
+
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass(&ctx)));
+    assert!(
+        payload.is_err(),
+        "the pass must refuse a config root outside the sandbox"
+    );
+    assert!(
+        !outside.path().join("herdr-root/agent-detection").exists(),
+        "nothing is written outside the sandbox"
+    );
+    if let Err(payload) = payload {
+        std::panic::resume_unwind(payload);
+    }
 }
